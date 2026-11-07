@@ -69,6 +69,8 @@ where
     discards: super::discards::Discards<S::PublicKey>,
     // QUILIBRIUM: repeated and conflicting votes per signer (repeats.rs).
     repeats: super::repeats::Repeats<S::PublicKey>,
+    // QUILIBRIUM: where this member's finalize votes stood (race.rs).
+    races: super::race::Races,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
 
@@ -137,6 +139,7 @@ where
                 epoch: cfg.epoch,
                 discards: Default::default(),
                 repeats: Default::default(),
+                races: Default::default(),
 
                 mailbox_receiver: receiver,
 
@@ -159,6 +162,7 @@ where
     pub fn name_discards(&mut self, partition: &str) {
         self.discards.partition = partition.to_string();
         self.repeats.partition = partition.to_string();
+        self.races.partition = partition.to_string();
     }
 
     fn new_round(&self, view: View) -> Round<S, B, D, Re> {
@@ -529,9 +533,14 @@ where
                         }
 
                         // Store and forward to voter
-                        work.entry(view)
-                            .or_insert_with(|| self.new_round(view))
-                            .mark_finalized();
+                        let round = work.entry(view).or_insert_with(|| self.new_round(view));
+                        let race = round.peer_copy_race();
+                        round.mark_finalized();
+                        if let Some(sample) = race {
+                            if let Some(summary) = self.races.record(self.context.as_ref().current(), sample) {
+                                summary.log(&self.races.partition, self.epoch.get());
+                            }
+                        }
                         voter.recovered(Certificate::Finalization(finalization));
                     }
                 }
@@ -729,6 +738,11 @@ where
                         .await
                     {
                         debug!(%updated_view, "constructed finalization, forwarding to voter");
+                        if let Some(sample) = round.take_race() {
+                            if let Some(summary) = self.races.record(self.context.as_ref().current(), sample) {
+                                summary.log(&self.races.partition, self.epoch.get());
+                            }
+                        }
                         voter.recovered(Certificate::Finalization(finalization));
                     }
                 }

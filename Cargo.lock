@@ -6224,6 +6224,7 @@ dependencies = [
 name = "quil-client"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "clap 4.5.4",
  "crossterm",

@@ -867,6 +867,10 @@ message GetGlobalVertexProofResponse {
 message GetArchiveEndpointsRequest {}
 message GetArchiveEndpointsResponse {
   repeated string endpoints = 1;
+  // The peer each endpoint is pinned to on the master, parallel to
+  // `endpoints`; empty bytes for an unpinned endpoint. Absent (empty list)
+  // from a master that predates it: every endpoint is then unpinned.
+  repeated bytes peer_ids = 2;
 }
 message ResolveRootRequest {
   bytes shard_id = 1;  // addr_path_shard_id(app, prefix) or single-shard id

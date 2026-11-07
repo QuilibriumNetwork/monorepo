@@ -28,12 +28,15 @@ pub enum Msg {
     Mint(super::mint::Progress),
     /// The shielded coins and pending transfers read, or why the read
     /// failed.
-    Shielded(Result<super::transfer::Read, String>),
+    Shielded(Result<super::transfer::Read, super::transfer::ReadFailure>),
     /// A transfer action's confirmation, or why there is none.
     TransferPreview(Result<super::transfer::Preview, String>),
     /// A running transfer action's report.
     Transfer(super::transfer::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
+    /// The node's health report: its conditions, none from a node that
+    /// predates them, or why it is unavailable.
+    HealthRefresh(super::model::HealthAnswer),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
     /// `dataRefreshMsg` — result of a full RPC data fetch.

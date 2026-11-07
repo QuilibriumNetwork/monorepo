@@ -291,7 +291,7 @@ pub fn refusal(m: &Model) -> Option<String> {
     } else {
         match &m.coins.legacy.answer {
             Some((Some(snapshot), _, _)) => {
-                if let Some((frame, left)) = coins::shields_open_at(snapshot) {
+                if let Some((frame, left)) = coins::shields_open_at(m) {
                     format!("shields open at f{frame}, in {left} frames.")
                 } else if snapshot.tally.unshielded <= snapshot.pending {
                     "no unshielded legacy coins to shield.".to_string()
@@ -900,6 +900,7 @@ pub(crate) mod shield_tests {
             })),
             Duration::from_secs(1),
         );
+        coins::node_reports_shields_at(&mut m, head);
         m
     }
 

@@ -18,6 +18,7 @@ mod account;
 pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
+mod info;
 pub(crate) mod legacy;
 pub(crate) mod output;
 #[cfg(feature = "native-proof")]
@@ -27,10 +28,27 @@ mod wallet;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::inclusion::Follow;
 #[cfg(feature = "confidential-tokens")]
-pub(crate) use wallet::{check_recipient, confidential_balance, list_escrows, saved_mints};
+pub(crate) use wallet::{
+    check_recipient, confidential_balance, list_escrows, saved_mints, ScanStopped,
+};
+#[cfg(all(test, feature = "native-proof"))]
+pub(crate) use wallet::{
+    scans_begin_ago, serve_left_out, serve_left_out_expiring, serve_left_out_with,
+};
 
-/// Default scan bounds of `qclient token` (`--max-pages`, `--max-coins`).
-pub(crate) const SCAN_MAX_PAGES: usize = 2048;
+/// A scan's page count when `--max-pages` sets none: no cap. A scan reads
+/// every coin or escrow of the application, nearly all of them other
+/// users', so a page cap counts what anyone can add for fees. The cursor's
+/// strict advance under one snapshot ends a scan, the owned-coin and escrow
+/// limits bound its memory, and each page's call deadline bounds a stall.
+///
+/// One bound still counts other users' records: the node releases a scan's
+/// snapshot an hour after the scan starts (`SCAN_MAX_AGE`), however often
+/// it is paged. At the ~90 coins/s a regular node served, a scan of more
+/// than about 320,000 coins cannot finish and fails each time it runs;
+/// through an archive or on a slow host the bound is lower.
+pub(crate) const SCAN_PAGES_UNCAPPED: usize = usize::MAX;
+/// Default limit of `qclient token` on the coins a scan keeps (`--max-coins`).
 pub(crate) const SCAN_MAX_COINS: usize = 1024;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::{
@@ -421,11 +439,11 @@ pub struct TokenArgs {
     /// Application identifier in hexadecimal (default: QUIL).
     #[arg(long, global = true)]
     pub application: Option<String>,
-    /// Maximum discovery pages (up to 64 confidential coins or escrows each,
-    /// 8 from older nodes); exhaustion fails rather than returning a partial
-    /// balance.
-    #[arg(long, global = true, default_value_t = SCAN_MAX_PAGES)]
-    pub max_pages: usize,
+    /// Stop a scan after this many discovery pages (up to 64 confidential
+    /// coins or escrows each, 8 from older nodes) instead of returning a
+    /// partial balance. None by default: a scan reads every page.
+    #[arg(long, global = true)]
+    pub max_pages: Option<usize>,
     /// Maximum recovered unspent coins retained during discovery.
     #[arg(long, global = true, default_value_t = SCAN_MAX_COINS)]
     pub max_coins: usize,
@@ -433,10 +451,23 @@ pub struct TokenArgs {
     pub command: TokenCommand,
 }
 
+impl TokenArgs {
+    /// The page cap `--max-pages` sets, else none.
+    pub(crate) fn page_cap(&self) -> usize {
+        self.max_pages.unwrap_or(SCAN_PAGES_UNCAPPED)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TokenCommand {
     /// Shows the account address of the managing account.
     Account,
+    /// Print a token's name, symbol and configuration, read from its
+    /// metadata vertex: `info <TokenDomain>`.
+    Info {
+        /// Token domain (32-byte hex), as `deploy token` printed it.
+        domain: String,
+    },
     /// Lists the total balance of tokens in the managing account.
     Balance,
     /// Lists all coins under control of the managing account.
@@ -578,7 +609,9 @@ pub enum TokenCommand {
         recipient: Option<String>,
         #[arg(long = "authority-key", default_value = "q-prover-key")]
         authority_key: String,
-        /// Use a free permissionless mint policy.
+        /// Require an unsigned mint. Optional: the token's deployed policy
+        /// decides whether the mint is signed; this only refuses a policy
+        /// that needs a signature.
         #[arg(long)]
         permissionless: bool,
         /// Paid mint policy: the token's payee QUIL address (hex, from
@@ -764,6 +797,7 @@ impl TokenCommand {
     fn submits(&self) -> bool {
         match self {
             TokenCommand::Account
+            | TokenCommand::Info { .. }
             | TokenCommand::Balance
             | TokenCommand::Coins
             | TokenCommand::Legacy(_)
@@ -1078,7 +1112,10 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         return legacy::run(global, &args.common, &application(args)?, listing).await;
     }
     let tc = TokenCtx::load(global, &args.common)?;
-    if !matches!(args.command, TokenCommand::Account) {
+    if !matches!(
+        args.command,
+        TokenCommand::Account | TokenCommand::Info { .. }
+    ) {
         tc.require_keys()?;
     }
     run_with_context(&tc, args).await
@@ -1110,17 +1147,17 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
         TokenCommand::Balance => {
-            return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await
+            return wallet::run_balance(tc, &application, args.page_cap(), args.max_coins).await
         }
         TokenCommand::Coins => {
-            return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await
+            return wallet::run_coins(tc, &application, args.page_cap(), args.max_coins).await
         }
         TokenCommand::ConfidentialAddress => {
             wallet::run(&tc, &application, false)?;
             return wallet::run(&tc, &application, true);
         }
         TokenCommand::Escrows { max_escrows } => {
-            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await
+            return wallet::run_escrows(tc, &application, args.page_cap(), *max_escrows).await
         }
         _ => {}
     }
@@ -1140,7 +1177,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
         let secs = std::time::Duration::from_secs;
         let follow = |wait: u64| wallet::inclusion::Follow {
             wait: secs(wait),
-            max_pages: args.max_pages,
+            max_pages: args.page_cap(),
         };
         match &args.command {
             TokenCommand::Transfer {
@@ -1158,7 +1195,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         recipient,
                         parse_amount(amount)?,
                         *fee,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1175,7 +1212,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         &application,
                         coins,
                         merge_fee(&tc, &application, *fee).await?,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1223,7 +1260,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         },
                     )
                     .await?,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
                     secs(*wait),
                 )
@@ -1245,7 +1282,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         parse_amount(amount)?,
                         pending_fee(&tc, &application, *fee).await?,
                         *expiration,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1374,7 +1411,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     wallet::SettlementBinding::Bundle(parse_id(context)?),
                     *fee,
                     None,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
                 )
                 .await?;
@@ -1392,7 +1429,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     parse_amount(amount)?,
                     *fee,
                     claimant_key,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
                 )
                 .await
@@ -1462,6 +1499,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
+        TokenCommand::Info { domain } => info::run(tc, domain).await,
         TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run_loaded(tc, &application, listing).await
@@ -1484,6 +1522,18 @@ mod tests {
     }
 
     #[test]
+    fn token_info_takes_a_domain() {
+        let domain = hex::encode([7; 32]);
+        let parsed = TokenCli::try_parse_from(["token", "info", &domain]).unwrap();
+        assert!(matches!(
+            parsed.token.command,
+            TokenCommand::Info { domain: ref d } if *d == domain
+        ));
+        assert!(!parsed.token.command.submits());
+        assert!(TokenCli::try_parse_from(["token", "info"]).is_err());
+    }
+
+    #[test]
     fn token_cli_uses_one_command_family_for_all_applications() {
         let app = hex::encode([7; 32]);
         let parsed = TokenCli::try_parse_from([
@@ -1502,7 +1552,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.token.application.as_deref(), Some(app.as_str()));
-        assert_eq!((parsed.token.max_pages, parsed.token.max_coins), (4, 8));
+        assert_eq!((parsed.token.page_cap(), parsed.token.max_coins), (4, 8));
         assert!(matches!(
             parsed.token.command,
             TokenCommand::Transfer { fee: Some(0), .. }

@@ -578,6 +578,22 @@ impl<P: GlobalProposer> GlobalProposer for PersistingSeals<P> {
         self.inner.verify_with_context(context, digest, bytes)
             && copy.is_none_or(|bytes| self.keep(&digest, &bytes))
     }
+    // The inner proposer's own waits (a vote whose parent a GLOBAL state
+    // sync withholds) and its end of patience pass through.
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> std::result::Result<bool, std::time::Duration> {
+        let copy = bytes.clone();
+        self.inner
+            .verify_or_defer(context, digest, bytes)
+            .map(|verified| verified && copy.is_none_or(|bytes| self.keep(&digest, &bytes)))
+    }
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        self.inner.verify_patience_ran_out(context, waited)
+    }
 }
 
 pub struct AppSeamProposer {
@@ -1203,6 +1219,30 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.fee_vote_out_of_bounds_now(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                fee_vote = header.fee_multiplier_vote,
+                anchor = header.global_frame_number,
+                latest_global = latest,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: its fee vote is outside the bounds every leader computes"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "fee vote out of range",
+                format!(
+                    "frame {}, vote {}, latest GLOBAL frame {latest}",
+                    header.frame_number, header.fee_multiplier_vote
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 view,
@@ -1392,6 +1432,8 @@ fn validation_reason(error: &str) -> &'static str {
         "output does not match the header"
     } else if error.contains("timestamp") {
         "timestamp out of range"
+    } else if error.contains("fee multiplier vote") {
+        "fee vote out of range"
     } else {
         "frame validation failed"
     }
@@ -4662,6 +4704,138 @@ mod tests {
         );
     }
 
+    /// A frame prices its application writes at the fee vote its leader
+    /// chose. From the fee vote bound frame a member refuses a frame whose
+    /// vote lies outside the bounds every leader computes, zero included,
+    /// and sync refuses it too; inside the bounds, and before the frame, they
+    /// accept it as before. A voter judges by its own latest GLOBAL frame as
+    /// well, so an anchor older than the bound frame does not evade it.
+    #[test]
+    fn a_frame_with_a_fee_vote_out_of_range_is_refused() {
+        use quil_types::store::ClockStore as _;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put_global(5);
+        let filter = vec![1; 32];
+        let validator = Arc::new(
+            BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone()),
+        );
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            validator.clone(),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| Ok(()))),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
+        // A frame anchored at GLOBAL frame 5, valid but for its vote.
+        let frame = |vote: u64| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 7,
+                rank: 43,
+                parent_selector: vec![7; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                global_frame_number: 5,
+                timestamp: 1_000,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(5, &[5; 516]),
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+                0,
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
+            );
+            AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            }
+        };
+        let votes_for = |frame: &AppShardFrame| {
+            proposer.verify(
+                43,
+                digest_from_identity([7; 32]),
+                app_frame_digest(frame).unwrap(),
+                Some(encode_app_frame(frame)),
+            )
+        };
+
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(6));
+        assert!(votes_for(&frame(0)), "before the bound frame");
+        assert!(validator
+            .validate_linked_without_storage(&frame(0))
+            .unwrap());
+
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(5));
+        for vote in [0, 1, 89, 111, u64::MAX] {
+            assert!(!votes_for(&frame(vote)), "vote {vote}");
+            liveness.settle(Step::Verify, 43, false);
+            let error = validator
+                .validate_linked_without_storage(&frame(vote))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("fee multiplier vote"), "{error}");
+        }
+        assert_eq!(
+            liveness.decisions().refused.get("fee vote out of range"),
+            Some(&5)
+        );
+        for vote in [90, 100, 110] {
+            assert!(votes_for(&frame(vote)), "vote {vote}");
+            assert!(validator
+                .validate_linked_without_storage(&frame(vote))
+                .unwrap());
+        }
+
+        // Anchored before the bound frame, judged by this voter's head.
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(6));
+        put_global(6);
+        assert!(
+            !votes_for(&frame(0)),
+            "an older anchor does not evade the bounds"
+        );
+        assert!(votes_for(&frame(100)));
+        assert!(
+            validator
+                .validate_linked_without_storage(&frame(0))
+                .unwrap(),
+            "sync judges by the anchor"
+        );
+        crate::fees::set_fee_vote_bound_frame_for_thread(None);
+    }
+
     /// A voter whose latest GLOBAL frame is in the required-anchor epoch
     /// refuses a proposal that names no GLOBAL anchor: GLOBAL would refuse
     /// the frame. Before the epoch it votes as before.
@@ -4925,5 +5099,58 @@ mod tests {
             &app_a,
         )
         .is_none());
+    }
+
+    /// A vote the handoff proposer defers (its parent read withheld while a
+    /// GLOBAL state sync installs) stays deferred through the seal wrapper,
+    /// and the end of its patience reaches the proposer. The wrapper used to
+    /// check such a vote at once, refusing it.
+    #[test]
+    fn the_seal_wrapper_passes_a_deferred_vote_and_its_end_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Deferring(AtomicUsize);
+        impl GlobalProposer for Deferring {
+            fn propose(&self, _: u64, _: Digest) -> Option<(Digest, Vec<u8>)> {
+                None
+            }
+            fn verify(&self, _: u64, _: Digest, _: Digest, _: Option<Vec<u8>>) -> bool {
+                false
+            }
+            fn verify_or_defer(
+                &self,
+                _: ProposalContext,
+                _: Digest,
+                _: Option<Vec<u8>>,
+            ) -> std::result::Result<bool, std::time::Duration> {
+                Err(std::time::Duration::from_millis(250))
+            }
+            fn verify_patience_ran_out(&self, _: ProposalContext, _: std::time::Duration) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wrapper = PersistingSeals {
+            inner: Deferring(AtomicUsize::new(0)),
+            bodies: None,
+        };
+        let context = ProposalContext {
+            epoch: 1,
+            view: 2,
+            parent_view: 1,
+            parent: digest_from_identity([0; 32]),
+            leader: None,
+        };
+        let digest = digest_from_identity([1; 32]);
+        assert!(
+            wrapper
+                .verify_or_defer(context, digest, Some(b"DATA".to_vec()))
+                .is_err(),
+            "a deferral of the wrapped proposer was refused at once"
+        );
+        wrapper.verify_patience_ran_out(context, quil_cw_consensus::adapters::VERIFY_PATIENCE);
+        assert_eq!(
+            wrapper.inner.0.load(Ordering::SeqCst),
+            1,
+            "the end of a vote's patience did not reach the wrapped proposer"
+        );
     }
 }

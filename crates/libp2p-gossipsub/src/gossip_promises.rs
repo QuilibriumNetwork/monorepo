@@ -41,6 +41,13 @@ impl GossipPromises {
         self.promises.contains_key(message)
     }
 
+    /// QUILIBRIUM: whether we sent `peer` an IWANT for `message` that it has not answered.
+    pub(crate) fn promised_by(&self, message: &MessageId, peer: &PeerId) -> bool {
+        self.promises
+            .get(message)
+            .is_some_and(|peers| peers.contains_key(peer))
+    }
+
     /// Get the peers we sent IWANT the input message id.
     pub(crate) fn peers_for_message(&self, message_id: &MessageId) -> Vec<PeerId> {
         self.promises

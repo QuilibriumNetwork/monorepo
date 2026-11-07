@@ -138,7 +138,8 @@ version = "1"
 
 [dev-dependencies.libp2p-identity]
 version = "0.2.12"
-features = ["rand", "ed25519"]
+# QUILIBRIUM: `ed448` for the codec tests of message key types.
+features = ["rand", "ed25519", "ed448"]
 
 [dev-dependencies.tokio]
 version = "1.38"

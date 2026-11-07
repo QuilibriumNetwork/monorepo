@@ -30,6 +30,7 @@ quil-execution = { path = "../quil-execution" }
 quil-p2p = { path = "../quil-p2p" }
 quil-rpc = { path = "../quil-rpc" }
 quil-hypergraph = { path = "../quil-hypergraph" }
+quil-tries = { path = "../quil-tries" }
 quil-lattice-ct = { path = "../quil-lattice-ct" }
 # `node diagnostics dial`: a subset of the features quil-p2p enables, so
 # neither adds a crate or a feature to the build.
@@ -64,11 +65,12 @@ libc = "0.2"
 
 [dev-dependencies]
 quil-forest = { path = "../quil-forest" }
-quil-tries = { path = "../quil-tries" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-store = { path = "../quil-store" }
 tempfile = "3"
+# Builds memo fixtures the wallet must survive (already in the build).
+aes-gcm = "0.10"
 # Paused time drives `--observe` through its polls in tests.
 tokio = { version = "1", features = ["test-util"] }
 

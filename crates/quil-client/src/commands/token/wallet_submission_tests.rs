@@ -1,8 +1,55 @@
 //! Loopback transport test. Payloads are structurally valid fixtures, not
 //! native proofs; this test establishes delivery/authentication, not admission.
 use super::*;
-use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use quil_lattice_ct::confidential::{memo::open_output, relation::membership::IDENTITY_BYTES};
 use std::sync::{Arc, Mutex};
+
+/// A coin as any sender can build it for a published address: its memo
+/// opens for `wallet` but carries `amount + 1`, while the commitment and
+/// owner are those of `amount`. Only the recipient can open a memo, so no
+/// verifier sees the difference. The layout is the memo module's: KEM
+/// ciphertext, AEAD nonce, encrypted amount and note seed, tag.
+fn mismatched_output(wallet: &RecipientWallet, amount: u128) -> Output {
+    use aes_gcm::{
+        aead::{AeadInPlace, KeyInit},
+        Aes256Gcm, Nonce,
+    };
+    use quil_lattice_ct::confidential::{memo::create_output_with_nonce, transfer::MEMO_BYTES};
+    const KEM_END: usize = 1039;
+    const NONCE_END: usize = KEM_END + 12;
+    const BODY_END: usize = NONCE_END + 48;
+    let address = wallet.address();
+    let seed = [77u8; 32];
+    let mut output = create_output_with_nonce(&wallet.context, address, amount, &seed)
+        .unwrap()
+        .output;
+    let (shared, kem) = sntrup761::encapsulate(&address.kem_public_key()[..]).unwrap();
+    output.memo[..KEM_END].copy_from_slice(&kem);
+    output.memo[KEM_END..NONCE_END].copy_from_slice(&[5; 12]);
+    let mut hash = Shake256::default();
+    hash.update(b"quil/token/memo-key/v2\0");
+    hash.update(&wallet.context);
+    hash.update(&kem);
+    hash.update(&shared);
+    let mut key = [0u8; 32];
+    hash.finalize_xof().read(&mut key);
+    let mut aad = b"quil/token/memo-aad/v2\0".to_vec();
+    aad.extend_from_slice(&wallet.context);
+    aad.extend_from_slice(address.recipient_key());
+    aad.extend_from_slice(&output.commitment.to_bytes());
+    aad.extend_from_slice(&output.owner);
+    aad.extend_from_slice(&kem);
+    let mut body = [0u8; 48];
+    body[..16].copy_from_slice(&(amount + 1).to_le_bytes());
+    body[16..].copy_from_slice(&seed);
+    let tag = Aes256Gcm::new_from_slice(&key)
+        .unwrap()
+        .encrypt_in_place_detached(Nonce::from_slice(&[5; 12]), &aad, &mut body)
+        .unwrap();
+    output.memo[NONCE_END..BODY_END].copy_from_slice(&body);
+    output.memo[BODY_END..MEMO_BYTES].copy_from_slice(&tag);
+    output
+}
 
 #[tokio::test]
 async fn wallet_scans_owned_unspent_coins_over_rpc() {
@@ -105,12 +152,9 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     let mut next_local: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut coins = Vec::new();
     let mut spent_image = None;
-    for (recipient, amount) in [(&wallet, 7), (&wallet, 11), (&other, 13), (&wallet, 17)] {
-        let output = create_output(&wallet.context, recipient.address(), amount)
-            .unwrap()
-            .output;
+    let mut place = |output: &Output| {
         let identity =
-            quil_execution::token_intrinsic::state::coin_identity(&wallet.context, 1, &output)
+            quil_execution::token_intrinsic::state::coin_identity(&wallet.context, 1, output)
                 .unwrap()
                 .0;
         let block = coin_blocks::block_for_address(width, &identity).unwrap();
@@ -120,21 +164,43 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         let address = quil_execution::token_intrinsic::state::create_coin(
             &wallet.context,
             1,
-            &output,
+            output,
             position,
         )
         .unwrap()
         .0;
+        (address, position)
+    };
+    for (recipient, amount) in [(&wallet, 7), (&wallet, 11), (&other, 13), (&wallet, 17)] {
+        let output = create_output(&wallet.context, recipient.address(), amount)
+            .unwrap()
+            .output;
+        let (address, position) = place(&output);
         if amount == 7 {
             spent_image = Some(
                 wallet
                     .recover_page(vec![(address, output.clone())])
-                    .unwrap()[0]
+                    .unwrap()
+                    .0[0]
                     .image,
             );
         }
         coins.push((address, output, position));
     }
+    // Anyone holding the wallet's address can add a coin whose memo opens
+    // for it but names another amount than the commitment holds.
+    let mismatched = mismatched_output(&wallet, 5);
+    assert!(matches!(
+        open_output(
+            &wallet.context,
+            &wallet.kem_secret,
+            &wallet.recipient,
+            &mismatched
+        ),
+        Err(quil_lattice_ct::confidential::memo::MemoError::InconsistentOutput)
+    ));
+    let (mismatched_address, position) = place(&mismatched);
+    coins.push((mismatched_address, mismatched, position));
     coins.sort_by_key(|(address, _, _)| *address);
     let records: Vec<_> = coins
         .iter()
@@ -161,7 +227,11 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         .encode()
         .unwrap()
         .to_vec();
-    let listed = coins.clone();
+    let listed: Vec<_> = coins
+        .iter()
+        .filter(|(address, _, _)| *address != mismatched_address)
+        .cloned()
+        .collect();
     let provider = Arc::new(Pages {
         network,
         application,
@@ -224,15 +294,56 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         .await
         .unwrap();
     let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
-    let unspent = wallet.clone().scan_unspent(&client, 4, 2).await.unwrap();
+    let unspent = wallet
+        .clone()
+        .scan_unspent(&client, 4, 2)
+        .await
+        .expect("skipped coins: the scan goes on past a coin whose memo does not match");
     let mut amounts: Vec<_> = unspent.iter().map(|coin| *coin.amount).collect();
     amounts.sort();
     assert_eq!(amounts, [11, 17]);
+    // The mismatched coin is skipped and counted, never owned or spent; the
+    // scan still returns the honest coins and balance, and ends with one
+    // warning naming the coin.
+    let mut report = ScanReport::default();
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let scanned = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_unspent_or_rootless(&client, 4, 2, &mut report),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(scanned.iter().map(|coin| *coin.amount).sum::<u128>(), 28);
+    assert!(scanned
+        .iter()
+        .all(|coin| coin.address != mismatched_address));
+    let line = report.line(std::time::Duration::ZERO);
+    assert!(line.contains(", 1 skipped"), "{line}");
+    let mut warnings = Vec::new();
+    while let Ok(line) = lines.try_recv() {
+        if line.starts_with("warning:") {
+            warnings.push(line);
+        }
+    }
+    let expected = format!(
+        "warning: skipped 1 coin(s) whose memo opens for this wallet but does not match the \
+         coin's amount or owner; they are not in the balance and are never spent: 0x{}",
+        hex::encode(mismatched_address)
+    );
+    assert_eq!(warnings, [expected]);
     // One page carries every coin: the node gathers the provider's pages of
     // one coin into the page of up to 64 the wallet asks for.
     let one_page = wallet.clone().scan_unspent(&client, 1, 2).await.unwrap();
     assert_eq!(one_page.len(), 2);
-    assert!(wallet.clone().scan_unspent(&client, 4, 1).await.is_err());
+    // Past its limit the scan keeps the largest coin and goes on.
+    let largest = wallet.clone().scan_unspent(&client, 4, 1).await.unwrap();
+    assert_eq!(
+        largest.iter().map(|coin| *coin.amount).collect::<Vec<_>>(),
+        [17]
+    );
     provider
         .fail_continuation
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -345,6 +456,1688 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     );
     provider.expired.store(false, SeqCst);
     assert_eq!(wallet.scan_unspent(&client, 4, 2).await.unwrap().len(), 2);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// The application's coins in address order, eight a page as a node's
+/// store answers them: `(address, frame, position, output)`; and its
+/// escrows in address order, eight a page: `(address, blob)`. After each
+/// listing, `tail` empty pages more, as a node passes over other users'
+/// records: a scan's page count grows with them, not with its own.
+#[cfg(feature = "native-proof")]
+struct Listed {
+    network: [u8; 32],
+    root: Vec<u8>,
+    coins: Vec<([u8; 32], u64, u64, Output)>,
+    escrows: Vec<([u8; 32], Vec<u8>)>,
+    tail: u64,
+}
+
+/// The cursor of a listing's `n`th empty page past its records: above
+/// every address (a coin's encodes a field element, so its top byte never
+/// reaches 0xff).
+#[cfg(feature = "native-proof")]
+fn tail_cursor(n: u64) -> [u8; 32] {
+    let mut cursor = [0xff; 32];
+    cursor[24..].copy_from_slice(&n.to_be_bytes());
+    cursor
+}
+
+#[cfg(feature = "native-proof")]
+impl Listed {
+    /// The next empty page past the records after `after`, if the records
+    /// are done and one is left: its cursor and whether more follow.
+    fn tail_page(&self, after: Option<&[u8; 32]>, records_done: bool) -> Option<([u8; 32], bool)> {
+        let done = after
+            .filter(|after| after[..24] == [0xff; 24])
+            .map(|after| u64::from_be_bytes(after[24..].try_into().unwrap()));
+        let n = match done {
+            Some(n) => n + 1,
+            None if records_done && self.tail > 0 => 1,
+            None => return None,
+        };
+        Some((tail_cursor(n), n < self.tail))
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl quil_types::store::CoinWitnessProvider for Listed {
+    fn coin_page(
+        &self,
+        _: &[u8; 32],
+        _: Option<&[u8; 32]>,
+        after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<quil_types::store::CoinPageData>> {
+        use quil_types::store::{CoinData, CoinPageData};
+        let start = self
+            .coins
+            .partition_point(|(address, ..)| after.is_some_and(|after| address <= after));
+        if let Some((cursor, has_more)) = self.tail_page(after, start == self.coins.len()) {
+            return Ok(Some(CoinPageData {
+                network: self.network,
+                snapshot_id: [33; 32],
+                root_record: self.root.clone(),
+                coins: Vec::new(),
+                cursor: Some(cursor),
+                has_more,
+            }));
+        }
+        let page = &self.coins[start..self.coins.len().min(start + 8)];
+        Ok(Some(CoinPageData {
+            network: self.network,
+            snapshot_id: [33; 32],
+            root_record: self.root.clone(),
+            coins: page
+                .iter()
+                .map(|(address, frame_number, position, output)| CoinData {
+                    address: *address,
+                    frame_number: *frame_number,
+                    position: *position,
+                    owner: output.owner.to_vec(),
+                    commitment: output.commitment.to_bytes().to_vec(),
+                    memo: output.memo.to_vec(),
+                })
+                .collect(),
+            cursor: page.last().map(|coin| coin.0).or(after.copied()),
+            has_more: start + page.len() < self.coins.len() || self.tail > 0,
+        }))
+    }
+
+    fn escrow_page(
+        &self,
+        _: &[u8; 32],
+        _: Option<&[u8; 32]>,
+        after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<quil_types::store::EscrowPageData>> {
+        let start = self
+            .escrows
+            .partition_point(|(address, _)| after.is_some_and(|after| address <= after));
+        if let Some((cursor, has_more)) = self.tail_page(after, start == self.escrows.len()) {
+            return Ok(Some(quil_types::store::EscrowPageData {
+                network: self.network,
+                snapshot_id: [33; 32],
+                escrows: Vec::new(),
+                cursor: Some(cursor),
+                has_more,
+            }));
+        }
+        let page = &self.escrows[start..self.escrows.len().min(start + 8)];
+        Ok(Some(quil_types::store::EscrowPageData {
+            network: self.network,
+            snapshot_id: [33; 32],
+            escrows: page.to_vec(),
+            cursor: page.last().map(|escrow| escrow.0).or(after.copied()),
+            has_more: start + page.len() < self.escrows.len() || self.tail > 0,
+        }))
+    }
+}
+
+/// What a node answers a read of a scan snapshot it released.
+#[cfg(feature = "native-proof")]
+const SNAPSHOT_EXPIRED: &str = "coin scan snapshot unavailable or expired; restart scan";
+
+/// [`Listed`] behind a node that fails some continuation reads: the next
+/// `cut_escrow_reads` escrow reads fail as a cut transfer does, and with
+/// `expired_coins` or `expired_escrows` every coin or escrow read finds
+/// the scan's snapshot released.
+#[cfg(feature = "native-proof")]
+struct Failing {
+    listed: Listed,
+    cut_escrow_reads: std::sync::atomic::AtomicUsize,
+    expired_coins: bool,
+    expired_escrows: bool,
+}
+
+#[cfg(feature = "native-proof")]
+impl quil_types::store::CoinWitnessProvider for Failing {
+    fn coin_page(
+        &self,
+        domain: &[u8; 32],
+        snapshot: Option<&[u8; 32]>,
+        after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<quil_types::store::CoinPageData>> {
+        use quil_types::{error::QuilError, store::CoinWitnessProvider};
+        if after.is_some() && self.expired_coins {
+            return Err(QuilError::NotFound(SNAPSHOT_EXPIRED.into()));
+        }
+        CoinWitnessProvider::coin_page(&self.listed, domain, snapshot, after)
+    }
+
+    fn escrow_page(
+        &self,
+        domain: &[u8; 32],
+        snapshot: Option<&[u8; 32]>,
+        after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<quil_types::store::EscrowPageData>> {
+        use quil_types::{error::QuilError, store::CoinWitnessProvider};
+        use std::sync::atomic::Ordering::SeqCst;
+        if after.is_some() && self.expired_escrows {
+            return Err(QuilError::NotFound(SNAPSHOT_EXPIRED.into()));
+        }
+        if after.is_some()
+            && self
+                .cut_escrow_reads
+                .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                .is_ok()
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "1 peer declined: 1x Unknown: h2 protocol error: error reading a body from \
+                 connection"
+                    .into(),
+            ));
+        }
+        CoinWitnessProvider::escrow_page(&self.listed, domain, snapshot, after)
+    }
+}
+
+/// `outputs`, each `(frame, output)`, placed in their blocks and listed in
+/// address order under a root over the first one (a scan only reads the
+/// root), with `escrows`.
+#[cfg(feature = "native-proof")]
+fn listed(
+    wallet: &RecipientWallet,
+    outputs: Vec<(u64, Output)>,
+    mut escrows: Vec<([u8; 32], Vec<u8>)>,
+) -> Listed {
+    use quil_execution::token_intrinsic::{coin_blocks, state};
+    use quil_lattice_ct::confidential::{
+        coin_tree::CoinRecord,
+        sharded_tree::{Shape, ShardedCoinTree},
+    };
+    let width = coin_blocks::INITIAL_BLOCK_BITS;
+    let mut next_local = std::collections::BTreeMap::<u64, u64>::new();
+    let mut coins: Vec<_> = outputs
+        .into_iter()
+        .map(|(frame, output)| {
+            let identity = state::coin_identity(&wallet.context, frame, &output)
+                .unwrap()
+                .0;
+            let block = coin_blocks::block_for_address(width, &identity).unwrap();
+            let local = next_local.entry(block).or_default();
+            let position = coin_blocks::position(width, block, *local).unwrap();
+            *local += 1;
+            let address = state::create_coin(&wallet.context, frame, &output, position)
+                .unwrap()
+                .0;
+            (address, frame, position, output)
+        })
+        .collect();
+    let first = &coins[0];
+    let tree = ShardedCoinTree::build(
+        &wallet.context,
+        Shape {
+            shard_bits: coin_blocks::BLOCK_INDEX_BITS,
+            subtree_bits: coin_blocks::SUBTREE_BITS,
+        },
+        &[CoinRecord {
+            address: first.0,
+            owner: first.3.owner,
+            commitment: first.3.commitment.clone(),
+            position: first.2,
+        }],
+    )
+    .unwrap();
+    let root = tree
+        .root_at_depth(tree.current_depth())
+        .unwrap()
+        .encode()
+        .unwrap()
+        .to_vec();
+    coins.sort_by_key(|coin| coin.0);
+    escrows.sort();
+    Listed {
+        network: wallet.network,
+        root,
+        coins,
+        escrows,
+        tail: 0,
+    }
+}
+
+/// An escrow naming `authority` as its recipient whose memo opens for
+/// `wallet`, its creation committed and unconsumed in `store`: its address
+/// and blob.
+#[cfg(feature = "native-proof")]
+fn open_escrow(
+    store: &quil_hypergraph::testing::MemStore,
+    wallet: &RecipientWallet,
+    authority: &[u8; 897],
+    amount: u128,
+) -> ([u8; 32], Vec<u8>) {
+    use quil_lattice_ct::confidential::{
+        memo::create_escrow_recovery, pending_claim::EscrowPolicy,
+    };
+    let recovery =
+        create_escrow_recovery(&wallet.context, wallet.address(), wallet.address(), amount)
+            .unwrap();
+    committed_escrow(
+        store,
+        wallet,
+        quil_execution::token_intrinsic::escrow::StoredEscrow {
+            frame_number: 1,
+            output: Output {
+                commitment: recovery.commitment,
+                owner: recovery.recipient.owner,
+                memo: recovery.recipient.ciphertext,
+            },
+            policy: EscrowPolicy {
+                recipient: *authority,
+                refund: [23; 897],
+                refund_after_global_frame: 100,
+            },
+            refund_recovery: recovery.refund,
+        },
+    )
+}
+
+/// An escrow whose refund branch names `authority` and whose refund memo
+/// opens for `wallet`, refundable from GLOBAL frame `refund_after`, its
+/// recipient another key; committed and unconsumed in `store`. Anyone can
+/// create one naming a wallet's key and claim it back before that frame.
+#[cfg(feature = "native-proof")]
+fn refund_escrow(
+    store: &quil_hypergraph::testing::MemStore,
+    wallet: &RecipientWallet,
+    authority: &[u8; 897],
+    amount: u128,
+    refund_after: u64,
+) -> ([u8; 32], Vec<u8>) {
+    use quil_lattice_ct::confidential::{
+        memo::create_escrow_recovery, pending_claim::EscrowPolicy,
+    };
+    let recovery =
+        create_escrow_recovery(&wallet.context, wallet.address(), wallet.address(), amount)
+            .unwrap();
+    committed_escrow(
+        store,
+        wallet,
+        quil_execution::token_intrinsic::escrow::StoredEscrow {
+            frame_number: 1,
+            output: Output {
+                commitment: recovery.commitment,
+                owner: recovery.recipient.owner,
+                memo: recovery.recipient.ciphertext,
+            },
+            policy: EscrowPolicy {
+                recipient: [24; 897],
+                refund: *authority,
+                refund_after_global_frame: refund_after,
+            },
+            refund_recovery: recovery.refund,
+        },
+    )
+}
+
+/// An escrow naming `authority` as its recipient whose memo opens for
+/// `wallet` but carries another amount than its commitment, as
+/// [`mismatched_output`] builds it; committed and unconsumed in `store`.
+#[cfg(feature = "native-proof")]
+fn mismatched_escrow(
+    store: &quil_hypergraph::testing::MemStore,
+    wallet: &RecipientWallet,
+    authority: &[u8; 897],
+    amount: u128,
+) -> ([u8; 32], Vec<u8>) {
+    use quil_lattice_ct::confidential::{
+        memo::create_escrow_recovery, pending_claim::EscrowPolicy,
+    };
+    let output = mismatched_output(wallet, amount);
+    let refund = create_escrow_recovery(&wallet.context, wallet.address(), wallet.address(), 1)
+        .unwrap()
+        .refund;
+    committed_escrow(
+        store,
+        wallet,
+        quil_execution::token_intrinsic::escrow::StoredEscrow {
+            frame_number: 1,
+            output,
+            policy: EscrowPolicy {
+                recipient: *authority,
+                refund: [23; 897],
+                refund_after_global_frame: 100,
+            },
+            refund_recovery: refund,
+        },
+    )
+}
+
+/// `escrow`'s address and blob, its creation committed and unconsumed in
+/// `store`.
+#[cfg(feature = "native-proof")]
+fn committed_escrow(
+    store: &quil_hypergraph::testing::MemStore,
+    wallet: &RecipientWallet,
+    escrow: quil_execution::token_intrinsic::escrow::StoredEscrow,
+) -> ([u8; 32], Vec<u8>) {
+    use quil_execution::token_intrinsic::global_commit;
+    use quil_types::store::*;
+    let (address, blob) = escrow.encode(&wallet.context).unwrap();
+    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+    let global_shard = ShardKey {
+        l1: quil_hypergraph::addressing::get_bloom_filter_indices(&global, 256, 3),
+        l2: global,
+    };
+    let mut record = global.to_vec();
+    record
+        .extend_from_slice(&global_commit::escrow_address(&wallet.application, &address).unwrap());
+    let txn = store.new_transaction(false).unwrap();
+    store
+        .save_vertex_underlying(
+            txn.as_ref(),
+            "vertex",
+            "adds",
+            &global_shard,
+            &record,
+            &global_commit::encode_escrow_record(&[5; 32], 100, false).unwrap(),
+        )
+        .unwrap();
+    (address, blob)
+}
+
+/// A node for `tc`'s wallet, served on `listener`, holding what its scans
+/// must leave out: beside an honest 20 and 6, the 6 sent again in a later
+/// frame, a coin whose memo does not match and a 3 past a limit of two
+/// coins; and pending transfers of 7, 9 and 11 to its prover key, with one
+/// whose memo does not match.
+#[cfg(feature = "native-proof")]
+pub(crate) fn serve_left_out(
+    tc: &TokenCtx,
+    listener: tokio::net::TcpListener,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    serve_left_out_with(tc, listener, 0, false)
+}
+
+/// [`serve_left_out`]'s node, each listing followed by `tail` empty pages
+/// (other users' records, read in pages of eight), and with `broken` an
+/// escrow record the wallet cannot decode, which fails its escrow scan.
+#[cfg(feature = "native-proof")]
+pub(crate) fn serve_left_out_with(
+    tc: &TokenCtx,
+    listener: tokio::net::TcpListener,
+    tail: u64,
+    broken: bool,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    serve_left_out_failing(tc, listener, tail, broken, None)
+}
+
+/// [`serve_left_out`]'s node with an empty page after each listing, on
+/// which the coin scan, or with `escrows` the escrow scan, finds its
+/// snapshot released.
+#[cfg(feature = "native-proof")]
+pub(crate) fn serve_left_out_expiring(
+    tc: &TokenCtx,
+    listener: tokio::net::TcpListener,
+    escrows: bool,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    serve_left_out_failing(tc, listener, 1, false, Some(escrows))
+}
+
+/// [`serve_left_out_with`]'s node. With `expired`, the coin scan
+/// (`Some(false)`) or the escrow scan (`Some(true)`) finds its snapshot
+/// released past page 1.
+#[cfg(feature = "native-proof")]
+fn serve_left_out_failing(
+    tc: &TokenCtx,
+    listener: tokio::net::TcpListener,
+    tail: u64,
+    broken: bool,
+    expired: Option<bool>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN).unwrap();
+    let output = |amount| {
+        create_output(&wallet.context, wallet.address(), amount)
+            .unwrap()
+            .output
+    };
+    let six = output(6);
+    let outputs = vec![
+        (1, output(20)),
+        (1, six.clone()),
+        (2, six),
+        (1, mismatched_output(&wallet, 5)),
+        (1, output(3)),
+    ];
+    let authority: [u8; 897] = tc
+        .key_manager
+        .get_public_key_bytes_by_id("q-prover-key")
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let mut escrows: Vec<_> = [7, 9, 11]
+        .into_iter()
+        .map(|amount| open_escrow(&store, &wallet, &authority, amount))
+        .collect();
+    escrows.push(mismatched_escrow(&store, &wallet, &authority, 13));
+    if broken {
+        escrows.push(([0x80; 32], vec![1, 2, 3]));
+    }
+    let mut listed = listed(&wallet, outputs, escrows);
+    listed.tail = tail;
+    let failing = Failing {
+        listed,
+        cut_escrow_reads: Default::default(),
+        expired_coins: expired == Some(false),
+        expired_escrows: expired == Some(true),
+    };
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(store)
+        .with_coin_witness_provider(Arc::new(failing));
+    serve_node(listener, server)
+}
+
+/// A sender can give two coins of a wallet one spend image: one output
+/// sent again in a later frame, or one nonce used twice. Spending either
+/// consumes the image, so a scan keeps one coin per image (the largest; of
+/// equal ones the oldest, then the lower address) and names the others;
+/// the balance, the coin limit, coin selection and a merge see each image
+/// once. A scan meets coins in address order, and the fixture fixes that
+/// order so that every run meets each kind of pair.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_wallet_scan_keeps_one_coin_per_spend_image() {
+    use quil_execution::token_intrinsic::state;
+    use quil_lattice_ct::confidential::memo::{create_output, create_output_with_nonce};
+    let network = [31; 32];
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let keys = sntrup761::Sntrup761KeyPair::generate();
+    let wallet = Arc::new(
+        RecipientWallet::from_keys(
+            &network,
+            &application,
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap(),
+    );
+    let with_nonce = |amount, nonce: u8| {
+        create_output_with_nonce(&wallet.context, wallet.address(), amount, &[nonce; 32])
+            .unwrap()
+            .output
+    };
+    let address = |(frame, output): &(u64, Output)| {
+        state::coin_identity(&wallet.context, *frame, output)
+            .unwrap()
+            .0
+    };
+    // A fresh memo moves a coin's address: draw memos until a group lists
+    // in the order given.
+    let in_order = |make: &dyn Fn() -> Vec<(u64, Output)>| {
+        for _ in 0..256 {
+            let group = make();
+            if group
+                .windows(2)
+                .all(|pair| address(&pair[0]) < address(&pair[1]))
+            {
+                return group;
+            }
+        }
+        panic!("no memo draw lists the group in order");
+    };
+    let honest = (
+        1,
+        create_output(&wallet.context, wallet.address(), 20)
+            .unwrap()
+            .output,
+    );
+    // A 6 listed first from frame 2, then the same output from frame 1,
+    // then another 6 on its nonce from frame 1: the second counts.
+    let sixes = in_order(&|| {
+        let six = with_nonce(6, 1);
+        vec![(2, six.clone()), (1, six), (1, with_nonce(6, 1))]
+    });
+    // On one nonce a 3 then a 9: the 9 replaces the 3. On another an 8
+    // then a 4: the 8 stays.
+    let rising = in_order(&|| vec![(1, with_nonce(3, 2)), (1, with_nonce(9, 2))]);
+    let falling = in_order(&|| vec![(1, with_nonce(8, 3)), (1, with_nonce(4, 3))]);
+    let expected: std::collections::BTreeSet<[u8; 32]> = [
+        address(&honest),
+        address(&sixes[1]),
+        address(&rising[1]),
+        address(&falling[0]),
+    ]
+    .into();
+    let mut outputs = vec![honest];
+    outputs.extend(sixes);
+    outputs.extend(rising);
+    outputs.extend(falling);
+    let listed = listed(&wallet, outputs, Vec::new());
+    let all: Vec<[u8; 32]> = listed.coins.iter().map(|coin| coin.0).collect();
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(Arc::new(quil_hypergraph::testing::MemStore::new()))
+        .with_coin_witness_provider(Arc::new(listed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let mut report = ScanReport::default();
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let scanned = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_unspent_or_rootless(&client, 4, 8, &mut report),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut amounts: Vec<u128> = scanned.iter().map(|coin| *coin.amount).collect();
+    amounts.sort();
+    assert_eq!(
+        amounts,
+        [6, 8, 9, 20],
+        "skipped coins: each spend image counts once, for its largest coin"
+    );
+    let kept: std::collections::BTreeSet<[u8; 32]> =
+        scanned.iter().map(|coin| coin.address).collect();
+    assert_eq!(
+        kept, expected,
+        "skipped coins: of equal coins on one image the oldest counts, then the lower address"
+    );
+    let skipped: Vec<[u8; 32]> = all
+        .iter()
+        .copied()
+        .filter(|address| !kept.contains(address))
+        .collect();
+    assert_eq!(skipped.len(), 4);
+    let line = report.line(std::time::Duration::ZERO);
+    assert!(line.contains(", 4 skipped"), "{line}");
+    let mut warnings = Vec::new();
+    while let Ok(line) = lines.try_recv() {
+        if line.starts_with("warning:") {
+            warnings.push(line);
+        }
+    }
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    let prefix = "warning: skipped 4 coin(s) sharing a spend image with another coin of this \
+                  wallet; only one coin per image can be spent, so the balance counts the \
+                  largest: 0x";
+    assert!(warning.starts_with(prefix), "{warning}");
+    assert!(!warning.ends_with("..."), "{warning}");
+    for address in &all {
+        let named = warning.contains(&format!("0x{}", hex::encode(address)));
+        assert_eq!(named, skipped.contains(address), "{warning}");
+    }
+    // The coin limit counts images, and the whole balance funds one
+    // transfer or merge without a second coin of an image.
+    let four = wallet.clone().scan_unspent(&client, 4, 4).await.unwrap();
+    let (selected, change) = select_coins(four, 43, 0, 4).unwrap();
+    assert_eq!((selected.len(), *change), (4, 0));
+    let again = wallet.clone().scan_unspent(&client, 4, 4).await.unwrap();
+    let (merged, total) = merge_selection(again, &[], 4).unwrap();
+    assert_eq!(total, 43);
+    let images: std::collections::BTreeSet<_> = merged.iter().map(|coin| coin.image).collect();
+    assert_eq!(images.len(), merged.len());
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// Anyone can send a wallet coins, at the cost of fees. Past its limit a
+/// scan keeps the coins that rank first (the largest; of equal ones the
+/// oldest, then the lower address), names the rest in a warning, and goes
+/// on; hiding a coin takes more than the limit's count of larger ones.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_scan_past_its_coin_limit_keeps_the_largest() {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let keys = sntrup761::Sntrup761KeyPair::generate();
+    let wallet = Arc::new(
+        RecipientWallet::from_keys(
+            &[31; 32],
+            &quil_execution::domains::QUIL_TOKEN,
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap(),
+    );
+    let output = |amount| {
+        create_output(&wallet.context, wallet.address(), amount)
+            .unwrap()
+            .output
+    };
+    // Two coins of 11, from frames 2 and 1: of the two the older counts.
+    let older = output(11);
+    let older_address =
+        quil_execution::token_intrinsic::state::coin_identity(&wallet.context, 1, &older)
+            .unwrap()
+            .0;
+    let listed = listed(
+        &wallet,
+        vec![
+            (1, output(5)),
+            (2, output(11)),
+            (1, output(7)),
+            (1, older),
+            (1, output(13)),
+        ],
+        Vec::new(),
+    );
+    let all: Vec<[u8; 32]> = listed.coins.iter().map(|coin| coin.0).collect();
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(Arc::new(quil_hypergraph::testing::MemStore::new()))
+        .with_coin_witness_provider(Arc::new(listed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let mut report = ScanReport::default();
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let kept = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_unspent_or_rootless(&client, 4, 2, &mut report),
+    )
+    .await
+    .expect("skipped coins: a scan past its coin limit goes on")
+    .unwrap();
+    let mut amounts: Vec<u128> = kept.iter().map(|coin| *coin.amount).collect();
+    amounts.sort();
+    assert_eq!(
+        amounts,
+        [11, 13],
+        "skipped coins: past the limit the largest coins count"
+    );
+    assert!(
+        kept.iter().any(|coin| coin.address == older_address),
+        "skipped coins: of equal coins past the limit the oldest counts"
+    );
+    let line = report.line(std::time::Duration::ZERO);
+    assert!(line.contains(", 3 skipped"), "{line}");
+    let warnings: Vec<String> = std::iter::from_fn(|| lines.try_recv().ok())
+        .filter(|line| line.starts_with("warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    let prefix = "warning: left out 3 coin(s) past the scan's coin limit; the balance counts \
+                  the largest; a larger --max-coins counts more, and merging coins brings more \
+                  into the count: 0x";
+    assert!(warning.starts_with(prefix), "{warning}");
+    for address in &all {
+        let named = warning.contains(&format!("0x{}", hex::encode(address)));
+        let counted = kept.iter().any(|coin| coin.address == *address);
+        assert_eq!(named, !counted, "{warning}");
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// Anyone can name a wallet in an escrow, at the cost of fees. Past its
+/// limit an escrow scan keeps the largest, in scan order, warns how many it
+/// left out, and goes on.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn an_escrow_scan_past_its_limit_keeps_the_largest() {
+    let keys = sntrup761::Sntrup761KeyPair::generate();
+    let wallet = Arc::new(
+        RecipientWallet::from_keys(
+            &[31; 32],
+            &quil_execution::domains::QUIL_TOKEN,
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap(),
+    );
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let mut escrows: Vec<_> = [5, 11, 7, 13, 9]
+        .into_iter()
+        .map(|amount| open_escrow(&store, &wallet, &authority, amount))
+        .collect();
+    escrows.sort();
+    let listed = Listed {
+        network: wallet.network,
+        root: Vec::new(),
+        coins: Vec::new(),
+        escrows,
+        tail: 0,
+    };
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(store)
+        .with_coin_witness_provider(Arc::new(listed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let (kept, left_out) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), 4, 2),
+    )
+    .await
+    .expect("skipped coins: an escrow scan past its limit goes on");
+    let mut amounts: Vec<u128> = kept.iter().map(|escrow| *escrow.1).collect();
+    amounts.sort();
+    assert_eq!(
+        amounts,
+        [11, 13],
+        "skipped coins: past the limit the largest escrows are kept"
+    );
+    assert!(kept.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(kept.iter().all(|escrow| !escrow.2 && escrow.3 == 100));
+    assert_eq!(left_out.limited, 3);
+    let warnings: Vec<String> = std::iter::from_fn(|| lines.try_recv().ok())
+        .filter(|line| line.starts_with("warning:"))
+        .collect();
+    let expected = "warning: left out 3 of 5 unconsumed escrow(s) naming this wallet: past the \
+                    limit of 2 the scan keeps those this wallet can act on now, then the \
+                    largest; a larger --max-escrows lists more";
+    assert_eq!(warnings, [expected]);
+    // Within the limit it keeps them all, without a warning.
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let (all, left_out) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), 4, 5),
+    )
+    .await
+    .unwrap();
+    assert_eq!((all.len(), left_out.limited), (5, 0));
+    assert!(std::iter::from_fn(|| lines.try_recv().ok()).all(|line| !line.starts_with("warning:")));
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A scan's warnings: one line per kind of skipped coin, each counting
+/// every coin of its kind and naming the first four.
+#[test]
+fn scan_warnings_count_every_skipped_coin_and_name_the_first_four() {
+    let mut report = ScanReport::default();
+    assert!(report.warnings().is_empty());
+    for n in 1..=6 {
+        report.skip_mismatched([n; 32]);
+    }
+    report.skip_duplicate([9; 32]);
+    let named = |of: &[u8]| {
+        of.iter()
+            .map(|n| format!("0x{}", hex::encode([*n; 32])))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mismatched = format!(
+        "warning: skipped 6 coin(s) whose memo opens for this wallet but does not match the \
+         coin's amount or owner; they are not in the balance and are never spent: {}, ...",
+        named(&[1, 2, 3, 4])
+    );
+    let duplicate = format!(
+        "warning: skipped 1 coin(s) sharing a spend image with another coin of this wallet; \
+         only one coin per image can be spent, so the balance counts the largest: {}",
+        named(&[9])
+    );
+    assert_eq!(
+        report.warnings(),
+        [mismatched, duplicate],
+        "skipped coins: one warning per kind, naming the first four"
+    );
+    let line = report.line(std::time::Duration::ZERO);
+    assert!(line.ends_with(", 7 skipped"), "{line}");
+}
+
+/// A wallet for the scan tests, on a test network's QUIL.
+#[cfg(feature = "native-proof")]
+fn scan_wallet() -> Arc<RecipientWallet> {
+    let keys = sntrup761::Sntrup761KeyPair::generate();
+    Arc::new(
+        RecipientWallet::from_keys(
+            &[31; 32],
+            &quil_execution::domains::QUIL_TOKEN,
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap(),
+    )
+}
+
+/// `listed` served over loopback with `store`, the node reporting GLOBAL
+/// head `head`: a client and the node's shutdown.
+#[cfg(feature = "native-proof")]
+async fn serve_listed(
+    listed: impl quil_types::store::CoinWitnessProvider + 'static,
+    store: Arc<quil_hypergraph::testing::MemStore>,
+    head: u64,
+) -> (
+    quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(store)
+        .with_coin_witness_provider(Arc::new(listed));
+    server
+        .last_global_head_frame
+        .store(head, std::sync::atomic::Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    (client, stop, serving)
+}
+
+/// The warning lines a captured run printed.
+#[cfg(feature = "native-proof")]
+fn warning_lines(lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| lines.try_recv().ok())
+        .filter(|line| line.starts_with("warning:"))
+        .collect()
+}
+
+/// A/B reproducer: a scan's pages hold every coin or escrow of the
+/// application, nearly all of them other users', so a page budget let
+/// anyone end every scan for fees: by default 2,048 pages (131,072 coins
+/// at 64 a page). With no default cap, a coin scan and an escrow scan read
+/// past that many pages. Empty pages stand in for full ones: a node
+/// gathers eight reads per page, and a budget counted pages either way.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_default_scan_reads_past_the_old_page_budget() {
+    use clap::Parser;
+    use quil_lattice_ct::confidential::memo::create_output;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        token: super::super::TokenArgs,
+    }
+    let defaults = Cli::try_parse_from(["qclient", "balance"]).unwrap().token;
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let escrow = open_escrow(&store, &wallet, &authority, 7);
+    let coin = create_output(&wallet.context, wallet.address(), 5)
+        .unwrap()
+        .output;
+    let mut listed = listed(&wallet, vec![(1, coin)], vec![escrow]);
+    let pages = 2_048 + 8;
+    listed.tail = pages * 8;
+    let (client, stop, serving) = serve_listed(listed, store, 0).await;
+    let (escrows, _) = wallet
+        .clone()
+        .scan_escrows(
+            &client,
+            authority.to_vec(),
+            defaults.page_cap(),
+            defaults.max_coins,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "skipped coins: none, but a default escrow scan of {pages} pages stopped: {error}"
+            )
+        });
+    assert_eq!(escrows.len(), 1);
+    assert_eq!(*escrows[0].1, 7);
+    let coins = wallet
+        .clone()
+        .scan_unspent(&client, defaults.page_cap(), defaults.max_coins)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("skipped coins: none, but a default coin scan of {pages} pages stopped: {error}")
+        });
+    assert_eq!(coins.len(), 1);
+    assert_eq!(*coins[0].amount, 5);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// Anyone can name a wallet's key as an escrow's refund, with a far refund
+/// frame, and claim the escrow back at will: such an escrow costs its
+/// creator only fees. Past its limit an escrow scan keeps first the
+/// escrows the wallet can act on now (its recipient branch, or its refund
+/// branch from the refund frame), then the largest, so larger escrows of
+/// that kind do not push the wallet's incoming transfers out.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn an_escrow_scan_keeps_what_the_wallet_can_act_on_first() {
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let mut escrows = vec![
+        open_escrow(&store, &wallet, &authority, 5),
+        refund_escrow(&store, &wallet, &authority, 3, 400),
+    ];
+    for amount in 100..104 {
+        let far = 1_000_000;
+        escrows.push(refund_escrow(&store, &wallet, &authority, amount, far));
+    }
+    escrows.sort();
+    let listed = Listed {
+        network: wallet.network,
+        root: Vec::new(),
+        coins: Vec::new(),
+        escrows,
+        tail: 0,
+    };
+    let (client, stop, serving) = serve_listed(listed, store, 500).await;
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let (kept, left_out) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), 4, 3),
+    )
+    .await
+    .expect("skipped coins: an escrow scan past its limit goes on");
+    let mut amounts: Vec<(u128, bool)> = kept.iter().map(|escrow| (*escrow.1, escrow.2)).collect();
+    amounts.sort();
+    assert_eq!(
+        amounts,
+        [(3, true), (5, false), (103, true)],
+        "skipped coins: past the limit the escrows this wallet can act on now are kept first"
+    );
+    assert!(kept.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(left_out.limited, 3);
+    let expected = "warning: left out 3 of 6 unconsumed escrow(s) naming this wallet: past the \
+                    limit of 3 the scan keeps those this wallet can act on now, then the \
+                    largest; a larger --max-escrows lists more";
+    assert_eq!(warning_lines(&mut lines), [expected]);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// An escrow's creator chooses its memo, which no verifier can open: one
+/// that opens for the wallet but does not match the escrow can be neither
+/// accepted nor refunded. The scan counts it and warns, as it does for
+/// such a coin, and lists the others.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn an_escrow_whose_memo_does_not_match_is_counted() {
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let mut escrows = vec![
+        open_escrow(&store, &wallet, &authority, 7),
+        mismatched_escrow(&store, &wallet, &authority, 9),
+    ];
+    escrows.sort();
+    let listed = Listed {
+        network: wallet.network,
+        root: Vec::new(),
+        coins: Vec::new(),
+        escrows,
+        tail: 0,
+    };
+    let (client, stop, serving) = serve_listed(listed, store, 0).await;
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let (kept, skipped) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), 4, 4),
+    )
+    .await
+    .unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(*kept[0].1, 7);
+    assert_eq!(
+        skipped.mismatched, 1,
+        "skipped coins: an escrow whose memo does not match is counted"
+    );
+    assert_eq!(skipped.limited, 0);
+    let expected = "warning: skipped 1 unconsumed escrow(s) naming this wallet whose memo opens \
+                    for it but does not match the escrow; this wallet can neither accept nor \
+                    refund them";
+    assert_eq!(warning_lines(&mut lines), [expected]);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A node can fail to deliver a page, as when a transfer is cut, and a
+/// scan can last an hour: an escrow scan asks again for such a page, as a
+/// coin scan does, and goes on from its cursor rather than losing the whole
+/// read. The first cut read only ends the node's gathering of page 1; the
+/// second fails the first asking of page 2.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn an_escrow_scan_asks_again_for_a_page_the_node_could_not_deliver() {
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let failing = Failing {
+        listed: Listed {
+            network: wallet.network,
+            root: Vec::new(),
+            coins: Vec::new(),
+            escrows: vec![open_escrow(&store, &wallet, &authority, 7)],
+            tail: 1,
+        },
+        cut_escrow_reads: std::sync::atomic::AtomicUsize::new(2),
+        expired_coins: false,
+        expired_escrows: false,
+    };
+    let (client, stop, serving) = serve_listed(failing, store, 0).await;
+    let (kept, _) = wallet
+        .clone()
+        .scan_escrows(&client, authority.to_vec(), 4, 4)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "skipped coins: none, but an escrow scan stopped at one transient page error: \
+                 {error}"
+            )
+        });
+    assert_eq!(kept.len(), 1);
+    assert_eq!(*kept[0].1, 7);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// What an escrow scan with a limit of one keeps, as `(amount, refund
+/// branch)`, of an incoming 5 and a refund of 9 from GLOBAL frame
+/// `refund_after`, at head 500. With `no_head` the node refuses the scan's
+/// read of the head: a scan within the limit, which reads no head, counts
+/// the calls before it, and the node refuses the limited scan's next one.
+#[cfg(feature = "native-proof")]
+#[allow(clippy::result_large_err)] // tonic's interceptor returns its Status by value
+async fn due_refund_or_incoming(refund_after: u64, no_head: bool) -> Vec<(u128, bool)> {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let mut escrows = vec![
+        open_escrow(&store, &wallet, &authority, 5),
+        refund_escrow(&store, &wallet, &authority, 9, refund_after),
+    ];
+    escrows.sort();
+    let listed = Listed {
+        network: wallet.network,
+        root: Vec::new(),
+        coins: Vec::new(),
+        escrows,
+        tail: 0,
+    };
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(store)
+        .with_coin_witness_provider(Arc::new(listed));
+    server.last_global_head_frame.store(500, SeqCst);
+    let calls = Arc::new(AtomicUsize::new(0));
+    // The call the node refuses, counted from one; none while zero.
+    let refused = Arc::new(AtomicUsize::new(0));
+    let (seen, refuse) = (calls.clone(), refused.clone());
+    let service = quil_types::proto::node::node_service_server::NodeServiceServer::with_interceptor(
+        server,
+        move |request: tonic::Request<()>| {
+            if seen.fetch_add(1, SeqCst) + 1 == refuse.load(SeqCst) {
+                Err(tonic::Status::unavailable(
+                    "this node reports no GLOBAL head",
+                ))
+            } else {
+                Ok(request)
+            }
+        },
+    );
+    let (listener, multiaddr) = bind_loopback().await;
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(socket, _)| socket);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let client = client_at(&multiaddr).await;
+    let (all, _) = wallet
+        .clone()
+        .scan_escrows(&client, authority.to_vec(), 4, 2)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let before_head = calls.load(SeqCst);
+    let head_read = 2 * before_head + 1;
+    if no_head {
+        refused.store(head_read, SeqCst);
+    }
+    let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+    let (kept, left_out) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), 4, 1),
+    )
+    .await
+    .expect("skipped coins: an escrow scan past its limit goes on");
+    assert_eq!(left_out.limited, 1);
+    assert_eq!(calls.load(SeqCst), head_read, "the head was read last");
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    kept.iter().map(|escrow| (*escrow.1, escrow.2)).collect()
+}
+
+/// Execution admits a refund from its refund frame on, so a refund branch
+/// is one the wallet can act on from that frame: at GLOBAL head 500 a
+/// refund from frame 500 ranks with the incoming transfers and, larger,
+/// is kept; one from frame 501 ranks after them.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_refund_is_actionable_from_its_refund_frame() {
+    assert_eq!(
+        due_refund_or_incoming(500, false).await,
+        [(9, true)],
+        "skipped coins: a refund at its refund frame is one the wallet can act on"
+    );
+    assert_eq!(due_refund_or_incoming(501, false).await, [(5, false)]);
+}
+
+/// Without a GLOBAL head (the node's info read fails), no refund ranks as
+/// one the wallet can act on: the scan goes on and keeps the incoming
+/// transfers first. With the head read, the same node's refund from frame
+/// 400 is kept.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn without_a_global_head_refunds_rank_after_incoming_transfers() {
+    assert_eq!(due_refund_or_incoming(400, false).await, [(9, true)]);
+    assert_eq!(
+        due_refund_or_incoming(400, true).await,
+        [(5, false)],
+        "skipped coins: without a GLOBAL head the incoming transfer is kept first"
+    );
+}
+
+/// A/B reproducer: a bundle payment (`deploy`, a paid write) scans the
+/// payer's coins with the page cap a balance scan has: none by default. A
+/// budget of 128 pages ended every payment once the network held more
+/// than 8,192 coins (128 full pages of 64), which anyone can send for
+/// fees. The payment runs through `pay_for_bundle` against a node whose
+/// coins take more than 128 pages, and the payer holds 1 base unit: past
+/// its scan the payment fails for funds, not for its page count. Empty
+/// pages stand in for full ones.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_bundle_payment_scans_past_page_128() {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let directory = tempfile::tempdir().unwrap();
+    let key_manager = Arc::new(
+        quil_keys::FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            &hex::encode([9; 32]),
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap(),
+    );
+    key_manager.create_agreement_key("q-onion-key", 9).unwrap();
+    let (listener, multiaddr) = bind_loopback().await;
+    let opts = crate::rpc::ConnectOpts {
+        listen_grpc_multiaddr: multiaddr,
+        ..Default::default()
+    };
+    let tc = TokenCtx {
+        node_config: quil_config::Config::default(),
+        config_dir: directory.path().to_path_buf(),
+        key_manager: key_manager.clone(),
+        connect_opts: opts.clone(),
+        submit_opts: opts,
+        submit_key_manager: key_manager,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
+        peer_id_bytes: Vec::new(),
+        read_flags: Vec::new(),
+        max_fee: u128::MAX,
+    };
+    let network = quote_network();
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let wallet = RecipientWallet::load(&tc, &network, &application).unwrap();
+    let coin = create_output(&wallet.context, wallet.address(), 1)
+        .unwrap()
+        .output;
+    let mut listed = listed(&wallet, vec![(1, coin)], Vec::new());
+    // Pages of eight reads, past 128 pages.
+    listed.tail = (128 + 8) * 8;
+    let server = quoting_node()
+        .with_hypergraph_store(Arc::new(quil_hypergraph::testing::MemStore::new()))
+        .with_coin_witness_provider(Arc::new(listed));
+    let (stop, serving) = serve_node(listener, server);
+    let rest = quil_execution::message_envelope::CanonicalMessageBundle {
+        requests: vec![None],
+        timestamp: 0,
+    };
+    let payment = pay_for_bundle(&tc, [0x42; 32], &rest, None, std::time::Duration::ZERO);
+    let error = Box::pin(payment)
+        .await
+        .expect_err("the payer holds 1 base unit")
+        .to_string();
+    assert!(
+        error.contains("insufficient node-reported unspent funds"),
+        "skipped coins: none, but the payment stopped before its scan read every page: {error}"
+    );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A node can answer a page that holds no coin: `recover_page` returns at
+/// once for it, without deriving the keys that open a coin and give its
+/// spend image.
+#[cfg(feature = "native-proof")]
+#[test]
+fn an_empty_scan_page_derives_no_key() {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let wallet = scan_wallet();
+    let derived = || KEY_DERIVATIONS.with(std::cell::Cell::get);
+    let before = derived();
+    let (owned, mismatched) = wallet.recover_page(Vec::new()).unwrap();
+    assert!(owned.is_empty() && mismatched.is_empty());
+    assert_eq!(
+        derived(),
+        before,
+        "a page holding no coin derived the wallet's keys"
+    );
+    let output = create_output(&wallet.context, wallet.address(), 3)
+        .unwrap()
+        .output;
+    let (owned, _) = wallet.recover_page(vec![([1; 32], output)]).unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(
+        derived(),
+        before + 1,
+        "a page holding a coin derives the keys once"
+    );
+}
+
+/// The node releases a scan's snapshot an hour after the scan starts. A
+/// scan stopped by that says so, and that running it again on that node
+/// fails the same way; one whose snapshot went sooner (left idle, a node
+/// restart) or whose pin was lost says to run it again.
+#[test]
+fn a_scan_that_outlives_its_snapshot_says_why() {
+    const EXPIRED: &str = "coin scan snapshot unavailable or expired; restart scan";
+    const UNPINNED: &str = "the peer serving this scan is no longer pinned; restart the scan";
+    let status = |message: &str| anyhow::Error::from(tonic::Status::not_found(message));
+    let report = ScanReport {
+        pages: 9,
+        coins: 576,
+        ..Default::default()
+    };
+    let hour = report
+        .stopped(status(EXPIRED), SCAN_SNAPSHOT_MAX_AGE)
+        .to_string();
+    assert!(
+        hour.starts_with("scan stopped at page 10 after 576 coins in 9 pages and 60 min: "),
+        "{hour}"
+    );
+    assert!(hour.contains("fails the same way"), "{hour}");
+    let sooner = report
+        .stopped(status(EXPIRED), SCAN_SNAPSHOT_MAX_AGE / 2)
+        .to_string();
+    assert!(sooner.ends_with("run it again"), "{sooner}");
+    let unpinned = report
+        .stopped(status(UNPINNED), SCAN_SNAPSHOT_MAX_AGE)
+        .to_string();
+    assert!(unpinned.ends_with("run it again"), "{unpinned}");
+}
+
+/// A scan of the whole application can take up to the hour the node keeps
+/// its snapshot, so a coin or escrow scan that goes on prints how far it
+/// got every 64 pages. Empty pages stand in for full ones.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_long_scan_reports_its_progress() {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let escrow = open_escrow(&store, &wallet, &authority, 7);
+    let coin = create_output(&wallet.context, wallet.address(), 5)
+        .unwrap()
+        .output;
+    let mut listed = listed(&wallet, vec![(1, coin)], vec![escrow]);
+    // Pages of eight reads, past 128 pages.
+    listed.tail = (128 + 8) * 8;
+    let (client, stop, serving) = serve_listed(listed, store, 0).await;
+    let uncapped = super::super::SCAN_PAGES_UNCAPPED;
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let coins = crate::commands::token::output::capture(
+        notes.clone(),
+        wallet.clone().scan_unspent(&client, uncapped, 4),
+    )
+    .await
+    .unwrap();
+    assert_eq!(coins.len(), 1);
+    let (escrows, _) = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_escrows(&client, authority.to_vec(), uncapped, 4),
+    )
+    .await
+    .unwrap();
+    assert_eq!(escrows.len(), 1);
+    let lines: Vec<String> = std::iter::from_fn(|| lines.try_recv().ok()).collect();
+    for expected in [
+        "confidential scan: 64 pages, 1 coins in ",
+        "confidential scan: 128 pages, 1 coins in ",
+        "confidential scan: 64 pages, 1 escrows in ",
+        "confidential scan: 128 pages, 1 escrows in ",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.starts_with(expected)),
+            "skipped coins: none, but no progress line {expected:?}: {lines:?}"
+        );
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// The error of a coin scan, or with `escrows` an escrow scan, begun the
+/// hour the node keeps its snapshot ago, whose page 2 finds the snapshot
+/// released: as the scan's own call sites report it.
+#[cfg(feature = "native-proof")]
+async fn outlived_scan(escrows: bool) -> anyhow::Error {
+    use quil_lattice_ct::confidential::memo::create_output;
+    let wallet = scan_wallet();
+    let authority = [22; 897];
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let escrow = open_escrow(&store, &wallet, &authority, 7);
+    let coin = create_output(&wallet.context, wallet.address(), 5)
+        .unwrap()
+        .output;
+    let mut listed = listed(&wallet, vec![(1, coin)], vec![escrow]);
+    listed.tail = 1;
+    let failing = Failing {
+        listed,
+        cut_escrow_reads: Default::default(),
+        expired_coins: !escrows,
+        expired_escrows: escrows,
+    };
+    let (client, stop, serving) = serve_listed(failing, store, 0).await;
+    scans_begin_ago(SCAN_SNAPSHOT_MAX_AGE);
+    let error = if escrows {
+        wallet
+            .scan_escrows(&client, authority.to_vec(), 4, 4)
+            .await
+            .err()
+    } else {
+        wallet.scan_unspent(&client, 4, 4).await.err()
+    };
+    scans_begin_ago(std::time::Duration::ZERO);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    error.expect("page 2 finds the snapshot released")
+}
+
+/// The node releases a scan's snapshot an hour after the scan starts. A
+/// coin scan stopped by that says so from the time it ran: given no time,
+/// it would say to run it again, which stops the same way.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_coin_scan_stopped_by_its_snapshot_hour_says_so() {
+    let error = outlived_scan(false).await;
+    let stopped = error
+        .downcast_ref::<ScanStopped>()
+        .unwrap_or_else(|| panic!("the coin scan's error is the node's bare one: {error:#}"));
+    assert_eq!(
+        stopped.outlived(),
+        Some(60),
+        "the coin scan's error says to run it again: {error}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.starts_with("scan stopped at page 2 after 1 coins in 1 pages and 60 min: "),
+        "{text}"
+    );
+}
+
+/// An escrow scan stopped by the node's snapshot hour says so, as a coin
+/// scan does: its page errors are the scan's, from the time it ran.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn an_escrow_scan_stopped_by_its_snapshot_hour_says_so() {
+    let error = outlived_scan(true).await;
+    let stopped = error
+        .downcast_ref::<ScanStopped>()
+        .unwrap_or_else(|| panic!("the escrow scan's error is the node's bare one: {error:#}"));
+    assert_eq!(
+        stopped.outlived(),
+        Some(60),
+        "the escrow scan's error says to run it again: {error}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.starts_with("scan stopped at page 2 after 1 escrows in 1 pages and 60 min: "),
+        "{text}"
+    );
+}
+
+/// `token split` and `token merge` name their coins. One the scan left out
+/// is refused with the reason and what to do: past the coin limit (a
+/// larger --max-coins), a second coin of a spend image, or a memo that
+/// does not match; not as an unknown coin.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_named_coin_the_scan_left_out_is_refused_with_why() {
+    use quil_execution::token_intrinsic::state;
+    use quil_lattice_ct::confidential::memo::create_output;
+    let wallet = scan_wallet();
+    let output = |amount| {
+        create_output(&wallet.context, wallet.address(), amount)
+            .unwrap()
+            .output
+    };
+    let address = |frame, output: &Output| {
+        state::coin_identity(&wallet.context, frame, output)
+            .unwrap()
+            .0
+    };
+    let (twenty, six, three) = (output(20), output(6), output(3));
+    let mismatched = mismatched_output(&wallet, 5);
+    let (twenty_at, six_at, again_at, three_at, mismatched_at) = (
+        address(1, &twenty),
+        address(1, &six),
+        address(2, &six),
+        address(1, &three),
+        address(1, &mismatched),
+    );
+    let listed = listed(
+        &wallet,
+        vec![
+            (1, twenty),
+            (1, six.clone()),
+            (2, six),
+            (1, mismatched),
+            (1, three),
+        ],
+        Vec::new(),
+    );
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let (client, stop, serving) = serve_listed(listed, store, 0).await;
+    let refused = |named: Vec<[u8; 32]>| {
+        let wallet = wallet.clone();
+        let client = client.clone();
+        async move {
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            match crate::commands::token::output::capture(
+                notes,
+                wallet.scan_spendable_named(&client, 4, 2, &named),
+            )
+            .await
+            {
+                Ok(coins) => format!("kept {}", coins.len()),
+                Err(error) => error.to_string(),
+            }
+        }
+    };
+    let coin = |address: &[u8; 32]| format!("coin 0x{}", hex::encode(address));
+    let past_limit = refused(vec![twenty_at, three_at]).await;
+    assert_eq!(
+        past_limit,
+        format!(
+            "{} is past this scan's coin limit, which keeps the largest coins; run again with a \
+             larger --max-coins",
+            coin(&three_at)
+        ),
+        "skipped coins: a named coin past the limit is refused with why"
+    );
+    assert_eq!(
+        refused(vec![again_at]).await,
+        format!(
+            "{} shares a spend image with another coin of this wallet, which the scan kept and \
+             `token coins` lists; only one coin per image can be spent",
+            coin(&again_at)
+        ),
+        "skipped coins: a named second coin of an image is refused with why"
+    );
+    assert_eq!(
+        refused(vec![mismatched_at]).await,
+        format!(
+            "{} has a memo that opens for this wallet but does not match the coin; it can never \
+             be spent",
+            coin(&mismatched_at)
+        ),
+        "skipped coins: a named coin whose memo does not match is refused with why"
+    );
+    assert_eq!(
+        refused(vec![[9; 32]]).await,
+        format!("{} is not an unspent coin of this wallet", coin(&[9; 32]))
+    );
+    assert_eq!(
+        refused(vec![twenty_at, twenty_at]).await,
+        format!("{} is named twice", coin(&twenty_at))
+    );
+    assert_eq!(refused(vec![twenty_at, six_at]).await, "kept 2");
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// Past twice its limit a scan trims what it holds to the limit and goes
+/// on; a coin of a kept coin's spend image met after the trim must still
+/// find that coin. Here coins of 1, 9, 8 and 2 come first, in address
+/// order, and the trim at four keeps the 9 and the 8; then a 20 on the
+/// 9's image replaces the 9. A spend scan's witnesses then cover the 20.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_coin_scan_trimmed_mid_scan_keeps_one_coin_per_image() {
+    use quil_execution::token_intrinsic::state;
+    use quil_lattice_ct::confidential::memo::{create_output, create_output_with_nonce};
+    let wallet = scan_wallet();
+    let outputs = [
+        create_output(&wallet.context, wallet.address(), 1),
+        create_output_with_nonce(&wallet.context, wallet.address(), 9, &[5; 32]),
+        create_output(&wallet.context, wallet.address(), 8),
+        create_output(&wallet.context, wallet.address(), 2),
+        create_output_with_nonce(&wallet.context, wallet.address(), 20, &[5; 32]),
+    ]
+    .map(|created| created.unwrap().output);
+    // A coin's address hashes its frame: give each the frame placing it
+    // lowest above the one before, so the scan meets them in this order.
+    let mut previous = [0; 32];
+    let placed: Vec<(u64, Output, [u8; 32])> = outputs
+        .into_iter()
+        .map(|output| {
+            let (address, frame) = (1..=64)
+                .map(|frame| {
+                    (
+                        state::coin_identity(&wallet.context, frame, &output)
+                            .unwrap()
+                            .0,
+                        frame,
+                    )
+                })
+                .filter(|(address, _)| *address > previous)
+                .min()
+                .expect("a frame places the coin after the one before");
+            previous = address;
+            (frame, output, address)
+        })
+        .collect();
+    let replacing = placed[4].2;
+    let listed = listed(
+        &wallet,
+        placed
+            .iter()
+            .map(|(frame, output, _)| (*frame, output.clone()))
+            .collect(),
+        Vec::new(),
+    );
+    assert_eq!(
+        listed.coins.iter().map(|coin| coin.0).collect::<Vec<_>>(),
+        placed.iter().map(|coin| coin.2).collect::<Vec<_>>()
+    );
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let (client, stop, serving) = serve_listed(listed, store, 0).await;
+    let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+    let kept = crate::commands::token::output::capture(
+        notes,
+        wallet
+            .clone()
+            .scan_unspent_or_rootless(&client, 4, 2, &mut ScanReport::default()),
+    )
+    .await
+    .expect("skipped coins: a scan past its coin limit goes on")
+    .unwrap();
+    let mut amounts: Vec<u128> = kept.iter().map(|coin| *coin.amount).collect();
+    amounts.sort();
+    assert_eq!(
+        amounts,
+        [8, 20],
+        "skipped coins: after a trim the scan keeps one coin per spend image, the largest"
+    );
+    let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+    let spendable = crate::commands::token::output::capture(
+        notes,
+        wallet.clone().scan_spendable(&client, 4, 2),
+    )
+    .await
+    .unwrap();
+    assert!(spendable.iter().any(|coin| coin.address == replacing));
+    let witnessed = wallet
+        .prepared
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|scan| scan.owned.contains_key(&replacing));
+    assert!(
+        witnessed,
+        "skipped coins: the spend scan keeps the witness of a coin that replaced another of its \
+         image"
+    );
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
@@ -566,7 +2359,8 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
         .clone()
         .scan_escrows(&client, vec![22; 897], 2, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         (
             recipient[0].0,
@@ -580,13 +2374,15 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
         .clone()
         .scan_escrows(&client, vec![23; 897], 2, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!((refund[0].0, *refund[0].1, refund[0].2), (address, 7, true));
     assert!(wallet
         .clone()
         .scan_escrows(&client, vec![24; 897], 2, 1)
         .await
         .unwrap()
+        .0
         .is_empty());
     // One page carries the empty first page and the escrow behind it: the
     // node gathers both into the page of up to 64 the wallet asks for.
@@ -594,7 +2390,8 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
         .clone()
         .scan_escrows(&client, vec![22; 897], 1, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(one_page.len(), 1);
     // Consumption is the global commit's: the GLOBAL escrow record flips.
     let mut consumed_vertex = global.to_vec();
@@ -615,12 +2412,14 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
         .scan_escrows(&client, vec![22; 897], 2, 1)
         .await
         .unwrap()
+        .0
         .is_empty());
     assert!(wallet
         .clone()
         .scan_escrows(&client, vec![23; 897], 2, 1)
         .await
         .unwrap()
+        .0
         .is_empty());
     // A malformed record fails the scan rather than reading as open.
     store
@@ -1174,12 +2973,7 @@ async fn a_default_wallet_scan_finds_its_coin_behind_the_old_page_budget() {
         .scan_unspent(&client, pages, defaults.max_coins)
         .await
         .unwrap_or_else(|error| {
-            panic!(
-                "a scan of {pages} pages must reach the wallet's coin behind {others} \
-                 others, as a default scan ({} pages) must behind {}: {error}",
-                defaults.max_pages,
-                defaults.max_pages * 8
-            )
+            panic!("a scan of {pages} pages must reach the wallet's coin behind {others}: {error}")
         });
     assert_eq!(unspent.len(), 1);
     assert_eq!(unspent[0].address, my_address);
@@ -1588,12 +3382,36 @@ impl ReportedCoins {
         Self::with_other(wallet, None, early, late, report)
     }
 
+    /// [`Self::new`] without late coins, plus one early coin after the
+    /// wallet's in the first early coin's block, whose owner is not a
+    /// canonical identity: GLOBAL committed it, and every tree over the
+    /// committed coins burns it (its position holds the empty leaf). Its
+    /// memo opens for another wallet.
+    fn with_burned(
+        wallet: &RecipientWallet,
+        early: usize,
+        report: bool,
+    ) -> (Self, Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        Self::build(wallet, None, true, early, &[], report)
+    }
+
     /// [`Self::new`], plus four early coins of `other` after the wallet's
     /// in staging order: one in the first early coin's block, two in a block
     /// no coin of the wallet is in and one alone in a third block.
     fn with_other(
         wallet: &RecipientWallet,
         other: Option<&RecipientWallet>,
+        early: usize,
+        late: &[usize],
+        report: bool,
+    ) -> (Self, Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        Self::build(wallet, other, false, early, late, report)
+    }
+
+    fn build(
+        wallet: &RecipientWallet,
+        other: Option<&RecipientWallet>,
+        burned: bool,
         early: usize,
         late: &[usize],
         report: bool,
@@ -1664,7 +3482,8 @@ impl ReportedCoins {
                     .unwrap();
                 addresses.push(address);
             }
-            roots::refresh_root(&hypergraph, &network, &application, limits).unwrap();
+            roots::refresh_root(&hypergraph, &network, &application, limits)
+                .expect("the staged coins fold");
             addresses
         };
         // Early coins in at least two blocks, so inputs come from different
@@ -1704,6 +3523,27 @@ impl ReportedCoins {
                     outputs.push(draw(other, 1, Some(block)));
                 }
             }
+        }
+        if burned {
+            let keys = sntrup761::Sntrup761KeyPair::generate();
+            let stranger = RecipientWallet::from_keys(
+                &network,
+                &application,
+                &keys.public,
+                Zeroizing::new(keys.secret),
+            )
+            .unwrap();
+            let block = block_of(&first);
+            let coin = (0..4096)
+                .map(|_| Output {
+                    owner: [0xff; IDENTITY_BYTES],
+                    ..draw(&stranger, 1, None)
+                })
+                .find(|output| {
+                    block_of(&state::coin_identity(&wallet.context, 1, output).unwrap().0) == block
+                })
+                .expect("a burned coin in the first early coin's block");
+            outputs.push(coin);
         }
         let staged = outputs.len();
         let early_addresses = stage(1, outputs);
@@ -2166,6 +4006,83 @@ async fn spend_witnesses_come_from_the_selection_scan() {
     );
     stop.send(()).unwrap();
     serving.await.unwrap();
+}
+
+/// A coin GLOBAL committed with an owner that is not a canonical identity is
+/// burned: every tree over the committed coins takes its position as the
+/// empty leaf. Anyone can place one beside a wallet's coin, so the wallet
+/// must place it as the chain does and still prove its own coin under the
+/// same subtree against the canonical root, from a full rescan and from the
+/// selection scan, with the shards' reports and without them.
+#[tokio::test]
+async fn spend_witnesses_place_a_burned_coin_as_the_chain_does() {
+    use quil_lattice_ct::confidential::relation::membership::Node;
+    use std::sync::atomic::Ordering::SeqCst;
+    for report in [true, false] {
+        let wallet = witness_wallet();
+        let (fixture, early, _) = ReportedCoins::with_burned(&wallet, 3, report);
+        let burned: Vec<[u8; 32]> = fixture
+            .coins
+            .iter()
+            .filter(|(_, output, ..)| Node::from_identity_bytes(&output.owner).is_err())
+            .map(|(address, ..)| *address)
+            .collect();
+        assert_eq!(burned.len(), 1, "one coin with a non-canonical owner");
+        assert_eq!(
+            ReportedCoins::block(&burned[0]),
+            ReportedCoins::block(&early[0]),
+            "the burned coin shares a block with the wallet's coin"
+        );
+        let provider = Arc::new(RecordingCoins::new(&wallet, &fixture));
+        let (client, stop, serving) = witness_client(&fixture, provider.clone()).await;
+        let expected = provider.tree.auth_path(&early[0]).unwrap();
+        let coin = fixture.output(&early[0]);
+        let selected = [(early[0], &coin)];
+        let (root, paths) = wallet
+            .witnesses(&client, &selected)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a full rescan refused the spend (reported: {report}): {error:#}")
+            });
+        assert!(
+            root == fixture.root,
+            "the rescan's root is not the canonical root"
+        );
+        assert!(
+            paths[0].siblings == expected.siblings && paths[0].right == expected.right,
+            "the rescan's path is not the whole tree's (reported: {report})"
+        );
+        let owned = wallet
+            .clone()
+            .scan_spendable(&client, 64, 16)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the selection scan refused the spend (reported: {report}): {error:#}")
+            });
+        assert_eq!(owned.len(), 3, "the burned coin is not the wallet's");
+        assert!(
+            wallet.prepared.lock().unwrap().is_some(),
+            "the selection scan kept no witnesses (reported: {report})"
+        );
+        let scanned = provider.pages.load(SeqCst);
+        let (root, paths) = wallet.witnesses(&client, &selected).await.unwrap();
+        assert_eq!(
+            provider.pages.load(SeqCst),
+            scanned,
+            "the spend scanned the coins again for its witnesses"
+        );
+        assert!(
+            root == fixture.root,
+            "the selection scan's root is not the canonical root"
+        );
+        assert!(
+            paths[0].siblings == expected.siblings && paths[0].right == expected.right,
+            "the selection scan's path is not the whole tree's (reported: {report})"
+        );
+        assert!(provider.named.lock().unwrap().is_empty());
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
 }
 
 // ---- Retries after proving: the call sites, against a node that fails ----

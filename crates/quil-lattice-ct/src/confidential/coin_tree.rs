@@ -205,6 +205,30 @@ fn depth_for(count: u64) -> usize {
     depth
 }
 
+/// The leaf a committed coin takes at its position. A coin whose owner is
+/// not a canonical identity is burned: its position holds the empty leaf, as
+/// an unfilled position does, and nothing can spend it (an ownership proof
+/// needs a canonical owner). Every tree over the same committed coins (a
+/// block's frontier, the sharded tree, a full rebuild) so agrees on it.
+/// GLOBAL can commit such an output from an operation nothing refused;
+/// failing the fold on it instead stops the shard that owns its block, on
+/// every replica, for good.
+pub fn committed_leaf(
+    key: &MembershipKey,
+    owner: &[u8; IDENTITY_BYTES],
+    commitment: &AmountCommitment,
+) -> Node {
+    match Node::from_identity_bytes(owner) {
+        Ok(owner) => key.leaf(&owner, commitment),
+        Err(_) => Node::zero(),
+    }
+}
+
+/// Whether a committed coin with this owner is burned ([`committed_leaf`]).
+pub fn is_burned_owner(owner: &[u8; IDENTITY_BYTES]) -> bool {
+    Node::from_identity_bytes(owner).is_err()
+}
+
 fn zero_nodes(key: &MembershipKey, max_depth: usize) -> Vec<Node> {
     let mut zeros = vec![Node::zero()];
     for level in 0..max_depth {
@@ -278,8 +302,7 @@ impl CoinTree {
         let mut leaves = Vec::with_capacity(coins.len().max(1));
         for &i in &order {
             let coin = &coins[i];
-            let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
-            leaves.push(key.leaf(&owner, &coin.commitment));
+            leaves.push(committed_leaf(&key, &coin.owner, &coin.commitment));
         }
         if leaves.is_empty() {
             leaves.push(zeros[0].clone());
@@ -433,6 +456,8 @@ impl Frontier {
         self.count += 1;
     }
     /// Append the coin at the next position. Capacity is `2^max_depth` leaves.
+    /// A burned coin takes its position with the empty leaf
+    /// ([`committed_leaf`]).
     pub fn append(
         &mut self,
         owner: &[u8; IDENTITY_BYTES],
@@ -441,9 +466,8 @@ impl Frontier {
         if self.count >= (1u64 << self.max_depth) {
             return Err(TreeError::Capacity);
         }
-        let owner = Node::from_identity_bytes(owner).map_err(|_| TreeError::Encoding)?;
         let position = self.count;
-        self.append_leaf(self.key.leaf(&owner, commitment));
+        self.append_leaf(committed_leaf(&self.key, owner, commitment));
         Ok(position)
     }
     /// Append while exposing the newly completed leaf and parent subtrees.
@@ -457,11 +481,10 @@ impl Frontier {
         if self.count >= (1u64 << self.max_depth) {
             return Err(TreeError::Capacity);
         }
-        let owner = Node::from_identity_bytes(owner).map_err(|_| TreeError::Encoding)?;
         let position = self.count;
         let mut nodes = Vec::new();
         self.append_leaf_with(
-            self.key.leaf(&owner, commitment),
+            committed_leaf(&self.key, owner, commitment),
             &mut |level, index, node| {
                 nodes.push(CompletedNode {
                     level,
@@ -569,6 +592,49 @@ mod tests {
             })
             .collect()
     }
+    /// A committed coin whose owner is not a canonical identity is burned.
+    /// The frontier, the full tree and a shard's sparse fold all take its
+    /// position as the empty leaf: the same root as the position left empty.
+    #[test]
+    fn a_noncanonical_owner_is_burned_as_the_empty_leaf_in_every_tree() {
+        use super::super::sharded_tree::{subtree_root, Shape};
+        let context = [3; 32];
+        let mut records = coins(3);
+        records[1].owner = [0xff; IDENTITY_BYTES];
+        assert!(is_burned_owner(&records[1].owner));
+        assert!(!is_burned_owner(&records[0].owner));
+        let mut frontier = Frontier::new(&context, 8).unwrap();
+        for coin in &records {
+            assert_eq!(
+                frontier.append(&coin.owner, &coin.commitment).unwrap(),
+                coin.position
+            );
+        }
+        let root = frontier.root_at_depth(8).unwrap();
+        assert_eq!(root.coins, 3);
+        let mut indexed = Frontier::new(&context, 8).unwrap();
+        for coin in &records {
+            indexed
+                .append_with_nodes(&coin.owner, &coin.commitment)
+                .unwrap();
+        }
+        assert_eq!(indexed.root_at_depth(8).unwrap(), root);
+        let tree = CoinTree::build(&context, &records, 8, 100).unwrap();
+        assert_eq!(tree.root_at_depth(8).unwrap(), root);
+        let shape = Shape {
+            shard_bits: 1,
+            subtree_bits: 8,
+        };
+        assert_eq!(subtree_root(&context, shape, &records).unwrap(), root.root);
+        let mut kept = coins(3);
+        kept.remove(1);
+        assert_eq!(
+            subtree_root(&context, shape, &kept).unwrap(),
+            root.root,
+            "a burned position holds what an empty one does"
+        );
+    }
+
     #[test]
     fn indexed_paths_match_full_trees_and_reject_missing_or_corrupt_nodes() {
         use std::collections::BTreeMap;

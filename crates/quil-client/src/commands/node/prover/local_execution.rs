@@ -1,5 +1,5 @@
 //! Display local worker observations without inferring health from allocation.
-use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
+use quil_types::proto::node::{RestartReadiness, SessionSeal, ShardRecovery, WorkerExecution};
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -92,6 +92,49 @@ pub fn age(timestamp: u64) -> String {
         format!("{}s", now_ms().saturating_sub(timestamp) / 1000)
     }
 }
+/// What restarting the node now costs a seat, as one clause, and whether it
+/// warrants a warning color (the seat loses its share or stops its shard).
+/// A verdict this client does not know is shown as the node named it.
+pub fn restart_summary(r: &RestartReadiness) -> (String, bool) {
+    let encode = if r.labels_kept {
+        format!(
+            "resumes from its kept layers, layer {}/{}",
+            r.layers_done, r.layers
+        )
+    } else {
+        "labels not kept, redone from zero".to_string()
+    };
+    match r.verdict.as_str() {
+        "ok" if r.encoding => (
+            format!(
+                "Restart: ok; the storage encode {encode}, adds {} min",
+                r.restart_cost_minutes
+            ),
+            false,
+        ),
+        "ok" => ("Restart: ok".into(), false),
+        "costs_share" => (
+            format!(
+                "Restart: costs this seat's storage share this epoch; the encode {encode}, \
+                 adds {} min, {} min to grace",
+                r.restart_cost_minutes, r.minutes_to_grace
+            ),
+            true,
+        ),
+        "stops_shard" => (
+            format!(
+                "Restart: stops this shard; no spare voter in its committee (margin {})",
+                r.committee_margin.unwrap_or_default()
+            ),
+            true,
+        ),
+        "unknown" => (
+            "Restart: cost unknown; no GLOBAL frame seen yet".into(),
+            false,
+        ),
+        other => (format!("Restart: {other}"), false),
+    }
+}
 pub fn detail(s: Option<&WorkerExecution>) -> String {
     let Some(s) = s else {
         return "Local execution: unknown (node has no worker observations)".into();
@@ -121,6 +164,10 @@ pub fn detail(s: Option<&WorkerExecution>) -> String {
         + &s.seal
             .as_ref()
             .map(|seal| format!("; {}", sealed(seal)))
+            .unwrap_or_default()
+        + &s.restart
+            .as_ref()
+            .map(|r| format!("; {}", restart_summary(r).0))
             .unwrap_or_default()
 }
 /// The session's finalized terminal seal and how far GLOBAL has taken it: a
@@ -238,6 +285,50 @@ mod tests {
         assert!(seal_summary(&seal).contains("awaiting GLOBAL recording"));
         seal.recorded_unix_ms = 2;
         assert!(seal_summary(&seal).contains("recorded by GLOBAL"));
+    }
+    #[test]
+    fn restart_summaries_name_each_verdict_and_warn_only_on_a_loss() {
+        let seat = |verdict: &str| RestartReadiness {
+            verdict: verdict.into(),
+            encoding: true,
+            labels_kept: true,
+            layers_done: 4,
+            layers: 11,
+            restart_cost_minutes: 20,
+            minutes_to_grace: 15,
+            committee_margin: Some(0),
+        };
+        assert_eq!(
+            restart_summary(&seat("ok")),
+            (
+                "Restart: ok; the storage encode resumes from its kept layers, layer 4/11, adds 20 min"
+                    .to_string(),
+                false
+            )
+        );
+        let mut idle = seat("ok");
+        idle.encoding = false;
+        assert_eq!(restart_summary(&idle), ("Restart: ok".to_string(), false));
+        let (costs, warns) = restart_summary(&RestartReadiness {
+            labels_kept: false,
+            ..seat("costs_share")
+        });
+        assert!(
+            warns && costs.contains("labels not kept, redone from zero"),
+            "{costs}"
+        );
+        let (stops, warns) = restart_summary(&seat("stops_shard"));
+        assert!(warns && stops.contains("margin 0"), "{stops}");
+        assert!(!restart_summary(&seat("unknown")).1);
+        assert_eq!(restart_summary(&seat("later")).0, "Restart: later");
+        let text = detail(Some(&WorkerExecution {
+            restart: Some(seat("stops_shard")),
+            ..Default::default()
+        }));
+        assert!(
+            text.ends_with("no spare voter in its committee (margin 0)"),
+            "{text}"
+        );
     }
     #[test]
     fn missing_stale_and_blocked_observations_are_distinct() {

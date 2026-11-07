@@ -344,12 +344,12 @@ async fn render(
     }
     let deadline = tokio::time::Instant::now() + opts.timeout;
     let mut dropped = Vec::new();
-    // One node, shard, reward and legacy answer each.
-    let mut pending = 4;
+    // One node, health, shard, reward and legacy answer each.
+    let mut pending = 5;
     while pending > 0 {
         let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
             eprintln!(
-                "render: {pending} of 4 node answers missing after {}s",
+                "render: {pending} of 5 node answers missing after {}s",
                 opts.timeout.as_secs()
             );
             break;
@@ -357,6 +357,7 @@ async fn render(
         if matches!(
             msg,
             Msg::RewardRefresh(_)
+                | Msg::HealthRefresh(_)
                 | Msg::ShardRefresh(_)
                 | Msg::DataRefresh { .. }
                 | Msg::LegacyRefresh { .. }
@@ -567,6 +568,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
 
 struct RefreshState {
     node: Arc<Semaphore>,
+    health: Arc<Semaphore>,
+    /// Where the node's health conditions are read, or why they are not.
+    health_source: Result<crate::commands::node::diagnostics::HealthSource, String>,
     shards: Arc<Semaphore>,
     rewards: Arc<Semaphore>,
     legacy: Arc<Semaphore>,
@@ -589,6 +593,8 @@ impl Default for RefreshState {
     fn default() -> Self {
         Self {
             node: Arc::new(Semaphore::new(1)),
+            health: Arc::new(Semaphore::new(1)),
+            health_source: Err("no node config to ask this node with".into()),
             shards: Arc::new(Semaphore::new(1)),
             rewards: Arc::new(Semaphore::new(1)),
             legacy: Arc::new(Semaphore::new(1)),
@@ -611,6 +617,10 @@ impl RefreshState {
                 p2p.network,
             ),
             config_dir: Some(pc.config_dir.clone()),
+            health_source: crate::commands::node::diagnostics::HealthSource::for_node(
+                &pc.node_config,
+                &pc.key_manager,
+            ),
             token: Some((global, max_fee)),
             action_log: crate::commands::token::action_log::ActionLog::enabled(
                 &pc.config_dir,
@@ -661,6 +671,12 @@ fn spawn_action(
                 &tx,
                 None,
                 actions::fetch_data(client.clone()),
+            );
+            spawn_refresh(
+                &refresh.health,
+                &tx,
+                None,
+                actions::fetch_health(refresh.health_source.clone()),
             );
             spawn_refresh(
                 &refresh.rewards,
@@ -760,10 +776,19 @@ fn spawn_action(
             original_status,
         } => {
             let progress = tx.clone();
+            let waits = super::EpochWaits::Node(refresh.health_source.clone());
             tokio::spawn(async move {
                 let _ = tx.send(
-                    actions::do_lifecycle(client, km, action, filters, original_status, progress)
-                        .await,
+                    actions::do_lifecycle(
+                        client,
+                        km,
+                        waits,
+                        action,
+                        filters,
+                        original_status,
+                        progress,
+                    )
+                    .await,
                 );
             });
         }
@@ -1051,10 +1076,14 @@ mod observe_tests {
 
     use super::*;
 
-    /// The node's answers to poll `step`, its status and its shards, as a
-    /// refresh delivers them: GLOBAL and the shard advance, while GLOBAL's
-    /// committed head for the shard keeps its frame.
-    fn answers(step: u64) -> [Msg; 2] {
+    /// The node's answers to poll `step`, its status, its shards and its
+    /// health report, as a refresh delivers them: GLOBAL and the shard
+    /// advance, while GLOBAL's committed head for the shard keeps its frame,
+    /// which the node reports from the third poll on.
+    fn answers(step: u64) -> [Msg; 3] {
+        use quil_types::proto::diagnostics::{
+            AffectedShard, ConditionKind, ConditionSeverity, HealthCondition, HealthConditions,
+        };
         let status = Msg::DataRefresh {
             node_info: Some(NodeInfoResponse {
                 last_received_frame: 500 + step * 3,
@@ -1078,7 +1107,35 @@ mod observe_tests {
             }],
             ..Default::default()
         };
-        [status, Msg::ShardRefresh(Ok(shards))]
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let health = HealthConditions {
+            conditions: (step >= 3)
+                .then(|| HealthCondition {
+                    kind: ConditionKind::GlobalAppFramesUnchanged as i32,
+                    severity: ConditionSeverity::Warning as i32,
+                    since_unix_ms: since,
+                    affected: 1,
+                    tracked: 1,
+                    threshold: 60,
+                    shards: vec![AffectedShard {
+                        filter: vec![1],
+                        frame: 995,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
+            sources: Vec::new(),
+        };
+        [
+            status,
+            Msg::ShardRefresh(Ok(shards)),
+            Msg::HealthRefresh(model::HealthAnswer::Reported(health)),
+        ]
     }
 
     fn options(observe: u64) -> RenderOptions {
@@ -1153,6 +1210,8 @@ mod observe_tests {
         assert!(!text.trim().is_empty(), "no text: {line:?}");
     }
 
+    /// Observing applies each poll's health report, so a condition the node
+    /// reports only after the first snapshot shows.
     #[tokio::test(start_paused = true)]
     async fn observing_raises_the_stall_notice_one_snapshot_cannot() {
         let stall = "WARN Global app frames unchanged >60s: 1/1 tracked shards.";

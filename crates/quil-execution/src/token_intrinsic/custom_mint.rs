@@ -66,8 +66,15 @@ pub fn load_policy(state: &HypergraphState, application: &[u8; 32]) -> Result<Mi
         .get(application, &HYPERGRAPH_METADATA_ADDRESS, &disc)?
         .filter(|blob| !blob.is_empty())
         .ok_or_else(|| invalid("token application is not deployed"))?;
+    policy_from_metadata(&blob)
+}
+
+/// Decode the mint policy from a token's metadata vertex blob: the bytes
+/// [`load_policy`] reads from state and a wallet reads over RPC before it
+/// builds, and pays for, a mint.
+pub fn policy_from_metadata(blob: &[u8]) -> Result<MintPolicy> {
     let outer = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob)
+        root: quil_tries::deserialize_go_tree(blob)
             .map_err(|_| unavailable("cannot decode token metadata"))?,
     };
     let inner_blob = outer

@@ -151,6 +151,31 @@ pub fn global_uncovered_shard_tx_frame(network: u8) -> u64 {
     }
 }
 
+/// First mainnet GLOBAL frame whose prover root a reward mint, mint claim,
+/// settlement claim or coin delivery can cite: the first 2.1.0 frame. Frames
+/// from the 2.1 genesis ([`FRAME_2_1_CUTOVER`]) to the flag day the chain
+/// rewound to (`quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME`, 669,975)
+/// commit 74-byte legacy prover roots, and none exists below the genesis, so
+/// no node resolves a citation of an earlier frame. Other networks start at
+/// frame 0 with forest roots.
+pub const MAINNET_FIRST_CITABLE_GLOBAL_FRAME: u64 = 669_976;
+
+#[cfg(test)]
+mod first_citable_global_frame_tests {
+    #[test]
+    fn mainnet_citations_start_at_the_first_2_1_0_frame() {
+        assert_eq!(
+            super::MAINNET_FIRST_CITABLE_GLOBAL_FRAME,
+            quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1
+        );
+        assert_eq!(
+            super::MAINNET_FIRST_CITABLE_GLOBAL_FRAME,
+            super::FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX
+        );
+        const _: () = assert!(super::FRAME_2_1_CUTOVER < super::MAINNET_FIRST_CITABLE_GLOBAL_FRAME);
+    }
+}
+
 #[cfg(test)]
 mod uncovered_shard_tx_tests {
     #[test]

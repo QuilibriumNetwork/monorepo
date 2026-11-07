@@ -204,7 +204,7 @@ pub(crate) fn resolve_id<'a>(
 
 /// The peer ID of the Falcon network key `key`, as the peer listener's
 /// handshake proves it.
-fn falcon_peer(key: &[u8]) -> anyhow::Result<PeerId> {
+pub(crate) fn falcon_peer(key: &[u8]) -> anyhow::Result<PeerId> {
     Ok(quil_p2p::Keypair::falcon_from_bytes(key)
         .map_err(|e| anyhow::anyhow!("not a Falcon network key: {e}"))?
         .public()

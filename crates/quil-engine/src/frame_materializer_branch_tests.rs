@@ -8,6 +8,9 @@ mod selected_parent_tests;
 #[path = "frame_materializer_publication_tests.rs"]
 mod publication_tests;
 
+#[path = "frame_materializer_uncitable_citation_tests.rs"]
+mod uncitable_citation_tests;
+
 fn limits() -> MaterializerBranchLimits {
     MaterializerBranchLimits {
         execution: ExecutionBranchLimits {
@@ -157,6 +160,130 @@ impl Fixture {
         self.source.record_current_prover_root();
         self.current.materialize(cursor);
     }
+
+    /// A fixture whose genesis prover tree holds `paid`'s settlement record,
+    /// with that genesis (frame 0) in its clock, and the genesis root.
+    fn paying(key: Option<&[u8]>, paid: &PaidDeploy) -> (Self, [u8; 32]) {
+        let fixture = Self::seeded(key, |crdt| paid.seed(crdt));
+        let root = fixture
+            .source
+            .hypergraph
+            .current_forest_phase_root(&[0xff; 32], 0)
+            .unwrap();
+        let txn = fixture.clock.new_transaction(false).unwrap();
+        fixture
+            .clock
+            .put_global_clock_frame(&frame(0, root), txn.as_ref())
+            .unwrap();
+        txn.commit().unwrap();
+        (fixture, root)
+    }
+}
+
+/// A token deploy paid as a wallet pays it (`send_paid_request`): a
+/// settlement claim opens the bundle and proves a GLOBAL settlement record
+/// at the genesis prover root. Every node refuses a priced deploy without
+/// one, with or without the token proof suite.
+struct PaidDeploy {
+    deploy: quil_types::proto::global::MessageRequest,
+    claim: quil_execution::token_intrinsic::settlement_claim::SettlementClaim,
+}
+
+impl PaidDeploy {
+    fn new(deploy: &quil_execution::token_intrinsic::TokenDeploy) -> Self {
+        let deploy = quil_types::proto::global::MessageRequest {
+            timestamp: 0,
+            request: Some(
+                quil_types::proto::global::message_request::Request::TokenDeploy(
+                    quil_execution::token_intrinsic::conversions::token_deploy_to_proto(deploy)
+                        .unwrap(),
+                ),
+            ),
+        };
+        // The claim binds the rest of its bundle: every request but the first.
+        let unpaid = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(
+            &quil_types::proto::global::MessageBundle {
+                requests: vec![deploy.clone()],
+                timestamp: 0,
+            },
+        )
+        .unwrap();
+        let mut rest =
+            quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&unpaid)
+                .unwrap();
+        rest.requests.insert(0, None);
+        let claim = quil_execution::token_intrinsic::settlement_claim::SettlementClaim {
+            network: [1; 32],
+            application: quil_execution::token_intrinsic::constants::token_base_domain(),
+            cited_global_frame: 0,
+            global_root: [0; 32],
+            receipt: [0x5e; 32],
+            settlement: 1 << 40,
+            context: quil_execution::token_intrinsic::settlement_claim::bundle_context(&rest)
+                .unwrap(),
+            payment_address: [0; 32],
+            payment: 0,
+            claimant_key_type: 0,
+            claimant_public_key: Vec::new(),
+            claimant_signature: Vec::new(),
+            forest_proof: Vec::new(),
+        };
+        Self { deploy, claim }
+    }
+
+    /// Write the GLOBAL settlement record (a fixture's seed).
+    fn seed(&self, crdt: &Arc<quil_hypergraph::HypergraphCrdt>) {
+        let record = quil_execution::token_intrinsic::settlement_record::create_record(
+            &self.claim.entry().unwrap(),
+        )
+        .unwrap();
+        crdt.add_vertex(
+            &quil_hypergraph::Location {
+                app_address: quil_execution::domains::GLOBAL,
+                data_address: self.claim.receipt,
+            },
+            &record,
+        )
+        .unwrap();
+        crdt.commit(0).unwrap();
+    }
+
+    /// The paid bundle: the claim proving the record at `crdt`'s global
+    /// prover root `root` (frame 0's), then the deploy.
+    fn bundle(
+        &self,
+        crdt: &quil_hypergraph::HypergraphCrdt,
+        root: [u8; 32],
+    ) -> quil_types::proto::global::MessageBundle {
+        let proof = crdt
+            .global_vertex_membership_at_root(&root, &self.claim.receipt)
+            .unwrap()
+            .expect("the seeded settlement record is held at the genesis root");
+        let claim = quil_execution::token_intrinsic::settlement_claim::SettlementClaim {
+            global_root: root,
+            forest_proof: quil_forest::MembershipProof {
+                inputs: vec![proof],
+            }
+            .to_bytes(),
+            ..self.claim.clone()
+        };
+        quil_types::proto::global::MessageBundle {
+            requests: vec![
+                quil_types::proto::global::MessageRequest {
+                    timestamp: 0,
+                    request: Some(
+                        quil_types::proto::global::message_request::Request::TokenOperation(
+                            quil_types::proto::token::TokenOperation {
+                                canonical_bytes: claim.encode().unwrap(),
+                            },
+                        ),
+                    ),
+                },
+                self.deploy.clone(),
+            ],
+            timestamp: 0,
+        }
+    }
 }
 
 #[test]
@@ -293,10 +420,6 @@ fn a_global_execution_publishes_across_storing_a_served_shard_frame() {
 
 #[test]
 fn tentative_deployment_matches_durable_application_state_and_continues_in_child() {
-    let fixture = Fixture::new(None);
-    let expected = Fixture::new(None);
-    let sequence = fixture.db.inner().latest_sequence_number();
-    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
     let config = quil_execution::token_intrinsic::config::TokenConfiguration {
         behavior: quil_execution::token_intrinsic::constants::DIVISIBLE as u32,
         name: b"materializer branch token".to_vec(),
@@ -308,18 +431,13 @@ fn tentative_deployment_matches_durable_application_state_and_continues_in_child
         config: config.to_canonical_bytes().unwrap(),
         rdf_schema: Vec::new(),
     };
+    let paid = PaidDeploy::new(&deploy);
+    let (fixture, genesis) = Fixture::paying(None, &paid);
+    let (expected, _) = Fixture::paying(None, &paid);
+    let sequence = fixture.db.inner().latest_sequence_number();
+    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
     let mut input = frame(1, branch.prover_root().unwrap());
-    input.requests[0]
-        .requests
-        .push(quil_types::proto::global::MessageRequest {
-            timestamp: 0,
-            request: Some(
-                quil_types::proto::global::message_request::Request::TokenDeploy(
-                    quil_execution::token_intrinsic::conversions::token_deploy_to_proto(&deploy)
-                        .unwrap(),
-                ),
-            ),
-        });
+    input.requests[0] = paid.bundle(&fixture.source.hypergraph, genesis);
     let result = branch.materialize(&input).unwrap();
     let outcomes = branch
         .execution

@@ -55,7 +55,42 @@ use libp2p::{Multiaddr, PeerId};
 use crate::protocol::pb;
 
 /// The concrete stock gossipsub behaviour we wrap.
-type Inner = gossipsub::Behaviour;
+type Inner = gossipsub::Behaviour<gossipsub::IdentityTransform, SubscriptionLimit>;
+
+/// How peers' subscriptions are bounded, see [`subscription_filter`].
+type SubscriptionLimit = gossipsub::MaxCountSubscriptionFilter<TopicLengthLimit>;
+
+/// The most topics one peer may be subscribed to, as far as this node records.
+/// A node subscribes to a few global topics and five per shard it serves, so
+/// this covers some 1,600 shards. Without a bound, every connected peer could
+/// make the node hold any number of topics for it.
+const MAX_PEER_TOPICS: usize = 8192;
+
+/// The longest topic a peer may subscribe to: the hex of a 64-byte bitmask
+/// (the node's bitmasks have at most 35 bytes).
+const MAX_TOPIC_LEN: usize = 128;
+
+/// Refuses topics longer than [`MAX_TOPIC_LEN`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TopicLengthLimit;
+
+impl gossipsub::TopicSubscriptionFilter for TopicLengthLimit {
+    fn can_subscribe(&mut self, topic_hash: &gossipsub::TopicHash) -> bool {
+        topic_hash.as_str().len() <= MAX_TOPIC_LEN
+    }
+}
+
+/// The subscription filter of the gossip behaviour: at most
+/// [`MAX_PEER_TOPICS`] topics per peer, each at most [`MAX_TOPIC_LEN`] long. A
+/// change past the limit is dropped with the rest of its RPC; the node sends
+/// one subscription change per RPC.
+fn subscription_filter() -> SubscriptionLimit {
+    gossipsub::MaxCountSubscriptionFilter {
+        filter: TopicLengthLimit,
+        max_subscribed_topics: MAX_PEER_TOPICS,
+        max_subscriptions_per_request: 1024,
+    }
+}
 
 /// Result of a per-bitmask message validator. Mirrors the historical
 /// `blossomsub::ValidationResult` so `node.rs`'s validators are unchanged;
@@ -83,6 +118,10 @@ impl ValidationResult {
 /// A per-bitmask validator closure: forwarding peer, signed author (if the
 /// message is signed) and data.
 type Validator = Arc<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync>;
+
+/// The validator of bitmasks without one of their own: forwarding peer,
+/// bitmask and data.
+type FallbackValidator = Arc<dyn Fn(&PeerId, &[u8], &[u8]) -> ValidationResult + Send + Sync>;
 
 /// Events emitted by the behaviour to the swarm. Identical in shape to the
 /// historical `BlossomSubEvent` so `node.rs`'s match arms are unchanged.
@@ -125,6 +164,9 @@ pub struct BlossomSubBehaviour {
     peer_subscriptions: HashMap<PeerId, HashSet<Vec<u8>>>,
     /// Per-bitmask validators, run on the receive path before delivery.
     validators: HashMap<Vec<u8>, Validator>,
+    /// Validator of the bitmasks without one in `validators` (the shard
+    /// topics, which come and go with the shards served).
+    fallback_validator: Option<FallbackValidator>,
     /// Local peer id (author of outgoing messages).
     local_peer_id: Option<PeerId>,
     /// Application-level score overrides (source of truth for the getter).
@@ -138,6 +180,9 @@ pub struct BlossomSubBehaviour {
     /// Operator log state for gossip RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcLog,
     unsent_rpcs: UnsentRpcLog,
+    /// Operator log of peers answering under the message ids of releases before strict shard
+    /// gossip.
+    legacy_ids: LegacyIdLog,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -166,9 +211,10 @@ impl BlossomSubBehaviour {
         // `inner` with the real key.
         let placeholder = Keypair::generate_ed25519();
         let traffic: Arc<crate::gossip_traffic::GossipTraffic> = Default::default();
-        let inner = Inner::new(
+        let inner = Inner::new_with_subscription_filter(
             gossipsub::MessageAuthenticity::Signed(placeholder),
             config.clone(),
+            subscription_filter(),
         )
         .expect("valid gossipsub config")
         .with_traffic_observer(traffic.clone());
@@ -181,6 +227,7 @@ impl BlossomSubBehaviour {
             connected_peers: HashMap::new(),
             peer_subscriptions: HashMap::new(),
             validators: HashMap::new(),
+            fallback_validator: None,
             local_peer_id: None,
             application_scores: HashMap::new(),
             pending_events: VecDeque::new(),
@@ -188,6 +235,7 @@ impl BlossomSubBehaviour {
             cache_pressure: CachePressure::default(),
             rejected_rpcs: RejectedRpcLog::default(),
             unsent_rpcs: UnsentRpcLog::default(),
+            legacy_ids: LegacyIdLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
@@ -216,9 +264,10 @@ impl BlossomSubBehaviour {
         let inner = if !self.metrics_registered {
             let mut guard = self.metrics_registry.lock().unwrap();
             let sub = guard.sub_registry_with_prefix("gossipsub");
-            let inner = Inner::new(
+            let inner = Inner::new_with_subscription_filter(
                 gossipsub::MessageAuthenticity::Signed(keypair),
                 self.config.clone(),
+                subscription_filter(),
             )
             .expect("valid gossipsub config")
             .with_metrics(sub, gossipsub::MetricsConfig::default())
@@ -227,9 +276,10 @@ impl BlossomSubBehaviour {
             self.metrics_registered = true;
             inner
         } else {
-            Inner::new(
+            Inner::new_with_subscription_filter(
                 gossipsub::MessageAuthenticity::Signed(keypair),
                 self.config.clone(),
+                subscription_filter(),
             )
             .expect("valid gossipsub config")
             .with_traffic_observer(self.traffic.clone())
@@ -242,12 +292,11 @@ impl BlossomSubBehaviour {
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
-        //  (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO — a `Reject` from
-        //      the graduated staleness validator (only fires on >5-min-stale
-        //      PeerInfo/KeyRegistry, which an honest relayer never forwards)
-        //      accrues a QUADRATIC penalty, so a sustained stale/replay flood
-        //      graylists the offending peer while a one-off aged message does
-        //      not.
+        //  (2) topic P₄ (invalid-message) on every subscribed topic — a
+        //      `Reject` from a validator, or a message the codec refuses (bad
+        //      signature, size), accrues a QUADRATIC penalty, so a sustained
+        //      flood of invalid messages graylists the offending peer while a
+        //      one-off does not.
         // Every other topic-score term is ZEROED (see `build_peer_score`).
         let (score_params, thresholds) = build_peer_score();
         if let Err(e) = self.inner.with_peer_score(score_params, thresholds) {
@@ -257,6 +306,9 @@ impl BlossomSubBehaviour {
         // rebind (defensive; in practice none exist yet).
         for bitmask in self.subscriptions.clone() {
             let _ = self.inner.subscribe(&topic_for(&bitmask));
+            let _ = self
+                .inner
+                .set_topic_params(topic_for(&bitmask), invalid_message_topic_params());
         }
         for peer in self.direct_peers.clone() {
             self.inner.add_explicit_peer(&peer);
@@ -293,6 +345,16 @@ impl BlossomSubBehaviour {
         self.validators.insert(bitmask, Arc::new(validator));
     }
 
+    /// Register the validator of every bitmask without a validator of its own
+    /// (see [`register_validator`](Self::register_validator)). It also gets
+    /// the bitmask, and runs on the receive path before delivery/forwarding.
+    pub fn register_fallback_validator(
+        &mut self,
+        validator: impl Fn(&PeerId, &[u8], &[u8]) -> ValidationResult + Send + Sync + 'static,
+    ) {
+        self.fallback_validator = Some(Arc::new(validator));
+    }
+
     /// Install a per-(source, target) forward filter. **Unsupported on stock
     /// gossipsub** — kept for API compatibility; a no-op with a one-time warning.
     pub fn set_forward_filter(
@@ -323,10 +385,14 @@ impl BlossomSubBehaviour {
         }
     }
 
-    /// Subscribe to a bitmask.
+    /// Subscribe to a bitmask. Its topic gets the invalid-message penalty
+    /// ([`invalid_message_topic_params`]) once scoring is on.
     pub fn subscribe(&mut self, bitmask: Vec<u8>) {
         match self.inner.subscribe(&topic_for(&bitmask)) {
             Ok(_) => {
+                let _ = self
+                    .inner
+                    .set_topic_params(topic_for(&bitmask), invalid_message_topic_params());
                 self.subscriptions.insert(bitmask);
             }
             Err(e) => {
@@ -479,6 +545,11 @@ impl BlossomSubBehaviour {
         self.rejected_rpcs
             .observe(self.inner.rejected_rpc_stats(), now);
         self.unsent_rpcs.observe(self.inner.unsent_rpc_stats(), now);
+        self.legacy_ids.observe(
+            crate::node::strict_shard_gossip(),
+            self.inner.take_legacy_id_answers(),
+            now,
+        );
         if self.subscriptions.is_empty() {
             return;
         }
@@ -778,6 +849,153 @@ impl UnsentRpcLog {
     }
 }
 
+/// After strict shard gossip turns on, peers answering under pre-strict message ids are
+/// ignored for this long: every upgraded node switches within seconds of the epoch's first
+/// GLOBAL frame, and until then it advertises and answers under those ids too.
+const LEGACY_ID_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// While peers answer under pre-strict message ids, the warning repeats at this interval; this
+/// long without one ends the episode.
+const LEGACY_ID_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The most peers one line names; the line also counts them all.
+const LEGACY_ID_PEERS_NAMED: usize = 8;
+
+/// Operator log of peers on a release before strict shard gossip. Under strict shard gossip a
+/// shard CW message's id names its author; such a peer still advertises and answers under the
+/// content id, so it and this node break each other's gossip promises and lower each other's
+/// scores until they graylist each other. The peer's own node does not say why. A warning names
+/// such peers when they start answering under the content id (after
+/// [`LEGACY_ID_SWITCH_GRACE`]), one per [`LEGACY_ID_LOG_INTERVAL`] while they continue, and an
+/// info line when they stop.
+#[derive(Debug, Default)]
+struct LegacyIdLog {
+    /// When strict shard gossip was first seen on, while it stays on.
+    strict_since: Option<std::time::Instant>,
+    /// Answers per peer since the previous line.
+    pending: HashMap<PeerId, u64>,
+    episode: Option<LegacyIdEpisode>,
+}
+
+#[derive(Debug)]
+struct LegacyIdEpisode {
+    started: std::time::Instant,
+    last_answer: std::time::Instant,
+    last_log: std::time::Instant,
+    /// Answers in the episode, logged ones included.
+    answers: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyIdLogLine {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl LegacyIdLog {
+    fn observe(
+        &mut self,
+        strict: bool,
+        answers: HashMap<PeerId, u64>,
+        now: std::time::Instant,
+    ) -> Option<LegacyIdLogLine> {
+        self.strict_since = if strict {
+            Some(self.strict_since.unwrap_or(now))
+        } else {
+            None
+        };
+        let switched = self
+            .strict_since
+            .is_some_and(|since| now.duration_since(since) >= LEGACY_ID_SWITCH_GRACE);
+        let answering = switched && !answers.is_empty();
+        if answering {
+            for (peer, count) in answers {
+                if self.pending.len() < 1024 || self.pending.contains_key(&peer) {
+                    *self.pending.entry(peer).or_insert(0) += count;
+                }
+            }
+        }
+        let line = match self.episode.as_mut() {
+            None if answering => LegacyIdLogLine::Started,
+            None => return None,
+            Some(episode) if answering => {
+                episode.last_answer = now;
+                if now.duration_since(episode.last_log) < LEGACY_ID_LOG_INTERVAL {
+                    return None;
+                }
+                LegacyIdLogLine::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_answer) < LEGACY_ID_LOG_INTERVAL {
+                    return None;
+                }
+                LegacyIdLogLine::Ended
+            }
+        };
+        let episode = self.episode.get_or_insert(LegacyIdEpisode {
+            started: now,
+            last_answer: now,
+            last_log: now,
+            answers: 0,
+        });
+        let pending = std::mem::take(&mut self.pending);
+        let peers = pending.len();
+        let answers: u64 = pending.values().sum();
+        episode.answers += answers;
+        episode.last_log = now;
+        let mut ranked: Vec<_> = pending.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let named = ranked
+            .iter()
+            .take(LEGACY_ID_PEERS_NAMED)
+            .map(|(peer, count)| format!("{peer}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let epoch = quil_types::consensus::strict_shard_gossip_epoch();
+        let total = episode.answers;
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        match line {
+            LegacyIdLogLine::Started => tracing::warn!(
+                peers,
+                answers,
+                %named,
+                epoch,
+                "peers answer this node's gossip requests for shard consensus messages under \
+                 the message ids of releases before strict shard gossip: they run such a \
+                 release, or have not yet reached the strict epoch's GLOBAL frames. Since that \
+                 epoch they and upgraded nodes break each other's gossip promises and graylist \
+                 each other, so their consensus messages are lost in bursts. Nothing to do on \
+                 this node; whoever runs a named peer must upgrade it, or check that it follows \
+                 the GLOBAL head"
+            ),
+            LegacyIdLogLine::Continuing => tracing::warn!(
+                peers,
+                answers,
+                total,
+                %named,
+                epoch,
+                duration_secs,
+                "peers still answer this node's gossip requests under the message ids of \
+                 releases before strict shard gossip; the counts are since the previous line"
+            ),
+            LegacyIdLogLine::Ended => {
+                tracing::info!(
+                    peers,
+                    answers,
+                    total,
+                    %named,
+                    duration_secs,
+                    "no peer answered under the message ids of releases before strict shard \
+                     gossip for ten minutes; the episode ended"
+                );
+                self.episode = None;
+            }
+        }
+        Some(line)
+    }
+}
+
 /// The identity-hash gossipsub topic for a bitmask: the topic string is
 /// `hex(bitmask)`, so the on-wire topic bytes are a lossless, UTF-8-safe
 /// encoding of the arbitrary bitmask bytes.
@@ -893,12 +1111,14 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         let bitmask = bitmask_from_topic(&message.topic);
                         // `validate_messages()` is on, so we must report an
                         // outcome for every message before it is forwarded.
-                        let outcome = match self.validators.get(&bitmask) {
-                            Some(v) => {
-                                v(&propagation_source, message.source.as_ref(), &message.data)
-                            }
-                            None => ValidationResult::Accept,
-                        };
+                        let outcome =
+                            match (self.validators.get(&bitmask), &self.fallback_validator) {
+                                (Some(v), _) => {
+                                    v(&propagation_source, message.source.as_ref(), &message.data)
+                                }
+                                (None, Some(v)) => v(&propagation_source, &bitmask, &message.data),
+                                (None, None) => ValidationResult::Accept,
+                            };
                         let _ = self.inner.report_message_validation_result(
                             &message_id,
                             &propagation_source,
@@ -957,32 +1177,40 @@ impl NetworkBehaviour for BlossomSubBehaviour {
     }
 }
 
-/// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
-/// per-network protocol id and setting the BlossomSub message id
-/// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
-/// (`mesh_peers_per_subnet`) are dropped; `mcache_max_bytes` maps onto the
-/// vendored crate's message-cache byte budget.
+/// The score parameters of every subscribed topic: only P₄, the invalid-message
+/// penalty (weight × counter²). A `Reject` from a validator, or a message the
+/// codec refuses (bad signature, oversized), counts one. The counter keeps 90 %
+/// a second (it kept 50 %, which forgot a flood within seconds): a one-off stays
+/// above every threshold, three put the sender below the graylist threshold and
+/// keep it below the gossip threshold for some seconds, and a sustained stream
+/// keeps it graylisted. The delivery terms (P₁–P₃, P₃b) stay zero: they punish
+/// honest peers for WAN delivery variance and made meshes flap; whether small
+/// positive P₂/P₃ would help defend meshes needs measurement first.
+fn invalid_message_topic_params() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        time_in_mesh_weight: 0.0,
+        first_message_deliveries_weight: 0.0,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        invalid_message_deliveries_weight: -50.0,
+        invalid_message_deliveries_decay: 0.9,
+        ..Default::default()
+    }
+}
+
 /// Peer-score config. Two channels are active: (1) the application score
 /// (`set_application_score`, driven by the node — peer_authenticator + per-source
-/// drop-rate penalties); (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO, so
-/// a `Reject` from the graduated staleness validator (fires ONLY on >5-min-stale
-/// PeerInfo/KeyRegistry, which an honest relayer never forwards) accrues a
-/// QUADRATIC penalty — a sustained stale/replay flood graylists the peer while a
-/// one-off aged message does not. Every honest-peer-affecting topic term
-/// (time-in-mesh, first/mesh deliveries, mesh-failure) is ZEROED: those punish
-/// peers for normal WAN delivery variance and cause mesh flapping.
+/// drop-rate penalties); (2) topic P₄ (invalid-message,
+/// [`invalid_message_topic_params`]) on GLOBAL_FRAME and GLOBAL_PEER_INFO here,
+/// and on every other topic as it is subscribed. Every honest-peer-affecting
+/// topic term (time-in-mesh, first/mesh deliveries, mesh-failure) is ZEROED:
+/// those punish peers for normal WAN delivery variance and cause mesh flapping.
 fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
-    let mut pi_topic = gossipsub::TopicScoreParams::default();
-    pi_topic.topic_weight = 1.0;
-    pi_topic.time_in_mesh_weight = 0.0;
-    pi_topic.first_message_deliveries_weight = 0.0;
-    pi_topic.mesh_message_deliveries_weight = 0.0;
-    pi_topic.mesh_failure_penalty_weight = 0.0;
-    pi_topic.invalid_message_deliveries_weight = -50.0; // P₄ = weight × counter²
-    pi_topic.invalid_message_deliveries_decay = 0.5; // ~halves each decay_interval → recovers
-                                                     // Keep `PeerScoreParams::default()` for everything else — notably
-                                                     // `app_specific_weight` (the existing `set_application_score` channel),
-                                                     // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
+    let pi_topic = invalid_message_topic_params();
+    // Keep `PeerScoreParams::default()` for everything else — notably
+    // `app_specific_weight` (the existing `set_application_score` channel),
+    // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
     let mut score_params = gossipsub::PeerScoreParams::default();
     // GLOBAL_FRAME `[0,0]`: the gate `Reject`s only a wrong type prefix, which
     // every build rejects, so an honest relay never forwards one; copies of
@@ -1012,6 +1240,10 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
     (score_params, thresholds)
 }
 
+/// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
+/// per-network protocol id and setting the BlossomSub message id
+/// (`[0x01] ++ SHA256(data)`); `mcache_max_bytes` maps onto the vendored
+/// crate's message-cache byte budget.
 fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Config {
     let mut builder = gossipsub::ConfigBuilder::default();
     builder
@@ -1055,11 +1287,39 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .duplicate_cache_time(std::time::Duration::from_secs(300))
         // Run per-bitmask validators before forwarding (see module docs).
         .validate_messages()
+        // A node's master and standalone workers sign with one identity under
+        // different transport ids (`P2PNode::new_for_worker`), and a relay
+        // excludes only the source from forwarding. So a message from our own
+        // identity, relayed by an honest peer, is a sibling's: check it like
+        // any other, without penalising the relay. Copies of messages this
+        // process published are dropped as duplicates.
+        .allow_self_origin(true)
         // BlossomSub message id = `[0x01] ++ SHA256(data)`. Stock gossipsub's
         // default id differs, so we set it explicitly to keep the dedup key
-        // stable across the network.
+        // stable across the network. Under strict shard gossip a shard CW
+        // topic's id also covers the message's author
+        // (`crate::node::gossip_message_id`).
         .message_id_fn(|message: &gossipsub::Message| {
-            gossipsub::MessageId::from(crate::node::message_id(&message.data))
+            let source = message
+                .source
+                .map(|peer| peer.to_bytes())
+                .unwrap_or_default();
+            gossipsub::MessageId::from(crate::node::gossip_message_id(
+                &bitmask_from_topic(&message.topic),
+                &source,
+                &message.data,
+                crate::node::strict_shard_gossip(),
+            ))
+        })
+        // A peer that answers an IWANT for the content id of a shard CW message under strict
+        // shard gossip runs an older release (`LegacyIdLog`).
+        .legacy_message_id_fn(|message: &gossipsub::Message| {
+            crate::node::pre_strict_gossip_message_id(
+                &bitmask_from_topic(&message.topic),
+                &message.data,
+                crate::node::strict_shard_gossip(),
+            )
+            .map(gossipsub::MessageId::from)
         })
         // Inbound signature verification (StrictSign); signed outbound is
         // late-bound via `set_signing_identity`.
@@ -1079,6 +1339,61 @@ mod propagation_tests {
     use libp2p::swarm::SwarmEvent;
     use libp2p::{Multiaddr, Swarm, SwarmBuilder};
     use std::time::Duration;
+
+    /// Under strict shard gossip, two copies of a message with the same data
+    /// and different authors get different ids on a shard CW topic, so the
+    /// author's own copy is not dropped as the duplicate of a copy another
+    /// peer re-published first. Every other topic, and every topic before the
+    /// strict epoch, keeps the content id `[0x01] ++ SHA256(data)`.
+    #[test]
+    fn shard_cw_message_ids_name_their_author_when_strict() {
+        let config = build_config(0, &crate::BlossomsubParams::default());
+        let filter = [7u8; 32];
+        let mut cw = vec![0x01u8];
+        cw.extend_from_slice(&filter);
+        let (genuine, reauthored) = (PeerId::random(), PeerId::random());
+        let message = |bitmask: &[u8], source: PeerId| gossipsub::Message {
+            source: Some(source),
+            data: b"\x00vote".to_vec(),
+            sequence_number: Some(1),
+            topic: topic_for(bitmask).hash(),
+        };
+        let id = |bitmask: &[u8], source: PeerId| config.message_id(&message(bitmask, source));
+        let content = gossipsub::MessageId::from(crate::node::message_id(b"\x00vote"));
+        let mut legacy = vec![0x00u8];
+        legacy.extend_from_slice(&filter);
+        let others: [&[u8]; 6] = [
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0x00, 0x00],
+            &[0u8; 16],
+            &filter,
+            &legacy,
+            &[0x01; 32],
+        ];
+        crate::node::set_strict_shard_gossip(false);
+        assert_eq!(id(&cw, genuine), content);
+        assert_eq!(id(&cw, reauthored), content);
+        crate::node::set_strict_shard_gossip(true);
+        assert_ne!(
+            id(&cw, genuine),
+            id(&cw, reauthored),
+            "a re-authored copy of a CW message shares its author's id"
+        );
+        assert_ne!(id(&cw, genuine), content);
+        assert_eq!(id(&cw, genuine).0.len(), 33);
+        assert_eq!(id(&cw, genuine).0[0], 0x01);
+        assert_eq!(id(&cw, genuine), id(&cw, genuine));
+        for bitmask in others {
+            assert_eq!(
+                id(bitmask, genuine),
+                content,
+                "{} keeps the content id",
+                hex::encode(bitmask)
+            );
+            assert_eq!(id(bitmask, reauthored), content);
+        }
+        crate::node::set_strict_shard_gossip(false);
+    }
 
     #[test]
     fn build_config_applies_the_message_cache_byte_budget() {
@@ -1119,6 +1434,83 @@ mod propagation_tests {
             pressure.observe(stats(13), at(201)),
             Some(CachePressureLog::Started)
         );
+    }
+
+    /// Peers answering under pre-strict ids are named once strict shard gossip has been on for
+    /// the switch grace, at most once per interval, and the episode ends after an interval
+    /// without one. Before strict shard gossip, or within the grace, nothing is logged.
+    #[test]
+    fn legacy_id_answers_log_after_the_switch_with_bounded_repeats_and_end() {
+        let (old, other) = (PeerId::random(), PeerId::random());
+        let answers = |peers: &[PeerId]| -> HashMap<PeerId, u64> {
+            peers.iter().map(|peer| (*peer, 2u64)).collect()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = LegacyIdLog::default();
+        assert_eq!(log.observe(false, answers(&[old]), at(0)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(1)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(120)), None);
+        assert!(log.pending.is_empty(), "answers within the grace were kept");
+        assert_eq!(
+            log.observe(true, answers(&[old, other]), at(121)),
+            Some(LegacyIdLogLine::Started)
+        );
+        assert_eq!(log.observe(true, answers(&[old]), at(122)), None);
+        assert_eq!(log.observe(true, answers(&[]), at(300)), None);
+        assert_eq!(
+            log.observe(true, answers(&[old]), at(721)),
+            Some(LegacyIdLogLine::Continuing)
+        );
+        assert_eq!(log.episode.as_ref().map(|episode| episode.answers), Some(8));
+        assert_eq!(log.observe(true, answers(&[]), at(1000)), None);
+        assert_eq!(
+            log.observe(true, answers(&[]), at(1321)),
+            Some(LegacyIdLogLine::Ended)
+        );
+        assert_eq!(log.observe(true, answers(&[]), at(2000)), None);
+        // Strict shard gossip off and on again: a new grace.
+        assert_eq!(log.observe(false, answers(&[]), at(2001)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(2002)), None);
+        assert_eq!(
+            log.observe(true, answers(&[old]), at(2122)),
+            Some(LegacyIdLogLine::Started)
+        );
+    }
+
+    /// Under strict shard gossip, only a shard CW topic's message has a pre-strict id, its
+    /// content id; before it, none has.
+    #[test]
+    fn only_shard_cw_messages_have_a_pre_strict_id_when_strict() {
+        let config = build_config(0, &crate::BlossomsubParams::default());
+        let mut cw = vec![0x01u8];
+        cw.extend_from_slice(&[7u8; 32]);
+        let message = |bitmask: &[u8]| gossipsub::Message {
+            source: Some(PeerId::random()),
+            data: b"\x00vote".to_vec(),
+            sequence_number: Some(1),
+            topic: topic_for(bitmask).hash(),
+        };
+        let content = gossipsub::MessageId::from(crate::node::message_id(b"\x00vote"));
+        let others: [&[u8]; 3] = [&[0x00, 0x00, 0x00, 0x00], &[7u8; 32], &[0x01; 32]];
+        crate::node::set_strict_shard_gossip(false);
+        assert_eq!(config.legacy_message_id(&message(&cw)), None);
+        crate::node::set_strict_shard_gossip(true);
+        let strict_cw = message(&cw);
+        assert_eq!(config.legacy_message_id(&strict_cw), Some(content));
+        assert_ne!(
+            config.legacy_message_id(&strict_cw),
+            Some(config.message_id(&strict_cw))
+        );
+        for bitmask in others {
+            assert_eq!(
+                config.legacy_message_id(&message(bitmask)),
+                None,
+                "{} has a pre-strict id",
+                hex::encode(bitmask)
+            );
+        }
+        crate::node::set_strict_shard_gossip(false);
     }
 
     #[test]
@@ -1198,6 +1590,27 @@ mod propagation_tests {
         assert_eq!(frame.mesh_message_deliveries_weight, 0.0);
     }
 
+    /// A message the codec or a validator refuses on a shard topic must
+    /// count against its sender's score, as it does on the global topics:
+    /// unscored, invalid messages there cost the sender nothing.
+    #[test]
+    fn reproduces_unscored_invalid_messages_on_shard_topics() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        let keypair = Keypair::generate_ed25519();
+        behaviour.set_signing_identity(keypair.public().to_peer_id(), keypair);
+        let shard_topic = vec![0x01; 33];
+        behaviour.subscribe(shard_topic.clone());
+
+        let penalty = behaviour
+            .inner
+            .get_topic_params(&topic_for(&shard_topic))
+            .map_or(0.0, |params| params.invalid_message_deliveries_weight);
+        assert!(
+            penalty < 0.0,
+            "a subscribed shard topic carries no invalid-message penalty"
+        );
+    }
+
     /// The registered validator sees the signed author of a message.
     #[test]
     fn authored_validators_see_the_author() {
@@ -1220,6 +1633,41 @@ mod propagation_tests {
         assert_eq!(one(&forwarder, None, b""), ValidationResult::Ignore);
         let two = &behaviour.validators[&vec![2]];
         assert_eq!(two(&forwarder, None, b""), ValidationResult::Reject);
+    }
+
+    /// Bitmasks without a validator of their own go to the fallback, with
+    /// their bitmask; those with one never do.
+    #[test]
+    fn the_fallback_validator_sees_unregistered_bitmasks() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        behaviour.register_validator(vec![1], |_, _| ValidationResult::Accept);
+        behaviour.register_fallback_validator(|_, bitmask, data| {
+            if bitmask == [2] && data == b"ok" {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Ignore
+            }
+        });
+        let fallback = behaviour.fallback_validator.clone().unwrap();
+        let peer = PeerId::random();
+        assert!(behaviour.validators.contains_key(&vec![1]));
+        assert_eq!(fallback(&peer, &[2], b"ok"), ValidationResult::Accept);
+        assert_eq!(fallback(&peer, &[2], b"no"), ValidationResult::Ignore);
+        assert_eq!(fallback(&peer, &[3], b"ok"), ValidationResult::Ignore);
+    }
+
+    /// A peer's subscriptions are bounded in number and topic length.
+    #[test]
+    fn peer_subscriptions_are_bounded() {
+        use gossipsub::TopicSubscriptionFilter as _;
+        let mut filter = subscription_filter();
+        assert_eq!(filter.max_subscribed_topics, MAX_PEER_TOPICS);
+        assert_eq!(filter.max_subscriptions_per_request, 1024);
+        let longest = gossipsub::TopicHash::from_raw("0".repeat(MAX_TOPIC_LEN));
+        let longer = gossipsub::TopicHash::from_raw("0".repeat(MAX_TOPIC_LEN + 1));
+        assert!(filter.can_subscribe(&topic_for(&[0xff; 35]).hash()));
+        assert!(filter.can_subscribe(&longest));
+        assert!(!filter.can_subscribe(&longer));
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
@@ -1340,6 +1788,95 @@ mod propagation_tests {
             "both leaves must receive the hub's published message (published={published}, a={a_got}, b={b_got})"
         );
     }
+
+    /// A message on a bitmask without a validator of its own gets the
+    /// fallback validator's verdict on the receive path, and the validator
+    /// sees its bitmask: a message it rejects is not delivered, one it
+    /// accepts is.
+    #[tokio::test]
+    async fn received_messages_on_unregistered_bitmasks_get_the_fallback_verdict() {
+        let bitmask = vec![0x01u8; 33];
+        type Seen = Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+        let seen: Seen = Default::default();
+
+        let mut hub = build_swarm();
+        let mut leaf = build_swarm();
+        let leaf_id = *leaf.local_peer_id();
+        let validated = seen.clone();
+        let fallback = move |_: &PeerId, bitmask: &[u8], data: &[u8]| {
+            validated
+                .lock()
+                .unwrap()
+                .push((bitmask.to_vec(), data.to_vec()));
+            if data == b"accepted" {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Reject
+            }
+        };
+        leaf.behaviour_mut().register_fallback_validator(fallback);
+        hub.behaviour_mut().subscribe(bitmask.clone());
+        leaf.behaviour_mut().subscribe(bitmask.clone());
+
+        hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let hub_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
+                break address;
+            }
+        };
+        leaf.dial(hub_addr).expect("leaf dial");
+
+        let mut published = false;
+        let mut delivered = Vec::new();
+        let ok = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                tokio::select! {
+                    _ = hub.select_next_some() => {}
+                    ev = leaf.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BlossomSubEvent::Message { message, .. }) = ev {
+                            delivered.push(message.data);
+                        }
+                    }
+                }
+                if !published && hub.behaviour().peer_subscribed_to(&leaf_id, &bitmask) {
+                    for data in [b"rejected".to_vec(), b"accepted".to_vec()] {
+                        hub.behaviour_mut()
+                            .publish(bitmask.clone(), data)
+                            .expect("publish");
+                    }
+                    published = true;
+                }
+                let accepted = delivered.iter().any(|data| data == b"accepted");
+                if accepted && seen.lock().unwrap().len() >= 2 {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            ok,
+            "the fallback must see both and the accepted one arrive ({delivered:?}, {seen:?})"
+        );
+        assert_eq!(
+            delivered,
+            vec![b"accepted".to_vec()],
+            "a message the fallback validator rejected was delivered"
+        );
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (bitmask.clone(), b"accepted".to_vec()),
+                (bitmask, b"rejected".to_vec()),
+            ],
+            "the fallback validator sees each message with its bitmask"
+        );
+    }
+
     /// IDONTWANT received, from gossipsub's own counter in `swarm`'s registry.
     fn idontwants_received(swarm: &Swarm<BlossomSubBehaviour>) -> u64 {
         crate::metrics::render(&swarm.behaviour().metrics_registry())

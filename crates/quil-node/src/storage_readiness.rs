@@ -701,7 +701,8 @@ async fn run_inner(
     let archives = endpoints(args)?;
     ensure!(!archives.is_empty(), "no archive endpoints");
     for (endpoint, peer) in &archives {
-        quil_rpc::archive_client::pin_archive_peer(endpoint, *peer);
+        // A conflicting entry keeps the first pin: its dial fails.
+        let _ = quil_rpc::archive_client::pin_archive_peer(endpoint, *peer);
     }
     let signer = quil_crypto::FalconSigner::generate();
     let key = signer.private_key();

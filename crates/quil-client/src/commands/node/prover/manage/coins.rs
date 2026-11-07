@@ -627,12 +627,34 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Shields of legacy coins open at this GLOBAL frame, and the frames
-/// left, while the received head is before it.
-pub fn shields_open_at(snapshot: &Snapshot) -> Option<(u64, u64)> {
-    let rule = snapshot.rule?;
-    let head = *snapshot.head.as_ref().ok()?;
-    (head < rule.shield_all_from).then(|| (rule.shield_all_from, rule.shield_all_from - head))
+/// Shields of legacy coins (`shield-all`'s batches) open at this GLOBAL
+/// frame, and the frames left, while this node's health conditions say
+/// admission refuses them.
+pub fn shields_open_at(m: &Model) -> Option<(u64, u64)> {
+    let (from, head) = crate::commands::token::legacy::shields_closed(m.health_conditions(), true)?;
+    Some((from, from - head))
+}
+
+/// This node's health conditions at GLOBAL `head` with shields admitted
+/// from frame 900 and batches from 1000, as its registry judges them.
+#[cfg(test)]
+pub(crate) fn node_reports_shields_at(m: &mut Model, head: u64) {
+    let mut registry = quil_rpc::health_conditions::HealthRegistry::default();
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    registry.refresh_waits(
+        quil_rpc::health_conditions::GlobalObservation {
+            head_frame: head,
+            epoch_length: 720,
+            shields_from: Some((900, 1000)),
+            sync_installing: None,
+        },
+        now_ms,
+    );
+    m.health = super::model::HealthAnswer::Reported(registry.snapshot());
+    m.health_received = Some(Instant::now());
 }
 
 /// Every current Coins condition, in display order.
@@ -722,7 +744,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     }
     // Counts are the legacy row's, the batches and the frame shields open
     // at the Shield plan's: these notices name the condition and the key.
-    match (shields_open_at(snapshot), snapshot.plan) {
+    match (shields_open_at(m), snapshot.plan) {
         (Some(_), _) => push(
             "coins-shield-gate",
             NoticeSeverity::Info,
@@ -1110,6 +1132,8 @@ mod coins_tests {
             &mut m,
             Ok(Read {
                 coins: Some((2, 90)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![escrow(false, 0), escrow(true, 400), escrow(true, 900)],
             }),
         );
@@ -1272,7 +1296,9 @@ mod coins_tests {
             .all(|n| n.attention && n.severity == NoticeSeverity::Info));
         m.notice_minimum = NoticeSeverity::Info;
         assert_eq!(shown_notices(&m, fmt).len(), 3);
-        // Before the gate: an expected wait, no attention item.
+        // Before the gate, as the node reports it: an expected wait, no
+        // attention item.
+        node_reports_shields_at(&mut m, 990);
         apply_legacy(
             &mut m,
             Ok(Some(snapshot(4, 990, 0, false))),

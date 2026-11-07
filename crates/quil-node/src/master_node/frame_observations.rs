@@ -1,5 +1,7 @@
-//! Bounded node-owned frame observations. Downtime and missing reads are gaps,
-//! not evidence of either production or a stall. This cache is not consensus state.
+//! Bounded node-owned frame observations. Downtime is a gap, not evidence of
+//! either production or a stall; a failed or skipped read within a run is not,
+//! as the next good read counts the frames the committed head advanced across
+//! it (up to `MAX_SPAN`). This cache is not consensus state.
 use quil_types::proto::node::{FrameCadence, FrameWindow};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,6 +15,11 @@ const MAX_SERIES: usize = 256;
 const MAX_SAMPLES: usize = 1442;
 const MAX_FILE: u64 = 12 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"QFRAME01";
+/// Longest span between two good reads of one run that counts as observed.
+/// A regular node's shard heads advance in jumps at each archive sync, and a
+/// read failing at that moment must not drop the jump; a longer outage
+/// stays a gap.
+const MAX_SPAN: u64 = 600;
 
 pub(super) fn unix_seconds() -> u64 {
     SystemTime::now()
@@ -31,6 +38,9 @@ struct Sample {
 struct Series {
     samples: VecDeque<Sample>,
     runtime_last: Option<u64>,
+    /// The latest read failed: the cadence is withheld until a good read,
+    /// which still counts from the last good one.
+    missed: bool,
 }
 #[derive(Default, Debug)]
 pub(super) struct Observations {
@@ -93,9 +103,10 @@ impl Observations {
             series.samples.pop_front();
         }
         let Some((frame, generation)) = head.filter(|(frame, _)| *frame > 0) else {
-            series.runtime_last = None;
+            series.missed = true;
             return;
         };
+        series.missed = false;
         if series
             .samples
             .back()
@@ -113,7 +124,7 @@ impl Observations {
         }
         let continuous = series.samples.back().is_some_and(|last| {
             series.runtime_last == Some(last.at)
-                && now - last.at <= 90
+                && now - last.at <= MAX_SPAN
                 && last.generation == generation
                 && frame >= last.frame
         });
@@ -131,8 +142,13 @@ impl Observations {
     pub fn snapshot(&self, filter: &[u8], now: u64) -> Option<FrameCadence> {
         let series = self.series.get(filter)?;
         let latest = series.samples.back()?;
-        // A restored record alone is not a fresh node observation.
-        if series.runtime_last != Some(latest.at) || now < latest.at || now - latest.at > 90 {
+        // A restored record alone, or one a failed read followed, is not a
+        // fresh node observation.
+        if series.missed
+            || series.runtime_last != Some(latest.at)
+            || now < latest.at
+            || now - latest.at > 90
+        {
             return None;
         }
         let window = |seconds| {
@@ -216,7 +232,9 @@ impl Observations {
                     || previous.as_ref().is_some_and(|p| {
                         at <= p.at
                             || flag[0] == 1
-                                && (at - p.at > 90 || frame < p.frame || generation != p.generation)
+                                && (at - p.at > MAX_SPAN
+                                    || frame < p.frame
+                                    || generation != p.generation)
                     })
                 {
                     return Err(invalid());
@@ -241,6 +259,152 @@ impl Observations {
         Ok(result)
     }
 }
+/// A failing shard head read's lines: a summary at most this often.
+const READ_LOG_EVERY: u64 = 3_600;
+/// Good reads for this long, with no failure, end a failing episode.
+const READ_QUIET: u64 = 600;
+/// Bytes of a read error a line carries.
+const READ_ERROR_MAX: usize = 256;
+
+/// The sampler's committed shard head reads. A failure is bridged by the
+/// next good read, so it costs no frames, but its cause is unknown: an
+/// episode logs its start, at most one summary per `READ_LOG_EVERY` and its
+/// end once reads stay good for `READ_QUIET`.
+#[derive(Default, Debug)]
+pub(super) struct ReadFailures {
+    episode: Option<Episode>,
+}
+#[derive(Debug)]
+struct Episode {
+    since: u64,
+    logged: u64,
+    last_failure: u64,
+    failed: u64,
+    good: u64,
+    total: u64,
+    error: String,
+    read_ms: u64,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ReadLine {
+    Started {
+        error: String,
+        read_ms: u64,
+    },
+    Failing {
+        failed: u64,
+        good: u64,
+        since_secs: u64,
+        error: String,
+        read_ms: u64,
+    },
+    Recovered {
+        failed: u64,
+        lasted_secs: u64,
+        error: String,
+        read_ms: u64,
+    },
+}
+
+impl ReadFailures {
+    pub fn failed(&mut self, now: u64, error: &str, read_ms: u64) -> Option<ReadLine> {
+        let mut error = error.to_owned();
+        if error.len() > READ_ERROR_MAX {
+            let mut end = READ_ERROR_MAX;
+            while !error.is_char_boundary(end) {
+                end -= 1;
+            }
+            error.truncate(end);
+        }
+        let Some(e) = self.episode.as_mut() else {
+            self.episode = Some(Episode {
+                since: now,
+                logged: now,
+                last_failure: now,
+                failed: 0,
+                good: 0,
+                total: 1,
+                error: error.clone(),
+                read_ms,
+            });
+            return Some(ReadLine::Started { error, read_ms });
+        };
+        e.failed += 1;
+        e.total += 1;
+        e.last_failure = now;
+        e.error = error;
+        e.read_ms = read_ms;
+        if now.saturating_sub(e.logged) < READ_LOG_EVERY {
+            return None;
+        }
+        let line = ReadLine::Failing {
+            failed: e.failed,
+            good: e.good,
+            since_secs: now.saturating_sub(e.since),
+            error: e.error.clone(),
+            read_ms,
+        };
+        (e.logged, e.failed, e.good) = (now, 0, 0);
+        Some(line)
+    }
+    pub fn succeeded(&mut self, now: u64) -> Option<ReadLine> {
+        let e = self.episode.as_mut()?;
+        e.good += 1;
+        if now.saturating_sub(e.last_failure) < READ_QUIET {
+            return None;
+        }
+        let e = self.episode.take()?;
+        Some(ReadLine::Recovered {
+            failed: e.total,
+            lasted_secs: e.last_failure.saturating_sub(e.since),
+            error: e.error,
+            read_ms: e.read_ms,
+        })
+    }
+}
+
+impl ReadLine {
+    pub fn emit(&self, shards: usize) {
+        match self {
+            ReadLine::Started { error, read_ms } => tracing::warn!(
+                shards,
+                error = %error,
+                read_ms,
+                "shard head read failed; app frame cadence counts the next good read \
+                 from the last one, and a summary follows hourly while reads fail"
+            ),
+            ReadLine::Failing {
+                failed,
+                good,
+                since_secs,
+                error,
+                read_ms,
+            } => tracing::warn!(
+                shards,
+                failed_reads = failed,
+                good_reads = good,
+                since_secs,
+                last_error = %error,
+                last_read_ms = read_ms,
+                "shard head reads failed this interval; counts cover the interval"
+            ),
+            ReadLine::Recovered {
+                failed,
+                lasted_secs,
+                error,
+                read_ms,
+            } => tracing::info!(
+                shards,
+                failed_reads = failed,
+                lasted_secs,
+                last_error = %error,
+                last_read_ms = read_ms,
+                "shard head reads recovered"
+            ),
+        }
+    }
+}
+
 fn invalid() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -375,6 +539,123 @@ mod tests {
         assert!(full.series.contains_key(b"".as_slice()));
         assert!(full.series.contains_key(&vec![0, 0]));
         assert_eq!(full.series.len(), MAX_SERIES);
+    }
+
+    #[test]
+    fn a_read_failed_at_an_archive_sync_keeps_the_jump_it_spans() {
+        // A regular node's shard heads advance 25-30 frames at each 5-minute
+        // archive sync, and the committed read failed at half of them.
+        let mut o = Observations::default();
+        let (start, mut frame, mut total) = (100_000u64, 1_000u64, 0u64);
+        for minute in 0..=60u64 {
+            let now = start + minute * 60;
+            if minute > 0 && minute % 5 == 0 {
+                let jump = 25 + minute / 5 % 6;
+                frame += jump;
+                total += jump;
+                if minute / 5 % 2 == 1 {
+                    o.observe(b"a", None, now);
+                    assert!(
+                        o.snapshot(b"a", now).is_none(),
+                        "stale: cadence after a failed read"
+                    );
+                    continue;
+                }
+            }
+            o.observe(b"a", Some((frame, 1)), now);
+        }
+        let h = o.snapshot(b"a", start + 3600).unwrap().hour.unwrap();
+        assert_eq!(
+            (h.observed_seconds, h.advanced_frames),
+            (3600, total),
+            "bridged: failed reads dropped the frames they spanned"
+        );
+        // Reads failing for longer than MAX_SPAN leave a gap.
+        for minute in 61..=71u64 {
+            o.observe(b"a", None, start + minute * 60);
+        }
+        frame += 30;
+        o.observe(b"a", Some((frame, 1)), start + 72 * 60);
+        o.observe(b"a", Some((frame, 1)), start + 73 * 60);
+        let d = o.snapshot(b"a", start + 73 * 60).unwrap().day.unwrap();
+        assert_eq!(
+            (d.observed_seconds, d.advanced_frames),
+            (3660, total),
+            "gap: an outage counted as observed"
+        );
+    }
+
+    #[test]
+    fn a_span_bridged_over_a_failed_read_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frames.bin");
+        let mut o = Observations::default();
+        o.observe(b"a", Some((100, 1)), 1000);
+        o.observe(b"a", None, 1060);
+        o.observe(b"a", Some((128, 1)), 1120);
+        o.save(&path, b"scope").unwrap();
+        let mut restored =
+            Observations::load(&path, b"scope", 1300).expect("restored: cache refused");
+        restored.observe(b"a", Some((130, 1)), 1300);
+        restored.observe(b"a", Some((136, 1)), 1360);
+        let h = restored.snapshot(b"a", 1360).unwrap().hour.unwrap();
+        assert_eq!(
+            (h.observed_seconds, h.advanced_frames),
+            (180, 34),
+            "bridged: failed reads dropped the frames they spanned"
+        );
+    }
+
+    #[test]
+    fn shard_read_failures_log_a_start_hourly_summaries_and_an_end() {
+        // Reads fail at every 5-minute archive sync for two hours, then stay
+        // good: one start, one hourly summary, one end; no line per tick.
+        let mut f = ReadFailures::default();
+        let mut lines = Vec::new();
+        for minute in 0..=130u64 {
+            let now = 1_000 + minute * 60;
+            lines.extend(if minute % 5 == 0 && minute < 120 {
+                f.failed(now, "busy", 40)
+            } else {
+                f.succeeded(now)
+            });
+        }
+        assert_eq!(lines.len(), 3, "bounded: {lines:?}");
+        let busy = || "busy".to_owned();
+        assert_eq!(
+            lines,
+            [
+                ReadLine::Started {
+                    error: busy(),
+                    read_ms: 40
+                },
+                ReadLine::Failing {
+                    failed: 12,
+                    good: 48,
+                    since_secs: 3_600,
+                    error: busy(),
+                    read_ms: 40
+                },
+                ReadLine::Recovered {
+                    failed: 24,
+                    lasted_secs: 115 * 60,
+                    error: busy(),
+                    read_ms: 40
+                },
+            ]
+        );
+        // A read failing at every tick for two hours logs three lines, and
+        // a long error is cut on a character boundary.
+        let mut f = ReadFailures::default();
+        let long = format!("a{}", "é".repeat(READ_ERROR_MAX));
+        let lines: Vec<_> = (0..=120u64)
+            .filter_map(|minute| f.failed(minute * 60, &long, 7))
+            .collect();
+        assert_eq!(lines.len(), 3, "bounded: {lines:?}");
+        let ReadLine::Failing { error, .. } = &lines[2] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(error.len(), READ_ERROR_MAX - 1);
     }
 
     #[test]

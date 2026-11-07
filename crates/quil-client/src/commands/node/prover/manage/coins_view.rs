@@ -114,7 +114,7 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
     let state = if let Some(state) = super::super::shield::row_state(m) {
         (state, Some(PRIMARY))
     } else if tally.unshielded > 0 {
-        if coins::shields_open_at(snapshot).is_some() {
+        if coins::shields_open_at(m).is_some() {
             plain("unshielded")
         } else {
             attention("unshielded")
@@ -199,13 +199,13 @@ fn shielded_detail(m: &Model) -> String {
     // total and `As of`, the Transfers panel the pending transfers,
     // Notifications a read's progress, or its failure with ‹E›.
     let read = "This wallet's unspent confidential coins, read with the pending \
-                transfers by full scans matched on this machine (about a minute)";
+                transfers by full scans matched on this machine (longer on a larger network, at most an hour)";
     if transfers.reading.is_some() {
         return format!("{read}.");
     }
     match &transfers.read {
         None => "‹E› reads this wallet's unspent confidential coins with the pending transfers by \
-                 full scans matched on this machine (about a minute)."
+                 full scans matched on this machine (longer on a larger network, at most an hour)."
             .into(),
         Some(Ok(_)) => format!("{read}; ‹E› reads again."),
         Some(Err(_)) => format!("{read}."),
@@ -1084,7 +1084,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
         return ("Shield plan".into(), Vec::new(), None);
     };
     let mut footer = Vec::new();
-    if let Some((frame, left)) = coins::shields_open_at(snapshot) {
+    if let Some((frame, left)) = coins::shields_open_at(m) {
         footer.push(Line::from(Span::styled(
             format!("Shields open at f{frame} (in {left} frames)."),
             Style::new().fg(PRIMARY),
@@ -2025,7 +2025,8 @@ mod coins_render_tests {
             "{text}"
         );
         // A failed read: its notice gives ‹E›, the detail and panel do not.
-        super::super::super::transfer::apply_read(&mut m, Err("timed out".into()));
+        let failed = super::super::super::transfer::ReadFailure::Failed("timed out".into());
+        super::super::super::transfer::apply_read(&mut m, Err(failed));
         m.notice_minimum = NoticeSeverity::Info;
         let text = render_text(&mut m, 120, 50);
         assert_eq!(text.matches("‹E›").count(), 1, "{text}");
@@ -2049,6 +2050,8 @@ mod coins_render_tests {
             &mut m,
             Ok(Read {
                 coins: Some((4, 24_000_000_000)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![
                     Escrow {
                         address: [0xab; 32],
@@ -2327,6 +2330,8 @@ mod coins_render_tests {
             &mut m,
             Ok(super::super::super::transfer::Read {
                 coins: Some((1, 5)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![super::super::super::transfer::Escrow {
                     address: [1; 32],
                     amount: 5,
@@ -2582,6 +2587,8 @@ mod coins_render_tests {
             &mut m,
             Ok(Read {
                 coins: Some((4, 24_000_000_000)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![
                     Escrow {
                         address: [0xab; 32],

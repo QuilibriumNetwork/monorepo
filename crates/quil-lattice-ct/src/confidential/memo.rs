@@ -260,6 +260,33 @@ fn create_output_with_seed(
     Ok(CreatedOutput { output, opening })
 }
 
+/// What opening a coin needs that no coin changes: the context's membership
+/// key and the recipient's public key under it. Deriving them expands about
+/// 1,050 polynomials, where the rest of an opening is one decapsulation and
+/// one decryption, so a wallet scan derives them once and opens every coin
+/// with [`open_output_with_keys`].
+pub struct OpeningKeys {
+    context: [u8; 32],
+    membership: MembershipKey,
+    recipient_key: [u8; IDENTITY_BYTES],
+}
+
+impl OpeningKeys {
+    pub fn derive(context: &[u8; 32], recipient: &RecipientSecret) -> Self {
+        let membership = MembershipKey::derive(context);
+        let recipient_key = membership.recipient_key(recipient);
+        Self {
+            context: *context,
+            membership,
+            recipient_key,
+        }
+    }
+
+    pub fn membership(&self) -> &MembershipKey {
+        &self.membership
+    }
+}
+
 /// Authenticate, decrypt, and check both the value commitment and recipient
 /// owner identity before returning a spend witness to the recipient wallet.
 pub fn open_output(
@@ -268,13 +295,30 @@ pub fn open_output(
     recipient: &RecipientSecret,
     output: &Output,
 ) -> Result<OpenedOutput, MemoError> {
+    open_output_with_keys(
+        &OpeningKeys::derive(context, recipient),
+        kem_secret_key,
+        recipient,
+        output,
+    )
+}
+
+/// [`open_output`] with the keys derived once, in their context. Keys
+/// derived for another recipient open none of `recipient`'s coins.
+pub fn open_output_with_keys(
+    keys: &OpeningKeys,
+    kem_secret_key: &[u8],
+    recipient: &RecipientSecret,
+    output: &Output,
+) -> Result<OpenedOutput, MemoError> {
+    let context = &keys.context;
     let secret = sntrup761::SecretKey::from_bytes(kem_secret_key).map_err(|_| MemoError::Key)?;
     let kem =
         sntrup761::Ciphertext::from_bytes(&output.memo[..KEM_BYTES]).map_err(|_| MemoError::Key)?;
     let shared_secret = sntrup761::decapsulate(&kem, &secret);
     let key = aead_key(context, kem.as_bytes(), shared_secret.as_bytes());
-    let membership = MembershipKey::derive(context);
-    let aad = associated_data(context, &membership.recipient_key(recipient), output);
+    let membership = &keys.membership;
+    let aad = associated_data(context, &keys.recipient_key, output);
     let mut plain = Zeroizing::new([0; 48]);
     plain.copy_from_slice(&output.memo[NONCE_END..BODY_END]);
     Aes256Gcm::new_from_slice(&key[..])
@@ -575,6 +619,127 @@ mod tests {
             open_output(&context, secret.as_bytes(), &recipient, &output),
             Err(MemoError::InconsistentOutput)
         ));
+    }
+
+    /// Keys derived once open what [`open_output`] opens, to the same amounts
+    /// and owners, and refuse what it refuses; keys derived for another
+    /// recipient open none of this recipient's coins.
+    #[test]
+    fn keys_derived_once_open_what_open_output_opens() {
+        let context = [3; 32];
+        let (public, secret) = sntrup761::keypair();
+        let (foreign, _) = sntrup761::keypair();
+        let recipient = RecipientSecret::from_seed(&context, &[9; 32]);
+        let other = RecipientSecret::from_seed(&context, &[8; 32]);
+        let membership = MembershipKey::derive(&context);
+        let ours = |amount: u128| {
+            create_output_inner(
+                &context,
+                public.as_bytes(),
+                &membership.recipient_key(&recipient),
+                amount,
+            )
+            .unwrap()
+            .output
+        };
+        let mut outputs: Vec<Output> = [0, 1, u128::MAX].into_iter().map(ours).collect();
+        outputs.push(
+            create_output_inner(
+                &context,
+                foreign.as_bytes(),
+                &membership.recipient_key(&other),
+                5,
+            )
+            .unwrap()
+            .output,
+        );
+        let mut tampered = ours(7);
+        tampered.memo[BODY_END] ^= 1;
+        outputs.push(tampered);
+        let keys = OpeningKeys::derive(&context, &recipient);
+        let opened: Vec<_> = outputs
+            .iter()
+            .map(|output| open_output_with_keys(&keys, secret.as_bytes(), &recipient, output))
+            .collect();
+        for (i, (once, output)) in opened.iter().zip(&outputs).enumerate() {
+            match (
+                once,
+                open_output(&context, secret.as_bytes(), &recipient, output),
+            ) {
+                (Ok(once), Ok(fresh)) => {
+                    assert_eq!(once.amount, fresh.amount, "coin {i}");
+                    assert_eq!(
+                        membership.owner_key(&once.secrets.owner),
+                        membership.owner_key(&fresh.secrets.owner),
+                        "coin {i}"
+                    );
+                }
+                (Err(once), Err(fresh)) => assert_eq!(once, &fresh, "coin {i}"),
+                _ => panic!("coin {i}: keys derived once and open_output disagree"),
+            }
+        }
+        let amounts: Vec<_> = opened
+            .into_iter()
+            .map(|opened| opened.map(|opened| opened.amount))
+            .collect();
+        assert_eq!(
+            amounts,
+            [
+                Ok(0),
+                Ok(1),
+                Ok(u128::MAX),
+                Err(MemoError::Authentication),
+                Err(MemoError::Authentication)
+            ],
+            "keys derived once misread a coin"
+        );
+        let others = OpeningKeys::derive(&context, &other);
+        for output in &outputs[..3] {
+            assert!(matches!(
+                open_output_with_keys(&others, secret.as_bytes(), &recipient, output),
+                Err(MemoError::Authentication)
+            ));
+        }
+    }
+
+    /// Per-coin cost of opening a foreign coin (most of a scan) with keys
+    /// derived per coin, as [`open_output`] does, and with keys derived
+    /// once. Run it in a release build, alone on an idle host.
+    #[test]
+    #[ignore = "timing: run alone on an idle host"]
+    fn opening_cost_per_coin() {
+        let context = [3; 32];
+        let (_, secret) = sntrup761::keypair();
+        let (foreign, _) = sntrup761::keypair();
+        let recipient = RecipientSecret::from_seed(&context, &[9; 32]);
+        let other = MembershipKey::derive(&context)
+            .recipient_key(&RecipientSecret::from_seed(&context, &[8; 32]));
+        let outputs: Vec<_> = (0..64)
+            .map(|amount| {
+                create_output_inner(&context, foreign.as_bytes(), &other, amount)
+                    .unwrap()
+                    .output
+            })
+            .collect();
+        let per_coin = |open: &dyn Fn(&Output) -> bool| {
+            let started = std::time::Instant::now();
+            assert!(outputs.iter().all(|output| !open(output)));
+            started.elapsed() / outputs.len() as u32
+        };
+        let fresh = per_coin(&|output| {
+            open_output(&context, secret.as_bytes(), &recipient, output).is_ok()
+        });
+        let started = std::time::Instant::now();
+        let keys = OpeningKeys::derive(&context, &recipient);
+        let derive = started.elapsed();
+        let once = per_coin(&|output| {
+            open_output_with_keys(&keys, secret.as_bytes(), &recipient, output).is_ok()
+        });
+        eprintln!(
+            "foreign coin: {fresh:?} with keys per coin, {once:?} with keys derived once \
+             (derivation {derive:?}); {:.1}x",
+            fresh.as_secs_f64() / once.as_secs_f64()
+        );
     }
 
     /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.

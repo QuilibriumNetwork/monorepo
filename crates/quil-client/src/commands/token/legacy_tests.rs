@@ -899,3 +899,28 @@ fn the_shield_journal_is_private_and_keeps_its_entries() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the journal lists the wallet's coins");
 }
+
+/// This node's shield wait gates each kind by its own frame: single shields
+/// from the first, `shield-all`'s batches from the later; none without the
+/// node's condition.
+#[test]
+fn shields_wait_for_the_frame_of_their_kind() {
+    let mut registry = quil_rpc::health_conditions::HealthRegistry::default();
+    registry.refresh_waits(
+        quil_rpc::health_conditions::GlobalObservation {
+            head_frame: 950,
+            epoch_length: 720,
+            shields_from: Some((900, 1000)),
+            sync_installing: None,
+        },
+        1_800_000_000_000,
+    );
+    let conditions = registry.snapshot().conditions;
+    assert_eq!(
+        shields_closed(&conditions, false),
+        None,
+        "single shields are admitted from frame 900"
+    );
+    assert_eq!(shields_closed(&conditions, true), Some((1000, 950)));
+    assert_eq!(shields_closed(&[], true), None);
+}

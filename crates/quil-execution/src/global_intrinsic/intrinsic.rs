@@ -92,6 +92,55 @@ struct SealDrain {
     complete: bool,
 }
 
+/// What [`GlobalIntrinsic::seal_drain`] requires of drain headers from their
+/// shard and frame numbers alone, checked before any certificate or header
+/// is verified: each from the session's shard `filter`, consecutive, the
+/// first not yet executed numbered `next`, none past the sealed `checkpoint`.
+/// Whether they end at it (complete); else, from the seal recovery frame, a
+/// partial drain of exactly `MAX_DRAIN_HEADERS` headers, one or more not yet
+/// executed.
+fn drain_shape(
+    frame_number: u64,
+    checkpoint: u64,
+    filter: &[u8],
+    mut next: u64,
+    headers: &[super::frame_header::FrameHeader],
+) -> Result<bool> {
+    use super::handoff;
+    let invalid = |message: &str| QuilError::InvalidArgument(format!("seal drain: {message}"));
+    let mut last: Option<u64> = None;
+    let mut drained = 0usize;
+    for op in headers {
+        if op.address != filter {
+            return Err(invalid("header from another shard"));
+        }
+        if last.is_some_and(|previous| op.frame_number != previous.saturating_add(1)) {
+            return Err(invalid("headers are not consecutive"));
+        }
+        last = Some(op.frame_number);
+        if op.frame_number < next {
+            continue;
+        }
+        if op.frame_number > next {
+            return Err(invalid("headers leave a gap after the executed tip"));
+        }
+        next = next.saturating_add(1);
+        drained += 1;
+    }
+    match last {
+        Some(last) if last == checkpoint => Ok(true),
+        Some(last) if last > checkpoint => Err(invalid("headers run past the sealed checkpoint")),
+        _ if frame_number < handoff::seal_recovery_frame() => {
+            Err(invalid("headers do not end at the sealed checkpoint"))
+        }
+        _ if headers.len() != handoff::MAX_DRAIN_HEADERS => Err(invalid(
+            "a partial drain carries exactly the most headers a submission may",
+        )),
+        _ if drained == 0 => Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
+        _ => Ok(false),
+    }
+}
+
 /// Where a committee session pass spent its time, logged when it is slow.
 struct SessionPassTiming {
     frame: u64,
@@ -3252,27 +3301,21 @@ impl GlobalIntrinsic {
             .iter()
             .map(|bytes| super::frame_header::FrameHeader::from_canonical_bytes(bytes))
             .collect::<Result<Vec<_>>>()?;
-        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut executed = recorded;
         let mut next = executed
             .as_ref()
             .map_or(session.base_frame, |tip| tip.frame)
             .saturating_add(1);
+        let checkpoint = sealed.submission.seal.checkpoint.frame;
+        // Before any certificate: a copy numbered wrong costs no signature.
+        let complete = drain_shape(frame_number, checkpoint, &session.filter, next, &headers)?;
+        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut last: Option<u64> = None;
         let mut drained = 0usize;
         for (op, by_seal) in headers.into_iter().zip(by_seal) {
-            if op.address != session.filter {
-                return Err(invalid("header from another shard"));
-            }
-            if last.is_some_and(|previous| op.frame_number != previous.saturating_add(1)) {
-                return Err(invalid("headers are not consecutive"));
-            }
             last = Some(op.frame_number);
             if op.frame_number < next {
                 continue;
-            }
-            if op.frame_number > next {
-                return Err(invalid("headers leave a gap after the executed tip"));
             }
             if by_seal {
                 self.check_seal_certified_header(frame_number, &op)?;
@@ -3329,23 +3372,6 @@ impl GlobalIntrinsic {
             next = next.saturating_add(1);
             drained += 1;
         }
-        let checkpoint = sealed.submission.seal.checkpoint.frame;
-        let complete = match last {
-            Some(last) if last == checkpoint => true,
-            Some(last) if last > checkpoint => {
-                return Err(invalid("headers run past the sealed checkpoint"))
-            }
-            _ if frame_number < handoff::seal_recovery_frame() => {
-                return Err(invalid("headers do not end at the sealed checkpoint"));
-            }
-            _ if sealed.drain.len() != handoff::MAX_DRAIN_HEADERS => {
-                return Err(invalid(
-                    "a partial drain carries exactly the most headers a submission may",
-                ));
-            }
-            _ if drained == 0 => return Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
-            _ => false,
-        };
         if execute && drained > 0 {
             tracing::info!(
                 frame = frame_number,
@@ -5315,6 +5341,47 @@ impl GlobalIntrinsic {
                 timing.lap("early fences");
             }
         }
+        // From the silent fence's first frame, a session whose tip stood
+        // still for K frames because members went silent on every shard is
+        // fenced early without them (`handoff::silence`). The prover scan is
+        // built only when some session is due for that judgement.
+        if super::handoff::silence::evaluates(frame_number) {
+            let stalled = super::handoff::silence::stalled(state, frame_number, &filters)?;
+            timing.lap("silent stalls");
+            if !stalled.is_empty() {
+                if scanned.is_none() {
+                    scanned = Some(timed_prover_scan(hg, &timing.scan_ms)?);
+                }
+                let scan = scanned.as_ref().expect("scanned above");
+                let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+                    let desired =
+                        super::handoff::schedule::desired_members(scan, filter, frame_number);
+                    let desired =
+                        super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+                    super::handoff::silence::seated(state, frame_number, filter, desired, scan)
+                };
+                let checkpoint = state.changeset_len();
+                match super::handoff::silence::evaluate(
+                    state,
+                    frame_number,
+                    &stalled,
+                    scan,
+                    &mut desired,
+                ) {
+                    Ok(decisions) => {
+                        if !decisions.is_empty() {
+                            super::handoff::silence::fence(state, frame_number, &decisions)?;
+                        }
+                    }
+                    Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                        state.rollback_to(checkpoint);
+                        tracing::error!(frame = frame_number, %error, "committee silence: silent-prover pass failed; nothing fenced");
+                    }
+                    Err(error) => return Err(error),
+                }
+                timing.lap("silent-prover fences");
+            }
+        }
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
@@ -5324,10 +5391,12 @@ impl GlobalIntrinsic {
             if scanned.is_none() {
                 scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
             }
-            let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
-                super::handoff::schedule::desired_members(scan, filter, frame_number)
-            });
-            super::handoff::exclusion::seated(state, frame_number, filter, desired)
+            let Some(scan) = scanned.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let desired = super::handoff::schedule::desired_members(scan, filter, frame_number);
+            let desired = super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+            super::handoff::silence::seated(state, frame_number, filter, desired, scan)
         };
         // From the seal successor eligibility frame a sealed membership
         // source's successor waits for this pass, and takes the same

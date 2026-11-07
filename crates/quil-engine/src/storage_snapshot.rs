@@ -661,6 +661,9 @@ struct RunningLeaf {
     /// Its layers labelled when it started, now, and of how many
     /// ([`LeafProgress::layers`]); none when not reported.
     layers: Option<(usize, usize, usize)>,
+    /// Whether its labelled layers are kept on disk, so a restart goes on
+    /// from them ([`LeafProgress::labels_kept`]); none until known.
+    kept: Option<bool>,
     /// How long it paused ([`LeafProgress::paused`]).
     paused: std::time::Duration,
     /// Whether its start was logged, or it was reported running long: its
@@ -677,6 +680,9 @@ struct RunningLeaves {
     /// Each leaf's epoch, shard, work and outcome as it ended, for tests.
     #[cfg(test)]
     ended: Vec<(u64, Vec<u8>, LeafWork, LeafOutcome)>,
+    /// Each ended leaf's shard and whether it had noted its labels kept.
+    #[cfg(test)]
+    ended_kept: Vec<(Vec<u8>, Option<bool>)>,
 }
 
 fn running_leaves() -> std::sync::MutexGuard<'static, RunningLeaves> {
@@ -729,6 +735,14 @@ impl LeafProgress {
                 }
             };
             leaf.layers = Some((from, done, of));
+        }
+    }
+
+    /// Note whether the leaf's labelled layers are kept on disk (room was
+    /// admitted for them): a restart goes on from them, else redoes the leaf.
+    pub fn labels_kept(&self, kept: bool) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            leaf.kept = Some(kept);
         }
     }
 
@@ -817,6 +831,8 @@ pub fn leaf_started_from(
             started: std::time::Instant::now(),
             estimate,
             layers: None,
+            // Encoded from layers kept ahead: nothing is lost to labelling.
+            kept: (work == LeafWork::FromLabelsAhead).then_some(true),
             paused: std::time::Duration::ZERO,
             logged,
         },
@@ -837,9 +853,13 @@ impl Drop for LeafProgress {
             }
         });
         #[cfg(test)]
-        running_leaves()
-            .ended
-            .push((leaf.epoch, leaf.filter.clone(), leaf.work, outcome));
+        {
+            let mut running = running_leaves();
+            running
+                .ended
+                .push((leaf.epoch, leaf.filter.clone(), leaf.work, outcome));
+            running.ended_kept.push((leaf.filter.clone(), leaf.kept));
+        }
         if leaf.logged {
             info!(epoch = leaf.epoch, filter = %hex::encode(&leaf.filter), nodes = leaf.nodes,
                 work = leaf.work.name(), seconds = leaf.started.elapsed().as_secs(),
@@ -876,6 +896,72 @@ pub fn snapshot_progress(filters: &[Vec<u8>], epoch: u64) -> Option<SnapshotProg
         }
     }
     (progress.leaves > 0).then_some(progress)
+}
+
+/// The snapshot encode of the leaves of `filters` running now, for a restart
+/// verdict (`crate::restart_readiness`); `None` when none is.
+pub(crate) fn seat_encode(filters: &[Vec<u8>]) -> Option<crate::restart_readiness::EncodeState> {
+    use crate::restart_readiness::EncodeState;
+    let frame = global_frame();
+    let default_layers = quil_crypto::sdr::SdrParams::default().layers;
+    let running = running_leaves();
+    let mut state: Option<EncodeState> = None;
+    for leaf in running
+        .leaves
+        .values()
+        .filter(|leaf| leaf.work != LeafWork::LabellingAhead && filters.contains(&leaf.filter))
+    {
+        let elapsed = leaf.started.elapsed();
+        let worked = elapsed.saturating_sub(leaf.paused);
+        let (done, of) = match (leaf.layers, leaf.work) {
+            (Some((_, done, of)), _) => (done, of),
+            (None, LeafWork::FromLabelsAhead) => (default_layers, default_layers),
+            (None, _) => (0, default_layers),
+        };
+        let kept = leaf.kept == Some(true);
+        let one_layer = label_estimate(leaf.nodes) / u32::try_from(of).unwrap_or(1).max(1);
+        // Encoding from kept labels redoes its encode; labelling from kept
+        // layers loses at most the layer in progress.
+        let lost = if kept && leaf.work != LeafWork::FromLabelsAhead {
+            worked.min(one_layer)
+        } else {
+            worked
+        };
+        let remaining = leaf
+            .estimate
+            .map_or(std::time::Duration::ZERO, |e| e.saturating_sub(elapsed));
+        let to_grace = frame.map(|frame| {
+            let grace = quil_types::consensus::storage_snapshot_frame(leaf.epoch)
+                .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
+            std::time::Duration::from_millis(
+                grace
+                    .saturating_sub(frame)
+                    .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(frame)),
+            )
+        });
+        state = Some(match state {
+            None => EncodeState {
+                labels_kept: kept,
+                layers_done: done,
+                layers: of,
+                remaining,
+                lost,
+                to_grace,
+            },
+            Some(s) => EncodeState {
+                labels_kept: s.labels_kept && kept,
+                layers_done: s.layers_done.min(done),
+                layers: s.layers.max(of),
+                remaining: s.remaining.max(remaining),
+                lost: s.lost.max(lost),
+                to_grace: match (s.to_grace, to_grace) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                },
+            },
+        });
+    }
+    state
 }
 
 /// Report, every [`LEAF_PROGRESS_INTERVAL`] at most once a seat, the leaves
@@ -930,6 +1016,10 @@ fn report_long_leaves() {
             }
         }
         for ((epoch, filter, work), seat) in seats {
+            let (ready, verdict) = crate::restart_readiness::shards_readiness(
+                std::slice::from_ref(&filter),
+                crate::restart_readiness::noted_margin(&filter),
+            );
             let estimated = seat
                 .estimate
                 .map_or_else(|| "unknown".to_string(), |e| (e.as_secs() / 60).to_string());
@@ -969,13 +1059,21 @@ fn report_long_leaves() {
                 // ahead) this is the expected wait of a renewal.
                 _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,
                     nodes = seat.nodes, longest_minutes = longest, estimated_minutes = %estimated,
-                    grace_frame, work = work.name(), scope = "local",
+                    grace_frame, work = work.name(), labels_kept = ready.labels_kept,
+                    layers_done = ready.layers_done, layers = ready.layers,
+                    restart_cost_minutes = ready.restart_cost_minutes,
+                    minutes_to_grace = ready.minutes_to_grace, restart = verdict.text(),
+                    scope = "local",
                     action = "no action needed: the seat's renewal registers its storage once \
                               they end; this warns if they pass their estimate",
                     "this node is still preparing a seat's storage proof data; its renewal waits for it"),
                 _ => warn!(epoch, filter = %filter, leaves = seat.leaves, nodes = seat.nodes,
                     longest_minutes = longest, estimated_minutes = %estimated, grace_frame,
-                    work = work.name(), scope = "local",
+                    work = work.name(), labels_kept = ready.labels_kept,
+                    layers_done = ready.layers_done, layers = ready.layers,
+                    restart_cost_minutes = ready.restart_cost_minutes,
+                    minutes_to_grace = ready.minutes_to_grace, restart = verdict.text(),
+                    scope = "local",
                     action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
                               if the leaves have not ended by the grace frame, the seat renews \
                               without a storage registration that epoch",
@@ -993,7 +1091,11 @@ fn report_long_leaves() {
 /// otherwise it is labelled now, going on from the whole layers kept on disk
 /// at a count its data may register (labelled ahead, or by this snapshot
 /// before a restart), its labels kept for its seal when their filesystem has
-/// room for them.
+/// room for them. Labels kept that do not match their column commitment are
+/// labelled again rather than encoded from
+/// (`crate::storage_labels::Kept::verified_last_layer`), and a leaf whose
+/// labels cannot be written is encoded as by a process that keeps none, its
+/// seal labelling it again.
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
     encode_member_with(
         captured,
@@ -1037,7 +1139,9 @@ fn encode_member_until(
     }
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         if quil_types::consensus::persistent_storage_at(captured.epoch) {
-            return persistent::encode_leaf(captured, member, prefix, replicas, store, stop);
+            // A persistent sector fails rather than goes on unkept.
+            return persistent::encode_leaf(captured, member, prefix, replicas, store, stop)
+                .map(|(n, ahead, resumed)| (n, ahead, resumed, None));
         }
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         if stop() {
@@ -1052,7 +1156,7 @@ fn encode_member_until(
                     .get_hash_leaf(captured.epoch, &leaf_id)?
                     .ok_or_else(|| unavailable("snapshot alias disappeared".into()))?;
                 replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
-                return Ok((leaf.n, true, 0));
+                return Ok((leaf.n, true, 0, None));
             }
         }
         let size = captured.leaf_size(prefix)?;
@@ -1114,10 +1218,43 @@ fn encode_member_until(
         };
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
+        // Labels kept that are not whole are labelled again rather than
+        // encoded from: a registration from them could never be sealed.
         let ahead = store.and_then(|store| {
-            store.find(captured.epoch, member, &leaf_id, |n| {
+            let kept = store.find(captured.epoch, member, &leaf_id, |n| {
                 padded_nodes_allowed(exact, n)
-            })
+            })?;
+            let checking = std::time::Instant::now();
+            let last = kept.verified_last_layer();
+            let took = checking.elapsed();
+            match last {
+                Some(last) => {
+                    if took >= LEAF_LOGGED_FROM {
+                        info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+                            leaf = %hex::encode(&leaf_id), nodes = kept.n,
+                            verify_seconds = took.as_secs_f64(), scope = "local",
+                            "storage labels kept for a leaf took long to check against their \
+                             column commitment before its snapshot encodes from them: check this \
+                             node's disk and CPU load if this recurs");
+                    }
+                    Some((kept, last))
+                }
+                None => {
+                    warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+                        leaf = %hex::encode(&leaf_id), nodes = kept.n,
+                        verify_seconds = took.as_secs_f64(), scope = "local",
+                        action = "check this node's disk and its kernel log for I/O errors if \
+                                  this recurs",
+                        "storage labels kept for a leaf do not match their column commitment, as \
+                         a torn or damaged file on this node's disk leaves them; they are removed \
+                         and the leaf is labelled again for its snapshot (about an hour per GiB \
+                         on a core)");
+                    let n = kept.n;
+                    drop(kept);
+                    store.discard_damaged(captured.epoch, member, &leaf_id, n);
+                    None
+                }
+            }
         });
         // Else the leaf is labelled at the count its data may register
         // with the most whole layers kept on disk, or at its own.
@@ -1129,10 +1266,10 @@ fn encode_member_until(
                 .unwrap_or((exact, 0)),
             _ => (exact, 0),
         };
-        let nodes = ahead.as_ref().map_or(count, |kept| kept.n);
+        let nodes = ahead.as_ref().map_or(count, |(labels, _)| labels.n);
         memory.resize(ahead.as_ref().map_or_else(
             || encoding_bytes(nodes),
-            |kept| quil_crypto::storage_proof::encoding_with_labels_bytes(kept.n),
+            |(labels, _)| quil_crypto::storage_proof::encoding_with_labels_bytes(labels.n),
         ));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
@@ -1153,9 +1290,7 @@ fn encode_member_until(
                 LeafWork::LabellingNow
             },
         );
-        let from_kept = ahead.and_then(|kept| {
-            use quil_crypto::storage_proof::LabelSource as _;
-            let last = kept.last_layer()?;
+        let from_kept = ahead.and_then(|(kept, last)| {
             quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
         });
         let ahead = from_kept.is_some();
@@ -1164,17 +1299,20 @@ fn encode_member_until(
             // `crate::storage_jobs::ahead_beside_due` of it.
             memory.labelling_now();
         }
-        // Labelled now and kept when there is room; otherwise encoded as by a
-        // process that keeps no labels, and its seal labels it again.
+        // Labelled now and kept when there is room; otherwise, or when its
+        // labels cannot be written, encoded as by a process that keeps no
+        // labels, and its seal labels it again: a failed write does not fail
+        // the snapshot, whose retry would label every leaf again.
         let mut data = Some(data);
         if from_kept.is_none() {
             data.take();
         }
-        let mut resumed = 0;
+        let (mut resumed, mut unkept) = (0, None);
         let labelled = match (&from_kept, store) {
             (None, Some(store)) => {
                 match store.admit(captured.epoch, member, &leaf_id, count, Stage::Snapshot) {
                     Some(admitted) => {
+                        progress.labels_kept(true);
                         let layers = params.layers;
                         if let Some(kept) = admitted.resumed() {
                             resumed = kept.layers;
@@ -1191,15 +1329,15 @@ fn encode_member_until(
                         }
                         progress.layers(admitted.resumes_from(), layers);
                         let labelling = admitted
-                            .label_kept(&params, stop, &|done| progress.layers(done, layers))?;
+                            .label_kept(&params, stop, &|done| progress.layers(done, layers));
                         match labelling {
-                            Labelling::Labelled(labelled) => Some((count, labelled)),
-                            Labelling::Refused => {
+                            Ok(Labelling::Labelled(labelled)) => Some((count, labelled)),
+                            Ok(Labelling::Refused) => {
                                 return Err(QuilError::Internal(
                                     "storage labels: a snapshot's labelling refused room".into(),
                                 ))
                             }
-                            Labelling::Stopped { .. } => {
+                            Ok(Labelling::Stopped { .. }) => {
                                 // Kept for the next attempt unless the seat
                                 // renews without them.
                                 if grace_passed(member, captured.epoch)
@@ -1210,10 +1348,21 @@ fn encode_member_until(
                                 progress.end(stop_outcome());
                                 return Err(stopped());
                             }
+                            Err(error) => {
+                                unkept = Some(error);
+                                None
+                            }
                         }
                     }
-                    None => None,
+                    None => {
+                        progress.labels_kept(false);
+                        None
+                    }
                 }
+            }
+            (None, None) => {
+                progress.labels_kept(false);
+                None
             }
             _ => None,
         };
@@ -1260,13 +1409,22 @@ fn encode_member_until(
         replicas.put_data_cap(captured.epoch, &leaf_id, &encoded.data_cap)?;
         replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
         progress.end(LeafOutcome::Completed);
-        Ok((encoded.n, ahead, resumed))
+        Ok((encoded.n, ahead, resumed, unkept))
     })?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
-        labelled_ahead = encoded.iter().filter(|(_, ahead, _)| *ahead).count(),
-        layers_resumed = encoded.iter().map(|(.., resumed)| resumed).sum::<usize>(),
+        labelled_ahead = encoded.iter().filter(|(_, ahead, ..)| *ahead).count(),
+        layers_resumed = encoded.iter().map(|(_, _, resumed, _)| resumed).sum::<usize>(),
         nodes = encoded.iter().map(|(n, ..)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
         "storage snapshot leaves encoded");
+    let mut unkept = encoded.iter().filter_map(|(.., unkept)| unkept.as_ref());
+    if let Some(error) = unkept.next() {
+        warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+            leaves = encoded.len(), unkept = 1 + unkept.count(), %error, scope = "local",
+            "storage labels not kept at the snapshot: writing them failed on this node's \
+             disk; the leaves are registered without them, and their seal labels them again \
+             (about an hour per GiB on a core): check free space and health of the \
+             storage-labels disk");
+    }
     let nodes: Vec<u64> = encoded.iter().map(|(n, ..)| *n).collect();
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
@@ -2063,10 +2221,43 @@ pub fn prepare_member_seat(
 /// Seconds a failed snapshot waits before it is tried again.
 const SNAPSHOT_RETRY_SECS: u64 = 60;
 
+/// Times a job failing on a local disk error (`QuilError::Io`, as a label
+/// write to a full disk) doubles its wait before it is tried again: from
+/// [`SNAPSHOT_RETRY_SECS`] to 32 minutes, about a fifth of an epoch.
+const IO_RETRY_DOUBLINGS: u32 = 5;
+
+/// A snapshot job's record ([`request`]).
+#[derive(Default)]
+struct JobState {
+    /// When it last failed, and how long it waits since; `None` while it is
+    /// queued or running.
+    failed: Option<(std::time::Instant, std::time::Duration)>,
+    /// Its failures in a row on a local disk error.
+    io_failures: u32,
+}
+
+impl JobState {
+    /// Record a failure with `error`: how long the job waits before it is
+    /// tried again. A local disk error waits twice as long as the one before
+    /// it, up to [`IO_RETRY_DOUBLINGS`] times; any other waits
+    /// [`SNAPSHOT_RETRY_SECS`].
+    fn failed_with(&mut self, error: &QuilError) -> std::time::Duration {
+        self.io_failures = match error {
+            QuilError::Io(_) => self.io_failures.saturating_add(1),
+            _ => 0,
+        };
+        let doublings = self.io_failures.saturating_sub(1).min(IO_RETRY_DOUBLINGS);
+        let wait = std::time::Duration::from_secs(SNAPSHOT_RETRY_SECS << doublings);
+        self.failed = Some((std::time::Instant::now(), wait));
+        wait
+    }
+}
+
 /// Run the snapshot job for `key` in `lane` (`crate::storage_jobs::spawn`)
-/// unless one is queued or running, or the last failed less than
-/// [`SNAPSHOT_RETRY_SECS`] ago. A job that succeeds leaves its record behind,
-/// so its caller stops asking.
+/// unless one is queued or running, or the last failed less than its wait
+/// ago ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
+/// it fails on a local disk error. A job that succeeds leaves its record
+/// behind, so its caller stops asking.
 pub fn request(
     lane: &[u8],
     key: Vec<u8>,
@@ -2074,19 +2265,29 @@ pub fn request(
     job: impl FnOnce() -> Result<()> + Send + 'static,
 ) {
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-    static STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, Option<Instant>>>> =
+    use std::time::Duration;
+    static STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, JobState>>> =
         std::sync::OnceLock::new();
+    // A failed job no caller asked for again within twice the longest wait
+    // is forgotten.
+    let forget = Duration::from_secs(2 * (SNAPSHOT_RETRY_SECS << IO_RETRY_DOUBLINGS));
     let state = STATE.get_or_init(Default::default);
     {
         let Ok(mut jobs) = state.lock() else { return };
-        jobs.retain(|_, failed| {
-            failed.is_none_or(|at| at.elapsed() < Duration::from_secs(SNAPSHOT_RETRY_SECS))
-        });
-        if jobs.contains_key(&key) {
-            return;
+        jobs.retain(|_, job| job.failed.is_none_or(|(at, _)| at.elapsed() < forget));
+        match jobs.get(&key).map(|job| job.failed) {
+            // Queued or running, or waiting after a failure.
+            Some(None) => return,
+            Some(Some((at, wait))) if at.elapsed() < wait => return,
+            Some(Some(_)) => {
+                if let Some(job) = jobs.get_mut(&key) {
+                    job.failed = None;
+                }
+            }
+            None => {
+                jobs.insert(key.clone(), JobState::default());
+            }
         }
-        jobs.insert(key.clone(), None);
     }
     crate::storage_jobs::spawn(lane, label, move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
@@ -2096,8 +2297,16 @@ pub fn request(
                 Ok(()) => {
                     jobs.remove(&key);
                 }
-                Err(_) => {
-                    jobs.insert(key, Some(Instant::now()));
+                Err(error) => {
+                    let job = jobs.entry(key).or_default();
+                    let wait = job.failed_with(error);
+                    if job.io_failures == 1 {
+                        warn!(label, %error, retry_seconds = wait.as_secs(),
+                            max_retry_seconds = SNAPSHOT_RETRY_SECS << IO_RETRY_DOUBLINGS,
+                            "storage snapshot job failed on this node's disk; while it keeps \
+                             failing it is tried again at doubling intervals rather than every \
+                             minute: check free space and health of the node's disk");
+                    }
                 }
             }
         }
@@ -2463,7 +2672,7 @@ pub(crate) mod tests {
         let proved = captured.prove_binding(&claim).unwrap();
         assert_eq!(binding::verify(&claim, &proved), Ok(()));
         assert_eq!(
-            LeafBinding::from_bytes(&proved.to_bytes()),
+            LeafBinding::from_bytes(&proved.to_bytes(), claim.epoch),
             Some(proved.clone())
         );
         assert!(
@@ -4492,6 +4701,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// Whether the leaf of `captured`'s seat noted its labels kept when its
+    /// encode ended. A leaf this small ends before any stop check could
+    /// sample it mid-labelling, so the flag is read as the leaf ends.
+    fn encode_kept(
+        captured: &Captured,
+        member: &[u8],
+        store: Option<&crate::storage_labels::LabelStore>,
+    ) -> Option<bool> {
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let before = running_leaves().ended_kept.len();
+        encode_member_until(captured, member, &replicas, store, &|| false).unwrap();
+        let running = running_leaves();
+        let ended = &running.ended_kept[before..];
+        assert!(ended.iter().all(|(filter, _)| *filter == captured.filter));
+        assert!(!ended.is_empty(), "a leaf ran");
+        assert!(
+            ended.iter().all(|(_, kept)| *kept == ended[0].1),
+            "{ended:?}"
+        );
+        ended[0].1
+    }
+
+    /// A restart verdict reads whether a labelling leaf keeps its layers on
+    /// disk: kept where the filesystem has room, not where it refused room
+    /// or the node keeps no labels (2026-11-05: a restart redoes the second
+    /// from zero).
+    #[test]
+    fn a_labelling_leaf_reports_whether_its_layers_are_kept() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        let crdt = test_crdt();
+        let app = [0x7Du8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let member = [0x62u8; 32];
+        let dir = std::env::temp_dir().join(format!("quil-labels-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let roomy = LabelStore::with_space(dir.clone(), ample_space());
+        assert_eq!(encode_kept(&captured, &member, Some(&roomy)), Some(true));
+        // Its own directory: the roomy call's complete labels would be found
+        // and the leaf encoded from them (kept), whatever the room.
+        let cramped_dir = dir.with_extension("cramped");
+        let _ = std::fs::remove_dir_all(&cramped_dir);
+        let cramped = LabelStore::with_space(
+            cramped_dir.clone(),
+            Box::new(|_| {
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 100 << 30,
+                    free_bytes: 9 << 30,
+                    ..Default::default()
+                })
+            }),
+        );
+        assert_eq!(
+            encode_kept(&captured, &member, Some(&cramped)),
+            Some(false),
+            "room refused"
+        );
+        assert_eq!(
+            encode_kept(&captured, &member, None),
+            Some(false),
+            "no store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cramped_dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// What a restart loses of a seat's running leaf: at most one layer when
+    /// its layers are kept, everything it did otherwise; labelling ahead is
+    /// no part of a snapshot's seat.
+    #[test]
+    fn a_restart_loses_a_layer_of_kept_labels_and_all_of_unkept() {
+        let filter = b"seat-encode-loss".to_vec();
+        let leaf = leaf_started(9, &filter, b"leaf", 15_000_000, LeafWork::LabellingNow);
+        let ahead = leaf_started(9, &filter, b"other", 15_000_000, LeafWork::LabellingAhead);
+        leaf.layers(4, 11);
+        let hour = std::time::Duration::from_secs(3600);
+        running_leaves().leaves.get_mut(&leaf.id).unwrap().started =
+            std::time::Instant::now() - hour;
+        let unkept = seat_encode(std::slice::from_ref(&filter)).unwrap();
+        assert!(!unkept.labels_kept);
+        assert!(unkept.lost >= hour, "{:?}", unkept.lost);
+        assert_eq!((unkept.layers_done, unkept.layers), (4, 11));
+        leaf.labels_kept(true);
+        let kept = seat_encode(std::slice::from_ref(&filter)).unwrap();
+        assert!(kept.labels_kept);
+        assert_eq!(kept.lost, label_estimate(15_000_000) / 11);
+        drop(ahead);
+        drop(leaf);
+        assert_eq!(seat_encode(std::slice::from_ref(&filter)), None);
+    }
+
     /// A leaf whose labels' filesystem has no room for them
     /// (`crate::storage_labels::LabelStore::admit`) is not labelled ahead,
     /// and is encoded at its snapshot as by a process that keeps no labels:
@@ -4665,6 +4979,18 @@ pub(crate) mod tests {
             assert_eq!(sparse.to_bytes(), dense.to_bytes());
             binding::verify(&claim, &sparse).unwrap();
             assert_eq!(values.get(), binding::BINDING_SAMPLES);
+            // From the padding bound both open record 0 as well.
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(0));
+            let dense = captured.prove_binding(&claim).unwrap();
+            let sparse = binding::prove_sparse(&claim, &source, &proof, &value).unwrap();
+            let verified = binding::verify(&claim, &sparse);
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+            assert_eq!(sparse.to_bytes(), dense.to_bytes());
+            assert_eq!(
+                sparse.first.is_empty(),
+                captured.entries(prefix).unwrap().len() < 2
+            );
+            assert_eq!(verified, Ok(()));
             assert!(binding::prove_sparse(&claim, &source, &proof, &|_, _| Err(
                 "missing retained value".into()
             ))
@@ -4804,5 +5130,728 @@ pub(crate) mod tests {
             "fresh native proofs alone crowd out the existing GLOBAL budget"
         );
         eprintln!("mainnet model: shards=109 active_app_provers=168 local_sector_mib={} changed_encode_peak_mib={} cold_peak_mib={} one-copy-native-bytes={total_native} effective-active-seats={active_seats} replicated-native-bytes={replicated_native} epoch-budget-bytes={epoch_budget}",n*32>>20,encode>>20,cold>>20);
+    }
+
+    /// A job failing on a local disk error waits twice as long at each
+    /// failure, up to 32 minutes; any other failure, or one after it, waits
+    /// a minute.
+    #[test]
+    fn a_job_failing_on_the_disk_is_retried_at_doubling_intervals() {
+        let mut job = JobState::default();
+        let disk = || QuilError::Io(std::io::Error::other("no space left"));
+        let waits: Vec<u64> = (0..7).map(|_| job.failed_with(&disk()).as_secs()).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1920, 1920]);
+        let other = QuilError::ExecutionUnavailable("no source".into());
+        assert_eq!(job.failed_with(&other).as_secs(), 60);
+        assert_eq!(job.failed_with(&disk()).as_secs(), 60);
+    }
+
+    /// Labels kept for a leaf whose layers file was torn, its length
+    /// unchanged (here the second half of its last layer zeroed, as two
+    /// workers writing it at once can leave it), are not encoded from: the
+    /// registration is the leaf's own encoding, which its seal can open.
+    #[test]
+    fn a_torn_kept_label_file_is_not_encoded_from() {
+        use crate::storage_labels::{ample_space, files_under, LabelStore, Stage};
+        use quil_crypto::storage_proof::{data_node_count, NODE_BYTES};
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("quil-labels-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let crdt = test_crdt();
+        let app = [0x7Eu8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 7;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let member = [0x63u8; 32];
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let admitted = store
+            .admit(epoch, &member, &leaf_id, exact, Stage::Ahead)
+            .unwrap();
+        assert!(admitted.label(&params).unwrap().kept);
+        // Tear the kept layers file.
+        let layers = files_under(&dir)
+            .into_iter()
+            .find(|file| file.extension().is_some_and(|kind| kind == "layers"))
+            .expect("the kept layers");
+        let half = exact / 2;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&layers)
+            .unwrap()
+            .write_all_at(
+                &vec![0u8; ((exact - half) * NODE_BYTES as u64) as usize],
+                ((params.layers as u64 - 1) * exact + half) * NODE_BYTES as u64,
+            )
+            .unwrap();
+        assert!(store
+            .find(epoch, &member, &leaf_id, |n| n == exact)
+            .is_some());
+
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_member_with(&captured, &member, &replicas, Some(&store)).unwrap();
+        let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+        let whole = quil_crypto::storage_proof::encode_leaf_at(
+            &data,
+            &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+            &params,
+            exact,
+            &mut |_, _| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            stored.registration_root == whole.registration_root(),
+            "a torn kept label file was encoded from: the registration commits to a \
+             replica that is not the leaf's encoding, so its seal can never be proven"
+        );
+    }
+
+    /// A leaf whose labels cannot be written (here its label directory's
+    /// path is taken by a file) is encoded as by a process that keeps no
+    /// labels: the snapshot succeeds with the leaf's own encoding, rather
+    /// than failing and labelling every leaf again at each retry.
+    #[test]
+    fn a_failed_label_write_does_not_fail_the_snapshot() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use sha3::Digest as _;
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let crdt = test_crdt();
+        let app = [0x7Du8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 8;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let member = [0x64u8; 32];
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert!(!captured.prefixes.is_empty());
+        // Each leaf's label directory, `<epoch>/<member and leaf>` below the
+        // store's before the stable replica key epoch, is taken by a file.
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let mut h = sha3::Sha3_256::new();
+            h.update((member.len() as u32).to_be_bytes());
+            h.update(member);
+            h.update(&leaf_id);
+            let path = dir.join(epoch.to_string()).join(hex::encode(h.finalize()));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+        }
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let result = encode_member_with(&captured, &member, &replicas, Some(&store));
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            result.is_ok(),
+            "a failed label write failed the snapshot, whose job is then retried every \
+             minute, labelling every leaf again: {result:?}"
+        );
+        let params = quil_crypto::sdr::SdrParams::default();
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let data = captured.leaf_data(prefix).unwrap();
+            let own = quil_crypto::storage_proof::encode_leaf(
+                &data,
+                &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+                &params,
+            );
+            let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+            assert!(stored.registration_root == own.registration_root());
+        }
+    }
+
+    /// A leaf of 24 vertices of distinct bytes on `app`, captured at `epoch`.
+    fn padding_leaf(app: [u8; 32], epoch: u64) -> Captured {
+        let crdt = test_crdt();
+        for d in 0u8..24 {
+            let value: Vec<u8> = (0..200 + d as usize)
+                .map(|k| (k * 31 + d as usize * 7) as u8)
+                .collect();
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(9), d),
+                },
+                &value,
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap()
+    }
+
+    /// `bound`'s openings, made against the data tree `from`, opened
+    /// against `to`, which holds the same nodes below `exact`.
+    fn repath(
+        bound: &mut LeafBinding,
+        from: &quil_crypto::storage_proof::MerkleTree,
+        to: &quil_crypto::storage_proof::MerkleTree,
+        exact: u64,
+    ) {
+        let index: std::collections::HashMap<Vec<[u8; 32]>, u64> =
+            (0..exact).map(|i| (from.path(i), i)).collect();
+        let mut moved = |opening: &mut binding::Opening| {
+            opening.path = to.path(index[&opening.path]);
+        };
+        bound.header.iter_mut().for_each(&mut moved);
+        bound.last.iter_mut().for_each(&mut moved);
+        bound.first.iter_mut().for_each(&mut moved);
+        for check in &mut bound.records {
+            check.records.iter_mut().for_each(&mut moved);
+            check.value_node.iter_mut().for_each(&mut moved);
+        }
+        for check in &mut bound.coverage {
+            if let Some((_, openings)) = &mut check.record {
+                openings.iter_mut().for_each(&mut moved);
+            }
+        }
+    }
+
+    /// A member pads its leaf's data with the negated last labels, so its
+    /// replica is zero on every padding node and it keeps nothing there:
+    /// the seal holds (the replica is the data plus the labels) and the
+    /// padding is never opened, so GLOBAL's binding check passed it.
+    #[test]
+    fn a_registration_padded_with_negated_labels_is_not_bound() {
+        use quil_crypto::storage_hash as hash;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, encode_leaf_at, max_padded_nodes, prove_seal, verify_seal,
+            MerkleTree, Registered, SealStatement, Tree, NODE_BYTES,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Du8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let n = max_padded_nodes(exact);
+        let member = [0x4Eu8; 32];
+        let key = quil_crypto::sdr::replica_key(&member, &leaf_id, epoch);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let honest = encode_leaf_at(&data, &key, &params, n, &mut |_, _| {});
+        let mut padded = data_nodes(&data);
+        padded.resize(n as usize * NODE_BYTES, 0);
+        let honest_data = MerkleTree::from_nodes(&padded).unwrap();
+        assert_eq!(
+            honest_data.commitment(Tree::Data),
+            honest.comm_d,
+            "harness check: the honest data tree"
+        );
+        // On the padding the data is zero, so the replica there is the last
+        // labels: negate them into the data, and the replica is zero.
+        let mut replica = honest.replica.clone();
+        replica[exact as usize * NODE_BYTES..].fill(0);
+        for v in exact as usize..n as usize {
+            let label = hash::from_bytes(&honest.replica[v * NODE_BYTES..][..NODE_BYTES]).unwrap();
+            let negated = hash::to_bytes(&hash::sub(&hash::ZERO, &label));
+            padded[v * NODE_BYTES..][..NODE_BYTES].copy_from_slice(&negated);
+        }
+        let cheat_data = MerkleTree::from_nodes(&padded).unwrap();
+        let registered = Registered {
+            comm_d: cheat_data.commitment(Tree::Data),
+            comm_c: honest.comm_c,
+            comm_r: MerkleTree::from_nodes(&replica)
+                .unwrap()
+                .commitment(Tree::Replica),
+        };
+        let beacon = [0x5Du8; 32];
+        let statement = SealStatement {
+            member: &member,
+            leaf_id: &leaf_id,
+            epoch,
+            n,
+            registered,
+            beacon: &beacon,
+        };
+        let count = quil_types::consensus::STORAGE_SEAL_CHALLENGES;
+        let seal = prove_seal(&replica, &statement, &params, count)
+            .expect("harness check: the zeroed replica seals");
+        assert_eq!(
+            verify_seal(&statement, &seal, &params, count),
+            Ok(()),
+            "harness check: the zeroed replica's seal verifies"
+        );
+        // The binding a member proves of its honest data, opened against the
+        // padded data instead: the nodes below `exact` are the same.
+        let honest_claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, honest.comm_d, n)
+            .unwrap();
+        let mut bound = captured.prove_binding(&honest_claim).unwrap();
+        assert_eq!(binding::verify(&honest_claim, &bound), Ok(()));
+        repath(&mut bound, &honest_data, &cheat_data, exact);
+        let claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, registered.comm_d, n)
+            .unwrap();
+        let verdict = binding::verify(&claim, &bound);
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        if verdict.is_ok() {
+            panic!(
+                "VULNERABLE: a registration padded with the negated last labels was sealed \
+                 and bound, its replica zero on {} of its {n} nodes",
+                n - exact
+            );
+        }
+    }
+
+    /// From the padding bound epoch the binding shows a registration's
+    /// padding zero, at the floor (no padding), one node and the cap: an
+    /// honest member's binding verifies and parses, and padding with any
+    /// nonzero node, first, last or between, fails, however it is opened.
+    /// Before the epoch a padding opening is refused by the check and by
+    /// the parse, as a build without the bound refuses its bytes.
+    #[test]
+    fn from_the_padding_bound_epoch_only_zero_padding_is_bound() {
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, max_padded_nodes, MerkleTree, Tree, NODE_BYTES,
+        };
+        use quil_execution::global_intrinsic::storage_epoch_proof::{SeatProof, StorageEpochProof};
+        let epoch = 6;
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Eu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let (member, beacon) = ([0x4Fu8; 32], [0x5Eu8; 32]);
+        for n in [exact, exact + 1, exact + 2, max_padded_nodes(exact)] {
+            let mut padded = data_nodes(&data);
+            padded.resize(n as usize * NODE_BYTES, 0);
+            let honest = MerkleTree::from_nodes(&padded).unwrap();
+            let claim = captured
+                .claim(
+                    &prefix,
+                    &leaf_id,
+                    &member,
+                    &beacon,
+                    honest.commitment(Tree::Data),
+                    n,
+                )
+                .unwrap();
+            let proved = captured.prove_binding(&claim).unwrap();
+            assert_eq!(binding::verify(&claim, &proved), Ok(()), "{n} of {exact}");
+            assert_eq!(proved.padding.is_some(), n > exact, "{n} of {exact}");
+            let bytes = proved.to_bytes();
+            assert_eq!(LeafBinding::from_bytes(&bytes, epoch), Some(proved.clone()));
+            if n == exact {
+                let mut extra = proved.clone();
+                extra.padding = Some(extra.header[0].clone());
+                assert_eq!(
+                    binding::verify(&claim, &extra),
+                    Err("storage binding: the padding opening".into())
+                );
+                continue;
+            }
+            let mut unopened = proved.clone();
+            unopened.padding = None;
+            assert_eq!(
+                binding::verify(&claim, &unopened),
+                Err("storage binding: the padding opening".into())
+            );
+            for spot in [exact, n - 1, exact + (n - exact) / 2] {
+                let mut cheat = padded.clone();
+                cheat[spot as usize * NODE_BYTES] = 1;
+                let cheat_tree = MerkleTree::from_nodes(&cheat).unwrap();
+                let cheat_claim = captured
+                    .claim(
+                        &prefix,
+                        &leaf_id,
+                        &member,
+                        &beacon,
+                        cheat_tree.commitment(Tree::Data),
+                        n,
+                    )
+                    .unwrap();
+                let mut bound = proved.clone();
+                repath(&mut bound, &honest, &cheat_tree, exact);
+                for opened in [exact, spot] {
+                    let at = opened as usize * NODE_BYTES;
+                    for node in [[0u8; 32], cheat[at..at + NODE_BYTES].try_into().unwrap()] {
+                        bound.padding = Some(binding::Opening {
+                            node,
+                            path: cheat_tree.path(opened),
+                        });
+                        assert_eq!(
+                            binding::verify(&cheat_claim, &bound),
+                            Err("storage binding: padding that is not zero nodes".into()),
+                            "a nonzero padding node at {spot} of {n}, opened at {opened}"
+                        );
+                    }
+                }
+            }
+            // A seat's proof parses its bindings by the epoch they seal.
+            let proof = StorageEpochProof {
+                member,
+                seats: vec![SeatProof {
+                    shard_filter: app.to_vec(),
+                    epoch: epoch - 2,
+                    seals: true,
+                    bindings: vec![proved.clone()],
+                    ..Default::default()
+                }],
+                proof: vec![1],
+            };
+            let encoded = proof.to_canonical_bytes();
+            assert_eq!(
+                StorageEpochProof::from_canonical_bytes(&encoded).unwrap(),
+                proof
+            );
+            // Before the epoch: no padding opening is made, and one is refused.
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch + 1));
+            assert!(StorageEpochProof::from_canonical_bytes(&encoded).is_err());
+            let earlier = captured.prove_binding(&claim).unwrap();
+            assert_eq!(earlier.padding, None);
+            assert_eq!(binding::verify(&claim, &earlier), Ok(()));
+            assert_eq!(
+                binding::verify(&claim, &proved),
+                Err("storage binding: the padding opening".into())
+            );
+            assert_eq!(LeafBinding::from_bytes(&bytes, epoch), None);
+            assert_eq!(
+                LeafBinding::from_bytes(&earlier.to_bytes(), epoch),
+                Some(earlier)
+            );
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        }
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+    }
+
+    /// A leaf's data with every record's offset moved `gap` nodes on, and
+    /// the gap, between the index and the first value, zero.
+    fn shifted_data(captured: &Captured, prefix: &[u32], gap: u64) -> Vec<u8> {
+        use quil_crypto::storage_hash::DATA_BYTES_PER_NODE;
+        let data = captured.leaf_data(prefix).unwrap();
+        let header = binding::header_nodes(&captured.filter, prefix) as usize;
+        let entries = captured.entries(prefix).unwrap().len();
+        // An index record takes two nodes; its offset is its bytes 33..41.
+        let values = (header + 2 * entries) * DATA_BYTES_PER_NODE;
+        let mut shifted = data[..values].to_vec();
+        for r in 0..entries {
+            let at = (header + 2 * r) * DATA_BYTES_PER_NODE + 33;
+            let offset = u64::from_be_bytes(shifted[at..at + 8].try_into().unwrap());
+            if r == 0 {
+                assert_eq!(offset, 0, "harness check: record 0's offset");
+            }
+            let moved = offset + gap * DATA_BYTES_PER_NODE as u64;
+            shifted[at..at + 8].copy_from_slice(&moved.to_be_bytes());
+        }
+        shifted.resize(values + gap as usize * DATA_BYTES_PER_NODE, 0);
+        shifted.extend_from_slice(&data[values..]);
+        shifted
+    }
+
+    /// `bound`, made against the data tree `from` of `exact` nodes, moved
+    /// onto `nodes` (tree `to`): the same data with every node from
+    /// `values` on `gap` nodes further. Each opening takes its node from
+    /// `nodes`.
+    fn shift_binding(
+        bound: &mut LeafBinding,
+        from: &quil_crypto::storage_proof::MerkleTree,
+        exact: u64,
+        (values, gap): (u64, u64),
+        nodes: &[u8],
+        to: &quil_crypto::storage_proof::MerkleTree,
+    ) {
+        use quil_crypto::storage_proof::NODE_BYTES;
+        let index: std::collections::HashMap<Vec<[u8; 32]>, u64> =
+            (0..exact).map(|i| (from.path(i), i)).collect();
+        let mut moved = |opening: &mut binding::Opening| {
+            let mut i = index[&opening.path];
+            if i >= values {
+                i += gap;
+            }
+            opening.node = nodes[i as usize * NODE_BYTES..][..NODE_BYTES]
+                .try_into()
+                .unwrap();
+            opening.path = to.path(i);
+        };
+        bound.header.iter_mut().for_each(&mut moved);
+        bound.last.iter_mut().for_each(&mut moved);
+        bound.first.iter_mut().for_each(&mut moved);
+        for check in &mut bound.records {
+            check.records.iter_mut().for_each(&mut moved);
+            check.value_node.iter_mut().for_each(&mut moved);
+        }
+        for check in &mut bound.coverage {
+            if let Some((_, openings)) = &mut check.record {
+                openings.iter_mut().for_each(&mut moved);
+            }
+        }
+    }
+
+    /// A member moves every record's offset on by a gap before the first
+    /// value and fills the gap with the negated last labels, so its replica
+    /// is zero there and it keeps nothing of it: the seal holds (the
+    /// replica is the data plus the labels), the values end at the
+    /// registered count so nothing is padded, and no check opens the gap or
+    /// reads record 0's offset, so GLOBAL's binding check passed it, with a
+    /// gap past the padding cap.
+    #[test]
+    fn a_gap_before_the_first_value_is_not_bound() {
+        use quil_crypto::storage_hash as hash;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, encode_leaf_at, max_padded_nodes, prove_seal, verify_seal,
+            MerkleTree, Registered, SealStatement, Tree, NODE_BYTES,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Cu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let values = binding::header_nodes(&captured.filter, &prefix)
+            + 2 * captured.entries(&prefix).unwrap().len() as u64;
+        // One node past the padding cap: more than any padding could hold.
+        let cap = max_padded_nodes(exact) - exact;
+        let gap = cap + 1;
+        let shifted = shifted_data(&captured, &prefix, gap);
+        let n = data_node_count(shifted.len() as u64);
+        assert_eq!(n, exact + gap, "harness check: the shifted data's nodes");
+        let member = [0x4Cu8; 32];
+        let key = quil_crypto::sdr::replica_key(&member, &leaf_id, epoch);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let honest = encode_leaf_at(&shifted, &key, &params, n, &mut |_, _| {});
+        let mut nodes = data_nodes(&shifted);
+        assert_eq!(
+            MerkleTree::from_nodes(&nodes)
+                .unwrap()
+                .commitment(Tree::Data),
+            honest.comm_d,
+            "harness check: the shifted data tree"
+        );
+        // On the gap the data is zero, so the replica there is the last
+        // labels: negate them into the data, and the replica is zero.
+        let mut replica = honest.replica.clone();
+        for v in values as usize..(values + gap) as usize {
+            let at = v * NODE_BYTES;
+            let label = hash::from_bytes(&honest.replica[at..][..NODE_BYTES]).unwrap();
+            let negated = hash::to_bytes(&hash::sub(&hash::ZERO, &label));
+            nodes[at..at + NODE_BYTES].copy_from_slice(&negated);
+            replica[at..at + NODE_BYTES].fill(0);
+        }
+        let cheat_data = MerkleTree::from_nodes(&nodes).unwrap();
+        let registered = Registered {
+            comm_d: cheat_data.commitment(Tree::Data),
+            comm_c: honest.comm_c,
+            comm_r: MerkleTree::from_nodes(&replica)
+                .unwrap()
+                .commitment(Tree::Replica),
+        };
+        let beacon = [0x5Cu8; 32];
+        let statement = SealStatement {
+            member: &member,
+            leaf_id: &leaf_id,
+            epoch,
+            n,
+            registered,
+            beacon: &beacon,
+        };
+        let count = quil_types::consensus::STORAGE_SEAL_CHALLENGES;
+        let seal = prove_seal(&replica, &statement, &params, count)
+            .expect("harness check: the replica zero on the gap seals");
+        assert_eq!(
+            verify_seal(&statement, &seal, &params, count),
+            Ok(()),
+            "harness check: the replica zero on the gap's seal verifies"
+        );
+        // The binding a member proves of the leaf's data, moved onto the
+        // shifted data: header and index in place, values `gap` nodes on.
+        let plain = MerkleTree::from_nodes(&data_nodes(&data)).unwrap();
+        let plain_claim = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                plain.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let mut bound = captured.prove_binding(&plain_claim).unwrap();
+        assert_eq!(binding::verify(&plain_claim, &bound), Ok(()));
+        shift_binding(
+            &mut bound,
+            &plain,
+            exact,
+            (values, gap),
+            &nodes,
+            &cheat_data,
+        );
+        let claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, registered.comm_d, n)
+            .unwrap();
+        let verdict = binding::verify(&claim, &bound);
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        match verdict {
+            Ok(()) => panic!(
+                "VULNERABLE: a binding whose values start {gap} nodes past the index was sealed \
+                 and bound, its replica zero on those {gap} of its {n} nodes, past the padding \
+                 cap of {cap}"
+            ),
+            Err(e) => assert_eq!(
+                e,
+                "storage binding: values that do not start at the first record"
+            ),
+        }
+    }
+
+    /// From the padding bound epoch the binding opens record 0 and shows the
+    /// values start at its offset 0, adding offsets checked (class guard,
+    /// with `only_a_tail_of_zero_nodes_opens_as_padding`): an honest
+    /// binding verifies and parses with record 0 in it; moving every offset
+    /// on by one node, two or past the padding cap fails, as do record 0
+    /// left out or posed by another record, and a last offset that does not
+    /// fit beside its length. Before the epoch a moved binding verifies as
+    /// every earlier build verifies it, and record 0's nodes are refused by
+    /// the check and by the parse.
+    #[test]
+    fn from_the_padding_bound_epoch_the_values_start_at_record_zero() {
+        use quil_crypto::storage_hash::DATA_BYTES_PER_NODE;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, max_padded_nodes, MerkleTree, Tree,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Bu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let header = binding::header_nodes(&captured.filter, &prefix);
+        let entries = captured.entries(&prefix).unwrap().len() as u64;
+        let values = header + 2 * entries;
+        let (member, beacon) = ([0x4Bu8; 32], [0x5Bu8; 32]);
+        let plain = MerkleTree::from_nodes(&data_nodes(&data)).unwrap();
+        let claim = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                plain.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let proved = captured.prove_binding(&claim).unwrap();
+        assert_eq!(binding::verify(&claim, &proved), Ok(()));
+        assert_eq!(proved.first.len(), 2, "record 0's two nodes");
+        let bytes = proved.to_bytes();
+        assert_eq!(LeafBinding::from_bytes(&bytes, epoch), Some(proved.clone()));
+        let first_record = Err("storage binding: the first record".to_string());
+        let mut unopened = proved.clone();
+        unopened.first.clear();
+        assert_eq!(binding::verify(&claim, &unopened), first_record);
+        // Parsed, a trailer carries record 0 or a padding opening, never
+        // neither, so each binding has one encoding.
+        let encoded = unopened.to_bytes();
+        assert_eq!(
+            LeafBinding::from_bytes(&encoded, epoch),
+            Some(unopened.clone())
+        );
+        let mut empty_trailer = encoded;
+        empty_trailer.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(LeafBinding::from_bytes(&empty_trailer, epoch), None);
+        let mut posed = proved.clone();
+        posed.first = proved.last.clone();
+        assert_eq!(
+            binding::verify(&claim, &posed),
+            Err("storage binding: a record node does not open".into())
+        );
+        let cap = max_padded_nodes(exact) - exact;
+        for gap in [1, 2, cap + 1] {
+            let nodes = data_nodes(&shifted_data(&captured, &prefix, gap));
+            let tree = MerkleTree::from_nodes(&nodes).unwrap();
+            let shifted = captured
+                .claim(
+                    &prefix,
+                    &leaf_id,
+                    &member,
+                    &beacon,
+                    tree.commitment(Tree::Data),
+                    exact + gap,
+                )
+                .unwrap();
+            let mut bound = proved.clone();
+            shift_binding(&mut bound, &plain, exact, (values, gap), &nodes, &tree);
+            assert_eq!(
+                binding::verify(&shifted, &bound),
+                Err("storage binding: values that do not start at the first record".into()),
+                "a gap of {gap} nodes"
+            );
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch + 1));
+            let mut earlier = bound.clone();
+            earlier.first.clear();
+            assert_eq!(
+                binding::verify(&shifted, &earlier),
+                Ok(()),
+                "before the epoch, a gap of {gap} nodes binds as it did"
+            );
+            assert_eq!(binding::verify(&shifted, &bound), first_record);
+            assert_eq!(LeafBinding::from_bytes(&bound.to_bytes(), epoch), None);
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        }
+        // The last record's offset is the largest there is: its sum with
+        // the length does not fit, and refuses rather than wrapping.
+        let mut past = data;
+        let at = ((header + 2 * (entries - 1)) as usize) * DATA_BYTES_PER_NODE + 33;
+        past[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        let nodes = data_nodes(&past);
+        let tree = MerkleTree::from_nodes(&nodes).unwrap();
+        let wrapped = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                tree.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let mut bound = proved.clone();
+        shift_binding(&mut bound, &plain, exact, (values, 0), &nodes, &tree);
+        assert_eq!(
+            binding::verify(&wrapped, &bound),
+            Err("storage binding: an offset past the values' end".into())
+        );
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
     }
 }

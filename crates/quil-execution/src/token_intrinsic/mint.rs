@@ -137,10 +137,11 @@ pub struct VerifiedMint {
     mint: Mint,
 }
 
-/// Resolve only the canonical global frame named by the signed statement.
-/// The bound must come from consensus execution, not the local latest frame
-/// (which can vary between validators) or an application-frame counter.
-pub(crate) use super::mint_authorization::clock_reward_root;
+/// Resolve only the canonical global frame named by the signed statement,
+/// refusing one before the network's first citable frame. The bound must
+/// come from consensus execution, not the local latest frame (which can vary
+/// between validators) or an application-frame counter.
+pub(crate) use super::mint_authorization::cited_reward_root;
 
 /// Admit against the stored canonical global frame. Missing local history is
 /// an execution failure, not a deterministic rejection of the transaction.
@@ -192,7 +193,13 @@ pub(crate) fn verify_mint_from_clock_with_worker(
     if mint.statement.application != domains::QUIL_TOKEN {
         return Err(invalid("custom-token mint policy is not integrated"));
     }
-    let root = clock_reward_root(clock, mint.statement.cited_frame, finalized_global_frame)?;
+    let root = cited_reward_root(
+        clock,
+        network,
+        "reward mint",
+        mint.statement.cited_frame,
+        finalized_global_frame,
+    )?;
     verify_decoded_mint(
         state,
         mint,
@@ -1132,7 +1139,7 @@ mod tests {
                         &s.application,
                         &message
                     ),
-                    Err(QuilError::ExecutionUnavailable(_))
+                    Err(QuilError::InvalidArgument(_))
                 ));
             } else {
                 // An explicit anchor is authoritative in either venue and bounds

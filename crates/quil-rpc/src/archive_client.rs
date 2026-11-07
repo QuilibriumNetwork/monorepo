@@ -156,13 +156,22 @@ static ARCHIVE_PEERS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// Pin `endpoint` (`host:port`, as the pool dials it) to `peer`: every later
-/// PQNoise dial to it must reach that identity. A later pin replaces an
-/// earlier one.
-pub fn pin_archive_peer(endpoint: &str, peer: quil_p2p::PeerId) {
-    ARCHIVE_PEERS
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(endpoint.to_string(), peer);
+/// PQNoise dial to it must reach that identity. An endpoint already pinned
+/// to another peer keeps that pin, which is returned: one archive's record
+/// naming another archive's endpoint must not make that archive unreachable.
+pub fn pin_archive_peer(
+    endpoint: &str,
+    peer: quil_p2p::PeerId,
+) -> std::result::Result<(), quil_p2p::PeerId> {
+    let mut pins = ARCHIVE_PEERS.write().unwrap_or_else(|e| e.into_inner());
+    match pins.get(endpoint) {
+        Some(held) if *held != peer => Err(*held),
+        Some(_) => Ok(()),
+        None => {
+            pins.insert(endpoint.to_string(), peer);
+            Ok(())
+        }
+    }
 }
 
 /// The identity pinned for `endpoint` ([`pin_archive_peer`]), if any.
@@ -172,6 +181,37 @@ pub fn pinned_archive_peer(endpoint: &str) -> Option<quil_p2p::PeerId> {
         .unwrap_or_else(|e| e.into_inner())
         .get(endpoint)
         .copied()
+}
+
+/// The (endpoint, pinned peer) pairs of a master's archive directory. At
+/// most 32 endpoints of at most 512 bytes; `peer_ids` is empty (a master
+/// that predates it: all unpinned) or parallel to them, each entry empty
+/// (unpinned) or a peer id of at most 128 bytes. The error names what is
+/// malformed.
+pub fn archive_directory(
+    response: quil_types::proto::global::GetArchiveEndpointsResponse,
+) -> Result<Vec<(String, Option<quil_p2p::PeerId>)>, &'static str> {
+    if response.endpoints.len() > 32
+        || response
+            .endpoints
+            .iter()
+            .any(|e| e.is_empty() || e.len() > 512)
+        || !(response.peer_ids.is_empty() || response.peer_ids.len() == response.endpoints.len())
+        || response.peer_ids.iter().any(|p| p.len() > 128)
+    {
+        return Err("invalid archive directory dimensions");
+    }
+    let mut peers = response.peer_ids.into_iter();
+    response
+        .endpoints
+        .into_iter()
+        .map(|endpoint| match peers.next().filter(|p| !p.is_empty()) {
+            None => Ok((endpoint, None)),
+            Some(bytes) => quil_p2p::PeerId::from_bytes(&bytes)
+                .map(|peer| (endpoint, Some(peer)))
+                .map_err(|_| "invalid archive directory peer id"),
+        })
+        .collect()
 }
 
 /// Record one connection attempt to `addr`; returns the transition to log.
@@ -332,6 +372,19 @@ impl ArchiveClient {
         Self::connect_pq(addr, connector).await
     }
 
+    /// [`Self::connect_mtls`] to a node that must answer as `peer`: a dial
+    /// to an endpoint taken from a peer's signed record, so that the
+    /// record cannot name another node's address and have it answer for it.
+    pub async fn connect_peer(
+        addr: &str,
+        falcon_signing_key: &[u8],
+        peer: quil_p2p::PeerId,
+    ) -> Result<Self, ArchiveClientError> {
+        let connector =
+            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+        Self::connect_pq(addr, connector).await
+    }
+
     /// Connect only to this worker's own master, which holds the same Falcon
     /// identity. Historical canonical frames and the archive directory rely
     /// on this pin; possession of an unrelated peer key is insufficient.
@@ -339,12 +392,8 @@ impl ArchiveClient {
         addr: &str,
         falcon_signing_key: &[u8],
     ) -> Result<Self, ArchiveClientError> {
-        let peer = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
-            .map_err(|error| ArchiveClientError::TlsInit(format!("master identity: {error}")))?
-            .public()
-            .to_peer_id();
         let connector =
-            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+            QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
         Self::connect_pq(addr, connector).await
     }
 
@@ -751,22 +800,27 @@ impl ArchiveClient {
 
     /// Ask this worker's authenticated master for its verified archive pool.
     pub async fn get_archive_endpoints(&mut self) -> Result<Vec<String>, ArchiveClientError> {
+        Ok(self
+            .get_archive_directory()
+            .await?
+            .into_iter()
+            .map(|(endpoint, _)| endpoint)
+            .collect())
+    }
+
+    /// [`get_archive_endpoints`](Self::get_archive_endpoints) with the peer
+    /// the master pinned each endpoint to, if any.
+    pub async fn get_archive_directory(
+        &mut self,
+    ) -> Result<Vec<(String, Option<quil_p2p::PeerId>)>, ArchiveClientError> {
         let response = self
             .inner
             .clone()
-            .max_decoding_message_size(32 * 515 + 128)
+            .max_decoding_message_size(32 * (515 + 131) + 128)
             .get_archive_endpoints(quil_types::proto::global::GetArchiveEndpointsRequest {})
             .await?
             .into_inner();
-        if response.endpoints.len() > 32
-            || response
-                .endpoints
-                .iter()
-                .any(|e| e.is_empty() || e.len() > 512)
-        {
-            return Err(tonic::Status::data_loss("invalid archive directory dimensions").into());
-        }
-        Ok(response.endpoints)
+        archive_directory(response).map_err(|why| tonic::Status::data_loss(why).into())
     }
 
     /// Fetch and authenticate one bounded historical GLOBAL membership proof.
@@ -1358,6 +1412,21 @@ impl QuilPqNoiseConnector {
         self
     }
 
+    /// A connector to this node's own master, which holds the same Falcon
+    /// identity: a node answering at the master's address as another is
+    /// refused.
+    pub fn to_own_master(falcon_signing_key: Vec<u8>) -> Result<Self, Box<ArchiveClientError>> {
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&falcon_signing_key)
+            .map_err(|error| {
+                Box::new(ArchiveClientError::TlsInit(format!(
+                    "master identity: {error}"
+                )))
+            })?
+            .public()
+            .to_peer_id();
+        Ok(Self::new(falcon_signing_key).with_expected_peer(peer))
+    }
+
     /// Fail with [`OwnEndpoint`] when the server is `peer`.
     pub fn refusing_peer(mut self, peer: quil_p2p::PeerId) -> Self {
         self.refused_peer = Some(peer);
@@ -1684,7 +1753,7 @@ mod pinned_archive_tests {
                 let _ = crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await;
             });
             let endpoint = address.to_string();
-            pin_archive_peer(&endpoint, if pinned_to_server { server } else { other });
+            pin_archive_peer(&endpoint, if pinned_to_server { server } else { other }).unwrap();
             let mut connector = QuilPqNoiseConnector::new(quil_p2p::generate_falcon_signing_key())
                 .pinned_for(&endpoint);
             let result = tokio::time::timeout(
@@ -1719,7 +1788,7 @@ mod pinned_archive_tests {
             .unwrap()
             .public()
             .to_peer_id();
-        pin_archive_peer("192.0.2.2:8340", pinned);
+        pin_archive_peer("192.0.2.2:8340", pinned).unwrap();
         assert_eq!(pinned_archive_peer("192.0.2.2:8340"), Some(pinned));
         assert_eq!(
             QuilPqNoiseConnector::new(key)
@@ -1729,11 +1798,72 @@ mod pinned_archive_tests {
             Some(explicit)
         );
     }
+
+    /// R112-D-2: a pin stays with the peer it names. Pinning the same
+    /// endpoint to another peer (one archive's record naming another
+    /// archive's address) leaves the first pin, so that archive stays
+    /// reachable.
+    #[test]
+    fn r112_d2_an_archive_pin_is_not_replaced_by_another_peer() {
+        let peer = || {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
+        let (first, second) = (peer(), peer());
+        let endpoint = "198.51.100.1:8340";
+        let _ = pin_archive_peer(endpoint, first);
+        let _ = pin_archive_peer(endpoint, first);
+        let _ = pin_archive_peer(endpoint, second);
+        assert_eq!(
+            pinned_archive_peer(endpoint),
+            Some(first),
+            "R112-D-2: a later pin to another peer replaced the archive's pin"
+        );
+    }
 }
 
 #[cfg(test)]
 mod pinned_master_tests {
     use super::*;
+
+    /// A worker's connector to its master expects the node's own identity: a
+    /// node at the master's address holding another key is refused.
+    #[tokio::test]
+    async fn a_connector_to_the_own_master_refuses_another_identity() {
+        for same_key in [true, false] {
+            let client_key = quil_p2p::generate_falcon_signing_key();
+            let server_key = if same_key {
+                client_key.clone()
+            } else {
+                quil_p2p::generate_falcon_signing_key()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                crate::pqnoise_channel::pq_server_handshake(tcp, &server_key)
+                    .await
+                    .unwrap()
+            });
+            let mut connector = QuilPqNoiseConnector::to_own_master(client_key).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), same_key, "same key: {same_key}");
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("identity does not match"),
+                    "{error}"
+                );
+            }
+            let _ = server.await;
+        }
+    }
 
     #[tokio::test]
     async fn master_pin_accepts_own_key_and_rejects_a_legitimate_unrelated_peer() {

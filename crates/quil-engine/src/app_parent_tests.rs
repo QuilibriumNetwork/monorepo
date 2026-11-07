@@ -1319,3 +1319,81 @@ fn a_parent_that_cannot_be_executed_keeps_the_prepared_one() {
         &prepared
     ));
 }
+
+/// A notarized parent whose reward citation names a GLOBAL frame this
+/// member lacks is not executed privately without it. The member fetches the
+/// frame from its own master in the background and refuses the parent until
+/// the frame is here, then executes it as a holder does: a parent that can
+/// only finalize through a child does not stall the shard.
+#[test]
+fn a_private_parent_citing_an_unheld_frame_fetches_it_before_executing() {
+    use super::super::cited_frame_fetch_tests as cf;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let dir = cf::scratch_dir();
+    let mut rig = rig();
+    let anchors_db = quil_store::RocksDb::open_in_memory().unwrap();
+    let anchors = Arc::new(quil_store::RocksClockStore::new(anchors_db.inner()));
+    let txn = anchors.new_transaction(false).unwrap();
+    anchors
+        .put_global_clock_frame(&cf::global_frame(cf::ANCHOR), txn.as_ref())
+        .unwrap();
+    txn.commit().unwrap();
+    let manager = Arc::try_unwrap(rig.manager).ok().unwrap();
+    rig.manager = Arc::new(cf::with_token_suite(manager, anchors.clone(), &dir));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let master = cf::holding(&[cf::CITED]);
+    let executor = executor(
+        &rig,
+        anchors.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    )
+    .with_cited_frame_source(
+        Some(cf::master_source(&master, &calls)),
+        Some(runtime.handle().clone()),
+    );
+    let (mut frame, _) = parent(&rig, cf::ANCHOR);
+    frame.requests = vec![cf::mint_claim_bundle(cf::CITED)];
+    // Priced as the canonical reproducer's frame is.
+    let header = frame.header.as_mut().unwrap();
+    header.difficulty = 50_000;
+    header.fee_multiplier_vote = 7;
+    let digest = offer(&rig, &frame);
+
+    let refused = executor
+        .prepare(digest, RANK)
+        .err()
+        .expect("a parent citing an unheld GLOBAL frame must not execute without it");
+    assert!(
+        refused.to_string().contains(CITED_FRAMES_UNFETCHED),
+        "the parent must wait for its cited frame: {refused}"
+    );
+    assert!(executor.cited_fetch.lock().unwrap().running);
+    assert!(
+        executor.prepare(digest, RANK).is_err(),
+        "the parent waits while the fetch runs"
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while executor.cited_fetch.lock().unwrap().running {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the background fetch must end");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(anchors.get_global_clock_frame(cf::CITED).is_ok());
+
+    let prepared = executor
+        .prepare(digest, RANK)
+        .expect("once its cited frame is held the parent executes privately");
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(cursor(&rig.manager.crdt(), &rig.filter), None);
+    drop(prepared);
+    let _ = std::fs::remove_dir_all(dir);
+}

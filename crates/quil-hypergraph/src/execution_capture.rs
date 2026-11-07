@@ -347,6 +347,7 @@ impl ExecutionCapture<'_> {
                         .collect(),
                 ),
                 sub_meta: RwLock::new(sizes.iter().map(|(k, v)| (k.clone(), *v)).collect()),
+                staged_sizes_base: RwLock::new(Default::default()),
                 sizes_warmed: AtomicBool::new(true),
                 exact_sizes: AtomicBool::new(source.exact_sizes.load(Ordering::Acquire)),
                 size_warm_lock: std::sync::Mutex::new(()),

@@ -67,6 +67,58 @@ pub async fn ensure_global_anchor(
     Ok(())
 }
 
+/// What [`fetch_cited_frames`] left: the frames now held (fetched and
+/// stored, or held already), and those still missing with the reason.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CitedFetch {
+    pub held: Vec<u64>,
+    pub missing: Vec<(u64, String)>,
+}
+
+impl CitedFetch {
+    /// Each of `frames` missing for `reason`: nothing could fetch them.
+    pub fn unfetchable(frames: &[u64], reason: &str) -> Self {
+        Self {
+            held: Vec::new(),
+            missing: frames
+                .iter()
+                .map(|&number| (number, reason.to_string()))
+                .collect(),
+        }
+    }
+}
+
+/// Backfill each of `frames` the store lacks, in order, through
+/// [`ensure_global_anchor`], all within `budget`: the GLOBAL frames the
+/// reward citations of a frame about to execute name. A frame not fetched
+/// within the budget is left missing, never refused: the frame then waits
+/// for retry with nothing executed, and the frames fetched so far are kept.
+pub async fn fetch_cited_frames(
+    store: &dyn ClockStore,
+    source: &GlobalAnchorSource,
+    frames: &[u64],
+    budget: Duration,
+) -> CitedFetch {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut outcome = CitedFetch::default();
+    for &number in frames {
+        if tokio::time::Instant::now() >= deadline {
+            outcome
+                .missing
+                .push((number, "the fetch budget was spent".into()));
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, ensure_global_anchor(store, source, number)).await {
+            Ok(Ok(())) => outcome.held.push(number),
+            Ok(Err(error)) => outcome.missing.push((number, error.to_string())),
+            Err(_) => outcome
+                .missing
+                .push((number, "the fetch budget was spent".into())),
+        }
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +201,57 @@ mod tests {
             ));
             assert_eq!(store.get_latest_global_clock_frame().unwrap(), frame(100));
         }
+    }
+
+    /// A master that cannot answer costs at most the budget, and the
+    /// frames it serves are still fetched; nothing is fetched twice.
+    #[tokio::test(start_paused = true)]
+    async fn cited_frame_fetches_end_within_their_budget() {
+        type Fetch = Pin<Box<dyn Future<Output = Result<GlobalFrame>> + Send>>;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = quil_store::RocksClockStore::new(db.inner());
+        put(&store, &frame(100));
+        put(&store, &frame(30));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let one_hangs: GlobalAnchorSource = Arc::new(move |n: u64| -> Fetch {
+            counted.fetch_add(1, Ordering::SeqCst);
+            if n == 50 {
+                Box::pin(std::future::pending::<Result<GlobalFrame>>())
+            } else {
+                Box::pin(async move { Ok(frame(n)) })
+            }
+        });
+        let budget = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let outcome = fetch_cited_frames(&store, &one_hangs, &[30, 40, 50, 60], budget).await;
+        assert_eq!(outcome.held, vec![30, 40, 60]);
+        assert_eq!(
+            outcome.missing.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![50]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a held frame is not fetched"
+        );
+        assert_eq!(store.get_global_clock_frame(60).unwrap(), frame(60));
+        assert!(started.elapsed() <= budget);
+
+        let all_hang: GlobalAnchorSource =
+            Arc::new(|_: u64| -> Fetch { Box::pin(std::future::pending::<Result<GlobalFrame>>()) });
+        let frames: Vec<u64> = (1..=10).collect();
+        let started = tokio::time::Instant::now();
+        let outcome = fetch_cited_frames(&store, &all_hang, &frames, budget).await;
+        assert!(outcome.held.is_empty());
+        assert_eq!(
+            outcome.missing.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            frames
+        );
+        assert!(
+            started.elapsed() <= budget,
+            "ten unanswered fetches must end within the budget, took {:?}",
+            started.elapsed()
+        );
     }
 }

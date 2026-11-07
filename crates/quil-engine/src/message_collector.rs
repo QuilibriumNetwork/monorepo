@@ -346,6 +346,8 @@ pub enum Refusal {
     /// Nothing on this node takes messages from its collector: it proposes no
     /// GLOBAL frames ([`MessageCollector::set_no_proposer`]).
     NoProposer,
+    /// An alt shard update failed its verifier.
+    InvalidAltShardUpdate,
 }
 
 impl Refusal {
@@ -357,6 +359,7 @@ impl Refusal {
             Self::InvalidShardFrame => "shard frame failed verification",
             Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, which holds such frames only from active provers and up to a cap per shard",
             Self::NoProposer => "this node is not an archive: it proposes no GLOBAL frames, so a message submitted to it would never be included",
+            Self::InvalidAltShardUpdate => "alt shard update failed verification",
         }
     }
 
@@ -1122,6 +1125,14 @@ impl MessageCollector {
                 );
                 return SubmitOutcome::Filtered(Refusal::ProverOnly);
             }
+        }
+
+        // Execution does not verify this op: only a message nothing else may
+        // carry stops here. No duty, frame or reader waits on one, so refusing
+        // it for good stalls nothing; a verifier that accepts one lifts this.
+        if let Some(reason) = alt_shard_update_refusal(&data) {
+            note_alt_shard_refused(&reason);
+            return SubmitOutcome::Filtered(Refusal::InvalidAltShardUpdate);
         }
 
         let mut message = CollectedMessage::new(data);
@@ -2135,6 +2146,68 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Why a bundle must not be held, if it carries an alt shard update its
+/// verifier refuses.
+fn alt_shard_update_refusal(data: &[u8]) -> Option<String> {
+    use quil_execution::global_intrinsic::alt_shard_update_materialize::alt_shard_update_refusal;
+    use quil_execution::global_intrinsic::consensus_types::TYPE_ALT_SHARD_UPDATE;
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    let bundle = CanonicalMessageBundle::from_canonical_bytes(data).ok()?;
+    let refusal = bundle
+        .requests
+        .iter()
+        .flatten()
+        .filter(|request| request.inner_type_prefix == TYPE_ALT_SHARD_UPDATE)
+        .find_map(|request| {
+            alt_shard_update_refusal(&request.inner_bytes, &quil_crypto::DefaultKeyManager::new())
+        });
+    refusal
+}
+
+/// Least time between two lines about refused alt shard updates.
+const ALT_SHARD_REFUSAL_LINE_EVERY: Duration = Duration::from_secs(60);
+
+/// Refusals since the last line, and when that line was logged.
+#[derive(Default)]
+struct AltShardRefusals {
+    unreported: u64,
+    last_line: Option<Instant>,
+}
+
+impl AltShardRefusals {
+    /// Count one refusal at `now`; the count to log, when a line is due.
+    fn note(&mut self, now: Instant) -> Option<u64> {
+        self.unreported += 1;
+        if self
+            .last_line
+            .is_some_and(|last| now.duration_since(last) < ALT_SHARD_REFUSAL_LINE_EVERY)
+        {
+            return None;
+        }
+        self.last_line = Some(now);
+        Some(std::mem::take(&mut self.unreported))
+    }
+}
+
+/// One bounded line for a sender's per-message noise.
+fn note_alt_shard_refused(reason: &str) {
+    static REFUSALS: std::sync::Mutex<Option<AltShardRefusals>> = std::sync::Mutex::new(None);
+    let mut refusals = REFUSALS.lock().unwrap();
+    if let Some(refused) = refusals
+        .get_or_insert_with(AltShardRefusals::default)
+        .note(Instant::now())
+    {
+        tracing::warn!(
+            refused,
+            reason,
+            scope = "the sender",
+            action = "none on this node",
+            "message collector: refused alt shard updates; `refused` counts those since the \
+             previous line, at most one a minute; `reason` is the latest's"
+        );
+    }
+}
+
 /// Check if a message is a prover-protocol message. Messages added
 /// to the collector are raw bundle bytes — the outer type prefix
 /// determines if it's a prover message. MessageBundle (0x0312) and
@@ -2158,6 +2231,18 @@ fn is_prover_message(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One line a minute, each counting every refusal since the one before.
+    #[test]
+    fn refused_alt_shard_updates_log_a_bounded_count() {
+        let start = Instant::now();
+        let mut refusals = AltShardRefusals::default();
+        assert_eq!(refusals.note(start), Some(1));
+        assert_eq!(refusals.note(start + Duration::from_secs(1)), None);
+        assert_eq!(refusals.note(start + Duration::from_secs(59)), None);
+        assert_eq!(refusals.note(start + Duration::from_secs(60)), Some(3));
+        assert_eq!(refusals.note(start + Duration::from_secs(61)), None);
+    }
 
     #[test]
     fn add_and_collect() {

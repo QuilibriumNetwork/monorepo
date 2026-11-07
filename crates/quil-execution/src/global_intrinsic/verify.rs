@@ -2372,7 +2372,7 @@ mod tests {
         let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
         let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
         let mut op = sample_split();
-        op.frame_number = 700_000; // >= UNIFIED_TREE_CUTOVER_FRAME (698_000)
+        op.frame_number = 700_000; // >= UNIFIED_TREE_CUTOVER_FRAME (699_500)
         op.shard_address = app.to_vec(); // bare app root (empty bit-path parent)
         op.proposed_shards = vec![c0, c1];
         assert!(

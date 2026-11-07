@@ -884,11 +884,159 @@ pub fn offer_submission(
     queue.offer(digest, canonical.len(), operations, job, front) || queue.pending(&digest)
 }
 
+/// What became of a confidential submission when it reached this node, for
+/// the line of a frame that later waits on its proofs ([`note_arrival`]).
+/// Ordered by how far it got: across this node's shards the furthest counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArrivalVerdict {
+    /// None of this node's shards is the one that verifies it on arrival.
+    NotDesignated,
+    /// Its designated shard's collector did not take it as new.
+    NotCollected,
+    /// Nothing left to verify, or it failed dispatch's checks first.
+    Skipped,
+    /// Admitted under the budget, but the queue did not take it.
+    NotQueued,
+    /// Past the arrival budget ([`ARRIVAL_WINDOW`]).
+    OverBudget,
+    /// Queued, or already verifying, on arrival.
+    Queued,
+}
+
+impl ArrivalVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDesignated => "not designated",
+            Self::NotCollected => "not collected",
+            Self::Skipped => "skipped",
+            Self::NotQueued => "not queued",
+            Self::OverBudget => "over budget",
+            Self::Queued => "queued",
+        }
+    }
+}
+
+/// When a submission first reached this node, and the furthest it got.
+pub type Arrival = (Instant, ArrivalVerdict);
+
+/// Submissions whose arrival this node remembers ([`note_arrival`]); past it
+/// the oldest is forgotten.
+pub const ARRIVAL_ENTRIES: usize = 4096;
+
+/// Bundles one line describes ([`describe_arrivals`]); the rest are counted.
+pub const DESCRIBED_BUNDLES: usize = 4;
+
+/// When each confidential submission first reached this node and the
+/// furthest it got on arrival, bounded to its newest entries.
+pub struct ArrivalLog {
+    entries: HashMap<[u8; 32], Arrival>,
+    order: VecDeque<[u8; 32]>,
+    max: usize,
+}
+
+impl ArrivalLog {
+    pub fn new(max: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max: max.max(1),
+        }
+    }
+
+    /// Record an arrival of `digest` at `now`: the first arrival's time is
+    /// kept, and the furthest verdict.
+    pub fn note(&mut self, digest: [u8; 32], verdict: ArrivalVerdict, now: Instant) {
+        if let Some((_, kept)) = self.entries.get_mut(&digest) {
+            *kept = (*kept).max(verdict);
+            return;
+        }
+        if self.order.len() >= self.max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(digest);
+        self.entries.insert(digest, (now, verdict));
+    }
+
+    pub fn get(&self, digest: &[u8; 32]) -> Option<Arrival> {
+        self.entries.get(digest).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
+fn arrival_log() -> &'static Mutex<ArrivalLog> {
+    static LOG: std::sync::OnceLock<Mutex<ArrivalLog>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(ArrivalLog::new(ARRIVAL_ENTRIES)))
+}
+
+/// Remember that the submission `digest` reached one of this node's shards
+/// at `now`, and what became of it there.
+pub fn note_arrival(digest: [u8; 32], verdict: ArrivalVerdict, now: Instant) {
+    arrival_log()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .note(digest, verdict, now);
+}
+
+/// When the submission `digest` first reached this node, and the furthest it
+/// got on arrival; `None` if it never arrived here (or was forgotten).
+pub fn arrival(digest: &[u8; 32]) -> Option<Arrival> {
+    arrival_log()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(digest)
+}
+
+/// One line's account of the bundles a frame waits on: for each of the
+/// first [`DESCRIBED_BUNDLES`], its digest's first four bytes, how long
+/// before `now` it first reached this node and what became of it then
+/// (`9ac09df9 seen 312 s ago (not designated)`), or that it never arrived
+/// here (`9ac09df9 not seen arriving`); then `+N more`.
+pub fn describe_arrivals(bundles: &[([u8; 32], Option<Arrival>)], now: Instant) -> String {
+    let mut parts: Vec<String> = bundles
+        .iter()
+        .take(DESCRIBED_BUNDLES)
+        .map(|(digest, seen)| {
+            let short: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+            match seen {
+                Some((at, verdict)) => format!(
+                    "{short} seen {} s ago ({})",
+                    now.saturating_duration_since(*at).as_secs(),
+                    verdict.as_str()
+                ),
+                None => format!("{short} not seen arriving"),
+            }
+        })
+        .collect();
+    if bundles.len() > DESCRIBED_BUNDLES {
+        parts.push(format!("+{} more", bundles.len() - DESCRIBED_BUNDLES));
+    }
+    parts.join("; ")
+}
+
+/// [`describe_arrivals`] of the submissions `digests` as this node saw them
+/// arrive ([`arrival`]): the `bundles` of a frame waiting on their proofs.
+pub fn describe_waiting(digests: &[[u8; 32]], now: Instant) -> String {
+    let bundles: Vec<_> = digests
+        .iter()
+        .map(|digest| (*digest, arrival(digest)))
+        .collect();
+    describe_arrivals(&bundles, now)
+}
+
 /// Queue an arriving canonical submission's verification
 /// ([`offer_submission`], at the back) under the [`ARRIVAL_WINDOW`] budget.
 /// `sizes`: the bytes of each of its confidential operations still to
 /// verify (`ExecutionEngineManager::arrival_operations`), charged at their
-/// estimated verification time. True when it is queued or verifying now.
+/// estimated verification time. Returns what became of it.
 pub fn offer_arrival(
     queue: &Arc<AdmissionQueue>,
     exec: &Arc<quil_execution::ExecutionEngineManager>,
@@ -896,26 +1044,26 @@ pub fn offer_arrival(
     canonical: &[u8],
     sizes: &[usize],
     now: Instant,
-) -> bool {
+) -> ArrivalVerdict {
     if sizes.is_empty() {
         queue.note_arrival_skipped();
-        return false;
+        return ArrivalVerdict::Skipped;
     }
     if queue.pending(&digest(canonical)) {
-        return true;
+        return ArrivalVerdict::Queued;
     }
     let cost: f64 = sizes
         .iter()
         .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
         .sum();
     if !queue.admit_arrival(cost, now) {
-        return false;
+        return ArrivalVerdict::OverBudget;
     }
-    let queued = offer_submission(queue, exec, application, canonical, false);
-    if !queued {
-        queue.refund_arrival(cost);
+    if offer_submission(queue, exec, application, canonical, false) {
+        return ArrivalVerdict::Queued;
     }
-    queued
+    queue.refund_arrival(cost);
+    ArrivalVerdict::NotQueued
 }
 
 /// [`offer_submission`] as a vote-time warm-up of a proposal for `frame` of
@@ -1437,5 +1585,63 @@ mod tests {
             vec![(0xf1, true); MAX_ATTEMPTS as usize + 2]
         );
         assert!(!queue.pending(&[0xf1; 32]));
+    }
+
+    /// A submission's arrival keeps when it first reached this node and the
+    /// furthest it got on any of its shards; the log forgets its oldest
+    /// entries past its bound.
+    #[test]
+    fn the_arrival_log_keeps_the_first_arrival_and_the_furthest_verdict() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(5);
+        let mut log = ArrivalLog::new(3);
+        log.note([1; 32], ArrivalVerdict::NotDesignated, t0);
+        log.note([1; 32], ArrivalVerdict::Queued, later);
+        log.note([1; 32], ArrivalVerdict::NotCollected, later);
+        let (at, verdict) = log.get(&[1; 32]).expect("the arrival is remembered");
+        assert_eq!(at, t0, "the first arrival's time is kept");
+        assert_eq!(
+            verdict,
+            ArrivalVerdict::Queued,
+            "the furthest verdict is kept"
+        );
+        for tag in 2..=4 {
+            log.note([tag; 32], ArrivalVerdict::OverBudget, later);
+        }
+        assert_eq!(log.len(), 3, "the arrival log is bounded");
+        assert!(log.get(&[1; 32]).is_none(), "the oldest entry went first");
+        assert!(log.get(&[4; 32]).is_some());
+    }
+
+    /// The `bundles` of a frame waiting on proofs name, for each of the first
+    /// four, when it first reached this node and what became of it, or that
+    /// it never arrived here; the rest are counted.
+    #[test]
+    fn a_waiting_frame_names_when_its_bundles_arrived_and_their_verdicts() {
+        let now = Instant::now();
+        note_arrival(
+            [0x9a; 32],
+            ArrivalVerdict::NotDesignated,
+            now - Duration::from_secs(312),
+        );
+        note_arrival([0x9b; 32], ArrivalVerdict::OverBudget, now);
+        let mut digests = vec![[0x9a; 32], [0xee; 32], [0x9b; 32]];
+        assert_eq!(
+            describe_waiting(&digests, now),
+            "9a9a9a9a seen 312 s ago (not designated); eeeeeeee not seen arriving; \
+             9b9b9b9b seen 0 s ago (over budget)",
+            "the bundles line names each arrival"
+        );
+        digests.extend([[0xe1; 32], [0xe2; 32], [0xe3; 32]]);
+        let line = describe_waiting(&digests, now);
+        assert!(
+            line.ends_with("e1e1e1e1 not seen arriving; +2 more"),
+            "the bundles line is bounded: {line}"
+        );
+        assert_eq!(
+            line.matches(" s ago (").count(),
+            2,
+            "two of the bundles were seen: {line}"
+        );
     }
 }

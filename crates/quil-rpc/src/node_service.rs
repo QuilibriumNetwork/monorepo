@@ -362,6 +362,9 @@ pub type AppHypergraphStores = Arc<
     dyn Fn(&[u8]) -> Result<Vec<Arc<dyn quil_types::store::HypergraphStore>>, Status> + Send + Sync,
 >;
 
+/// Sees every shard info this node serves.
+pub type ShardInfoObserver = Arc<dyn Fn(&node::GetShardInfoResponse) + Send + Sync>;
+
 /// This node's seat's share of a shard's certificates, by shard filter.
 pub type CertificateShareProvider =
     Arc<dyn Fn(&[u8]) -> Option<node::CertificateShare> + Send + Sync>;
@@ -390,6 +393,9 @@ pub struct NodeRpcServer {
     /// This node's seat's share of a shard's certificates
     /// (`ShardRewardInfo.certificate_share`); `None` for no seat.
     pub certificate_share_provider: Option<CertificateShareProvider>,
+    /// Sees every shard info served: the node's health conditions judge
+    /// the peer-reported and committed heads in it.
+    pub shard_info_observer: Option<ShardInfoObserver>,
 
     // Stores and registries (optional — None means unavailable).
     pub prover_registry: Option<Arc<dyn ProverRegistry>>,
@@ -517,6 +523,7 @@ impl NodeRpcServer {
             frame_cadence_provider: None,
             seat_concentration_provider: None,
             certificate_share_provider: None,
+            shard_info_observer: None,
             prover_registry: None,
             shard_info_provider: None,
             token_fee_provider: None,
@@ -592,6 +599,10 @@ impl NodeRpcServer {
     }
     pub fn with_certificate_share_provider(mut self, provider: CertificateShareProvider) -> Self {
         self.certificate_share_provider = Some(provider);
+        self
+    }
+    pub fn with_shard_info_observer(mut self, observer: ShardInfoObserver) -> Self {
+        self.shard_info_observer = Some(observer);
         self
     }
     pub fn with_shard_info_provider(mut self, provider: Arc<dyn ShardInfoProvider>) -> Self {
@@ -1868,14 +1879,18 @@ impl NodeService for NodeRpcServer {
             });
         }
 
-        Ok(Response::new(node::GetShardInfoResponse {
+        let response = node::GetShardInfoResponse {
             shards,
             difficulty,
             pomw_basis: basis.to_signed_bytes_be(),
             world_state_bytes: world_bytes.to_signed_bytes_be(),
             frame_number,
             allocation_scoring_strategy: provider.allocation_scoring_strategy().into(),
-        }))
+        };
+        if let Some(observer) = &self.shard_info_observer {
+            observer(&response);
+        }
+        Ok(Response::new(response))
     }
 
     async fn request_join(

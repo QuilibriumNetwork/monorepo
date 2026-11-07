@@ -216,6 +216,10 @@ impl OnionExitProxy {
         method: &str,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
+        // The request is for `target_peer`, so the dial must reach that peer:
+        // a node answering at its advertised address as another is refused.
+        let expected = quil_p2p::PeerId::from_bytes(target_peer)
+            .map_err(|e| format!("target peer id: {e}"))?;
         // DEFENSE 1: the target must be an in-network routing peer; use its
         // advertised stream multiaddr, never an arbitrary address.
         let addrs = (self.peer_lookup)(target_peer)
@@ -230,7 +234,10 @@ impl OnionExitProxy {
             .connect_timeout(Duration::from_secs(10))
             .tcp_nodelay(true);
         let channel = endpoint
-            .connect_with_connector(QuilPqNoiseConnector::new(self.falcon_signing_key.clone()))
+            .connect_with_connector(
+                QuilPqNoiseConnector::new(self.falcon_signing_key.clone())
+                    .with_expected_peer(expected),
+            )
             .await
             .map_err(|e| format!("dial: {e}"))?;
 
@@ -367,6 +374,45 @@ mod tests {
             "a minute on, with the drops since"
         );
         assert_eq!(proxy.note_unbound(1_061), None);
+    }
+
+    /// The exit sends a proxied request only to a node answering as its
+    /// target: one at the target's advertised address with another identity
+    /// is refused before the request is sent. The method is one no onion
+    /// service serves, so a node that got the request answers with a status.
+    #[tokio::test]
+    async fn the_exit_sends_a_request_only_to_its_target() {
+        let target_key = quil_p2p::generate_falcon_signing_key();
+        let target = crate::onion_service::peer_of(&target_key).to_bytes();
+        let method = "/quilibrium.node.global.pb.OnionService/Unserved";
+        for (answering, reached) in [
+            (quil_p2p::generate_falcon_signing_key(), false),
+            (target_key.clone(), true),
+        ] {
+            let addr = crate::onion_service::onion_server_as(answering).await;
+            let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![addr.clone()]));
+            let proxy = OnionExitProxy::new(
+                quil_p2p::generate_falcon_signing_key(),
+                lookup,
+                HashSet::from([method.to_string()]),
+            );
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                proxy.process(build_onion_rpc(&target, method, b"x")),
+            )
+            .await
+            .expect("the request ends");
+            let sent = !matches!(&outcome, Err(error) if error.starts_with("dial:"));
+            if sent && !reached {
+                panic!(
+                    "VULNERABLE: the onion exit sent a request to a node answering with a \
+                     different peer's identity than its target: {outcome:?}"
+                );
+            }
+            if !sent && reached {
+                panic!("the target was refused at its own address: {outcome:?}");
+            }
+        }
     }
 
     #[test]

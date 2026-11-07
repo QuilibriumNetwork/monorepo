@@ -149,9 +149,22 @@ pub fn prove_sparse(
     if !claim.allows_nodes(exact) {
         return fail("snapshot index count differs from registration");
     }
+    // As `prove_with_cap`: from the padding bound, record 0 and the first
+    // padding node are opened too.
+    let bound = quil_types::consensus::storage_padding_bound_at(claim.epoch);
     let mut proved = LeafBinding {
         header: header_openings,
         last,
+        first: if bound && count > 1 {
+            records(0)?
+        } else {
+            Vec::new()
+        },
+        padding: if bound && exact < claim.n {
+            Some(open(exact)?)
+        } else {
+            None
+        },
         ..Default::default()
     };
     let value_limit = if quil_types::consensus::persistent_storage_at(claim.epoch) {

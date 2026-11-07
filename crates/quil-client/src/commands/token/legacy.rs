@@ -1050,36 +1050,49 @@ async fn global_head(client: &Client) -> Result<u64, String> {
     }
 }
 
-/// Refuse to prove shields that admission would refuse at the node's GLOBAL
-/// head: the proving is wasted, and a refused batch also keeps its coins out
-/// of the next run for two hours. Without a known rule or head, go ahead.
-#[cfg(feature = "native-proof")]
-pub(crate) async fn ensure_shields_active(
-    client: &Client,
-    network: u8,
+/// The frame admission takes shields of legacy coins from (`batch`: those
+/// of `token shield-all`), and the GLOBAL head, while this node's health
+/// conditions say admission refuses them.
+pub(crate) fn shields_closed(
+    conditions: &[quil_types::proto::diagnostics::HealthCondition],
     batch: bool,
-) -> anyhow::Result<()> {
-    let Some(rule) = shield_rule(network) else {
-        return Ok(());
-    };
-    let Ok(head) = global_head(client).await else {
-        return Ok(());
-    };
+) -> Option<(u64, u64)> {
+    let kind = quil_types::proto::diagnostics::ConditionKind::ShieldsNotAdmitted as i32;
+    let wait = conditions.iter().find(|c| c.kind == kind)?.wait?;
     let from = if batch {
-        rule.shield_all_from
+        wait.batch_from_frame
     } else {
-        rule.shield_from
+        wait.until_frame
     };
-    anyhow::ensure!(
-        head >= from,
+    (wait.head_frame < from).then_some((from, wait.head_frame))
+}
+
+/// Refuse to prove shields that admission would refuse at this node's
+/// GLOBAL head, as its health conditions say: the proving is wasted, and a
+/// refused batch also keeps its coins out of the next run for two hours.
+/// When the node cannot say, go ahead: admission still refuses them.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn ensure_shields_active(tc: &TokenCtx, batch: bool) -> anyhow::Result<()> {
+    let Ok(source) = crate::commands::node::diagnostics::HealthSource::for_node(
+        &tc.node_config,
+        &tc.key_manager,
+    ) else {
+        return Ok(());
+    };
+    let Ok(Some(health)) = source.read().await else {
+        return Ok(());
+    };
+    let Some((from, head)) = shields_closed(&health.conditions, batch) else {
+        return Ok(());
+    };
+    anyhow::bail!(
         "shields of legacy coins are admitted from GLOBAL frame {}, and the node's GLOBAL head \
          is {} ({} frames before it): admission would refuse them (\"source owner mismatch\"); \
          run this again once the head reaches that frame (`qclient token legacy` shows it)",
         grouped(from),
         grouped(head),
         grouped(from - head)
-    );
-    Ok(())
+    )
 }
 
 /// The filters, bit paths and active prover counts of `application`'s

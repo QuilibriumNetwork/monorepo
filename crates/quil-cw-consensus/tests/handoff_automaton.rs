@@ -24,6 +24,7 @@ use commonware_utils::{
 use quil_cw_consensus::{
     adapters::{
         BlockStore, FrameFinalizer, FrameSink, GlobalProposer, Liveness, ProposalContext, Step,
+        VERIFY_PATIENCE,
     },
     engine_host::{build_global_engine, GlobalEngineParams},
     falcon_base::{FalconPrivateKey, FalconPublicKey},
@@ -1022,10 +1023,12 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
             ))
         })
     };
+    let liveness = Arc::new(Liveness::default());
     let proposer = HandoffProposer::new(Arc::new(DataProposer), session, reader(state.clone()))
         .unwrap()
         .with_private_reader(Some(private))
-        .with_behind_probe(Some(probe));
+        .with_behind_probe(Some(probe))
+        .with_liveness(Some(liveness.clone()));
 
     assert!(proposer.propose_with_context(ctx).is_none());
     assert!(
@@ -1033,6 +1036,7 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
         "a behind leader gave its turn up only after its parent waits"
     );
     assert_eq!(private_reads.load(Ordering::SeqCst), 0);
+    liveness.settle_turn(1, false, Duration::from_millis(7));
 
     *behind.lock().unwrap() = None;
     let next = ProposalContext { view: 2, ..ctx };
@@ -1041,10 +1045,111 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
         proposer.propose_retry().is_some(),
         "a leader that is not behind waits for its parent as before"
     );
+    liveness.settle_turn(2, false, Duration::from_millis(3_000));
+    let gave_up = liveness.take_behind_give_ups();
+    assert_eq!(
+        (gave_up.turns, gave_up.max_ms),
+        (1, 7),
+        "only the behind leader's turn counts as given up while behind"
+    );
     *state.lock().unwrap() = Some(parent);
     let before = asked.load(Ordering::SeqCst);
     assert!(proposer.propose_with_context(next).is_some());
     assert_eq!(asked.load(Ordering::SeqCst), before);
+}
+
+/// A vote whose parent read a GLOBAL state sync withholds (11-27 s every
+/// 5 min on a regular node) waits for the sync to install, then is checked
+/// in full: refused at once, it cost the member the view's certificate
+/// signatures. A parent unreadable without a sync, and any other refusal
+/// during one, are answered at once; a sync that outlasts the vote's
+/// patience is refused as before, naming the sync.
+#[test]
+fn a_vote_waits_for_a_global_state_sync_then_is_checked() {
+    let (session, _) = session();
+    let parent = genesis(&session);
+    let syncing = Arc::new(AtomicBool::new(true));
+    let probe: BehindProbe = {
+        let syncing = syncing.clone();
+        Arc::new(move || {
+            syncing
+                .load(Ordering::SeqCst)
+                .then(|| "execution unavailable: global state sync in progress".to_string())
+        })
+    };
+    let liveness = Arc::new(Liveness::default());
+    let proposer = HandoffProposer::new(
+        Arc::new(DataProposer),
+        session.clone(),
+        selected_parent(&session, Some(syncing.clone())),
+    )
+    .unwrap()
+    .with_behind_probe(Some(probe))
+    .with_liveness(Some(liveness.clone()));
+
+    // While the sync installs, the vote waits; once it landed, it is checked.
+    let first = context(&session, &parent, 1);
+    let (digest, bytes) = DataProposer.propose(1, first.parent).unwrap();
+    for _ in 0..3 {
+        assert!(
+            proposer
+                .verify_or_defer(first, digest, Some(bytes.clone()))
+                .is_err(),
+            "a vote whose parent a GLOBAL state sync withholds was refused at once"
+        );
+    }
+    syncing.store(false, Ordering::SeqCst);
+    assert_eq!(
+        proposer.verify_or_defer(first, digest, Some(bytes.clone())),
+        Ok(true)
+    );
+    liveness.settle(Step::Verify, 1, true);
+
+    // Another refusal during a sync is answered at once.
+    syncing.store(true, Ordering::SeqCst);
+    let other_epoch = ProposalContext {
+        epoch: session.generation + 1,
+        ..context(&session, &parent, 2)
+    };
+    assert_eq!(
+        proposer.verify_or_defer(other_epoch, digest, Some(bytes.clone())),
+        Ok(false),
+        "another refusal waited for the sync"
+    );
+    liveness.settle(Step::Verify, 2, false);
+
+    // A sync that outlasts the vote's patience: refused, naming the sync.
+    let third = context(&session, &parent, 3);
+    let (digest, bytes) = DataProposer.propose(3, third.parent).unwrap();
+    assert!(proposer
+        .verify_or_defer(third, digest, Some(bytes.clone()))
+        .is_err());
+    proposer.verify_patience_ran_out(third, VERIFY_PATIENCE);
+    liveness.settle(Step::Verify, 3, false);
+    let decided = liveness.decisions();
+    assert_eq!(decided.accepted, 1);
+    assert_eq!(decided.refused.get("parent unavailable"), Some(&1));
+    let last = decided.last_refused.unwrap();
+    assert_eq!(last.view, 3);
+    assert!(
+        last.detail.contains("global state sync in progress") && last.detail.contains("waited"),
+        "the refusal names the sync and its wait: {}",
+        last.detail
+    );
+
+    // Without a sync, an unreadable parent is refused at once, as before.
+    let quiet = HandoffProposer::new(
+        Arc::new(DataProposer),
+        session.clone(),
+        reader(Arc::new(Mutex::new(None))),
+    )
+    .unwrap()
+    .with_behind_probe(Some(Arc::new(|| None)));
+    assert_eq!(
+        quiet.verify_or_defer(first, digest, Some(bytes)),
+        Ok(false),
+        "a vote waited without a sync"
+    );
 }
 
 /// [`DataProposer`] counting the proposals it builds.
@@ -1142,6 +1247,7 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
         }
         let store = BlockStore::new();
         let behind = Arc::new(AtomicBool::new(true));
+        let behind_liveness = Arc::new(Liveness::default());
         let built: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let finalized: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let mut handles = Vec::new();
@@ -1153,17 +1259,20 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
                 selected_parent(&session, lagging.clone()),
             )
             .unwrap();
-            if let Some(flag) = lagging {
-                proposer = proposer.with_behind_probe(Some(Arc::new(move || {
-                    flag.load(Ordering::SeqCst)
-                        .then(|| "GLOBAL state sync installing".to_string())
-                })));
-            }
-            let params = GlobalEngineParams::new(
+            let mut params = GlobalEngineParams::new(
                 format!("behind-{node}"),
                 session.generation,
                 Digest(session.genesis),
             );
+            if let Some(flag) = lagging {
+                proposer = proposer
+                    .with_behind_probe(Some(Arc::new(move || {
+                        flag.load(Ordering::SeqCst)
+                            .then(|| "GLOBAL state sync installing".to_string())
+                    })))
+                    .with_liveness(Some(behind_liveness.clone()));
+                params.liveness = Some(behind_liveness.clone());
+            }
             let engine = build_global_engine(
                 ctx.child("validator").with_attribute("node", node),
                 schemes[node].clone(),
@@ -1190,6 +1299,15 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
             built[0].load(Ordering::SeqCst),
             0,
             "a behind member never builds"
+        );
+        let gave_up = behind_liveness.take_behind_give_ups();
+        assert!(
+            gave_up.turns > 0,
+            "its turns given up while behind are counted"
+        );
+        assert!(
+            gave_up.max_ms < 250,
+            "each turn ends before one parent wait: {gave_up:?}"
         );
 
         behind.store(false, Ordering::SeqCst);
