@@ -3905,6 +3905,8 @@ impl AppConsensusEngine {
         let mut restarted = false;
         // Submissions queued ahead of this frame's last one.
         let mut queued_ahead = 0usize;
+        // The bundles this frame waits on, with their arrival here.
+        let mut waiting = Vec::new();
         for bundle in requests {
             let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
                 continue;
@@ -3916,6 +3918,7 @@ impl AppConsensusEngine {
             }
             unverified.extend(sizes);
             let digest = crate::admission_verify::digest(&canon);
+            waiting.push(digest);
             restarted |= !(queue.pending(&digest) || proof_prewarm_running(&canon));
             verifying &=
                 crate::admission_verify::offer_submission(queue, exec, application, &canon, true)
@@ -3953,9 +3956,14 @@ impl AppConsensusEngine {
                     operations = unverified.len(),
                     estimate_secs = estimate_secs.round() as u64,
                     queued_ahead,
+                    bundles = %crate::admission_verify::describe_waiting(
+                        &waiting,
+                        std::time::Instant::now()
+                    ),
                     scope = "this worker",
                     action = "an expected wait: the frame materializes once its proofs verify; this worker keeps \
-                              voting and serving its seats meanwhile",
+                              voting and serving its seats meanwhile; bundles says when each first reached this \
+                              node and whether it was verified on arrival",
                     "app-shard frame materialization waits for its proof verification on a background thread"
                 );
                 Some(QuilError::ExecutionUnavailable(
@@ -11828,41 +11836,50 @@ impl AppConsensusEngine {
         let Some(exec) = self.execution_engine.as_ref() else {
             return;
         };
+        use crate::admission_verify::{note_arrival, ArrivalVerdict};
         if quil_execution::ExecutionEngineManager::confidential_operation_count(
             &self.app_address,
             data,
         ) == 0
-            || !arrival_designated(
-                &self.filter,
-                routing_shards(&self.app_address).as_deref(),
-                &crate::admission_verify::digest(data),
-                quil_execution::ExecutionEngineManager::shield_source(data),
-            )
         {
+            return;
+        }
+        // Remembered for the line of a frame that later waits on its proofs.
+        let digest = crate::admission_verify::digest(data);
+        if !arrival_designated(
+            &self.filter,
+            routing_shards(&self.app_address).as_deref(),
+            &digest,
+            quil_execution::ExecutionEngineManager::shield_source(data),
+        ) {
+            note_arrival(digest, ArrivalVerdict::NotDesignated, now);
             return;
         }
         let queue = crate::admission_verify::global();
         if !collected {
             queue.note_arrival_skipped();
+            note_arrival(digest, ArrivalVerdict::NotCollected, now);
             return;
         }
         let global = self
             .storage_source_hypergraph
             .clone()
             .unwrap_or_else(|| exec.crdt());
-        match exec.arrival_operations(&global, &self.app_address, data) {
-            Ok(sizes) => {
-                crate::admission_verify::offer_arrival(
-                    queue,
-                    exec,
-                    &self.app_address,
-                    data,
-                    &sizes,
-                    now,
-                );
+        let verdict = match exec.arrival_operations(&global, &self.app_address, data) {
+            Ok(sizes) => crate::admission_verify::offer_arrival(
+                queue,
+                exec,
+                &self.app_address,
+                data,
+                &sizes,
+                now,
+            ),
+            Err(_) => {
+                queue.note_arrival_skipped();
+                ArrivalVerdict::Skipped
             }
-            Err(_) => queue.note_arrival_skipped(),
-        }
+        };
+        note_arrival(digest, verdict, now);
     }
 
     // ---------------------------------------------------------------
