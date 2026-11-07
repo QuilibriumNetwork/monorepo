@@ -90,7 +90,11 @@ pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 /// The Global KPI's fields, in printed order; picker names, and the expanded
 /// labels the KPI prints.
 pub const GLOBAL_FIELD_NAMES: &[&str] = &["  frame", "  epoch", "  next boundary"];
-pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): 10s/frame"];
+pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): GLOBAL rate"];
+
+/// Readings the Credited KPI needs before it states a rate, in seconds:
+/// half of its 60m window, and 2h of its 24h one.
+pub const CREDITED_MIN_SPAN_SECONDS: [u64; 2] = [1800, 7200];
 
 pub const TOP_KPI_NAMES: &[&str] = &[
     "Peer ID",
@@ -106,6 +110,7 @@ pub const ALLOC_KPI_NAMES: &[&str] = &[
     "Status",
     "Claimable",
     "Reward",
+    "Credited",
     "Allocation GLOBAL snapshot",
     "Shown allocations",
     "Selected allocations",
@@ -438,6 +443,9 @@ pub struct Model {
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
     /// Frame committee size by shard filter, scaling the observed estimates.
     pub node_app_committee: HashMap<Vec<u8>, u32>,
+    /// This node's seat's certificate share by shard filter, scaling the
+    /// observed estimates in place of the committee's quorum share.
+    pub node_app_cert_share: HashMap<Vec<u8>, CertificateShare>,
     /// When each cadence's RPC answer arrived; staleness counts from here.
     pub node_global_cadence_received: Option<std::time::Instant>,
     pub node_app_cadence_received: Option<std::time::Instant>,
@@ -460,6 +468,9 @@ pub struct Model {
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
+    /// This session's claimable balance readings, oldest first, kept for
+    /// 24h; runs of an unchanged balance keep their first and last reading.
+    pub claimable_readings: std::collections::VecDeque<(std::time::Instant, u128)>,
     /// Why the last reward read failed; cleared by a successful one.
     pub reward_error: Option<String>,
     pub reward_loaded: bool,
@@ -862,7 +873,10 @@ impl Model {
     }
     pub fn daily_reward(&self, per_frame: &BigInt, filter: &[u8], index: usize) -> Option<BigInt> {
         if index == 2 {
-            return Some(per_frame * BigInt::from(8640));
+            return Some(super::super::theory_quil_daily(
+                per_frame,
+                self.node_global_cadence.as_ref(),
+            ));
         }
         if self.app_cadence_stale() {
             return None;
@@ -872,7 +886,62 @@ impl Model {
             self.node_app_cadence.get(filter)?,
             index == 1,
             self.node_app_committee.get(filter).copied().unwrap_or(0),
+            self.node_app_cert_share.get(filter),
         )
+    }
+    /// The share of frames the 60m (`day` false) or 24h estimate pays this
+    /// node's seat on a shard; `None` while that estimate reads `-`.
+    pub fn reward_share(&self, filter: &[u8], day: bool) -> Option<super::super::SigningShare> {
+        if self.app_cadence_stale() {
+            return None;
+        }
+        super::super::observed_window(self.node_app_cadence.get(filter)?, day)?;
+        Some(super::super::signing_share(
+            self.node_app_cert_share.get(filter),
+            day,
+            self.node_app_committee.get(filter).copied().unwrap_or(0),
+        ))
+    }
+    /// Record an authenticated claimable balance read at `now`.
+    pub fn record_claimable(&mut self, units: u128, now: std::time::Instant) {
+        let readings = &mut self.claimable_readings;
+        let run = readings.len() >= 2
+            && readings
+                .iter()
+                .rev()
+                .take(2)
+                .all(|&(_, previous)| previous == units);
+        if run {
+            readings.pop_back();
+        }
+        readings.push_back((now, units));
+        while readings
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at).as_secs() > 86_400)
+        {
+            readings.pop_front();
+        }
+    }
+    /// Base units per day credited to this node's prover over the last 60m
+    /// (`day` false) or 24h of this session: the claimable balance's rises
+    /// between consecutive readings over the time they span. A fall, a mint
+    /// claiming the balance, adds nothing. `None` until the readings span
+    /// [`CREDITED_MIN_SPAN_SECONDS`].
+    pub fn credited_daily(&self, day: bool, now: std::time::Instant) -> Option<BigInt> {
+        let window = if day { 86_400 } else { 3_600 };
+        let mut readings = self
+            .claimable_readings
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at).as_secs() <= window);
+        let &(first_at, mut previous) = readings.next()?;
+        let (mut last_at, mut credited) = (first_at, 0u128);
+        for &(at, units) in readings {
+            credited = credited.saturating_add(units.saturating_sub(previous));
+            (previous, last_at) = (units, at);
+        }
+        let span = last_at.saturating_duration_since(first_at).as_secs();
+        (span >= CREDITED_MIN_SPAN_SECONDS[usize::from(day)])
+            .then(|| BigInt::from(credited) * BigInt::from(86_400) / BigInt::from(span))
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
         if self.app_cadence_stale() {
@@ -899,6 +968,7 @@ impl Model {
             .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
             .collect();
         self.node_app_committee = committee_sizes(shards);
+        self.node_app_cert_share = certificate_shares(shards);
         self.seat_concentration = seat_concentration(shards);
     }
 
@@ -1001,6 +1071,7 @@ impl Model {
                 .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
                 .collect();
             self.node_app_committee = committee_sizes(shards);
+            self.node_app_cert_share = certificate_shares(shards);
             self.seat_concentration = seat_concentration(shards);
         }
         self.peer_id = node_info.peer_id.clone();
@@ -2071,6 +2142,15 @@ fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
         .shards
         .iter()
         .map(|s| (s.filter.clone(), super::super::committee_size(s)))
+        .collect()
+}
+
+/// This node's seat's certificate share on each shard that reports one.
+fn certificate_shares(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, CertificateShare> {
+    shards
+        .shards
+        .iter()
+        .filter_map(|s| Some((s.filter.clone(), s.certificate_share?)))
         .collect()
 }
 
@@ -3193,5 +3273,178 @@ mod frame_interval_tests {
         };
         m.observe_app_intervals(&shards, std::time::Instant::now());
         assert_eq!(m.app_interval(&[1]), None);
+    }
+}
+
+#[cfg(test)]
+mod reward_share_tests {
+    use super::*;
+    use quil_types::proto::node::{CertificateWindow, FrameCadence, FrameWindow, ShardRewardInfo};
+
+    /// 30 frames in 600s in both windows: 95_040_000 a day at 22_000 a
+    /// frame, every frame paid.
+    fn cadence() -> FrameCadence {
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: window,
+            day: window,
+        }
+    }
+    fn counted(frames: u64, signed_frames: u64) -> Option<CertificateWindow> {
+        Some(CertificateWindow {
+            window_seconds: 3600,
+            observed_seconds: 3600,
+            frames,
+            signed_frames,
+        })
+    }
+    /// A 22-member committee (quorum 15) whose seat signed `hour` and `day`.
+    fn model(hour: Option<CertificateWindow>, day: Option<CertificateWindow>) -> Model {
+        let mut m = Model::new();
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 22,
+                frame_cadence: Some(cadence()),
+                certificate_share: Some(CertificateShare {
+                    hour,
+                    day,
+                    committee: 22,
+                    quorum: 15,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        m
+    }
+
+    /// GLOBAL credits each signer of a frame's certificate the same
+    /// per-signer reward, so a seat earns the frames it signed.
+    #[test]
+    fn observed_rewards_pay_the_seats_own_certificate_share() {
+        let m = model(counted(40, 38), counted(900, 810));
+        let per_frame = BigInt::from(22_000);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 0),
+            Some(BigInt::from(95_040_000 / 40 * 38)),
+            "rewards: the 60m estimate pays the seat's 60m share, 38 of 40"
+        );
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 900 * 810)),
+            "rewards: the 24h estimate pays the seat's 24h share, 810 of 900"
+        );
+    }
+
+    /// A window in which the node counted no frame pays the quorum share,
+    /// 15 of 22; the other window keeps its own share.
+    #[test]
+    fn a_window_without_counted_certificates_pays_the_quorum_share() {
+        let m = model(counted(0, 0), counted(900, 810));
+        let per_frame = BigInt::from(22_000);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 0),
+            Some(BigInt::from(95_040_000 / 22 * 15)),
+            "rewards: no 60m frame counted, the 60m estimate pays the quorum share"
+        );
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 900 * 810)),
+            "rewards: the 24h estimate keeps the seat's 24h share"
+        );
+        let unreported = model(None, None);
+        assert_eq!(
+            unreported.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 22 * 15)),
+            "rewards: no share reported, the 24h estimate pays the quorum share"
+        );
+    }
+
+    /// `T`: one frame of the shard per GLOBAL frame at the measured GLOBAL
+    /// interval, the 24h window first, every frame paid; the 10s target
+    /// while none is measured.
+    #[test]
+    fn theory_pays_one_frame_per_measured_global_frame() {
+        let mut m = Model::new();
+        let per_frame = BigInt::from(1_000);
+        let window = |window_seconds, advanced_frames| {
+            Some(FrameWindow {
+                window_seconds,
+                observed_seconds: window_seconds,
+                advanced_frames,
+            })
+        };
+        m.node_global_cadence = Some(FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: window(3600, 353),
+            day: window(86_400, 8_470),
+        });
+        m.node_global_cadence_received = Some(std::time::Instant::now());
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 8_470)),
+            "rewards: T at the 24h GLOBAL rate, 8470 frames a day"
+        );
+        m.node_global_cadence.as_mut().unwrap().day = None;
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 353 * 24)),
+            "rewards: T at the 60m GLOBAL rate without a 24h one"
+        );
+        m.node_global_cadence = None;
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 8_640)),
+            "rewards: T at the 10s target while none is measured"
+        );
+    }
+
+    /// Credited reads only its window's reads; a run of an unchanged
+    /// balance keeps its first and last read, and reads age out after 24h.
+    #[test]
+    fn credited_reads_only_its_window() {
+        let mut m = Model::new();
+        let start = std::time::Instant::now();
+        let at = |minutes: u64| start + std::time::Duration::from_secs(minutes * 60);
+        for minute in 0..=5 {
+            m.record_claimable(1_000, at(minute));
+        }
+        assert_eq!(
+            m.claimable_readings.len(),
+            2,
+            "rewards: a run keeps its first and last read"
+        );
+        m.record_claimable(1_000, at(30));
+        m.record_claimable(4_600, at(90));
+        assert_eq!(
+            m.credited_daily(false, at(90)),
+            Some(BigInt::from(3_600 * 24)),
+            "rewards: the 60m window reads 30m..90m, 3_600 units in an hour"
+        );
+        assert_eq!(
+            m.credited_daily(true, at(90)),
+            None,
+            "rewards: the 24h window needs 2h of reads"
+        );
+        m.record_claimable(4_600, at(150));
+        assert_eq!(
+            m.credited_daily(true, at(150)),
+            Some(BigInt::from(3_600 * 86_400 / 9_000)),
+            "rewards: the 24h window reads 0..150m"
+        );
+        m.record_claimable(4_600, at(25 * 60));
+        assert!(
+            m.claimable_readings
+                .front()
+                .is_some_and(|&(first, _)| first >= at(60)),
+            "rewards: reads over 24h old age out"
+        );
     }
 }

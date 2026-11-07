@@ -141,6 +141,9 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             m.reward_error = result.as_ref().err().cloned();
             m.claimable_reward = result.ok().flatten();
             m.reward_last_success = m.claimable_reward.map(|_| now);
+            if let Some((units, _)) = m.claimable_reward {
+                m.record_claimable(units, now);
+            }
             vec![]
         }
         Msg::HealthRefresh(answer) => {
