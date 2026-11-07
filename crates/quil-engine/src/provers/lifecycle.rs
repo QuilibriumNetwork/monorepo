@@ -654,6 +654,8 @@ pub struct ProverLifecycle {
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
     /// The contents and time of the last `lifecycle allocation buckets` line.
     buckets_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// The contents and time of the last `lifecycle capacity` line.
+    capacity_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
     /// Whether free workers are waiting on capacity; see [`capacity_wait_note`].
     capacity_wait: std::sync::Mutex<Option<CapacityWait>>,
     /// Halt-risk leave penalty notices already logged (#976).
@@ -878,6 +880,7 @@ impl ProverLifecycle {
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
             buckets_logged: std::sync::Mutex::new(None),
+            capacity_logged: std::sync::Mutex::new(None),
             capacity_wait: std::sync::Mutex::new(None),
             seniority_guard: Default::default(),
             session_hosting: Default::default(),
@@ -1680,6 +1683,66 @@ impl ProverLifecycle {
                           (qclient node prover manage, Ctrl+O) and send the join again",
                 "lifecycle: rejecting an operator's join; the seat goes");
         }
+    }
+
+    /// Log the seats held against the worker capacity, as both capacity
+    /// sheds see them: the surplus-actives leave (all actives against the
+    /// worker capacity) and the leave sweep (auto-managed seats against the
+    /// workers that can serve them). Without a leave neither comparison left
+    /// a trace, so a node that fits could not be told from one that failed to
+    /// shed. On change, else every [`BUCKETS_LOG_EVERY`].
+    fn report_capacity_view(
+        &self,
+        frame_number: u64,
+        active: &[Vec<u8>],
+        leaving: &[(Vec<u8>, u64)],
+        workers: &[crate::worker::WorkerInfo],
+        worker_capacity: usize,
+        surplus: &SurplusSelection,
+    ) {
+        let pins = manually_managed_filters(workers);
+        let auto_held = active
+            .iter()
+            .filter(|f| !pins.contains(*f) && !leaving.iter().any(|(l, _)| l == *f))
+            .count();
+        let auto_capacity = auto_worker_capacity(workers, worker_capacity, pins.len());
+        let overcapacity = auto_held.saturating_sub(auto_capacity);
+        let view = (
+            active.len(),
+            worker_capacity,
+            surplus.surplus,
+            surplus.eligible,
+            auto_held,
+            auto_capacity,
+            pins.len(),
+        );
+        let contents = format!("{view:?}");
+        let due = self
+            .capacity_logged
+            .lock()
+            .map(|mut last| buckets_line_due(&mut last, contents, std::time::Instant::now()))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        info!(
+            frame = frame_number,
+            active = active.len(),
+            worker_capacity,
+            surplus = surplus.surplus,
+            eligible = surplus.eligible,
+            shielded = surplus.shielded.len(),
+            auto_held,
+            auto_worker_capacity = auto_capacity,
+            overcapacity,
+            workers = workers.len(),
+            manual_pins = pins.len(),
+            pending_leaves = leaving.len(),
+            scope = "local",
+            "lifecycle capacity: seats held against the workers that can serve them; a surplus \
+             is proposed to leave, worst-scoring first, unless the halt-risk shield keeps it \
+             (logged on change, else every 10 min)"
+        );
     }
 
     /// Report the leaves rejected at `frame_number` because the halt-risk
@@ -3499,6 +3562,16 @@ impl ProverLifecycle {
             &draining_filters,
             &storage_protected,
         );
+        if shard_info_ready && !active_filters.is_empty() {
+            self.report_capacity_view(
+                frame_number,
+                &active_filters,
+                &leaving_filters,
+                &workers,
+                worker_capacity,
+                &surplus_selection,
+            );
+        }
         if shard_info_ready && !active_filters.is_empty() && !join_proposed_this_cycle {
             self.report_storage_spared(
                 frame_number,
@@ -4082,11 +4155,8 @@ impl ProverLifecycle {
             // `select_excess_active_filters`: the allocator binds an unbound
             // allocation to it first, so subtracting it found a surplus of
             // one per idle manual worker and left a holding it could serve.
-            let auto_worker_capacity = workers
-                .iter()
-                .filter(|w| !w.manually_managed || w.filter.is_empty())
-                .count()
-                .min(worker_capacity.saturating_sub(manually_managed_filters.len()));
+            let auto_worker_capacity =
+                auto_worker_capacity(&workers, worker_capacity, manually_managed_filters.len());
             let overcapacity = sheddable_filters.len().saturating_sub(auto_worker_capacity);
             let overcapacity_filters: Vec<Vec<u8>> = if overcapacity == 0 {
                 Vec::new()
@@ -5665,6 +5735,23 @@ fn log_capacity_wait(note: &CapacityWaitNote) {
         expected = d.expected,
         "no join is proposed: free workers wait for capacity"
     );
+}
+
+/// Capacity for auto-managed allocations: the worker count less the workers
+/// bound to the operator's pins. An idle manual worker still counts, as in
+/// `select_excess_active_filters`: the allocator binds an unbound allocation
+/// to it first, so subtracting it found a surplus of one per idle manual
+/// worker and left a holding it could serve.
+fn auto_worker_capacity(
+    workers: &[crate::worker::WorkerInfo],
+    worker_capacity: usize,
+    manual_pins: usize,
+) -> usize {
+    workers
+        .iter()
+        .filter(|w| !w.manually_managed || w.filter.is_empty())
+        .count()
+        .min(worker_capacity.saturating_sub(manual_pins))
 }
 
 /// How often an unchanged `lifecycle allocation buckets` line repeats.
@@ -12583,6 +12670,81 @@ mod proposal_loop_tests {
             "no surplus expected when active count == worker count; got {} in {:?}",
             proposed, actions
         );
+    }
+
+    /// The lifecycle logs the seats it holds against its worker capacity,
+    /// whether or not a leave follows, so a node that fits can be told from
+    /// one that should shed; an unchanged view is not logged again.
+    #[test]
+    fn the_capacity_view_is_logged_on_change() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        for i in 1..=4u32 {
+            wm.add(allocated_worker(i, filter_bytes(0xA0 + i as u8)));
+        }
+        let held = |n: u8| {
+            let allocs: Vec<_> = (1..=n)
+                .map(|i| alloc(filter_bytes(0xA0 + i), ProverStatus::Active, 10))
+                .collect();
+            let summaries: Vec<_> = (1..=n)
+                .map(|i| ProverShardSummary {
+                    filter: filter_bytes(0xA0 + i),
+                    status_counts: HashMap::from([(ProverStatus::Active, 4 + u32::from(i))]),
+                    total_size: 1_000_000,
+                })
+                .collect();
+            (allocs, summaries)
+        };
+        let (allocs, summaries) = held(4);
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        let capacity_lines = |logged: &str| -> Vec<String> {
+            logged
+                .lines()
+                .filter(|line| line.contains("lifecycle capacity:"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        lifecycle.set_prover_root_verified_frame(100);
+        let (actions, logged) = evaluate_logged(&lifecycle, 100, reg.as_ref(), wm.as_ref());
+        assert_eq!(count_proposed_leaves(&actions), 0, "{actions:?}");
+        let lines = capacity_lines(&logged);
+        assert_eq!(lines.len(), 1, "one capacity line at capacity: {logged}");
+        for field in ["auto_held=4", "auto_worker_capacity=4", "overcapacity=0"] {
+            assert!(lines[0].contains(field), "{field} missing: {}", lines[0]);
+        }
+
+        lifecycle.set_prover_root_verified_frame(101);
+        let (_, logged) = evaluate_logged(&lifecycle, 101, reg.as_ref(), wm.as_ref());
+        assert!(
+            capacity_lines(&logged).is_empty(),
+            "an unchanged view is not logged again: {logged}"
+        );
+
+        let (allocs, summaries) = held(6);
+        reg.set_prover(prover(address, allocs));
+        reg.set_summaries(summaries);
+        seed_sizes_from_registry(&lifecycle, reg.as_ref());
+        lifecycle.set_prover_root_verified_frame(102);
+        let (actions, logged) = evaluate_logged(&lifecycle, 102, reg.as_ref(), wm.as_ref());
+        let lines = capacity_lines(&logged);
+        assert_eq!(lines.len(), 1, "one capacity line over capacity: {logged}");
+        for field in [
+            "auto_held=6",
+            "auto_worker_capacity=4",
+            "overcapacity=2",
+            "surplus=2",
+        ] {
+            assert!(lines[0].contains(field), "{field} missing: {}", lines[0]);
+        }
+        assert_eq!(count_proposed_leaves(&actions), 2, "{actions:?}");
     }
 
     #[test]
