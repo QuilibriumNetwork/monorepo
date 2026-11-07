@@ -34,6 +34,9 @@ pub enum Msg {
     /// A running transfer action's report.
     Transfer(super::transfer::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
+    /// The node's health report: its conditions, none from a node that
+    /// predates them, or why it is unavailable.
+    HealthRefresh(super::model::HealthAnswer),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
     /// `dataRefreshMsg` — result of a full RPC data fetch.

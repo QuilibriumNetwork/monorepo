@@ -185,6 +185,117 @@ message HealthReport {
   // How fast the master store's reads and the disk under it are; absent
   // from nodes that predate it or before the first interval closes.
   StoreIoHealth store_io = 12;
+  // The health conditions this node detects and what it observed to judge
+  // them; absent from nodes that predate it (they judge none).
+  HealthConditions health = 13;
+}
+
+// A health condition this node detects (`HealthCondition.kind`). Readers
+// that predate a kind show it by severity and scope only.
+enum ConditionKind {
+  CONDITION_KIND_UNSPECIFIED = 0;
+  // Earning allocations whose worker's materialized app frame has not
+  // advanced for its window.
+  CONDITION_KIND_LOCAL_APP_FRAMES_UNCHANGED = 1;
+  // Shards whose head, as peers report it, has not changed for its window.
+  CONDITION_KIND_PEER_APP_FRAMES_UNCHANGED = 2;
+  // Shards whose head in committed GLOBAL state has not changed for its
+  // window while GLOBAL and the shard's app frames both advanced.
+  CONDITION_KIND_GLOBAL_APP_FRAMES_UNCHANGED = 3;
+  // Shards whose head in committed GLOBAL state trails their app head by
+  // more than `HealthCondition.threshold` frames.
+  CONDITION_KIND_GLOBAL_APP_FRAMES_BEHIND = 4;
+}
+
+enum ConditionSeverity {
+  CONDITION_SEVERITY_UNSPECIFIED = 0;
+  CONDITION_SEVERITY_INFO = 1;
+  CONDITION_SEVERITY_WARNING = 2;
+  CONDITION_SEVERITY_ERROR = 3;
+}
+
+// Whose problem a condition is, as far as this node can tell.
+enum ConditionScope {
+  CONDITION_SCOPE_UNSPECIFIED = 0;
+  CONDITION_SCOPE_THIS_NODE = 1;
+  // What peers report: the peer or the shard it reports on.
+  CONDITION_SCOPE_PEER = 2;
+  // Committed GLOBAL state, the same on every node that follows it.
+  CONDITION_SCOPE_NETWORK = 3;
+}
+
+// What the operator checks next (`HealthCondition.action`); readers map it
+// to text, and one that predates a value points to this node's log.
+enum ConditionAction {
+  CONDITION_ACTION_UNSPECIFIED = 0;
+  // The affected workers' logs: sync, close, handoff and activation waits
+  // are excluded, so a stop there is an engine or consensus failure.
+  CONDITION_ACTION_CHECK_WORKER_LOGS = 1;
+  // The shard on the explorer: advancing there means the reporting peer
+  // trails; stopped there means the shard halted.
+  CONDITION_ACTION_COMPARE_PEER_WITH_EXPLORER = 2;
+  // GLOBAL's inclusion of the shard on the explorer: advancing there means
+  // this node's GLOBAL view trails.
+  CONDITION_ACTION_CHECK_GLOBAL_INCLUSION = 3;
+}
+
+// One shard or allocation a condition affects.
+message AffectedShard {
+  // The public shard filter.
+  bytes filter = 1;
+  // The worker serving it, for conditions of this node's workers; 0
+  // otherwise.
+  uint32 core_id = 2;
+  // The frame that has not moved (for `..._BEHIND`, the committed head).
+  uint64 frame = 3;
+  // Since when this node has seen that frame unchanged; 0 for `..._BEHIND`.
+  uint64 unchanged_since_unix_ms = 4;
+  // The window this shard was judged by: the base window, or 3 of its
+  // mean frame intervals on a slower shard; 0 for `..._BEHIND`.
+  uint64 window_secs = 5;
+  // For `..._BEHIND`: the frames the committed head trails the app head.
+  uint64 lag_frames = 6;
+}
+
+// A condition current in this node's view. Each one is logged when it
+// starts, at most every 10 minutes while it lasts, and when it ends.
+message HealthCondition {
+  ConditionKind kind = 1;
+  ConditionSeverity severity = 2;
+  ConditionScope scope = 3;
+  ConditionAction action = 4;
+  // When it started, on this node's clock.
+  uint64 since_unix_ms = 5;
+  // Affected of tracked: the count and its denominator.
+  uint32 affected = 6;
+  uint32 tracked = 7;
+  // The base window in seconds for the `..._UNCHANGED` kinds, the lag in
+  // frames for `..._BEHIND`.
+  uint64 threshold = 8;
+  // The affected shards, at most 64; the rest are counted.
+  repeated AffectedShard shards = 9;
+  uint32 omitted_shards = 10;
+}
+
+// What this node observed to judge one kind, so a reader can tell "nothing
+// wrong" from "nothing observed".
+message ConditionSource {
+  ConditionKind kind = 1;
+  // The latest fresh observation the kind was judged on; 0 without one.
+  uint64 observed_unix_ms = 2;
+  // What it tracks with fresh observations (allocations or shards).
+  uint32 tracked = 3;
+}
+
+message HealthConditions {
+  // The conditions found at the last evaluation, worst first. One that is
+  // clear is not served: it ends after 60 s clear, and one recurring sooner
+  // is served again under its first start, without a log line, so it can
+  // be missing between its start and end lines; those lines count such
+  // clear spells (`clear_spells`, `unserved_secs`).
+  repeated HealthCondition conditions = 1;
+  // Every kind this build judges, observed or not.
+  repeated ConditionSource sources = 2;
 }
 
 // Whether the master store's reads and its disk are fast enough

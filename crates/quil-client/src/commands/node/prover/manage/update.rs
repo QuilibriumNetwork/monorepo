@@ -143,6 +143,11 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             m.reward_last_success = m.claimable_reward.map(|_| now);
             vec![]
         }
+        Msg::HealthRefresh(answer) => {
+            m.health = answer;
+            m.health_received = Some(now);
+            vec![]
+        }
         Msg::ShardLoading => {
             m.shard_loading = true;
             m.shard_message_time = Some(std::time::SystemTime::now());
@@ -159,8 +164,6 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             match result {
                 Ok(shards) => {
                     m.observe_app_intervals(&shards, now);
-                    m.observe_reported_app_heads(&shards, now);
-                    m.observe_committed_app_heads(&shards, now);
                     m.shard_error = None;
                     m.shard_last_success = Some(now);
                     m.shard_last_duration = elapsed;
@@ -193,8 +196,6 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             }
             if let Some(shards) = &shard_info {
                 m.observe_app_intervals(shards, now);
-                m.observe_reported_app_heads(shards, now);
-                m.observe_committed_app_heads(shards, now);
             }
             m.last_fetch_success = Some(now);
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {

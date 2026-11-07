@@ -27,8 +27,8 @@ use quil_types::proto::diagnostics::diagnostics_service_server::{
     DiagnosticsService, DiagnosticsServiceServer,
 };
 use quil_types::proto::diagnostics::{
-    Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure,
-    RecoveryPhase, StoreIoHealth, WorkerHealth,
+    Blocker, FailureCount, GetHealthReportRequest, HealthConditions, HealthReport, Phase,
+    RecoveryFailure, RecoveryPhase, StoreIoHealth, WorkerHealth,
 };
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
@@ -40,6 +40,8 @@ pub const SCHEMA: u32 = 1;
 /// Bounds of one report: workers beyond them are counted, not sent.
 pub const MAX_WORKERS: usize = 256;
 pub const MAX_REPORT_BYTES: usize = 32 * 1024;
+/// The health conditions take at most this much of a report.
+pub const MAX_HEALTH_BYTES: usize = MAX_REPORT_BYTES / 2;
 /// A filter longer than any shard filter is not reported.
 pub const MAX_FILTER_BYTES: usize = 128;
 /// Requests are empty: anything larger is refused before it is decoded.
@@ -320,6 +322,9 @@ pub struct HealthInputs {
     /// The master store's latest I/O interval
     /// ([`quil_forest::store_io::latest`]).
     pub store_io: Option<StoreIoHealth>,
+    /// The node's health conditions
+    /// ([`crate::health_conditions::HealthRegistry::snapshot`]).
+    pub health: Option<HealthConditions>,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -336,6 +341,8 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         master_store_write_failed: inputs.master_store_write_failed,
         worker_capacity: inputs.worker_capacity,
         store_io: inputs.store_io.clone(),
+        // Before the workers, within half the size bound.
+        health: inputs.health.clone().map(bound_health),
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -366,6 +373,24 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
     }
     report.omitted_workers = omitted;
     report
+}
+
+/// `health` within [`MAX_HEALTH_BYTES`]: the last listed shards of the
+/// longest lists are counted instead, conditions and counts always stay.
+fn bound_health(mut health: HealthConditions) -> HealthConditions {
+    while health.encoded_len() > MAX_HEALTH_BYTES {
+        let Some(longest) = health
+            .conditions
+            .iter_mut()
+            .filter(|c| !c.shards.is_empty())
+            .max_by_key(|c| c.shards.len())
+        else {
+            break;
+        };
+        longest.shards.pop();
+        longest.omitted_shards = longest.omitted_shards.saturating_add(1);
+    }
+    health
 }
 
 /// Why a request was not served, as the refusal summary counts it.
@@ -717,12 +742,20 @@ impl DiagnosticsService for DiagnosticsServer {
             &self.build_fingerprint,
             quil_engine::worker_execution::now_ms(),
         );
-        let requester = match requester {
-            Requester::Own => "self".to_string(),
-            Requester::Peer(peer) => peer_tail(&peer),
-        };
-        info!(%requester, workers = report.workers.len(), omitted_workers = report.omitted_workers,
-            bytes = report.encoded_len(), "diagnostics health report served");
+        match requester {
+            // This node's own clients (the node manager asks each refresh)
+            // are no access to account for.
+            Requester::Own => debug!(
+                workers = report.workers.len(),
+                bytes = report.encoded_len(),
+                "diagnostics health report served to this node"
+            ),
+            Requester::Peer(peer) => {
+                info!(requester = %peer_tail(&peer), workers = report.workers.len(),
+                    omitted_workers = report.omitted_workers, bytes = report.encoded_len(),
+                    "diagnostics health report served")
+            }
+        }
         Ok(Response::new(report))
     }
 }
@@ -1585,6 +1618,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(build_report(&long, &[], 0).omitted_workers, 1);
+    }
+
+    /// The node's conditions ride the report within half its size bound:
+    /// every condition and count stays, the longest shard lists shrink, and
+    /// the workers still fit beside them.
+    #[test]
+    fn health_conditions_ride_the_report_within_their_bound() {
+        use quil_types::proto::diagnostics::{AffectedShard, HealthCondition};
+        let condition = |kind| HealthCondition {
+            kind,
+            affected: 64,
+            tracked: 64,
+            shards: (0..64u8)
+                .map(|f| AffectedShard {
+                    filter: vec![f; MAX_FILTER_BYTES],
+                    frame: u64::MAX,
+                    unchanged_since_unix_ms: u64::MAX,
+                    window_secs: u64::MAX,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let inputs = HealthInputs {
+            workers: (0..8)
+                .map(|core| entry(core, &[core as u8; 32], None))
+                .collect(),
+            health: Some(HealthConditions {
+                conditions: (1..=4).map(condition).collect(),
+                sources: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let report = build_report(&inputs, &[0xff; 32], 1);
+        let health = report.health.as_ref().expect("conditions reported");
+        assert!(
+            health.encoded_len() <= MAX_HEALTH_BYTES,
+            "{}",
+            health.encoded_len()
+        );
+        assert_eq!(health.conditions.len(), 4);
+        for c in &health.conditions {
+            assert_eq!(c.affected, 64);
+            assert_eq!(c.shards.len() as u32 + c.omitted_shards, 64);
+        }
+        assert_eq!((report.workers.len(), report.omitted_workers), (8, 0));
+        assert!(report.encoded_len() <= MAX_REPORT_BYTES);
+        // A node that judges nothing sends no conditions at all.
+        assert!(build_report(&HealthInputs::default(), &[], 1)
+            .health
+            .is_none());
     }
 
     /// Over the real transport: the listener's handshake identity admits a

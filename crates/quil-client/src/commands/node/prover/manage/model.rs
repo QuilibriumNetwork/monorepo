@@ -5,6 +5,8 @@
 use super::super::local_execution::{execution_label, local_execution_state, state_at};
 use std::collections::{HashMap, HashSet};
 
+use quil_types::proto::diagnostics::{ConditionKind, HealthCondition, HealthConditions};
+
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
@@ -377,38 +379,18 @@ pub struct FilterOutcome {
     pub settled: bool,
 }
 
-/// Progress inferred only from newly returned peer-head snapshots.
-#[derive(Debug, Clone)]
-pub struct ReportedAppProgress {
-    pub frame: u64,
-    pub generation: Option<u64>,
-    pub last_change: std::time::Instant,
-    pub last_seen: std::time::Instant,
-    pub observations: u32,
-    pub stalled: bool,
-}
-
-/// A committed app head (GlobalHead) trailing the shard's app head by more
-/// than this many frames is reported as behind.
-pub const GLOBAL_APP_LAG_FRAMES: u64 = 100;
-
-/// Progress of GLOBAL's committed app head of one shard, inferred only from
-/// newly returned shard snapshots, against the shard's app head: the higher
-/// of the peer-reported head and this node's materialized frame.
-#[derive(Debug, Clone)]
-pub struct CommittedAppProgress {
-    pub frame: u64,
-    pub generation: u64,
-    /// The GLOBAL frame and app head when `frame` last changed.
-    pub global_frame: u64,
-    pub head: u64,
-    pub last_change: std::time::Instant,
-    pub last_seen: std::time::Instant,
-    pub observations: u32,
-    /// Unchanged while GLOBAL and the app head both advanced.
-    pub stalled: bool,
-    /// More than [`GLOBAL_APP_LAG_FRAMES`] behind the app head.
-    pub behind: bool,
+/// The node's answer to the node manager's health report request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HealthAnswer {
+    /// No answer yet.
+    #[default]
+    Unread,
+    /// The node's conditions.
+    Reported(HealthConditions),
+    /// The node answered without conditions: its version predates them.
+    NotReported,
+    /// No report: why.
+    Failed(String),
 }
 
 // ── Model ────────────────────────────────────────────────────────────────
@@ -561,17 +543,11 @@ pub struct Model {
     pub notice_offset: usize,
     pub notice_lines: usize,
     pub notice_visible: usize,
-    pub app_progress_observed_since: Option<std::time::Instant>,
     pub global_alarm_time: Option<std::time::SystemTime>,
-    pub app_stall_time: Option<std::time::SystemTime>,
-    pub reported_app_progress: HashMap<Vec<u8>, ReportedAppProgress>,
-    pub reported_app_stall_time: Option<std::time::SystemTime>,
-    pub committed_app_progress: HashMap<Vec<u8>, CommittedAppProgress>,
-    /// Allocations (filter keys) whose local materialized frame is unchanged
-    /// for 60s, and the staffed earning allocations with fresh observations.
-    pub local_stalled_rows: HashSet<String>,
-    pub local_stalled_count: usize,
-    pub local_app_rows: usize,
+    /// The node's health conditions, as its last health report gave them.
+    pub health: HealthAnswer,
+    /// When the last health answer arrived.
+    pub health_received: Option<std::time::Instant>,
     /// When each current condition notice was first observed, by its key.
     pub notice_since: HashMap<&'static str, std::time::SystemTime>,
     pub status_msg: String,
@@ -935,174 +911,46 @@ impl Model {
         }
     }
 
-    /// Record peer-head progress once per fresh shard RPC, never on cache reuse.
-    pub fn observe_reported_app_heads(
-        &mut self,
-        shards: &GetShardInfoResponse,
-        now: std::time::Instant,
-    ) {
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
-        let mut known = HashSet::new();
-        for shard in &shards.shards {
-            // Empty/unknown peer metadata and unstaffed shards cannot establish a stall.
-            if shard.active_provers == 0
-                || (shard.latest_frame == 0 && shard.materialized_frame == 0)
-            {
-                continue;
-            }
-            if !known.insert(shard.filter.clone()) {
-                continue;
-            }
-            let generation = shard.global_head.as_ref().map(|h| h.generation);
-            let progress = self
-                .reported_app_progress
-                .entry(shard.filter.clone())
-                .or_insert(ReportedAppProgress {
-                    frame: shard.latest_frame,
-                    generation,
-                    last_change: now,
-                    last_seen: now,
-                    observations: 0,
-                    stalled: false,
-                });
-            if progress.frame != shard.latest_frame
-                || progress.generation != generation
-                || now.saturating_duration_since(progress.last_seen) > budget
-            {
-                *progress = ReportedAppProgress {
-                    frame: shard.latest_frame,
-                    generation,
-                    last_change: now,
-                    last_seen: now,
-                    observations: 0,
-                    stalled: false,
-                };
-            }
-            progress.last_seen = now;
-            progress.observations = progress.observations.saturating_add(1);
-            if progress.observations >= 3
-                && now.saturating_duration_since(progress.last_change) >= window
-            {
-                progress.stalled = true;
-            }
+    /// The node's current conditions, from a fresh health report; none from
+    /// an old or missing one.
+    pub fn health_conditions(&self) -> &[HealthCondition] {
+        let fresh = self
+            .health_received
+            .is_some_and(|t| t.elapsed().as_secs() <= self.refresh_seconds * 2 + 30);
+        match &self.health {
+            HealthAnswer::Reported(health) if fresh => health.conditions.as_slice(),
+            _ => &[],
         }
-        self.reported_app_progress
-            .retain(|filter, _| known.contains(filter));
     }
 
+    /// Whether the node's current `kind` condition lists `filter` (and,
+    /// for this node's workers, `core`).
+    pub fn condition_affects(&self, kind: ConditionKind, filter: &[u8], core: Option<u32>) -> bool {
+        self.health_conditions()
+            .iter()
+            .filter(|c| c.kind == kind as i32)
+            .flat_map(|c| &c.shards)
+            .any(|s| s.filter == filter && core.is_none_or(|core| s.core_id == core))
+    }
+
+    /// The node reports the shard's peer-reported head unchanged.
     pub fn reported_app_stalled(&self, filter: &[u8]) -> bool {
-        if self.shard_error.is_some() {
-            return false;
-        }
-        self.reported_app_progress.get(filter).is_some_and(|p| {
-            p.stalled && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
-        })
+        self.condition_affects(ConditionKind::PeerAppFramesUnchanged, filter, None)
     }
 
-    pub fn reported_app_stall_counts(&self, now: std::time::Instant) -> Option<(usize, usize)> {
-        if self.shard_error.is_some() {
-            return None;
-        }
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let known: Vec<_> = self
-            .reported_app_progress
-            .values()
-            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
-            .collect();
-        let stalled = known.iter().filter(|p| p.stalled).count();
-        (stalled > 0).then_some((stalled, known.len()))
-    }
-
-    /// Record GLOBAL's committed app heads once per fresh shard RPC, never on
-    /// cache reuse. Unstaffed shards and shards without a committed head or
-    /// an app head cannot establish a stall or a lag.
-    pub fn observe_committed_app_heads(
-        &mut self,
-        shards: &GetShardInfoResponse,
-        now: std::time::Instant,
-    ) {
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
-        let mut local: HashMap<Vec<u8>, u64> = HashMap::new();
-        for a in &self.allocations {
-            if let Some(frame) = a.execution.as_ref().and_then(|e| e.materialized_frame) {
-                let entry = local.entry(a.filter.clone()).or_default();
-                *entry = (*entry).max(frame);
-            }
-        }
-        let mut known = HashSet::new();
-        for shard in &shards.shards {
-            let Some(committed) = shard.global_head.as_ref() else {
-                continue;
-            };
-            let head = shard
-                .latest_frame
-                .max(local.get(&shard.filter).copied().unwrap_or(0));
-            if shard.active_provers == 0 || head == 0 || !known.insert(shard.filter.clone()) {
-                continue;
-            }
-            let fresh = CommittedAppProgress {
-                frame: committed.frame,
-                generation: committed.generation,
-                global_frame: committed.global_frame,
-                head,
-                last_change: now,
-                last_seen: now,
-                observations: 0,
-                stalled: false,
-                behind: false,
-            };
-            let progress = self
-                .committed_app_progress
-                .entry(shard.filter.clone())
-                .or_insert_with(|| fresh.clone());
-            if progress.frame != committed.frame
-                || progress.generation != committed.generation
-                || now.saturating_duration_since(progress.last_seen) > budget
-            {
-                *progress = fresh;
-            }
-            progress.last_seen = now;
-            progress.observations = progress.observations.saturating_add(1);
-            progress.behind = head.saturating_sub(committed.frame) > GLOBAL_APP_LAG_FRAMES;
-            if progress.observations >= 3
-                && now.saturating_duration_since(progress.last_change) >= window
-                && committed.global_frame > progress.global_frame
-                && head > progress.head
-            {
-                progress.stalled = true;
-            }
-        }
-        self.committed_app_progress
-            .retain(|filter, _| known.contains(filter));
-    }
-
-    /// The shard's GlobalHead is stalled or behind in a fresh snapshot.
+    /// The node reports the shard's committed head (GlobalHead) unchanged
+    /// or behind.
     pub fn committed_app_flagged(&self, filter: &[u8]) -> bool {
-        if self.shard_error.is_some() {
-            return false;
-        }
-        self.committed_app_progress.get(filter).is_some_and(|p| {
-            (p.stalled || p.behind)
-                && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
-        })
+        self.condition_affects(ConditionKind::GlobalAppFramesUnchanged, filter, None)
+            || self.condition_affects(ConditionKind::GlobalAppFramesBehind, filter, None)
     }
 
-    /// Stalled and behind shards, and the tracked shards with fresh snapshots.
-    pub fn committed_app_counts(&self, now: std::time::Instant) -> Option<(usize, usize, usize)> {
-        if self.shard_error.is_some() {
-            return None;
-        }
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let known: Vec<_> = self
-            .committed_app_progress
-            .values()
-            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
-            .collect();
-        let stalled = known.iter().filter(|p| p.stalled).count();
-        let behind = known.iter().filter(|p| p.behind).count();
-        (stalled + behind > 0).then_some((stalled, behind, known.len()))
+    /// The node reports the local app frames of the allocation on `filter`
+    /// served by `worker_id` unchanged.
+    pub fn local_app_stalled(&self, filter: &[u8], worker_id: i64) -> bool {
+        u32::try_from(worker_id).is_ok_and(|core| {
+            self.condition_affects(ConditionKind::LocalAppFramesUnchanged, filter, Some(core))
+        })
     }
 
     // ── Data refresh ─────────────────────────────────────────────────────
@@ -2439,123 +2287,47 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn reported_heads_track_individual_shards_and_ignore_unknown_or_unstaffed_rows() {
-        use quil_types::proto::node::ShardRewardInfo;
-        use std::time::{Duration, Instant};
-        let start = Instant::now();
-        let mut m = Model::new();
-        let mut shards = GetShardInfoResponse {
-            shards: vec![
-                ShardRewardInfo {
-                    filter: vec![1],
-                    active_provers: 1,
-                    latest_frame: 10,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![2],
-                    active_provers: 1,
-                    latest_frame: 20,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![3],
-                    active_provers: 1,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![4],
-                    latest_frame: 30,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        for secs in [0, 30, 60] {
-            shards.shards[1].latest_frame += 1;
-            m.observe_reported_app_heads(&shards, start + Duration::from_secs(secs));
-        }
-        assert_eq!(m.reported_app_progress.len(), 2);
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(60)),
-            Some((1, 2))
-        );
-        // Row filtering and cache-backed local-status refreshes do not affect tracking.
-        m.allocations.clear();
-        m.available.clear();
-        m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 3);
-        m.refresh_seconds = 60;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            Some((1, 2))
-        );
-        shards.shards[0].latest_frame += 1;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(62));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(62)),
-            None
-        );
-    }
-
-    #[test]
-    fn reported_heads_require_fresh_confirmations_and_reset_on_missing_data_or_generation() {
-        use quil_types::proto::node::{GlobalAppFrameHead, ShardRewardInfo};
-        use std::time::{Duration, Instant};
-        let start = Instant::now();
-        let mut m = Model::new();
-        let mut shards = GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![1],
-                active_provers: 1,
-                latest_frame: 10,
-                global_head: Some(GlobalAppFrameHead {
-                    generation: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        m.observe_reported_app_heads(&shards, start);
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(60));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(60)),
-            None
-        );
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            Some((1, 1))
-        );
-        m.shard_error = Some("fetch failed".into());
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            None
-        );
-        m.shard_error = None;
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(122)),
-            None
-        );
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(122));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        assert!(!m.reported_app_progress[&vec![1]].stalled);
-        shards.shards[0].global_head.as_mut().unwrap().generation = 2;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(123));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        shards.shards[0].latest_frame = 9;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(124));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        m.observe_reported_app_heads(
-            &GetShardInfoResponse::default(),
-            start + Duration::from_secs(125),
-        );
-        assert!(m.reported_app_progress.is_empty());
-    }
     use super::*;
+
+    /// Cells follow the node's conditions while its report is fresh: each
+    /// kind flags only the shards (and workers) it lists, and an old report
+    /// or one from a node that predates conditions flags nothing.
+    #[test]
+    fn cells_follow_the_node_conditions_while_the_report_is_fresh() {
+        use quil_types::proto::diagnostics::AffectedShard;
+        let shard = |filter: u8, core_id| AffectedShard {
+            filter: vec![filter],
+            core_id,
+            ..Default::default()
+        };
+        let condition = |kind: ConditionKind, shards| HealthCondition {
+            kind: kind as i32,
+            shards,
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![
+                condition(ConditionKind::PeerAppFramesUnchanged, vec![shard(1, 0)]),
+                condition(ConditionKind::GlobalAppFramesBehind, vec![shard(2, 0)]),
+                condition(ConditionKind::LocalAppFramesUnchanged, vec![shard(3, 7)]),
+            ],
+            sources: Vec::new(),
+        });
+        m.health_received = Some(std::time::Instant::now());
+        assert!(m.reported_app_stalled(&[1]));
+        assert!(!m.reported_app_stalled(&[2]));
+        assert!(m.committed_app_flagged(&[2]));
+        assert!(!m.committed_app_flagged(&[1]));
+        assert!(m.local_app_stalled(&[3], 7));
+        assert!(!m.local_app_stalled(&[3], 8), "another worker on it");
+        assert!(!m.local_app_stalled(&[3], -1), "no worker");
+        m.health_received = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        assert!(!m.reported_app_stalled(&[1]), "an old report");
+        m.health_received = Some(std::time::Instant::now());
+        m.health = HealthAnswer::NotReported;
+        assert!(m.health_conditions().is_empty());
+    }
 
     fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
         ShardAllocationInfo {

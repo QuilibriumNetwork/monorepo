@@ -20,6 +20,7 @@ use super::super::format_quil_daily_round;
 use super::coins;
 use super::model::*;
 use super::util::{center_trunc, clamp_offset, filter_label, shared_filter_address};
+use quil_types::proto::diagnostics::ConditionSeverity;
 
 #[path = "coins_view.rs"]
 mod coins_view;
@@ -581,7 +582,6 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         &sorted_allocs,
         &sorted_avail,
     );
-    update_app_progress_warning(m);
     let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
     let alloc_border = Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM });
     let alloc_block = Block::default()
@@ -825,17 +825,12 @@ fn provers_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
     if global_alarm_active(m) {
         found.push(NoticeSeverity::Error);
     }
-    if m.notice_minimum <= NoticeSeverity::Warning {
-        if rpc_status_is_fresh(m)
-            && m.reported_app_stall_counts(std::time::Instant::now())
-                .is_some()
-        {
-            found.push(NoticeSeverity::Warning);
-        }
-        if m.app_stall_time.is_some() {
-            found.push(NoticeSeverity::Warning);
-        }
-    }
+    found.extend(
+        node_condition_notices(m)
+            .into_iter()
+            .map(|(severity, _)| severity)
+            .filter(|severity| *severity >= m.notice_minimum),
+    );
     found.extend(
         condition_notices(m)
             .into_iter()
@@ -1560,7 +1555,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
                     .and_then(|s| s.materialized_frame)
                     .map(|h| h.to_string())
                     .unwrap_or_else(|| "-".into());
-                if m.local_stalled_rows.contains(&a.filter_key) {
+                if m.local_app_stalled(&a.filter, a.worker_id) {
                     height + "!"
                 } else {
                     height
@@ -2024,7 +2019,7 @@ fn recovery_failed(a: &AllocationRow) -> bool {
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
     let state = m.execution_state(a.execution.as_ref());
     if matches!(state, "running" | "serving")
-        && (local_warning(m, a) || m.local_stalled_rows.contains(&a.filter_key))
+        && (local_warning(m, a) || m.local_app_stalled(&a.filter, a.worker_id))
     {
         Color::Yellow
     } else {
@@ -3199,15 +3194,6 @@ fn update_message_lifetime(m: &mut Model) {
     } else {
         m.global_alarm_time = None;
     }
-    if rpc_status_is_fresh(m)
-        && m.reported_app_stall_counts(std::time::Instant::now())
-            .is_some()
-    {
-        m.reported_app_stall_time
-            .get_or_insert_with(std::time::SystemTime::now);
-    } else {
-        m.reported_app_stall_time = None;
-    }
     let active: Vec<&'static str> = condition_notices(m)
         .into_iter()
         .map(|(key, ..)| key)
@@ -3365,63 +3351,6 @@ fn earning_allocations(m: &Model) -> Vec<&AllocationRow> {
         .collect()
 }
 
-/// Judge each staffed earning allocation with a fresh observation on its own:
-/// missing or old data is excluded rather than reported as a stall, and one
-/// advancing allocation does not hide another that stopped.
-fn update_app_progress_warning(m: &mut Model) {
-    let rows: Vec<(String, u64)> = if m.reachable {
-        earning_allocations(m)
-            .into_iter()
-            .filter_map(|a| {
-                let e = a.execution.as_ref()?;
-                (e.materialized_frame.is_some()
-                    && matches!(
-                        m.execution_state(Some(e)),
-                        "starting" | "running" | "serving" | "blocked" | "stopped"
-                    ))
-                .then(|| (a.filter_key.clone(), e.last_advance_unix_ms))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if rows.is_empty() {
-        m.app_progress_observed_since = None;
-        m.app_stall_time = None;
-        m.local_stalled_rows.clear();
-        m.local_stalled_count = 0;
-        m.local_app_rows = 0;
-        return;
-    }
-    let observed = *m
-        .app_progress_observed_since
-        .get_or_insert_with(std::time::Instant::now);
-    let now = std::time::SystemTime::now();
-    let now_ms = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    m.local_app_rows = rows.len();
-    let stalled: Vec<String> = rows
-        .into_iter()
-        .filter(|(_, last)| {
-            if *last == 0 {
-                observed.elapsed().as_secs() >= 60
-            } else {
-                now_ms.saturating_sub(*last) >= 60_000
-            }
-        })
-        .map(|(key, _)| key)
-        .collect();
-    m.local_stalled_count = stalled.len();
-    m.local_stalled_rows = stalled.into_iter().collect();
-    if m.local_stalled_count == 0 {
-        m.app_stall_time = None;
-    } else {
-        m.app_stall_time.get_or_insert(now);
-    }
-}
-
 /// Current active + leaving forecasts in the 60m and 24h windows when the
 /// 60m one is below half the 24h one. Only rows whose shard has 30 min of
 /// 60m and 2h of 24h coverage count; both windows price frames alike.
@@ -3467,27 +3396,18 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
     if !rpc_status_is_fresh(m) {
         return notices;
     }
-    if let Some((stalled, behind, known)) = m.committed_app_counts(std::time::Instant::now()) {
-        if stalled > 0 {
-            notices.push((
-                "global-app-unchanged",
-                NoticeSeverity::Warning,
-                format!(
-                    "{}: {stalled}/{known} tracked shards.",
-                    progress_stall_text("Global app frames", 60.max(m.refresh_seconds * 3))
-                ),
-            ));
-        }
-        if behind > 0 {
-            notices.push((
-                "global-app-behind",
-                NoticeSeverity::Warning,
-                format!(
-                    "Global app frames >{GLOBAL_APP_LAG_FRAMES} behind app heads: \
-                     {behind}/{known} tracked shards."
-                ),
-            ));
-        }
+    match &m.health {
+        HealthAnswer::NotReported => notices.push((
+            "health-not-reported",
+            NoticeSeverity::Warning,
+            "Health conditions not reported by this node version.".to_string(),
+        )),
+        HealthAnswer::Failed(reason) => notices.push((
+            "health-unavailable",
+            NoticeSeverity::Warning,
+            format!("Health report unavailable: {reason}."),
+        )),
+        HealthAnswer::Unread | HealthAnswer::Reported(_) => {}
     }
     if let Some((hour, day)) = reward_drop(m) {
         notices.push((
@@ -3679,6 +3599,31 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
     notices
 }
 
+/// The node's current health conditions as notice lines, each stamped
+/// with the time the node saw it start: the node judges them, this client
+/// only shows them.
+fn node_condition_notices(m: &Model) -> Vec<(NoticeSeverity, String)> {
+    m.health_conditions()
+        .iter()
+        .map(|c| {
+            let severity = match ConditionSeverity::try_from(c.severity) {
+                Ok(ConditionSeverity::Error) => NoticeSeverity::Error,
+                Ok(ConditionSeverity::Info) => NoticeSeverity::Info,
+                _ => NoticeSeverity::Warning,
+            };
+            let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(c.since_unix_ms);
+            (
+                severity,
+                format!(
+                    "{}{}",
+                    message_timestamp(Some(since)),
+                    quil_rpc::health_conditions::notice_text(c)
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Shared progress-notice convention; tracker definitions belong in help.
 fn progress_stall_text(signal: &str, seconds: u64) -> String {
     format!("{signal} unchanged >{seconds}s")
@@ -3723,33 +3668,16 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
             width,
         ));
     }
-    if m.notice_minimum <= NoticeSeverity::Warning {
-        if rpc_status_is_fresh(m) {
-            if let Some((stalled, known)) = m.reported_app_stall_counts(std::time::Instant::now()) {
-                lines.extend(wrap_message(
-                    Line::from(Span::styled(
-                        format!(
-                            "{}{}: {stalled}/{known} tracked shards.",
-                            message_timestamp(m.reported_app_stall_time),
-                            progress_stall_text("Peer app frames", 60.max(m.refresh_seconds * 3))
-                        ),
-                        Style::new().fg(Color::Yellow),
-                    )),
-                    width,
-                ));
-            }
-        }
-        if let Some(time) = m.app_stall_time {
+    for (severity, text) in node_condition_notices(m) {
+        if severity >= m.notice_minimum {
             lines.extend(wrap_message(
                 Line::from(Span::styled(
-                    format!(
-                        "{}{}: {}/{} allocations.",
-                        message_timestamp(Some(time)),
-                        progress_stall_text("Local app frames", 60),
-                        m.local_stalled_count,
-                        m.local_app_rows
-                    ),
-                    Style::new().fg(Color::Yellow),
+                    text,
+                    Style::new().fg(if severity == NoticeSeverity::Error {
+                        ERROR
+                    } else {
+                        WARNING
+                    }),
                 )),
                 width,
             ));
@@ -4642,9 +4570,9 @@ fn help_items() -> Vec<HelpItem> {
         kv("LocalMat", "Local materialized height:"),
         item("`-`: unknown"),
         item("`0!`: no materialized frames, with colors off; colors show a `yellow` `0`"),
-        item("`yellow` (or `!` with colors off): unchanged for 60s; see Local app notice"),
+        item("`yellow` (or `!` with colors off): unchanged for its window; see Local app notice"),
         kv("PeerMat", "Peer-reported materialized height; compared with PeerHead"),
-        kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks unchanged fresh reports for max(60s, 3 polls)"),
+        kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks a shard the node reports unchanged; see Reported app heads"),
         kv("GlobalHead", "Committed app head@generation, independent of LocalMat and peer metadata; absent on older servers:"),
         item("`-`: unavailable"),
         item("`0@gN`: a known genesis head"),
@@ -4692,11 +4620,12 @@ fn help_items() -> Vec<HelpItem> {
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
         item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
-        kv("Local app notice", "`Local app frames unchanged >60s`: staffed earning allocations whose LocalMat has not advanced for 60s, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
-        kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
+        kv("Health conditions", "The node judges every condition below from its own observations, logs each when it starts, every 10 min while it lasts and when it ends, and serves them in its health report (`qclient node diagnostics health --self`); this manager reads that report each refresh and only shows it. A condition is shown only while the node's last evaluation found it: it ends after 60s clear, and one recurring sooner is shown again under its first start, so the log can hold a condition open while none is shown; its lasting and end lines count those clear spells (`clear_spells`, `unserved_secs`). A stall window is 60s, or 3 of the shard's node-measured mean frame intervals on a slower shard (the shorter of the fresh 60m and 24h means), so a healthy slow shard is not reported between frames; notices state the 60s base. Missing or old observations establish no condition. `Health conditions not reported by this node version`: the node predates them, so none are shown; update the node. `Health report unavailable`: this manager could not read the report from the node's peer listener"),
+        kv("Local app notice", "`Local app frames unchanged >60s`: earning allocations whose worker's LocalMat has not advanced for their window, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
+        kv("Reported app heads", "No peer-reported app frames advanced for their window on the stated subset of the shards the node tracks from served shard info; while no client reads shard info the node tracks none. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Missing/unstaffed rows are excluded. Does not prove a network halt"),
         kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
-        kv("Global app notice", "Committed GLOBAL state: each tracked shard's GlobalHead against its app head, the higher of PeerHead and LocalMat. Counts include allocated and unallocated shards with provers, a GlobalHead and an app head. Affected GlobalHead cells are `yellow`, or marked `!` with colors off:"),
-        item("`Global app frames unchanged >Ns`: GlobalHead kept its frame over 3+ fresh snapshots spanning max(60s, 3 polls) while the GLOBAL snapshot and the app head both advanced"),
+        kv("Global app notice", "Committed GLOBAL state: each tracked shard's GlobalHead against its app head, the higher of PeerHead and LocalMat, sampled by the node every minute and on each served shard info. Counts include allocated and unallocated shards with provers, a GlobalHead and an app head. Affected GlobalHead cells are `yellow`, or marked `!` with colors off:"),
+        item("`Global app frames unchanged >60s`: GlobalHead kept its frame for its window while the GLOBAL snapshot and the app head both advanced"),
         item("`Global app frames >100 behind app heads`: GlobalHead trails the app head by more than 100 frames"),
         item("Either way GLOBAL has not applied the newer shard frames, so their shard state and rewards are not credited yet. On most tracked shards it is network-wide: GLOBAL frames are not carrying shard frames; report it with the GLOBAL frame and shard filters. On a few shards, check those shards' committees"),
         kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the active + leaving forecast over the last 60m is below half its 24h value. Counts rows whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
@@ -5842,95 +5771,26 @@ mod tests {
         }
     }
 
+    /// The node's conditions show as notices stamped with the node's start
+    /// time, at their level, and flag only the cells they list; an old
+    /// report shows nothing, and a node that predates conditions or a
+    /// failed read says so instead of being judged here.
     #[test]
-    fn reported_app_notice_has_independent_scope_timestamp_and_freshness() {
-        use quil_types::proto::node::ShardRewardInfo;
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let shards = quil_types::proto::node::GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![1],
-                active_provers: 1,
-                latest_frame: 10,
-                ..Default::default()
-            }],
-            ..Default::default()
+    fn node_conditions_drive_the_notices_and_cells() {
+        use quil_types::proto::diagnostics::{
+            AffectedShard, ConditionKind, HealthCondition, HealthConditions,
         };
-        for ago in [60, 30, 0] {
-            m.observe_reported_app_heads(&shards, now - Duration::from_secs(ago));
-        }
-        update_message_lifetime(&mut m);
-        let timestamp = m
-            .reported_app_stall_time
-            .expect("known shard stalls independently of local allocations");
-        let text = message_lines(&m, Line::default(), 300)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains(&format!(
-            "{}Peer app frames unchanged >60s: 1/1 tracked shards.",
-            message_timestamp(Some(timestamp))
-        )));
-        assert!(
-            text.chars().count() <= 80,
-            "keep routine notices short; explain tracking in help"
-        );
-        assert!(!text.contains("Local app frames unchanged"));
-        for interval in [30, 60, 5, 15] {
-            m.refresh_seconds = interval;
-            update_message_lifetime(&mut m);
-            assert_eq!(m.reported_app_stall_time, Some(timestamp));
-        }
-        let mut allocation = row("01", 1, 1, 9, "", "");
-        allocation.filter = vec![1];
-        allocation.latest_frame = 10;
-        let mut available = shard("01", 1, 1);
-        available.filter = vec![1];
-        available.latest_frame = 10;
-        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "10!");
-        assert_eq!(avail_cell(&m, &available, 9, 0), "stalled!");
-        m.color_coding = true;
-        assert!(!alloc_display_cell(&m, &allocation, 7, 0).contains('!'));
-        assert!(!avail_display_cell(&m, &available, 9, 0).contains('!'));
-        let lines =
-            render_alloc_panel(&mut m, &[allocation.clone()], Rect::new(0, 0, 300, 3), None);
-        assert!(lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .any(|span| span.content.trim() == "10" && span.style.fg == Some(WARNING)));
-        m.color_coding = false;
-        assert!(alloc_display_cell(&m, &allocation, 7, 0).contains('!'));
-        assert!(avail_display_cell(&m, &available, 9, 0).contains('!'));
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Peer app frames unchanged")));
-        m.shard_error = Some("fetch failed".into());
-        update_message_lifetime(&mut m);
-        assert!(m.reported_app_stall_time.is_none());
-        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "10");
-        assert_ne!(avail_cell(&m, &available, 9, 0), "stalled!");
-    }
-
-    #[test]
-    fn app_stall_warning_counts_each_allocation_and_clears_on_progress_or_missing_data() {
         use quil_types::proto::node::WorkerExecution;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let mut m = Model::new();
-        m.frame_number = 2160;
-        m.epoch_length = 720;
-        m.reachable = true;
         m.color_coding = false;
+        m.last_fetch_success = Some(Instant::now());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let mut worker = row("aa", 1, 1, 7, "", "");
-        worker.status = 2;
-        worker.epoch = 3;
+        worker.filter = vec![0xaa];
         worker.execution = Some(WorkerExecution {
             state: "serving".into(),
             materialized_frame: Some(744),
@@ -5939,14 +5799,33 @@ mod tests {
             ..Default::default()
         });
         let mut other = worker.clone();
+        other.filter = vec![0xbb];
         other.filter_key = "bb".into();
         other.filter_hex = "bb".into();
         other.worker_id = 8;
         m.allocations = vec![worker, other];
-        update_app_progress_warning(&mut m);
-        let timestamp = m.app_stall_time.expect("known stalled workers warn");
-        update_app_progress_warning(&mut m);
-        assert_eq!(m.app_stall_time, Some(timestamp));
+        let since = now - 90_000;
+        let reported = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::LocalAppFramesUnchanged as i32,
+                severity: ConditionSeverity::Warning as i32,
+                since_unix_ms: since,
+                affected: 1,
+                tracked: 2,
+                threshold: 60,
+                shards: vec![AffectedShard {
+                    filter: vec![0xaa],
+                    core_id: 7,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            sources: Vec::new(),
+        });
+        m.health = HealthAnswer::Reported(HealthConditions::default());
+        m.health_received = Some(Instant::now());
+        let quiet = provers_notice_summary(&m).map_or(0, |(n, _)| n);
+        m.health = reported;
         let notices = |m: &Model| {
             message_lines(m, Line::default(), 240)
                 .iter()
@@ -5955,205 +5834,37 @@ mod tests {
                 .join(" ")
         };
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(notices(&m).contains(&format!(
-            "{}Local app frames unchanged >60s: 2/2 allocations.",
-            message_timestamp(Some(timestamp))
-        )));
+        let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
+        assert!(
+            notices(&m).contains(&format!(
+                "{stamp}Local app frames unchanged >60s: 1/2 allocations."
+            )),
+            "{}",
+            notices(&m)
+        );
+        assert_eq!(provers_notice_summary(&m).map(|(n, _)| n), Some(quiet + 1));
         m.notice_minimum = NoticeSeverity::Error;
         assert!(!notices(&m).contains("Local app frames unchanged"));
         m.notice_minimum = NoticeSeverity::Warning;
-        // One advancing allocation no longer hides another that stopped.
-        m.allocations[1]
-            .execution
-            .as_mut()
-            .unwrap()
-            .last_advance_unix_ms = now;
-        update_app_progress_warning(&mut m);
-        assert_eq!(m.app_stall_time, Some(timestamp));
-        assert!(notices(&m).contains("Local app frames unchanged >60s: 1/2 allocations."));
         assert_eq!(alloc_display_cell(&m, &m.allocations[0], 6, 0), "744!");
         assert_eq!(alloc_display_cell(&m, &m.allocations[1], 6, 0), "744 ");
         assert_eq!(local_color(&m, &m.allocations[0]), Color::Yellow);
         assert_eq!(local_color(&m, &m.allocations[1]), SUCCESS);
-        // Missing data leaves the count rather than counting as a stall.
-        m.allocations[0].execution = None;
-        update_app_progress_warning(&mut m);
-        assert!(m.app_stall_time.is_none());
+        // An old report shows nothing.
+        m.health_received = Some(Instant::now() - Duration::from_secs(61));
         assert!(!notices(&m).contains("Local app frames unchanged"));
-        m.allocations[1].execution = None;
-        update_app_progress_warning(&mut m);
-        assert!(m.app_stall_time.is_none());
-        assert!(m.app_progress_observed_since.is_none());
-    }
-
-    #[test]
-    fn global_app_notice_reports_unchanged_and_trailing_committed_heads() {
-        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let shard_info =
-            |filter: u8, provers: u32, latest: u64, head: Option<(u64, u64)>| ShardRewardInfo {
-                filter: vec![filter],
-                active_provers: provers,
-                latest_frame: latest,
-                global_head: head.map(|(frame, global_frame)| GlobalAppFrameHead {
-                    frame,
-                    global_frame,
-                    generation: 1,
-                }),
-                ..Default::default()
-            };
-        for step in 0..3u64 {
-            let snapshot = GetShardInfoResponse {
-                shards: vec![
-                    // GLOBAL and the shard advance; the committed head does not.
-                    shard_info(1, 4, 1000 + step * 6, Some((995, 500 + step * 3))),
-                    // The committed head advances but trails by more than the bound.
-                    shard_info(2, 4, 1300 + step, Some((1000 + step, 500 + step * 3))),
-                    // Healthy: the committed head follows the shard.
-                    shard_info(
-                        3,
-                        4,
-                        1000 + step * 6,
-                        Some((995 + step * 6, 500 + step * 3)),
-                    ),
-                    // GLOBAL did not advance: the Global head notice covers it.
-                    shard_info(4, 4, 1000 + step * 6, Some((995, 500))),
-                    // The shard produced nothing new for GLOBAL to commit.
-                    shard_info(5, 4, 1000, Some((995, 500 + step * 3))),
-                    // Unstaffed, or without a committed head: not tracked.
-                    shard_info(6, 0, 1000 + step * 6, Some((995, 500 + step * 3))),
-                    shard_info(7, 4, 1000 + step * 6, None),
-                ],
-                ..Default::default()
-            };
-            m.observe_committed_app_heads(&snapshot, now - Duration::from_secs(60 - step * 30));
-        }
-        assert_eq!(m.committed_app_counts(now), Some((1, 1, 5)));
+        assert_eq!(alloc_display_cell(&m, &m.allocations[0], 6, 0), "744 ");
+        // A node that predates conditions, or a failed read: nothing is
+        // judged here in their place.
+        m.health_received = Some(Instant::now());
+        m.health = HealthAnswer::NotReported;
         update_message_lifetime(&mut m);
-        let unchanged = m.notice_since["global-app-unchanged"];
-        let behind = m.notice_since["global-app-behind"];
-        let text = message_lines(&m, Line::default(), 300)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        for notice in [
-            format!(
-                "{}Global app frames unchanged >60s: 1/5 tracked shards.",
-                message_timestamp(Some(unchanged))
-            ),
-            format!(
-                "{}Global app frames >100 behind app heads: 1/5 tracked shards.",
-                message_timestamp(Some(behind))
-            ),
-        ] {
-            assert!(text.contains(&notice), "{notice} missing from {text:?}");
-            assert!(notice.chars().count() <= 80, "routine notices fit one row");
-        }
-        let committed = |filter: u8, frame: u64| {
-            let mut s = shard("01", 1, 1);
-            s.filter = vec![filter];
-            s.global_head = Some(GlobalAppFrameHead {
-                frame,
-                global_frame: 506,
-                generation: 1,
-            });
-            s
-        };
-        let (stalled, trailing, healthy) =
-            (committed(1, 995), committed(2, 1002), committed(3, 1007));
-        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1!");
-        assert_eq!(avail_cell(&m, &trailing, 8, 0), "1002@g1!");
-        assert_eq!(avail_cell(&m, &healthy, 8, 0), "1007@g1");
-        let mut allocation = row("02", 1, 1, 7, "", "");
-        allocation.filter = vec![2];
-        allocation.global_head = trailing.global_head.clone();
-        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "1002@g1!");
-        assert_eq!(alloc_display_cell(&m, &allocation, 8, 0), "1002@g1 ");
-        let lines = render_avail_panel(
-            &mut m,
-            &[healthy.clone(), stalled.clone()],
-            Rect::new(0, 0, 300, 4),
-            None,
-        );
-        let fg = |content: &str| {
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .find(|span| span.content.trim() == content)
-                .and_then(|span| span.style.fg)
-        };
-        assert_eq!(fg("995@g1"), Some(WARNING));
-        assert_ne!(fg("1007@g1"), Some(WARNING));
-        m.color_coding = false;
-        assert_eq!(avail_display_cell(&m, &stalled, 8, 0), "995@g1!");
-        assert_eq!(avail_display_cell(&m, &healthy, 8, 0), "1007@g1 ");
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Global app frames")));
-        m.notice_minimum = NoticeSeverity::Warning;
-        // Stale status cannot keep a claim alive, nor can a failed shard fetch.
-        m.last_fetch_success = Some(now - Duration::from_secs(60));
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Global app frames")));
-        m.last_fetch_success = Some(now);
-        m.shard_error = Some("fetch failed".into());
+        assert!(notices(&m).contains("Health conditions not reported by this node version."));
+        assert!(!notices(&m).contains("unchanged"));
+        m.health = HealthAnswer::Failed("connect to this node's peer listener: refused".into());
         update_message_lifetime(&mut m);
-        assert!(m.committed_app_counts(now).is_none());
-        assert!(!m.committed_app_flagged(&[1]));
-        assert!(m.notice_since.is_empty());
-        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1");
-    }
-
-    #[test]
-    fn global_app_lag_needs_one_snapshot_and_uses_the_higher_local_or_peer_head() {
-        use quil_types::proto::node::{
-            GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo, WorkerExecution,
-        };
-        let now = std::time::Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let mut allocation = row("09", 1, 1, 3, "", "");
-        allocation.filter = vec![9];
-        allocation.execution = Some(WorkerExecution {
-            materialized_frame: Some(1151),
-            ..Default::default()
-        });
-        m.allocations = vec![allocation];
-        let snapshot = |committed| GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![9],
-                active_provers: 4,
-                latest_frame: 1000,
-                global_head: Some(GlobalAppFrameHead {
-                    frame: committed,
-                    global_frame: 500,
-                    generation: 2,
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        m.observe_committed_app_heads(&snapshot(1051), now);
-        assert_eq!(
-            m.committed_app_counts(now),
-            None,
-            "the bound itself is not behind"
-        );
-        m.observe_committed_app_heads(&snapshot(1050), now);
-        assert_eq!(m.committed_app_counts(now), Some((0, 1, 1)));
-        assert!(m.committed_app_flagged(&[9]));
-        m.allocations.clear();
-        m.observe_committed_app_heads(&snapshot(1050), now);
-        assert_eq!(
-            m.committed_app_counts(now),
-            None,
-            "the peer head alone is within the bound"
-        );
+        assert!(notices(&m)
+            .contains("Health report unavailable: connect to this node's peer listener: refused."));
     }
 
     #[test]
@@ -6686,20 +6397,10 @@ mod tests {
                 .to_string()
                 .contains(&format!("Reason: {reason}")));
             m.allocations = vec![allocation];
-            m.app_progress_observed_since =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
-            update_app_progress_warning(&mut m);
-            assert!(m.app_stall_time.is_none());
-            assert!(m.app_progress_observed_since.is_none());
         }
         m.allocations[0].execution.as_mut().unwrap().state = "serving".into();
         assert_eq!(alloc_cell(&m, &m.allocations[0], 9, STATE_WIDTH), "serve");
         assert!(local_warning(&m, &m.allocations[0]));
-        update_app_progress_warning(&mut m);
-        assert!(
-            m.app_stall_time.is_some(),
-            "serving still has independent progress warnings"
-        );
     }
 
     #[test]
@@ -8701,6 +8402,7 @@ mod tests {
             "Details",
             "Recovery footer",
             "Freshness",
+            "Health conditions",
             "Local app notice",
             "Reported app heads",
             "Global notice",

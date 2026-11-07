@@ -8,6 +8,7 @@ pub mod forest_read_cache;
 pub mod forest_sync_reader;
 pub mod frame_sync;
 pub mod global_service;
+pub mod health_conditions;
 pub mod log_export;
 pub mod mixnet_service;
 pub mod node_service;

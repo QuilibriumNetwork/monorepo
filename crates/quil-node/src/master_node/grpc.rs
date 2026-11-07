@@ -3474,24 +3474,80 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     }
     node_rpc_builder = node_rpc_builder
         .with_certificate_share_provider(Arc::new(super::seat_certificates::snapshot));
+    // The node's health conditions, served in its health report: fed by
+    // every shard info served (peer-reported and committed heads), the
+    // frame-observation sampler (committed heads) and the worker view, and
+    // judged every 15 s by each shard's cadence.
+    let health = Arc::new(std::sync::Mutex::new(
+        quil_rpc::health_conditions::HealthRegistry::default(),
+    ));
+    {
+        let health = health.clone();
+        node_rpc_builder = node_rpc_builder.with_shard_info_observer(Arc::new(
+            move |response: &quil_types::proto::node::GetShardInfoResponse| {
+                observe_served_shards(&health, response, quil_engine::worker_execution::now_ms());
+            },
+        ));
+    }
+    {
+        let (health, cadence, view, registry, head) = (
+            health.clone(),
+            cadence.clone(),
+            workers_view.clone(),
+            prover_registry.clone(),
+            current_frame.clone(),
+        );
+        sup.spawn("health-conditions", move |token| async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
+                let (health, cadence, view, registry, head) = (
+                    health.clone(),
+                    cadence.clone(),
+                    view.clone(),
+                    registry.clone(),
+                    head.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    let now = quil_engine::worker_execution::now_ms();
+                    let workers =
+                        health_workers(&view, registry.as_ref(), &prover_address, head.effective());
+                    let transitions = {
+                        let cadence = cadence.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                        health.observe_workers(workers, now);
+                        health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
+                    };
+                    for transition in &transitions {
+                        quil_rpc::health_conditions::log_transition(transition);
+                    }
+                })
+                .await?;
+            }
+            Ok(())
+        });
+    }
     {
         let state = cadence.clone();
         let registry = prover_registry.clone();
         let wm = worker_manager.clone();
         let committed = crdt.clone();
         let head = current_frame.clone();
+        let health = health.clone();
         sup.spawn("frame-observation-sampler", move |token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut ticks = 0;
             loop {
                 tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
-                let (state, registry, wm, committed, head) = (
+                let (state, registry, wm, committed, head, health) = (
                     state.clone(),
                     registry.clone(),
                     wm.clone(),
                     committed.clone(),
                     head.clone(),
+                    health.clone(),
                 );
                 let path = frame_observations_path.clone();
                 let scope = cadence_scope.clone();
@@ -3519,6 +3575,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     }
                     let filters: Vec<_> = filters.into_iter().collect();
                     let heads = committed_global_app_heads(&committed, &filters).ok();
+                    if let Some(heads) = heads.as_ref() {
+                        let observed: Vec<_> = filters
+                            .iter()
+                            .zip(heads)
+                            .filter_map(|(filter, head)| Some((filter.clone(), (*head)?)))
+                            .collect();
+                        health
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe_committed(&observed, quil_engine::worker_execution::now_ms());
+                    }
                     let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
                     cache.observe(&[], Some((head.effective(), 0)), now);
                     for (i, filter) in filters.iter().enumerate() {
@@ -4082,10 +4149,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             let registry =
                 prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
             let capacity = worker_capacity.clone();
+            let health = health.clone();
             let source: quil_rpc::diagnostics_service::HealthSource = Arc::new(move || {
                 let mut inputs =
                     health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address);
                 inputs.worker_capacity = capacity.load(std::sync::atomic::Ordering::Relaxed);
+                inputs.health = Some(health.lock().unwrap_or_else(|e| e.into_inner()).snapshot());
                 inputs
             });
             let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
@@ -4515,7 +4584,86 @@ fn health_inputs(
         // The configured count is the worker manager's; the source sets it.
         worker_capacity: 0,
         store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
+        // The node's registry; the source sets it.
+        health: None,
     }
+}
+
+/// Feed one served shard info to the health conditions: the head peers
+/// report for each shard and its head in committed GLOBAL state.
+fn observe_served_shards(
+    health: &std::sync::Mutex<quil_rpc::health_conditions::HealthRegistry>,
+    response: &quil_types::proto::node::GetShardInfoResponse,
+    now_ms: u64,
+) {
+    let peers: Vec<_> = response
+        .shards
+        .iter()
+        .map(|s| quil_rpc::health_conditions::PeerObservation {
+            filter: s.filter.clone(),
+            latest_frame: s.latest_frame,
+            materialized_frame: s.materialized_frame,
+            active_provers: s.active_provers,
+            generation: s.global_head.as_ref().map(|h| h.generation),
+        })
+        .collect();
+    let committed: Vec<_> = response
+        .shards
+        .iter()
+        .filter_map(|s| Some((s.filter.clone(), s.global_head?)))
+        .collect();
+    let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+    health.observe_peers(&peers, now_ms);
+    health.observe_committed(&committed, now_ms);
+}
+
+/// The worker view as the health conditions judge it: each allocated
+/// worker with its engine's report, earning while its allocation is active
+/// or leaving in this node's prover registry at `frame`.
+fn health_workers(
+    view: &std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>,
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    prover_address: &[u8],
+    frame: u64,
+) -> Vec<quil_rpc::health_conditions::WorkerObservation> {
+    use quil_types::consensus::EffectiveStatus;
+    let earning: std::collections::HashSet<Vec<u8>> = match registry.get_prover_info(prover_address)
+    {
+        Ok(Some(prover)) if frame > 0 => prover
+            .allocations
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.effective_status(frame),
+                    EffectiveStatus::Active | EffectiveStatus::Leaving
+                )
+            })
+            .map(|a| a.confirmation_filter.clone())
+            .collect(),
+        Ok(_) => Default::default(),
+        Err(error) => {
+            debug!(%error, "health conditions without earning allocations: prover registry unavailable");
+            Default::default()
+        }
+    };
+    view.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|w| w.allocated && !w.filter.is_empty())
+        .map(|w| {
+            let e = w.execution.as_ref();
+            quil_rpc::health_conditions::WorkerObservation {
+                core_id: w.core_id,
+                filter: w.filter.clone(),
+                earning: earning.contains(&w.filter),
+                state: e.map(|e| e.state.clone()).unwrap_or_default(),
+                blocker: e.map(|e| e.blocker.clone()).unwrap_or_default(),
+                observed_unix_ms: e.map_or(0, |e| e.observed_unix_ms),
+                materialized_frame: e.and_then(|e| e.materialized_frame),
+                last_advance_unix_ms: e.map_or(0, |e| e.last_advance_unix_ms),
+            }
+        })
+        .collect()
 }
 
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
@@ -4805,6 +4953,47 @@ mod health_input_tests {
                 Some(1),
                 Some(2 * quil_types::consensus::epoch_length_frames())
             )
+        );
+    }
+
+    /// Served shard info feeds the health conditions: the head peers report
+    /// and the committed head of each shard.
+    #[test]
+    fn served_shard_info_feeds_the_health_conditions() {
+        use quil_types::proto::diagnostics::ConditionKind;
+        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
+        let health = std::sync::Mutex::new(quil_rpc::health_conditions::HealthRegistry::default());
+        let response = |global_frame| GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 3,
+                latest_frame: 200,
+                global_head: Some(GlobalAppFrameHead {
+                    frame: 50,
+                    global_frame,
+                    generation: 1,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let t0 = 1_800_000_000_000;
+        observe_served_shards(&health, &response(10), t0);
+        observe_served_shards(&health, &response(10), t0 + 60_000);
+        let mut health = health.into_inner().unwrap();
+        health.evaluate(t0 + 60_000, &|_: &[u8]| None);
+        let kinds: Vec<i32> = health
+            .snapshot()
+            .conditions
+            .iter()
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ConditionKind::PeerAppFramesUnchanged as i32,
+                ConditionKind::GlobalAppFramesBehind as i32
+            ]
         );
     }
 }

@@ -21,8 +21,8 @@ use quil_forest::store_io::{health_cause, SlowCause};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
-    Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase,
-    StoreIoHealth, StoreIoVerdict, WorkerHealth,
+    Blocker, ConditionSeverity, GetHealthReportRequest, HealthConditions, HealthReport, Phase,
+    RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreIoVerdict, WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -744,6 +744,53 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
 
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
+/// The node's health conditions, one `[HH:MM:SS UTC] <LEVEL> <text>` line
+/// each with its scope and next check under it, and the kinds it judged
+/// without fresh observations; a node that predates them says so.
+fn health_lines(health: Option<&HealthConditions>) -> String {
+    use quil_rpc::health_conditions as hc;
+    let Some(health) = health else {
+        return "Health conditions: not reported by this node version.\n".into();
+    };
+    let mut out = String::new();
+    for c in &health.conditions {
+        let level = match ConditionSeverity::try_from(c.severity) {
+            Ok(ConditionSeverity::Error) => "ERROR",
+            Ok(ConditionSeverity::Info) => "INFO",
+            _ => "WARN",
+        };
+        let seconds = c.since_unix_ms / 1000;
+        let _ = writeln!(
+            out,
+            "[{:02}:{:02}:{:02} UTC] {level} {}",
+            seconds / 3600 % 24,
+            seconds / 60 % 60,
+            seconds % 60,
+            hc::notice_text(c)
+        );
+        let _ = writeln!(
+            out,
+            "  Scope: {}; next: {}.",
+            hc::scope_label(c.scope),
+            hc::action_text(c.action)
+        );
+    }
+    let unobserved: Vec<&str> = health
+        .sources
+        .iter()
+        .filter(|s| s.observed_unix_ms == 0)
+        .map(|s| hc::kind_label(s.kind))
+        .collect();
+    if !unobserved.is_empty() {
+        let _ = writeln!(
+            out,
+            "Not judged, no fresh observations: {}.",
+            unobserved.join(", ")
+        );
+    }
+    out
+}
+
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     let mut out = String::new();
     let build = report
@@ -776,6 +823,7 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     if let Some(line) = store_io_line(report.store_io.as_ref()) {
         let _ = writeln!(out, "{line}");
     }
+    out += &health_lines(report.health.as_ref());
     if report.workers.is_empty() {
         let _ = writeln!(out, "No data workers reported.");
         return out;
@@ -868,6 +916,7 @@ mod tests {
             workers,
             omitted_workers,
             master_store_write_failed: false,
+            health: Some(HealthConditions::default()),
             worker_capacity: 0,
             store_io: None,
         }
@@ -1032,6 +1081,61 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         assert!(
             older.contains("; 2 workers.\n") && !older.contains("draining"),
             "{older}"
+        );
+    }
+
+    /// The node's conditions print as notice lines with their scope and
+    /// next check, kinds without fresh observations are named, and a node
+    /// that predates conditions says so.
+    #[test]
+    fn the_node_conditions_print_as_notice_lines() {
+        use quil_types::proto::diagnostics::{
+            ConditionAction, ConditionKind, ConditionScope, ConditionSource, HealthCondition,
+        };
+        let mut with = report(Vec::new(), 0);
+        with.health = Some(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::GlobalAppFramesUnchanged as i32,
+                severity: ConditionSeverity::Warning as i32,
+                scope: ConditionScope::Network as i32,
+                action: ConditionAction::CheckGlobalInclusion as i32,
+                since_unix_ms: 3_723_000,
+                affected: 2,
+                tracked: 9,
+                threshold: 60,
+                ..Default::default()
+            }],
+            sources: vec![
+                ConditionSource {
+                    kind: ConditionKind::GlobalAppFramesUnchanged as i32,
+                    observed_unix_ms: 3_723_000,
+                    tracked: 9,
+                },
+                ConditionSource {
+                    kind: ConditionKind::PeerAppFramesUnchanged as i32,
+                    observed_unix_ms: 0,
+                    tracked: 0,
+                },
+            ],
+        });
+        let text = render_report("this node", &with);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1], "[01:02:03 UTC] WARN Global app frames unchanged >60s: 2/9 tracked shards.",
+            "{text}"
+        );
+        assert!(
+            lines[2].starts_with("  Scope: the network; next: check GLOBAL's inclusion"),
+            "{text}"
+        );
+        assert_eq!(
+            lines[3], "Not judged, no fresh observations: peer_app_frames_unchanged.",
+            "{text}"
+        );
+        with.health = None;
+        assert_eq!(
+            render_report("this node", &with).lines().nth(1),
+            Some("Health conditions: not reported by this node version.")
         );
     }
 
