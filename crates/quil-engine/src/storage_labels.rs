@@ -192,6 +192,28 @@ const FLUSH_CHUNK_BYTES: usize = 16 << 20;
 /// the stores' commits.
 const FLUSH_PERMITS: usize = 2;
 
+/// How long the labels written to disk at once may take there
+/// ([`Pace`]): a store's synced commit waits behind them, and a frame's
+/// votes wait on about 8 such commits in turn within its 10 s, so 50 ms
+/// keeps labels to half of the 100 ms a store fsync is warned at, and to
+/// 0.4 s of a frame. Chunks are cut to what this node's disk flushes in
+/// it, so a fast disk keeps [`FLUSH_CHUNK_BYTES`] chunks (2026-11-07: a
+/// node whose store fsyncs took about 1 s signed about half its
+/// certificates).
+const FLUSH_TARGET: Duration = Duration::from_millis(50);
+
+/// The smallest chunk labels are cut to ([`Pace::chunk`]): below it a
+/// push's own cost outweighs its bytes. A disk slower than this a
+/// [`FLUSH_TARGET`] (20 MB/s) is paced by time instead ([`Pace::overran`]).
+const FLUSH_MIN_CHUNK_BYTES: usize = 1 << 20;
+
+/// Chunks are cut to a multiple of this, so a page is written once.
+const FLUSH_CHUNK_ALIGN: usize = 64 << 10;
+
+/// Pushes of labels a disk's speed is taken from ([`Pace`]): their median
+/// ignores up to three slow ones, as behind a store's compaction.
+const PACE_WINDOW: usize = 8;
+
 /// Bytes of a kept layer read back at once, to resume a leaf's labelling
 /// ([`Admitted::label_ahead`]).
 const READ_CHUNK_BYTES: usize = 1 << 20;
@@ -1934,8 +1956,14 @@ impl Admitted<'_> {
                         manifest.layers.truncate(index);
                         manifest.layers.push(digest);
                         let listed = {
-                            let _permit = flush_gate().map(|gate| gate.take(tally));
-                            write_manifest(&dir, n, &manifest)
+                            let gate = flush_gate();
+                            let _permit = gate.map(|gate| gate.take(tally));
+                            let started = Instant::now();
+                            let listed = write_manifest(&dir, n, &manifest);
+                            if let Some(gate) = gate {
+                                gate.synced(started.elapsed(), tally);
+                            }
+                            listed
                         };
                         match listed {
                             Ok(()) => whole = index + 1,
@@ -2330,10 +2358,11 @@ fn read_layer(file: &mut File, offset: u64, into: &mut [Digest]) -> std::io::Res
 
 /// Counts the chunks of labels being written to disk in this process
 /// ([`FLUSH_PERMITS`]): a writer takes a permit before it writes a chunk
-/// and gives it back once the chunk is on disk ([`ChunkedWriter`]).
+/// and gives it back once the chunk is on disk ([`ChunkedWriter`]). It
+/// paces them by what they took ([`Pace`]).
 struct FlushGate {
     permits: usize,
-    held: Mutex<usize>,
+    pace: Mutex<Pace>,
     freed: Condvar,
 }
 
@@ -2346,33 +2375,150 @@ fn flush_gate() -> Option<&'static FlushGate> {
     cfg!(target_os = "linux").then_some(&FLUSH_GATE)
 }
 
+/// What a [`FlushGate`] holds: the permits held, the disk's speed over the
+/// latest pushes, and until when an overrun holds the permits back.
+///
+/// Labels written at once take the disk for their bytes over its speed,
+/// and a store's synced commit on the same disk waits behind them. Each
+/// push is timed, waits for the others in flight included, so a chunk cut
+/// to what one took [`FLUSH_TARGET`] for keeps all the labels in flight,
+/// this process's and any other's on the disk, near that long ahead of a
+/// commit ([`Self::chunk`]). A disk too slow for even the smallest chunk
+/// is given time between them ([`Self::overran`]).
+struct Pace {
+    held: usize,
+    /// Seconds a byte of the latest [`PACE_WINDOW`] pushes, the oldest
+    /// replaced first.
+    recent: [f64; PACE_WINDOW],
+    /// Pushes timed in all.
+    timed: usize,
+    /// No permit is given before this.
+    resume: Option<Instant>,
+}
+
+impl Pace {
+    const fn new() -> Self {
+        Self {
+            held: 0,
+            recent: [0.0; PACE_WINDOW],
+            timed: 0,
+            resume: None,
+        }
+    }
+
+    /// Bytes of the next chunk: what the disk took [`FLUSH_TARGET`] to
+    /// push at the median of the latest pushes, whole
+    /// [`FLUSH_CHUNK_ALIGN`]s from [`FLUSH_MIN_CHUNK_BYTES`] to
+    /// [`FLUSH_CHUNK_BYTES`], the most until a push is timed.
+    fn chunk(&self) -> usize {
+        let timed = self.timed.min(PACE_WINDOW);
+        let mut recent = self.recent;
+        let recent = &mut recent[..timed];
+        recent.sort_unstable_by(f64::total_cmp);
+        let Some(&per_byte) = recent.get(timed / 2) else {
+            return FLUSH_CHUNK_BYTES;
+        };
+        let bytes = FLUSH_TARGET.as_secs_f64() / per_byte;
+        if bytes >= FLUSH_CHUNK_BYTES as f64 {
+            return FLUSH_CHUNK_BYTES;
+        }
+        (bytes as usize / FLUSH_CHUNK_ALIGN * FLUSH_CHUNK_ALIGN)
+            .clamp(FLUSH_MIN_CHUNK_BYTES, FLUSH_CHUNK_BYTES)
+    }
+
+    /// Time a push of `bytes` that `took`: a chunk's, not a layer's
+    /// smaller end, whose push costs more than its bytes.
+    fn pushed(&mut self, bytes: u64, took: Duration, now: Instant) -> Duration {
+        if bytes >= FLUSH_MIN_CHUNK_BYTES as u64 {
+            self.recent[self.timed % PACE_WINDOW] = took.as_secs_f64() / bytes as f64;
+            self.timed += 1;
+        }
+        self.overran(took, now)
+    }
+
+    /// A push or sync that took past [`FLUSH_TARGET`] holds the permits
+    /// back as long as it overran: labels then take at most about half of
+    /// a disk too slow for the smallest chunk, and the stores' commits get
+    /// the rest. Returns the overrun.
+    fn overran(&mut self, took: Duration, now: Instant) -> Duration {
+        let over = took.saturating_sub(FLUSH_TARGET);
+        if !over.is_zero() {
+            let until = now + over;
+            self.resume = Some(self.resume.map_or(until, |resume| resume.max(until)));
+        }
+        over
+    }
+}
+
 impl FlushGate {
     const fn new(permits: usize) -> Self {
         Self {
             permits,
-            held: Mutex::new(0),
+            pace: Mutex::new(Pace::new()),
             freed: Condvar::new(),
         }
     }
 
-    /// A permit, once fewer than `permits` are held: a wait for it is
-    /// counted in `tally`.
+    fn pace(&self) -> MutexGuard<'_, Pace> {
+        self.pace.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A permit, once fewer than `permits` are held and no overrun holds
+    /// them back: a wait for it is counted in `tally`.
     fn take(&self, tally: &FlushTally) -> FlushPermit<'_> {
         let started = Instant::now();
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let waits = *held >= self.permits;
-        while *held >= self.permits {
-            held = self
-                .freed
-                .wait(held)
-                .unwrap_or_else(PoisonError::into_inner);
+        let mut pace = self.pace();
+        let mut waits = false;
+        loop {
+            if pace.held >= self.permits {
+                waits = true;
+                pace = self
+                    .freed
+                    .wait(pace)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let now = Instant::now();
+            match pace.resume {
+                Some(resume) if resume > now => {
+                    waits = true;
+                    pace = self
+                        .freed
+                        .wait_timeout(pace, resume - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+                _ => break,
+            }
         }
-        *held += 1;
-        drop(held);
+        pace.held += 1;
+        drop(pace);
         if waits {
             tally.waited(started.elapsed());
         }
         FlushPermit(self)
+    }
+
+    /// Bytes of the next chunk ([`Pace::chunk`]).
+    fn chunk(&self) -> usize {
+        self.pace().chunk()
+    }
+
+    /// A push of `bytes` that `took`, made holding a permit: returns the
+    /// bytes of the next chunk.
+    fn pushed(&self, bytes: u64, took: Duration, tally: &FlushTally) -> usize {
+        let mut pace = self.pace();
+        let over = pace.pushed(bytes, took, Instant::now());
+        let chunk = pace.chunk();
+        drop(pace);
+        tally.overran(over);
+        chunk
+    }
+
+    /// A sync that `took`, made holding a permit ([`Pace::overran`]).
+    fn synced(&self, took: Duration, tally: &FlushTally) {
+        let over = self.pace().overran(took, Instant::now());
+        tally.overran(over);
     }
 }
 
@@ -2381,10 +2527,10 @@ struct FlushPermit<'a>(&'a FlushGate);
 
 impl Drop for FlushPermit<'_> {
     fn drop(&mut self) {
-        let mut held = self.0.held.lock().unwrap_or_else(PoisonError::into_inner);
-        *held = held.saturating_sub(1);
-        drop(held);
-        self.0.freed.notify_one();
+        let mut pace = self.0.pace();
+        pace.held = pace.held.saturating_sub(1);
+        drop(pace);
+        self.0.freed.notify_all();
     }
 }
 
@@ -2402,6 +2548,10 @@ struct FlushTally {
     longest: Cell<Duration>,
     /// Time writing, pushing and syncing, holding a permit.
     disk: Cell<Duration>,
+    /// Pushes and syncs past [`FLUSH_TARGET`], and how long they held the
+    /// permits back in all ([`Pace::overran`]).
+    overruns: Cell<u64>,
+    overran: Cell<Duration>,
 }
 
 impl FlushTally {
@@ -2421,6 +2571,13 @@ impl FlushTally {
         self.disk.set(self.disk.get() + took);
     }
 
+    fn overran(&self, over: Duration) {
+        if !over.is_zero() {
+            self.overruns.set(self.overruns.get() + 1);
+            self.overran.set(self.overran.get() + over);
+        }
+    }
+
     /// One line for a labelling that wrote labels, as it ends.
     fn log(&self, epoch: u64, leaf_id: &[u8], n: u64, stage: Stage) {
         if self.chunks.get() == 0 {
@@ -2432,12 +2589,17 @@ impl FlushTally {
             permit_wait_seconds = self.waited.get().as_secs_f64(),
             longest_permit_wait_seconds = self.longest.get().as_secs_f64(),
             disk_seconds = self.disk.get().as_secs_f64(),
-            permits = FLUSH_PERMITS, chunk_bytes = FLUSH_CHUNK_BYTES, scope = "local",
+            overruns = self.overruns.get(),
+            overrun_seconds = self.overran.get().as_secs_f64(),
+            permits = FLUSH_PERMITS, chunk_bytes = FLUSH_CHUNK_BYTES,
+            target_ms = FLUSH_TARGET.as_millis() as u64, scope = "local",
             "storage labels written to disk a chunk at a time, at most `permits` chunks at \
-             once in this process, so the stores' synced commits wait behind no more; \
-             permit waits well above `disk_seconds` mean labelling outpaces this node's \
-             disk, which slows labelling, not the stores: check the disk's write speed if \
-             leaves miss their renewal's grace");
+             once in this process, each cut to what this node's disk writes in `target_ms`, \
+             so the stores' synced commits wait behind no more; `overruns` are writes past \
+             it, after which labels wait as long, giving the stores the disk. Permit waits \
+             well above `disk_seconds` mean labelling outpaces this node's disk, which slows \
+             labelling, not the stores: check the disk's write speed if leaves miss their \
+             renewal's grace");
     }
 }
 
@@ -2498,16 +2660,32 @@ fn chunk_bytes() -> usize {
     FLUSH_CHUNK_BYTES
 }
 
+/// Set this thread's label writers' chunk bytes ([`chunk_bytes`]).
+#[cfg(test)]
+pub(crate) fn set_chunk_bytes_for_test(bytes: Option<usize>) {
+    tests::TEST_CHUNK_BYTES.with(|chunk| chunk.set(bytes));
+}
+
+/// The chunks this thread's writers pushed through a flush gate since the
+/// last call, and their bytes.
+#[cfg(test)]
+pub(crate) fn take_gated_pushes() -> (u64, u64) {
+    tests::GATED_PUSHES.with(|pushes| pushes.replace((0, 0)))
+}
+
 /// Writes a leaf's labels to `inner` a chunk at a time: each chunk is
 /// written and pushed to disk ([`ChunkSink::push`]) holding a permit of its
 /// gate, before the next is written, so labels written and not yet on disk
-/// are at most a chunk a permit in the process ([`FLUSH_CHUNK_BYTES`]).
+/// are at most a chunk a permit in the process ([`FLUSH_CHUNK_BYTES`]),
+/// fewer bytes on a disk slower than its gate's pace ([`Pace::chunk`]).
 /// Syncing ([`Self::sync`]) holds one too. Without a gate (elsewhere than
 /// Linux) it is a buffered writer.
 struct ChunkedWriter<'a, W: ChunkSink> {
     inner: W,
     buffer: Vec<u8>,
+    /// The most bytes of a chunk, and those of the next.
     chunk: usize,
+    next: usize,
     /// Where in `inner` the next chunk goes.
     offset: u64,
     gate: Option<&'a FlushGate>,
@@ -2515,8 +2693,8 @@ struct ChunkedWriter<'a, W: ChunkSink> {
 }
 
 impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
-    /// Writing to `inner` from byte `offset`, its end, in chunks of `chunk`
-    /// bytes.
+    /// Writing to `inner` from byte `offset`, its end, in chunks of at most
+    /// `chunk` bytes.
     fn new(
         inner: W,
         offset: u64,
@@ -2525,10 +2703,12 @@ impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
         tally: &'a FlushTally,
     ) -> Self {
         let chunk = chunk.max(1);
+        let next = gate.map_or(chunk, |gate| gate.chunk().min(chunk));
         Self {
             inner,
-            buffer: Vec::with_capacity(chunk),
+            buffer: Vec::with_capacity(next),
             chunk,
+            next,
             offset,
             gate,
             tally,
@@ -2544,7 +2724,13 @@ impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
         let started = Instant::now();
         self.inner.write_all(&self.buffer)?;
         self.inner.push(self.offset, len)?;
-        self.tally.pushed(len, started.elapsed());
+        let took = started.elapsed();
+        #[cfg(test)]
+        tests::gated_push(self.gate.is_some(), len);
+        self.tally.pushed(len, took);
+        if let Some(gate) = self.gate {
+            self.next = gate.pushed(len, took, self.tally).min(self.chunk);
+        }
         self.offset += len;
         self.buffer.clear();
         Ok(())
@@ -2558,7 +2744,11 @@ impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
         let _permit = self.gate.map(|gate| gate.take(self.tally));
         let started = Instant::now();
         self.inner.sync(all)?;
-        self.tally.synced(started.elapsed());
+        let took = started.elapsed();
+        self.tally.synced(took);
+        if let Some(gate) = self.gate {
+            gate.synced(took, self.tally);
+        }
         Ok(())
     }
 
@@ -2570,10 +2760,10 @@ impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
 
 impl<W: ChunkSink> Write for ChunkedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.buffer.len() >= self.chunk {
+        if self.buffer.len() >= self.next {
             self.push()?;
         }
-        let len = bytes.len().min(self.chunk - self.buffer.len());
+        let len = bytes.len().min(self.next - self.buffer.len());
         self.buffer.extend_from_slice(&bytes[..len]);
         Ok(len)
     }
@@ -2584,6 +2774,21 @@ impl<W: ChunkSink> Write for ChunkedWriter<'_, W> {
         }
         self.inner.flush()
     }
+}
+
+/// Write `digests` to a new file at `path`, as a leaf's labels are written:
+/// a chunk at a time through the flush gate, paced, then synced whole
+/// ([`ChunkedWriter`]). A sector's last layer, up to 2 GiB, written at
+/// once and then synced held the stores' synced commits behind all of it
+/// (2026-11-07).
+pub(crate) fn write_digests_paced(path: &Path, digests: &[Digest]) -> std::io::Result<()> {
+    let tally = FlushTally::default();
+    let mut writer =
+        ChunkedWriter::new(File::create(path)?, 0, chunk_bytes(), flush_gate(), &tally);
+    for digests in digests.chunks(1024) {
+        writer.write_all(&hash::digests_to_bytes(digests))?;
+    }
+    writer.finish()
 }
 
 fn write_digests(writer: &mut impl Write, digests: &[Digest]) -> std::io::Result<()> {
@@ -3401,6 +3606,18 @@ mod tests {
         /// Chunks this thread's label writers push before the next push
         /// panics, before it writes, as a process stopped between chunks.
         static PUSHES_BEFORE_CRASH: Cell<Option<u32>> = const { Cell::new(None) };
+        /// Chunks this thread's writers pushed through a flush gate, and
+        /// their bytes ([`take_gated_pushes`]).
+        pub(super) static GATED_PUSHES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn gated_push(gated: bool, len: u64) {
+        if gated {
+            GATED_PUSHES.with(|pushes| {
+                let (chunks, bytes) = pushes.get();
+                pushes.set((chunks + 1, bytes + len));
+            });
+        }
     }
 
     pub(super) fn crash_before_push() {
@@ -3505,6 +3722,167 @@ mod tests {
             "writers past the permits waited, counted for the log"
         );
         assert_eq!(gauge.unpushed.load(Ordering::SeqCst), 0, "all pushed");
+    }
+
+    /// A store's synced commit waits behind the label chunks in flight, so
+    /// a slow disk gets chunks it writes within [`FLUSH_TARGET`]: two 16
+    /// MiB chunks took a disk writing 80 MB/s 419 ms, and a frame's votes
+    /// wait on about 8 commits in turn (2026-11-07). Each push is timed
+    /// with the others in flight, as on a disk.
+    #[test]
+    fn label_chunks_are_cut_to_what_a_slow_disk_writes_within_the_target() {
+        let now = Instant::now();
+        for mb_s in [80.0, 150.0, 400.0] {
+            let rate = mb_s * 1e6;
+            let mut pace = Pace::new();
+            let mut chunk = pace.chunk();
+            assert_eq!(chunk, FLUSH_CHUNK_BYTES, "the most until a push is timed");
+            for _ in 0..2 * PACE_WINDOW {
+                let took = Duration::from_secs_f64((FLUSH_PERMITS * chunk) as f64 / rate);
+                pace.pushed(chunk as u64, took, now);
+                chunk = pace.chunk();
+            }
+            let behind = Duration::from_secs_f64((FLUSH_PERMITS * chunk) as f64 / rate);
+            assert!(
+                behind <= FLUSH_TARGET,
+                "PACE-LABELS-CUT: at {mb_s} MB/s a store's commit waits {behind:?} behind \
+                 {FLUSH_PERMITS} chunks of {chunk} bytes of labels, past {FLUSH_TARGET:?}"
+            );
+            assert!(
+                behind >= FLUSH_TARGET / 2,
+                "PACE-LABELS-CUT: at {mb_s} MB/s chunks of {chunk} bytes take {behind:?}, \
+                 well under {FLUSH_TARGET:?}: labelling is slowed for nothing"
+            );
+        }
+    }
+
+    /// A disk too slow even for the smallest chunk in [`FLUSH_TARGET`]
+    /// gets as long as a push or sync overran it between them, so the
+    /// stores' commits get about half of it; labels still get the rest.
+    #[test]
+    fn a_disk_too_slow_for_the_smallest_chunk_gets_time_between_chunks() {
+        let gate = FlushGate::new(FLUSH_PERMITS);
+        let tally = FlushTally::default();
+        let over = Duration::from_millis(100);
+        let pushed = Instant::now();
+        let chunk = gate.pushed(FLUSH_MIN_CHUNK_BYTES as u64, FLUSH_TARGET + over, &tally);
+        drop(gate.take(&tally));
+        let waited = pushed.elapsed();
+        assert!(
+            chunk == FLUSH_MIN_CHUNK_BYTES && waited >= over,
+            "PACE-LABELS-OVERRUN: a push of {FLUSH_MIN_CHUNK_BYTES} bytes overran \
+             {FLUSH_TARGET:?} by {over:?}: the next chunk is {chunk} bytes, its permit \
+             came {waited:?} after"
+        );
+        let synced = Instant::now();
+        gate.synced(FLUSH_TARGET + over, &tally);
+        drop(gate.take(&tally));
+        let waited = synced.elapsed();
+        assert!(
+            waited >= over,
+            "PACE-LABELS-OVERRUN: a sync overran {FLUSH_TARGET:?} by {over:?}: the next \
+             permit came {waited:?} after"
+        );
+        assert_eq!(
+            tally.overruns.get(),
+            2,
+            "each overrun is counted for the log"
+        );
+        assert!(tally.overran.get() >= 2 * over);
+    }
+
+    /// A disk writing a whole chunk well within [`FLUSH_TARGET`] keeps
+    /// whole chunks and no waits between them: labelling is not slowed
+    /// there. A layer's small end, which costs more than its bytes, does
+    /// not count as the disk's speed.
+    #[test]
+    fn a_fast_disk_keeps_whole_chunks_and_no_waits() {
+        let gate = FlushGate::new(FLUSH_PERMITS);
+        let tally = FlushTally::default();
+        for _ in 0..2 * PACE_WINDOW {
+            // 1.7 GB/s.
+            let chunk = gate.pushed(FLUSH_CHUNK_BYTES as u64, Duration::from_millis(10), &tally);
+            assert_eq!(
+                chunk, FLUSH_CHUNK_BYTES,
+                "PACE-LABELS-FAST: a fast disk's chunks are cut"
+            );
+        }
+        gate.synced(FLUSH_TARGET, &tally);
+        for _ in 0..PACE_WINDOW {
+            let chunk = gate.pushed(4096, Duration::from_millis(5), &tally);
+            assert_eq!(
+                chunk, FLUSH_CHUNK_BYTES,
+                "PACE-LABELS-FAST: a layer's small ends cut the chunks"
+            );
+        }
+        assert!(
+            gate.pace().resume.is_none() && tally.overruns.get() == 0,
+            "PACE-LABELS-FAST: a fast disk's labels wait between chunks"
+        );
+    }
+
+    /// Writes nowhere, taking as long to push as a disk writing `rate`
+    /// bytes a second, and lists each push's bytes.
+    struct SlowDisk {
+        rate: f64,
+        pushes: Vec<u64>,
+    }
+
+    impl Write for SlowDisk {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ChunkSink for SlowDisk {
+        fn push(&mut self, _start: u64, len: u64) -> std::io::Result<()> {
+            std::thread::sleep(Duration::from_secs_f64(len as f64 / self.rate));
+            self.pushes.push(len);
+            Ok(())
+        }
+
+        fn sync(&mut self, _all: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A label writer on a slow disk cuts its chunks once it has timed one:
+    /// each takes the disk no longer than [`FLUSH_TARGET`]. A busier disk
+    /// only makes them smaller.
+    #[test]
+    fn a_label_writer_on_a_slow_disk_cuts_its_chunks_after_the_first() {
+        // 32 MiB/s: the first 16 MiB chunk takes it 500 ms.
+        let rate = (32u64 << 20) as f64;
+        let gate = FlushGate::new(FLUSH_PERMITS);
+        let tally = FlushTally::default();
+        let disk = SlowDisk {
+            rate,
+            pushes: Vec::new(),
+        };
+        let mut writer = ChunkedWriter::new(disk, 0, FLUSH_CHUNK_BYTES, Some(&gate), &tally);
+        let labels = vec![7u8; FLUSH_CHUNK_BYTES + (8 << 20)];
+        for piece in labels.chunks(64 << 10) {
+            writer.write_all(piece).unwrap();
+        }
+        writer.flush().unwrap();
+        let pushes = std::mem::take(&mut writer.inner.pushes);
+        assert_eq!(pushes.iter().sum::<u64>(), labels.len() as u64);
+        assert_eq!(
+            pushes[0], FLUSH_CHUNK_BYTES as u64,
+            "the first chunk is whole"
+        );
+        let longest = pushes[1..].iter().copied().max().unwrap_or(0);
+        let took = Duration::from_secs_f64(longest as f64 / rate);
+        assert!(
+            pushes.len() > 2 && took <= FLUSH_TARGET,
+            "PACE-LABELS-WIRED: after a chunk took the disk 500 ms, {} more chunks, the \
+             largest {longest} bytes taking it {took:?}, past {FLUSH_TARGET:?}",
+            pushes.len() - 1
+        );
     }
 
     /// A labelling stopped between two chunks of a layer, as by a crash or
