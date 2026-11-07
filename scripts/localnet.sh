@@ -186,11 +186,12 @@ fi
 # removed — a shard splits on prover-count (SPLIT_MAX_PROVERS) AND divisibility.
 # To force a localnet split, lower SPLIT_MAX_PROVERS below the covered count.
 
-# DEV: unified-app-tree cutover frame. Localnet starts at frame 0, so mainnet's
-# 695500 is never reached; set a LOW frame to exercise the state-commitment
-# switch — split apps fold into their single app tree + the commitment forks
-# (JMT root vs the legacy hash_pair rollup). Every node MUST use the SAME value
-# (deterministic or fork). Only honored when set; mainnet never sets it.
+# DEV: unified-app-tree cutover frame. Localnet starts at frame 0, so the
+# mainnet default (699500) is never reached and a localnet keeps the legacy
+# commitment unless this is set. Set a LOW frame (e.g. 30) to run the unified
+# tree mainnet runs — split apps fold into their single app tree + the commitment
+# forks (JMT root vs the legacy hash_pair rollup). Every node MUST use the SAME
+# value (deterministic or fork). Only honored when set; mainnet never sets it.
 if [[ -n "${UNIFIED_TREE_CUTOVER_FRAME:-}" ]]; then
   export QUIL_UNIFIED_TREE_CUTOVER_FRAME="$UNIFIED_TREE_CUTOVER_FRAME"
 fi
