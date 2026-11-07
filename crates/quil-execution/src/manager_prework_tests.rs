@@ -933,3 +933,62 @@ fn what_execution_refuses_before_its_proof_is_neither_verified_ahead_nor_awaited
         .unverified_confidential_operations(&owned)
         .is_empty());
 }
+
+/// A transfer creating a coin whose owner is not a canonical identity is
+/// refused by execution before its proof once canonical owners are required
+/// (`dispatch_for_commit`). On the base it passes arrival and is verified
+/// ahead, as it is by every member and archive, and only then refused, for
+/// free.
+#[test]
+fn a_noncanonical_owner_execution_refuses_before_its_proof_is_not_verified_ahead() {
+    use quil_lattice_ct::confidential::transfer::{Transfer, TransferStatement};
+    std::env::set_var("QUIL_CANONICAL_OWNER_FRAME", "0");
+    assert_eq!(
+        global_commit::init_canonical_owner_frame(1),
+        0,
+        "canonical owners are required from frame 0 in this process"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runs) = counting_worker(directory.path());
+    let manager = token_manager_with(worker);
+    let global = global_view();
+    publish_root(&global, 3);
+    let pairs = |bytes: Vec<u8>| vec![(APPLICATION.to_vec(), bundle(bytes))];
+    let honest = transfer(3, 0x51, 1);
+    assert!(manager
+        .arrival_operations(&global, &APPLICATION, &bundle(honest.clone()))
+        .is_ok_and(|sizes| !sizes.is_empty()));
+    manager.preverify_bundles(&pairs(honest));
+    assert_eq!(worker_runs(&runs), 1, "the counting worker never ran");
+    let forged = Transfer {
+        statement: TransferStatement {
+            network: NETWORK,
+            application: APPLICATION,
+            depth: 1,
+            root: Node::from_bytes(&[3; NODE_BYTES]).unwrap(),
+            images: vec![[0x52; IDENTITY_BYTES]],
+            outputs: vec![Output {
+                owner: [0xff; IDENTITY_BYTES],
+                ..output(2)
+            }],
+            fee: 2,
+        },
+        proof: proof(),
+    }
+    .encode()
+    .unwrap();
+    let tp = crate::token_engine::TYPE_LATTICE_TRANSACTION;
+    assert!(
+        spend_entries::check_owners(&NETWORK, &APPLICATION, tp, &forged).is_err(),
+        "execution refuses its owner before its proof"
+    );
+    let arrival = manager.arrival_operations(&global, &APPLICATION, &bundle(forged.clone()));
+    manager.preverify_bundles(&pairs(forged));
+    let verified = worker_runs(&runs) - 1;
+    assert!(
+        arrival.is_err() && verified == 0,
+        "READ-AHEAD GAP: a transfer creating a coin whose owner is not a canonical identity \
+         passed arrival ({arrival:?}) and was verified ahead ({verified} runs), though \
+         execution refuses it before its proof"
+    );
+}
