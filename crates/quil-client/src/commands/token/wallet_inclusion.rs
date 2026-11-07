@@ -109,7 +109,7 @@ fn hex32(bytes: &[u8]) -> String {
 }
 
 /// An argument as a POSIX shell reads it back unchanged.
-fn shell_word(word: &str) -> String {
+pub(super) fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
             .bytes()
@@ -146,7 +146,7 @@ pub(super) fn check_command(
 }
 
 /// The program name this process was started as, for commands it prints.
-fn program() -> String {
+pub(super) fn program() -> String {
     std::env::args()
         .next()
         .filter(|name| !name.is_empty())
