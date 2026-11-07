@@ -5,7 +5,7 @@ use quil_crypto::sntrup761;
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_lattice_ct::confidential::{
     address::RecipientAddress,
-    memo::{open_output, OpenedOutput},
+    memo::{open_output_with_keys, OpenedOutput, OpeningKeys},
     relation::membership::RecipientSecret,
     transfer::{parameter_context, Output},
 };
@@ -51,6 +51,15 @@ pub(super) struct RecipientWallet {
     /// What the last spend scan kept for its witnesses; the next witness
     /// rebuild takes it, so a spend lists the coins once.
     prepared: std::sync::Mutex<Option<SpendScan>>,
+    /// The keys that open this wallet's coins, derived on first use: a scan
+    /// opens every coin of the application with them.
+    opening: std::sync::OnceLock<OpeningKeys>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Derivations of a wallet's opening keys on this thread.
+    static KEY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a settlement binds: the bundle it funds, or — when the payer does not
@@ -2292,11 +2301,12 @@ impl RecipientWallet {
 
     fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
         use quil_lattice_ct::confidential::{memo::MemoError, relation::membership::MembershipKey};
-        let key = MembershipKey::derive(&self.context);
+        let keys = self.opening_keys();
+        let key: &MembershipKey = keys.membership();
         let mut owned = Vec::new();
         for (address, output) in page {
             let opened =
-                match open_output(&self.context, &self.kem_secret, &self.recipient, &output) {
+                match open_output_with_keys(keys, &self.kem_secret, &self.recipient, &output) {
                     Ok(opened) => opened,
                     Err(MemoError::Authentication) => continue,
                     Err(error) => anyhow::bail!("coin recovery: {error:?}"),
@@ -2837,6 +2847,7 @@ impl RecipientWallet {
             address,
             scan_pages: std::sync::atomic::AtomicUsize::new(DEFAULT_SCAN_PAGES),
             prepared: std::sync::Mutex::new(None),
+            opening: std::sync::OnceLock::new(),
         })
     }
 
@@ -3293,8 +3304,21 @@ impl RecipientWallet {
         &self.address
     }
     pub(super) fn open(&self, output: &Output) -> anyhow::Result<OpenedOutput> {
-        open_output(&self.context, &self.kem_secret, &self.recipient, output)
-            .map_err(|e| anyhow::anyhow!("memo: {e:?}"))
+        open_output_with_keys(
+            self.opening_keys(),
+            &self.kem_secret,
+            &self.recipient,
+            output,
+        )
+        .map_err(|e| anyhow::anyhow!("memo: {e:?}"))
+    }
+
+    fn opening_keys(&self) -> &OpeningKeys {
+        self.opening.get_or_init(|| {
+            #[cfg(test)]
+            KEY_DERIVATIONS.with(|n| n.set(n.get() + 1));
+            OpeningKeys::derive(&self.context, &self.recipient)
+        })
     }
 }
 
@@ -6928,7 +6952,10 @@ mod tests {
     }
 
     use super::*;
-    use quil_lattice_ct::confidential::{memo::create_output, relation::membership::MembershipKey};
+    use quil_lattice_ct::confidential::{
+        memo::{create_output, open_output},
+        relation::membership::MembershipKey,
+    };
 
     /// `token confidential-address` labels its two lines on stderr: which
     /// address is which, and what the escrow one is for.
@@ -8019,6 +8046,90 @@ mod tests {
                 .unwrap()
                 .address,
             payee.address
+        );
+    }
+
+    /// A wallet and a page of its coins (0, 1, 7 and the largest amount)
+    /// between coins of another wallet, as a scan reads them.
+    fn mixed_page() -> (RecipientWallet, Vec<([u8; 32], Output)>) {
+        let wallet = shield_test_wallet([1; 32]);
+        let other = shield_test_wallet([1; 32]);
+        let page = [
+            (true, 0),
+            (false, 5),
+            (true, 1),
+            (false, 9),
+            (true, 7),
+            (true, u128::MAX),
+            (false, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ours, amount))| {
+            let payee = if ours { &wallet } else { &other };
+            let output = create_output(&wallet.context, payee.address(), amount)
+                .unwrap()
+                .output;
+            ([i as u8; 32], output)
+        })
+        .collect();
+        (wallet, page)
+    }
+
+    /// A scan derives the keys that open a coin once, not once per coin:
+    /// they depend on the wallet alone.
+    #[test]
+    fn a_scan_derives_the_wallet_keys_once() {
+        let (wallet, page) = mixed_page();
+        KEY_DERIVATIONS.with(|n| n.set(0));
+        for _ in 0..2 {
+            assert_eq!(wallet.recover_page(page.clone()).unwrap().len(), 4);
+        }
+        let derivations = KEY_DERIVATIONS.with(|n| n.get());
+        assert_eq!(
+            derivations, 1,
+            "the scan derived the wallet keys {derivations} times"
+        );
+    }
+
+    /// The keys a scan derives once open exactly the coins `open_output`
+    /// opens with keys of its own, to the same amounts and spend images.
+    #[test]
+    fn a_scan_opens_the_coins_open_output_opens() {
+        let (wallet, page) = mixed_page();
+        let membership = MembershipKey::derive(&wallet.context);
+        let expected: Vec<_> = page
+            .iter()
+            .filter_map(|(address, output)| {
+                let opened = open_output(
+                    &wallet.context,
+                    &wallet.kem_secret,
+                    &wallet.recipient,
+                    output,
+                )
+                .ok()?;
+                let image = membership
+                    .key_image(&opened.secrets.owner)
+                    .identity_bytes()
+                    .unwrap();
+                Some((*address, opened.amount, image))
+            })
+            .collect();
+        let scanned: Vec<_> = wallet
+            .recover_page(page)
+            .unwrap()
+            .into_iter()
+            .map(|coin| (coin.address, *coin.amount, coin.image))
+            .collect();
+        assert_eq!(
+            scanned, expected,
+            "the scan opened other coins than open_output"
+        );
+        let amounts: Vec<_> = expected.iter().map(|(_, amount, _)| *amount).collect();
+        assert_eq!(
+            amounts,
+            [0, 1, 7, u128::MAX],
+            "open_output opened other coins than the wallet's"
         );
     }
 
