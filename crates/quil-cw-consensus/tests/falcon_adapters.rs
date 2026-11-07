@@ -575,3 +575,90 @@ fn a_busy_voter_answers_once_free_instead_of_nullifying() {
         "told once, not per deferral, how long it waited"
     );
 }
+
+/// Paces its first ask, declines its first attempt to wait for its parent,
+/// then finds itself behind (a GLOBAL state sync installing) and gives the
+/// turn up.
+struct BehindAfterOneWait {
+    liveness: Arc<quil_cw_consensus::adapters::Liveness>,
+    attempts: std::sync::atomic::AtomicU32,
+    paced: std::sync::atomic::AtomicBool,
+}
+impl GlobalProposer for BehindAfterOneWait {
+    fn propose(&self, _: u64, _: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        None
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, _: Option<Vec<u8>>) -> bool {
+        false
+    }
+    fn proposal_pacing(
+        &self,
+        _context: quil_cw_consensus::adapters::ProposalContext,
+    ) -> Option<Duration> {
+        (!self.paced.swap(true, std::sync::atomic::Ordering::SeqCst))
+            .then_some(Duration::from_secs(2))
+    }
+    fn propose_with_context(
+        &self,
+        context: quil_cw_consensus::adapters::ProposalContext,
+    ) -> Option<(Sha256Digest, Vec<u8>)> {
+        let before = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if before >= 1 {
+            self.liveness.note_behind(
+                context.view,
+                "parent unavailable",
+                "global state sync in progress",
+            );
+        }
+        None
+    }
+    fn propose_retry(&self) -> Option<Duration> {
+        (self.attempts.load(std::sync::atomic::Ordering::SeqCst) < 2)
+            .then_some(Duration::from_millis(250))
+    }
+}
+
+/// A turn given up while behind is timed from the ask, and its wait split
+/// into the pacing slept, the waits between its attempts and the rest.
+#[test]
+fn a_behind_give_up_says_where_its_wait_went() {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use quil_cw_consensus::adapters::{Liveness, TurnWait};
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let liveness = Arc::new(Liveness::default());
+    let proposer = Arc::new(BehindAfterOneWait {
+        liveness: liveness.clone(),
+        attempts: 0.into(),
+        paced: false.into(),
+    });
+    let given = deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"),
+            proposer,
+            BlockStore::new(),
+        )
+        .with_liveness(Some(liveness.clone()));
+        let pending = automaton
+            .propose(Context {
+                round: Round::new(Epoch::new(1), View::new(5)),
+                leader,
+                parent: (View::new(4), Sha256Digest([1; 32])),
+            })
+            .await;
+        assert!(pending.await.is_err(), "the turn was given up");
+        liveness.take_behind_give_ups()
+    });
+    assert_eq!(given.turns, 1);
+    assert_eq!(
+        given.longest,
+        TurnWait {
+            total: Duration::from_millis(2_250),
+            pacing: Duration::from_secs(2),
+            retries: Duration::from_millis(250),
+            attempts: 2,
+        },
+        "the give-up says where its wait went"
+    );
+}
