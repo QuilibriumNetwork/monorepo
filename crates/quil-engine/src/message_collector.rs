@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use sha3::{Digest, Sha3_256};
 
 use crate::proposal_pool::Intake;
+use quil_execution::manager::ShieldClaim;
 
 mod cert_union;
 pub(crate) use cert_union::order_copies_by_signers;
@@ -298,6 +299,13 @@ impl RankBuffer {
         self.seen.contains_key(key)
     }
 
+    /// The bytes of the held message with `key`.
+    fn data(&self, key: &[u8; 32]) -> Option<&[u8]> {
+        self.messages
+            .get(self.seen.get(key)?)
+            .map(|message| message.data.as_slice())
+    }
+
     /// Held messages in arrival order, with their arrival numbers.
     fn iter(&self) -> impl Iterator<Item = (u64, &CollectedMessage)> {
         self.messages.iter().map(|(arrival, m)| (*arrival, m))
@@ -352,6 +360,9 @@ pub enum Refusal {
     NoProposer,
     /// An alt shard update failed its verifier.
     InvalidAltShardUpdate,
+    /// Another shield of the same coin signed by the same key is pending
+    /// here or awaits its GLOBAL decision (the collector's shield claims).
+    ShieldClaimed,
 }
 
 impl Refusal {
@@ -364,12 +375,16 @@ impl Refusal {
             Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, which holds such frames only from active provers and up to a cap per shard",
             Self::NoProposer => "this node is not an archive: it proposes no GLOBAL frames, so a message submitted to it would never be included",
             Self::InvalidAltShardUpdate => "alt shard update failed verification",
+            Self::ShieldClaimed => "another shield of this coin signed by the same key is pending here or awaits its GLOBAL decision",
         }
     }
 
     /// The same message may be accepted later: the submitter should retry.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::RankFull | Self::AwaitingExecution)
+        matches!(
+            self,
+            Self::RankFull | Self::AwaitingExecution | Self::ShieldClaimed
+        )
     }
 }
 
@@ -464,6 +479,322 @@ impl<'a> Copied<'a> {
     }
 }
 
+/// How long a shield's claims stay held once a finalized frame carried it:
+/// past the window in which GLOBAL commits its relay (a header rides GLOBAL
+/// at most 12 GLOBAL frames after its anchor). By then a committed shield's
+/// sources are consumed, and the application engine refuses any other shield
+/// of them on arrival; a coin whose shield the commit rejected is free again.
+const CARRIED_SHIELD_HOLD: Duration = Duration::from_secs(600);
+
+/// How often refused shields are logged while they continue.
+const SHIELD_REFUSAL_LOG_EVERY: Duration = Duration::from_secs(600);
+
+/// How often the message holding a coin's claim is asked again whether its
+/// proofs failed to verify here, while other shields of the coin arrive.
+const SHIELD_REFUTATION_RECHECK: Duration = Duration::from_secs(1);
+
+/// Statements whose held shield failed its proof verification here, kept at
+/// most this many (the oldest goes first), each for [`CARRIED_SHIELD_HOLD`].
+const REFUTED_STATEMENTS_KEPT: usize = 4096;
+
+/// Judges whether a held message's confidential proofs failed to verify on
+/// this node: `Some` with the statements of its shields whose own proof
+/// failed. It reads only the verdict cache, so it runs under the buffers'
+/// lock.
+pub type ProofJudge = Box<dyn Fn(&[u8]) -> Option<Vec<[u8; 32]>>>;
+
+/// Makes a [`ProofJudge`] before the collector takes its locks (the token
+/// policy is read then, under the execution engines' lock)
+/// ([`MessageCollector::set_rejected_proofs`]).
+pub type RejectedProofs = std::sync::Arc<dyn Fn() -> Option<ProofJudge> + Send + Sync>;
+
+/// The held messages holding a coin's claim: every one carrying the shield
+/// statement that claims it. The first is asked whether its proofs failed
+/// here; the others hold the coin with it, and one of them takes its place
+/// when it leaves.
+struct ClaimHolders {
+    statement: [u8; 32],
+    first: [u8; 32],
+    /// One key per other held message carrying `statement`. A key whose
+    /// message left goes when that is found: when the message is removed
+    /// or dropped, when it would take the first's place, or at the latest
+    /// when the next finalized frame prunes the claims. So the set never
+    /// holds more than the messages held since that frame.
+    others: HashSet<[u8; 32]>,
+    /// When the first was last asked whether its proofs failed here.
+    checked: Option<Instant>,
+}
+
+impl ClaimHolders {
+    fn new(first: [u8; 32], statement: [u8; 32]) -> Self {
+        Self {
+            statement,
+            first,
+            others: HashSet::new(),
+            checked: None,
+        }
+    }
+
+    fn includes(&self, key: &[u8; 32]) -> bool {
+        self.first == *key || self.others.contains(key)
+    }
+
+    /// The first left: another holder still held (`holds`) takes its place.
+    /// `false` when none is left.
+    fn succeed(&mut self, holds: impl Fn(&[u8; 32]) -> bool) -> bool {
+        while let Some(next) = self.others.iter().next().copied() {
+            self.others.remove(&next);
+            if holds(&next) {
+                self.first = next;
+                self.checked = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The coins pending shields claim
+/// ([`quil_execution::ExecutionEngineManager::shield_claims`]): a coin's
+/// owner has one shield statement of it pending here at a time. Every
+/// shield of a coin after the first could only be rejected by the global
+/// commit, which credits no fee for it, after this shard and every archive
+/// verified its proof. Every held message carrying the statement holds the
+/// coin, so it is free only once none is left: one leaving (superseded,
+/// dropped, removed, pruned, replaced by a union) frees nothing while
+/// another still carries the shield.
+///
+/// The owner's signature covers the statement, not the proof, so anyone who
+/// saw a shield can send copies of it with other proof bytes, and a
+/// statement the owner signed earlier stays valid: neither may keep the
+/// owner's shield out. Copies of the holders' statement are never refused.
+/// A first holder whose proofs failed to verify here can never execute
+/// anywhere (a verdict depends on the bytes and the network's policy alone):
+/// when its own shield's proof failed, the coin is free, and copies of its
+/// statement take no coin for [`CARRIED_SHIELD_HOLD`]; when another of its
+/// operations failed, it leaves and the next holder takes its place. A
+/// later holder's failure marks nothing, so a copy sent after an honest
+/// shield cannot free its coin. A shield a finalized frame carried executed
+/// with a valid proof, and holds its coin against any other message.
+#[derive(Default)]
+struct ShieldClaims {
+    /// The holders of each coin a held message claims.
+    held: HashMap<[u8; 32], ClaimHolders>,
+    /// Each coin a shield a finalized frame carried claims, with that
+    /// message's key and when the frame was finalized here.
+    carried: HashMap<[u8; 32], ([u8; 32], Instant)>,
+    /// Statements whose held shield failed its proof verification here, and
+    /// when that was found.
+    refuted: HashMap<[u8; 32], Instant>,
+    /// Shields refused since the last line, and when that was logged.
+    refused: u64,
+    logged: Option<Instant>,
+}
+
+impl ShieldClaims {
+    /// Whether message `key`, making `claims`, claims a coin another message
+    /// holds: one a finalized frame carried within [`CARRIED_SHIELD_HOLD`]
+    /// of `now`, or one held messages this collector still holds (`holds`)
+    /// claim under another statement. A holder that left gives up its place
+    /// here. The first holder is asked whether its proofs failed here
+    /// (`rejected`, at most once per [`SHIELD_REFUTATION_RECHECK`] per
+    /// holder: `Some` with the statements of its shields whose own proof
+    /// failed): if its own shield's did, the coin is free and the statement
+    /// is remembered; if another of its operations did, it gives up its
+    /// place (a bundle that pairs another's honest shield with a garbage
+    /// operation marks nothing).
+    fn taken(
+        &mut self,
+        key: &[u8; 32],
+        claims: &[ShieldClaim],
+        now: Instant,
+        holds: impl Fn(&[u8; 32]) -> bool,
+        rejected: impl Fn(&[u8; 32]) -> Option<Vec<[u8; 32]>>,
+    ) -> bool {
+        for claim in claims {
+            if self.carried.get(&claim.coin).is_some_and(|(carrier, at)| {
+                carrier != key && now.saturating_duration_since(*at) < CARRIED_SHIELD_HOLD
+            }) {
+                return true;
+            }
+            // Each pass either ends or takes one holder out, so a coin's
+            // holders are each looked at once however many left.
+            while let Some(holders) = self.held.get_mut(&claim.coin) {
+                if holders.includes(key) {
+                    break;
+                }
+                if !holds(&holders.first) {
+                    if !holders.succeed(&holds) {
+                        self.held.remove(&claim.coin);
+                    }
+                    continue;
+                }
+                let due = holders.checked.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= SHIELD_REFUTATION_RECHECK
+                });
+                if due {
+                    holders.checked = Some(now);
+                    if let Some(failed) = rejected(&holders.first) {
+                        let statement = holders.statement;
+                        if failed.contains(&statement) {
+                            self.held.remove(&claim.coin);
+                            self.refute(statement, now);
+                        } else if !holders.succeed(&holds) {
+                            self.held.remove(&claim.coin);
+                        }
+                        continue;
+                    }
+                }
+                if holders.statement != claim.statement {
+                    return true;
+                }
+                break;
+            }
+        }
+        false
+    }
+
+    /// Remember that a held shield of `statement` failed its proof here.
+    fn refute(&mut self, statement: [u8; 32], now: Instant) {
+        if self.refuted.len() >= REFUTED_STATEMENTS_KEPT && !self.refuted.contains_key(&statement) {
+            if let Some(oldest) = self
+                .refuted
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(statement, _)| *statement)
+            {
+                self.refuted.remove(&oldest);
+            }
+        }
+        self.refuted.insert(statement, now);
+    }
+
+    /// Message `key`, now held, makes `claims`: it holds each coin nothing
+    /// else holds, and each its statement already holds, unless its
+    /// statement failed its proof here lately.
+    fn hold(&mut self, key: [u8; 32], claims: &[ShieldClaim], now: Instant) {
+        for claim in claims {
+            let refuted = self
+                .refuted
+                .get(&claim.statement)
+                .is_some_and(|at| now.saturating_duration_since(*at) < CARRIED_SHIELD_HOLD);
+            if refuted {
+                continue;
+            }
+            match self.held.get_mut(&claim.coin) {
+                Some(holders) => {
+                    if holders.statement == claim.statement && holders.first != key {
+                        holders.others.insert(key);
+                    }
+                }
+                None => {
+                    self.held
+                        .insert(claim.coin, ClaimHolders::new(key, claim.statement));
+                }
+            }
+        }
+    }
+
+    /// Held message `from` gave its place to `to`, which carries the same
+    /// shields (a union of a shard frame's copies differs from the copy it
+    /// extends only in the frame's certificate): the coins `from` held stay
+    /// held, by `to`.
+    fn rekey(&mut self, from: &[u8; 32], to: [u8; 32]) {
+        for holders in self.held.values_mut() {
+            if holders.first == *from {
+                holders.first = to;
+                holders.others.remove(&to);
+            } else if holders.others.remove(from) && holders.first != to {
+                holders.others.insert(to);
+            }
+        }
+    }
+
+    /// Held messages `keys` left: each gives up its place, and a coin is
+    /// free once none of its holders is left. Whether the next first holder
+    /// is still held is found when the coin is next claimed.
+    fn forget(&mut self, keys: &HashSet<[u8; 32]>) {
+        self.held.retain(|_, holders| {
+            holders.others.retain(|key| !keys.contains(key));
+            !keys.contains(&holders.first) || holders.succeed(|_| true)
+        });
+    }
+
+    /// A finalized frame carried message `key`, making `claims`, at `now`.
+    fn carry(&mut self, key: [u8; 32], claims: &[ShieldClaim], now: Instant) {
+        for claim in claims {
+            self.held.remove(&claim.coin);
+            self.carried.insert(claim.coin, (key, now));
+        }
+    }
+
+    /// Forget the holders no longer held, and holds and refuted statements
+    /// that ran out.
+    fn prune(&mut self, now: Instant, holds: impl Fn(&[u8; 32]) -> bool) {
+        self.held.retain(|_, holders| {
+            holders.others.retain(|key| holds(key));
+            holds(&holders.first) || holders.succeed(&holds)
+        });
+        self.carried
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < CARRIED_SHIELD_HOLD);
+        self.refuted
+            .retain(|_, at| now.saturating_duration_since(*at) < CARRIED_SHIELD_HOLD);
+    }
+
+    fn note_refused(&mut self, now: Instant) {
+        self.refused += 1;
+        self.report(now);
+    }
+
+    /// The line for the shields refused since the last one, if one is due:
+    /// the first at once, then at most one per [`SHIELD_REFUSAL_LOG_EVERY`].
+    fn report(&mut self, now: Instant) {
+        if self.refused == 0
+            || self
+                .logged
+                .is_some_and(|at| now.saturating_duration_since(at) < SHIELD_REFUSAL_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        tracing::info!(
+            refused = self.refused,
+            pending_claims = self.held.len(),
+            carried_claims = self.carried.len(),
+            refuted_statements = self.refuted.len(),
+            scope = "a wallet or peer",
+            action = "none here: a wallet seeing this for its own shield sent another shield of \
+                      a coin before its earlier one was decided; it is taken once that one is \
+                      rejected or fails its proof here, and refused for good once it commits",
+            "message collector: shields of a coin whose owner's earlier shield is pending or \
+             awaits its GLOBAL decision refused since the last line"
+        );
+        self.refused = 0;
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// Run once, with no collector lock held, between the two steps of
+    /// [`MessageCollector::mark_proofs_rejected`]: a submission arriving
+    /// while a proposal drops bundles whose proofs failed.
+    static DROP_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Run `hook` at the next gap of [`MessageCollector::mark_proofs_rejected`]
+/// on this thread.
+#[cfg(test)]
+pub(crate) fn set_drop_gap_hook(hook: Box<dyn FnOnce()>) {
+    DROP_GAP_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+fn run_drop_gap_hook() {
+    if let Some(hook) = DROP_GAP_HOOK.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// Thread-safe message collector. The message receive loop (writer)
 /// adds messages via `add_message`. The leader provider (reader)
 /// drains messages via `collect_for_rank`.
@@ -546,6 +877,11 @@ pub struct MessageCollector {
     last_pool: std::sync::Mutex<Option<crate::proposal_pool::ProposalPool>>,
     /// The unions of a shard frame's copies ([`cert_union`]).
     union: cert_union::UnionState,
+    /// The coins pending and recently carried shields claim.
+    shield_claims: std::sync::Mutex<ShieldClaims>,
+    /// Whether a held message's proofs failed to verify here, for the
+    /// shield claims ([`Self::set_rejected_proofs`]).
+    rejected_proofs: RwLock<Option<RejectedProofs>>,
 }
 
 /// How often submits refused for a full rank buffer are logged while they
@@ -816,6 +1152,8 @@ impl MessageCollector {
             verify_gate: std::sync::OnceLock::new(),
             last_pool: std::sync::Mutex::new(None),
             union: Default::default(),
+            shield_claims: std::sync::Mutex::new(ShieldClaims::default()),
+            rejected_proofs: RwLock::new(None),
         }
     }
 
@@ -834,6 +1172,14 @@ impl MessageCollector {
             pool.known = known.clone();
         }
         Some(pool)
+    }
+
+    /// Judge, with a judge `make` gives for each arrival, whether a held
+    /// shield's proofs failed to verify on this node: one whose did gives up
+    /// the coin it claims ([`ShieldClaims`]). Without one, no holder gives up
+    /// its coin before it leaves.
+    pub fn set_rejected_proofs(&self, make: RejectedProofs) {
+        *self.rejected_proofs.write().unwrap() = Some(make);
     }
 
     /// Install the admission check of shard frames. Archives, whose collector
@@ -1253,6 +1599,8 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         }
 
+        // What the shields it carries claim ([`ShieldClaims`]).
+        let claims = quil_execution::ExecutionEngineManager::shield_claims(&message.data);
         // Verify before holding when it can be now: an unverified header
         // cannot stand in for a real one, and only a verified one supersedes.
         // One that cannot be verified now (state unavailable, the verifier
@@ -1351,11 +1699,36 @@ impl MessageCollector {
             .unwrap()
             .back()
             .map_or(rank, |last| rank.max(*last));
+        // Made before the buffers' lock: making it reads the token policy
+        // under the execution engines' lock, which GLOBAL execution takes for
+        // writing.
+        let judge = (!claims.is_empty())
+            .then(|| self.rejected_proofs.read().unwrap().clone())
+            .flatten()
+            .and_then(|make| make());
         let mut buffers = self.buffers.write().unwrap();
         // Another copy may have been verified while this one was, or a
         // finalized frame carried it meanwhile.
         if (message.verified && self.superseded(&keys)) || self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
+        }
+        // A coin's owner has one shield of it pending here at a time
+        // ([`ShieldClaims`]); checked and recorded under the buffers' lock, so
+        // two shields of a coin arriving together cannot both be held.
+        let mut shields = (!claims.is_empty()).then(|| self.shield_claims.lock().unwrap());
+        if let Some(shields) = shields.as_mut() {
+            let now = Instant::now();
+            let held = |key: &[u8; 32]| buffers.values().find_map(|b| b.data(key));
+            if shields.taken(
+                &message.hash,
+                &claims,
+                now,
+                |key| held(key).is_some(),
+                |key| judge.as_ref().and_then(|judge| held(key).and_then(judge)),
+            ) {
+                shields.note_refused(now);
+                return SubmitOutcome::Filtered(Refusal::ShieldClaimed);
+            }
         }
         let (hash, verified) = (message.hash, message.verified);
         let ranks_held = buffers.len();
@@ -1364,6 +1737,9 @@ impl MessageCollector {
             AddOutcome::Added => {
                 let now = Instant::now();
                 self.note_rank_accepting(now, rank);
+                if let Some(shields) = shields.as_mut() {
+                    shields.hold(hash, &claims, now);
+                }
                 if !keys.is_empty() {
                     self.intake.note(Intake::Accepted, now);
                     if let Some(held) = held.filter(|_| !verified) {
@@ -1816,6 +2192,16 @@ impl MessageCollector {
             .iter()
             .flat_map(|m| extract_shard_frame_keys(m))
             .collect();
+        let carried_shields: Vec<([u8; 32], Vec<ShieldClaim>)> = raw_msgs
+            .iter()
+            .map(|m| {
+                (
+                    message_key(m),
+                    quil_execution::ExecutionEngineManager::shield_claims(m),
+                )
+            })
+            .filter(|(_, claims)| !claims.is_empty())
+            .collect();
 
         {
             let mut buffers = self.buffers.write().unwrap();
@@ -1833,6 +2219,14 @@ impl MessageCollector {
                 buf.retain(|m| !hashes.contains(&m.hash) && !carries_included_frame(&included, m));
             }
             buffers.retain(|_, b| !b.is_empty());
+            // The shields it carried keep their coins until the global commit
+            // decides them ([`ShieldClaims`]).
+            let now = Instant::now();
+            let mut shields = self.shield_claims.lock().unwrap();
+            for (key, claims) in &carried_shields {
+                shields.carry(*key, claims, now);
+            }
+            shields.prune(now, |key| buffers.values().any(|b| b.contains(key)));
         }
         {
             let mut fin = self.finalized.write().unwrap();
@@ -1857,6 +2251,13 @@ impl MessageCollector {
         }
     }
 
+    /// Log the shields refused since the last line, if a line is due: the
+    /// engine's cleanup timer calls this, so the last count is logged when
+    /// they stop.
+    pub fn report_refused_shields(&self) {
+        self.shield_claims.lock().unwrap().report(Instant::now());
+    }
+
     /// Consume `raw_msgs`, bundles a finalized frame carried that its
     /// execution skipped: like [`mark_finalized`]'s they leave the live
     /// buffers and are never held again, but the shard frames they claim do
@@ -1871,6 +2272,52 @@ impl MessageCollector {
         for raw in raw_msgs {
             finalized.insert(message_key(raw));
         }
+    }
+
+    /// Consume the bundles of `dropped`, whose proofs failed to verify on
+    /// this node, as [`Self::mark_skipped`] does; each comes with the
+    /// statements of its own shields whose proof failed. A bundle that was
+    /// the first holder of a coin ([`ShieldClaims`]) under such a statement
+    /// marks it: it takes no coin for [`CARRIED_SHIELD_HOLD`], so a fresh
+    /// copy of a replayed statement cannot take the coin again, and the coin
+    /// is free. A later holder, or a statement another bundle's shield
+    /// failed, marks nothing. Any other coin a dropped bundle held stays held
+    /// by the other held messages carrying its statement, and is free once
+    /// none is left. Marked before they leave the buffers, so a copy arriving
+    /// meanwhile finds its statement marked.
+    pub fn mark_proofs_rejected(&self, dropped: &[(Vec<u8>, Vec<[u8; 32]>)]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let failed: HashMap<[u8; 32], &[[u8; 32]]> = dropped
+            .iter()
+            .map(|(raw, failed)| (message_key(raw), failed.as_slice()))
+            .collect();
+        let keys: HashSet<[u8; 32]> = failed.keys().copied().collect();
+        {
+            let now = Instant::now();
+            let own = |holders: &ClaimHolders| {
+                failed
+                    .get(&holders.first)
+                    .is_some_and(|failed| failed.contains(&holders.statement))
+            };
+            let mut shields = self.shield_claims.lock().unwrap();
+            let refuted: HashSet<[u8; 32]> = shields
+                .held
+                .values()
+                .filter(|&holders| own(holders))
+                .map(|holders| holders.statement)
+                .collect();
+            for statement in refuted {
+                shields.refute(statement, now);
+            }
+            shields.held.retain(|_, holders| !own(holders));
+            shields.forget(&keys);
+        }
+        #[cfg(test)]
+        run_drop_gap_hook();
+        let raw_msgs: Vec<Vec<u8>> = dropped.iter().map(|(raw, _)| raw.clone()).collect();
+        self.mark_skipped(&raw_msgs);
     }
 
     /// Remove `raw_msgs` from the live buffers WITHOUT recording them as
@@ -1894,6 +2341,9 @@ impl MessageCollector {
             buf.retain(|m| !hashes.contains(&m.hash));
         }
         buffers.retain(|_, b| !b.is_empty());
+        // The coins they held stay held by the other messages carrying the
+        // same shields ([`ShieldClaims`]).
+        self.shield_claims.lock().unwrap().forget(&hashes);
     }
 
     /// Take back `data`, a message a finalized frame consumed that has to run
@@ -3934,6 +4384,299 @@ mod tests {
         assert_eq!(
             collector.add_message_outcome(1, header_bundle_for(0x72, &[])),
             SubmitOutcome::Accepted
+        );
+    }
+
+    /// A shield's claim on a coin holds it while the collector holds the
+    /// shield, and once a finalized frame carried it, for
+    /// `CARRIED_SHIELD_HOLD`; never against the shield's own copies, never
+    /// on another coin, and while held, never against a copy of its
+    /// statement with other proof bytes.
+    #[test]
+    fn a_shield_claim_holds_its_coin_until_it_leaves_or_its_hold_runs_out() {
+        let mut claims = ShieldClaims::default();
+        let (first, second, copy) = ([1; 32], [2; 32], [3; 32]);
+        let claim = |statement: u8| {
+            [ShieldClaim {
+                coin: [9; 32],
+                statement: [statement; 32],
+            }]
+        };
+        let now = Instant::now();
+        let held = |key: &[u8; 32]| *key == first;
+        let fine = |_: &[u8; 32]| None;
+        claims.hold(first, &claim(1), now);
+        assert!(claims.taken(&second, &claim(2), now, held, fine));
+        assert!(
+            !claims.taken(&first, &claim(1), now, held, fine),
+            "its own copy"
+        );
+        assert!(
+            !claims.taken(&copy, &claim(1), now, held, fine),
+            "a copy of its statement"
+        );
+        let other = [ShieldClaim {
+            coin: [8; 32],
+            statement: [2; 32],
+        }];
+        assert!(
+            !claims.taken(&second, &other, now, held, fine),
+            "another coin"
+        );
+        assert!(
+            !claims.taken(&second, &claim(2), now, |_| false, fine),
+            "the shield holding it left the collector"
+        );
+        let gone = |_: &[u8; 32]| false;
+        claims.carry(first, &claim(1), now);
+        let late = now + CARRIED_SHIELD_HOLD;
+        assert!(claims.taken(
+            &second,
+            &claim(2),
+            late - Duration::from_secs(1),
+            gone,
+            fine
+        ));
+        assert!(
+            claims.taken(&copy, &claim(1), now, gone, fine),
+            "a carried shield executed: a copy can only be rejected"
+        );
+        assert!(
+            !claims.taken(&first, &claim(1), now, gone, fine),
+            "a re-offered copy"
+        );
+        assert!(
+            !claims.taken(&second, &claim(2), late, gone, fine),
+            "the hold ran out"
+        );
+        claims.prune(late - Duration::from_secs(1), gone);
+        assert!(claims.held.is_empty() && claims.carried.len() == 1);
+        claims.prune(late, gone);
+        assert!(claims.carried.is_empty());
+    }
+
+    /// A bundle dropped for failed proofs marks a statement only when its own
+    /// shield of it failed and it was the coin's first holder under it: a
+    /// copy that held nothing, a later holder, or a bundle whose failure was
+    /// another bundle's statement marks nothing. A dropped bundle's coins
+    /// stay held by the other messages carrying the same shield.
+    #[test]
+    fn a_dropped_bundle_marks_only_the_statements_it_held_a_coin_under() {
+        let mc = MessageCollector::new();
+        let now = Instant::now();
+        let claim = |coin: u8, statement: u8| {
+            [ShieldClaim {
+                coin: [coin; 32],
+                statement: [statement; 32],
+            }]
+        };
+        let hold = |key: [u8; 32], coin: u8, statement: u8| {
+            mc.shield_claims
+                .lock()
+                .unwrap()
+                .hold(key, &claim(coin, statement), now)
+        };
+        let (copy, holder) = (b"dropped copy".to_vec(), b"dropped holder".to_vec());
+        hold([7; 32], 9, 1);
+        mc.mark_proofs_rejected(&[(copy, vec![[1; 32]])]);
+        {
+            let shields = mc.shield_claims.lock().unwrap();
+            assert!(
+                shields.refuted.is_empty(),
+                "a copy that held nothing marked its statement"
+            );
+            assert_eq!(
+                shields.held[&[9; 32]].first, [7; 32],
+                "the holder keeps its coin"
+            );
+        }
+        hold(message_key(&holder), 8, 2);
+        mc.mark_proofs_rejected(&[(holder, vec![[2; 32], [3; 32]])]);
+        {
+            let shields = mc.shield_claims.lock().unwrap();
+            assert!(
+                shields.refuted.contains_key(&[2; 32]),
+                "the holder's statement"
+            );
+            assert!(
+                !shields.refuted.contains_key(&[3; 32]),
+                "a statement it held nothing under"
+            );
+            assert!(!shields.held.contains_key(&[8; 32]), "its coin is free");
+        }
+        // A later holder whose own shield failed (a copy sent after an
+        // honest shield) leaves; the first keeps the coin, unmarked.
+        let later = b"later holder".to_vec();
+        hold([6; 32], 6, 4);
+        hold(message_key(&later), 6, 4);
+        mc.mark_proofs_rejected(&[(later, vec![[4; 32]])]);
+        {
+            let shields = mc.shield_claims.lock().unwrap();
+            assert!(
+                !shields.refuted.contains_key(&[4; 32]),
+                "a later holder's failure marked the statement"
+            );
+            assert_eq!(shields.held[&[6; 32]].first, [6; 32]);
+        }
+        // Dropped together: the first holder failed for another operation,
+        // a copy for its own shield. Each bundle answers for its own.
+        let (pairing, garbage) = (b"pairing".to_vec(), b"garbage copy".to_vec());
+        hold(message_key(&pairing), 5, 5);
+        hold(message_key(&garbage), 5, 5);
+        mc.mark_proofs_rejected(&[(pairing, vec![[6; 32]]), (garbage, vec![[5; 32]])]);
+        {
+            let shields = mc.shield_claims.lock().unwrap();
+            assert!(
+                !shields.refuted.contains_key(&[5; 32]),
+                "marked: a statement another bundle dropped with it failed"
+            );
+            assert!(!shields.held.contains_key(&[5; 32]), "both left");
+        }
+        // The first holder dropped for another operation: the next holds.
+        let (first, next) = (b"first holder".to_vec(), [4; 32]);
+        hold(message_key(&first), 4, 7);
+        hold(next, 4, 7);
+        mc.mark_proofs_rejected(&[(first, vec![[8; 32]])]);
+        let shields = mc.shield_claims.lock().unwrap();
+        assert_eq!(
+            shields.held.get(&[4; 32]).map(|holders| holders.first),
+            Some(next),
+            "VULNERABLE: the coin was freed while another message carries its shield"
+        );
+    }
+
+    /// Every held message carrying a coin's shield statement holds the coin,
+    /// and it is free only once none is left: a later holder takes the
+    /// first one's place, keeps it under a union's key, and is asked about
+    /// its proofs in turn. The first holder's own failed shield frees the
+    /// coin and marks the statement; its failed other operation only takes
+    /// it out.
+    #[test]
+    fn a_coin_is_free_only_once_no_held_message_carries_its_shield() {
+        let mut claims = ShieldClaims::default();
+        let (first, second, third, union, contender) =
+            ([1; 32], [2; 32], [3; 32], [4; 32], [9; 32]);
+        let claim = |statement: u8| {
+            [ShieldClaim {
+                coin: [7; 32],
+                statement: [statement; 32],
+            }]
+        };
+        let now = Instant::now();
+        let fine = |_: &[u8; 32]| None;
+        for key in [first, second, third] {
+            claims.hold(key, &claim(1), now);
+        }
+        claims.rekey(&second, union);
+        let held = |key: &[u8; 32]| *key == union || *key == third;
+        assert!(
+            claims.taken(&contender, &claim(2), now, held, fine),
+            "VULNERABLE: the first holder left and the coin was free while others carry its \
+             shield"
+        );
+        assert!(
+            !claims.taken(&third, &claim(1), now, held, fine),
+            "a holder's own copy"
+        );
+        claims.forget(&[union].into());
+        let held = |key: &[u8; 32]| *key == third;
+        assert!(
+            claims.taken(&contender, &claim(2), now, held, fine),
+            "VULNERABLE: a holder was removed and the coin was free while another carries its \
+             shield"
+        );
+        // The first holder's bundle failed for another operation: it leaves,
+        // the next one holds and is asked at once.
+        let copy = [5; 32];
+        claims.hold(copy, &claim(1), now);
+        let held = |key: &[u8; 32]| *key == third || *key == copy;
+        let later = now + SHIELD_REFUTATION_RECHECK;
+        let other_failed = |key: &[u8; 32]| (*key == third).then(|| vec![[8; 32]]);
+        assert!(
+            claims.taken(&contender, &claim(2), later, held, other_failed),
+            "VULNERABLE: a holder failed for another operation and the coin was free while \
+             another carries its shield"
+        );
+        assert_eq!(claims.held[&[7; 32]].first, copy);
+        assert!(claims.refuted.is_empty());
+        // The first holder's own shield failed: the coin is free and its
+        // statement takes none.
+        let own_failed = |key: &[u8; 32]| (*key == copy).then(|| vec![[1; 32]]);
+        let latest = later + SHIELD_REFUTATION_RECHECK;
+        assert!(!claims.taken(&contender, &claim(2), latest, held, own_failed));
+        assert!(claims.held.is_empty() && claims.refuted.contains_key(&[1; 32]));
+        claims.hold(third, &claim(1), latest);
+        assert!(claims.held.is_empty(), "a refuted statement held a coin");
+        // Pruned: holders no longer held give up their places.
+        claims.hold(first, &claim(3), latest);
+        claims.hold(second, &claim(3), latest);
+        claims.prune(latest, |key| *key == second);
+        assert_eq!(claims.held[&[7; 32]].first, second);
+        claims.prune(latest, |_| false);
+        assert!(claims.held.is_empty());
+    }
+
+    /// A holder whose proofs failed to verify here gives up its coin, and a
+    /// copy of its statement takes it for no one until the memory runs out;
+    /// the holder is asked at most once per `SHIELD_REFUTATION_RECHECK`, so
+    /// a flood of contending shields costs one lookup a second, and the
+    /// memory is bounded.
+    #[test]
+    fn a_holder_whose_proofs_failed_here_gives_up_its_coin_and_its_statement() {
+        let mut claims = ShieldClaims::default();
+        let (replayed, again, new) = ([1; 32], [2; 32], [3; 32]);
+        let claim = |statement: u8| {
+            [ShieldClaim {
+                coin: [9; 32],
+                statement: [statement; 32],
+            }]
+        };
+        let now = Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let refuted = |key: &[u8; 32]| {
+            asked.set(asked.get() + 1);
+            (*key == replayed).then(|| vec![[1; 32]])
+        };
+        let held = |_: &[u8; 32]| true;
+        claims.hold(replayed, &claim(1), now);
+        // A contending shield before the verdict: asked once, then not again
+        // within the recheck interval.
+        assert!(claims.taken(&new, &claim(2), now, held, |_| None));
+        assert!(claims.taken(&new, &claim(2), now, held, refuted));
+        assert_eq!(asked.get(), 0, "asked again within the recheck interval");
+        let later = now + SHIELD_REFUTATION_RECHECK;
+        // A fresh copy of the refuted statement takes nothing.
+        assert!(!claims.taken(&again, &claim(1), later, held, refuted));
+        assert_eq!(asked.get(), 1);
+        claims.hold(again, &claim(1), later);
+        assert!(claims.held.is_empty(), "a refuted statement held a coin");
+        assert!(!claims.taken(&new, &claim(2), later, held, refuted));
+        claims.hold(new, &claim(2), later);
+        assert_eq!(claims.held[&[9; 32]].first, new);
+        assert!(claims.taken(&again, &claim(1), later, held, refuted));
+        // The memory runs out, and is bounded.
+        claims.prune(later + CARRIED_SHIELD_HOLD, held);
+        assert!(claims.refuted.is_empty());
+        for n in 0..=REFUTED_STATEMENTS_KEPT {
+            let mut statement = [0; 32];
+            statement[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            claims.refute(statement, later + Duration::from_millis(n as u64));
+        }
+        assert_eq!(claims.refuted.len(), REFUTED_STATEMENTS_KEPT);
+        assert!(
+            !claims.refuted.contains_key(&[0; 32]),
+            "the oldest goes first"
+        );
+        // A holder whose bundle failed for another operation releases the
+        // coin, but its own statement is not marked.
+        let mut claims = ShieldClaims::default();
+        claims.hold(replayed, &claim(5), now);
+        assert!(!claims.taken(&new, &claim(6), now, held, |_| Some(vec![[7; 32]])));
+        assert!(claims.held.is_empty() && claims.refuted.is_empty());
+        claims.hold(again, &claim(5), now);
+        assert_eq!(
+            claims.held[&[9; 32]].first, again,
+            "an unmarked statement holds"
         );
     }
 }

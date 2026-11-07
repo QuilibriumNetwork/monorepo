@@ -353,6 +353,29 @@ pub fn read_root_history(
     .map(|mut fields| fields.remove(0)))
 }
 
+/// Publish `current` into `application`'s canonical root history at
+/// `frame`, as [`materialize_report`] does once shards report: for tests of
+/// what reads the history.
+#[cfg(any(test, feature = "testing-stubs"))]
+pub fn publish_root_for_tests(
+    state: &HypergraphState,
+    frame: u64,
+    application: &[u8; 32],
+    current: quil_lattice_ct::confidential::coin_tree::RootRecord,
+) -> Result<()> {
+    let history =
+        roots::publish_history(read_root_history(state, application)?.as_deref(), current)?;
+    write_record(
+        state,
+        frame,
+        &root_history_address(application)?,
+        &[
+            (vec![0xff; 32], kind(ROOT_HISTORY_KIND)?.to_vec()),
+            (vec![0], history),
+        ],
+    )
+}
+
 /// Whether the application's canonical root history retains `root`.
 pub fn accepts_root(
     state: &HypergraphState,

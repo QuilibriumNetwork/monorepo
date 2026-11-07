@@ -78,6 +78,61 @@ fn funding_shape(s: &TransferStatement, limits: CompileLimits) -> Result<()> {
     Ok(())
 }
 
+/// A pending claim's branch authority signed it, under the escrow terms the
+/// claim names (the global commit holds them to the stored escrow); a
+/// refund is also held to GLOBAL frame `frame`, the executing frame's
+/// anchor.
+fn claim_authorization(
+    claim: &PendingClaim,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    frame: Option<u64>,
+) -> Result<()> {
+    let s = &claim.statement;
+    pending_claim::check_authorization(
+        claim,
+        network,
+        application,
+        &s.escrow_address,
+        &s.source,
+        &s.policy,
+        frame,
+    )
+}
+
+/// Whether [`verify_for_commit`] refuses pending claim `claim` before its
+/// proof for its authority's signature, at whatever frame executes it: its
+/// authorization check at a frame past any refund deadline, which reads the
+/// signature alone. Whether a refund is due yet is the executing frame's
+/// to judge, and is not read here.
+pub(crate) fn claim_signature_refused(
+    claim: &PendingClaim,
+    network: &[u8; 32],
+    application: &[u8; 32],
+) -> bool {
+    matches!(
+        claim_authorization(claim, network, application, Some(u64::MAX)),
+        Err(QuilError::InvalidArgument(_))
+    )
+}
+
+/// A settlement's terms that [`verify_for_commit`] checks before its proof,
+/// from its bytes alone: its payment coin matches its payment, and a
+/// pre-funded claimant's key is post-quantum.
+pub(crate) fn settlement_terms(tx: &Settlement) -> Result<()> {
+    tx.statement
+        .check_payment()
+        .map_err(|_| invalid("payment coin does not match the payment"))?;
+    if let Some(claimant) = &tx.statement.claimant {
+        if !super::signature::is_post_quantum_authority(claimant.key_type) {
+            return Err(invalid(
+                "settlement claimant keys must be post-quantum (Falcon-512)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn verify_for_commit(
     state: &HypergraphState,
@@ -141,15 +196,7 @@ pub fn verify_for_commit(
             // The branch's authority signs the claim. A refund is also held to
             // this frame's anchor here (the commit re-checks it at its own,
             // later frame), so an early refund is not relayed at all.
-            pending_claim::check_authorization(
-                &claim,
-                network,
-                application,
-                &s.escrow_address,
-                &s.source,
-                &s.policy,
-                context.finalized_global_frame,
-            )?;
+            claim_authorization(&claim, network, application, context.finalized_global_frame)?;
             let claim_limits = CompileLimits {
                 max_inputs: 1,
                 max_outputs: limits.max_outputs,
@@ -224,16 +271,7 @@ pub fn verify_for_commit(
                 return Err(invalid("settlements spend QUIL"));
             }
             let tx = Settlement::decode(bytes, network, application).map_err(decode)?;
-            tx.statement
-                .check_payment()
-                .map_err(|_| invalid("payment coin does not match the payment"))?;
-            if let Some(claimant) = &tx.statement.claimant {
-                if !super::signature::is_post_quantum_authority(claimant.key_type) {
-                    return Err(invalid(
-                        "settlement claimant keys must be post-quantum (Falcon-512)",
-                    ));
-                }
-            }
+            settlement_terms(&tx)?;
             funding_shape(&tx.statement.funding, limits)?;
             verify_proof(
                 worker,
@@ -270,6 +308,202 @@ mod tests {
     };
     use quil_types::crypto::NoopInclusionProver;
     use std::sync::Arc;
+
+    /// Class guard for execution's refusals before the proof: every check
+    /// [`verify_for_commit`] makes ahead of a proof (each literal refusal
+    /// and each call whose error `?` returns) is classed here: read ahead by
+    /// `ExecutionEngineManager::execution_standing` through the same routine
+    /// (so arrival, the proposal filter and every pre-verification refuse
+    /// it before any proof work), made by dispatch's preflight first, or
+    /// not readable ahead, with why. A new check fails this test until it is
+    /// classed, and a check classed as read ahead must be called there.
+    #[test]
+    fn every_refusal_before_the_proof_is_read_ahead_or_classed() {
+        use crate::token_intrinsic::global_commit::{
+            guard_body, guard_fallible_calls, guard_source,
+        };
+        // (check, the call execution_standing reads it by, or why none).
+        const CLASSED: [(&str, std::result::Result<&str, &str>); 17] = [
+            (
+                "invalid operation encoding or context",
+                Err("preflight decodes it first"),
+            ),
+            ("Transfer::decode", Err("preflight decodes it first")),
+            ("PendingCreate::decode", Err("preflight decodes it first")),
+            ("PendingClaim::decode", Err("preflight decodes it first")),
+            ("AnyShield::decode", Err("preflight decodes it first")),
+            ("Settlement::decode", Err("preflight decodes it first")),
+            (
+                "funding_shape",
+                Err("preflight's dimensions; decoding refuses no, duplicate or too many images"),
+            ),
+            (
+                "split_outputs",
+                Err("decoding refuses a spend without outputs"),
+            ),
+            (
+                "missing escrow output",
+                Err("decoding refuses a spend without outputs"),
+            ),
+            ("too many outputs", Err("preflight's dimensions")),
+            (
+                "settlements spend QUIL",
+                Err("preflight's application check"),
+            ),
+            (
+                "claim_authorization",
+                Ok("commit_verify::claim_signature_refused("),
+            ),
+            ("shield::check_sources", Ok("shield::source_standing(")),
+            (
+                "shield::check_authorization",
+                Ok("shield::source_standing("),
+            ),
+            ("settlement_terms", Ok("commit_verify::settlement_terms(")),
+            (
+                "invalid or oversized relation",
+                Err("the relation its proof is verified against: proof work"),
+            ),
+            (
+                "operation does not commit through the global frame",
+                Err("dispatch_for_commit routes only what commits globally here"),
+            ),
+        ];
+        let source = guard_source(include_str!("commit_verify.rs"));
+        let manager = include_str!("../manager.rs");
+        let standing = {
+            let start = manager
+                .find("fn execution_standing(")
+                .expect("execution_standing");
+            let end = start + manager[start..].find("fn proof_refused(").expect("its end");
+            &manager[start..end]
+        };
+        // The checks of verify_for_commit's body in `source` no entry classes.
+        let unclassed = |source: &str| -> Vec<String> {
+            let body = guard_body(source, "pub fn verify_for_commit");
+            let mut checks: Vec<String> = body
+                .match_indices("invalid(\"")
+                .map(|(at, call)| {
+                    let rest = &body[at + call.len()..];
+                    rest[..rest.find('"').expect("end of the literal")].to_string()
+                })
+                .collect();
+            checks.extend(guard_fallible_calls(body));
+            checks.retain(|check| !CLASSED.iter().any(|(classed, _)| classed == check));
+            checks
+        };
+        let unread = unclassed(&source);
+        assert!(
+            unread.is_empty(),
+            "verify_for_commit refuses before the proof for {unread:?}: read it ahead in \
+             ExecutionEngineManager::execution_standing through the same routine, or class it \
+             here with why it cannot be"
+        );
+        let body = guard_body(&source, "pub fn verify_for_commit");
+        for (check, read) in CLASSED {
+            assert!(
+                body.contains(check),
+                "{check:?} is no longer a check of verify_for_commit: drop it here"
+            );
+            if let Ok(call) = read {
+                assert!(
+                    standing.contains(call),
+                    "{check:?} is classed as read ahead by {call:?}, which execution_standing \
+                     does not call"
+                );
+            }
+        }
+        // The guard catches a check added ahead of a proof.
+        let planted = source.replacen(
+            "            settlement_terms(&tx)?;\n",
+            "            settlement_terms(&tx)?;\nplanted_check(&tx)?;\n\
+             return Err(invalid(\"planted refusal\"));\n",
+            1,
+        );
+        assert_eq!(
+            unclassed(&planted),
+            ["planted refusal", "planted_check"],
+            "the guard missed a planted check"
+        );
+    }
+
+    /// A claim's authority signature is judged ahead of the proof at any
+    /// frame: one its branch's authority signed stands, before its refund
+    /// deadline too (the executing frame judges that), and one signed by
+    /// another key or not at all is refused.
+    #[test]
+    fn a_claims_signature_is_judged_ahead_and_its_refund_deadline_is_not() {
+        use quil_lattice_ct::confidential::{
+            pending_claim::{ClaimBranch, EscrowPolicy, PendingClaimStatement},
+            transfer::{Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        use quil_types::crypto::Signer;
+        let (recipient, refunder) = (
+            quil_crypto::FalconSigner::generate(),
+            quil_crypto::FalconSigner::generate(),
+        );
+        let (network, application) = ([91; 32], crate::domains::QUIL_TOKEN);
+        let domain = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&domain);
+        let opening = AmountOpening::from_seed(&domain, &[92; 32]);
+        let claim = |branch: ClaimBranch, signer: Option<&quil_crypto::FalconSigner>| {
+            let statement = PendingClaimStatement {
+                network,
+                application,
+                escrow_address: [93; 32],
+                source: key.commit(17, &opening),
+                policy: EscrowPolicy {
+                    recipient: recipient.public_key().try_into().unwrap(),
+                    refund: refunder.public_key().try_into().unwrap(),
+                    refund_after_global_frame: 100,
+                },
+                branch,
+                fee: 2,
+                outputs: vec![Output {
+                    commitment: key.commit(15, &opening),
+                    owner: [94;
+                        quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES],
+                    memo: [95; MEMO_BYTES],
+                }],
+            };
+            let signature = signer.map_or([0; 666], |signer| {
+                signer
+                    .sign_with_domain(&statement.context_bytes().unwrap(), &domain)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            });
+            PendingClaim {
+                statement,
+                signature,
+                proof: Vec::new(),
+            }
+        };
+        let refused = |claim: &PendingClaim| claim_signature_refused(claim, &network, &application);
+        let early_refund = claim(ClaimBranch::Refund, Some(&refunder));
+        assert!(
+            !refused(&claim(ClaimBranch::Recipient, Some(&recipient))) && !refused(&early_refund),
+            "a claim its authority signed was refused ahead, a refund before its deadline too"
+        );
+        assert!(
+            claim_authorization(&early_refund, &network, &application, Some(99)).is_err(),
+            "execution refuses the refund before its deadline"
+        );
+        for (name, forged) in [
+            ("unsigned", claim(ClaimBranch::Recipient, None)),
+            (
+                "another key",
+                claim(ClaimBranch::Recipient, Some(&refunder)),
+            ),
+            (
+                "a refund signed by the recipient",
+                claim(ClaimBranch::Refund, Some(&recipient)),
+            ),
+        ] {
+            assert!(refused(&forged), "{name}: not refused ahead");
+        }
+    }
 
     fn disk_state(path: &std::path::Path) -> HypergraphState {
         let db = quil_store::RocksDb::open(path).unwrap();

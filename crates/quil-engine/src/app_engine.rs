@@ -1658,21 +1658,78 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Every shard of the application collects every submission but a shield
         // of another shard, and any one of them may execute it. Once the global
         // commit has decided a bundle, whichever shard relayed it, it is done: drop it from the
-        // mempool instead of verifying its proofs again.
+        // mempool instead of verifying its proofs again. So is one it can only
+        // reject (`ExecutionEngineManager::commit_outlook`). One naming a root,
+        // escrow, source or policy this node does not hold yet is not proposed
+        // now, nor dropped: a later turn proposes it once this node holds it,
+        // or it ages out of this pool; other members holding it propose it.
+        // One whose proof failed to verify here
+        // (`ExecutionEngineManager::proofs_rejected`) can never execute, on
+        // any node of this network's policy: it leaves the pool for good, as
+        // one execution skipped (`mark_skipped`: no claim of it is kept),
+        // instead of being proposed again for every archive to verify.
         if let Some(manager) = self.execution_engine.as_ref() {
+            use quil_execution::manager::CommitOutlook;
             let global = self
                 .storage_source_hypergraph
                 .clone()
                 .unwrap_or_else(|| manager.crdt());
-            let done: Vec<bool> = canonical_requests
+            let outlooks: Vec<CommitOutlook> = canonical_requests
                 .iter()
-                .map(|canon| {
-                    quil_execution::ExecutionEngineManager::decided_globally(
-                        global.clone(),
-                        &self.app_address,
-                        canon,
-                    )
+                .map(|canon| manager.commit_outlook(&global, &self.app_address, canon))
+                .collect();
+            let pending = outlooks
+                .iter()
+                .filter(|outlook| **outlook == CommitOutlook::Pending)
+                .count();
+            if pending > 0 && pending_note_due(&self.filter, std::time::Instant::now()) {
+                info!(
+                    frame = frame_number,
+                    rank,
+                    held = pending,
+                    scope = "this node's GLOBAL view and store",
+                    action = "an expected wait: proposed once this node holds what they name; \
+                              ones it never holds age out of the pool",
+                    "holding bundles naming a root, escrow, legacy source or mint policy this node \
+                     does not hold yet: not verified or proposed until it does"
+                );
+            }
+            let failures = manager.proof_failures(&self.app_address);
+            // Each bundle with the statements of its own shields whose proof
+            // failed: only those mark a statement it held a coin under.
+            let failed_of: Vec<Option<Vec<[u8; 32]>>> = canonical_requests
+                .iter()
+                .zip(&outlooks)
+                .map(|(canon, outlook)| {
+                    failures
+                        .as_ref()
+                        .filter(|_| *outlook != CommitOutlook::Settled)
+                        .and_then(|failures| failures.of(canon))
                 })
+                .collect();
+            let refuted: Vec<bool> = failed_of.iter().map(Option::is_some).collect();
+            let failed: Vec<(Vec<u8>, Vec<[u8; 32]>)> = failed_of
+                .into_iter()
+                .zip(&origins)
+                .filter_map(|(failed, origin)| {
+                    failed.map(|statements| (raw_messages[*origin].clone(), statements))
+                })
+                .collect();
+            if !failed.is_empty() {
+                info!(
+                    frame = frame_number,
+                    rank,
+                    dropped = failed.len(),
+                    scope = "a wallet or peer",
+                    action = "none here: their submitter sent proofs that do not verify",
+                    "dropping bundles whose proofs failed to verify on this node: no frame can \
+                     execute them"
+                );
+                self.mempool.mark_proofs_rejected(&failed);
+            }
+            let done: Vec<bool> = outlooks
+                .iter()
+                .map(|outlook| *outlook == CommitOutlook::Settled)
                 .collect();
             let finished: Vec<Vec<u8>> = done
                 .iter()
@@ -1685,10 +1742,16 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     frame = frame_number,
                     rank,
                     dropped = finished.len(),
-                    "dropping bundles the global commit already decided"
+                    "dropping bundles the global commit already decided or can only reject"
                 );
                 self.mempool.mark_finalized(&finished);
-                let keep: Vec<bool> = done.iter().map(|done| !done).collect();
+            }
+            if !finished.is_empty() || pending > 0 || !failed.is_empty() {
+                let keep: Vec<bool> = outlooks
+                    .iter()
+                    .zip(&refuted)
+                    .map(|(outlook, refuted)| *outlook == CommitOutlook::Open && !refuted)
+                    .collect();
                 retain_kept(
                     &keep,
                     &mut request_bundles,
@@ -2904,6 +2967,11 @@ pub struct AppConsensusEngine {
     shields_elsewhere: ShieldsElsewhere,
     /// Submissions refused because no frame could execute them.
     malformed_arrivals: MalformedArrivals,
+    /// Submissions refused because GLOBAL decided them or can only reject them.
+    settled_arrivals: SettledArrivals,
+    /// Submissions collected unverified because they name what this node
+    /// does not hold yet.
+    pending_arrivals: PendingArrivals,
     shard_frame_number: u64,
 
     // Message queues
@@ -3246,6 +3314,20 @@ impl AppConsensusEngine {
             }
         }
 
+        // A held shield whose proofs failed to verify here gives up the coin
+        // it claims in this shard's mempool: it can never execute, and a copy
+        // of an earlier shield its owner signed would otherwise keep the
+        // owner's new one out (`message_collector::ShieldClaims`).
+        if let Some(manager) = deps.execution_engine.clone() {
+            let application = app_address.clone();
+            deps.message_collector
+                .set_rejected_proofs(Arc::new(move || {
+                    let failures = manager.proof_failures(&application)?;
+                    Some(Box::new(move |data: &[u8]| failures.of(data))
+                        as crate::message_collector::ProofJudge)
+                }));
+        }
+
         let sizes = SharedAppEngineSizes::new();
         let fee_snapshot = Arc::new(std::sync::Mutex::new(None));
         let shard_mat_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3311,6 +3393,8 @@ impl AppConsensusEngine {
             routing_seen: Default::default(),
             shields_elsewhere: ShieldsElsewhere::default(),
             malformed_arrivals: MalformedArrivals::default(),
+            settled_arrivals: SettledArrivals::default(),
+            pending_arrivals: PendingArrivals::default(),
             shard_frame_number: 0,
             _pending_messages: VecDeque::with_capacity(MAX_APP_MESSAGES_PER_RANK),
             proposal_cache: HashMap::new(),
@@ -12044,6 +12128,9 @@ impl AppConsensusEngine {
     fn report_arrivals_left(&mut self) {
         self.shields_elsewhere.report(&self.filter);
         self.malformed_arrivals.report(&self.filter);
+        self.settled_arrivals.report(&self.filter);
+        self.pending_arrivals.report(&self.filter);
+        self.message_collector.report_refused_shields();
     }
 
     /// Add an application message to this shard's mempool for inclusion in
@@ -12082,6 +12169,29 @@ impl AppConsensusEngine {
         {
             self.malformed_arrivals.note(&self.filter, data.len());
             return;
+        }
+        // One the global commit decided, or one it can only reject (a coin
+        // shielded, a key image spent, an escrow claimed; a shield of a coin
+        // its key does not own or did not sign for, which execution refuses),
+        // can never take effect, and the commit credits no fee for it.
+        // Collected, it would be verified here on arrival and by every
+        // archive once a frame carried it, while GLOBAL waits on them. One
+        // naming what this node does not hold yet is collected but not
+        // verified on arrival (`verify_on_arrival`) or proposed until it does.
+        if let Some(exec) = self.execution_engine.as_ref().filter(|_| operations > 0) {
+            use quil_execution::manager::CommitOutlook;
+            let global = self
+                .storage_source_hypergraph
+                .clone()
+                .unwrap_or_else(|| exec.crdt());
+            match exec.commit_outlook(&global, &self.app_address, &data) {
+                CommitOutlook::Settled => {
+                    self.settled_arrivals.note(&self.filter, data.len());
+                    return;
+                }
+                CommitOutlook::Pending => self.pending_arrivals.note(&self.filter, data.len()),
+                CommitOutlook::Open => {}
+            }
         }
         let now = std::time::Instant::now();
         let collected = self.message_collector.add_message_newest(data.clone());
@@ -14700,6 +14810,122 @@ impl MalformedArrivals {
         );
         self.submissions = 0;
         self.bytes = 0;
+    }
+}
+
+/// Submissions this shard refused on arrival since its last line because the
+/// global commit decided them or can only reject them.
+#[derive(Default)]
+struct SettledArrivals {
+    submissions: u64,
+    bytes: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl SettledArrivals {
+    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
+    fn note(&mut self, filter: &[u8], bytes: usize) {
+        self.submissions += 1;
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.submissions == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < SHIELDS_ELSEWHERE_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        info!(
+            filter = %hex::encode(filter),
+            submissions = self.submissions,
+            bytes = self.bytes,
+            scope = "a peer or wallet",
+            action = "none here: a wallet seeing this for its own submission resent one \
+                      already decided, or spends a coin or key image already spent",
+            "submissions GLOBAL already decided or can only reject refused on arrival since \
+             the last line"
+        );
+        self.submissions = 0;
+        self.bytes = 0;
+    }
+}
+
+/// Submissions this shard collected unverified since its last line because
+/// they name a root, escrow, legacy source or mint policy this node does not
+/// hold yet.
+#[derive(Default)]
+struct PendingArrivals {
+    submissions: u64,
+    bytes: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl PendingArrivals {
+    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
+    fn note(&mut self, filter: &[u8], bytes: usize) {
+        self.submissions += 1;
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.submissions == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < SHIELDS_ELSEWHERE_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        info!(
+            filter = %hex::encode(filter),
+            submissions = self.submissions,
+            bytes = self.bytes,
+            scope = "this node's GLOBAL view and store",
+            action = "an expected wait while this node catches up: they are verified and \
+                      proposed once it holds what they name, and age out of the pool if it \
+                      never does (a root or escrow GLOBAL never published, a source no shard \
+                      holds); persistent counts with a current view point at such submissions",
+            "submissions naming a root, escrow, legacy source or mint policy this node does not \
+             hold yet collected unverified since the last line"
+        );
+        self.submissions = 0;
+        self.bytes = 0;
+    }
+}
+
+/// Whether the line on bundles a proposal holds for this node's view is due
+/// for shard `filter`: at most one a minute.
+fn pending_note_due(filter: &[u8], now: std::time::Instant) -> bool {
+    static NOTES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    notes.retain(|_, at| now.saturating_duration_since(*at) < std::time::Duration::from_secs(3600));
+    match notes.get(filter) {
+        Some(at) if now.saturating_duration_since(*at) < std::time::Duration::from_secs(60) => {
+            false
+        }
+        _ => {
+            notes.insert(filter.to_vec(), now);
+            true
+        }
     }
 }
 

@@ -7,7 +7,7 @@
 //! the global commit.
 use super::{
     custom_mint, escrow,
-    global_commit::{self, EscrowClaim, EscrowCreate, SpendEntry},
+    global_commit::{self, CommitNeeds, EscrowClaim, EscrowCreate, SpendEntry},
     roots, settlement_record, spent, spent_check,
     state::coin_identity,
 };
@@ -22,7 +22,7 @@ use quil_lattice_ct::confidential::{
     custom_mint::CustomMint,
     mint::Mint,
     mint_claim::MintClaim,
-    pending_claim::{ClaimBranch, PendingClaim},
+    pending_claim::{ClaimBranch, PendingClaim, PendingClaimStatement},
     pending_create::PendingCreate,
     relation::membership::IDENTITY_BYTES,
     settlement::Settlement,
@@ -89,14 +89,49 @@ fn funding(entry: &mut SpendEntry, s: &TransferStatement, outputs: &[Output]) ->
     {
         return Err(invalid("invalid image set"));
     }
-    entry.root_digest = Some(roots::root_digest(&entry.context, s.depth, &s.root));
-    entry.consumptions = s
-        .images
-        .iter()
-        .map(|image| spent::marker_address(&s.network, &s.application, image))
-        .collect::<Result<_>>()?;
+    entry.root_digest = Some(funding_root(&entry.context, s));
+    entry.consumptions = image_markers(s)?;
     entry.outputs = output_addresses(&entry.context, entry.source_frame, outputs)?;
     Ok(())
+}
+
+/// The root a spend of existing coins proves its coins against.
+fn funding_root(context: &[u8; 32], s: &TransferStatement) -> [u8; 32] {
+    roots::root_digest(context, s.depth, &s.root)
+}
+
+/// The escrow a pending claim closes, as the global commit matches it.
+fn escrow_claim(context: &[u8; 32], s: &PendingClaimStatement) -> EscrowClaim {
+    EscrowClaim {
+        address: s.escrow_address,
+        binding: global_commit::escrow_binding(
+            context,
+            &s.escrow_address,
+            &s.source.to_bytes(),
+            &s.policy.recipient,
+            &s.policy.refund,
+            s.policy.refund_after_global_frame,
+        ),
+        refund: s.branch == ClaimBranch::Refund,
+    }
+}
+
+/// The markers a spend of existing coins consumes: one per key image.
+fn image_markers(s: &TransferStatement) -> Result<Vec<[u8; 32]>> {
+    s.images
+        .iter()
+        .map(|image| spent::marker_address(&s.network, &s.application, image))
+        .collect()
+}
+
+/// The markers a shield consumes: one per legacy source, so a batch commits
+/// all of them or none.
+fn shield_markers(shield: &AnyShield) -> Result<Vec<[u8; 32]>> {
+    shield
+        .sources()
+        .iter()
+        .map(|source| spent_check::key_image_spent_address(&source.address))
+        .collect()
 }
 
 /// The outputs a relayed operation creates, in the order its spend entry lists
@@ -289,29 +324,14 @@ pub fn spend_entry(
             let tx = PendingClaim::decode(bytes, network, application).map_err(decode)?;
             let s = &tx.statement;
             entry.outputs = output_addresses(&context, frame, &s.outputs)?;
-            entry.escrow_claim = Some(EscrowClaim {
-                address: s.escrow_address,
-                binding: global_commit::escrow_binding(
-                    &context,
-                    &s.escrow_address,
-                    &s.source.to_bytes(),
-                    &s.policy.recipient,
-                    &s.policy.refund,
-                    s.policy.refund_after_global_frame,
-                ),
-                refund: s.branch == ClaimBranch::Refund,
-            });
+            entry.escrow_claim = Some(escrow_claim(&context, s));
             entry.fee = s.fee;
         }
         TYPE_LATTICE_SHIELD => {
             // One consumption marker per legacy source: a batch commits all of
             // them or none.
             let tx = AnyShield::decode(bytes, network, application).map_err(decode)?;
-            entry.consumptions = tx
-                .sources()
-                .iter()
-                .map(|source| spent_check::key_image_spent_address(&source.address))
-                .collect::<Result<Vec<_>>>()?;
+            entry.consumptions = shield_markers(&tx)?;
             entry.outputs = output_addresses(&context, frame, tx.outputs())?;
             entry.fee = tx.fee();
         }
@@ -342,6 +362,85 @@ pub fn spend_entry(
     // executing shard's error, not the global frame's.
     entry.encode()?;
     Ok(entry)
+}
+
+/// The network an operation's bytes name, where every confidential
+/// operation carries it (as [`super::wire::fee`] reads it).
+pub fn operation_network(bytes: &[u8]) -> Option<[u8; 32]> {
+    bytes.get(12..44)?.try_into().ok()
+}
+
+/// What a relayed operation of `application` needs of GLOBAL state to
+/// commit, as its [`spend_entry`] (or, for a custom mint, [`commit_entry`])
+/// states it, read from its bytes against the network they name: decoding
+/// only, no proof and no state. A custom mint's consumptions here are its
+/// receipt alone; its entitlement marker depends on its deployed policy
+/// ([`custom_mint::commit_consumptions`]). Spend entries' frame-dependent
+/// parts (output and escrow addresses) are not needed and not read. `None`
+/// for bytes that do not decode as such an operation.
+pub fn commit_needs(application: &[u8; 32], tp: u32, bytes: &[u8]) -> Option<CommitNeeds> {
+    let network = operation_network(bytes)?;
+    let context = parameter_context(&network, application);
+    let mut needs = CommitNeeds {
+        context,
+        ..Default::default()
+    };
+    let funded = |needs: &mut CommitNeeds, s: &TransferStatement| -> Option<()> {
+        needs.root_digest = Some(funding_root(&needs.context, s));
+        needs.consumptions = image_markers(s).ok()?;
+        Some(())
+    };
+    match tp {
+        TYPE_LATTICE_TRANSACTION => funded(
+            &mut needs,
+            &Transfer::decode(bytes, &network, application)
+                .ok()?
+                .statement,
+        )?,
+        TYPE_LATTICE_PENDING => funded(
+            &mut needs,
+            &PendingCreate::decode(bytes, &network, application)
+                .ok()?
+                .statement
+                .funding,
+        )?,
+        TYPE_LATTICE_SETTLEMENT => funded(
+            &mut needs,
+            &Settlement::decode(bytes, &network, application)
+                .ok()?
+                .statement
+                .funding,
+        )?,
+        TYPE_LATTICE_SHIELD => {
+            needs.consumptions =
+                shield_markers(&AnyShield::decode(bytes, &network, application).ok()?).ok()?
+        }
+        TYPE_LATTICE_MINT_CLAIM => {
+            needs.consumptions = vec![
+                MintClaim::decode(bytes, &network, application)
+                    .ok()?
+                    .receipt,
+            ]
+        }
+        TYPE_LATTICE_PENDING_CLAIM => {
+            needs.escrow_claim = Some(escrow_claim(
+                &context,
+                &PendingClaim::decode(bytes, &network, application)
+                    .ok()?
+                    .statement,
+            ))
+        }
+        TYPE_LATTICE_MINT if application != &domains::QUIL_TOKEN => {
+            needs.consumptions = vec![custom_mint::receipt_address(
+                &CustomMint::decode(bytes, &network, application)
+                    .ok()?
+                    .statement,
+            )
+            .ok()?]
+        }
+        _ => return None,
+    }
+    Some(needs)
 }
 
 #[cfg(test)]
@@ -625,5 +724,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What an operation needs of GLOBAL state, read from its bytes, is what
+    /// its spend entry carries (root, consumptions, escrow claim, context),
+    /// for a transfer, a shield and a pending claim; nothing is read from the
+    /// bytes of another application or type, or bytes that do not decode.
+    #[test]
+    fn commit_needs_are_the_spend_entrys_read_from_the_bytes() {
+        use quil_lattice_ct::confidential::{
+            pending_claim::EscrowPolicy,
+            shield::{Shield, ShieldStatement},
+        };
+        let (network, application) = ([1u8; 32], [2u8; 32]);
+        let context = parameter_context(&network, &application);
+        let transfer = Transfer {
+            statement: TransferStatement {
+                network,
+                application,
+                depth: 32,
+                root: Node::from_bytes(&[3u8; NODE_BYTES]).unwrap(),
+                images: vec![[4; IDENTITY_BYTES], [5; IDENTITY_BYTES]],
+                outputs: vec![output(&context, 6)],
+                fee: 9,
+            },
+            proof: proof(),
+        }
+        .encode()
+        .unwrap();
+        let shield = Shield {
+            statement: ShieldStatement {
+                network,
+                application,
+                transparent_address: [8; 32],
+                owner_public_key: [9; 57],
+                amount: 12,
+                fee: 2,
+                outputs: vec![output(&context, 6)],
+            },
+            signature: [0; 114],
+            proof: proof(),
+        }
+        .encode()
+        .unwrap();
+        let claim = PendingClaim {
+            statement: PendingClaimStatement {
+                network,
+                application,
+                escrow_address: [10; 32],
+                source: CommitmentKey::derive(&context)
+                    .commit(12, &AmountOpening::from_seed(&context, &[11; 32])),
+                policy: EscrowPolicy {
+                    recipient: std::array::from_fn(|i| i as u8),
+                    refund: std::array::from_fn(|i| !(i as u8)),
+                    refund_after_global_frame: 300,
+                },
+                branch: ClaimBranch::Refund,
+                fee: 2,
+                outputs: vec![output(&context, 6)],
+            },
+            signature: std::array::from_fn(|_| 0),
+            proof: proof(),
+        }
+        .encode()
+        .unwrap();
+        for (tp, bytes) in [
+            (TYPE_LATTICE_TRANSACTION, &transfer),
+            (TYPE_LATTICE_SHIELD, &shield),
+            (TYPE_LATTICE_PENDING_CLAIM, &claim),
+        ] {
+            let needs = commit_needs(&application, tp, bytes).expect("decodes");
+            let entry = spend_entry(&network, &application, tp, bytes, 55).unwrap();
+            assert!(
+                !needs.consumptions.is_empty() || needs.escrow_claim.is_some(),
+                "type {tp:#x} read nothing"
+            );
+            assert_eq!(
+                needs,
+                CommitNeeds {
+                    context: entry.context,
+                    root_digest: entry.root_digest,
+                    consumptions: entry.consumptions,
+                    escrow_claim: entry.escrow_claim,
+                },
+                "type {tp:#x}"
+            );
+            assert!(commit_needs(&[7; 32], tp, bytes).is_none());
+            assert!(commit_needs(&application, tp, &bytes[..60]).is_none());
+        }
+        assert!(commit_needs(&application, TYPE_LATTICE_SHIELD, &transfer).is_none());
+        assert!(commit_needs(&application, 0x0513, &transfer).is_none());
     }
 }

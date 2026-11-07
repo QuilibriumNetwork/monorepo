@@ -338,18 +338,24 @@ fn busy_voter() -> BusyVoter {
     }
 }
 
-/// A bundle of one shield of a legacy coin, distinct per `n`, structurally
-/// valid as a replayed one is (it passes dispatch's checks before native
-/// work; authorization and proof are not valid). Its proofs are not known to
-/// verify within the budget on a node that has not measured its size class,
-/// so members verify it in the background.
-fn shield_bundle(n: u32) -> quil_types::proto::global::MessageBundle {
+/// A bundle of one shield of a legacy coin, distinct per `n`, as a replayed
+/// one is: of a coin of its key, written into `voter`'s store, and signed by
+/// that key, so it passes every check before its proof (its proof is not
+/// valid). Its proofs are not known to verify within the budget on a node
+/// that has not measured its size class, so members verify it in the
+/// background.
+fn shield_bundle(voter: &BusyVoter, n: u32) -> quil_types::proto::global::MessageBundle {
+    use quil_execution::{
+        hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        token_intrinsic::{legacy_migration, materialize},
+    };
     use quil_lattice_ct::confidential::{
         relation::membership::IDENTITY_BYTES,
         shield::{Shield, ShieldStatement},
         transfer::{parameter_context, Output, MEMO_BYTES},
         AmountOpening, CommitmentKey,
     };
+    use quil_types::crypto::Signer as _;
     use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
     let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network;
     let application = quil_execution::domains::QUIL_TOKEN;
@@ -358,23 +364,54 @@ fn shield_bundle(n: u32) -> quil_types::proto::global::MessageBundle {
     let opening = AmountOpening::from_seed(&context, &[2; 32]);
     let mut proof = vec![0; 40];
     proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-    let mut transparent_address = [3; 32];
-    transparent_address[..4].copy_from_slice(&n.to_be_bytes());
-    let op = Shield {
-        statement: ShieldStatement {
-            network,
-            application,
-            transparent_address,
-            owner_public_key: [4; 57],
+    let private = [23; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+    let mut salt = [3; 32];
+    salt[..4].copy_from_slice(&n.to_be_bytes());
+    let tree = legacy_migration::create_transparent_coin_tree(
+        &legacy_migration::TransparentCoin {
+            owner_address: quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap(),
             amount: 12,
-            fee: 2,
-            outputs: vec![Output {
-                commitment: key.commit(10, &opening),
-                owner: [5; IDENTITY_BYTES],
-                memo: [6; MEMO_BYTES],
-            }],
         },
-        signature: [0; 114],
+        &legacy_migration::transparent_type_hash(&application).unwrap(),
+        &salt,
+    )
+    .unwrap();
+    let transparent_address = materialize::coin_content_address(&tree).unwrap();
+    let state = HypergraphState::new(voter.manager.crdt());
+    state
+        .set(
+            &application,
+            &transparent_address,
+            &vertex_adds_discriminator().unwrap(),
+            1,
+            quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+    state.commit().unwrap();
+    state.abort();
+    let statement = ShieldStatement {
+        network,
+        application,
+        transparent_address,
+        owner_public_key: public.clone().try_into().unwrap(),
+        amount: 12,
+        fee: 2,
+        outputs: vec![Output {
+            commitment: key.commit(10, &opening),
+            owner: [5; IDENTITY_BYTES],
+            memo: [6; MEMO_BYTES],
+        }],
+    };
+    let signature = quil_crypto::Ed448Signer::from_bytes(&private, &public)
+        .unwrap()
+        .sign(&statement.context_bytes().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let op = Shield {
+        statement,
+        signature,
         proof,
     }
     .encode()
@@ -475,7 +512,7 @@ fn proposal_warm_ups_neither_grow_without_bound_nor_queue_ahead_of_a_finalized_f
     let mut warmed = Vec::new();
     for view in 0..PROPOSALS {
         let requests: Vec<_> = (0..BUNDLES)
-            .map(|i| shield_bundle(view * BUNDLES + i))
+            .map(|i| shield_bundle(&voter, view * BUNDLES + i))
             .collect();
         warmed.extend(
             requests
@@ -491,7 +528,7 @@ fn proposal_warm_ups_neither_grow_without_bound_nor_queue_ahead_of_a_finalized_f
     }
     // The finalized frame's materialization defers on its batch shield
     // (`defer_for_proof_verification`).
-    let honest = canonical(&shield_bundle(u32::MAX));
+    let honest = canonical(&shield_bundle(&voter, u32::MAX));
     assert!(admission_verify::offer_submission(
         queue,
         &voter.manager,
@@ -525,9 +562,9 @@ fn a_finalized_frames_verification_takes_the_slot_background_work_leaves_free() 
     voter._slots[0].unlock().unwrap();
     let queue = AdmissionQueue::new(8, 1 << 20, false);
     let (frame, warm, arrival) = (
-        canonical(&shield_bundle(1)),
-        canonical(&shield_bundle(2)),
-        canonical(&shield_bundle(3)),
+        canonical(&shield_bundle(&voter, 1)),
+        canonical(&shield_bundle(&voter, 2)),
+        canonical(&shield_bundle(&voter, 3)),
     );
     assert!(admission_verify::offer_submission(
         &queue,
@@ -576,7 +613,7 @@ fn a_refused_proposal_warms_up_nothing() {
     use crate::admission_verify;
     let voter = busy_voter();
     let queue = admission_verify::global();
-    let requests: Vec<_> = (0..4).map(shield_bundle).collect();
+    let requests: Vec<_> = (0..4).map(|n| shield_bundle(&voter, n)).collect();
     let digests: Vec<_> = requests
         .iter()
         .map(|bundle| admission_verify::digest(&canonical(bundle)))

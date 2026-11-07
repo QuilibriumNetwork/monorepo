@@ -959,6 +959,8 @@ impl FrameMaterializer {
 
         // Concurrent proof pre-verification for confidential token bundles
         // on the global route; the sequential loop below reuses the verdicts.
+        // What this frame's commit refuses from GLOBAL state alone is left
+        // out: the venue refuses it before the proof.
         {
             let mut routed = Vec::new();
             for bundle in &frame.requests {
@@ -971,7 +973,8 @@ impl FrameMaterializer {
                     routed.push((address, bytes));
                 }
             }
-            self.execution_manager.preverify_bundles(&routed);
+            self.execution_manager
+                .preverify_global_bundles(frame_number, &routed);
         }
         // Where message execution goes when it runs slow: per op kind
         // (messages, validate µs, process µs, slowest µs) and the execution

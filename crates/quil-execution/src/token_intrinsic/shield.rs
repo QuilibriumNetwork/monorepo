@@ -97,8 +97,19 @@ fn check_coin(
     let blob = state
         .get(application, address, &disc)?
         .ok_or_else(|| invalid("source coin not found"))?;
+    check_coin_blob(&blob, application, address, expected_amount, owners)
+}
+
+/// [`check_coin`] of the coin's stored `blob`.
+fn check_coin_blob(
+    blob: &[u8],
+    application: &[u8; 32],
+    address: &[u8; 32],
+    expected_amount: u128,
+    owners: &[[u8; 32]; 2],
+) -> Result<()> {
     let tree = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob).map_err(|_| invalid("invalid source coin"))?,
+        root: quil_tries::deserialize_go_tree(blob).map_err(|_| invalid("invalid source coin"))?,
     };
     let expected_type = legacy_migration::transparent_type_hash(application)?;
     if tree.leaves().len() != 4
@@ -126,6 +137,63 @@ fn check_coin(
         return Err(invalid("source owner mismatch"));
     }
     Ok(())
+}
+
+/// Where a shield stands before its proof, as [`check_sources`] and
+/// [`check_authorization`] find it in `state` under either owner form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceStanding {
+    /// Every source is a coin of the shield's key holding its amount, and
+    /// the key signed the shield.
+    Owned,
+    /// A source `state` holds is not a coin of the shield's key holding its
+    /// amount, under either owner form. Legacy coins never change: it never
+    /// will be.
+    Unowned,
+    /// The key did not sign the shield's statement.
+    Unsigned,
+    /// Every source `state` holds is the key's, which signed the shield, but
+    /// `state` does not hold one of them: a shard that is not the source's,
+    /// or a store still syncing it.
+    Missing,
+}
+
+/// Where `shield` of `application` stands in `state` (a store holding the
+/// shard of its sources) before any proof work: what execution refuses
+/// before verifying its proof ([`check_sources`], [`check_authorization`]),
+/// judged under both owner forms so it never refuses what either accepts,
+/// and whatever the batch shield frame. `None` when `state` cannot be read.
+pub(crate) fn source_standing(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    shield: &AnyShield,
+) -> Option<SourceStanding> {
+    let disc = vertex_adds_discriminator().ok()?;
+    let forms = [
+        owner_addresses(shield.owner_public_key(), false).ok()?,
+        owner_addresses(shield.owner_public_key(), true).ok()?,
+    ];
+    let mut missing = false;
+    for source in shield.sources() {
+        let Some(blob) = state.get(application, &source.address, &disc).ok()? else {
+            missing = true;
+            continue;
+        };
+        let owned = forms.iter().any(|owners| {
+            check_coin_blob(&blob, application, &source.address, source.amount, owners).is_ok()
+        });
+        if !owned {
+            return Some(SourceStanding::Unowned);
+        }
+    }
+    if check_authorization(shield).is_err() {
+        return Some(SourceStanding::Unsigned);
+    }
+    Some(if missing {
+        SourceStanding::Missing
+    } else {
+        SourceStanding::Owned
+    })
 }
 
 /// The legacy owner signed the shield's statement bytes, which bind every
