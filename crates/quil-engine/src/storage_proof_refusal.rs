@@ -5,8 +5,10 @@
 //! and cut short, and so cannot say whose proof it was, which epoch, or
 //! whether it came late or was a copy of one already applied
 //! (`storage_epoch_proof::REFUSED_LATE`, `REFUSED_DUPLICATE`). One info line
-//! per proof, at most [`LINES_PER_FRAME`] a frame. Logging only: which
-//! proofs are accepted does not change.
+//! per proof, at most [`LINES_PER_FRAME`] a frame. A proof that does not
+//! parse (a malformed binding, say) is named by the member bytes it starts
+//! with, its seats unlisted. Logging only: which proofs are accepted does
+//! not change.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -36,7 +38,7 @@ pub(crate) struct Refused {
     /// Each seat: shard filter, the epoch it settles and the one it seals.
     pub(crate) seats: String,
     pub(crate) more_seats: usize,
-    /// `duplicate`, `deadline_miss` or `other`.
+    /// `duplicate`, `deadline_miss`, `malformed` or `other`.
     pub(crate) kind: &'static str,
     pub(crate) reason: String,
 }
@@ -63,7 +65,12 @@ impl RefusalLog {
         let mut out = Vec::new();
         let mut unlisted = false;
         for inner in storage_proofs(raw) {
-            let Ok(proof) = StorageEpochProof::from_canonical_bytes(&inner) else {
+            let proof = StorageEpochProof::from_canonical_bytes(&inner).ok();
+            let Some(member) = proof
+                .as_ref()
+                .map(|proof| proof.member)
+                .or_else(|| unparsed_member(&inner))
+            else {
                 continue;
             };
             let hash: [u8; 32] = Sha256::digest(&inner).into();
@@ -80,10 +87,28 @@ impl RefusalLog {
             }
             self.named.insert(hash);
             self.lines += 1;
-            out.push(describe(&proof, reason));
+            out.push(match &proof {
+                Some(proof) => describe(proof, reason),
+                None => Refused {
+                    prover: hex::encode(&member[..8]),
+                    seats: "unparsed".into(),
+                    more_seats: 0,
+                    kind: "malformed",
+                    reason: reason.chars().take(REASON_CHARS).collect(),
+                },
+            });
         }
         (out, unlisted)
     }
+}
+
+/// The member a storage epoch proof that does not parse names in its first
+/// bytes, as the wire format places it.
+fn unparsed_member(inner: &[u8]) -> Option<[u8; 32]> {
+    if inner.get(4..8)? != 32u32.to_be_bytes() {
+        return None;
+    }
+    inner.get(8..40)?.try_into().ok()
 }
 
 /// The inner bytes of each storage epoch proof `raw` carries.
@@ -163,8 +188,9 @@ pub(crate) fn note(frame: u64, raw: &[u8], reason: &str) {
             "storage epoch proof refused: GLOBAL drops the whole proof, so this prover loses each \
              settlement and seal in it that GLOBAL has not applied, unless it sends another in time; \
              duplicate: a part GLOBAL already applied; deadline_miss: a part sent after the frame it \
-             had to land by, the prover's node is late (its operator's logs say why); other: see \
-             reason (reported once a proof)"
+             had to land by, the prover's node is late (its operator's logs say why); malformed: \
+             the proof does not parse, so its seats are not listed, the prover's build encodes it \
+             otherwise; other: see reason (reported once a proof)"
         );
     }
     if unlisted {
@@ -237,6 +263,27 @@ mod tests {
         let (named, _) = log.refused(988_594, &proof(0x5D, 10), &copy);
         assert_eq!(named[0].kind, "duplicate", "a bare proof, a late copy");
         assert!(log.refused(988_594, b"not a proof", "x").0.is_empty());
+
+        // A proof that does not parse is named by its member bytes, once.
+        let mut cut = proof(0x5E, 10);
+        cut.pop();
+        let malformed = "StorageEpochProof: a malformed binding";
+        let (named, _) = log.refused(988_594, &bundle(cut.clone()), malformed);
+        assert_eq!(
+            named,
+            vec![Refused {
+                prover: "5e5e5e5e5e5e5e5e".into(),
+                seats: "unparsed".into(),
+                more_seats: 0,
+                kind: "malformed",
+                reason: malformed.into(),
+            }]
+        );
+        assert!(log.refused(988_595, &cut, malformed).0.is_empty());
+        assert!(
+            log.refused(988_595, &cut[..20], "x").0.is_empty(),
+            "too short to name a member"
+        );
 
         // At most a frame's budget of lines; the rest wait for a later one.
         let mut log = RefusalLog::default();
