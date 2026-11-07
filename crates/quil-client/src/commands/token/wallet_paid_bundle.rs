@@ -223,7 +223,10 @@ pub(super) async fn submit_paid(
     save: bool,
 ) -> anyhow::Result<Option<Submitted>> {
     let application = wallet.application;
-    submit_paid_with(
+    // Boxed: the payment and its claim make this future about 57 KB in a
+    // debug build, and every wallet operation off QUIL awaits it, so inline
+    // it outgrew the 2 MiB test-thread stack of callers that never reach it.
+    Box::pin(submit_paid_with(
         tc,
         wallet,
         bytes,
@@ -244,7 +247,7 @@ pub(super) async fn submit_paid(
             )
             .await
         },
-    )
+    ))
     .await
 }
 
