@@ -114,6 +114,21 @@ impl Sector {
         }
         Ok(out)
     }
+    /// Whether the last layer on disk commits to the certificate.
+    fn last_matches(&self) -> bool {
+        #[cfg(test)]
+        tests::count_last_check(&self.dir);
+        self.last().is_ok_and(|last| {
+            let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(self.cert.n));
+            cap.commitment(Tree::Replica) == self.cert.labels
+        })
+    }
+    /// Whether a repair found the sector's labels, made again, to differ
+    /// from its certificate: it is not labelled again, and no leaf is
+    /// reserved in it, until its certificate is set up anew.
+    fn given_up(&self) -> bool {
+        fs::read(self.dir.join("repair-failed")).is_ok_and(|bytes| bytes == self.cert.to_bytes())
+    }
 }
 
 fn reserve(
@@ -182,7 +197,7 @@ fn try_reserve(
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
     if let Some(id) = mapped {
         let dir = root.join(hex::encode(id));
-        if Sector::load(dir.clone())?.is_none() {
+        if matches!(Sector::load(dir.clone()), Ok(None)) {
             if let Ok(bytes) = fs::read(dir.join("reservation")) {
                 if (bytes.len() == 48 || bytes.len() == 52) && bytes[16..48] == leaf_hash {
                     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
@@ -199,8 +214,11 @@ fn try_reserve(
         if !sector_directory(&entry.path()) {
             continue;
         }
-        if let Some(sector) = Sector::load(entry.path())? {
-            if sector.cert.n >= exact {
+        // A sector that cannot be read is skipped here: the certificate
+        // poll reports it, and it holds back no other leaf. A sector given
+        // up is skipped too: its leaves go to another.
+        if let Ok(Some(sector)) = Sector::load(entry.path()) {
+            if sector.cert.n >= exact && !sector.given_up() {
                 candidates.push(sector);
             }
         }
@@ -248,7 +266,7 @@ fn try_reserve(
         if !sector_directory(&entry.path()) {
             continue;
         }
-        if !Sector::load(entry.path())?.is_some_and(|s| s.certified) {
+        if Sector::load(entry.path()).is_ok_and(|s| !s.is_some_and(|s| s.certified)) {
             pending_count += 1;
         }
     }
@@ -345,12 +363,26 @@ fn initialize_with_progress(
             return Ok(sector.clone());
         }
     }
-    let (last, columns) = match store.find(epoch, member, &id, |count| count == n) {
-        Some(kept) => (
-            kept.last_layer()
-                .ok_or_else(|| unavailable("sector labels unreadable".into()))?,
-            kept.comm_c,
-        ),
+    // Kept labels that are not whole are labelled again rather than set up
+    // from: a certificate committing to them could never be proven.
+    let kept = store
+        .find(epoch, member, &id, |count| count == n)
+        .and_then(|kept| match kept.wholly_verified_last_layer() {
+            Some(last) => Some((last, kept.comm_c)),
+            None => {
+                warn!(epoch, sector = %hex::encode(id), nodes = n, scope = "local",
+                    action = "check this node's disk and its kernel log for I/O errors if \
+                              this recurs",
+                    "storage labels kept for a sector do not match their column commitment, \
+                     as a torn or damaged file on this node's disk leaves them; they are \
+                     removed and the sector is labelled again before its certificate");
+                drop(kept);
+                store.discard_damaged(epoch, member, &id, n);
+                None
+            }
+        });
+    let (last, columns) = match kept {
+        Some(pair) => pair,
         None => {
             let admitted = store
                 .admit(epoch, member, &id, n, Stage::Snapshot)
@@ -373,16 +405,32 @@ fn initialize_with_progress(
         columns,
         labels: cap.commitment(Tree::Replica),
     };
-    if previous.as_ref().is_some_and(|old| old.cert != cert) {
-        return Err(unavailable(
-            "regenerated sector differs from committed labels".into(),
-        ));
+    if let Some(old) = previous.as_ref().filter(|old| old.cert != cert) {
+        if old.certified {
+            return Err(unavailable(
+                "regenerated sector differs from committed labels".into(),
+            ));
+        }
+        // Uncertified, its certificate is GLOBAL's only as a pending
+        // precommit: the one its own labels give replaces it, rather than
+        // the sector being labelled again at every poll.
+        warn!(epoch, sector = %hex::encode(id), nodes = n, scope = "local",
+            action = "check this node's disk and its kernel log for I/O errors if this recurs",
+            "an uncertified sector's certificate on disk differs from the one its labels, \
+             made again, give, as labels damaged before it was written leave it; it takes \
+             theirs, and its precommit target and cached proofs are dropped");
+        let _ = fs::remove_file(dir.join("capacity-target"));
+        for entry in fs::read_dir(&dir).map_err(io)?.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("proof-"))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
-    // Up to 2 GiB: paced as the labels are, so the stores' synced commits
-    // never wait behind all of it.
-    let path = dir.join("last.tmp");
-    crate::storage_labels::write_digests_paced(&path, &last).map_err(io)?;
-    fs::rename(&path, dir.join("last")).map_err(io)?;
+    write_last(&dir, &last)?;
     atomic(&dir.join("cap"), &cap.to_bytes())?;
     let sector = Sector {
         dir,
@@ -397,6 +445,208 @@ fn initialize_with_progress(
     };
     sector.save()?;
     Ok(sector)
+}
+
+/// Write a sector's last layer whole, or leave the one there. Up to 2 GiB:
+/// paced as the labels are, so the stores' synced commits never wait behind
+/// all of it, on a repair as at setup.
+fn write_last(dir: &Path, last: &[hash::Digest]) -> Result<()> {
+    let path = dir.join("last.tmp");
+    crate::storage_labels::write_digests_paced(&path, last).map_err(io)?;
+    fs::rename(&path, dir.join("last")).map_err(io)
+}
+
+/// The sectors whose repair is queued or running, by directory: one repair
+/// a sector at most, so a repair running longer than an epoch queues none
+/// behind it.
+static REPAIRING: Mutex<std::collections::BTreeSet<PathBuf>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// A sector's place in [`REPAIRING`], left as its repair ends or is dropped.
+struct Repairing(PathBuf);
+impl Drop for Repairing {
+    fn drop(&mut self) {
+        REPAIRING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Whether a repair of the sector in `dir` is queued now: false when one
+/// is queued or running already.
+fn queue_repair(dir: &Path) -> bool {
+    REPAIRING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(dir.to_owned())
+}
+
+/// Label a certified sector again on its lane, and rewrite its last layer
+/// and cap from the labels when they match its certificate: the labels are
+/// the sector's own, so a last layer damaged on disk is repaired. A sector
+/// queues one repair at most; one whose labels, made again, differ from its
+/// certificate is given up ([`Sector::given_up`]) and never labelled again.
+fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
+    if sector.given_up() || !queue_repair(&sector.dir) {
+        return;
+    }
+    let repairing = Repairing(sector.dir.clone());
+    let store = store.for_profile(sector.cert.profile);
+    let (member, sector) = (member.to_vec(), sector.clone());
+    crate::storage_jobs::spawn(
+        &sector_lane(&member, &sector.cert.sector),
+        "sector repair",
+        move || {
+            let _repairing = repairing;
+            let (id, n) = (sector.cert.sector, sector.cert.n);
+            let order = crate::storage_jobs::AheadOrder {
+                deferrable: false,
+                seat_leaves: 1,
+                seat: crate::storage_jobs::ahead_place(),
+                leaf: 0,
+            };
+            let memory = crate::storage_jobs::reserve_ahead(
+                crate::storage_labels::label_ahead_bytes(n),
+                order,
+                epoch,
+                &crate::storage_jobs::stopping,
+            )
+            .ok_or_else(|| unavailable("sector repair stopped".into()))?;
+            // A last layer made whole since the repair was queued, or a
+            // sector given up, is labelled no more.
+            if sector.given_up() || sector.last_matches() {
+                return Ok(());
+            }
+            let stop = || {
+                memory.wait_while_paused(&crate::storage_jobs::stopping);
+                crate::storage_jobs::stopping() || memory.yield_requested()
+            };
+            let admitted = store
+                .admit(epoch, &member, &id, n, Stage::Snapshot)
+                .ok_or_else(|| unavailable("no disk space to repair a sector".into()))?;
+            let labelled = match admitted.label_kept(store.params(), &stop, &|_| {})? {
+                Labelling::Labelled(labelled) => labelled,
+                _ => return Err(unavailable("sector repair stopped".into())),
+            };
+            store.release_certified_sector(epoch, &member, &id);
+            let cap = MerkleCap::from_digests(&labelled.last, proof::seal_cap_height(n));
+            if cap.commitment(Tree::Replica) != sector.cert.labels
+                || labelled.comm_c != sector.cert.columns
+            {
+                atomic(&sector.dir.join("repair-failed"), &sector.cert.to_bytes())?;
+                warn!(epoch, sector = %hex::encode(id), nodes = n, scope = "local",
+                    action = "check this node's disk and its kernel log for I/O errors",
+                    "a certified sector labelled again does not match its certificate, as a \
+                     damaged certificate file, or labels damaged before it was certified, \
+                     leave it; it is given up: it is not labelled again, its last layer on \
+                     disk is left as it is, and its leaves go to another sector");
+                return Err(unavailable(
+                    "relabelled sector differs from its certificate".into(),
+                ));
+            }
+            write_last(&sector.dir, &labelled.last)?;
+            atomic(&sector.dir.join("cap"), &cap.to_bytes())?;
+            info!(epoch, sector = %hex::encode(id), nodes = n,
+                "a certified sector was labelled again and its last layer rewritten");
+            Ok(())
+        },
+    );
+}
+
+/// After a failed seal: when the sector's last layer on disk is missing or
+/// differs from its certificate, label the sector again, warning once an
+/// epoch. A leaf whose snapshot is unchanged is never encoded again, so a
+/// registered replica's damaged last layer shows only in its seal. The mark
+/// is checked before the layer, which each failing leaf would read again.
+fn repair_if_torn(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
+    let marker = sector.dir.join(format!("repair-{epoch}"));
+    if sector.given_up()
+        || marker.exists()
+        || sector.last_matches()
+        || atomic(&marker, &[]).is_err()
+    {
+        return;
+    }
+    warn!(epoch, sector = %hex::encode(sector.cert.sector), nodes = sector.cert.n,
+        scope = "local", action = "check this node's disk and its kernel log for I/O errors",
+        "a registered sector's last layer on disk is missing or does not match its \
+         certificate, as a damaged or lost file leaves it; its seals fail until it is \
+         labelled again, which starts now");
+    repair_last(store, member, epoch, sector);
+}
+
+/// A registered sector's cap, rewritten from its last layer when the file is
+/// damaged or missing and the layer matches the certificate, as the cap is
+/// made from it; otherwise the layer is repaired as after a failed seal. A
+/// cap that cannot be read fails every seal before one is made.
+fn cap_or_repair(
+    store: &LabelStore,
+    member: &[u8],
+    epoch: u64,
+    sector: &Sector,
+) -> Result<MerkleCap> {
+    let error = match sector.cap() {
+        Ok(cap) => return Ok(cap),
+        Err(error) => error,
+    };
+    if let Ok(last) = sector.last() {
+        let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(sector.cert.n));
+        if cap.commitment(Tree::Replica) == sector.cert.labels {
+            atomic(&sector.dir.join("cap"), &cap.to_bytes())?;
+            warn!(epoch, sector = %hex::encode(sector.cert.sector), nodes = sector.cert.n,
+                scope = "local",
+                action = "check this node's disk and its kernel log for I/O errors",
+                "a registered sector's cap on disk is damaged or missing; it was rewritten \
+                 from the sector's last layer, which matches its certificate");
+            return Ok(cap);
+        }
+    }
+    repair_if_torn(store, member, epoch, sector);
+    Err(error)
+}
+
+/// Whether the files a sector's certificate proof would be made from are
+/// its own: its last layer on disk commits to its certificate, and the
+/// labels kept for it, checked as a snapshot checks them, hold that layer
+/// under its column commitment.
+fn proof_inputs_whole(
+    kept: &crate::storage_labels::Kept,
+    last: &[u8],
+    cert: &sector::Certificate,
+) -> bool {
+    let Some(last) = hash::digests_from_bytes(last) else {
+        return false;
+    };
+    if last.len() as u64 != cert.n {
+        return false;
+    }
+    let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(cert.n));
+    cap.commitment(Tree::Replica) == cert.labels
+        && kept.comm_c == cert.columns
+        && kept.verified_last_layer() == Some(last)
+}
+
+/// Whether a sector's cached certificate proof verifies as GLOBAL verifies
+/// it, before it is sent again.
+fn proof_verifies(
+    member: &[u8; 32],
+    cert: &sector::Certificate,
+    epoch: u64,
+    beacon: &[u8],
+    bytes: &[u8],
+) -> bool {
+    use quil_execution::global_intrinsic::persistent_storage as protocol;
+    let message = protocol::CapacityMessage {
+        member: *member,
+        epoch,
+        certificate: *cert,
+        signed_at: 0,
+        signature: Vec::new(),
+        proof: Vec::new(),
+    };
+    let root = message.root();
+    protocol::verify_certificate(member, &cert.sector, epoch, cert.n, &root, beacon, bytes).is_ok()
 }
 
 pub(super) fn encode_leaf(
@@ -443,7 +693,31 @@ pub(super) fn encode_leaf(
             "snapshot layout metadata differs from data".into(),
         ));
     }
-    let last = sector.last()?;
+    let found = sector.last();
+    // A last layer damaged or lost on disk since its sector was certified
+    // would encode a replica whose proofs can never open it: check it against
+    // the certificate first, as its encoding reads every node anyway.
+    let whole = found.as_ref().is_ok_and(|last| {
+        let cap = MerkleCap::from_digests(last, proof::seal_cap_height(n));
+        cap.commitment(Tree::Replica) == sector.cert.labels
+    });
+    if !whole {
+        // Once an epoch: the sector is labelled again, its labels being its
+        // own, and its last layer rewritten when they match its certificate.
+        let marker = sector.dir.join(format!("repair-{}", captured.epoch));
+        if !marker.exists() && atomic(&marker, &[]).is_ok() {
+            warn!(epoch = captured.epoch, sector = %hex::encode(id), nodes = n, scope = "local",
+                action = "check this node's disk and its kernel log for I/O errors",
+                "a certified sector's last layer on disk is missing or does not match its \
+                 certificate, as a torn, damaged or lost file on this node's disk leaves it; \
+                 the sector is labelled again, and its leaves are encoded once that ends");
+            repair_last(store, member, captured.epoch, &sector);
+        }
+        return Err(unavailable(
+            "sector last layer differs from its certificate; it is labelled again".into(),
+        ));
+    }
+    let last = found?;
     let encoded = proof::encode_with_labels(&data, n, &last, sector.cert.labels)
         .map_err(QuilError::InvalidArgument)?;
     let root = sector::Registration {
@@ -496,7 +770,7 @@ impl Source {
                 "sector differs from registered certificate".into(),
             ));
         }
-        let cap = sector.cap()?;
+        let cap = cap_or_repair(store, member, epoch, &sector)?;
         let data = replicas
             .get_data_cap(epoch, &leaf)?
             .ok_or_else(|| unavailable("persistent data cap is absent".into()))?;
@@ -505,7 +779,14 @@ impl Source {
                 "persistent data cap differs from registration".into(),
             ));
         }
-        let last = Mutex::new(File::open(sector.dir.join("last")).map_err(io)?);
+        // A last layer gone from disk fails every seal: it is labelled again.
+        let last = match File::open(sector.dir.join("last")) {
+            Ok(file) => Mutex::new(file),
+            Err(error) => {
+                repair_if_torn(store, member, epoch, &sector);
+                return Err(io(error));
+            }
+        };
         Ok(Self {
             sector,
             last,
@@ -652,11 +933,16 @@ pub(super) fn prepare(
         let _memory = crate::storage_jobs::reserve(64 << 20);
         let root = sector::Registration::parse(&source.stored.registration_root).unwrap();
         let leaf_claim = captured.claim(prefix, &leaf, member, &beacon, root.data, n)?;
-        let binding = captured.prove_binding_sparse(&leaf_claim, &source)?;
+        let binding = captured
+            .prove_binding_sparse(&leaf_claim, &source)
+            .inspect_err(|_| repair_if_torn(store, member, target, &source.sector))?;
         let seal = sector::prove(member, &leaf, target, n, &root, &beacon, &|tree, index| {
             source.open(tree, index)
         })
-        .map_err(QuilError::InvalidArgument)?;
+        .map_err(|error| {
+            repair_if_torn(store, member, target, &source.sector);
+            QuilError::InvalidArgument(error)
+        })?;
         let leaf = SealedLeaf {
             persistent: Some(root),
             n,
@@ -773,8 +1059,9 @@ const PRECOMMIT_RESEND_FRAMES: u64 = 3;
 const CERTIFICATE_RESEND_FRAMES: u64 = 15;
 const CERTIFICATE_RESEND_MAX_FRAMES: u64 = 120;
 /// How far the frame the sector pool was last polled at may lie ahead of a
-/// poll's frame: an hour at 10 s frames, far more than application engines'
-/// GLOBAL frames differ by. One further ahead is not a poll of this node's.
+/// poll's frame, or of the newest GLOBAL frame this node holds: an hour at
+/// 10 s frames, far more than application engines' GLOBAL frames differ
+/// by. One further ahead is a damaged file, not a poll of this node's.
 const POLL_AHEAD_FRAMES: u64 = 360;
 /// Frames between two capacity traffic summary lines.
 const POLL_SUMMARY_FRAMES: u64 = 60;
@@ -846,13 +1133,16 @@ fn poll_summary(frame: u64) {
 /// Whether the sector pool polls at `frame`, recorded in `path`: once per
 /// new GLOBAL frame. Each application engine polls with the GLOBAL frame it
 /// has seen, and those differ: a poll from a frame at or below the last one
-/// polled would sign and send its sectors' messages again.
-fn poll_due(path: &Path, frame: u64) -> Result<bool> {
+/// polled would sign and send its sectors' messages again. `head` is the
+/// newest GLOBAL frame this node holds: a poll from a frame behind it is
+/// skipped too, as it would retarget sectors to an epoch already past.
+fn poll_due(path: &Path, frame: u64, head: u64) -> Result<bool> {
     let last = fs::read(path)
         .ok()
         .and_then(|b| <[u8; 8]>::try_from(b).ok())
         .map(u64::from_be_bytes);
-    if last.is_some_and(|last| frame <= last && last <= frame.saturating_add(POLL_AHEAD_FRAMES)) {
+    let ahead = frame.max(head).saturating_add(POLL_AHEAD_FRAMES);
+    if last.is_some_and(|last| frame <= last && last <= ahead) {
         return Ok(false);
     }
     atomic(path, &frame.to_be_bytes())?;
@@ -1000,6 +1290,18 @@ fn resume_reserved_sector(
     Ok(())
 }
 
+/// Whether a sector's damaged precommit target is reported now: once an
+/// epoch a sector, as polls from engines whose frames lie far apart may each
+/// find the other's target past their next epoch.
+fn target_warn_due(dir: &Path, epoch: u64) -> bool {
+    static WARNED: Mutex<std::collections::BTreeMap<PathBuf, u64>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.insert(dir.to_owned(), epoch) != Some(epoch)
+}
+
 /// Poll committed GLOBAL records, never execution's speculative overlay.
 /// Proof generation has a separate lane and durable retry files; a restart
 /// neither relabels certified capacity nor changes an accepted precommit.
@@ -1028,20 +1330,27 @@ pub(crate) fn poll_sector_certificates(
     if lock.try_lock().is_err() {
         return Ok(());
     }
-    // All application engines share this pool. Poll it once per GLOBAL frame.
+    // All application engines share this pool. Poll it once per GLOBAL
+    // frame, and never from a frame older than one polled: a materialized
+    // frame behind the head would retarget its sectors and sign precommits
+    // GLOBAL refuses as stale.
     let poll = root.join("last-poll");
-    if !poll_due(&poll, frame)? {
+    let head = anchors
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|latest| latest.header)
+        .map_or(0, |header| header.frame_number);
+    if !poll_due(&poll, frame, head)? {
         return Ok(());
     }
     poll_summary(frame);
     let snapshot = global.capture_committed_snapshot()?;
-    for entry in fs::read_dir(root).map_err(io)?.flatten() {
-        if !sector_directory(&entry.path()) {
-            continue;
-        }
+    // One sector at a time: a sector that cannot be read, or that differs
+    // from GLOBAL, is skipped and never holds back the others.
+    let poll_one = |entry: fs::DirEntry| -> Result<()> {
         let Some(mut sector) = Sector::load(entry.path())? else {
             resume_reserved_sector(store, member, entry.path())?;
-            continue;
+            return Ok(());
         };
         let initialized = fs::read(sector.dir.join("reservation")).map_err(io)?;
         let cache_epoch = u64::from_be_bytes(
@@ -1066,7 +1375,7 @@ pub(crate) fn poll_sector_certificates(
             store
                 .for_profile(sector.cert.profile)
                 .release_certified_sector(cache_epoch, member, &sector.cert.sector);
-            continue;
+            return Ok(());
         }
         // A disk flag is only a hint. Authority always comes from GLOBAL.
         if sector.certified {
@@ -1085,16 +1394,25 @@ pub(crate) fn poll_sector_certificates(
                     "sector certification waits: this member holds its sector cap; a new \
                      seat opens room, and certified sectors keep serving leaves they fit");
             }
-            continue;
+            return Ok(());
         }
         let target_path = sector.dir.join("capacity-target");
         let previous = fs::read(&target_path)
             .ok()
             .and_then(|b| <[u8; 8]>::try_from(b).ok())
             .map(u64::from_be_bytes);
+        // A target is written as the next epoch, or the first, and kept
+        // two epochs past it at most: one past both is damage.
+        let next = first.max(current.saturating_add(1));
+        if previous.is_some_and(|e| e > next) && target_warn_due(&sector.dir, current) {
+            warn!(frame, sector = %hex::encode(sector.cert.sector), stored = ?previous, next,
+                scope = "local", action = "check this node's disk if this recurs",
+                "a sector's precommit target on disk is past the next epoch, as a damaged \
+                 file leaves it; it precommits for the next epoch instead");
+        }
         let target = previous
-            .filter(|e| current <= e.saturating_add(2))
-            .unwrap_or(first.max(current.saturating_add(1)));
+            .filter(|e| current <= e.saturating_add(2) && *e <= next)
+            .unwrap_or(next);
         atomic(&target_path, &target.to_be_bytes())?;
         let pending = protocol::committed_pending(snapshot.as_ref(), member, &sector.cert, target)?;
         let pending = pending.filter(|p| p.epoch == target && p.certificate == sector.cert);
@@ -1102,14 +1420,14 @@ pub(crate) fn poll_sector_certificates(
             if let Some(precommit) = precommit_due(&sector, member, target, frame, signer)? {
                 publish(precommit);
             }
-            continue;
+            return Ok(());
         };
         let beacon_frame = pending.committed_at.saturating_add(1);
         if frame <= beacon_frame {
-            continue;
+            return Ok(());
         }
         let Some(header) = anchors.get_global_clock_frame(beacon_frame)?.header else {
-            continue;
+            return Ok(());
         };
         let beacon = quil_crypto::porep::derive_storage_beacon(beacon_frame, &header.output);
         let proving = OpenOptions::new()
@@ -1120,24 +1438,25 @@ pub(crate) fn poll_sector_certificates(
             .open(sector.dir.join("proving"))
             .map_err(io)?;
         if proving.try_lock().is_err() {
-            continue;
+            return Ok(());
         }
         let cache = sector.dir.join(format!("proof-{target}-{beacon_frame}"));
         // Refresh temporary layers while needed, but a durable proof can be
         // retransmitted after pressure eviction without regenerating them.
+        let kept_epoch = cache_epoch.max(current.saturating_add(1));
         let kept = store.for_profile(sector.cert.profile).find(
-            cache_epoch.max(current.saturating_add(1)),
+            kept_epoch,
             member,
             &sector.cert.sector,
             |n| n == sector.cert.n,
         );
         if kept.is_none() && !cache.is_file() {
             resume_reserved_sector(store, member, sector.dir.clone())?;
-            continue;
+            return Ok(());
         }
         if !certificate_due(&sector.dir, target, beacon_frame, frame) {
             tally(&PACING.certificates_held);
-            continue;
+            return Ok(());
         }
         let member = *member;
         let publish = publish.clone();
@@ -1146,8 +1465,20 @@ pub(crate) fn poll_sector_certificates(
             "sector certificate",
             move || {
                 let _guard = proving;
+                let verifies =
+                    |bytes: &[u8]| proof_verifies(&member, &sector.cert, target, &beacon, bytes);
                 let bytes = match fs::read(&cache) {
-                    Ok(bytes) => bytes,
+                    Ok(bytes) if verifies(&bytes) => bytes,
+                    Ok(_) => {
+                        warn!(epoch = target, sector = %hex::encode(sector.cert.sector),
+                            scope = "local", action = "check this node's disk if this recurs",
+                            "a sector's cached certificate proof does not verify, as a damaged \
+                             file leaves it; it is removed and made again");
+                        let _ = fs::remove_file(&cache);
+                        return Err(unavailable(
+                            "cached sector certificate proof does not verify".into(),
+                        ));
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         let kept = kept.ok_or_else(|| {
                             unavailable("sector proof cache and temporary layers are absent".into())
@@ -1166,6 +1497,28 @@ pub(crate) fn poll_sector_certificates(
                         };
                         let root = message.root();
                         let last = fs::read(sector.dir.join("last")).map_err(io)?;
+                        // Damaged labels or a damaged last layer fail the
+                        // proof at every poll: they are removed instead, and
+                        // the sector is labelled again from the next poll.
+                        if !proof_inputs_whole(&kept, &last, &sector.cert) {
+                            warn!(epoch = target, sector = %hex::encode(sector.cert.sector),
+                                scope = "local",
+                                action = "check this node's disk and kernel log for I/O errors",
+                                "a sector's kept labels or last layer on disk do not match its \
+                                 certificate, as a damaged file leaves them; they are removed \
+                                 and the sector is labelled again before its proof");
+                            drop(kept);
+                            let labels = store.for_profile(sector.cert.profile);
+                            labels.discard_damaged(
+                                kept_epoch,
+                                &member,
+                                &sector.cert.sector,
+                                sector.cert.n,
+                            );
+                            return Err(unavailable(
+                                "sector proof files differ from its certificate".into(),
+                            ));
+                        }
                         let challenge = sector::certificate_beacon(
                             &member,
                             &sector.cert.sector,
@@ -1222,6 +1575,26 @@ pub(crate) fn poll_sector_certificates(
                 Ok(())
             },
         );
+        Ok(())
+    };
+    for entry in fs::read_dir(root).map_err(io)?.flatten() {
+        if !sector_directory(&entry.path()) {
+            continue;
+        }
+        let (name, path) = (entry.file_name(), entry.path());
+        if let Err(error) = poll_one(entry) {
+            // Bounded to one line an hour at 10 s frames.
+            if frame.is_multiple_of(360) {
+                let action = if Sector::load(path).is_err() {
+                    "check this node's disk and its kernel log for I/O errors"
+                } else {
+                    "none if it clears as this node follows GLOBAL; it is retried each frame"
+                };
+                warn!(frame, sector = %name.to_string_lossy(), %error, scope = "local", action,
+                    "a sector could not be polled for certification and is skipped; \
+                     the other sectors are polled as usual");
+            }
+        }
     }
     Ok(())
 }
