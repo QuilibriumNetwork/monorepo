@@ -86,6 +86,13 @@ pub trait KvDb: Send + Sync {
         Ok(0)
     }
     fn compact_all(&self) -> Result<()>;
+    /// Write the store's write-ahead log to disk and wait until it is
+    /// there: writes made without a sync before it then do not wait for
+    /// the next synced commit to take them. Nothing where the store keeps
+    /// no log.
+    fn sync_wal(&self) -> Result<()> {
+        Ok(())
+    }
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;
     /// Approximate bytes of process memory this DB instance holds (block

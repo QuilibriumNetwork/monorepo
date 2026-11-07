@@ -915,6 +915,12 @@ impl store::KvDb for RocksDb {
         Ok(())
     }
 
+    fn sync_wal(&self) -> Result<()> {
+        self.db
+            .flush_wal(true)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
     fn close(&self) -> Result<()> {
         Ok(())
     }
