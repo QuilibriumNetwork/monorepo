@@ -8281,6 +8281,11 @@ impl AppConsensusEngine {
     /// means members' messages do not reach this node; unattributed high means
     /// they arrive from authors this node has no PeerInfo for, and are dropped;
     /// `blocked` counts messages consensus discarded as invalid.
+    /// `behind_gave_up` counts this member's turns given up since the last
+    /// line because a GLOBAL state sync was installing, and
+    /// `behind_wait_median_ms` / `behind_wait_max_ms` how long they waited
+    /// from the ask for a proposal to the give-up (the view's nullify); a
+    /// turn that waits out its parent instead takes about 3 s.
     fn log_session_liveness(&mut self) {
         let _probe = probe::section(probe::Section::SessionLiveness);
         self.log_inbound_drops(std::time::Instant::now());
@@ -8300,6 +8305,7 @@ impl AppConsensusEngine {
         self.session_liveness_logged = Some(std::time::Instant::now());
         let seen = liveness.snapshot();
         let decided = liveness.decisions();
+        let behind = liveness.take_behind_give_ups();
         if let Some(refusals) =
             self.refusals
                 .observe(std::time::Instant::now(), session.generation, &decided)
@@ -8366,6 +8372,8 @@ impl AppConsensusEngine {
             finalize_votes = seen.finalize_votes, current_view = %tally(seen.current), best_view = %tally(seen.best),
             proposed = decided.proposed, declined = ?decided.declined, last_declined = %outcome(decided.last_declined),
             accepted = decided.accepted, refused = ?decided.refused, last_refused = %outcome(decided.last_refused),
+            behind_gave_up = behind.turns, behind_wait_median_ms = behind.median_ms,
+            behind_wait_max_ms = behind.max_ms,
             blocked = seen.blocked, blocked_peers = seen.blocked_peers,
             materialized = self.last_materialized_frame,
             data_ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire),

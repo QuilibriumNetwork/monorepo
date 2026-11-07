@@ -1022,10 +1022,12 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
             ))
         })
     };
+    let liveness = Arc::new(Liveness::default());
     let proposer = HandoffProposer::new(Arc::new(DataProposer), session, reader(state.clone()))
         .unwrap()
         .with_private_reader(Some(private))
-        .with_behind_probe(Some(probe));
+        .with_behind_probe(Some(probe))
+        .with_liveness(Some(liveness.clone()));
 
     assert!(proposer.propose_with_context(ctx).is_none());
     assert!(
@@ -1033,6 +1035,7 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
         "a behind leader gave its turn up only after its parent waits"
     );
     assert_eq!(private_reads.load(Ordering::SeqCst), 0);
+    liveness.settle_turn(1, false, Duration::from_millis(7));
 
     *behind.lock().unwrap() = None;
     let next = ProposalContext { view: 2, ..ctx };
@@ -1040,6 +1043,13 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
     assert!(
         proposer.propose_retry().is_some(),
         "a leader that is not behind waits for its parent as before"
+    );
+    liveness.settle_turn(2, false, Duration::from_millis(3_000));
+    let gave_up = liveness.take_behind_give_ups();
+    assert_eq!(
+        (gave_up.turns, gave_up.max_ms),
+        (1, 7),
+        "only the behind leader's turn counts as given up while behind"
     );
     *state.lock().unwrap() = Some(parent);
     let before = asked.load(Ordering::SeqCst);
@@ -1142,6 +1152,7 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
         }
         let store = BlockStore::new();
         let behind = Arc::new(AtomicBool::new(true));
+        let behind_liveness = Arc::new(Liveness::default());
         let built: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let finalized: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let mut handles = Vec::new();
@@ -1153,17 +1164,20 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
                 selected_parent(&session, lagging.clone()),
             )
             .unwrap();
-            if let Some(flag) = lagging {
-                proposer = proposer.with_behind_probe(Some(Arc::new(move || {
-                    flag.load(Ordering::SeqCst)
-                        .then(|| "GLOBAL state sync installing".to_string())
-                })));
-            }
-            let params = GlobalEngineParams::new(
+            let mut params = GlobalEngineParams::new(
                 format!("behind-{node}"),
                 session.generation,
                 Digest(session.genesis),
             );
+            if let Some(flag) = lagging {
+                proposer = proposer
+                    .with_behind_probe(Some(Arc::new(move || {
+                        flag.load(Ordering::SeqCst)
+                            .then(|| "GLOBAL state sync installing".to_string())
+                    })))
+                    .with_liveness(Some(behind_liveness.clone()));
+                params.liveness = Some(behind_liveness.clone());
+            }
             let engine = build_global_engine(
                 ctx.child("validator").with_attribute("node", node),
                 schemes[node].clone(),
@@ -1190,6 +1204,15 @@ fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up()
             built[0].load(Ordering::SeqCst),
             0,
             "a behind member never builds"
+        );
+        let gave_up = behind_liveness.take_behind_give_ups();
+        assert!(
+            gave_up.turns > 0,
+            "its turns given up while behind are counted"
+        );
+        assert!(
+            gave_up.max_ms < 250,
+            "each turn ends before one parent wait: {gave_up:?}"
         );
 
         behind.store(false, Ordering::SeqCst);
