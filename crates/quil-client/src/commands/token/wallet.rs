@@ -30,6 +30,11 @@ pub(crate) use submission_tests::{serve_left_out, serve_left_out_expiring, serve
 mod mint_status;
 #[cfg(feature = "native-proof")]
 pub(super) use mint_status::run_mint_status;
+#[cfg(feature = "native-proof")]
+#[path = "wallet_paid_bundle.rs"]
+mod paid_bundle;
+#[cfg(feature = "native-proof")]
+pub(super) use paid_bundle::run_custom_mint_resume;
 #[path = "wallet_inclusion.rs"]
 pub(super) mod inclusion;
 #[cfg(feature = "native-proof")]
@@ -4953,8 +4958,10 @@ pub(crate) async fn transfer_fee(
 /// SHA3-256 (`settlement_claim::bundle_context`), or, for a pre-funded
 /// settlement, the claimant key that names one later. Returns the receipt the
 /// destination bundle's claim spends once the settlement's GLOBAL record is
-/// certified.
+/// certified. `before_submit` gets the receipt once the settlement is built,
+/// before it is sent; its error stops the payment.
 #[cfg(feature = "native-proof")]
+#[allow(clippy::too_many_arguments)] // the settlement's parts, as its callers name them
 pub(super) async fn run_pay(
     tc: &TokenCtx,
     destination: [u8; 32],
@@ -4964,6 +4971,7 @@ pub(super) async fn run_pay(
     payment: Option<(RecipientAddress, u128)>,
     max_pages: usize,
     max_coins: usize,
+    before_submit: Option<&paid_bundle::BeforeSubmit<'_>>,
 ) -> anyhow::Result<[u8; 32]> {
     use quil_lattice_ct::confidential::settlement::Settlement;
     anyhow::ensure!(amount > 0, "settlement amount must be positive");
@@ -5057,6 +5065,9 @@ pub(super) async fn run_pay(
             .map_err(|e| anyhow::anyhow!("settlement decode: {e:?}"))?
             .statement,
     )?;
+    if let Some(before_submit) = before_submit {
+        before_submit(&receipt)?;
+    }
     wallet
         .submit(
             &mut crate::retry::connect(|| tc.connect_submit()).await?,
@@ -5264,6 +5275,7 @@ pub(super) async fn run_prefund(
         None,
         max_pages,
         max_coins,
+        None,
     )
     .await?;
     record_prefunded(
@@ -5334,23 +5346,24 @@ pub(super) async fn run_prefunded(tc: &TokenCtx) -> anyhow::Result<()> {
 #[cfg(feature = "native-proof")]
 const PAY_SCAN_BUDGET: (usize, usize) = (super::SCAN_PAGES_UNCAPPED, super::SCAN_MAX_COINS);
 
-/// Pay, from this wallet's QUIL, for a bundle of operations on another
-/// application and return the claim to place first in that bundle.
-///
-/// `rest` is the destination bundle with its first request left empty. The
-/// settlement covers the destination venue's quoted charge for the bundle's
-/// state growth (plus the claim's marker) with the automatic headroom and goes
-/// to that venue's provers. `payment`, when given, also pays `value` QUIL to the
-/// payee in the same transaction (a paid mint's price). Waits up to `wait` for
-/// the settlement's GLOBAL record to be certified.
+/// What a destination bundle's settlement is: the amount to pay, the context
+/// it binds, and whether the bundle executes in the global venue.
 #[cfg(feature = "native-proof")]
-pub(super) async fn pay_for_bundle(
+struct BundleQuote {
+    amount: u128,
+    context: [u8; 32],
+    global_execution: bool,
+}
+
+/// Quote the settlement of `rest`, the destination bundle with its first
+/// request left empty: the destination venue's quoted charge for the bundle's
+/// state growth (plus the claim's marker) with the automatic headroom.
+#[cfg(feature = "native-proof")]
+async fn quote_bundle(
     tc: &TokenCtx,
     destination: [u8; 32],
     rest: &quil_execution::message_envelope::CanonicalMessageBundle,
-    payment: Option<(RecipientAddress, u128)>,
-    wait: std::time::Duration,
-) -> anyhow::Result<(Vec<u8>, bool)> {
+) -> anyhow::Result<BundleQuote> {
     use quil_execution::token_intrinsic::settlement_claim::{
         bundle_context, marker_record, request_cost,
     };
@@ -5413,68 +5426,102 @@ pub(super) async fn pay_for_bundle(
     println!("This bundle needs {amount} base units for {cost} bytes of state growth on {} (snapshot frame {}).",
         hex::encode(destination), quote.observed_frame);
     check_automatic_fee("bundle settlement", amount, tc.max_fee)?;
-    let claimed_payment = match &payment {
-        Some((payee, value)) => Some((
-            quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())?,
-            *value,
-        )),
-        None => None,
+    Ok(BundleQuote {
+        amount,
+        context,
+        global_execution: quote.global_execution,
+    })
+}
+
+/// The claim of the smallest unused pre-funded settlement of `destination`
+/// covering `quote`, for the bundle it quotes; `None` when there is none.
+/// Waits up to `wait` for the settlement's GLOBAL record to be certified.
+#[cfg(feature = "native-proof")]
+async fn claim_prefunded(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    quote: &BundleQuote,
+    wait: std::time::Duration,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(prefunded) = take_prefunded(tc, destination, quote.amount).await? else {
+        return Ok(None);
     };
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let signer = tc
+        .key_manager
+        .get_signer_by_id(&prefunded.key_id)
+        .map_err(|e| anyhow::anyhow!("claimant key {}: {e}", prefunded.key_id))?;
+    let signature = signer
+        .sign_with_domain(
+            &quil_execution::token_intrinsic::settlement_claim::claimant_message(
+                &network,
+                &destination,
+                &prefunded.receipt,
+                &quote.context,
+            ),
+            &quil_lattice_ct::confidential::transfer::parameter_context(&network, &destination),
+        )
+        .map_err(|e| anyhow::anyhow!("claimant signature: {e}"))?;
+    let binding = ClaimBinding::Claimant {
+        key_type: signer.key_type() as u32,
+        public_key: signer.public_key().to_vec(),
+        signature,
+    };
+    println!(
+        "Claiming pre-funded settlement {} ({} base units).",
+        hex::encode(prefunded.receipt),
+        prefunded.amount
+    );
+    settlement_claim(
+        tc,
+        destination,
+        prefunded.receipt,
+        prefunded.amount,
+        &binding,
+        None,
+        wait,
+    )
+    .await
+    .map(Some)
+}
+
+/// Pay, from this wallet's QUIL, for a bundle of operations on another
+/// application and return the claim to place first in that bundle.
+///
+/// `rest` is the destination bundle with its first request left empty. The
+/// settlement covers [`quote_bundle`]'s amount and goes to the destination
+/// venue's provers. `payment`, when given, also pays `value` QUIL to the
+/// payee in the same transaction (a paid mint's price). Waits up to `wait` for
+/// the settlement's GLOBAL record to be certified.
+#[cfg(feature = "native-proof")]
+pub(super) async fn pay_for_bundle(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    rest: &quil_execution::message_envelope::CanonicalMessageBundle,
+    payment: Option<(RecipientAddress, u128)>,
+    wait: std::time::Duration,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    let quote = quote_bundle(tc, destination, rest).await?;
+    let claimed_payment = paid_bundle::claimed_payment(&payment)?;
     // A pre-funded settlement of this destination pays for the bundle without
     // a new transaction. One that also carries a payment coin is not reused:
     // the payment is part of the settlement, chosen when it was paid.
     if payment.is_none() {
-        if let Some(prefunded) = take_prefunded(tc, destination, amount).await? {
-            let signer = tc
-                .key_manager
-                .get_signer_by_id(&prefunded.key_id)
-                .map_err(|e| anyhow::anyhow!("claimant key {}: {e}", prefunded.key_id))?;
-            let signature = signer
-                .sign_with_domain(
-                    &quil_execution::token_intrinsic::settlement_claim::claimant_message(
-                        &network,
-                        &destination,
-                        &prefunded.receipt,
-                        &context,
-                    ),
-                    &quil_lattice_ct::confidential::transfer::parameter_context(
-                        &network,
-                        &destination,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("claimant signature: {e}"))?;
-            let binding = ClaimBinding::Claimant {
-                key_type: signer.key_type() as u32,
-                public_key: signer.public_key().to_vec(),
-                signature,
-            };
-            println!(
-                "Claiming pre-funded settlement {} ({} base units).",
-                hex::encode(prefunded.receipt),
-                prefunded.amount
-            );
-            let claim = settlement_claim(
-                tc,
-                destination,
-                prefunded.receipt,
-                prefunded.amount,
-                &binding,
-                None,
-                wait,
-            )
-            .await?;
+        if let Some(claim) = claim_prefunded(tc, destination, &quote, wait).await? {
             return Ok((claim, quote.global_execution));
         }
     }
     let receipt = run_pay(
         tc,
         destination,
-        amount,
-        SettlementBinding::Bundle(context),
+        quote.amount,
+        SettlementBinding::Bundle(quote.context),
         None,
         payment,
         PAY_SCAN_BUDGET.0,
         PAY_SCAN_BUDGET.1,
+        None,
     )
     .await?;
     println!("Waiting for the settlement to be certified in global state...");
@@ -5482,8 +5529,8 @@ pub(super) async fn pay_for_bundle(
         tc,
         destination,
         receipt,
-        amount,
-        &ClaimBinding::Bundle(context),
+        quote.amount,
+        &ClaimBinding::Bundle(quote.context),
         claimed_payment,
         wait,
     )
@@ -5547,68 +5594,7 @@ async fn submit_refreshed_operation(
         }
         return Ok(submitted);
     }
-    submit_paid_operation(tc, wallet, bytes, None, SETTLEMENT_WAIT).await
-}
-
-/// Pay a QUIL settlement bound to `[claim, operation]` for the operation's
-/// application, wait for certification, and submit claim and operation
-/// together. `payment` adds a public payment coin (a paid mint's price).
-#[cfg(feature = "native-proof")]
-async fn submit_paid_operation(
-    tc: &TokenCtx,
-    wallet: &RecipientWallet,
-    bytes: Vec<u8>,
-    payment: Option<(RecipientAddress, u128)>,
-    wait: std::time::Duration,
-) -> anyhow::Result<Option<Submitted>> {
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-    let mut submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
-    let (domain, request) = wallet.prepare_submission(bytes.clone())?;
-    let timestamp = crate::send::now_millis();
-    let rest = CanonicalMessageBundle {
-        requests: vec![
-            None,
-            Some(
-                CanonicalMessageRequest::wrap(bytes.clone())
-                    .map_err(|e| anyhow::anyhow!("wrap operation: {e}"))?,
-            ),
-        ],
-        timestamp,
-    };
-    let (claim, global_execution) =
-        pay_for_bundle(tc, wallet.application, &rest, payment, wait).await?;
-    let bundle = quil_types::proto::global::MessageBundle {
-        requests: vec![
-            quil_types::proto::global::MessageRequest {
-                request: Some(
-                    quil_types::proto::global::message_request::Request::TokenOperation(
-                        quil_types::proto::token::TokenOperation {
-                            canonical_bytes: claim,
-                        },
-                    ),
-                ),
-                timestamp: 0,
-            },
-            request,
-        ],
-        timestamp,
-    };
-    if let Some(submitted) = &mut submitted {
-        submitted.bundle = bundle_id(&bundle)?;
-        if global_execution {
-            submitted.route = inclusion::Route::Global;
-        }
-    }
-    crate::send::send_to_venue(
-        &mut crate::retry::connect(|| tc.connect_submit()).await?,
-        &tc.submit_key_manager,
-        domain,
-        global_execution,
-        bundle,
-    )
-    .await?;
-    println!("Submitted with its QUIL settlement claim.");
-    Ok(submitted)
+    paid_bundle::submit_paid(tc, wallet, bytes, None, SETTLEMENT_WAIT, false).await
 }
 
 /// Build a token's mint-entitlement tree from a file of
@@ -5667,6 +5653,58 @@ pub(super) fn run_payment_address(tc: &TokenCtx) -> anyhow::Result<()> {
         hex::encode(quil_execution::token_intrinsic::settlement_record::payment_address(&encoded)?)
     );
     Ok(())
+}
+
+/// A certified settlement record whose fields are not the requested claim's.
+#[cfg(feature = "native-proof")]
+#[derive(Debug)]
+struct RecordMismatch(String);
+
+#[cfg(feature = "native-proof")]
+impl std::fmt::Display for RecordMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "settlement record does not match the requested claim: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl std::error::Error for RecordMismatch {}
+
+/// `token settlement-claim`: the claim spending `receipt` in the bundle whose
+/// context is `context`. The witness carries only a proof, so a paid
+/// settlement's payment comes from the caller; a claim without it never
+/// matches the record, and the error says which options supply it.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_settlement_claim(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    receipt: [u8; 32],
+    amount: u128,
+    context: [u8; 32],
+    payment: Option<([u8; 32], u128)>,
+    wait: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
+    settlement_claim(
+        tc,
+        destination,
+        receipt,
+        amount,
+        &ClaimBinding::Bundle(context),
+        payment,
+        wait,
+    )
+    .await
+    .map_err(|error| {
+        if payment.is_none() && error.is::<RecordMismatch>() {
+            anyhow::anyhow!("{error:#}; a paid settlement needs --payment-address and --payment")
+        } else {
+            error
+        }
+    })
 }
 
 /// Build the claim spending settlement `receipt` in `destination`'s bundle,
@@ -5745,9 +5783,7 @@ pub(super) async fn settlement_claim(
                         &global_root,
                         &claim.forest_proof,
                     )
-                    .map_err(|e| {
-                        anyhow::anyhow!("settlement record does not match the requested claim: {e}")
-                    })?;
+                    .map_err(|e| RecordMismatch(e.to_string()))?;
                     return Ok(claim.encode()?);
                 }
             }
@@ -5756,7 +5792,11 @@ pub(super) async fn settlement_claim(
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "settlement record not yet certified in a retained global root; retry later"
+            "settlement {} not yet certified in a retained global root after {} s; the node's \
+             GetMintAuthorizationStatus RPC for this receipt says what is missing, and its log \
+             line \"mint claim: no citable authorization yet\" names the frame it searched",
+            hex::encode(receipt),
+            wait.as_secs()
         );
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -7373,7 +7413,7 @@ pub(super) async fn run_custom_mint(
         )),
         None => None,
     };
-    let mut client = tc.connect().await?;
+    let client = tc.connect().await?;
     let policy = fetch_mint_policy(&client, &application).await?;
     let signs = custom_mint_signs(
         &policy,
@@ -7410,13 +7450,15 @@ pub(super) async fn run_custom_mint(
             },
         )
         .await?;
-    if let Some((payee, price, wait)) = paid {
-        let submitted =
-            submit_paid_operation(tc, &wallet, bytes, Some((payee, price)), wait).await?;
-        return inclusion::follow(tc, &wallet, "paid custom-token mint", submitted, follow).await;
-    }
-    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
-    inclusion::follow(tc, &wallet, "custom-token mint", submitted, follow).await
+    // The settlement pays for this one bundle, so the bundle is saved before
+    // the settlement is sent: a wait that runs out is finished by `--resume`,
+    // never by paying again.
+    let (what, payment, wait) = match paid {
+        Some((payee, price, wait)) => ("paid custom-token mint", Some((payee, price)), wait),
+        None => ("custom-token mint", None, SETTLEMENT_WAIT),
+    };
+    let submitted = paid_bundle::submit_paid(tc, &wallet, bytes, payment, wait, true).await?;
+    inclusion::follow(tc, &wallet, what, submitted, follow).await
 }
 
 #[cfg(test)]

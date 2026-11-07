@@ -4553,3 +4553,508 @@ async fn a_transient_witness_failure_keeps_waiting_for_the_settlement() {
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
+
+/// A token context on `multiaddr` whose keystore holds the wallet key and the
+/// peer key a send is signed with.
+#[cfg(feature = "native-proof")]
+fn paid_mint_ctx(directory: &std::path::Path, multiaddr: String) -> TokenCtx {
+    let (key_manager, _) = peer_key_manager(directory);
+    key_manager.create_agreement_key("q-onion-key", 9).unwrap();
+    let key_manager = Arc::new(key_manager);
+    let opts = crate::rpc::ConnectOpts {
+        listen_grpc_multiaddr: multiaddr,
+        ..Default::default()
+    };
+    TokenCtx {
+        node_config: quil_config::Config::default(),
+        config_dir: directory.to_path_buf(),
+        key_manager: key_manager.clone(),
+        connect_opts: opts.clone(),
+        submit_opts: opts,
+        submit_key_manager: key_manager,
+        submit_config_dir: directory.to_path_buf(),
+        submit_identity: Default::default(),
+        peer_id_bytes: Vec::new(),
+        read_flags: Vec::new(),
+        max_fee: u128::MAX,
+    }
+}
+
+/// An unsigned custom mint of 3 to `wallet`, framed as the node decodes it
+/// (its proof is not a valid proof).
+#[cfg(feature = "native-proof")]
+fn custom_mint_bytes(wallet: &RecipientWallet) -> Vec<u8> {
+    use quil_lattice_ct::confidential::custom_mint::{CustomMint, CustomMintStatement};
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    CustomMint {
+        statement: CustomMintStatement {
+            network: wallet.network,
+            application: wallet.application,
+            authority_key_type: 0,
+            authority_public_key: Vec::new(),
+            nonce: [8; 32],
+            amount: 3,
+            outputs: vec![
+                quil_lattice_ct::confidential::memo::create_output(
+                    &wallet.context,
+                    wallet.address(),
+                    3,
+                )
+                .unwrap()
+                .output,
+            ],
+            entitlement_proof: Vec::new(),
+        },
+        signature: Vec::new(),
+        proof,
+    }
+    .encode()
+    .unwrap()
+}
+
+/// A real GLOBAL membership proof of the settlement record `entry`.
+#[cfg(feature = "native-proof")]
+fn settlement_witness(
+    entry: &quil_execution::token_intrinsic::settlement_record::SettlementEntry,
+) -> quil_types::store::MintAuthorizationWitnessData {
+    use quil_execution::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+    use quil_hypergraph::addressing::{shard_key_for_location, Location};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+        Arc::new(quil_types::crypto::NoopInclusionProver),
+    ));
+    crdt.set_forest(quil_forest::Forest::new(db.inner()));
+    let state = HypergraphState::new(crdt.clone());
+    let global = quil_execution::domains::GLOBAL;
+    state
+        .set(
+            &global,
+            &entry.receipt,
+            &vertex_adds_discriminator().unwrap(),
+            1,
+            quil_execution::token_intrinsic::settlement_record::create_record(entry).unwrap(),
+        )
+        .unwrap();
+    state.commit().unwrap();
+    crdt.commit(1).unwrap();
+    let root: [u8; 32] = crdt
+        .compute_shard_root(
+            "vertex",
+            "adds",
+            &shard_key_for_location(&Location {
+                app_address: global,
+                data_address: entry.receipt,
+            }),
+        )
+        .try_into()
+        .unwrap();
+    let membership = crdt
+        .global_vertex_membership_at_root(&root, &entry.receipt)
+        .unwrap()
+        .unwrap();
+    quil_types::store::MintAuthorizationWitnessData {
+        found: true,
+        cited_frame: 1,
+        global_root: root.to_vec(),
+        forest_proof: quil_forest::MembershipProof {
+            inputs: vec![membership],
+        }
+        .to_bytes(),
+    }
+}
+
+/// A node holding one certified settlement record.
+#[cfg(feature = "native-proof")]
+struct CertifiedSettlement(quil_types::store::MintAuthorizationWitnessData);
+
+#[cfg(feature = "native-proof")]
+impl quil_types::store::CoinWitnessProvider for CertifiedSettlement {
+    fn mint_authorization_witness(
+        &self,
+        _receipt: &[u8; 32],
+    ) -> quil_types::error::Result<quil_types::store::MintAuthorizationWitnessData> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A/B reproducer: a custom mint's settlement pays for one exact bundle. The
+/// base paid first and saved nothing, so a settlement not certified within
+/// `--pay-wait` left a payment nothing could spend, and its "retry later" paid
+/// again. The bundle must be saved with the receipt before the settlement is
+/// sent, and the timeout must point at `--resume`.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_timed_out_paid_mint_leaves_its_bundle_to_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, multiaddr) = bind_loopback().await;
+    let tc = paid_mint_ctx(directory.path(), multiaddr);
+    let network = quote_network();
+    let wallet = RecipientWallet::load(&tc, &network, &[0x42; 32]).unwrap();
+    let payee = RecipientWallet::load(&tc, &network, &quil_execution::domains::QUIL_TOKEN)
+        .unwrap()
+        .address()
+        .clone();
+    let mint = custom_mint_bytes(&wallet);
+    // A node that quotes but certifies nothing: the wait runs out.
+    let (stop, serving) = serve_node(listener, quoting_node());
+    let payments = AtomicUsize::new(0);
+    let bound = Mutex::new(None);
+    let submitted = paid_bundle::submit_paid_with(
+        &tc,
+        &wallet,
+        mint.clone(),
+        Some((payee.clone(), 21)),
+        std::time::Duration::ZERO,
+        true,
+        async |amount, binding: SettlementBinding, _payment, before_submit| {
+            // As the wallet's payment does: the call, then the send.
+            if let Some(before_submit) = before_submit {
+                before_submit(&[5; 32])?;
+            }
+            payments.fetch_add(1, Ordering::SeqCst);
+            *bound.lock().unwrap() = Some((amount, binding.context()));
+            Ok([5; 32])
+        },
+    )
+    .await;
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    let Err(error) = submitted else {
+        panic!("nothing certified the settlement, yet the mint was submitted");
+    };
+    let error = format!("{error:#}");
+    assert_eq!(payments.load(Ordering::SeqCst), 1, "the mint pays once");
+    let saved: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("custom-mint-"))
+        })
+        .collect();
+    assert_eq!(
+        saved.len(),
+        1,
+        "NOTHING-TO-RESUME: a paid mint whose wait ran out saved no bundle: {error}"
+    );
+    let paid = paid_bundle::PaidBundle::load(&saved[0]).unwrap();
+    let (amount, context) = bound.lock().unwrap().take().unwrap();
+    assert_eq!(
+        paid.context().unwrap(),
+        context,
+        "the saved bundle is not the one the settlement binds"
+    );
+    assert_eq!(
+        (paid.receipt, paid.settlement, paid.application),
+        ([5; 32], amount, [0x42; 32])
+    );
+    assert_eq!(paid.operation, mint);
+    assert_eq!(
+        paid.payment,
+        Some((
+            quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())
+                .unwrap(),
+            21
+        ))
+    );
+    assert!(error.contains("not yet certified"), "{error}");
+    assert!(
+        error.contains(&format!("custom-mint --resume {}", saved[0].display())),
+        "{error}"
+    );
+    assert!(error.contains("do not run custom-mint again"), "{error}");
+    assert!(error.contains("GetMintAuthorizationStatus"), "{error}");
+}
+
+/// The saved file rebuilds exactly the bundle the settlement binds, and a
+/// file whose bundle no longer hashes to that context is refused rather
+/// than submitted as a bundle the settlement does not pay for.
+#[cfg(feature = "native-proof")]
+#[test]
+fn a_saved_paid_bundle_round_trips_to_its_bundle_context() {
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let directory = tempfile::tempdir().unwrap();
+    let operation = vec![0, 0, 5, 0x13, 9, 9, 9];
+    let paid = paid_bundle::PaidBundle {
+        network: quote_network(),
+        application: [0x42; 32],
+        timestamp: 1_700_000_000_123,
+        operation: operation.clone(),
+        receipt: [5; 32],
+        settlement: 77,
+        payment: Some(([6; 32], 21)),
+        global_execution: true,
+    };
+    let unpaid = paid_bundle::PaidBundle {
+        payment: None,
+        global_execution: false,
+        ..paid.clone()
+    };
+    // The context the settlement was paid for, as a submission hashes it.
+    let bound = quil_execution::token_intrinsic::settlement_claim::bundle_context(
+        &CanonicalMessageBundle {
+            requests: vec![
+                None,
+                Some(CanonicalMessageRequest::wrap(operation).unwrap()),
+            ],
+            timestamp: 1_700_000_000_123,
+        },
+    )
+    .unwrap();
+    for bundle in [&paid, &unpaid] {
+        let path = bundle.save(directory.path()).unwrap();
+        assert_eq!(
+            path.file_name().unwrap(),
+            "custom-mint-0505050505050505.txt"
+        );
+        let loaded =
+            paid_bundle::PaidBundle::load(&path).expect("ROUNDTRIP: a saved bundle must load");
+        assert_eq!(&loaded, bundle, "ROUNDTRIP: the saved bundle changed");
+        assert_eq!(
+            loaded.context().unwrap(),
+            bound,
+            "ROUNDTRIP: the saved bundle is not the one the settlement binds"
+        );
+    }
+    let text = paid.encode().unwrap();
+    for (from, to) in [
+        ("timestamp 1700000000123", "timestamp 1700000000124"),
+        ("operation 00000513090909", "operation 00000513090908"),
+    ] {
+        let changed = text.replace(from, to);
+        assert_ne!(changed, text, "{from}");
+        let error = paid_bundle::PaidBundle::decode(&changed)
+            .expect_err("TAMPER: a changed bundle was accepted");
+        assert!(
+            error.to_string().contains("does not hash to the context"),
+            "{error}"
+        );
+    }
+    assert!(paid_bundle::PaidBundle::decode(&text.replace("receipt ", "receipts ")).is_err());
+    assert!(paid_bundle::PaidBundle::decode(&text.replacen("qclient", "other", 1)).is_err());
+}
+
+/// `custom-mint --resume` submits the saved bundle, its claim first, once the
+/// settlement is certified, and pays nothing: no fee quote, no settlement,
+/// one send.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_resumed_mint_submits_its_saved_bundle_without_paying() {
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    use quil_execution::token_intrinsic::settlement_claim::{bundle_context, SettlementClaim};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    crate::retry::NO_WAIT.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, multiaddr) = bind_loopback().await;
+    let tc = paid_mint_ctx(directory.path(), multiaddr);
+    let network = quote_network();
+    let application = [0x42; 32];
+    let wallet = RecipientWallet::load(&tc, &network, &application).unwrap();
+    let paid = paid_bundle::PaidBundle {
+        network,
+        application,
+        timestamp: crate::send::now_millis(),
+        operation: custom_mint_bytes(&wallet),
+        receipt: [5; 32],
+        settlement: 77,
+        payment: Some(([6; 32], 21)),
+        global_execution: true,
+    };
+    let saved = paid.save(directory.path()).unwrap();
+    let context = paid.context().unwrap();
+    let record = SettlementClaim {
+        network,
+        application,
+        cited_global_frame: 0,
+        global_root: [0; 32],
+        receipt: [5; 32],
+        settlement: 77,
+        context,
+        payment_address: [6; 32],
+        payment: 21,
+        claimant_key_type: 0,
+        claimant_public_key: Vec::new(),
+        claimant_signature: Vec::new(),
+        forest_proof: Vec::new(),
+    }
+    .entry()
+    .unwrap();
+    let quotes = Arc::new(AtomicUsize::new(0));
+    let counted = quotes.clone();
+    let (server, received) = recording_node(Ok(()));
+    let server = server
+        .with_coin_witness_provider(Arc::new(CertifiedSettlement(settlement_witness(&record))))
+        .with_token_fee_provider(Arc::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "a resume pays nothing".into(),
+            ))
+        }));
+    let (stop, serving) = serve_node(listener, server);
+    let resumed =
+        paid_bundle::resume(&tc, Some(application), &saved, std::time::Duration::ZERO).await;
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    let (_, _, priced) = match resumed {
+        Ok(resumed) => resumed,
+        Err(error) if format!("{error:#}").contains("does not match the requested claim") => {
+            panic!("UNPAID-CLAIM: the resume's claim lacks the saved payment: {error:#}")
+        }
+        Err(error) => {
+            panic!("PAID-AGAIN: a resume must submit the saved bundle without paying: {error:#}")
+        }
+    };
+    assert!(priced);
+    assert_eq!(
+        quotes.load(Ordering::SeqCst),
+        0,
+        "PAID-AGAIN: a resume quoted a new settlement"
+    );
+    let received = received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1, "one bundle, sent once");
+    let bundle = CanonicalMessageBundle::from_canonical_bytes(&received[0]).unwrap();
+    assert_eq!(
+        bundle_context(&bundle).unwrap(),
+        context,
+        "the resumed bundle is not the one the settlement binds"
+    );
+    let claim = SettlementClaim::decode(&bundle.requests[0].as_ref().unwrap().inner_bytes).unwrap();
+    assert_eq!(
+        (
+            claim.receipt,
+            claim.settlement,
+            claim.context,
+            claim.payment
+        ),
+        ([5; 32], 77, context, 21)
+    );
+    // The record of a paid settlement carries its payment: the claim the resume
+    // sent proves it at the cited root, and the same claim without the payment
+    // (what `token settlement-claim` builds) does not.
+    let verify = |entry| {
+        quil_execution::token_intrinsic::settlement_record::verify_membership(
+            &network,
+            &entry,
+            &claim.global_root,
+            &claim.forest_proof,
+        )
+    };
+    verify(claim.entry().unwrap()).expect("UNPAID-CLAIM: the resumed claim is not proven");
+    let mut unpaid = claim.entry().unwrap();
+    (unpaid.payment_address, unpaid.payment) = ([0; 32], 0);
+    assert!(
+        verify(unpaid).is_err(),
+        "a claim without the payment proved a paid settlement"
+    );
+    // A file for another application is refused before the node is asked.
+    let other = paid_bundle::resume(&tc, Some([0x43; 32]), &saved, std::time::Duration::ZERO).await;
+    let Err(error) = other else {
+        panic!("a resume under another --application was accepted");
+    };
+    assert!(error.to_string().contains("not --application"), "{error}");
+}
+
+/// `token settlement-claim` on a paid settlement: the record carries the
+/// payment, which the node's witness does not, so the claim takes it from
+/// `--payment-address` and `--payment` and then proves at the cited root.
+/// Without them the claim cannot match, and the error names the options.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_paid_settlement_is_claimed_by_hand_with_its_payment() {
+    use quil_execution::token_intrinsic::settlement_claim::SettlementClaim;
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, multiaddr) = bind_loopback().await;
+    let tc = paid_mint_ctx(directory.path(), multiaddr);
+    let network = quote_network();
+    let (application, receipt, context) = ([0x42; 32], [5; 32], [7; 32]);
+    let record = SettlementClaim {
+        network,
+        application,
+        cited_global_frame: 0,
+        global_root: [0; 32],
+        receipt,
+        settlement: 77,
+        context,
+        payment_address: [6; 32],
+        payment: 21,
+        claimant_key_type: 0,
+        claimant_public_key: Vec::new(),
+        claimant_signature: Vec::new(),
+        forest_proof: Vec::new(),
+    }
+    .entry()
+    .unwrap();
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_coin_witness_provider(Arc::new(CertifiedSettlement(settlement_witness(&record))));
+    let (stop, serving) = serve_node(listener, server);
+    let (application, receipt, context) = (
+        hex::encode(application),
+        hex::encode(receipt),
+        hex::encode(context),
+    );
+    let claim = |payment: &[&str]| {
+        let mut arguments = vec![
+            "token",
+            "settlement-claim",
+            &application,
+            &receipt,
+            "77",
+            &context,
+        ];
+        arguments.extend_from_slice(payment);
+        arguments.into_iter().map(String::from).collect::<Vec<_>>()
+    };
+    let address = hex::encode([6; 32]);
+    let paid = claim(&["--payment-address", &address, "--payment", "21"]);
+    let unpaid = claim(&[]);
+    let paid = run_token_command(&tc, &paid.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let unpaid =
+        run_token_command(&tc, &unpaid.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    if let Err(error) = paid {
+        panic!("PAID-HAND-CLAIM: a claim with the settlement's payment was refused: {error:#}");
+    }
+    let Err(error) = unpaid else {
+        panic!("a claim without the payment matched a paid settlement");
+    };
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("does not match the requested claim")
+            && error.ends_with("; a paid settlement needs --payment-address and --payment"),
+        "NO-PAYMENT-HINT: the refusal does not name the payment options: {error}"
+    );
+}
+
+/// `--payment-address` and `--payment` are one value: either alone is refused
+/// before anything is asked of the node.
+#[cfg(feature = "native-proof")]
+#[test]
+fn settlement_claim_takes_both_payment_options_or_neither() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        token: super::super::TokenArgs,
+    }
+    let id = hex::encode([1; 32]);
+    let parse = |payment: &[&str]| {
+        let mut arguments = vec!["token", "settlement-claim", &id, &id, "77", &id];
+        arguments.extend_from_slice(payment);
+        Cli::try_parse_from(arguments).is_ok()
+    };
+    assert!(parse(&[]));
+    assert!(parse(&["--payment-address", &id, "--payment", "21"]));
+    for alone in [["--payment-address", id.as_str()], ["--payment", "21"]] {
+        assert!(
+            !parse(&alone),
+            "ONE-PAYMENT-OPTION: {} alone was accepted",
+            alone[0]
+        );
+    }
+}
