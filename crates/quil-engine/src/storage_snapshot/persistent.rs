@@ -1507,6 +1507,1132 @@ mod tests {
         assert_eq!(again.last().unwrap().len(), n as usize);
         gates(false);
     }
+    /// The one kept layers file of `n` nodes under the label store at `dir`.
+    fn kept_layers(dir: &Path, n: u64) -> PathBuf {
+        let name = format!("{n}.layers");
+        let (mut found, mut stack) = (Vec::new(), vec![dir.to_owned()]);
+        while let Some(at) = stack.pop() {
+            for entry in fs::read_dir(&at).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().and_then(|f| f.to_str()) == Some(name.as_str()) {
+                    found.push(path);
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "one kept layers file: {found:?}");
+        found.pop().unwrap()
+    }
+    /// A sector is set up from its kept labels only when they are whole
+    /// (`Kept::verified_last_layer`), as a snapshot encodes from them: labels
+    /// torn over their last layer, as a damaged disk leaves them, are
+    /// labelled again, and the sector commits to the labels it makes, never
+    /// to the torn layer, which its certificate proof could not open.
+    #[test]
+    fn a_sector_is_not_set_up_from_kept_labels_torn_over_their_last_layer() {
+        use std::os::unix::fs::FileExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [29; 32];
+        let (path, id, n) = reserve(&store, &member, b"torn", 1500, 100).unwrap();
+        let whole = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let whole_last = whole.last().unwrap();
+        // Set up again from the kept labels, as after a crash before the
+        // sector's certificate was written, the second half of their last
+        // layer zeroed and the file's length unchanged.
+        fs::remove_file(path.join("certificate")).unwrap();
+        let layers = kept_layers(dir.path(), n);
+        let torn = (n - n / 2) * 32;
+        let at = fs::metadata(&layers).unwrap().len() - torn;
+        let file = OpenOptions::new().write(true).open(&layers).unwrap();
+        file.write_all_at(&vec![0u8; torn as usize], at).unwrap();
+        drop(file);
+        let again = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+            .expect("LAST-LAYER-RELABEL: a sector whose kept labels are torn is labelled again");
+        assert!(
+            again.cert == whole.cert && again.last().unwrap() == whole_last,
+            "LAST-LAYER-CERT: a sector was set up from kept labels torn over their last layer"
+        );
+        gates(false);
+    }
+    /// A certified sector encodes data only from a last layer that matches
+    /// its certificate: one torn on disk since, its length unchanged, would
+    /// give a replica its proofs could never open. The leaf is refused and
+    /// nothing is stored for it, and it is encoded once the layer is whole.
+    #[test]
+    fn a_leaf_is_not_encoded_into_a_sector_whose_last_layer_is_torn() {
+        use std::os::unix::fs::FileExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [31; 32];
+        let app = [33; 32];
+        let crdt = super::super::tests::test_crdt();
+        let location = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, b"torn payload").unwrap();
+        crdt.commit(1).unwrap();
+        let capture =
+            |epoch| capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let snap = capture(1500);
+        let prefix = &snap.prefixes[0];
+        prewarm_sectors(&snap, &store, &member).unwrap();
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+        let exact = snap.node_count(prefix).unwrap();
+        let (path, id, n) = reserve(&store, &member, &leaf, 1500, exact).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        // The second half of the certified last layer zeroed, its length
+        // unchanged, as a damaged disk leaves it.
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let file = OpenOptions::new().write(true).open(&last).unwrap();
+        let torn = (n - n / 2) as usize * 32;
+        file.write_all_at(&vec![0u8; torn], n / 2 * 32).unwrap();
+        drop(file);
+        assert_ne!(fs::read(&last).unwrap(), whole);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let encoded = encode_leaf(&snap, &member, prefix, &replicas, Some(&store), &|| false);
+        assert!(
+            encoded.is_err() && replicas.get_hash_leaf(1500, &leaf).unwrap().is_none(),
+            "LAST-LAYER-ENCODE: a leaf was encoded into a sector whose last layer is torn"
+        );
+        fs::write(&last, &whole).unwrap();
+        encode_leaf(&snap, &member, prefix, &replicas, Some(&store), &|| false).unwrap();
+        assert!(replicas.get_hash_leaf(1500, &leaf).unwrap().is_some());
+        gates(false);
+    }
+    /// A sector precommits for the next epoch whatever target its disk
+    /// holds: a target past the next epoch, as a damaged file leaves it,
+    /// would pin each precommit to an epoch it is never taken for.
+    #[test]
+    fn a_sector_precommits_for_the_next_epoch_past_a_damaged_target() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+        use quil_execution::global_intrinsic::{materialize, persistent_storage as protocol};
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"damaged target", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        // A target far past the next epoch, as a damaged disk leaves it.
+        let target = path.join("capacity-target");
+        fs::write(&target, 1_000_000u64.to_be_bytes()).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        let polled =
+            poll_sector_certificates(frame + 1, &member, &global, clock, &TestIdentity, publish);
+        let next = 1500u64.max(quil_types::consensus::epoch_for_frame(frame + 1) + 1);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            next.to_be_bytes(),
+            "LAST-LAYER-TARGET: a sector kept a precommit target past the next epoch"
+        );
+        polled.unwrap();
+        let sent = recv.try_recv().unwrap();
+        let precommit = StorageEpochProof::from_canonical_bytes(&sent).unwrap();
+        let state = HypergraphState::new(global.clone());
+        let records =
+            protocol::check_capacity(frame + 1, &precommit, &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        assert_eq!(records.len(), 1, "GLOBAL takes it");
+        gates(false);
+    }
+    /// A sector that cannot be read is skipped by a poll, never ending it:
+    /// the other sectors still precommit.
+    #[test]
+    fn a_damaged_sector_does_not_hold_back_the_others_certification() {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        crate::storage_jobs::set_job_slots_for_test(2);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (whole, id, n) = reserve(store, &member, b"whole", 1500, 100).unwrap();
+        initialize(store, &member, 1500, whole, id, n, &|| false).unwrap();
+        let (torn, id, n) = reserve(store, &member, b"torn", 1500, 100).unwrap();
+        initialize(store, &member, 1500, torn.clone(), id, n, &|| false).unwrap();
+        // Its certificate torn, as a damaged disk leaves it.
+        fs::write(torn.join("certificate"), b"torn").unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        let polled =
+            poll_sector_certificates(frame + 1, &member, &global, clock, &TestIdentity, publish);
+        assert!(
+            polled.is_ok(),
+            "LAST-LAYER-POLL: a damaged sector ended the poll of every other sector"
+        );
+        assert!(recv.try_recv().is_ok(), "the whole sector precommits");
+        assert!(recv.try_recv().is_err(), "the damaged sector does not");
+        gates(false);
+    }
+    /// A sector is set up from kept labels only when every node of their
+    /// last layer chains to its column digest: one damaged node, which a
+    /// sample of the leaf's nodes would most likely miss, is labelled again.
+    #[test]
+    fn a_sector_is_not_set_up_from_kept_labels_with_one_damaged_node() {
+        use std::os::unix::fs::FileExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [39; 32];
+        let (path, id, n) = reserve(&store, &member, b"one node", 1500, 400).unwrap();
+        assert!(n > 256, "more nodes than a sample checks");
+        let whole = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let whole_last = whole.last().unwrap();
+        // Set up again, as after a crash before the certificate was written,
+        // one node in the middle of the kept last layer zeroed.
+        fs::remove_file(path.join("certificate")).unwrap();
+        let layers = kept_layers(dir.path(), n);
+        let at = fs::metadata(&layers).unwrap().len() - (n - n / 2 - 1) * 32;
+        let file = OpenOptions::new().write(true).open(&layers).unwrap();
+        file.write_all_at(&[0u8; 32], at).unwrap();
+        drop(file);
+        let again = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+            .expect("LAST-LAYER-NODE: kept labels with a damaged node are labelled again");
+        assert!(
+            again.cert == whole.cert && again.last().unwrap() == whole_last,
+            "LAST-LAYER-NODE: a sector was set up from kept labels with a damaged node"
+        );
+        gates(false);
+    }
+    /// A certified sector whose last layer is torn on disk is labelled
+    /// again, and its last layer rewritten from labels that match its
+    /// certificate: the leaf it refused is then encoded.
+    #[test]
+    fn a_certified_sector_with_a_torn_last_layer_is_labelled_again() {
+        use std::os::unix::fs::FileExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [41; 32];
+        let app = [43; 32];
+        let crdt = super::super::tests::test_crdt();
+        let location = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, b"torn payload").unwrap();
+        crdt.commit(1).unwrap();
+        let capture =
+            |epoch| capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let snap = capture(1500);
+        let prefix = &snap.prefixes[0];
+        prewarm_sectors(&snap, &store, &member).unwrap();
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+        let exact = snap.node_count(prefix).unwrap();
+        let (path, id, n) = reserve(&store, &member, &leaf, 1500, exact).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let file = OpenOptions::new().write(true).open(&last).unwrap();
+        let torn = (n - n / 2) as usize * 32;
+        file.write_all_at(&vec![0u8; torn], n / 2 * 32).unwrap();
+        drop(file);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let encoded = loop {
+            let encoded = encode_leaf(&snap, &member, prefix, &replicas, Some(&store), &|| false);
+            if encoded.is_ok() || std::time::Instant::now() > deadline {
+                break encoded;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            encoded.is_ok() && fs::read(&last).unwrap() == whole,
+            "LAST-LAYER-REPAIR: a certified sector's torn last layer was not labelled again"
+        );
+        gates(false);
+    }
+    /// The certificate poll never goes back in frames: a poll from a frame
+    /// older than one polled, as a materialized frame behind the head brings,
+    /// neither retargets a sector nor sends a stale precommit.
+    #[test]
+    fn a_poll_from_an_older_frame_changes_nothing() {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"older frame", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        let head = 1500 * quil_types::consensus::epoch_length_frames() + 5;
+        poll_sector_certificates(
+            head,
+            &member,
+            &global,
+            clock.clone(),
+            &TestIdentity,
+            publish.clone(),
+        )
+        .unwrap();
+        assert!(recv.try_recv().is_ok(), "the head's poll precommits");
+        let target = fs::read(path.join("capacity-target")).unwrap();
+        poll_sector_certificates(head - 10, &member, &global, clock, &TestIdentity, publish)
+            .unwrap();
+        assert!(
+            recv.try_recv().is_err() && fs::read(path.join("capacity-target")).unwrap() == target,
+            "LAST-LAYER-BACKWARDS: a poll from an older frame retargeted or precommitted again"
+        );
+        gates(false);
+    }
+    /// One sector whose certificate cannot be read holds back no other
+    /// leaf's reservation.
+    #[test]
+    fn a_damaged_sector_does_not_hold_back_reservations() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [45; 32];
+        let (torn, id, n) = reserve(&store, &member, b"torn", 1500, 100).unwrap();
+        initialize(&store, &member, 1500, torn.clone(), id, n, &|| false).unwrap();
+        fs::write(torn.join("certificate"), b"torn").unwrap();
+        let other = reserve(&store, &member, b"other", 1500, 100);
+        assert!(
+            other.is_ok(),
+            "LAST-LAYER-RESERVE: a damaged sector held back another leaf's reservation"
+        );
+        gates(false);
+    }
+    /// A sector's certificate proof is made only from files that match its
+    /// certificate, and a cached proof is sent again only when it verifies:
+    /// a last layer torn before the proof is labelled again, and a torn
+    /// cached proof is removed rather than sent.
+    #[test]
+    fn a_sector_proof_is_made_and_sent_only_from_whole_files() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+        use quil_execution::global_intrinsic::{materialize, persistent_storage as protocol};
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        use std::time::Duration;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"proof files", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        poll_sector_certificates(
+            frame + 1,
+            &member,
+            &global,
+            clock.clone(),
+            &TestIdentity,
+            publish.clone(),
+        )
+        .unwrap();
+        let precommit = StorageEpochProof::from_canonical_bytes(
+            &recv.recv_timeout(Duration::from_secs(5)).unwrap(),
+        )
+        .unwrap();
+        let state = HypergraphState::new(global.clone());
+        let records =
+            protocol::check_capacity(frame + 1, &precommit, &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        protocol::apply(&state, frame + 1, &records).unwrap();
+        state.commit().unwrap();
+        global.commit(frame + 1).unwrap();
+        let output = vec![9; 516];
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: frame + 2,
+                        output: output.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        // The last layer torn before the sector's proof is made.
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let mut torn = whole.clone();
+        torn[whole.len() / 2..].fill(0);
+        fs::write(&last, &torn).unwrap();
+        let mut at = frame + 3;
+        let mut sent = None;
+        while sent.is_none() && at < frame + 600 {
+            poll_sector_certificates(
+                at,
+                &member,
+                &global,
+                clock.clone(),
+                &TestIdentity,
+                publish.clone(),
+            )
+            .unwrap();
+            sent = recv.recv_timeout(Duration::from_millis(200)).ok();
+            at += 1;
+        }
+        let sent = sent.map(|bytes| StorageEpochProof::from_canonical_bytes(&bytes).unwrap());
+        let state = HypergraphState::new(global.clone());
+        let proven = sent.is_some_and(|certificate| {
+            protocol::check_capacity(frame + 4, &certificate, &state, &TestIdentity, &|at| {
+                assert_eq!(at, frame + 2);
+                Ok(output.clone())
+            })
+            .is_ok()
+        });
+        assert!(
+            proven && fs::read(&last).unwrap() == whole,
+            "LAST-LAYER-PROVE: no certificate proof was made from the sector's whole files"
+        );
+        // A cached proof torn, then sent again while GLOBAL has not taken it.
+        let proving = File::open(path.join("proving")).unwrap();
+        for _ in 0..1000 {
+            if proving.try_lock().is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(proving);
+        // A later poll of the loop above may have sent the cached proof
+        // again before the first send was received.
+        while recv.try_recv().is_ok() {}
+        let mut cache = None;
+        for entry in fs::read_dir(&path).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("proof-") {
+                cache = Some(entry.path());
+            }
+        }
+        let cache = cache.expect("a cached certificate proof");
+        let proof = fs::read(&cache).unwrap();
+        fs::write(&cache, &proof[..proof.len() / 2]).unwrap();
+        // GLOBAL has not taken the proof: it is sent again once its resend
+        // wait has passed. A poll of the loop above may have sent it again,
+        // doubling the wait, so this poll lies past the longest wait.
+        let at = at + CERTIFICATE_RESEND_MAX_FRAMES;
+        poll_sector_certificates(at, &member, &global, clock, &TestIdentity, publish).unwrap();
+        let proving = File::open(path.join("proving")).unwrap();
+        for _ in 0..1000 {
+            if proving.try_lock().is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            recv.try_recv().is_err(),
+            "LAST-LAYER-CACHE: a cached certificate proof that does not verify was sent"
+        );
+        assert!(
+            !cache.exists(),
+            "LAST-LAYER-CACHE-KEPT: a cached certificate proof that does not verify was kept"
+        );
+        gates(false);
+    }
+    /// A registered replica's sector whose last layer is torn on disk is
+    /// labelled again when its seal fails: with its snapshot unchanged, the
+    /// leaf is never encoded again, so the seal is where the damage shows.
+    #[test]
+    fn a_registered_sector_with_a_torn_last_layer_is_labelled_again() {
+        use std::os::unix::fs::FileExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = [47; 32];
+        let app = [49; 32];
+        let crdt = super::super::tests::test_crdt();
+        let location = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, b"served payload").unwrap();
+        crdt.commit(1).unwrap();
+        let capture =
+            |epoch| capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let snap = capture(1502);
+        let prefix = &snap.prefixes[0];
+        prewarm_sectors(&snap, store, &member).unwrap();
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+        let exact = snap.node_count(prefix).unwrap();
+        let (path, id, n) = reserve(store, &member, &leaf, 1502, exact).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1502, &member, &id);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_leaf(&snap, &member, prefix, &replicas, Some(store), &|| false).unwrap();
+        // The registered sector's last layer torn, its length unchanged.
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let file = OpenOptions::new().write(true).open(&last).unwrap();
+        let torn = (n - n / 2) as usize * 32;
+        file.write_all_at(&vec![0u8; torn], n / 2 * 32).unwrap();
+        drop(file);
+        let slot = quil_types::consensus::StorageSeatSlot {
+            epoch: 1502,
+            leaves: vec![prefix.clone()],
+            registered_at: 1502 * quil_types::consensus::epoch_length_frames(),
+            sealed_at: None,
+            frames: 0,
+            accumulator: [0; 32],
+            chained: Vec::new(),
+            open: true,
+        };
+        let output = vec![9; 516];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let prepared = loop {
+            let prepared = prepare(&replicas, &member, &app, 1500, &slot, &output, &snap);
+            if prepared.is_ok() || std::time::Instant::now() > deadline {
+                break prepared;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            prepared.is_ok() && fs::read(&last).unwrap() == whole,
+            "LAST-LAYER-SERVE: a registered sector's torn last layer was not labelled again"
+        );
+        gates(false);
+    }
+    /// A certified sector holding the one leaf of `app`'s data, set up at
+    /// epoch 1500: the data, the leaf's prefix, and the sector's directory,
+    /// id and nodes.
+    fn certified_leaf(
+        store: &LabelStore,
+        member: &[u8; 32],
+        app: [u8; 32],
+    ) -> (
+        Arc<quil_hypergraph::HypergraphCrdt>,
+        Vec<u32>,
+        PathBuf,
+        [u8; 32],
+        u64,
+    ) {
+        let crdt = super::super::tests::test_crdt();
+        let location = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, b"repaired payload").unwrap();
+        crdt.commit(1).unwrap();
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let prefix = snap.prefixes[0].clone();
+        prewarm_sectors(&snap, store, member).unwrap();
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let exact = snap.node_count(&prefix).unwrap();
+        let (path, id, n) = reserve(store, member, &leaf, 1500, exact).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, member, &id);
+        (crdt, prefix, path, id, n)
+    }
+    /// The second half of a sector's last layer zeroed, its length
+    /// unchanged, as a damaged disk leaves it: the whole layer's bytes.
+    fn tear_last(path: &Path, n: u64) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let file = OpenOptions::new().write(true).open(&last).unwrap();
+        let torn = (n - n / 2) as usize * 32;
+        file.write_all_at(&vec![0u8; torn], n / 2 * 32).unwrap();
+        whole
+    }
+    /// A sector whose labels, made again, do not match its certificate, as
+    /// a damaged certificate file leaves it, is labelled again once and
+    /// then given up: no later epoch labels it again, and its leaf goes to
+    /// another sector.
+    #[test]
+    fn a_sector_whose_repair_cannot_match_its_certificate_is_given_up() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([51; 32], [57; 32]);
+        let (crdt, prefix, path, id, _) = certified_leaf(&store, &member, app);
+        // The certificate's labels damaged, the file still read whole.
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.cert.labels = sector.cert.columns;
+        sector.save().unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let lane = sector_lane(&member, &id);
+        let idle = std::time::Duration::from_secs(120);
+        let encode = |epoch| {
+            let snap =
+                capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+            let encoded = encode_leaf(&snap, &member, &prefix, &replicas, Some(&store), &|| false);
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, idle),
+                "the repair ends"
+            );
+            encoded
+        };
+        let _ = encode(1500);
+        let _ = encode(1501);
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let snap = capture_at(&crdt, &app, 1501, &[current_source(&crdt, &app, 1501)]).unwrap();
+        let exact = snap.node_count(&prefix).unwrap();
+        let (_, again, _) = reserve(&store, &member, &leaf, 1501, exact).unwrap();
+        assert!(
+            again != id && !path.join("repair-1501").exists(),
+            "LAST-LAYER-GIVE-UP: a sector whose repair cannot match its certificate was \
+             labelled again or kept its leaf"
+        );
+        gates(false);
+    }
+    /// A sector queues at most one repair: a repair running longer than an
+    /// epoch queues none behind it each epoch.
+    #[test]
+    fn a_sector_queues_at_most_one_repair() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([53; 32], [59; 32]);
+        let (crdt, prefix, path, id, n) = certified_leaf(&store, &member, app);
+        let whole = tear_last(&path, n);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        // A job running on the sector's lane through three epochs, as a long
+        // repair runs.
+        let lane = sector_lane(&member, &id);
+        let (release, running) = std::sync::mpsc::channel::<()>();
+        crate::storage_jobs::spawn(&lane, "long repair", move || {
+            let _ = running.recv();
+            Ok(())
+        });
+        for epoch in 1500..1503 {
+            let snap =
+                capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+            let _ = encode_leaf(&snap, &member, &prefix, &replicas, Some(&store), &|| false);
+        }
+        let queued = crate::storage_jobs::queued_in_lane(&lane);
+        release.send(()).unwrap();
+        let idle = std::time::Duration::from_secs(120);
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&lane, idle),
+            "the repairs end"
+        );
+        assert_eq!(
+            queued, 1,
+            "LAST-LAYER-QUEUE: a sector queued other than one repair over three epochs"
+        );
+        assert_eq!(fs::read(path.join("last")).unwrap(), whole);
+        gates(false);
+    }
+    /// A repair that finds its sector's last layer whole when it starts, as
+    /// a repair before it leaves it, labels nothing again.
+    #[test]
+    fn a_repair_of_a_whole_last_layer_labels_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([55; 32], [61; 32]);
+        let (crdt, prefix, path, id, n) = certified_leaf(&store, &member, app);
+        let whole = tear_last(&path, n);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let lane = sector_lane(&member, &id);
+        let (release, running) = std::sync::mpsc::channel::<()>();
+        crate::storage_jobs::spawn(&lane, "earlier repair", move || {
+            let _ = running.recv();
+            Ok(())
+        });
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let _ = encode_leaf(&snap, &member, &prefix, &replicas, Some(&store), &|| false);
+        let queued = crate::storage_jobs::queued_in_lane(&lane);
+        // The layer made whole while the repair waits, as the repair before
+        // it leaves it.
+        let last = path.join("last");
+        fs::write(&last, whole).unwrap();
+        let inode = fs::metadata(&last).unwrap().ino();
+        release.send(()).unwrap();
+        let idle = std::time::Duration::from_secs(120);
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&lane, idle),
+            "the repair ends"
+        );
+        assert_eq!(
+            queued, 1,
+            "LAST-LAYER-REPAIR: a torn last layer queued no repair"
+        );
+        assert_eq!(
+            fs::metadata(&last).unwrap().ino(),
+            inode,
+            "LAST-LAYER-AGAIN: a repair labelled a sector whose last layer was whole again"
+        );
+        gates(false);
+    }
+    /// A poll is not skipped for a last-polled frame past every frame known,
+    /// as a damaged file leaves it: the sector still precommits.
+    #[test]
+    fn a_sector_precommits_past_a_damaged_last_poll() {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"damaged last poll", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path, id, n, &|| false).unwrap();
+        // A last-polled frame far past every frame, as a damaged file
+        // leaves it.
+        fs::write(
+            home(store, &member).join("last-poll"),
+            u64::MAX.to_be_bytes(),
+        )
+        .unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        poll_sector_certificates(frame + 1, &member, &global, clock, &TestIdentity, publish)
+            .unwrap();
+        assert!(
+            recv.try_recv().is_ok(),
+            "LAST-LAYER-FUTURE: a damaged last-polled frame stopped the sector's precommit"
+        );
+        gates(false);
+    }
+    /// Each sector's checks of its last layer against its certificate
+    /// (`Sector::last_matches`), by directory.
+    static LAST_CHECKS: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_last_check(dir: &Path) {
+        *LAST_CHECKS
+            .lock()
+            .unwrap()
+            .entry(dir.to_owned())
+            .or_default() += 1;
+    }
+    fn last_checks(dir: &Path) -> usize {
+        LAST_CHECKS.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+    /// A certified sector set up at epoch 1502, the one leaf of `app`'s data
+    /// encoded into it, and the seat slot that seals the leaf: the
+    /// snapshot, the slot, the replicas, and the sector's directory and
+    /// nodes.
+    fn registered_leaf(
+        store: &LabelStore,
+        member: &[u8; 32],
+        app: [u8; 32],
+    ) -> (
+        Captured,
+        quil_types::consensus::StorageSeatSlot,
+        ReplicaStore,
+        PathBuf,
+        u64,
+    ) {
+        let crdt = super::super::tests::test_crdt();
+        let location = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, b"served payload").unwrap();
+        crdt.commit(1).unwrap();
+        let snap = capture_at(&crdt, &app, 1502, &[current_source(&crdt, &app, 1502)]).unwrap();
+        let prefix = snap.prefixes[0].clone();
+        prewarm_sectors(&snap, store, member).unwrap();
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let exact = snap.node_count(&prefix).unwrap();
+        let (path, id, n) = reserve(store, member, &leaf, 1502, exact).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1502, member, &id);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_leaf(&snap, member, &prefix, &replicas, Some(store), &|| false).unwrap();
+        let slot = quil_types::consensus::StorageSeatSlot {
+            epoch: 1502,
+            leaves: vec![prefix],
+            registered_at: 1502 * quil_types::consensus::epoch_length_frames(),
+            sealed_at: None,
+            frames: 0,
+            accumulator: [0; 32],
+            chained: Vec::new(),
+            open: true,
+        };
+        (snap, slot, replicas, path, n)
+    }
+    /// A registered replica whose sector's repair was given up
+    /// (`Sector::given_up`) marks no repair when its seal fails, nor warns
+    /// that one starts: the sector is never labelled again, and its leaves
+    /// go to another.
+    #[test]
+    fn a_failing_seal_of_a_given_up_sector_marks_no_repair() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([65; 32], [67; 32]);
+        let (snap, slot, replicas, path, n) = registered_leaf(store, &member, app);
+        tear_last(&path, n);
+        // Given up, as a repair whose labels differ from the certificate
+        // leaves it.
+        let sector = Sector::load(path.clone()).unwrap().unwrap();
+        fs::write(path.join("repair-failed"), sector.cert.to_bytes()).unwrap();
+        let prepared = prepare(&replicas, &member, &app, 1500, &slot, &[9u8; 516], &snap);
+        assert!(prepared.is_err(), "a torn last layer fails the seal");
+        assert!(
+            !path.join("repair-1502").exists(),
+            "LAST-LAYER-SEAL-GIVE-UP: a failing seal of a given-up sector marked a repair"
+        );
+        gates(false);
+    }
+    /// A failing seal checks its sector's last layer against the
+    /// certificate only while no repair is marked this epoch: each failing
+    /// leaf of the sector would read the layer again, 32 bytes a node,
+    /// outside any reservation.
+    #[test]
+    fn a_failing_seal_reads_no_last_layer_once_a_repair_is_marked() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([69; 32], [71; 32]);
+        let (snap, slot, replicas, path, n) = registered_leaf(store, &member, app);
+        tear_last(&path, n);
+        // A repair marked this epoch, as an earlier failing seal leaves it.
+        fs::write(path.join("repair-1502"), b"").unwrap();
+        let prepared = prepare(&replicas, &member, &app, 1500, &slot, &[9u8; 516], &snap);
+        assert!(prepared.is_err(), "a torn last layer fails the seal");
+        assert_eq!(
+            last_checks(&path),
+            0,
+            "LAST-LAYER-MARKED-READ: a failing seal read its sector's last layer though its \
+             repair was marked this epoch"
+        );
+        gates(false);
+    }
+    /// An uncertified sector whose certificate on disk differs from the one
+    /// its labels, made again, give, as a sector set up from torn kept
+    /// labels leaves it, takes the certificate they give: GLOBAL holds the
+    /// old one only as a pending precommit, so its target and cached proof
+    /// are dropped and it precommits anew. Refused, it was labelled again at
+    /// every poll, with no end.
+    #[test]
+    fn an_uncertified_sector_takes_the_certificate_its_labels_give() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [73; 32];
+        let (path, id, n) = reserve(&store, &member, b"certified anew", 1500, 100).unwrap();
+        let whole = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        // Its certificate committed to other labels, its target and a proof
+        // made for them on disk.
+        let mut torn = Sector::load(path.clone()).unwrap().unwrap();
+        torn.cert.labels = torn.cert.columns;
+        torn.save().unwrap();
+        fs::write(path.join("capacity-target"), 1501u64.to_be_bytes()).unwrap();
+        fs::write(path.join("proof-1501-7"), b"proof").unwrap();
+        // Its kept labels removed, as a proof's check of them removes them.
+        store.discard_damaged(1500, &member, &id, n);
+        let again = initialize(&store, &member, 1500, path.clone(), id, n, &|| false);
+        let saved = Sector::load(path.clone()).unwrap().unwrap();
+        assert!(
+            again.is_ok_and(|sector| sector.cert == whole.cert)
+                && saved.cert == whole.cert
+                && !saved.certified
+                && !path.join("capacity-target").exists()
+                && !path.join("proof-1501-7").exists(),
+            "LAST-LAYER-RECERTIFY: an uncertified sector kept a certificate its labels do not \
+             give"
+        );
+        gates(false);
+    }
+    /// A damaged precommit target is reported once an epoch a sector,
+    /// however many polls find it: engines whose frames lie far apart may
+    /// each find the other's target past their next epoch.
+    #[test]
+    fn a_damaged_precommit_target_is_reported_once_an_epoch() {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"reported target", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(|_| {});
+        // A target far past the next epoch at each of two polls in one
+        // epoch.
+        for at in [frame + 1, frame + 2] {
+            fs::write(path.join("capacity-target"), 1_000_000u64.to_be_bytes()).unwrap();
+            poll_sector_certificates(
+                at,
+                &member,
+                &global,
+                clock.clone(),
+                &TestIdentity,
+                publish.clone(),
+            )
+            .unwrap();
+        }
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let reports = logged
+            .matches("precommit target on disk is past the next epoch")
+            .count();
+        assert_eq!(
+            reports, 1,
+            "LAST-LAYER-TARGET-WARN: a damaged precommit target was reported {reports} times \
+             in an epoch, not once"
+        );
+        gates(false);
+    }
+    /// A registered replica seals again once its sector's cap file, damaged
+    /// on disk, is rewritten from a last layer that matches the
+    /// certificate, and once a last layer gone from disk is labelled again:
+    /// either failed its seals for good, before any repair could start.
+    #[test]
+    fn a_registered_sector_seals_again_past_a_damaged_cap_or_a_lost_last_layer() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([75; 32], [77; 32]);
+        let (snap, slot, replicas, path, _) = registered_leaf(store, &member, app);
+        let output = vec![9; 516];
+        let cap = fs::read(path.join("cap")).unwrap();
+        fs::write(path.join("cap"), b"torn").unwrap();
+        let prepared = prepare(&replicas, &member, &app, 1500, &slot, &output, &snap);
+        assert!(
+            prepared.is_ok() && fs::read(path.join("cap")).unwrap() == cap,
+            "LAST-LAYER-CAP: a registered sector's damaged cap was not rewritten from its \
+             whole last layer"
+        );
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        fs::remove_file(&last).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let prepared = loop {
+            let prepared = prepare(&replicas, &member, &app, 1500, &slot, &output, &snap);
+            if prepared.is_ok() || std::time::Instant::now() > deadline {
+                break prepared;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            prepared.is_ok() && fs::read(&last).is_ok_and(|bytes| bytes == whole),
+            "LAST-LAYER-SERVE-MISSING: a registered sector whose last layer is gone was not \
+             labelled again"
+        );
+        gates(false);
+    }
+    /// A certified sector whose last layer is gone from disk is labelled
+    /// again, as one torn is, and the leaf it refused is then encoded.
+    #[test]
+    fn a_certified_sector_whose_last_layer_is_lost_is_labelled_again() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([79; 32], [81; 32]);
+        let (crdt, prefix, path, _, _) = certified_leaf(&store, &member, app);
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        fs::remove_file(&last).unwrap();
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let encoded = loop {
+            let encoded = encode_leaf(&snap, &member, &prefix, &replicas, Some(&store), &|| false);
+            if encoded.is_ok() || std::time::Instant::now() > deadline {
+                break encoded;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            encoded.is_ok() && fs::read(&last).is_ok_and(|bytes| bytes == whole),
+            "LAST-LAYER-MISSING: a certified sector whose last layer is gone was not labelled \
+             again"
+        );
+        gates(false);
+    }
     #[test]
     fn concurrent_pool_reservations_are_unique_and_bounded_by_cpu_slots() {
         crate::storage_jobs::set_job_slots_for_test(3);
