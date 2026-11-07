@@ -75,6 +75,7 @@ pub mod storage_epoch_batch;
 pub mod storage_history;
 pub mod storage_jobs;
 pub mod storage_labels;
+pub mod storage_ledger;
 pub mod storage_readiness;
 pub mod storage_snapshot;
 pub mod thread_worker;

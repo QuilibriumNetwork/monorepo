@@ -724,6 +724,23 @@ pub(crate) fn init(
                     "could not restore the manual remote workers"),
             }
         }
+        // This master proves the node's epoch proofs from its standalone
+        // workers' parts (400 MiB per sealed leaf): admit them with the
+        // workers' jobs in their ledger, beside their labels. The workers
+        // share one store parent (`worker_store_path`); an archive runs no
+        // app-shard seats.
+        if !archive_mode {
+            quil_engine::storage_jobs::install_master_ledger(
+                &crate::prover_tree_syncer_prod::storage_labels_dir(
+                    &crate::prover_tree_syncer_prod::worker_store_path(
+                        &config.db.worker_paths,
+                        &config.db.worker_path_prefix,
+                        &config.db.path,
+                        1,
+                    ),
+                ),
+            );
+        }
         // Publish to the halt broadcaster spawned above so it can
         // SetHalted across standalone workers when coverage halts.
         let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
@@ -904,23 +921,12 @@ pub(crate) fn init(
                 + Send
                 + Sync,
         > = Arc::new(move |core_id: u32| {
-            let path: std::path::PathBuf = {
-                let idx = core_id.saturating_sub(1) as usize;
-                if let Some(p) = worker_paths_cfg.get(idx).filter(|s| !s.is_empty()) {
-                    std::path::PathBuf::from(p)
-                } else if !worker_path_prefix_cfg.is_empty() {
-                    std::path::PathBuf::from(
-                        worker_path_prefix_cfg.replace("%d", &core_id.to_string()),
-                    )
-                } else {
-                    let base = if worker_db_base.is_empty() {
-                        std::path::PathBuf::from(".config/store")
-                    } else {
-                        std::path::PathBuf::from(&worker_db_base)
-                    };
-                    base.join(format!("worker-{}", core_id))
-                }
-            };
+            let path = crate::prover_tree_syncer_prod::worker_store_path(
+                &worker_paths_cfg,
+                &worker_path_prefix_cfg,
+                &worker_db_base,
+                core_id,
+            );
             std::fs::create_dir_all(&path)
                 .map_err(|e| format!("worker {} mkdir {}: {e}", core_id, path.display()))?;
             let db = quil_store::RocksDb::open(&path)

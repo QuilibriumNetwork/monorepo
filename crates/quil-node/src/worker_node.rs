@@ -35,26 +35,12 @@ pub(crate) async fn start(
     //   1. `db.worker_paths[core_id - 1]` (core 0 is master).
     //   2. `db.worker_path_prefix` with `%d` → core id.
     //   3. `<db.path or .config/store>/worker-<core_id>`.
-    let db_path: std::path::PathBuf = {
-        let idx = core_id.saturating_sub(1) as usize;
-        if let Some(p) = config.db.worker_paths.get(idx).filter(|s| !s.is_empty()) {
-            std::path::PathBuf::from(p)
-        } else if !config.db.worker_path_prefix.is_empty() {
-            std::path::PathBuf::from(
-                config
-                    .db
-                    .worker_path_prefix
-                    .replace("%d", &core_id.to_string()),
-            )
-        } else {
-            let base = if config.db.path.is_empty() {
-                std::path::PathBuf::from(".config/store")
-            } else {
-                std::path::PathBuf::from(&config.db.path)
-            };
-            base.join(format!("worker-{}", core_id))
-        }
-    };
+    let db_path = crate::prover_tree_syncer_prod::worker_store_path(
+        &config.db.worker_paths,
+        &config.db.worker_path_prefix,
+        &config.db.path,
+        core_id,
+    );
     info!(core_id, db_path = %db_path.display(), "worker store path resolved");
     std::fs::create_dir_all(&db_path)?;
     let db = quil_store::RocksDb::open(&db_path)?;

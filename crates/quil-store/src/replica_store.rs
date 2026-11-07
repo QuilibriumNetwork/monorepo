@@ -345,24 +345,17 @@ fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, sto
 static BACKGROUND: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
 
 /// One thread of this module's, counted from before it is spawned until it
-/// ends, so a wait started meanwhile sees it.
-struct Background;
+/// ends, so a wait started meanwhile sees it. A process ending through
+/// `exit` waits for it too.
+struct Background {
+    _exit: quil_forest::ExitHold,
+}
 
 impl Background {
     fn start() -> Self {
-        // A process ending through `exit` (a test binary; any normal return
-        // from `main`) first waits for these threads: RocksDB's statics were
-        // registered for teardown before this, so they are torn down after.
-        static AT_EXIT: std::sync::Once = std::sync::Once::new();
-        AT_EXIT.call_once(|| {
-            extern "C" fn wait_at_exit() {
-                wait_for_background_work(std::time::Duration::from_secs(60));
-            }
-            // SAFETY: registers a plain function with no captured state.
-            unsafe { libc::atexit(wait_at_exit) };
-        });
+        let exit = quil_forest::ExitHold::start();
         *BACKGROUND.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-        Self
+        Self { _exit: exit }
     }
 }
 
