@@ -1004,6 +1004,51 @@ fn watch(member: [u8; 32]) {
 /// Bytes proving holds per sealed leaf, and at least.
 const PROVING_BYTES_PER_SEALED_LEAF: u64 = 400 << 20;
 
+/// Which halves a part carries, for its log line: `frames` counts only the
+/// settling half, so a part that seals alone logs `frames=0`.
+pub fn part_name(seals: bool, settles: bool) -> &'static str {
+    match (seals, settles) {
+        (true, true) => "seal+settle",
+        (true, false) => "seal",
+        (false, true) => "settle",
+        (false, false) => "none",
+    }
+}
+
+/// Proofs that began and did not finish (the job unwound), since the
+/// process started.
+static ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Warns, when dropped before [`ProofWatch::finish`], that a member's epoch
+/// proof began and did not end: the log otherwise shows the proof's start
+/// and nothing after it, whatever interrupted it.
+struct ProofWatch {
+    member: String,
+    seats: usize,
+    shards: Vec<String>,
+    started: Instant,
+    finished: bool,
+}
+
+impl ProofWatch {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for ProofWatch {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(member = %self.member, seats = self.seats, shards = ?self.shards,
+            seconds = self.started.elapsed().as_secs_f64(),
+            "storage epoch proof started but did not finish: the node was stopping or the proving job \
+             unwound; its seats' workers send each part again, alone");
+    }
+}
+
 /// The lane of settlements proved alone.
 const SETTLEMENT_LANE: &[u8] = b"epoch proofs: settlements alone";
 
@@ -1055,7 +1100,18 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
             .iter()
             .map(|seat| (seat.member, seat.part.shard_filter.clone(), seat.part.epoch))
             .collect();
-        match prove(seats) {
+        info!(member, seats = count, sealed_leaves = sealed, shards = ?shards,
+            "proving storage epoch proof over the collected seats");
+        let mut watch = ProofWatch {
+            member: member.clone(),
+            seats: count,
+            shards: shards.clone(),
+            started,
+            finished: false,
+        };
+        let proof = prove(seats);
+        watch.finish();
+        match proof {
             Ok(bytes) => {
                 info!(member, seats = count, sealed_leaves = sealed, bytes = bytes.len(),
                     seconds = started.elapsed().as_secs_f64(), shards = ?shards, "submitting storage epoch proof");
@@ -1133,6 +1189,40 @@ mod tests {
             comm_r: [4; 32],
         }];
         part
+    }
+
+    #[test]
+    fn a_part_is_named_by_the_halves_it_carries() {
+        assert_eq!(part_name(true, true), "seal+settle");
+        assert_eq!(part_name(true, false), "seal");
+        assert_eq!(part_name(false, true), "settle");
+        assert_eq!(part_name(false, false), "none");
+    }
+
+    #[test]
+    fn a_proof_that_began_and_did_not_finish_is_counted_as_abandoned() {
+        let watch = || ProofWatch {
+            member: String::new(),
+            seats: 1,
+            shards: Vec::new(),
+            started: Instant::now(),
+            finished: false,
+        };
+        let before = ABANDONED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut done = watch();
+        done.finish();
+        drop(done);
+        assert_eq!(
+            ABANDONED.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "a finished proof is not counted"
+        );
+        drop(watch());
+        assert_eq!(
+            ABANDONED.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "an unfinished proof is counted"
+        );
     }
 
     /// A part splits into its seal and its settlement, each a part that

@@ -3837,7 +3837,7 @@ impl AppConsensusEngine {
                 })?;
                 seat.solo = attempt > 1 || (settle_alone && !seals);
                 let bytes = seat.to_bytes();
-                info!(epoch, seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
+                info!(epoch, part = crate::storage_epoch_batch::part_name(seals, settles), seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
                     bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
                     "storage epoch proof part prepared for the node");
                 publish(bytes);
