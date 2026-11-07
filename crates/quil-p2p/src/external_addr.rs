@@ -792,6 +792,24 @@ mod tests {
         documentation || crate::node::is_routable(addr)
     }
 
+    /// A peer's advertised address must not be dialled when the address the
+    /// transport dials is local, nor when it names a host the node has to
+    /// look up: a public address in front of a loopback one, or a DNS name,
+    /// passed the routability check.
+    #[test]
+    fn reproduces_stacked_and_named_addresses_routable() {
+        for addr in [
+            "/ip4/8.8.8.8/ip4/127.0.0.1/tcp/8337",
+            "/ip4/8.8.8.8/ip4/10.0.0.1/tcp/8336",
+            "/dns4/localhost/tcp/8337",
+        ] {
+            assert!(
+                !crate::node::is_routable(&addr.parse().unwrap()),
+                "{addr} counted as routable, so the node would dial it"
+            );
+        }
+    }
+
     fn tracker() -> ExternalAddrTracker {
         ExternalAddrTracker::new(Some(8336), Some(8336), false, routable)
     }

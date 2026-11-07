@@ -100,6 +100,9 @@ impl std::fmt::Debug for TopicConfigs {
     }
 }
 
+/// QUILIBRIUM: the id an older release computes for a message, where it differs.
+type LegacyMessageIdFn = Arc<dyn Fn(&Message) -> Option<MessageId> + Send + Sync + 'static>;
+
 /// Configuration parameters that define the performance of the gossipsub network.
 #[derive(Clone)]
 pub struct Config {
@@ -116,6 +119,8 @@ pub struct Config {
     duplicate_cache_time: Duration,
     validate_messages: bool,
     message_id_fn: Arc<dyn Fn(&Message) -> MessageId + Send + Sync + 'static>,
+    /// QUILIBRIUM: see [`ConfigBuilder::legacy_message_id_fn`].
+    legacy_message_id_fn: Option<LegacyMessageIdFn>,
     allow_self_origin: bool,
     do_px: bool,
     prune_peers: usize,
@@ -311,6 +316,14 @@ impl Config {
     /// the message id.
     pub fn message_id(&self, message: &Message) -> MessageId {
         (self.message_id_fn)(message)
+    }
+
+    /// QUILIBRIUM: the id an older release computes for `message`, if the builder set one
+    /// ([`ConfigBuilder::legacy_message_id_fn`]).
+    pub fn legacy_message_id(&self, message: &Message) -> Option<MessageId> {
+        self.legacy_message_id_fn
+            .as_ref()
+            .and_then(|id_fn| id_fn(message))
     }
 
     /// By default, gossipsub will reject messages that are sent to us that have the same message
@@ -540,6 +553,7 @@ impl Default for ConfigBuilder {
                         .push_str(&message.sequence_number.unwrap_or_default().to_string());
                     MessageId::from(source_string)
                 }),
+                legacy_message_id_fn: None,
                 allow_self_origin: false,
                 do_px: false,
                 // NOTE: Increasing this currently has little effect until Signed
@@ -845,6 +859,18 @@ impl ConfigBuilder {
         F: Fn(&Message) -> MessageId + Send + Sync + 'static,
     {
         self.config.message_id_fn = Arc::new(id_fn);
+        self
+    }
+
+    /// QUILIBRIUM: the id older releases compute for a message, when a flag day changed
+    /// [`Self::message_id_fn`] for it; `None` where they compute the same id. A peer that
+    /// answers our IWANT for such an id runs an older release: the behaviour counts it
+    /// (`Behaviour::take_legacy_id_answers`) for the node's operator log. Unset by default.
+    pub fn legacy_message_id_fn<F>(&mut self, id_fn: F) -> &mut Self
+    where
+        F: Fn(&Message) -> Option<MessageId> + Send + Sync + 'static,
+    {
+        self.config.legacy_message_id_fn = Some(Arc::new(id_fn));
         self
     }
 

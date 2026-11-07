@@ -234,7 +234,7 @@ pub fn build_worker_reachability(
 /// or building structs. Walks the encoding skipping each
 /// length-prefixed field by offset arithmetic. Used by the topic
 /// validator to short-circuit the expensive full decode + Ed448
-/// verify when a stale message is going to be rejected anyway.
+/// verify when a stale message is going to be dropped anyway.
 ///
 /// Returns `None` if the encoding doesn't look like a PeerInfo
 /// (wrong type prefix, truncated, or any length prefix overflows).
@@ -821,8 +821,9 @@ pub const MAX_KEY_REGISTRY_BYTES: usize = 64 * 1024;
 /// A PeerInfo or KeyRegistry older than this is dropped without penalty: it
 /// can age in transit through an honest relay.
 const STALE_IGNORE_PAST_MS: i64 = 60_000;
-/// Older than this, it is rejected: no honest relay forwards it.
-const STALE_REJECT_PAST_MS: i64 = 300_000;
+/// Older than this, it is stale: still dropped without penalty, as the
+/// check depends on the receiver's clock (see [`peer_info_gossip_result`]).
+const STALE_PAST_MS: i64 = 300_000;
 
 static STRICT_PEER_INFO_VALIDATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -857,7 +858,7 @@ pub enum PeerInfoVerdict {
 }
 
 fn freshness(timestamp: i64, now_ms: i64, max_ahead_ms: i64) -> Option<PeerInfoVerdict> {
-    if timestamp < now_ms - STALE_REJECT_PAST_MS {
+    if timestamp < now_ms - STALE_PAST_MS {
         Some(PeerInfoVerdict::Stale)
     } else if timestamp < now_ms - STALE_IGNORE_PAST_MS || timestamp > now_ms + max_ahead_ms {
         Some(PeerInfoVerdict::Late)
@@ -928,12 +929,18 @@ pub fn peer_info_gossip_verdict(data: &[u8], now_ms: i64) -> PeerInfoVerdict {
 /// dropped without penalty until strict validation, since releases before
 /// these checks forward it: penalising them for it would cut them off the
 /// mesh. Strict validation also refuses unsigned KeyRegistry timestamps.
+///
+/// A late or stale record is dropped without penalty under any setting.
+/// Whether it is stale depends on the receiver's clock, and a rejection
+/// lowers its forwarder's score on every topic: a relay whose clock is a
+/// few minutes slow, an originator whose clock is, and any release that
+/// forwards records without these checks would be graylisted for it. A
+/// stale record is not forwarded either way.
 pub fn peer_info_gossip_result(verdict: PeerInfoVerdict, strict: bool) -> crate::ValidationResult {
     use crate::ValidationResult::{Accept, Ignore, Reject};
     match verdict {
         PeerInfoVerdict::Accept => Accept,
-        PeerInfoVerdict::Late => Ignore,
-        PeerInfoVerdict::Stale => Reject,
+        PeerInfoVerdict::Late | PeerInfoVerdict::Stale => Ignore,
         PeerInfoVerdict::Invalid if strict => Reject,
         PeerInfoVerdict::Invalid => Ignore,
         PeerInfoVerdict::UnsignedTimestamp if strict => Reject,
@@ -1583,7 +1590,7 @@ mod tests {
 
     // =====================================================================
     // Cheap-peek timestamp extraction (avoids full canonical decode +
-    // Ed448 verify on messages that will be rejected for staleness anyway)
+    // Ed448 verify on messages that will be dropped for staleness anyway)
     // =====================================================================
 
     fn fixture_peer_info(timestamp: i64, last_received: u64) -> CanonicalPeerInfo {
@@ -1806,9 +1813,44 @@ mod tests {
             Accept
         );
         assert_eq!(peer_info_gossip_result(PeerInfoVerdict::Late, true), Ignore);
+    }
+
+    /// A stale PeerInfo or KeyRegistry is dropped without penalty, strict or
+    /// not, as staleness depends on the receiver's clock; an invalid record
+    /// and an unsigned KeyRegistry timestamp are still rejected when strict.
+    #[test]
+    fn stale_records_are_ignored_and_invalid_ones_rejected_when_strict() {
+        use crate::ValidationResult::{Ignore, Reject};
+        let stale_info = signed_peer_info(NOW - 6 * 60_000);
+        let stale_registry = key_registry((NOW - 6 * 60_000) as u64, true);
+        for stale in [&stale_info, &stale_registry] {
+            let verdict = peer_info_gossip_verdict(stale, NOW);
+            assert_eq!(verdict, PeerInfoVerdict::Stale);
+            for strict in [false, true] {
+                assert_eq!(
+                    peer_info_gossip_result(verdict, strict),
+                    Ignore,
+                    "a stale record is penalised (strict {strict})"
+                );
+            }
+        }
+        let mut invalid = signed_peer_info(NOW - 1_000);
+        let at = invalid.len() - 16 - 10;
+        invalid[at] ^= 1;
+        let verdict = peer_info_gossip_verdict(&invalid, NOW);
+        assert_eq!(verdict, PeerInfoVerdict::Invalid);
         assert_eq!(
-            peer_info_gossip_result(PeerInfoVerdict::Stale, false),
-            Reject
+            peer_info_gossip_result(verdict, true),
+            Reject,
+            "an invalid record is not rejected when strict"
+        );
+        let unsigned = key_registry((NOW - 1_000) as u64, false);
+        let verdict = peer_info_gossip_verdict(&unsigned, NOW);
+        assert_eq!(verdict, PeerInfoVerdict::UnsignedTimestamp);
+        assert_eq!(
+            peer_info_gossip_result(verdict, true),
+            Reject,
+            "an unsigned KeyRegistry timestamp is not rejected when strict"
         );
     }
 
