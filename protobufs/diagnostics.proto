@@ -205,7 +205,15 @@ enum ConditionKind {
   // Shards whose head in committed GLOBAL state trails their app head by
   // more than `HealthCondition.threshold` frames.
   CONDITION_KIND_GLOBAL_APP_FRAMES_BEHIND = 4;
-  // 5-24 are taken by other conditions.
+  // 5-12 are taken by other conditions.
+  // This node's GLOBAL head (the frame it follows) has not advanced for
+  // `HealthCondition.threshold` seconds. On a GLOBAL prover
+  // `HealthCondition.global` counts the GLOBAL provers it hears.
+  CONDITION_KIND_GLOBAL_HEAD_UNCHANGED = 13;
+  // GLOBAL advanced fewer than `HealthCondition.threshold` frames an hour
+  // over the window in `HealthCondition.global`.
+  CONDITION_KIND_GLOBAL_FRAMES_SLOW = 14;
+  // 15-24 are taken by other conditions.
   // An expected wait: an archive state sync of GLOBAL has installed some of
   // its chunks but not the last, so committed GLOBAL state (each shard's
   // committed head among it) is unreadable until it does. A warning once it
@@ -252,7 +260,15 @@ enum ConditionAction {
   // GLOBAL's inclusion of the shard on the explorer: advancing there means
   // this node's GLOBAL view trails.
   CONDITION_ACTION_CHECK_GLOBAL_INCLUSION = 3;
-  // 4-20 are taken by other conditions.
+  // 4-9 are taken by other conditions.
+  // GLOBAL's head on the explorer: stopped there means GLOBAL halted
+  // network-wide; advancing there means this node stopped following it.
+  CONDITION_ACTION_CHECK_GLOBAL_HEAD = 10;
+  // GLOBAL's frame rate on the explorer: slow there means its provers vote
+  // late or skip leader turns; normal there means this node receives its
+  // frames late.
+  CONDITION_ACTION_CHECK_GLOBAL_RATE = 11;
+  // 12-20 are taken by other conditions.
   // None while the GLOBAL state sync installs; past its expected time, the
   // node's `sync phase` and prover tree sync log lines.
   CONDITION_ACTION_WAIT_FOR_GLOBAL_SYNC = 21;
@@ -294,12 +310,14 @@ message HealthCondition {
   uint32 affected = 6;
   uint32 tracked = 7;
   // The base window in seconds for the `..._UNCHANGED` kinds, the lag in
-  // frames for `..._BEHIND`.
+  // frames for `..._BEHIND`, the frames an hour for `..._FRAMES_SLOW`.
   uint64 threshold = 8;
   // The affected shards, at most 64; the rest are counted.
   repeated AffectedShard shards = 9;
   uint32 omitted_shards = 10;
-  // 11-14 are taken by other conditions.
+  // 11-13 are taken by other conditions.
+  // For the GLOBAL progress kinds: what was judged.
+  GlobalProgress global = 14;
   // For the expected waits: what ends it.
   ExpectedWait wait = 15;
 }
@@ -316,6 +334,21 @@ message ExpectedWait {
   // How long it lasts at most when all is well; 0 when only its frame bounds
   // it. A wait lasting longer is a warning.
   uint64 expected_secs = 4;
+}
+
+// GLOBAL's progress as this node judged it (`HealthCondition.global`).
+message GlobalProgress {
+  // This node's GLOBAL head.
+  uint64 head = 1;
+  // Frames GLOBAL advanced over `span_secs`: for `..._HEAD_UNCHANGED` 0 over
+  // the span the head stayed, for `..._FRAMES_SLOW` the rate's window.
+  uint64 advanced_frames = 2;
+  uint64 span_secs = 3;
+  // On a GLOBAL prover: the GLOBAL provers, those heard from recently (this
+  // node included) and the quorum consensus needs; 0 elsewhere.
+  uint32 provers = 4;
+  uint32 reachable = 5;
+  uint32 quorum = 6;
 }
 
 // What this node observed to judge one kind, so a reader can tell "nothing

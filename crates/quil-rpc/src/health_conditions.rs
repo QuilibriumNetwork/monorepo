@@ -22,11 +22,12 @@
 //! worker core numbers, frames, counts and times, never addresses, keys,
 //! paths or peer IDs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use quil_engine::global_stall::GlobalReach;
 use quil_types::proto::diagnostics::{
     AffectedShard, ConditionAction, ConditionKind, ConditionScope, ConditionSeverity,
-    ConditionSource, ExpectedWait, HealthCondition, HealthConditions,
+    ConditionSource, ExpectedWait, GlobalProgress, HealthCondition, HealthConditions,
 };
 use quil_types::proto::node::{FrameCadence, FrameWindow, GlobalAppFrameHead};
 use tracing::{error, info, warn};
@@ -63,13 +64,25 @@ pub const PROVER_OP_MARGIN_FRAMES: u64 =
 /// advances: the margin's frames many times over. Longer means GLOBAL is not
 /// advancing, or this node is not following it.
 pub const EPOCH_WAIT_EXPECTED_MS: u64 = 10 * 60_000;
+/// GLOBAL's head unchanged this long is a stall: four leader timeouts and at
+/// least this, so a few skipped leader turns and a frame are not one; a
+/// GLOBAL prover's longer leader timeout widens it ([`GlobalReach`]).
+pub const GLOBAL_STALL_MS: u64 = quil_engine::global_stall::MIN_STALL_AFTER.as_millis() as u64;
+/// GLOBAL advancing fewer frames an hour is slow (10 s frames make 360).
+pub const GLOBAL_MIN_FRAMES_PER_HOUR: u64 = 330;
+/// GLOBAL's rate is judged over at most this window, once its samples span
+/// [`GLOBAL_RATE_MIN_SPAN_MS`].
+pub const GLOBAL_RATE_WINDOW_MS: u64 = 3_600_000;
+pub const GLOBAL_RATE_MIN_SPAN_MS: u64 = 600_000;
 
 /// Every kind this build judges.
-pub const KINDS: [ConditionKind; 7] = [
+pub const KINDS: [ConditionKind; 9] = [
     ConditionKind::LocalAppFramesUnchanged,
     ConditionKind::PeerAppFramesUnchanged,
     ConditionKind::GlobalAppFramesUnchanged,
     ConditionKind::GlobalAppFramesBehind,
+    ConditionKind::GlobalHeadUnchanged,
+    ConditionKind::GlobalFramesSlow,
     ConditionKind::GlobalStateSyncInstalling,
     ConditionKind::ProverOpsWaitForEpoch,
     ConditionKind::ShieldsNotAdmitted,
@@ -215,6 +228,17 @@ struct CommittedTrack {
     seen_ms: u64,
 }
 
+/// The GLOBAL head this node knows, as the health task samples it.
+#[derive(Debug, Clone, Default)]
+struct GlobalTrack {
+    head: u64,
+    since_ms: u64,
+    seen_ms: u64,
+    /// `(time, head)` over the rate window.
+    samples: VecDeque<(u64, u64)>,
+    reach: Option<GlobalReach>,
+}
+
 #[derive(Debug, Clone)]
 struct Current {
     since_ms: u64,
@@ -226,6 +250,7 @@ struct Current {
     /// An expected wait that lasted past its expected time.
     overran: bool,
     condition: HealthCondition,
+    log_evidence: Option<String>,
 }
 
 /// A change of a condition, to be logged.
@@ -233,6 +258,9 @@ struct Current {
 pub enum Transition {
     Started {
         condition: HealthCondition,
+        /// Evidence for this node's log that is not served, such as the
+        /// labels of unreachable GLOBAL provers.
+        log_evidence: Option<String>,
     },
     Lasting {
         condition: HealthCondition,
@@ -241,6 +269,7 @@ pub enum Transition {
         /// length, during which it was not served.
         clear_spells: u32,
         unserved_ms: u64,
+        log_evidence: Option<String>,
     },
     /// An expected wait lasted past its expected time: from now on a
     /// warning.
@@ -274,6 +303,7 @@ pub struct HealthRegistry {
     committed_seen_ms: u64,
     global: GlobalObservation,
     global_seen_ms: u64,
+    global_head: Option<GlobalTrack>,
     /// When each judged worker without an advance was first judged.
     worker_first_seen: HashMap<(u32, Vec<u8>), u64>,
     current: BTreeMap<i32, Current>,
@@ -285,6 +315,8 @@ pub struct HealthRegistry {
 fn severity_of(kind: ConditionKind, overran: bool) -> ConditionSeverity {
     if WAIT_KINDS.contains(&kind) && !overran {
         ConditionSeverity::Info
+    } else if kind == ConditionKind::GlobalHeadUnchanged {
+        ConditionSeverity::Error
     } else {
         ConditionSeverity::Warning
     }
@@ -307,6 +339,8 @@ fn action_of(kind: ConditionKind) -> ConditionAction {
         ConditionKind::GlobalStateSyncInstalling => ConditionAction::WaitForGlobalSync,
         ConditionKind::ProverOpsWaitForEpoch => ConditionAction::WaitForNextEpoch,
         ConditionKind::ShieldsNotAdmitted => ConditionAction::WaitForShieldAdmission,
+        ConditionKind::GlobalHeadUnchanged => ConditionAction::CheckGlobalHead,
+        ConditionKind::GlobalFramesSlow => ConditionAction::CheckGlobalRate,
         _ => ConditionAction::CheckGlobalInclusion,
     }
 }
@@ -321,6 +355,11 @@ fn expected_ms(kind: ConditionKind) -> Option<u64> {
     }
 }
 
+/// Whether `frames` over `span_ms` reach [`GLOBAL_MIN_FRAMES_PER_HOUR`].
+fn global_rate_ok(frames: u64, span_ms: u64) -> bool {
+    u128::from(frames) * 3_600_000 >= u128::from(GLOBAL_MIN_FRAMES_PER_HOUR) * u128::from(span_ms)
+}
+
 /// One kind's judgement in an evaluation.
 struct Judged {
     kind: ConditionKind,
@@ -330,6 +369,18 @@ struct Judged {
     threshold: u64,
     /// For an expected wait: what ends it, when it is current.
     wait: Option<ExpectedWait>,
+    global: Option<GlobalProgress>,
+    log_evidence: Option<String>,
+}
+
+/// GLOBAL's progress judged at one evaluation.
+#[derive(Default)]
+struct GlobalJudged {
+    unchanged: Option<(AffectedShard, GlobalProgress)>,
+    slow: Option<(AffectedShard, GlobalProgress)>,
+    tracked: u32,
+    window_ms: u64,
+    unreachable: Option<String>,
 }
 
 impl HealthRegistry {
@@ -446,6 +497,8 @@ impl HealthRegistry {
                 observed_unix_ms,
                 threshold,
                 wait: wait.filter(|_| observed_unix_ms != 0 && tracked),
+                global: None,
+                log_evidence: None,
             };
 
         let kind = ConditionKind::GlobalStateSyncInstalling;
@@ -504,6 +557,37 @@ impl HealthRegistry {
             }
         }
         transitions
+    }
+
+    /// Record the GLOBAL head this node knows (0: unknown) and, on a GLOBAL
+    /// prover, the GLOBAL provers it hears.
+    pub fn observe_global_head(&mut self, head: u64, reach: Option<GlobalReach>, now_ms: u64) {
+        if head == 0 {
+            return;
+        }
+        let mut track = match self.global_head.take() {
+            Some(t) if now_ms.saturating_sub(t.seen_ms) <= OBSERVATION_GAP_MS => t,
+            _ => GlobalTrack {
+                head,
+                since_ms: now_ms,
+                ..Default::default()
+            },
+        };
+        if track.head != head {
+            track.head = head;
+            track.since_ms = now_ms;
+        }
+        track.seen_ms = now_ms;
+        track.samples.push_back((now_ms, head));
+        while track
+            .samples
+            .front()
+            .is_some_and(|(t, _)| t + GLOBAL_RATE_WINDOW_MS < now_ms)
+        {
+            track.samples.pop_front();
+        }
+        track.reach = reach;
+        self.global_head = Some(track);
     }
 
     /// Record the worker view.
@@ -614,6 +698,76 @@ impl HealthRegistry {
         (unchanged, behind, tracked)
     }
 
+    /// GLOBAL's head unchanged for its window, else its rate below
+    /// [`GLOBAL_MIN_FRAMES_PER_HOUR`] once the samples span
+    /// [`GLOBAL_RATE_MIN_SPAN_MS`]: a stall is one condition while it lasts
+    /// and shows in the rate after it, until the hour has made it up, so a
+    /// stall shorter than a reader's gap between reads still shows.
+    /// Nothing without a fresh observation.
+    fn judge_global(&mut self, now_ms: u64) -> GlobalJudged {
+        if self
+            .global_head
+            .as_ref()
+            .is_some_and(|t| now_ms.saturating_sub(t.seen_ms) > OBSERVATION_GAP_MS)
+        {
+            self.global_head = None;
+        }
+        let Some(t) = self.global_head.as_ref() else {
+            return GlobalJudged {
+                window_ms: GLOBAL_STALL_MS,
+                ..Default::default()
+            };
+        };
+        let window_ms = global_window_ms(t.reach.as_ref());
+        let progress = |advanced_frames, span_ms: u64| {
+            let (provers, reachable, quorum) = t
+                .reach
+                .as_ref()
+                .map_or((0, 0, 0), |r| (r.provers, r.reachable, r.quorum));
+            GlobalProgress {
+                head: t.head,
+                advanced_frames,
+                span_secs: span_ms / 1000,
+                provers: provers as u32,
+                reachable: reachable as u32,
+                quorum: quorum as u32,
+            }
+        };
+        let mut judged = GlobalJudged {
+            tracked: 1,
+            window_ms,
+            unreachable: t
+                .reach
+                .as_ref()
+                .filter(|r| !r.unreachable.is_empty())
+                .map(|r| r.unreachable.join(", ")),
+            ..Default::default()
+        };
+        // Unchanged only as far as it was observed.
+        let unchanged_ms = t.seen_ms.saturating_sub(t.since_ms);
+        if unchanged_ms >= window_ms {
+            let row = AffectedShard {
+                frame: t.head,
+                unchanged_since_unix_ms: t.since_ms,
+                window_secs: window_ms / 1000,
+                ..Default::default()
+            };
+            judged.unchanged = Some((row, progress(0, unchanged_ms)));
+        } else if let Some(&(first_ms, first_head)) = t.samples.front() {
+            let span_ms = t.seen_ms.saturating_sub(first_ms);
+            let frames = t.head.saturating_sub(first_head);
+            if span_ms >= GLOBAL_RATE_MIN_SPAN_MS && !global_rate_ok(frames, span_ms) {
+                let row = AffectedShard {
+                    frame: t.head,
+                    window_secs: span_ms / 1000,
+                    ..Default::default()
+                };
+                judged.slow = Some((row, progress(frames, span_ms)));
+            }
+        }
+        judged
+    }
+
     /// Judge every kind at `now_ms`, each shard by its window from
     /// `cadence`; the transitions to log.
     pub fn evaluate(
@@ -626,6 +780,8 @@ impl HealthRegistry {
         let (local, local_tracked) = self.judge_local(now_ms, &window);
         let (peer, peer_tracked) = self.judge_peers(now_ms, &window);
         let (unchanged, behind, committed_tracked) = self.judge_committed(now_ms, &window);
+        let global = self.judge_global(now_ms);
+        let global_seen = self.global_head.as_ref().map_or(0, |t| t.seen_ms);
         let fresh = |seen: u64| {
             if seen != 0 && now_ms.saturating_sub(seen) <= OBSERVATION_GAP_MS {
                 seen
@@ -642,6 +798,8 @@ impl HealthRegistry {
                 observed_unix_ms: fresh(self.workers_seen_ms),
                 threshold: base_secs,
                 wait: None,
+                global: None,
+                log_evidence: None,
             },
             Judged {
                 kind: ConditionKind::PeerAppFramesUnchanged,
@@ -650,6 +808,8 @@ impl HealthRegistry {
                 observed_unix_ms: fresh(self.peers_seen_ms),
                 threshold: base_secs,
                 wait: None,
+                global: None,
+                log_evidence: None,
             },
             Judged {
                 kind: ConditionKind::GlobalAppFramesUnchanged,
@@ -658,6 +818,8 @@ impl HealthRegistry {
                 observed_unix_ms: fresh(self.committed_seen_ms),
                 threshold: base_secs,
                 wait: None,
+                global: None,
+                log_evidence: None,
             },
             Judged {
                 kind: ConditionKind::GlobalAppFramesBehind,
@@ -666,6 +828,32 @@ impl HealthRegistry {
                 observed_unix_ms: fresh(self.committed_seen_ms),
                 threshold: GLOBAL_APP_LAG_FRAMES,
                 wait: None,
+                global: None,
+                log_evidence: None,
+            },
+            Judged {
+                kind: ConditionKind::GlobalHeadUnchanged,
+                shards: global
+                    .unchanged
+                    .iter()
+                    .map(|(row, _)| row.clone())
+                    .collect(),
+                tracked: global.tracked,
+                observed_unix_ms: fresh(global_seen),
+                threshold: global.window_ms / 1000,
+                wait: None,
+                global: global.unchanged.map(|(_, progress)| progress),
+                log_evidence: global.unreachable,
+            },
+            Judged {
+                kind: ConditionKind::GlobalFramesSlow,
+                shards: global.slow.iter().map(|(row, _)| row.clone()).collect(),
+                tracked: global.tracked,
+                observed_unix_ms: fresh(global_seen),
+                threshold: GLOBAL_MIN_FRAMES_PER_HOUR,
+                wait: None,
+                global: global.slow.map(|(_, progress)| progress),
+                log_evidence: None,
             },
         ];
         self.sources.clear();
@@ -693,6 +881,8 @@ impl HealthRegistry {
             tracked,
             threshold,
             wait,
+            global,
+            log_evidence,
             ..
         } = judged;
         let key = kind as i32;
@@ -735,6 +925,7 @@ impl HealthRegistry {
             shards,
             omitted_shards,
             wait,
+            global,
         };
         if let Some(current) = self.current.get_mut(&key) {
             // It recurred within its clear hold: count the spell.
@@ -745,6 +936,7 @@ impl HealthRegistry {
             let duration_ms = now_ms.saturating_sub(current.since_ms);
             let overran = expected_ms(kind).is_some_and(|expected| duration_ms >= expected);
             current.condition = condition(current.since_ms, overran);
+            current.log_evidence = log_evidence;
             if overran && !current.overran {
                 // An anomaly now: a warning from here on.
                 current.overran = true;
@@ -763,6 +955,7 @@ impl HealthRegistry {
                     duration_ms: now_ms.saturating_sub(current.since_ms),
                     clear_spells: current.clear_spells,
                     unserved_ms: current.unserved_ms,
+                    log_evidence: current.log_evidence.clone(),
                 });
             }
             return None;
@@ -775,10 +968,14 @@ impl HealthRegistry {
             unserved_ms: 0,
             overran: false,
             condition: condition(now_ms, false),
+            log_evidence: log_evidence.clone(),
         };
         let started = current.condition.clone();
         self.current.insert(key, current);
-        Some(Transition::Started { condition: started })
+        Some(Transition::Started {
+            condition: started,
+            log_evidence,
+        })
     }
 
     /// The conditions found at the last evaluation, worst first (a clear
@@ -796,6 +993,13 @@ impl HealthRegistry {
             sources: self.sources.clone(),
         }
     }
+}
+
+/// The stall window GLOBAL's head is judged by.
+fn global_window_ms(reach: Option<&GlobalReach>) -> u64 {
+    reach.map_or(GLOBAL_STALL_MS, |r| {
+        (r.stall_after.as_millis() as u64).max(GLOBAL_STALL_MS)
+    })
 }
 
 /// The condition's notice, as the node logs it and clients show it.
@@ -861,6 +1065,33 @@ pub fn notice_text(c: &HealthCondition) -> String {
                 )
             }
         }
+        ConditionKind::GlobalHeadUnchanged => {
+            let reach = c.global.as_ref().filter(|g| g.provers > 0);
+            match reach {
+                Some(g) if g.reachable < g.quorum => format!(
+                    "Global head unchanged >{threshold}s: {} of {} GLOBAL provers reachable, {} \
+                     needed.",
+                    g.reachable, g.provers, g.quorum
+                ),
+                Some(g) => format!(
+                    "Global head unchanged >{threshold}s although {} of {} GLOBAL provers are \
+                     reachable ({} needed).",
+                    g.reachable, g.provers, g.quorum
+                ),
+                None => format!("Global head unchanged >{threshold}s."),
+            }
+        }
+        ConditionKind::GlobalFramesSlow => {
+            let g = c.global.unwrap_or_default();
+            let rate = (g.advanced_frames * 3_600)
+                .checked_div(g.span_secs)
+                .unwrap_or(0);
+            format!(
+                "Global frames slow: {} in {} min (~{rate}/h, below {threshold}/h).",
+                g.advanced_frames,
+                g.span_secs / 60
+            )
+        }
         ConditionKind::Unspecified => format!(
             "Health condition {} ({}, {}): {affected}/{tracked}; see this node's log.",
             c.kind,
@@ -868,6 +1099,21 @@ pub fn notice_text(c: &HealthCondition) -> String {
             scope_label(c.scope)
         ),
     }
+}
+
+/// The notice of the worst current GLOBAL progress condition, if any, as a
+/// clause without its final stop: what a paced shield pauses for.
+pub fn global_progress_notice(health: &HealthConditions) -> Option<String> {
+    health
+        .conditions
+        .iter()
+        .find(|c| {
+            matches!(
+                ConditionKind::try_from(c.kind),
+                Ok(ConditionKind::GlobalHeadUnchanged | ConditionKind::GlobalFramesSlow)
+            )
+        })
+        .map(|c| notice_text(c).trim_end_matches('.').to_string())
 }
 
 /// What the operator checks next.
@@ -895,6 +1141,18 @@ pub fn action_text(action: i32) -> &'static str {
         }
         ConditionAction::WaitForShieldAdmission => {
             "nothing: shield once GLOBAL reaches the admission frame"
+        }
+        ConditionAction::CheckGlobalHead => {
+            "compare GLOBAL's head on the explorer: stopped there means GLOBAL halted \
+             network-wide (a GLOBAL prover's log names the unreachable provers to bring back; \
+             with a quorum reachable, look for provers on builds with other activation \
+             constants), advancing there means this node stopped following GLOBAL: check its \
+             peers and sync"
+        }
+        ConditionAction::CheckGlobalRate => {
+            "compare GLOBAL's frame rate on the explorer: slow there means GLOBAL provers vote \
+             late or skip leader turns (their logs count skipped turns), normal there means \
+             this node receives GLOBAL frames late: check its peers"
         }
         ConditionAction::Unspecified => "see this node's log",
     }
@@ -928,6 +1186,8 @@ pub fn kind_label(kind: i32) -> &'static str {
         ConditionKind::GlobalStateSyncInstalling => "global_state_sync_installing",
         ConditionKind::ProverOpsWaitForEpoch => "prover_ops_wait_for_epoch",
         ConditionKind::ShieldsNotAdmitted => "shields_not_admitted",
+        ConditionKind::GlobalHeadUnchanged => "global_head_unchanged",
+        ConditionKind::GlobalFramesSlow => "global_frames_slow",
         ConditionKind::Unspecified => "unknown",
     }
 }
@@ -939,7 +1199,10 @@ fn shard_names(c: &HealthCondition) -> String {
         .shards
         .iter()
         .take(3)
-        .map(|s| hex::encode(&s.filter[s.filter.len().saturating_sub(6)..]))
+        .map(|s| match s.filter.as_slice() {
+            [] => "global".to_string(),
+            filter => hex::encode(&filter[filter.len().saturating_sub(6)..]),
+        })
         .collect::<Vec<_>>()
         .join(",");
     let more = c.affected.saturating_sub(3);
@@ -979,10 +1242,14 @@ macro_rules! at_severity {
 /// an expected wait starts as info, and warns once it overruns.
 pub fn log_transition(transition: &Transition) {
     match transition {
-        Transition::Started { condition: c } => {
+        Transition::Started {
+            condition: c,
+            log_evidence,
+        } => {
             at_severity!(c.severity, condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
-                widest_window_secs = widest_window(c), action = action_text(c.action),
+                widest_window_secs = widest_window(c), evidence = log_evidence.as_deref(),
+                action = action_text(c.action),
                 text = %notice_text(c), "health condition started");
         }
         Transition::Lasting {
@@ -990,11 +1257,13 @@ pub fn log_transition(transition: &Transition) {
             duration_ms,
             clear_spells,
             unserved_ms,
+            log_evidence,
         } => {
             at_severity!(c.severity, condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
                 widest_window_secs = widest_window(c), duration_secs = duration_ms / 1000,
                 clear_spells, unserved_secs = unserved_ms / 1000,
+                evidence = log_evidence.as_deref(),
                 action = action_text(c.action), text = %notice_text(c),
                 "health condition lasting");
         }
@@ -1921,5 +2190,228 @@ mod tests {
             assert!(current(&reg, kind).is_none(), "{from:?}");
             assert_eq!(source_of(&reg, kind), (T0, 0), "{from:?}");
         }
+    }
+
+    fn reach(reachable: usize, stall_secs: u64) -> GlobalReach {
+        GlobalReach {
+            provers: 4,
+            reachable,
+            quorum: 3,
+            unreachable: (reachable..4).map(|m| format!("…member{m}")).collect(),
+            stall_after: std::time::Duration::from_secs(stall_secs),
+        }
+    }
+
+    /// GLOBAL's head unchanged for 120 s, as far as it was observed, is an
+    /// error of the network; an advance clears it.
+    #[test]
+    fn global_head_unchanged_starts_after_its_window() {
+        let none = |_: &[u8]| None;
+        let mut reg = HealthRegistry::default();
+        for secs in (0..=105).step_by(15) {
+            let now = T0 + secs * 1000;
+            reg.observe_global_head(5_000, None, now);
+            assert!(reg.evaluate(now, &none).is_empty(), "at {secs}s");
+        }
+        let now = T0 + 120_000;
+        reg.observe_global_head(5_000, None, now);
+        let started = reg.evaluate(now, &none);
+        assert!(
+            matches!(
+                started.as_slice(),
+                [Transition::Started {
+                    log_evidence: None,
+                    ..
+                }]
+            ),
+            "{started:?}"
+        );
+        let snapshot = reg.snapshot();
+        let c = &snapshot.conditions[0];
+        assert_eq!(
+            (c.kind, c.severity, c.scope, c.action, c.threshold),
+            (
+                ConditionKind::GlobalHeadUnchanged as i32,
+                ConditionSeverity::Error as i32,
+                ConditionScope::Network as i32,
+                ConditionAction::CheckGlobalHead as i32,
+                120
+            )
+        );
+        assert_eq!(c.shards[0].unchanged_since_unix_ms, T0);
+        assert_eq!(
+            c.global.as_ref().map(|g| (g.head, g.span_secs, g.provers)),
+            Some((5_000, 120, 0))
+        );
+        assert_eq!(notice_text(c), "Global head unchanged >120s.");
+        assert_eq!(shard_names(c), "global");
+        reg.observe_global_head(5_001, None, now + 15_000);
+        reg.evaluate(now + 15_000, &none);
+        assert!(reg.snapshot().conditions.is_empty());
+    }
+
+    /// On a GLOBAL prover the window is four of its leader timeouts, the
+    /// notice counts the provers it hears against the quorum, and only the
+    /// log names the silent ones.
+    #[test]
+    fn a_global_prover_judges_by_its_leader_timeout_and_counts_the_provers_heard() {
+        let none = |_: &[u8]| None;
+        let run = |reachable: usize| {
+            let mut reg = HealthRegistry::default();
+            let mut transitions = Vec::new();
+            for secs in (0..=255).step_by(15) {
+                let now = T0 + secs * 1000;
+                reg.observe_global_head(5_000, Some(reach(reachable, 240)), now);
+                let changes = reg.evaluate(now, &none);
+                assert!(secs >= 240 || changes.is_empty(), "at {secs}s: {changes:?}");
+                transitions.extend(changes);
+            }
+            (reg.snapshot().conditions, transitions)
+        };
+        let (conditions, transitions) = run(2);
+        assert_eq!(
+            notice_text(&conditions[0]),
+            "Global head unchanged >240s: 2 of 4 GLOBAL provers reachable, 3 needed."
+        );
+        assert!(
+            matches!(
+                transitions.as_slice(),
+                [Transition::Started { log_evidence: Some(names), .. }]
+                    if names == "…member2, …member3"
+            ),
+            "{transitions:?}"
+        );
+        let (conditions, _) = run(3);
+        assert_eq!(
+            notice_text(&conditions[0]),
+            "Global head unchanged >240s although 3 of 4 GLOBAL provers are reachable (3 needed)."
+        );
+    }
+
+    /// Under 330 frames an hour is slow once 10 minutes are observed; 330
+    /// is not.
+    #[test]
+    fn global_frames_slow_needs_ten_minutes_under_330_an_hour() {
+        let none = |_: &[u8]| None;
+        // `frames` every 120 s: 11 make 330 an hour, 10 make 300.
+        let run = |frames: u64, until: u64| {
+            let mut reg = HealthRegistry::default();
+            for step in 0..=until / 120 {
+                let now = T0 + step * 120_000;
+                reg.observe_global_head(1_000 + step * frames, None, now);
+                reg.evaluate(now, &none);
+            }
+            reg.snapshot().conditions
+        };
+        assert!(run(10, 480).is_empty(), "judged before 10 minutes");
+        assert!(run(11, 3_600).is_empty(), "330 an hour is not slow");
+        let slow = run(10, 600);
+        assert_eq!(slow.len(), 1);
+        assert_eq!(
+            (slow[0].kind, slow[0].severity, slow[0].threshold),
+            (
+                ConditionKind::GlobalFramesSlow as i32,
+                ConditionSeverity::Warning as i32,
+                GLOBAL_MIN_FRAMES_PER_HOUR
+            )
+        );
+        assert_eq!(
+            notice_text(&slow[0]),
+            "Global frames slow: 50 in 10 min (~300/h, below 330/h)."
+        );
+    }
+
+    /// A stall is one condition while it lasts; after it the hour's rate
+    /// shows it, so a stall between two of a reader's reads still shows.
+    #[test]
+    fn a_global_stall_then_shows_in_the_hourly_rate() {
+        let none = |_: &[u8]| None;
+        // One frame per 10 s for 20 min, standing still for 5 min, then on.
+        let head = |secs: u64| {
+            1_000
+                + match secs {
+                    s if s < 1_200 => s / 10,
+                    s if s < 1_500 => 120,
+                    s => 120 + (s - 1_500) / 10,
+                }
+        };
+        let mut reg = HealthRegistry::default();
+        let mut kinds = HashMap::new();
+        for secs in (0..=1_530).step_by(15) {
+            let now = T0 + secs * 1000;
+            reg.observe_global_head(head(secs), None, now);
+            reg.evaluate(now, &none);
+            let current: Vec<i32> = reg.snapshot().conditions.iter().map(|c| c.kind).collect();
+            kinds.insert(secs, current);
+        }
+        assert_eq!(kinds[&1_185], Vec::<i32>::new());
+        assert_eq!(kinds[&1_485], [ConditionKind::GlobalHeadUnchanged as i32]);
+        assert_eq!(kinds[&1_515], [ConditionKind::GlobalFramesSlow as i32]);
+    }
+
+    /// A paced shield pauses for the worst GLOBAL progress condition and for
+    /// no other kind.
+    #[test]
+    fn the_global_progress_notice_is_the_worst_global_condition() {
+        let condition = |kind: ConditionKind, severity: ConditionSeverity| HealthCondition {
+            kind: kind as i32,
+            severity: severity as i32,
+            threshold: 120,
+            global: Some(GlobalProgress {
+                advanced_frames: 50,
+                span_secs: 600,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let local = condition(
+            ConditionKind::LocalAppFramesUnchanged,
+            ConditionSeverity::Warning,
+        );
+        let mut health = HealthConditions {
+            conditions: vec![
+                condition(ConditionKind::GlobalHeadUnchanged, ConditionSeverity::Error),
+                local.clone(),
+                condition(ConditionKind::GlobalFramesSlow, ConditionSeverity::Warning),
+            ],
+            sources: Vec::new(),
+        };
+        assert_eq!(
+            global_progress_notice(&health).as_deref(),
+            Some("Global head unchanged >120s")
+        );
+        health.conditions = vec![local];
+        assert_eq!(global_progress_notice(&health), None);
+    }
+
+    /// Without a fresh GLOBAL observation the GLOBAL kinds end, unobserved.
+    #[test]
+    fn global_conditions_end_without_fresh_observations() {
+        let none = |_: &[u8]| None;
+        let mut reg = HealthRegistry::default();
+        for secs in (0..=135).step_by(15) {
+            let now = T0 + secs * 1000;
+            reg.observe_global_head(5_000, None, now);
+            reg.evaluate(now, &none);
+        }
+        assert!(affected(&reg, ConditionKind::GlobalHeadUnchanged).is_some());
+        let ended = reg.evaluate(T0 + 295_000, &none);
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    unobserved: true,
+                    ..
+                }]
+            ),
+            "{ended:?}"
+        );
+        let source = reg
+            .snapshot()
+            .sources
+            .into_iter()
+            .find(|s| s.kind == ConditionKind::GlobalHeadUnchanged as i32)
+            .unwrap();
+        assert_eq!((source.observed_unix_ms, source.tracked), (0, 0));
     }
 }

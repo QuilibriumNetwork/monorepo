@@ -6808,6 +6808,8 @@ struct ShieldAllIo<'a> {
     announce: Option<bool>,
     /// The batches announced so far.
     submissions: Vec<Submitted>,
+    /// Where the node's GLOBAL judgement is read, or why it is not.
+    health: Result<crate::commands::node::diagnostics::HealthSource, String>,
     /// The last proved batch's total and fee, for its submission record.
     proved: Option<(u128, u128)>,
     started: std::time::Instant,
@@ -6843,13 +6845,24 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     }
 
-    async fn head(&mut self) -> anyhow::Result<u64> {
-        Ok(self
+    async fn global(&mut self) -> anyhow::Result<super::shield_pacing::GlobalRead> {
+        let head = self
             .client
             .get_node_info(quil_types::proto::node::GetNodeInfoRequest::default())
             .await?
             .into_inner()
-            .last_global_head_frame)
+            .last_global_head_frame;
+        let source = self
+            .health
+            .as_ref()
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
+        let health = source.read().await.map_err(|why| anyhow::anyhow!(why))?;
+        let health = health
+            .ok_or_else(|| anyhow::anyhow!("the node predates health conditions; update it"))?;
+        Ok(super::shield_pacing::GlobalRead {
+            head,
+            degraded: quil_rpc::health_conditions::global_progress_notice(&health),
+        })
     }
 
     fn coins(&self, index: usize) -> usize {
@@ -7042,6 +7055,10 @@ async fn submit_shield_all(
         paths,
         announce,
         submissions: Vec::new(),
+        health: crate::commands::node::diagnostics::HealthSource::for_node(
+            &tc.node_config,
+            &tc.key_manager,
+        ),
         proved: None,
         started: std::time::Instant::now(),
         record,

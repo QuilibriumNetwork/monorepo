@@ -572,11 +572,12 @@ pub enum TokenCommand {
     /// covering them. A submitted batch's coins stay out of new runs for two
     /// hours. Submissions are at least `--min-interval` seconds apart
     /// (default 300, at most 12 per hour).
-    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
-    /// or under 330 frames per hour as the head advanced across the sampled
-    /// window, judged once 10 minutes are sampled) and resumes after 10
-    /// minutes of healthy advance. Each pause, resume, submission and
-    /// inclusion is printed with the projected end.
+    /// The run pauses while the node reports GLOBAL degraded (its head
+    /// unchanged for 120 s, or under 330 frames in the last hour, judged
+    /// once 10 minutes are observed) or its report is unreadable for 60 s,
+    /// and resumes once the node has reported GLOBAL healthy for 10
+    /// minutes. Each pause, resume, submission and inclusion is printed
+    /// with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).

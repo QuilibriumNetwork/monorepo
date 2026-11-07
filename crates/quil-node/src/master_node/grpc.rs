@@ -3538,8 +3538,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         .with_certificate_share_provider(Arc::new(super::seat_certificates::snapshot));
     // The node's health conditions, served in its health report: fed by
     // every shard info served (peer-reported and committed heads), the
-    // frame-observation sampler (committed heads) and the worker view, and
-    // judged every 15 s by each shard's cadence.
+    // frame-observation sampler (committed heads), the worker view and this
+    // node's GLOBAL head, and judged every 15 s by each shard's cadence.
     let health = Arc::new(std::sync::Mutex::new(
         quil_rpc::health_conditions::HealthRegistry::default(),
     ));
@@ -3585,6 +3585,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
                         health.observe_global(observed, now);
                         health.observe_workers(workers, now);
+                        observe_global_progress(&mut health, &head, now);
                         health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
                     };
                     for transition in &transitions {
@@ -4722,6 +4723,20 @@ fn health_global(
     }
 }
 
+/// Feed this node's GLOBAL head to the health conditions, with the GLOBAL
+/// provers it hears when it is one.
+fn observe_global_progress(
+    health: &mut quil_rpc::health_conditions::HealthRegistry,
+    frame: &quil_engine::current_frame::CurrentFrame,
+    now_ms: u64,
+) {
+    health.observe_global_head(
+        frame.effective(),
+        quil_engine::global_stall::reach(),
+        now_ms,
+    );
+}
+
 /// Feed one served shard info to the health conditions: the head peers
 /// report for each shard and its head in committed GLOBAL state.
 fn observe_served_shards(
@@ -4985,6 +5000,29 @@ mod health_input_tests {
             ("stops_shard", Some(0))
         );
         assert_eq!(restart(2), None);
+    }
+
+    /// The health task judges this node's own GLOBAL head: one that stays
+    /// for the stall window is the GLOBAL progress condition.
+    #[test]
+    fn the_health_task_feeds_this_nodes_global_head() {
+        use quil_rpc::health_conditions::{HealthRegistry, GLOBAL_STALL_MS};
+        use quil_types::proto::diagnostics::ConditionKind;
+        let frame = quil_engine::current_frame::CurrentFrame::default();
+        frame.observe(935_134);
+        let mut health = HealthRegistry::default();
+        let t0 = 1_800_000_000_000;
+        for now in [t0, t0 + GLOBAL_STALL_MS] {
+            observe_global_progress(&mut health, &frame, now);
+            health.evaluate(now, &|_: &[u8]| None);
+        }
+        let snapshot = health.snapshot();
+        let stalled = snapshot
+            .conditions
+            .iter()
+            .find(|c| c.kind == ConditionKind::GlobalHeadUnchanged as i32)
+            .expect("the head stayed for the stall window");
+        assert_eq!(stalled.global.as_ref().map(|g| g.head), Some(935_134));
     }
 
     /// The report reads the master's worker view as the refresh loop builds

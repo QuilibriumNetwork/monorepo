@@ -1,15 +1,15 @@
-//! Operator signals for GLOBAL consensus on a GLOBAL prover: a warning while
-//! the GLOBAL head stops advancing, and a bounded count of the leader turns
-//! that pass without a proposal.
+//! Operator signals for GLOBAL consensus on a GLOBAL prover: which GLOBAL
+//! provers this node hears, for the node's GLOBAL progress condition, and a
+//! bounded count of the leader turns that pass without a proposal.
 //!
 //! A halted GLOBAL committee logs little on its live members: transport
-//! warnings about the missing members and routine status lines. Nothing said
-//! that GLOBAL had stopped, for how long, or that it lacks the members its
-//! quorum needs. [`GlobalWatch`] says so: one warning once the head has not
-//! advanced for [`GlobalWatch::stall_after`], a repeat every [`STALL_REPEAT`]
-//! with its duration, and one line when the head advances again. Each warning
-//! counts the GLOBAL provers heard from recently against the quorum
-//! consensus needs and names the silent ones.
+//! warnings about the missing members and routine status lines. The node's
+//! health registry (`quil_rpc::health_conditions`) judges on every node
+//! whether the GLOBAL head advances, logs that condition and serves it. On a
+//! GLOBAL prover [`GlobalWatch`] adds what only a member knows ([`reach`]):
+//! the GLOBAL provers heard from recently against the quorum consensus
+//! needs, the silent ones, and the stall window its leader timeout implies,
+//! so the condition says whether GLOBAL lacks the members its quorum needs.
 //!
 //! A leader turn passes without a proposal when its view is nullified and no
 //! member voted for any proposal in it: the leader stopped, is unreachable,
@@ -25,18 +25,18 @@ use std::time::{Duration, Instant};
 
 use quil_cw_consensus::adapters::{Liveness, ViewSigners};
 use quil_cw_consensus::falcon_base::FalconPublicKey;
-use quil_types::store::ClockStore;
 
-/// How often the watch looks at the GLOBAL head.
+/// How often the watch looks at consensus.
 pub const CHECK_EVERY: Duration = Duration::from_secs(10);
-/// The shortest stall that warns. A frame takes about 10 s
+/// The shortest GLOBAL stall. A frame takes about 10 s
 /// ([`crate::difficulty::IDEAL_FRAME_TIME`]); a leader turn without a
-/// proposal adds a leader timeout (30 s by default). The threshold is four
+/// proposal adds a leader timeout (30 s by default). A stall needs four
 /// leader timeouts and at least this, so three consecutive skipped turns and
-/// a frame do not warn.
+/// a frame are not one.
 pub const MIN_STALL_AFTER: Duration = Duration::from_secs(120);
-/// How often a continuing stall warns again.
-pub const STALL_REPEAT: Duration = Duration::from_secs(300);
+/// A published [`GlobalReach`] older than this is not served: the watch
+/// stopped.
+const REACH_FRESH: Duration = Duration::from_secs(30);
 /// How often skipped leader turns are logged at most.
 pub const SKIP_REPORT_EVERY: Duration = Duration::from_secs(600);
 /// A member counts as reachable when a consensus message of it arrived this
@@ -92,31 +92,47 @@ impl GlobalContact {
     }
 }
 
-/// What the watch logs.
+/// The GLOBAL provers this GLOBAL prover hears, as the node's GLOBAL
+/// progress condition reports them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GlobalLog {
-    /// The head has not advanced for `stalled_secs`.
-    Stalled {
-        frame: u64,
-        stalled_secs: u64,
-        view: u64,
-        provers: usize,
-        reachable: usize,
-        quorum: usize,
-        unreachable: Vec<String>,
-        repeat: bool,
-    },
-    /// The head advanced after a warned stall of `stalled_secs`.
-    Resumed { frame: u64, stalled_secs: u64 },
-    /// `skipped` leader turns passed without a proposal since the previous
-    /// line, over `window_secs`, per leader.
-    Skipped {
-        skipped: u64,
-        window_secs: u64,
-        leaders: Vec<(String, u64)>,
-        last_view: u64,
-        last_leader: String,
-    },
+pub struct GlobalReach {
+    pub provers: usize,
+    /// Heard from recently, this node included.
+    pub reachable: usize,
+    pub quorum: usize,
+    /// The silent provers' labels, for this node's log only.
+    pub unreachable: Vec<String>,
+    /// How long the head may stay before it is a stall: four leader
+    /// timeouts, and at least [`MIN_STALL_AFTER`].
+    pub stall_after: Duration,
+}
+
+static REACH: Mutex<Option<(GlobalReach, Instant)>> = Mutex::new(None);
+
+/// The GLOBAL provers this node heard at the watch's latest check; `None`
+/// when it is not a GLOBAL prover, or the watch stopped.
+pub fn reach() -> Option<GlobalReach> {
+    let latest = REACH.lock().ok()?.clone();
+    latest
+        .filter(|(_, at)| at.elapsed() <= REACH_FRESH)
+        .map(|(reach, _)| reach)
+}
+
+fn publish(reach: GlobalReach) {
+    if let Ok(mut latest) = REACH.lock() {
+        *latest = Some((reach, Instant::now()));
+    }
+}
+
+/// `skipped` leader turns passed without a proposal since the previous
+/// line, over `window_secs`, per leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skipped {
+    pub skipped: u64,
+    pub window_secs: u64,
+    pub leaders: Vec<(String, u64)>,
+    pub last_view: u64,
+    pub last_leader: String,
 }
 
 /// The leader of `view`: consensus elects round-robin over the ordered
@@ -127,8 +143,8 @@ pub fn leader_of(epoch: u64, view: u64, members: usize) -> usize {
     (epoch.wrapping_add(view) as usize) % members.max(1)
 }
 
-/// The state behind [`GlobalLog`]; the caller supplies the clock, head,
-/// view and votes, so it runs without a consensus host.
+/// The state behind [`GlobalReach`] and [`Skipped`]; the caller supplies
+/// the clock, view and votes, so it runs without a consensus host.
 pub struct GlobalWatch {
     /// Member labels in participant order.
     labels: Vec<String>,
@@ -137,9 +153,6 @@ pub struct GlobalWatch {
     epoch: u64,
     stall_after: Duration,
     heard_within: Duration,
-    head: Option<u64>,
-    advanced: Option<Instant>,
-    warned: Option<Instant>,
     /// The highest view examined for a skipped turn.
     checked: u64,
     skipped: BTreeMap<usize, u64>,
@@ -166,19 +179,12 @@ impl GlobalWatch {
             epoch,
             stall_after: (leader_timeout * 4).max(MIN_STALL_AFTER),
             heard_within: (timeout_retry * 4).max(MIN_HEARD_WITHIN),
-            head: None,
-            advanced: None,
-            warned: None,
             checked: 0,
             skipped: BTreeMap::new(),
             skip_since: None,
             skip_logged: None,
             last_skip: None,
         }
-    }
-
-    pub fn stall_after(&self) -> Duration {
-        self.stall_after
     }
 
     fn label(&self, member: usize) -> String {
@@ -191,59 +197,21 @@ impl GlobalWatch {
             .unwrap_or_else(|| format!("member {member}"))
     }
 
-    /// Look at the head `head`, the highest consensus view `view`, when each
-    /// member was last heard, and the votes of recent views.
+    /// Look at the highest consensus view `view` and the votes of recent
+    /// views: the skipped leader turns to log, when a line is due.
     pub fn check(
         &mut self,
         now: Instant,
-        head: u64,
         view: u64,
-        heard: &[Option<Instant>],
         votes: impl Fn(u64) -> Option<ViewSigners>,
-    ) -> Vec<GlobalLog> {
-        let mut logs = Vec::new();
+    ) -> Option<Skipped> {
         self.scan_skips(now, view, &votes);
-        if let Some(log) = self.report_skips(now) {
-            logs.push(log);
-        }
-        if let Some(log) = self.check_head(now, head, view, heard) {
-            logs.push(log);
-        }
-        logs
+        self.report_skips(now)
     }
 
-    fn check_head(
-        &mut self,
-        now: Instant,
-        head: u64,
-        view: u64,
-        heard: &[Option<Instant>],
-    ) -> Option<GlobalLog> {
-        let since = match (self.head, self.advanced) {
-            (Some(previous), Some(since)) if previous == head => since,
-            _ => {
-                let stalled = self
-                    .advanced
-                    .map(|since| now.saturating_duration_since(since));
-                self.head = Some(head);
-                self.advanced = Some(now);
-                return self.warned.take().map(|_| GlobalLog::Resumed {
-                    frame: head,
-                    stalled_secs: stalled.unwrap_or_default().as_secs(),
-                });
-            }
-        };
-        let stalled = now.saturating_duration_since(since);
-        if stalled < self.stall_after {
-            return None;
-        }
-        if self
-            .warned
-            .is_some_and(|warned| now.saturating_duration_since(warned) < STALL_REPEAT)
-        {
-            return None;
-        }
-        let repeat = self.warned.replace(now).is_some();
+    /// The GLOBAL provers heard within the heard window at `now`, given when
+    /// each member was last heard.
+    pub fn reach(&self, now: Instant, heard: &[Option<Instant>]) -> GlobalReach {
         let provers = self.labels.len();
         let reached = |member: usize| {
             Some(member) == self.own
@@ -257,16 +225,13 @@ impl GlobalWatch {
             .filter(|member| !reached(*member))
             .map(|member| self.label(member))
             .collect();
-        Some(GlobalLog::Stalled {
-            frame: head,
-            stalled_secs: stalled.as_secs(),
-            view,
+        GlobalReach {
             provers,
             reachable: provers - unreachable.len(),
             quorum: self.quorum,
             unreachable,
-            repeat,
-        })
+            stall_after: self.stall_after,
+        }
     }
 
     /// Count the views before `view` that were nullified by a quorum without
@@ -295,7 +260,7 @@ impl GlobalWatch {
         self.checked = last;
     }
 
-    fn report_skips(&mut self, now: Instant) -> Option<GlobalLog> {
+    fn report_skips(&mut self, now: Instant) -> Option<Skipped> {
         let since = self.skip_since?;
         if self
             .skip_logged
@@ -307,7 +272,7 @@ impl GlobalWatch {
         let skipped = std::mem::take(&mut self.skipped);
         self.skip_since = None;
         self.skip_logged = Some(now);
-        Some(GlobalLog::Skipped {
+        Some(Skipped {
             skipped: skipped.values().sum(),
             window_secs: now.saturating_duration_since(since).as_secs(),
             leaders: skipped
@@ -320,76 +285,34 @@ impl GlobalWatch {
     }
 }
 
-/// Write `log` as one line.
-pub fn emit(log: &GlobalLog) {
-    match log {
-        GlobalLog::Stalled {
-            frame,
-            stalled_secs,
-            view,
-            provers,
-            reachable,
-            quorum,
-            unreachable,
-            repeat,
-        } => {
-            let unreachable = unreachable.join(", ");
-            if reachable < quorum {
-                tracing::warn!(frame, stalled_secs, view, provers, reachable, quorum, %unreachable, repeat,
-                    scope = "network", action = "check",
-                    "GLOBAL halted network-wide: {reachable} of {provers} GLOBAL provers reachable, {quorum} needed; \
-                     it resumes when a missing prover returns, so bring the unreachable provers back");
-            } else {
-                tracing::warn!(frame, stalled_secs, view, provers, reachable, quorum, %unreachable, repeat,
-                    scope = "network", action = "check",
-                    "GLOBAL head not advancing although {reachable} of {provers} GLOBAL provers are reachable \
-                     ({quorum} needed): compare the GLOBAL head and the proposal and verify warnings on the reachable provers; \
-                     one that a proposal declares a parent state other than a prover's own execution means the provers \
-                     run builds with different activation constants");
-            }
-        }
-        GlobalLog::Resumed {
-            frame,
-            stalled_secs,
-        } => {
-            tracing::info!(
-                frame,
-                stalled_secs,
-                "GLOBAL advancing again after {stalled_secs}s"
-            );
-        }
-        GlobalLog::Skipped {
-            skipped,
-            window_secs,
-            leaders,
-            last_view,
-            last_leader,
-        } => {
-            let leaders = leaders
-                .iter()
-                .map(|(leader, count)| format!("{leader} ({count})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::info!(skipped, window_secs, %leaders, last_view, %last_leader, scope = "network",
-                "GLOBAL leader turns skipped: their views were nullified without a proposal, each costing a leader \
-                 timeout; a leader listed repeatedly is stopped, unreachable or cannot build a proposal");
-        }
-    }
+/// Write `skipped` as one line.
+pub fn emit(skipped: &Skipped) {
+    let Skipped {
+        skipped,
+        window_secs,
+        leaders,
+        last_view,
+        last_leader,
+    } = skipped;
+    let leaders = leaders
+        .iter()
+        .map(|(leader, count)| format!("{leader} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(skipped, window_secs, %leaders, last_view, %last_leader, scope = "network",
+        "GLOBAL leader turns skipped: their views were nullified without a proposal, each costing a leader \
+         timeout; a leader listed repeatedly is stopped, unreachable or cannot build a proposal");
 }
 
-/// Run the watch every [`CHECK_EVERY`] until `contact` is dropped.
-pub fn spawn(
-    mut watch: GlobalWatch,
-    contact: Weak<GlobalContact>,
-    liveness: Arc<Liveness>,
-    clock_store: Arc<dyn ClockStore>,
-) {
+/// Run the watch every [`CHECK_EVERY`] until `contact` is dropped,
+/// publishing each check's [`reach`].
+pub fn spawn(mut watch: GlobalWatch, contact: Weak<GlobalContact>, liveness: Arc<Liveness>) {
     tracing::info!(
         stall_after_secs = watch.stall_after.as_secs(),
         heard_within_secs = watch.heard_within.as_secs(),
         provers = watch.labels.len(),
         quorum = watch.quorum,
-        "GLOBAL stall watch started"
+        "GLOBAL prover watch started"
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CHECK_EVERY);
@@ -399,19 +322,11 @@ pub fn spawn(
             let Some(contact) = contact.upgrade() else {
                 break;
             };
-            let Some(head) = clock_store
-                .get_latest_global_clock_frame()
-                .ok()
-                .and_then(|frame| frame.header.map(|header| header.frame_number))
-            else {
-                continue;
-            };
-            let view = liveness.snapshot().view;
-            for log in watch.check(Instant::now(), head, view, &contact.last_heard(), |view| {
-                liveness.view_signers(view)
-            }) {
-                emit(&log);
+            let (now, view) = (Instant::now(), liveness.snapshot().view);
+            if let Some(skipped) = watch.check(now, view, |view| liveness.view_signers(view)) {
+                emit(&skipped);
             }
+            publish(watch.reach(now, &contact.last_heard()));
         }
     });
 }
@@ -430,95 +345,35 @@ mod tests {
         GlobalWatch::new(labels, Some(0), 3, 0, LEADER, RETRY)
     }
 
-    fn none(_: u64) -> Option<ViewSigners> {
-        None
-    }
-
+    /// Reach counts this node and the members heard within the heard
+    /// window, names the silent ones and carries the stall window; the
+    /// node's GLOBAL progress condition reads what was published.
     #[test]
-    fn a_stall_warns_at_its_threshold_repeats_after_the_interval_and_ends_when_the_head_advances() {
-        let mut watch = watch();
-        assert_eq!(watch.stall_after(), Duration::from_secs(120));
+    fn reach_counts_the_provers_heard_within_the_window() {
+        let watch = watch();
         let start = Instant::now();
         let at = |secs: u64| start + Duration::from_secs(secs);
-        // Members 1 and 2 are heard; member 3 was last heard at start.
-        let heard = |now: Instant| vec![None, Some(now), Some(now), Some(start)];
-        assert!(watch
-            .check(at(0), 935_134, 50, &heard(at(0)), none)
-            .is_empty());
-        for secs in [10, 60, 119] {
-            assert!(
-                watch
-                    .check(at(secs), 935_134, 50, &heard(at(secs)), none)
-                    .is_empty(),
-                "no warning before 120 s ({secs})"
-            );
-        }
-        let first = watch.check(at(120), 935_134, 50, &heard(at(120)), none);
+        // Member 1 is heard at 90 s, member 2 at 30 s, member 3 at start.
+        let heard = vec![None, Some(at(90)), Some(at(30)), Some(start)];
+        let reach = watch.reach(at(90), &heard);
         assert_eq!(
-            first,
-            vec![GlobalLog::Stalled {
-                frame: 935_134,
-                stalled_secs: 120,
-                view: 50,
+            reach,
+            GlobalReach {
                 provers: 4,
                 reachable: 3,
                 quorum: 3,
                 unreachable: vec!["…dddddd".into()],
-                repeat: false,
-            }]
+                stall_after: Duration::from_secs(120),
+            }
         );
-        for secs in [130, 300, 419] {
-            assert!(
-                watch
-                    .check(at(secs), 935_134, 50, &heard(at(secs)), none)
-                    .is_empty(),
-                "no repeat before 300 s ({secs})"
-            );
-        }
-        // Member 2 falls silent too: the repeat counts 2 of 4 below quorum.
-        let silent = vec![None, Some(at(420)), Some(at(300)), Some(start)];
-        let repeat = watch.check(at(420), 935_134, 50, &silent, none);
+        // Member 2 falls silent too: 2 of 4, below quorum.
+        let later = watch.reach(at(91), &heard);
         assert_eq!(
-            repeat,
-            vec![GlobalLog::Stalled {
-                frame: 935_134,
-                stalled_secs: 420,
-                view: 50,
-                provers: 4,
-                reachable: 2,
-                quorum: 3,
-                unreachable: vec!["…cccccc".into(), "…dddddd".into()],
-                repeat: true,
-            }]
+            (later.reachable, later.unreachable),
+            (2, vec!["…cccccc".to_string(), "…dddddd".to_string()])
         );
-        let resumed = watch.check(at(500), 935_135, 51, &heard(at(500)), none);
-        assert_eq!(
-            resumed,
-            vec![GlobalLog::Resumed {
-                frame: 935_135,
-                stalled_secs: 500
-            }]
-        );
-        assert!(
-            watch
-                .check(at(510), 935_136, 52, &heard(at(510)), none)
-                .is_empty(),
-            "an unwarned advance is quiet"
-        );
-        assert!(
-            watch
-                .check(at(629), 935_136, 52, &heard(at(629)), none)
-                .is_empty(),
-            "a new stall restarts the threshold"
-        );
-        assert!(matches!(
-            watch.check(at(630), 935_136, 52, &heard(at(630)), none)[..],
-            [GlobalLog::Stalled {
-                stalled_secs: 120,
-                repeat: false,
-                ..
-            }]
-        ));
+        publish(reach.clone());
+        assert_eq!(super::reach(), Some(reach));
     }
 
     #[test]
@@ -568,49 +423,40 @@ mod tests {
         let mut watch = watch();
         let start = Instant::now();
         let at = |secs: u64| start + Duration::from_secs(secs);
-        let heard = vec![None; 4];
         // Views 3 and 7 are led by member 3 (epoch 0, 4 members): nullified
         // by three members without a notarize vote.
         let skipped: &[u64] = &[3, 7, 11, 15, 19];
-        let first = watch.check(at(0), 10, 6, &heard, votes(skipped));
+        let first = watch.check(at(0), 6, votes(skipped));
         assert_eq!(
             first,
-            vec![GlobalLog::Skipped {
+            Some(Skipped {
                 skipped: 1,
                 window_secs: 0,
                 leaders: vec![("…dddddd".into(), 1)],
                 last_view: 3,
                 last_leader: "…dddddd".into(),
-            }]
+            })
         );
         // View 7 waits until view 9 is under way; later turns aggregate.
-        assert!(watch
-            .check(at(10), 11, 8, &heard, votes(skipped))
-            .is_empty());
-        assert!(watch
-            .check(at(20), 12, 9, &heard, votes(skipped))
-            .is_empty());
+        assert!(watch.check(at(10), 8, votes(skipped)).is_none());
+        assert!(watch.check(at(20), 9, votes(skipped)).is_none());
         assert!(
-            watch
-                .check(at(599), 20, 21, &heard, votes(skipped))
-                .is_empty(),
+            watch.check(at(599), 21, votes(skipped)).is_none(),
             "no line before the interval"
         );
-        let second = watch.check(at(600), 21, 22, &heard, votes(skipped));
+        let second = watch.check(at(600), 22, votes(skipped));
         assert_eq!(
             second,
-            vec![GlobalLog::Skipped {
+            Some(Skipped {
                 skipped: 4,
                 window_secs: 580,
                 leaders: vec![("…dddddd".into(), 4)],
                 last_view: 19,
                 last_leader: "…dddddd".into(),
-            }]
+            })
         );
         assert!(
-            watch
-                .check(at(1300), 30, 30, &heard, votes(skipped))
-                .is_empty(),
+            watch.check(at(1300), 30, votes(skipped)).is_none(),
             "nothing new, nothing logged"
         );
     }
@@ -626,7 +472,7 @@ mod tests {
                 ..Default::default()
             })
         };
-        assert!(watch.check(now, 1, 10, &[], partial).is_empty());
+        assert!(watch.check(now, 10, partial).is_none());
         let mut watch = super::tests::watch();
         let refused = |view: u64| {
             Some(ViewSigners {
@@ -636,14 +482,14 @@ mod tests {
                 ..Default::default()
             })
         };
-        assert!(watch.check(now, 1, 10, &[], refused).is_empty());
+        assert!(watch.check(now, 10, refused).is_none());
     }
 
     #[test]
     fn a_long_gap_scans_only_the_views_liveness_keeps() {
         let mut watch = watch();
         let scanned = std::cell::RefCell::new(Vec::new());
-        watch.check(Instant::now(), 1, 1_000_000, &[], |view| {
+        watch.check(Instant::now(), 1_000_000, |view| {
             scanned.borrow_mut().push(view);
             None
         });
