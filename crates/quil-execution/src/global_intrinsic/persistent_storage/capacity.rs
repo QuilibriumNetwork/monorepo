@@ -227,10 +227,7 @@ pub fn check_capacity(
     let pending = pending_certificate(state, &message.member, &message.certificate, message.epoch)?;
     if message.proof.is_empty() {
         let current = quil_types::consensus::epoch_for_frame(frame);
-        if message.epoch < current
-            || message.epoch
-                > current.saturating_add(quil_types::consensus::PERSISTENT_STORAGE_WARMUP_EPOCHS)
-        {
+        if !quil_types::consensus::capacity_precommit_window(current, message.epoch) {
             return Err(invalid("precommit outside warmup window".into()));
         }
         if message.signed_at > frame
