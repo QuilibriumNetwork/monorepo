@@ -40,11 +40,11 @@
 //! each yield never ended (2026-11-01). The leaves wait for memory in an
 //! order (`crate::storage_jobs::AheadOrder`): those its snapshot could not
 //! label within half the renewal's grace first ([`ahead_orders`]). Only so
-//! many are labelled at once (`crate::storage_jobs::ahead_jobs_for`: two on a
-//! node of 32 GB, more with more cores and memory), and while a renewal's
-//! leaf is labelled now only half of them go on beside it; the others pause,
-//! keeping their memory and layers, until that labelling ends
-//! (`crate::storage_jobs::Reservation::wait_while_paused`).
+//! many are labelled at once (`crate::storage_jobs::ahead_jobs_for`: three
+//! on a 16-thread node of 31 GiB, more with more cores and memory), and
+//! while a renewal's leaf is labelled now only half of them go on beside it;
+//! the others pause, keeping their memory and layers, until that labelling
+//! ends (`crate::storage_jobs::Reservation::wait_while_paused`).
 //!
 //! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
 //! snapshot frame ([`expired`]): the snapshot labels what is left itself,
@@ -2516,7 +2516,8 @@ pub(crate) fn ahead_orders(
 
 /// Label ahead the leaves `member` will register for `epoch` on shard
 /// `filter`: the leaves of the shard's data in `crdt` now, each at
-/// `precompute_nodes` of its node count, side by side
+/// `precompute_nodes` of its node count, or at a count its data allows
+/// with whole layers kept ([`label_leaf_ahead`]), side by side
 /// (`storage_jobs::for_each_parallel`), each waiting for memory in its order
 /// ([`ahead_orders`]). A leaf already labelled at a count its data allows is
 /// left, and one its filesystem has no room for is not labelled
@@ -2660,7 +2661,16 @@ fn label_leaf_ahead(
         epoch,
     } = *leaf;
     let stopping = || QuilError::ExecutionUnavailable("the node is stopping".into());
-    let n = precompute_nodes(exact);
+    // At the count its data may register with the most whole layers kept,
+    // as its snapshot picks (`crate::storage_snapshot`), else at one with
+    // room for the data to change by the snapshot: from the stable replica
+    // key epoch, a leaf whose data changed within its band since an earlier
+    // epoch's attempt goes on from its layers rather than from the first.
+    let n = store
+        .resumable(epoch, member, leaf_id, |count| {
+            padded_nodes_allowed(exact, count)
+        })
+        .map_or_else(|| precompute_nodes(exact), |(count, _)| count);
     let layers = params.layers;
     // When the leaf last gave its memory back, with the layers it kept.
     let mut yielded: Option<(Instant, usize)> = None;
@@ -3842,6 +3852,68 @@ mod tests {
             store.find(10, &member, leaf, |count| count == n).is_some(),
             "the labels for 10 and later stay"
         );
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// From the stable replica key epoch, labelling ahead for a leaf whose
+    /// data changed within its padding band since an earlier epoch's attempt
+    /// goes on from the whole layers that attempt kept, at their count, as
+    /// the leaf's snapshot would; at a count picked from the data again it
+    /// started from its first layer.
+    #[test]
+    fn labelling_ahead_goes_on_from_layers_kept_at_a_count_its_data_still_allows() {
+        use quil_crypto::storage_proof::{padded_nodes_allowed, precompute_nodes};
+        let stable = quil_types::consensus::MAINNET_STABLE_REPLICA_KEY_EPOCH
+            .expect("mainnet has a stable replica key epoch");
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(stable));
+        let epoch = stable + 1;
+        let dir = temp_dir("ahead-moved-count");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf) = ([8u8; 32], b"leaf".as_slice());
+        // Labelled ahead for the epoch before, given up after 3 layers.
+        let n = precompute_nodes(3_000);
+        let admitted = store.admit(stable, &member, leaf, n, Stage::Ahead).unwrap();
+        let done = AtomicU64::new(0);
+        let stopped = admitted
+            .label_kept(
+                &SdrParams::default(),
+                &|| done.load(Ordering::SeqCst) >= 3,
+                &|labelled| done.store(labelled as u64, Ordering::SeqCst),
+            )
+            .unwrap();
+        assert!(matches!(stopped, Labelling::Stopped { layers: 3 }));
+        // Its data grew by a node: still registrable at that count, which
+        // a count picked from the data again is not.
+        let exact = 3_001;
+        assert!(padded_nodes_allowed(exact, n));
+        assert_ne!(precompute_nodes(exact), n);
+        let ahead = Leaf {
+            member: &member,
+            filter: &[0x5Au8; 32],
+            leaf_id: leaf,
+            epoch,
+        };
+        let order = crate::storage_jobs::AheadOrder {
+            deferrable: false,
+            seat_leaves: 1,
+            seat: 0,
+            leaf: 0,
+        };
+        let labelled = label_leaf_ahead(&store, &ahead, exact, order, &SdrParams::default());
+        assert_eq!(
+            labelled.unwrap(),
+            Some(n),
+            "ahead misjudged: labelled at a count of its own"
+        );
+        assert_eq!(
+            store.resumed(),
+            vec![(leaf.to_vec(), n, 3)],
+            "ahead misjudged: not from its kept layers"
+        );
+        assert!(store
+            .find(epoch, &member, leaf, |count| count == n)
+            .is_some());
         quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
         let _ = fs::remove_dir_all(&dir);
     }
