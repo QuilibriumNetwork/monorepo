@@ -708,9 +708,11 @@ pub struct ProverLifecycle {
     halt_state: Arc<HaltState>,
     /// Per-shard byte sizes derived from the local hypergraph CRDT
     /// (`local_app_shard_get_sizes` walks `vertex_adds`). Authoritative
-    /// for shards this node holds data for — everything else is 0 and
-    /// excluded by the writer at the point of insertion. Refreshed
-    /// every frame by the archive poller's `on_frame` closure.
+    /// for shards this node holds data for. A shard whose data it does not
+    /// store reports a nominal size with no data shards
+    /// (`reported_shard_size`); `merged_shard_metrics` lets such a row only
+    /// fill in a filter the archives did not report. Refreshed every frame
+    /// by the archive poller's `on_frame` closure.
     ///
     /// **Split from a previous single-cache design**: a single
     /// `shard_sizes_by_filter` field was overwritten on each
@@ -720,6 +722,9 @@ pub struct ProverLifecycle {
     /// of every 60 frames. Splitting into two caches lets each writer
     /// own its source-of-truth without racing.
     local_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
+    /// The contents and time of the last `no join candidate` line; see
+    /// [`ProverLifecycle::report_empty_candidates`].
+    empty_candidates_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
     /// Per-shard (byte size, data-shard count) pairs from the most recent successful
     /// `GetAppShards` archive fetch. Authoritative for shards we are
     /// NOT allocated to (the local cache would have 0 / missing
@@ -896,6 +901,7 @@ impl ProverLifecycle {
             allocator,
             halt_state,
             local_shard_sizes: RwLock::new(HashMap::new()),
+            empty_candidates_logged: std::sync::Mutex::new(None),
             remote_shard_sizes: RwLock::new(HashMap::new()),
             frozen_shards: RwLock::new(std::collections::HashSet::new()),
             unsized_live_shards: RwLock::new(std::collections::HashSet::new()),
@@ -1051,9 +1057,10 @@ impl ProverLifecycle {
     }
 
     /// Merged read of the two size caches. Remote entries form the
-    /// base map (authoritative for shards we're not on); local
-    /// entries override / fill in (authoritative for shards we
-    /// hold). Cloned per call — typical map sizes are O(thousands)
+    /// base map (authoritative for shards we're not on); a local row
+    /// with data shards overrides it (authoritative for shards we hold
+    /// data for), and any local row fills in a filter the archives did
+    /// not report. Cloned per call — typical map sizes are O(thousands)
     /// at most, called once per `evaluate` (~10 s cadence), so the
     /// alloc cost is negligible. Returned by value so callers
     /// don't hold either lock during proposal building.
@@ -1071,8 +1078,16 @@ impl ProverLifecycle {
             .map(|g| g.clone())
             .unwrap_or_default();
         if let Ok(local) = self.local_shard_sizes.read() {
-            for (k, v) in local.iter() {
-                merged.insert(k.clone(), *v);
+            for (filter, &(bytes, data_shards)) in local.iter() {
+                // A row without data shards measured nothing: its size is
+                // the nominal one `reported_shard_size` gives a shard whose
+                // data this node does not store. Replacing the archive's
+                // row with it zeroes the shard's data-shard count (the
+                // reward-greedy planner then drops the shard as a join
+                // candidate) and shrinks the world byte total.
+                if data_shards > 0 || !merged.contains_key(filter) {
+                    merged.insert(filter.clone(), (bytes, data_shards));
+                }
             }
         }
         merged
@@ -1801,6 +1816,50 @@ impl ProverLifecycle {
                      to halt risk");
             }
         }
+    }
+
+    /// One line when workers are free to join but every candidate was
+    /// filtered out (`drops` is `Some`), with the count each filter
+    /// dropped: on change, and every [`BUCKETS_LOG_EVERY`] while it lasts.
+    /// `None` ends the state, so its next start logs at once.
+    fn report_empty_candidates(
+        &self,
+        frame_number: u64,
+        drops: Option<&CandidateDrops>,
+        free_workers: usize,
+        assignable_workers: usize,
+    ) {
+        let Ok(mut last) = self.empty_candidates_logged.lock() else {
+            return;
+        };
+        let Some(drops) = drops else {
+            *last = None;
+            return;
+        };
+        let contents = format!("{drops:?} {free_workers} {assignable_workers}");
+        if !buckets_line_due(&mut last, contents, std::time::Instant::now()) {
+            return;
+        }
+        info!(
+            frame = frame_number,
+            free_workers,
+            assignable_workers,
+            live_shards = drops.live_shards,
+            held_or_rejoin_blocked = drops.held_or_rejoin_blocked,
+            split_parent = drops.split_parent,
+            no_size = drops.no_size,
+            built = drops.built,
+            reject_backoff = drops.reject_backoff,
+            operator_left = drops.operator_left,
+            frozen = drops.frozen,
+            no_data_shards = drops.no_data_shards,
+            strategy = ?self.strategy,
+            scope = "this node",
+            action = "none while every live shard is held or backed off; counts under no_size \
+                      or no_data_shards are shards the archive sizes do not cover: check the \
+                      archive refresh",
+            "no join candidate: free workers stay idle, every shard was filtered out"
+        );
     }
 
     /// Drop filters whose last Leave proposal is within
@@ -2746,8 +2805,8 @@ impl ProverLifecycle {
         //   the unconfirmed Joining → operator-visible symptom is
         //   "joins never confirm."
         // Merged view: remote sizes (authoritative for shards we're
-        // not on) overlaid by local sizes (authoritative for shards
-        // we hold data for). See `merged_shard_sizes` for the rule.
+        // not on) overlaid by measured local sizes (authoritative for
+        // shards we hold data for). See `merged_shard_sizes` for the rule.
         let shard_metrics = self.merged_shard_metrics();
         let shard_sizes_snapshot: HashMap<Vec<u8>, u64> = shard_metrics
             .iter()
@@ -2832,12 +2891,15 @@ impl ProverLifecycle {
         };
         let proposal_grid =
             proposal_grid_filters(&shards_store_filters, &current_summaries, &remote_shards);
-        let mut proposal_descriptors = build_proposal_descriptors(
+        let mut candidate_drops = CandidateDrops::default();
+        let mut proposal_descriptors = build_proposal_descriptors_counted(
             &current_summaries,
             &join_excluded_filters,
             &shard_sizes_snapshot,
             &proposal_grid,
+            &mut candidate_drops,
         );
+        candidate_drops.built = proposal_descriptors.len();
         // Recently-rejected join backoff: drop any shard that rejected our
         // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
         // allocation is terminal so it's excluded from `join_excluded_filters`
@@ -2864,7 +2926,9 @@ impl ProverLifecycle {
             })
             .unwrap_or_default();
         if !reject_backoff.is_empty() {
+            let before = proposal_descriptors.len();
             proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
+            candidate_drops.reject_backoff = before - proposal_descriptors.len();
         }
         // A shard the operator left: a free auto worker would otherwise rejoin
         // it at the next cycle. Local to this node's own proposals: no other
@@ -2875,17 +2939,21 @@ impl ProverLifecycle {
             &self.allocation_reasons,
         );
         if !operator_left.is_empty() {
+            let before = proposal_descriptors.len();
             proposal_descriptors.retain(|d| {
                 !operator_left.iter().any(|h| h.filter == d.filter)
                     || proposer::halt_risk_unstaffed(d)
             });
+            candidate_drops.operator_left = before - proposal_descriptors.len();
         }
         self.report_operator_left_holds(frame_number, &operator_left);
         // A shard a pending split or merge has frozen: the chain refuses the
         // whole join if it names one, taking the other shards with it.
         if let Ok(frozen) = self.frozen_shards.read() {
             if !frozen.is_empty() {
+                let before = proposal_descriptors.len();
                 proposal_descriptors.retain(|d| !frozen.contains(&d.filter));
+                candidate_drops.frozen = before - proposal_descriptors.len();
             }
         }
         for descriptor in &mut proposal_descriptors {
@@ -2898,7 +2966,9 @@ impl ProverLifecycle {
             }
         }
         // Missing reward metadata cannot establish a profitable destination.
+        let before = proposal_descriptors.len();
         proposal_descriptors.retain(|d| self.strategy != Strategy::RewardGreedy || d.shards > 0);
+        candidate_drops.no_data_shards = before - proposal_descriptors.len();
         let mut decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         for descriptor in &mut decide_all_descriptors {
@@ -3634,6 +3704,16 @@ impl ProverLifecycle {
                 }
             }
         }
+
+        // The candidate snapshot below logs only a non-empty list: free
+        // workers with every shard filtered out need their own line.
+        self.report_empty_candidates(
+            frame_number,
+            (shard_info_ready && allow_proposals && proposal_descriptors.is_empty())
+                .then_some(&candidate_drops),
+            free_worker_ids.len(),
+            assignable_worker_ids.len(),
+        );
 
         // 1) ProposeJoin — gated on allowProposals && canPropose.
         //    Mirrors worker_allocator.go:210-247. Pure score-driven —
@@ -5454,11 +5534,46 @@ fn operator_left_holds(
         .collect()
 }
 
+/// What the join-candidate filters dropped in one evaluation, for the line
+/// that explains an empty candidate list. The first four count live shards
+/// (registry summaries); the rest count descriptors after `built`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CandidateDrops {
+    live_shards: usize,
+    held_or_rejoin_blocked: usize,
+    split_parent: usize,
+    no_size: usize,
+    built: usize,
+    reject_backoff: usize,
+    operator_left: usize,
+    frozen: usize,
+    no_data_shards: usize,
+}
+
+#[cfg(test)]
 fn build_proposal_descriptors(
     summaries: &[ProverShardSummary],
     our_filters: &[Vec<u8>],
     shard_sizes: &HashMap<Vec<u8>, u64>,
     shards_store_filters: &[Vec<u8>],
+) -> Vec<ShardDescriptor> {
+    build_proposal_descriptors_counted(
+        summaries,
+        our_filters,
+        shard_sizes,
+        shards_store_filters,
+        &mut CandidateDrops::default(),
+    )
+}
+
+/// Join candidates: shards we are not on, scored with the joiner ring.
+/// Records in `drops` why each live shard was left out.
+fn build_proposal_descriptors_counted(
+    summaries: &[ProverShardSummary],
+    our_filters: &[Vec<u8>],
+    shard_sizes: &HashMap<Vec<u8>, u64>,
+    shards_store_filters: &[Vec<u8>],
+    drops: &mut CandidateDrops,
 ) -> Vec<ShardDescriptor> {
     let mut out: Vec<ShardDescriptor> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -5467,13 +5582,16 @@ fn build_proposal_descriptors(
         if s.filter.is_empty() {
             continue;
         }
+        drops.live_shards += 1;
         if our_filters.contains(&s.filter) {
+            drops.held_or_rejoin_blocked += 1;
             continue;
         }
         // A split-away parent keeps its old allocations (and possibly a size
         // entry) but is not a shard any more; joining it strands a worker.
         // See `known_shard_filters` for why the reported sizes alone lag.
         if is_split_parent(&s.filter, &known) {
+            drops.split_parent += 1;
             continue;
         }
         // Skip shards we don't have real byte-size data for. The
@@ -5488,7 +5606,10 @@ fn build_proposal_descriptors(
         // and `continue`s on zero.
         let raw_size = match shard_sizes.get(&s.filter).copied() {
             Some(n) if n > 0 => n,
-            _ => continue,
+            _ => {
+                drops.no_size += 1;
+                continue;
+            }
         };
         let active = s
             .status_counts
@@ -6664,6 +6785,48 @@ mod shard_size_cache_tests {
         let merged = lc.merged_shard_sizes();
         assert_eq!(merged.get(b"shard-A".as_ref()), Some(&500));
     }
+
+    /// A local row without data shards is the nominal size of a shard this
+    /// node stores no data for (`reported_shard_size`): the archive's row
+    /// for that shard stands. A measured local row still overrides.
+    #[test]
+    fn a_nominal_local_row_keeps_the_archive_row() {
+        let lc = make_lifecycle();
+        lc.set_remote_shard_metrics(HashMap::from([
+            (b"unheld".to_vec(), (1_600_000_000, 4)),
+            (b"held".to_vec(), (3_000, 1)),
+        ]));
+        lc.set_local_shard_metrics(HashMap::from([
+            (b"unheld".to_vec(), (90 * 4096, 0)),
+            (b"held".to_vec(), (5_000, 2)),
+        ]));
+        let merged = lc.merged_shard_metrics();
+        assert_eq!(
+            merged.get(b"unheld".as_ref()),
+            Some(&(1_600_000_000, 4)),
+            "a nominal local row replaced the archive row of a join candidate (archive-row-kept)"
+        );
+        assert_eq!(
+            merged.get(b"held".as_ref()),
+            Some(&(5_000, 2)),
+            "a measured local row overrides the archive row"
+        );
+    }
+
+    /// Any local row fills in a filter the archives did not report.
+    #[test]
+    fn a_local_row_fills_a_filter_the_archive_lacks() {
+        let lc = make_lifecycle();
+        lc.set_remote_shard_metrics(HashMap::from([(b"reported".to_vec(), (1_000, 1))]));
+        lc.set_local_shard_metrics(HashMap::from([(b"unreported".to_vec(), (8_192, 0))]));
+        let merged = lc.merged_shard_metrics();
+        assert_eq!(
+            merged.get(b"unreported".as_ref()),
+            Some(&(8_192, 0)),
+            "a local row fills in a filter the archive lacks (local-row-fills-in)"
+        );
+        assert_eq!(merged.get(b"reported".as_ref()), Some(&(1_000, 1)));
+    }
 }
 
 #[cfg(test)]
@@ -7216,6 +7379,97 @@ mod proposal_loop_tests {
             count_proposed_leaves(&actions),
             0,
             "larger bytes do not imply higher per-worker rewards; actions={actions:?}"
+        );
+    }
+
+    /// One held seat and one free worker; `unheld` is a live shard the node
+    /// is not on.
+    fn one_free_worker_beside_a_held_seat(
+        held: &[u8],
+        unheld: &[u8],
+    ) -> (
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+        Arc<ProverLifecycle>,
+    ) {
+        let address = vec![0xCD; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.to_vec()));
+        wm.add(idle_worker(2));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(held.to_vec(), ProverStatus::Active, 10)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(held.to_vec(), 8),
+            shard_summary(unheld.to_vec(), 8),
+        ]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        (wm, reg, lc)
+    }
+
+    /// A shard this node stores no data for has a local row of nominal size
+    /// and no data shards. The archive's row for it decides: otherwise the
+    /// reward-greedy filter drops the shard and the free worker stays idle.
+    #[test]
+    fn a_nominal_local_row_keeps_an_unheld_shard_a_join_candidate() {
+        let held = filter_bytes(0xA1);
+        let unheld = filter_bytes(0xA2);
+        let (wm, reg, lc) = one_free_worker_beside_a_held_seat(&held, &unheld);
+        lc.set_remote_shard_metrics(HashMap::from([
+            (held, (1_000_000, 1)),
+            (unheld.clone(), (100_000_000, 4)),
+        ]));
+        lc.set_local_shard_metrics(HashMap::from([(unheld.clone(), (90 * 4096, 0))]));
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            proposed_join_filters(&actions),
+            vec![unheld],
+            "the unheld shard stays a join candidate (unheld-candidate-kept); actions={actions:?}"
+        );
+    }
+
+    /// Free workers with every candidate filtered out log one line with the
+    /// count each filter dropped (the candidate snapshot logs only a
+    /// non-empty list); an unchanged state does not repeat it.
+    #[test]
+    fn free_workers_without_a_join_candidate_log_why() {
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let held = filter_bytes(0xA1);
+        let unheld = filter_bytes(0xA2);
+        let (wm, reg, lc) = one_free_worker_beside_a_held_seat(&held, &unheld);
+        lc.set_remote_shard_metrics(HashMap::from([
+            (held, (1_000_000, 1)),
+            (unheld, (100_000_000, 0)),
+        ]));
+        let line = "no join candidate: free workers stay idle";
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(proposed_join_filters(&actions).is_empty(), "{actions:?}");
+        let lines = logs.lines_with(line);
+        assert_eq!(
+            lines.len(),
+            1,
+            "free workers with no join candidate log why (empty-candidates-line): {lines:?}"
+        );
+        for field in [
+            "free_workers=1",
+            "live_shards=2",
+            "held_or_rejoin_blocked=1",
+            "built=1",
+            "no_data_shards=1",
+        ] {
+            assert!(lines[0].contains(field), "{field} missing: {}", lines[0]);
+        }
+        lc.set_prover_root_verified_frame(101);
+        lc.evaluate(101, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            logs.lines_with(line).len(),
+            1,
+            "an unchanged state logs no second line (empty-candidates-bounded)"
         );
     }
 
@@ -13344,9 +13598,11 @@ mod proposal_loop_tests {
         reg.set_summaries(vec![shard_summary(held.clone(), active)]);
         let lc = make_lifecycle(address, wm.clone(), reg.clone());
         // `make_lifecycle` seeds every summary's size with one shard, a known
-        // rank; none reads as the reward inputs not having arrived.
+        // rank; an archive row with none reads as the reward inputs not
+        // having arrived. A local row without data shards would not do: the
+        // archive row outranks it (`merged_shard_metrics`).
         if !known_rank {
-            lc.set_local_shard_metrics(HashMap::from([(held, (1_000_000, 0))]));
+            lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 0))]));
         }
         lc.set_prover_root_verified_frame(720);
         (wm, reg, lc)
