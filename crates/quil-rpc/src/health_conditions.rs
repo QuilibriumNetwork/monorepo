@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use quil_types::consensus::{EffectiveStatus, SILENT_RENEWAL_BLOCKER};
 use quil_types::proto::diagnostics::{
     AffectedShard, ConditionAction, ConditionKind, ConditionScope, ConditionSeverity,
     ConditionSource, ExpectedWait, HealthCondition, HealthConditions,
@@ -63,13 +64,26 @@ pub const PROVER_OP_MARGIN_FRAMES: u64 =
 /// advances: the margin's frames many times over. Longer means GLOBAL is not
 /// advancing, or this node is not following it.
 pub const EPOCH_WAIT_EXPECTED_MS: u64 = 10 * 60_000;
+/// Frames a materializing worker normally trails the head peers report: a
+/// worker within them has caught up.
+pub const RECOVERY_TRAIL_FRAMES: u64 = 2;
 
 /// Every kind this build judges.
-pub const KINDS: [ConditionKind; 7] = [
+pub const KINDS: [ConditionKind; 17] = [
     ConditionKind::LocalAppFramesUnchanged,
     ConditionKind::PeerAppFramesUnchanged,
     ConditionKind::GlobalAppFramesUnchanged,
     ConditionKind::GlobalAppFramesBehind,
+    ConditionKind::AllocationsWithoutWorker,
+    ConditionKind::LocalExecutionStopped,
+    ConditionKind::AllocationEpochStale,
+    ConditionKind::RenewalWithheld,
+    ConditionKind::RecoveryFailing,
+    ConditionKind::AllocationsRejected,
+    ConditionKind::AllocationsPaused,
+    ConditionKind::WorkersBoundWithoutAllocation,
+    ConditionKind::LocalAppFramesNoneMaterialized,
+    ConditionKind::WorkerObservationsStale,
     ConditionKind::GlobalStateSyncInstalling,
     ConditionKind::ProverOpsWaitForEpoch,
     ConditionKind::ShieldsNotAdmitted,
@@ -157,6 +171,10 @@ pub struct WorkerObservation {
     /// When the materialized frame last advanced; 0 when it has not since
     /// the engine started.
     pub last_advance_unix_ms: u64,
+    /// When its latest archive recovery attempt failed, and when one last
+    /// finished; 0 when none has.
+    pub recovery_error_unix_ms: u64,
+    pub recovery_outcome_unix_ms: u64,
 }
 
 impl WorkerObservation {
@@ -165,21 +183,47 @@ impl WorkerObservation {
             && now_ms.saturating_sub(self.observed_unix_ms) <= WORKER_STALE_MS
     }
 
+    /// The handoff wait, which older workers classified as a blocker.
+    fn handoff(&self) -> bool {
+        self.state == "blocked" && self.blocker == "awaiting successor"
+    }
+
     /// A fresh observation of an earning worker in a phase that advances
     /// frames: sync, close, handoff, activation and other waits are
     /// expected lifecycle waits, not stalls.
-    fn judged(&self, now_ms: u64) -> bool {
-        // Older workers classified the handoff wait as a blocker.
-        let handoff = self.state == "blocked" && self.blocker == "awaiting successor";
+    fn earning_and_advancing(&self, now_ms: u64) -> bool {
         self.fresh(now_ms)
             && self.earning
             && !self.filter.is_empty()
-            && self.materialized_frame.is_some()
-            && !handoff
+            && !self.handoff()
             && matches!(
                 self.state.as_str(),
                 "starting" | "running" | "serving" | "blocked" | "stopped"
             )
+    }
+
+    /// An earning, advancing worker that reports its materialized frame.
+    fn judged(&self, now_ms: u64) -> bool {
+        self.earning_and_advancing(now_ms) && self.materialized_frame.is_some()
+    }
+}
+
+/// One of this prover's allocations in this node's prover registry at the
+/// current frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationObservation {
+    pub filter: Vec<u8>,
+    pub status: EffectiveStatus,
+    /// For a rejected or kicked allocation, or a join that missed its
+    /// confirm window: the epoch it was lost in; `None` otherwise or
+    /// unknown.
+    pub lost_epoch: Option<u64>,
+}
+
+impl AllocationObservation {
+    /// A row the operator sees: live, or active with a stale epoch.
+    fn shown(&self) -> bool {
+        self.status.is_live() || self.status == EffectiveStatus::ExpiredEpoch
     }
 }
 
@@ -274,6 +318,13 @@ pub struct HealthRegistry {
     committed_seen_ms: u64,
     global: GlobalObservation,
     global_seen_ms: u64,
+    allocations: Vec<AllocationObservation>,
+    allocations_seen_ms: u64,
+    /// The epoch of the frame the allocations were read at.
+    epoch: u64,
+    /// When each kind's (worker core, shard) was first judged in the state
+    /// that kind holds over the base window.
+    held_since: HashMap<(i32, u32, Vec<u8>), u64>,
     /// When each judged worker without an advance was first judged.
     worker_first_seen: HashMap<(u32, Vec<u8>), u64>,
     current: BTreeMap<i32, Current>,
@@ -284,29 +335,51 @@ pub struct HealthRegistry {
 /// warning.
 fn severity_of(kind: ConditionKind, overran: bool) -> ConditionSeverity {
     if WAIT_KINDS.contains(&kind) && !overran {
-        ConditionSeverity::Info
-    } else {
-        ConditionSeverity::Warning
+        return ConditionSeverity::Info;
+    }
+    match kind {
+        // A seat that does no work, or lost its place, earns nothing.
+        ConditionKind::AllocationsWithoutWorker
+        | ConditionKind::LocalExecutionStopped
+        | ConditionKind::AllocationsRejected => ConditionSeverity::Error,
+        // A closing session usually keeps its worker until it seals, and a
+        // stale observation says only that the state is unknown.
+        ConditionKind::WorkersBoundWithoutAllocation | ConditionKind::WorkerObservationsStale => {
+            ConditionSeverity::Info
+        }
+        _ => ConditionSeverity::Warning,
     }
 }
 
 fn scope_of(kind: ConditionKind) -> ConditionScope {
     match kind {
-        ConditionKind::LocalAppFramesUnchanged | ConditionKind::GlobalStateSyncInstalling => {
-            ConditionScope::ThisNode
-        }
         ConditionKind::PeerAppFramesUnchanged => ConditionScope::Peer,
-        _ => ConditionScope::Network,
+        ConditionKind::GlobalAppFramesUnchanged
+        | ConditionKind::GlobalAppFramesBehind
+        | ConditionKind::ProverOpsWaitForEpoch
+        | ConditionKind::ShieldsNotAdmitted => ConditionScope::Network,
+        _ => ConditionScope::ThisNode,
     }
 }
 
 fn action_of(kind: ConditionKind) -> ConditionAction {
     match kind {
-        ConditionKind::LocalAppFramesUnchanged => ConditionAction::CheckWorkerLogs,
+        ConditionKind::LocalAppFramesUnchanged | ConditionKind::LocalAppFramesNoneMaterialized => {
+            ConditionAction::CheckWorkerLogs
+        }
         ConditionKind::PeerAppFramesUnchanged => ConditionAction::ComparePeerWithExplorer,
         ConditionKind::GlobalStateSyncInstalling => ConditionAction::WaitForGlobalSync,
         ConditionKind::ProverOpsWaitForEpoch => ConditionAction::WaitForNextEpoch,
         ConditionKind::ShieldsNotAdmitted => ConditionAction::WaitForShieldAdmission,
+        ConditionKind::AllocationsWithoutWorker => ConditionAction::BindWorkers,
+        ConditionKind::LocalExecutionStopped => ConditionAction::CheckBlockers,
+        ConditionKind::AllocationEpochStale => ConditionAction::CheckProverConfirmations,
+        ConditionKind::RenewalWithheld => ConditionAction::CheckSilentWorkers,
+        ConditionKind::RecoveryFailing => ConditionAction::CheckArchiveRecovery,
+        ConditionKind::AllocationsRejected => ConditionAction::CheckAllocations,
+        ConditionKind::AllocationsPaused => ConditionAction::ResumeOrLeave,
+        ConditionKind::WorkersBoundWithoutAllocation => ConditionAction::CheckWorkerBindings,
+        ConditionKind::WorkerObservationsStale => ConditionAction::CheckWorkerProcesses,
         _ => ConditionAction::CheckGlobalInclusion,
     }
 }
@@ -318,6 +391,15 @@ fn expected_ms(kind: ConditionKind) -> Option<u64> {
         ConditionKind::GlobalStateSyncInstalling => Some(GLOBAL_SYNC_EXPECTED_MS),
         ConditionKind::ProverOpsWaitForEpoch => Some(EPOCH_WAIT_EXPECTED_MS),
         _ => None,
+    }
+}
+
+/// `seen` while it is fresh at `now_ms`; 0 otherwise.
+fn fresh_at(seen: u64, now_ms: u64) -> u64 {
+    if seen != 0 && now_ms.saturating_sub(seen) <= OBSERVATION_GAP_MS {
+        seen
+    } else {
+        0
     }
 }
 
@@ -512,6 +594,286 @@ impl HealthRegistry {
         self.workers_seen_ms = now_ms;
     }
 
+    /// Record this prover's allocations, read at a frame of `epoch`.
+    pub fn observe_allocations(
+        &mut self,
+        allocations: Vec<AllocationObservation>,
+        epoch: u64,
+        now_ms: u64,
+    ) {
+        self.allocations = allocations;
+        self.epoch = epoch;
+        self.allocations_seen_ms = now_ms;
+    }
+
+    /// The conditions of this node's allocations and their workers. Each
+    /// needs fresh observations of what it compares: without them it tracks
+    /// nothing. States that pass at a restart or a rebind (no worker yet, a
+    /// blocked start, nothing materialized yet) count once they held for
+    /// the base window.
+    fn judge_seats(&mut self, now_ms: u64) -> Vec<Judged> {
+        let workers_seen = fresh_at(self.workers_seen_ms, now_ms);
+        let allocations_seen = fresh_at(self.allocations_seen_ms, now_ms);
+        let both_seen = if workers_seen != 0 && allocations_seen != 0 {
+            workers_seen.min(allocations_seen)
+        } else {
+            0
+        };
+        let workers: &[WorkerObservation] = if workers_seen != 0 {
+            &self.workers
+        } else {
+            &[]
+        };
+        let allocations: &[AllocationObservation] = if allocations_seen != 0 {
+            &self.allocations
+        } else {
+            &[]
+        };
+        let (workers_and_allocations, allocations_and_workers) = if both_seen != 0 {
+            (workers, allocations)
+        } else {
+            (&[][..], &[][..])
+        };
+        let mut held = HashMap::new();
+        let mut over_window = |kind: ConditionKind, core_id: u32, filter: &[u8], frame: u64| {
+            let key = (kind as i32, core_id, filter.to_vec());
+            let since = self.held_since.get(&key).copied().unwrap_or(now_ms);
+            held.insert(key, since);
+            (now_ms.saturating_sub(since) >= BASE_WINDOW_MS).then(|| AffectedShard {
+                filter: filter.to_vec(),
+                core_id,
+                frame,
+                unchanged_since_unix_ms: since,
+                window_secs: BASE_WINDOW_MS / 1000,
+                lag_frames: 0,
+            })
+        };
+        let allocation = |a: &AllocationObservation| AffectedShard {
+            filter: a.filter.clone(),
+            ..Default::default()
+        };
+        let worker = |w: &WorkerObservation| AffectedShard {
+            filter: w.filter.clone(),
+            core_id: w.core_id,
+            frame: w.materialized_frame.unwrap_or(0),
+            ..Default::default()
+        };
+        let shown =
+            |list: &[AllocationObservation]| list.iter().filter(|a| a.shown()).count() as u32;
+
+        let due: Vec<_> = allocations_and_workers
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    EffectiveStatus::Active
+                        | EffectiveStatus::Leaving
+                        | EffectiveStatus::ExpiredEpoch
+                )
+            })
+            .collect();
+        let workerless = due
+            .iter()
+            .filter(|a| !workers_and_allocations.iter().any(|w| w.filter == a.filter))
+            .filter_map(|a| over_window(ConditionKind::AllocationsWithoutWorker, 0, &a.filter, 0))
+            .collect();
+
+        let staffed: Vec<_> = workers
+            .iter()
+            .filter(|w| w.earning_and_advancing(now_ms))
+            .collect();
+        let stopped = staffed
+            .iter()
+            .filter(|w| matches!(w.state.as_str(), "blocked" | "stopped"))
+            .filter_map(|w| {
+                over_window(
+                    ConditionKind::LocalExecutionStopped,
+                    w.core_id,
+                    &w.filter,
+                    w.materialized_frame.unwrap_or(0),
+                )
+            })
+            .collect();
+
+        let reporting: Vec<_> = workers.iter().filter(|w| w.fresh(now_ms)).collect();
+        let withheld = reporting
+            .iter()
+            .filter(|w| both_seen != 0 && w.blocker == SILENT_RENEWAL_BLOCKER)
+            .map(|w| worker(w))
+            .collect();
+        let recovering = reporting
+            .iter()
+            .filter(|w| w.recovery_error_unix_ms > w.recovery_outcome_unix_ms)
+            .filter(|w| {
+                // Without both heights nothing is known, so nothing counts
+                // as caught up.
+                let head = self
+                    .peers
+                    .get(&w.filter)
+                    .filter(|t| now_ms.saturating_sub(t.seen_ms) <= OBSERVATION_GAP_MS)
+                    .map_or(0, |t| t.frame);
+                let caught_up = head > 0
+                    && w.materialized_frame
+                        .is_some_and(|h| h > 0 && h + RECOVERY_TRAIL_FRAMES >= head);
+                !caught_up
+            })
+            .map(|w| worker(w))
+            .collect();
+
+        let running: Vec<_> = reporting
+            .iter()
+            .filter(|w| !w.filter.is_empty() && matches!(w.state.as_str(), "running" | "serving"))
+            .collect();
+        let unmaterialized = running
+            .iter()
+            .filter(|w| w.materialized_frame == Some(0))
+            .filter_map(|w| {
+                over_window(
+                    ConditionKind::LocalAppFramesNoneMaterialized,
+                    w.core_id,
+                    &w.filter,
+                    0,
+                )
+            })
+            .collect();
+
+        // A worker with no execution report says nothing; one whose report
+        // stopped arriving is stale.
+        let reported: Vec<_> = workers
+            .iter()
+            .filter(|w| !w.state.is_empty() || w.observed_unix_ms != 0)
+            .collect();
+        let stale = reported
+            .iter()
+            .filter(|w| !w.fresh(now_ms))
+            .map(|w| AffectedShard {
+                unchanged_since_unix_ms: w.observed_unix_ms,
+                ..worker(w)
+            })
+            .collect();
+
+        let epoch = self.epoch;
+        let rejected = allocations
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    EffectiveStatus::Rejected
+                        | EffectiveStatus::Kicked
+                        | EffectiveStatus::ExpiredJoining
+                )
+            })
+            .filter(|a| {
+                a.lost_epoch
+                    .is_some_and(|lost| lost.saturating_add(1) >= epoch)
+            })
+            .map(allocation)
+            .collect();
+        let with_status = |status: EffectiveStatus| {
+            allocations
+                .iter()
+                .filter(|a| a.status == status)
+                .map(allocation)
+                .collect::<Vec<_>>()
+        };
+        let live: Vec<&[u8]> = allocations_and_workers
+            .iter()
+            .filter(|a| a.shown())
+            .map(|a| a.filter.as_slice())
+            .collect();
+        let bound = workers_and_allocations
+            .iter()
+            .filter(|w| !w.filter.is_empty() && !live.contains(&w.filter.as_slice()))
+            .map(worker)
+            .collect();
+
+        let base_secs = BASE_WINDOW_MS / 1000;
+        let judged = vec![
+            Judged {
+                kind: ConditionKind::AllocationsWithoutWorker,
+                shards: workerless,
+                tracked: due.len() as u32,
+                observed_unix_ms: both_seen,
+                threshold: base_secs,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::LocalExecutionStopped,
+                shards: stopped,
+                tracked: staffed.len() as u32,
+                observed_unix_ms: workers_seen,
+                threshold: base_secs,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::AllocationEpochStale,
+                shards: with_status(EffectiveStatus::ExpiredEpoch),
+                tracked: shown(allocations),
+                observed_unix_ms: allocations_seen,
+                threshold: 0,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::RenewalWithheld,
+                shards: withheld,
+                tracked: shown(allocations_and_workers),
+                observed_unix_ms: both_seen,
+                threshold: 0,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::RecoveryFailing,
+                shards: recovering,
+                tracked: reporting.len() as u32,
+                observed_unix_ms: workers_seen,
+                threshold: RECOVERY_TRAIL_FRAMES,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::AllocationsRejected,
+                shards: rejected,
+                tracked: allocations.len() as u32,
+                observed_unix_ms: allocations_seen,
+                threshold: 0,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::AllocationsPaused,
+                shards: with_status(EffectiveStatus::Paused),
+                tracked: shown(allocations),
+                observed_unix_ms: allocations_seen,
+                threshold: 0,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::WorkersBoundWithoutAllocation,
+                shards: bound,
+                tracked: workers_and_allocations.len() as u32,
+                observed_unix_ms: both_seen,
+                threshold: 0,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::LocalAppFramesNoneMaterialized,
+                shards: unmaterialized,
+                tracked: running.len() as u32,
+                observed_unix_ms: workers_seen,
+                threshold: base_secs,
+                wait: None,
+            },
+            Judged {
+                kind: ConditionKind::WorkerObservationsStale,
+                shards: stale,
+                tracked: reported.len() as u32,
+                observed_unix_ms: workers_seen,
+                threshold: WORKER_STALE_MS / 1000,
+                wait: None,
+            },
+        ];
+        self.held_since = held;
+        judged
+    }
+
     fn judge_local(
         &mut self,
         now_ms: u64,
@@ -626,13 +988,8 @@ impl HealthRegistry {
         let (local, local_tracked) = self.judge_local(now_ms, &window);
         let (peer, peer_tracked) = self.judge_peers(now_ms, &window);
         let (unchanged, behind, committed_tracked) = self.judge_committed(now_ms, &window);
-        let fresh = |seen: u64| {
-            if seen != 0 && now_ms.saturating_sub(seen) <= OBSERVATION_GAP_MS {
-                seen
-            } else {
-                0
-            }
-        };
+        let seats = self.judge_seats(now_ms);
+        let fresh = |seen: u64| fresh_at(seen, now_ms);
         let base_secs = BASE_WINDOW_MS / 1000;
         let judged = [
             Judged {
@@ -670,7 +1027,8 @@ impl HealthRegistry {
         ];
         self.sources.clear();
         let mut transitions = Vec::new();
-        for mut judged in judged.into_iter().chain(self.judge_waits(now_ms)) {
+        let waits = self.judge_waits(now_ms);
+        for mut judged in judged.into_iter().chain(seats).chain(waits) {
             self.sources.push(ConditionSource {
                 kind: judged.kind as i32,
                 observed_unix_ms: judged.observed_unix_ms,
@@ -861,6 +1219,34 @@ pub fn notice_text(c: &HealthCondition) -> String {
                 )
             }
         }
+        ConditionKind::AllocationsWithoutWorker => {
+            format!("Allocations without a worker: {affected}/{tracked}.")
+        }
+        ConditionKind::LocalExecutionStopped => {
+            format!("Local execution blocked or stopped: {affected}/{tracked} allocations.")
+        }
+        ConditionKind::AllocationEpochStale => {
+            format!("Allocation epoch stale (re-confirm!): {affected}/{tracked} allocations.")
+        }
+        ConditionKind::RenewalWithheld => {
+            format!("Renewal withheld, no vote sent: {affected}/{tracked} allocations.")
+        }
+        ConditionKind::RecoveryFailing => {
+            format!("Last recovery attempt failed: {affected}/{tracked} workers.")
+        }
+        ConditionKind::AllocationsRejected => {
+            format!("Allocations rejected or kicked: {affected}/{tracked}.")
+        }
+        ConditionKind::AllocationsPaused => format!("Allocations paused: {affected}/{tracked}."),
+        ConditionKind::WorkersBoundWithoutAllocation => {
+            format!("Workers bound without an allocation: {affected}/{tracked} workers.")
+        }
+        ConditionKind::LocalAppFramesNoneMaterialized => {
+            format!("Local app frames: none materialized on {affected}/{tracked} allocations.")
+        }
+        ConditionKind::WorkerObservationsStale => {
+            format!("Worker observations stale >{threshold}s: {affected}/{tracked} workers.")
+        }
         ConditionKind::Unspecified => format!(
             "Health condition {} ({}, {}): {affected}/{tracked}; see this node's log.",
             c.kind,
@@ -896,6 +1282,41 @@ pub fn action_text(action: i32) -> &'static str {
         ConditionAction::WaitForShieldAdmission => {
             "nothing: shield once GLOBAL reaches the admission frame"
         }
+        ConditionAction::BindWorkers => {
+            "check the worker allocator's log lines and the free workers: an allocation \
+             without a worker does no work and earns nothing until one is bound"
+        }
+        ConditionAction::CheckBlockers => {
+            "read each affected row's blocker and its worker's log: the blocker names what \
+             stopped it"
+        }
+        ConditionAction::CheckProverConfirmations => {
+            "check the node's prover confirmation log lines: the node reconfirms each \
+             allocation during every epoch, so this epoch's reconfirm has not been recorded"
+        }
+        ConditionAction::CheckSilentWorkers => {
+            "check the workers and restart one that stays silent: a seat renews once its \
+             worker votes or restarts, or at the latest four epochs on"
+        }
+        ConditionAction::CheckArchiveRecovery => {
+            "read the recovery's error and failure streak: the worker retries and keeps the \
+             leaves it installed; it ends once the worker catches up"
+        }
+        ConditionAction::CheckAllocations => {
+            "check the allocations on the explorer and the node's join and confirmation log \
+             lines: a rejected or kicked seat earns nothing until a new join is confirmed"
+        }
+        ConditionAction::ResumeOrLeave => {
+            "resume the paused allocations or leave them: a paused seat earns nothing"
+        }
+        ConditionAction::CheckWorkerBindings => {
+            "expected while a closing session the worker belongs to seals; a binding that \
+             outlasts it does work no seat pays for"
+        }
+        ConditionAction::CheckWorkerProcesses => {
+            "check that the workers run and answer: their state is unknown until a report \
+             arrives"
+        }
         ConditionAction::Unspecified => "see this node's log",
     }
 }
@@ -928,6 +1349,16 @@ pub fn kind_label(kind: i32) -> &'static str {
         ConditionKind::GlobalStateSyncInstalling => "global_state_sync_installing",
         ConditionKind::ProverOpsWaitForEpoch => "prover_ops_wait_for_epoch",
         ConditionKind::ShieldsNotAdmitted => "shields_not_admitted",
+        ConditionKind::AllocationsWithoutWorker => "allocations_without_worker",
+        ConditionKind::LocalExecutionStopped => "local_execution_stopped",
+        ConditionKind::AllocationEpochStale => "allocation_epoch_stale",
+        ConditionKind::RenewalWithheld => "renewal_withheld",
+        ConditionKind::RecoveryFailing => "recovery_failing",
+        ConditionKind::AllocationsRejected => "allocations_rejected",
+        ConditionKind::AllocationsPaused => "allocations_paused",
+        ConditionKind::WorkersBoundWithoutAllocation => "workers_bound_without_allocation",
+        ConditionKind::LocalAppFramesNoneMaterialized => "local_app_frames_none_materialized",
+        ConditionKind::WorkerObservationsStale => "worker_observations_stale",
         ConditionKind::Unspecified => "unknown",
     }
 }
@@ -954,13 +1385,17 @@ fn widest_window(c: &HealthCondition) -> u64 {
     c.shards.iter().map(|s| s.window_secs).max().unwrap_or(0)
 }
 
-/// Why a condition of `kind` ended while still observed.
+/// Why a condition of `kind` ended while its observations stayed fresh.
 fn ended_reason(kind: ConditionKind) -> &'static str {
     match kind {
         ConditionKind::GlobalStateSyncInstalling => "GLOBAL state installed",
         ConditionKind::ProverOpsWaitForEpoch => "next epoch started",
         ConditionKind::ShieldsNotAdmitted => "admission frame reached",
-        _ => "progress resumed",
+        ConditionKind::LocalAppFramesUnchanged
+        | ConditionKind::PeerAppFramesUnchanged
+        | ConditionKind::GlobalAppFramesUnchanged
+        | ConditionKind::GlobalAppFramesBehind => "progress resumed",
+        _ => "condition cleared",
     }
 }
 
@@ -1921,5 +2356,354 @@ mod tests {
             assert!(current(&reg, kind).is_none(), "{from:?}");
             assert_eq!(source_of(&reg, kind), (T0, 0), "{from:?}");
         }
+    }
+
+    fn seat(filter: u8, status: EffectiveStatus) -> AllocationObservation {
+        AllocationObservation {
+            filter: vec![filter],
+            status,
+            lost_epoch: None,
+        }
+    }
+
+    /// `kind`'s current condition.
+    fn condition(reg: &HealthRegistry, kind: ConditionKind) -> Option<HealthCondition> {
+        reg.snapshot()
+            .conditions
+            .into_iter()
+            .find(|c| c.kind == kind as i32)
+    }
+
+    /// Each listed row's filter byte and worker core.
+    fn listed(c: &HealthCondition) -> Vec<(u8, u32)> {
+        c.shards.iter().map(|s| (s.filter[0], s.core_id)).collect()
+    }
+
+    /// Observe `workers` and `seats` at `now` in epoch 10 and judge.
+    fn judge_seats_at(
+        reg: &mut HealthRegistry,
+        workers: &[WorkerObservation],
+        seats: &[AllocationObservation],
+        now: u64,
+    ) -> Vec<Transition> {
+        reg.observe_workers(workers.to_vec(), now);
+        reg.observe_allocations(seats.to_vec(), 10, now);
+        reg.evaluate(now, &|_: &[u8]| None)
+    }
+
+    /// Active, leaving and epoch-stale allocations need a worker on their
+    /// shard; one without counts once it lacked one for the base window,
+    /// and a bound worker ends it.
+    #[test]
+    fn allocations_without_a_worker_count_after_the_base_window() {
+        let seats = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::Leaving),
+            seat(3, EffectiveStatus::ExpiredEpoch),
+            seat(4, EffectiveStatus::Joining),
+            seat(5, EffectiveStatus::Paused),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[worker(7, 1, T0, T0)], &seats, T0);
+        let kind = ConditionKind::AllocationsWithoutWorker;
+        assert!(condition(&reg, kind).is_none(), "not yet for the window");
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &[worker(7, 1, now, T0)], &seats, now);
+        let c = condition(&reg, kind).expect("workerless");
+        assert_eq!(listed(&c), [(2, 0), (3, 0)]);
+        assert_eq!((c.affected, c.tracked), (2, 3));
+        assert_eq!(c.severity, ConditionSeverity::Error as i32);
+        assert_eq!(c.scope, ConditionScope::ThisNode as i32);
+        assert_eq!(notice_text(&c), "Allocations without a worker: 2/3.");
+        let bound = [
+            worker(7, 1, now, T0),
+            worker(8, 2, now, T0),
+            worker(9, 3, now, T0),
+        ];
+        judge_seats_at(&mut reg, &bound, &seats, now + 15_000);
+        assert!(condition(&reg, kind).is_none(), "a bound worker ends it");
+    }
+
+    /// An earning worker blocked or stopped for the base window counts, of
+    /// the earning workers in frame-advancing phases; the handoff wait and
+    /// workers that do not earn take no part.
+    #[test]
+    fn local_execution_stopped_counts_earning_workers_after_the_base_window() {
+        let at = |now: u64| {
+            let state = |core, state: &str| {
+                let mut w = worker(core, core as u8, now, T0);
+                w.state = state.into();
+                w
+            };
+            let mut handoff = state(3, "blocked");
+            handoff.blocker = "awaiting successor".into();
+            let mut idle = state(4, "blocked");
+            idle.earning = false;
+            vec![
+                state(1, "blocked"),
+                state(2, "stopped"),
+                handoff,
+                idle,
+                state(5, "serving"),
+                state(6, "syncing"),
+            ]
+        };
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &at(T0), &[], T0);
+        let kind = ConditionKind::LocalExecutionStopped;
+        assert!(condition(&reg, kind).is_none(), "not yet for the window");
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &at(now), &[], now);
+        let c = condition(&reg, kind).expect("stopped");
+        assert_eq!(listed(&c), [(1, 1), (2, 2)]);
+        assert_eq!((c.affected, c.tracked), (2, 3));
+        assert_eq!(c.severity, ConditionSeverity::Error as i32);
+        assert_eq!(c.shards[0].window_secs, 60);
+        assert_eq!(
+            notice_text(&c),
+            "Local execution blocked or stopped: 2/3 allocations."
+        );
+    }
+
+    /// Active allocations whose recorded epoch is stale, of the allocations
+    /// the operator sees (expired and lost ones are not).
+    #[test]
+    fn epoch_stale_allocations_are_counted_of_those_shown() {
+        let seats = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::ExpiredEpoch),
+            seat(3, EffectiveStatus::Paused),
+            seat(4, EffectiveStatus::Joining),
+            seat(5, EffectiveStatus::ExpiredLeaving),
+            seat(6, EffectiveStatus::Rejected),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[], &seats, T0);
+        let c = condition(&reg, ConditionKind::AllocationEpochStale).expect("stale epoch");
+        assert_eq!(listed(&c), [(2, 0)]);
+        assert_eq!((c.affected, c.tracked), (1, 4));
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(
+            notice_text(&c),
+            "Allocation epoch stale (re-confirm!): 1/4 allocations."
+        );
+    }
+
+    /// Paused allocations are listed of those shown.
+    #[test]
+    fn paused_allocations_are_listed() {
+        let seats = [
+            seat(1, EffectiveStatus::Active),
+            seat(3, EffectiveStatus::Paused),
+            seat(4, EffectiveStatus::Joining),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[], &seats, T0);
+        let c = condition(&reg, ConditionKind::AllocationsPaused).expect("paused");
+        assert_eq!(listed(&c), [(3, 0)]);
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(notice_text(&c), "Allocations paused: 1/3.");
+    }
+
+    /// Workers whose renewal the node withholds are listed by their fresh
+    /// blocker, of the allocations shown.
+    #[test]
+    fn renewal_withheld_lists_workers_with_the_silent_blocker() {
+        let mut silent = worker(1, 1, T0, T0);
+        silent.blocker = SILENT_RENEWAL_BLOCKER.into();
+        let mut old = worker(3, 3, T0 - WORKER_STALE_MS - 1, T0);
+        old.blocker = SILENT_RENEWAL_BLOCKER.into();
+        let seats = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::Active),
+            seat(3, EffectiveStatus::Active),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[silent, worker(2, 2, T0, T0), old], &seats, T0);
+        let c = condition(&reg, ConditionKind::RenewalWithheld).expect("withheld");
+        assert_eq!(listed(&c), [(1, 1)]);
+        assert_eq!((c.affected, c.tracked), (1, 3));
+        assert_eq!(
+            notice_text(&c),
+            "Renewal withheld, no vote sent: 1/3 allocations."
+        );
+    }
+
+    /// A failed latest recovery attempt counts while the worker trails the
+    /// head peers report by more than the normal trail, or the head is
+    /// unknown; one older than the last outcome does not.
+    #[test]
+    fn recovery_failing_ends_once_the_worker_is_within_the_normal_trail() {
+        let failing = |core, filter, materialized| {
+            let mut w = worker(core, filter, T0, T0);
+            w.materialized_frame = Some(materialized);
+            w.recovery_error_unix_ms = T0 - 1000;
+            w.recovery_outcome_unix_ms = T0 - 5000;
+            w
+        };
+        let judge = |workers: &[WorkerObservation]| {
+            let mut reg = HealthRegistry::default();
+            reg.observe_peers(&[peer(1, 800)], T0);
+            judge_seats_at(&mut reg, workers, &[], T0);
+            condition(&reg, ConditionKind::RecoveryFailing).map(|c| listed(&c))
+        };
+        assert_eq!(judge(&[failing(1, 1, 700)]), Some(vec![(1, 1)]));
+        assert_eq!(judge(&[failing(1, 1, 799)]), None, "the normal trail");
+        assert_eq!(judge(&[failing(1, 1, 797)]), Some(vec![(1, 1)]));
+        assert_eq!(judge(&[failing(2, 2, 900)]), Some(vec![(2, 2)]), "no head");
+        let mut recovered = failing(1, 1, 700);
+        recovered.recovery_outcome_unix_ms = T0;
+        assert_eq!(judge(&[recovered]), None);
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[failing(1, 1, 700)], &[], T0);
+        let c = condition(&reg, ConditionKind::RecoveryFailing).expect("failing");
+        assert_eq!(
+            notice_text(&c),
+            "Last recovery attempt failed: 1/1 workers."
+        );
+    }
+
+    /// A rejected or kicked allocation, or a join that missed its confirm
+    /// window, counts in the epoch it was lost and the next; one lost at an
+    /// unknown time establishes nothing.
+    #[test]
+    fn rejections_and_kicks_count_in_their_epoch_and_the_next() {
+        let lost = |filter, status, epoch| AllocationObservation {
+            lost_epoch: epoch,
+            ..seat(filter, status)
+        };
+        let seats = vec![
+            lost(1, EffectiveStatus::Rejected, Some(10)),
+            lost(2, EffectiveStatus::Kicked, Some(9)),
+            lost(3, EffectiveStatus::ExpiredJoining, Some(8)),
+            lost(4, EffectiveStatus::Rejected, None),
+            seat(5, EffectiveStatus::Active),
+        ];
+        let mut reg = HealthRegistry::default();
+        reg.observe_allocations(seats.clone(), 10, T0);
+        reg.evaluate(T0, &|_: &[u8]| None);
+        let c = condition(&reg, ConditionKind::AllocationsRejected).expect("lost seats");
+        assert_eq!(listed(&c), [(1, 0), (2, 0)]);
+        assert_eq!((c.affected, c.tracked), (2, 5));
+        assert_eq!(c.severity, ConditionSeverity::Error as i32);
+        assert_eq!(notice_text(&c), "Allocations rejected or kicked: 2/5.");
+        reg.observe_allocations(seats, 11, T0 + 15_000);
+        reg.evaluate(T0 + 15_000, &|_: &[u8]| None);
+        let c = condition(&reg, ConditionKind::AllocationsRejected).expect("lost seats");
+        assert_eq!(listed(&c), [(1, 0)]);
+    }
+
+    /// A worker bound to a shard where this prover holds no live allocation
+    /// is listed, of the bound workers; an informational wait.
+    #[test]
+    fn workers_bound_without_a_live_allocation_are_listed() {
+        let seats = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::ExpiredLeaving),
+            seat(3, EffectiveStatus::Rejected),
+        ];
+        let workers = [
+            worker(1, 1, T0, T0),
+            worker(2, 2, T0, T0),
+            worker(3, 3, T0, T0),
+            worker(4, 9, T0, T0),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &workers, &seats, T0);
+        let c = condition(&reg, ConditionKind::WorkersBoundWithoutAllocation).expect("bound");
+        assert_eq!(listed(&c), [(2, 2), (3, 3), (9, 4)]);
+        assert_eq!((c.affected, c.tracked), (3, 4));
+        assert_eq!(c.severity, ConditionSeverity::Info as i32);
+        assert_eq!(
+            notice_text(&c),
+            "Workers bound without an allocation: 3/4 workers."
+        );
+    }
+
+    /// A running or serving worker that has materialized no frame counts
+    /// once it held for the base window; other phases take no part.
+    #[test]
+    fn running_workers_without_a_materialized_frame_count_after_the_base_window() {
+        let at = |now: u64| {
+            let state = |core, state: &str, frame| {
+                let mut w = worker(core, core as u8, now, T0);
+                w.state = state.into();
+                w.materialized_frame = Some(frame);
+                w
+            };
+            let mut idle = state(2, "running", 0);
+            idle.earning = false;
+            vec![
+                state(1, "serving", 0),
+                idle,
+                state(3, "syncing", 0),
+                state(4, "serving", 500),
+            ]
+        };
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &at(T0), &[], T0);
+        let kind = ConditionKind::LocalAppFramesNoneMaterialized;
+        assert!(condition(&reg, kind).is_none(), "not yet for the window");
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &at(now), &[], now);
+        let c = condition(&reg, kind).expect("none materialized");
+        assert_eq!(listed(&c), [(1, 1), (2, 2)]);
+        assert_eq!((c.affected, c.tracked), (2, 3));
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(
+            notice_text(&c),
+            "Local app frames: none materialized on 2/3 allocations."
+        );
+    }
+
+    /// A worker observation older than the stale threshold on this node's
+    /// clock, or one never observed, is stale; a worker without a report
+    /// says nothing.
+    #[test]
+    fn stale_worker_observations_are_judged_by_the_node_clock() {
+        let old = T0 - WORKER_STALE_MS - 1;
+        let mut unreported = worker(4, 4, 0, T0);
+        unreported.state.clear();
+        let workers = [
+            worker(1, 1, T0, T0),
+            worker(2, 2, old, T0),
+            worker(3, 3, 0, T0),
+            unreported,
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &workers, &[], T0);
+        let c = condition(&reg, ConditionKind::WorkerObservationsStale).expect("stale");
+        assert_eq!(listed(&c), [(2, 2), (3, 3)]);
+        assert_eq!((c.affected, c.tracked), (2, 3));
+        assert_eq!(c.shards[0].unchanged_since_unix_ms, old);
+        assert_eq!(c.severity, ConditionSeverity::Info as i32);
+        assert_eq!(
+            notice_text(&c),
+            "Worker observations stale >30s: 2/3 workers."
+        );
+    }
+
+    /// The allocation conditions rest on the prover registry's view: when
+    /// it is not read again they end, unobserved, rather than last forever.
+    #[test]
+    fn seat_conditions_end_without_fresh_allocations() {
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[], &[seat(1, EffectiveStatus::Paused)], T0);
+        assert!(condition(&reg, ConditionKind::AllocationsPaused).is_some());
+        let later = T0 + OBSERVATION_GAP_MS + 1;
+        reg.observe_workers(Vec::new(), later);
+        let transitions = reg.evaluate(later, &|_: &[u8]| None);
+        assert!(
+            transitions.iter().any(|t| matches!(
+                t,
+                Transition::Ended {
+                    kind: ConditionKind::AllocationsPaused,
+                    unobserved: true,
+                    ..
+                }
+            )),
+            "{transitions:?}"
+        );
+        assert!(condition(&reg, ConditionKind::AllocationsPaused).is_none());
     }
 }
