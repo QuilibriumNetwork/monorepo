@@ -564,6 +564,16 @@ impl InMemoryProverRegistry {
         self.resource_usage
     }
 
+    /// Whether this cache's rows were read at a later state of the same
+    /// database than `other`'s: every sequence in its scan interval is past
+    /// every one in `other`'s. Unknown without both scan points.
+    fn scanned_after(&self, other: &Self) -> bool {
+        match (self.scanned, other.scanned) {
+            (Some(held), Some(read)) => held.database == read.database && held.from > read.to,
+            _ => false,
+        }
+    }
+
     /// Everything a refresh determines, in a fixed order (not the scan point).
     #[cfg(test)]
     fn content(&self) -> String {
@@ -1652,6 +1662,7 @@ fn initial_load_signal(loaded: bool) -> Arc<tokio::sync::watch::Sender<bool>> {
 struct RefreshGate {
     serial: std::sync::Mutex<()>,
     edits: std::sync::atomic::AtomicU64,
+    slow: std::sync::Mutex<SlowRefreshes>,
 }
 
 impl RefreshGate {
@@ -1663,6 +1674,77 @@ impl RefreshGate {
     fn edits(&self) -> u64 {
         self.edits.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Warn about a refresh over [`SLOW_REFRESH`], at most once per
+    /// [`SLOW_REFRESH_WARN_INTERVAL`]; the next warning counts the slow
+    /// refreshes in between.
+    fn report(&self, timing: &RefreshTiming) {
+        if timing.total <= SLOW_REFRESH {
+            return;
+        }
+        let mut slow = self
+            .slow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slow.since_warn += 1;
+        if slow
+            .warned
+            .is_some_and(|at| at.elapsed() < SLOW_REFRESH_WARN_INTERVAL)
+        {
+            return;
+        }
+        let slow_refreshes = std::mem::take(&mut slow.since_warn);
+        slow.warned = Some(std::time::Instant::now());
+        drop(slow);
+        tracing::warn!(
+            total_ms = timing.total.as_millis() as u64,
+            serial_wait_ms = timing.serial_wait.as_millis() as u64,
+            read_ms = timing.read.as_millis() as u64,
+            reads = timing.reads,
+            vertices = timing.vertices,
+            write_wait_ms = timing.write_wait.as_millis() as u64,
+            provers = timing.provers,
+            kept_newer = timing.kept_newer,
+            slow_refreshes,
+            scope = "this node",
+            "prover registry refresh took over 30 s; readers kept the previous registry \
+             meanwhile. serial_wait_ms is the wait behind another refresh, read_ms the store \
+             read (a second read, reads=2, runs under the registry lock after an edit), \
+             write_wait_ms the wait for readers to release the registry; a slow read with few \
+             vertices points at this node's store"
+        );
+    }
+}
+
+/// A refresh this long warns; mainnet refreshes take 6-65 s (2026-11-07).
+const SLOW_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+/// At most one slow-refresh warning per interval.
+const SLOW_REFRESH_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[derive(Default)]
+struct SlowRefreshes {
+    warned: Option<std::time::Instant>,
+    since_warn: u64,
+}
+
+/// Where a full refresh of the canonical registry spent its time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RefreshTiming {
+    total: std::time::Duration,
+    /// Waiting for another refresh of the same cache to end.
+    serial_wait: std::time::Duration,
+    /// Reading the store, both reads together.
+    read: std::time::Duration,
+    /// 2 when an edit overlapped the first read.
+    reads: u32,
+    /// Prover vertices the reads visited.
+    vertices: usize,
+    /// Waiting for readers to release the registry before the install.
+    write_wait: std::time::Duration,
+    /// Provers in the registry after the install.
+    provers: usize,
+    /// The cache already held rows read at a later state, and was kept.
+    kept_newer: bool,
 }
 
 pub(crate) struct PreparedRegistryAdoption<'a> {
@@ -1932,6 +2014,40 @@ impl SharedProverRegistry {
         Ok(())
     }
 
+    /// [`Self::refresh_from_store`] from `snapshot`, a capture of
+    /// `hg_store` taken earlier: a caller that captured the store as one
+    /// write left it reads that state, whatever was written since. A cache
+    /// that already holds rows read at a later state of the same database
+    /// is kept, so readers never go back to an older registry. When another
+    /// write reached the cache during the read, `hg_store` is read again
+    /// under the lock, as [`Self::refresh_from_store`] does.
+    pub fn refresh_from_capture(
+        &self,
+        hg_store: &dyn HypergraphStore,
+        snapshot: &dyn SnapshotReadable,
+    ) -> QuilResult<()> {
+        self.check_execution_store(hg_store.backing_store_identity())?;
+        if self.execution_binding.is_some() {
+            return self.refresh_from_store(hg_store);
+        }
+        let before = self.snapshot_local_prover();
+        self.install_read(
+            || {
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh_from_snapshot(snapshot)?;
+                Ok(fresh)
+            },
+            || {
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh(hg_store)?;
+                Ok(fresh)
+            },
+        )?;
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(())
+    }
+
     /// Install the registry `read` builds from the store. Reading every
     /// prover vertex takes 18-29 s on a regular node's store (2026-10-24);
     /// under the write lock, every worker thread reading the registry
@@ -1942,27 +2058,62 @@ impl SharedProverRegistry {
     fn refresh_canonical(
         &self,
         read: impl Fn() -> QuilResult<InMemoryProverRegistry>,
-    ) -> QuilResult<()> {
+    ) -> QuilResult<RefreshTiming> {
+        self.install_read(&read, &read)
+    }
+
+    /// [`Self::refresh_canonical`], reading with `again` when an edit
+    /// overlapped `first`. Keeps a cache whose rows were read at a later
+    /// state of the same database than the read's, and warns when the
+    /// whole refresh took over [`SLOW_REFRESH`].
+    fn install_read(
+        &self,
+        first: impl FnOnce() -> QuilResult<InMemoryProverRegistry>,
+        again: impl FnOnce() -> QuilResult<InMemoryProverRegistry>,
+    ) -> QuilResult<RefreshTiming> {
+        let started = std::time::Instant::now();
         let _serial = self
             .refresh
             .serial
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut timing = RefreshTiming {
+            serial_wait: started.elapsed(),
+            reads: 1,
+            ..RefreshTiming::default()
+        };
         let edits = self.refresh.edits();
-        let fresh = read()?;
+        let read_started = std::time::Instant::now();
+        let fresh = first()?;
+        timing.read = read_started.elapsed();
+        timing.vertices = fresh.resource_usage.vertices;
         {
+            let lock_started = std::time::Instant::now();
             let mut guard = self
                 .inner
                 .write()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-            *guard = if self.refresh.edits() == edits {
+            timing.write_wait = lock_started.elapsed();
+            let fresh = if self.refresh.edits() == edits {
                 fresh
             } else {
-                read()?
+                let reread_started = std::time::Instant::now();
+                let fresh = again()?;
+                timing.reads = 2;
+                timing.read += reread_started.elapsed();
+                timing.vertices += fresh.resource_usage.vertices;
+                fresh
             };
+            timing.kept_newer = guard.scanned_after(&fresh);
+            if !timing.kept_newer {
+                *guard = fresh;
+            }
+            timing.provers = guard.distinct_provers();
         }
         self.note_initial_load();
-        Ok(())
+        timing.total = started.elapsed();
+        self.refresh.report(&timing);
+        Ok(timing)
     }
 
     /// Bring an execution branch's registry up to date with the registry rows
@@ -3920,6 +4071,113 @@ mod tests {
             shared.read(|r| r.largest_row),
             2,
             "the repeated read is installed"
+        );
+    }
+
+    /// A prover-tree sync refreshes the registry from the store as the sync
+    /// left it, and that refresh can end after a later read was installed
+    /// (the startup load, a state jump): it must not put the older registry
+    /// back.
+    #[test]
+    fn a_refresh_from_an_older_capture_keeps_the_newer_registry() {
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        seed_prover(&store, &shard, 0x11, 0);
+        let older = store.capture_tree_snapshot().unwrap().unwrap();
+        seed_prover(&store, &shard, 0x12, 0);
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert_eq!(shared.read(|r| r.distinct_provers()), 2);
+        shared
+            .refresh_from_capture(store.as_ref(), older.as_ref())
+            .unwrap();
+        assert_eq!(
+            shared.read(|r| r.distinct_provers()),
+            2,
+            "registry refresh from an older capture put back a registry older than the last completed refresh"
+        );
+        assert!(shared.initial_load_complete());
+        seed_prover(&store, &shard, 0x13, 0);
+        let newer = store.capture_tree_snapshot().unwrap().unwrap();
+        seed_prover(&store, &shard, 0x14, 0);
+        shared
+            .refresh_from_capture(store.as_ref(), newer.as_ref())
+            .unwrap();
+        assert_eq!(
+            shared.read(|r| r.distinct_provers()),
+            3,
+            "registry refresh from a later capture installs exactly that capture"
+        );
+    }
+
+    /// The slow-refresh warning names where the time went: both reads when
+    /// an edit overlapped the first, the vertices they visited and the
+    /// provers installed.
+    #[test]
+    fn a_refresh_overlapped_by_an_edit_reports_both_reads() {
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        seed_prover(&store, &shard, 0x21, 0);
+        seed_prover(&store, &shard, 0x22, 0);
+        let shared = SharedProverRegistry::new();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let timing = shared
+            .refresh_canonical(|| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    shared
+                        .update_prover_activity(&[1; 32], &[2; 32], 5)
+                        .unwrap();
+                }
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh(store.as_ref())?;
+                Ok(fresh)
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                timing.reads,
+                timing.vertices,
+                timing.provers,
+                timing.kept_newer
+            ),
+            (2, 4, 2, false),
+            "refresh timing miscounts its reads"
+        );
+        assert!(timing.total >= timing.serial_wait + timing.read);
+    }
+
+    /// One warning per interval at most, counting the slow refreshes since
+    /// the last one; a refresh of exactly 30 s is not slow.
+    #[test]
+    fn slow_refreshes_warn_once_per_interval() {
+        let gate = RefreshGate::default();
+        let state = |gate: &RefreshGate| {
+            let slow = gate.slow.lock().unwrap();
+            (slow.warned.is_some(), slow.since_warn)
+        };
+        gate.report(&RefreshTiming {
+            total: SLOW_REFRESH,
+            ..RefreshTiming::default()
+        });
+        assert_eq!(state(&gate), (false, 0), "a 30 s refresh is not slow");
+        let slow = RefreshTiming {
+            total: SLOW_REFRESH + std::time::Duration::from_millis(1),
+            ..RefreshTiming::default()
+        };
+        gate.report(&slow);
+        assert_eq!(state(&gate), (true, 0), "the first slow refresh warns");
+        gate.report(&slow);
+        gate.report(&slow);
+        assert_eq!(
+            state(&gate),
+            (true, 2),
+            "slow refreshes within the interval warn again"
         );
     }
 
