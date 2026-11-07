@@ -100,6 +100,10 @@ pub mod test_support;
 #[cfg(test)]
 mod test_alloc;
 
+/// Reproducers of a private advisory (SCA).
+#[cfg(test)]
+mod sca_repro_tests;
+
 pub use app_engine::AppConsensusEngine;
 pub use app_shard_cache::AppShardCache;
 pub use difficulty::AsertDifficultyAdjuster;
