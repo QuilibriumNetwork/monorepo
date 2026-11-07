@@ -1088,11 +1088,14 @@ fn new_profiles_are_gated_and_known_legacy_capacity_survives_profile_changes() {
 }
 
 #[test]
-fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
+fn mainnet_precommits_use_three_layers_within_the_coordinated_warmup() {
     use quil_types::consensus::{
         set_min_sector_nodes_for_thread, set_persistent_storage_epoch_for_thread,
-        set_storage_seal_profile_for_thread, EPOCH_LENGTH_FRAMES,
+        set_storage_seal_profile_for_thread, EPOCH_LENGTH_FRAMES, MAINNET_PERSISTENT_STORAGE_EPOCH,
+        PERSISTENT_STORAGE_WARMUP_EPOCHS,
     };
+    let first = MAINNET_PERSISTENT_STORAGE_EPOCH.unwrap();
+    let warmup_epoch = first - PERSISTENT_STORAGE_WARMUP_EPOCHS;
     set_persistent_storage_epoch_for_thread(None);
     set_storage_seal_profile_for_thread(None);
     set_min_sector_nodes_for_thread(Some(32));
@@ -1101,13 +1104,13 @@ fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
     let (root, _, _, _) = fixture_for_profile(member, sector::Profile::Three);
     let mut message = CapacityMessage {
         member,
-        epoch: 1444,
+        epoch: first,
         certificate: root.certificate(32),
         signed_at: 0,
         signature: vec![1; 666],
         proof: Vec::new(),
     };
-    let before = 1411 * EPOCH_LENGTH_FRAMES + 20;
+    let before = (warmup_epoch - 1) * EPOCH_LENGTH_FRAMES + 20;
     message.signed_at = before;
     assert!(check_capacity(
         before,
@@ -1119,7 +1122,7 @@ fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
     .unwrap_err()
     .to_string()
     .contains("warmup"));
-    let warmup = 1412 * EPOCH_LENGTH_FRAMES + 20;
+    let warmup = warmup_epoch * EPOCH_LENGTH_FRAMES + 20;
     message.signed_at = warmup;
     assert_eq!(
         check_capacity(
@@ -1133,7 +1136,7 @@ fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
         .len(),
         1
     );
-    message.epoch = 1443;
+    message.epoch = first - 1;
     assert!(check_capacity(
         warmup,
         &message.envelope(),
@@ -1144,7 +1147,7 @@ fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
     .unwrap_err()
     .to_string()
     .contains("inactive"));
-    message.epoch = 1444;
+    message.epoch = first;
     message.certificate.profile = sector::Profile::Two;
     assert!(check_capacity(
         warmup,

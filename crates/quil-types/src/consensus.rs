@@ -1208,16 +1208,18 @@ pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
     UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
-/// Mainnet epoch 1393 (GLOBAL frame 1,002,960): application committees and
+/// Mainnet epoch 1467 (GLOBAL frame 1,056,240): application committees and
 /// rewarded participants must have a sealed registration for their epoch.
 /// No empty-committee fallback may admit an unsealed member. Archives serving
 /// GLOBAL use its separate membership protocol and have no shard storage seat.
 /// Replica keys switch to persistent member/leaf keys at
 /// [`MAINNET_STABLE_REPLICA_KEY_EPOCH`]; epoch freshness remains bound into
 /// the registration, beacon challenges and STARK.
-/// Provers should upgrade before epoch 1385 for the full warmup. GLOBAL
-/// executors must upgrade before epoch 1392 admits the first epoch-1393 seals.
-pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1393);
+/// Equal to [`MAINNET_PERSISTENT_STORAGE_EPOCH`]: a release published by
+/// epoch 1435 plus its [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] (32).
+/// Provers should upgrade before epoch 1459 for the full warmup. GLOBAL
+/// executors must upgrade before epoch 1466 admits the first epoch-1467 seals.
+pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1467);
 static SEALED_STORAGE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 thread_local! {
     static SEALED_STORAGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -4251,10 +4253,18 @@ mod strict_peer_info_epoch_tests {
 mod sealed_storage_activation_tests {
     use super::*;
     #[test]
-    fn sealed_storage_cutover_is_1393_and_mainnet_ignores_overrides() {
-        assert_eq!(MAINNET_SEALED_STORAGE_EPOCH, Some(1393));
+    fn sealed_storage_cutover_is_1467_and_mainnet_ignores_overrides() {
+        assert_eq!(
+            MAINNET_SEALED_STORAGE_EPOCH,
+            Some(1467),
+            "sealed storage starts at epoch 1467"
+        );
         for setting in [None, Some("0"), Some("9999"), Some("bad")] {
-            assert_eq!(sealed_storage_epoch_for(0, setting), 1393);
+            assert_eq!(
+                sealed_storage_epoch_for(0, setting),
+                1467,
+                "mainnet seals from epoch 1467 whatever the setting"
+            );
         }
         assert_eq!(sealed_storage_epoch_for(1, None), u64::MAX);
         assert_eq!(sealed_storage_epoch_for(1, Some("7")), 7);
@@ -4290,6 +4300,44 @@ mod sealed_storage_activation_tests {
         assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
         set_unsealed_issuance_epoch_for_thread(None);
         set_sealed_storage_epoch_for_thread(None);
+    }
+
+    /// The mainnet defaults, with no setting or thread override: a frame
+    /// before 1,056,240 (epoch 1467) neither requires a sealed seat nor stops
+    /// the unsealed issuance share; the frame itself does both.
+    #[test]
+    fn mainnet_requires_sealing_from_frame_1_056_240() {
+        set_sealed_storage_epoch_for_thread(None);
+        set_persistent_storage_epoch_for_thread(None);
+        set_unsealed_issuance_epoch_for_thread(None);
+        let boundary = 1_056_240;
+        assert_eq!(epoch_start_frame(1467), boundary);
+        for frame in [1_002_960, 1_039_680, boundary - 1] {
+            assert!(
+                !sealed_storage_required_at(frame),
+                "frame {frame}: sealing is required only from epoch 1467"
+            );
+            assert!(
+                storage_seat_eligible(&[1], frame, None),
+                "frame {frame}: an unsealed member counts until epoch 1467"
+            );
+            assert!(
+                unsealed_issuance_active(frame),
+                "frame {frame}: unsealed issuance is paid until epoch 1467"
+            );
+        }
+        assert!(
+            sealed_storage_required_at(boundary),
+            "sealing is required from epoch 1467"
+        );
+        assert!(
+            !storage_seat_eligible(&[1], boundary, None),
+            "an unsealed member stops counting at epoch 1467"
+        );
+        assert!(
+            !unsealed_issuance_active(boundary),
+            "unsealed issuance stops at epoch 1467"
+        );
     }
 }
 
