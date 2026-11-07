@@ -2137,7 +2137,7 @@ mod tests {
         // The archive at the first covering endpoint is that prover: it is
         // asked once. The one at the second is pinned to no one, so a
         // record naming its address does not take its place.
-        quil_rpc::archive_client::pin_archive_peer("10.0.0.1:8340", peer_of(1));
+        quil_rpc::archive_client::pin_archive_peer("10.0.0.1:8340", peer_of(1)).unwrap();
         let pool = no_archives();
         // A duplicate must not use an archive attempt, regardless of where
         // it appears in the pool. Distinct archives still get all three.

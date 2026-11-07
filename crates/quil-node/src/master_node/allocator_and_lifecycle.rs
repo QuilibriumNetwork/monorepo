@@ -282,6 +282,11 @@ pub(crate) fn init(
             );
             quil_engine::execution_deferral::collector_verifier(manager, current, global, deferrals)
         });
+        // A copy of a frame already held verified has only the signers it adds
+        // verified, against their session.
+        message_collector.set_certificate_committees(
+            quil_engine::message_collector::session_committees(crdt.clone()),
+        );
         // Forget held frames execution passed, and log the end of a wait,
         // even when no submit arrives.
         let global = crdt.clone();

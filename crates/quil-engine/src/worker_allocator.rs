@@ -904,7 +904,13 @@ const COOLDOWN_KINDS: usize = 3;
 /// caller and every pass waiting behind it.
 const RECONCILE_SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Shortest time between two slow lines of one caller.
+/// A pass longer than one GLOBAL frame interval warns: its caller falls a
+/// frame behind. A pass of 255 workers ran 5-7 s past each epoch boundary
+/// on busy nodes with no caller falling behind (2026-11-07): that is info.
+const RECONCILE_WARN_AFTER: std::time::Duration =
+    std::time::Duration::from_millis(quil_types::consensus::IDEAL_FRAME_TIME_MS);
+
+/// Shortest time between two slow lines of one caller at one level.
 const RECONCILE_SLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Where a reconcile pass spent its time: what it waits on, and the steps that
@@ -938,13 +944,15 @@ fn timed<T>(part: &mut std::time::Duration, step: impl FnOnce() -> T) -> T {
     done
 }
 
-/// Which slow passes log a line: at most one per caller per
-/// [`RECONCILE_SLOW_EVERY`], counting those it leaves out. A slow pass runs on
-/// every frame at worst, so the callers' lines stay bounded.
+/// Which slow passes log a line: at most one per caller and level per
+/// [`RECONCILE_SLOW_EVERY`], counting those it leaves out, so a recent info
+/// line never hides a warning. A slow pass runs on every frame at worst, so
+/// the callers' lines stay bounded.
 #[derive(Debug)]
 struct SlowPassLog {
     slow_after: std::time::Duration,
-    callers: HashMap<&'static str, SlowCaller>,
+    warn_after: std::time::Duration,
+    callers: HashMap<(&'static str, bool), SlowCaller>,
 }
 
 #[derive(Debug)]
@@ -957,39 +965,42 @@ impl Default for SlowPassLog {
     fn default() -> Self {
         Self {
             slow_after: RECONCILE_SLOW_AFTER,
+            warn_after: RECONCILE_WARN_AFTER,
             callers: HashMap::new(),
         }
     }
 }
 
 impl SlowPassLog {
-    /// Whether a pass of `caller` that took `took` logs a line at `now`: the
-    /// slow passes of this caller left out since its last line, or `None`.
+    /// Whether a pass of `caller` that took `took` logs a line at `now`:
+    /// whether it warns, and the slow passes of this caller at that level
+    /// left out since its last line; or `None`.
     fn admit(
         &mut self,
         caller: &'static str,
         took: std::time::Duration,
         now: std::time::Instant,
-    ) -> Option<u64> {
+    ) -> Option<(bool, u64)> {
         if took < self.slow_after {
             return None;
         }
-        let Some(seen) = self.callers.get_mut(caller) else {
+        let warns = took >= self.warn_after;
+        let Some(seen) = self.callers.get_mut(&(caller, warns)) else {
             self.callers.insert(
-                caller,
+                (caller, warns),
                 SlowCaller {
                     last_line: now,
                     left_out: 0,
                 },
             );
-            return Some(0);
+            return Some((warns, 0));
         };
         if now.saturating_duration_since(seen.last_line) < RECONCILE_SLOW_EVERY {
             seen.left_out += 1;
             return None;
         }
         seen.last_line = now;
-        Some(std::mem::take(&mut seen.left_out))
+        Some((warns, std::mem::take(&mut seen.left_out)))
     }
 }
 
@@ -1238,18 +1249,13 @@ impl WorkerAllocator {
     }
 
     /// Report where [`Self::expiry_awaits_view`] starts and stops holding a
-    /// seat among `allocations` at `frame`. A reconcile after a registry sync
-    /// runs at that sync's older frame, where the seat may not read expired
-    /// yet: the frame-driven reconcile reports.
+    /// seat among `allocations` at `frame`, the newest frame reconciled.
     fn log_expiry_view_holds(
         &self,
         allocations: &[quil_types::consensus::ProverAllocationInfo],
         frame: u64,
     ) {
         use std::sync::atomic::Ordering;
-        if frame < self.reconciled_frame.load(Ordering::Relaxed) {
-            return;
-        }
         let held: HashMap<Vec<u8>, u64> = allocations
             .iter()
             .filter_map(|a| {
@@ -2541,7 +2547,8 @@ impl WorkerAllocator {
         result
     }
 
-    /// Say where a slow pass spent its time, bounded per caller.
+    /// Say where a slow pass spent its time, bounded per caller: a warning
+    /// past one GLOBAL frame interval, info below it.
     fn log_slow_pass(
         &self,
         caller: &'static str,
@@ -2549,12 +2556,12 @@ impl WorkerAllocator {
         took: std::time::Duration,
         times: &ReconcileTimes,
     ) {
-        let left_out = self
+        let admitted = self
             .slow_passes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .admit(caller, took, std::time::Instant::now());
-        let Some(left_out) = left_out else {
+        let Some((warns, left_out)) = admitted else {
             return;
         };
         let parts = times.lock_wait
@@ -2564,15 +2571,25 @@ impl WorkerAllocator {
             + times.bind
             + times.eviction;
         let ms = |time: std::time::Duration| time.as_millis() as u64;
-        warn!(caller, frame = frame_number, workers = times.workers, total_ms = ms(took),
-            lock_wait_ms = ms(times.lock_wait), retention_ms = ms(times.retention),
-            settlement_ms = ms(times.settlement), release_ms = ms(times.release),
-            bind_ms = ms(times.bind), eviction_ms = ms(times.eviction),
-            other_ms = ms(took.saturating_sub(parts)), left_out, scope = "this node",
-            action = "report this line if it repeats; the largest part names the step: lock_wait_ms \
-                      behind another caller's pass, retention_ms reads of the committed GLOBAL view, \
-                      settlement_ms the registry's seat slots, release_ms and bind_ms the worker table",
-            "worker reconcile slow: this pass held its caller, and any pass behind it, past the bound");
+        macro_rules! slow_line {
+            ($level:ident, $bound:literal) => {
+                $level!(caller, frame = frame_number, workers = times.workers, total_ms = ms(took),
+                    lock_wait_ms = ms(times.lock_wait), retention_ms = ms(times.retention),
+                    settlement_ms = ms(times.settlement), release_ms = ms(times.release),
+                    bind_ms = ms(times.bind), eviction_ms = ms(times.eviction),
+                    other_ms = ms(took.saturating_sub(parts)), left_out, scope = "this node",
+                    action = "report this line if it repeats; the largest part names the step: lock_wait_ms \
+                              behind another caller's pass, retention_ms reads of the committed GLOBAL view, \
+                              settlement_ms the registry's seat slots, release_ms and bind_ms the worker table",
+                    "worker reconcile slow: the {} waited on this pass, and any pass behind it, {}",
+                    caller, $bound)
+            };
+        }
+        if warns {
+            slow_line!(warn, "past one GLOBAL frame interval");
+        } else {
+            slow_line!(info, "within one GLOBAL frame interval");
+        }
     }
 
     fn reconcile(&self, frame_number: u64, times: &mut ReconcileTimes) -> Result<()> {
@@ -2581,8 +2598,17 @@ impl WorkerAllocator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
         });
-        self.reconciled_frame
-            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+        // Seats are judged at the newest frame any pass has reconciled at,
+        // not at the caller's: binds and releases only move forward in
+        // frame. Callers run out of order (a GLOBAL frame poller catching up
+        // an epoch behind a registry sync), and judged at the older frame a
+        // seat a newer pass released read current and was bound back, then
+        // released again by the next current pass. A pass behind still
+        // applies what the registry shows now.
+        let judged_frame = self
+            .reconciled_frame
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed)
+            .max(frame_number);
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
         // the deep filter that survived the v2 tree wipe in the local worker store
@@ -2614,6 +2640,9 @@ impl WorkerAllocator {
             }
             info!(frame = frame_number, cleared, "prover-reset v3: cleared auto-managed worker filters (re-join lands on genesis grid)");
         }
+        // The reset above keys on the caller's own frame; everything below
+        // judges seats.
+        let frame_number = judged_frame;
 
         // A node loads its prover registry in the background at startup.
         // Read before that load ends, it shows none of our allocations, and
@@ -2735,13 +2764,21 @@ impl WorkerAllocator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let local_public_key = prover_info.as_ref().map(|p| p.public_key.clone());
+        // One committed view for every worker of the pass, captured at the
+        // first that needs it.
+        let mut retention_view = None;
         for worker in &workers {
             // Whether the worker's committee session retains it: unknown while
             // a GLOBAL state sync withholds the committed view.
             let retention = timed(&mut times.retention, || {
                 match (session_authority.as_ref(), local_public_key.as_ref()) {
                     (Some(global), Some(member)) if !worker.filter.is_empty() => {
-                        crate::app_handoff::worker_retention(global, &worker.filter, member)
+                        let view = retention_view.get_or_insert_with(|| {
+                            quil_execution::global_intrinsic::handoff::CommittedView::capture(
+                                global,
+                            )
+                        });
+                        crate::app_handoff::worker_retention_in(view, &worker.filter, member)
                     }
                     _ => Some(false),
                 }
@@ -5640,7 +5677,31 @@ mod tests {
             ),
             None
         );
-        assert_eq!(log.admit("frame poller", bound, now), Some(0));
+        assert_eq!(log.admit("frame poller", bound, now), Some((false, 0)));
+    }
+
+    /// A pass of 255 workers took 5-7 s past each epoch boundary on busy
+    /// nodes and warned, while no caller fell a frame behind (2026-11-07). It
+    /// warns only past one GLOBAL frame interval, also within a minute of an
+    /// info line of its caller; below that it is info.
+    #[test]
+    fn a_slow_pass_warns_only_past_one_global_frame_interval() {
+        let now = std::time::Instant::now();
+        let mut log = SlowPassLog::default();
+        let interval = std::time::Duration::from_millis(quil_types::consensus::IDEAL_FRAME_TIME_MS);
+        let under = interval - std::time::Duration::from_millis(1);
+        assert_eq!(
+            log.admit("frame poller", under, now),
+            Some((false, 0)),
+            "a pass under one GLOBAL frame interval warned"
+        );
+        assert_eq!(
+            log.admit("frame poller", interval, now),
+            Some((true, 0)),
+            "a pass of one GLOBAL frame interval did not warn, or an info line hid it"
+        );
+        assert_eq!(log.admit("frame poller", under, now), None);
+        assert_eq!(log.admit("frame poller", interval, now), None);
     }
 
     /// A caller logs at most one slow line a minute, then says how many it
@@ -5651,16 +5712,15 @@ mod tests {
         let at = |secs| start + std::time::Duration::from_secs(secs);
         let slow = std::time::Duration::from_secs(9);
         let mut log = SlowPassLog::default();
-        assert_eq!(log.admit("frame poller", slow, at(0)), Some(0));
+        assert_eq!(log.admit("frame poller", slow, at(0)), Some((false, 0)));
         assert_eq!(log.admit("frame poller", slow, at(10)), None);
         assert_eq!(log.admit("frame poller", slow, at(59)), None);
-        assert_eq!(log.admit("frame receive", slow, at(59)), Some(0));
-        assert_eq!(log.admit("frame poller", slow, at(60)), Some(2));
+        assert_eq!(log.admit("frame receive", slow, at(59)), Some((false, 0)));
+        assert_eq!(log.admit("frame poller", slow, at(60)), Some((false, 2)));
         assert_eq!(log.admit("frame poller", slow, at(70)), None);
-        assert_eq!(log.admit("frame poller", slow, at(120)), Some(1));
+        assert_eq!(log.admit("frame poller", slow, at(120)), Some((false, 1)));
     }
 
-    /// The slow line names the caller and splits the pass: the wait for the
     /// lock and each step, so one line tells them apart. A pass under the bound
     /// says nothing.
     #[test]
@@ -5701,7 +5761,11 @@ mod tests {
         // A second pass that releases and binds again, behind another pass.
         wm.add_with_filter(1, kicked.clone());
         wm.add(idle_worker(2, 0));
-        alloc.slow_passes.lock().unwrap().slow_after = std::time::Duration::ZERO;
+        {
+            let mut slow = alloc.slow_passes.lock().unwrap();
+            slow.slow_after = std::time::Duration::ZERO;
+            slow.warn_after = std::time::Duration::ZERO;
+        }
         let (held, wait_held) = std::sync::mpsc::channel();
         let pass_starts = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder = {
@@ -5734,6 +5798,8 @@ mod tests {
             "scope=\"this node\"",
             "total_ms=",
             "other_ms=",
+            "the registry sync waited on this pass",
+            "past one GLOBAL frame interval",
         ] {
             assert!(line.contains(field), "{field}: {line}");
         }
@@ -5769,6 +5835,16 @@ mod tests {
         assert!(
             sum <= value("total_ms"),
             "the parts add up to the pass: {line}"
+        );
+        // Within one GLOBAL frame interval the line is info.
+        alloc.slow_passes.lock().unwrap().warn_after = std::time::Duration::from_secs(3600);
+        alloc.on_new_frame_by("frame poller", 102).unwrap();
+        let lines = logs.lines_with("the frame poller waited on this pass");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("within one GLOBAL frame interval"),
+            "{}",
+            lines[0]
         );
     }
 
@@ -6839,6 +6915,48 @@ mod tests {
         assert_eq!(
             workers[0].filter, live_filter,
             "the stale epoch binding must yield its only worker to the live allocation"
+        );
+    }
+
+    /// Two callers reconcile out of frame order: a registry sync at its
+    /// current cursor, and a GLOBAL frame poller catching up an epoch behind
+    /// it. Judged at the poller's frame, a seat the sync's pass had found
+    /// lapsed read current again and was bound back to its worker, and the
+    /// next current pass released it again: on an overloaded node the same
+    /// manual workers lost their seats pass after pass (2026-11-07). A pass
+    /// at an older frame judges at the newest frame already reconciled.
+    #[test]
+    fn an_older_frame_does_not_rebind_a_seat_a_newer_pass_released() {
+        const LOST: &str = "manual worker lost its seat and is idle";
+        let e = epoch_length_frames();
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &filter).unwrap();
+        wm.set_manually_managed(1, true).unwrap();
+        let seat = ProverAllocationInfo {
+            epoch: 20,
+            ..make_alloc(filter.clone())
+        };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![seat])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        alloc.note_renewals_offered();
+        let bound = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.clone();
+
+        let newer = 22 * e + 5;
+        let logged = reconcile_logged(&alloc, newer);
+        assert!(bound(&wm).is_empty(), "lapsed at the newer frame");
+        assert_eq!(logged.matches(LOST).count(), 1, "{logged}");
+
+        // The poller's pass, an epoch and more behind, where the seat is current.
+        reconcile_logged(&alloc, 20 * e + 5);
+        assert!(
+            bound(&wm).is_empty(),
+            "an older pass rebound the seat a newer pass released"
+        );
+        let logged = reconcile_logged(&alloc, newer + 1);
+        assert!(
+            !logged.contains(LOST),
+            "the seat is lost once, not again at each current pass: {logged}"
         );
     }
 

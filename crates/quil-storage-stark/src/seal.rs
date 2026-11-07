@@ -60,7 +60,6 @@ const ROOT: &str = "root";
 
 const D: usize = hash::DIGEST_ELEMS;
 const W: usize = poseidon::WIDTH;
-const LAYERS: usize = 11;
 const DRG: usize = 6;
 const EXPANDER: usize = 8;
 /// Slots per challenge: the node, its DRG parents, its expander parents.
@@ -73,14 +72,6 @@ const LABEL_ROWS: usize = 16 * LABEL_BLOCKS;
 const LABEL_LENGTH: u32 = (2 + DRG + EXPANDER) as u32 * D as u32;
 /// Tables never shorter than this.
 const MIN_HEIGHT: usize = 4;
-
-/// Reads of each `Pub` entry: a challenged node by every layer's header (11),
-/// its column, its data, replica and column paths, and its check row; a DRG
-/// parent by every layer (11), its column and its path; an expander parent by
-/// layers 1..=10, its column and its path.
-const NODE_READS: u32 = LAYERS as u32 + 1 + 3 + 1;
-const DRG_READS: u32 = LAYERS as u32 + 1 + 1;
-const EXPANDER_READS: u32 = (LAYERS as u32 - 1) + 1 + 1;
 
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -258,6 +249,7 @@ struct FrameBlock {
 /// What the verifier derives from an epoch statement.
 #[derive(Clone, Debug)]
 pub struct Public {
+    layers: usize,
     /// The sealed leaves, then the held ones.
     leaves: Vec<LeafPublic>,
     /// Per global challenge: its leaf and its index in that leaf.
@@ -271,9 +263,10 @@ pub struct Public {
 
 impl Public {
     pub fn new(statement: &EpochStatement, params: &SdrParams) -> Result<Self, String> {
-        if (params.drg_degree, params.expander_degree, params.layers) != (DRG, EXPANDER, LAYERS) {
+        if params.drg_degree != DRG || params.expander_degree != EXPANDER || !params.optimized() {
             return Err(
-                "the seal circuit is fixed to DRG degree 6, expander degree 8 and 11 layers".into(),
+                "the seal circuit requires degrees 6/8 and an explicit 2, 3 or 11 layer suite"
+                    .into(),
             );
         }
         if statement.seals.is_empty() && statement.frames.is_empty() {
@@ -349,11 +342,12 @@ impl Public {
             }
         }
         Ok(Self {
+            layers: params.layers,
             leaves,
             challenge_of,
             openings,
             blocks,
-            digest: statement_digest(statement),
+            digest: statement_digest(statement, params.layers),
         })
     }
 
@@ -415,8 +409,8 @@ impl Public {
                 let count = leaf.challenges.len();
                 let columns = leaf.column_paths() as usize;
                 let paths = 2 * count + columns + leaf.openings as usize;
-                count * LAYERS * LABEL_BLOCKS
-                    + columns * LAYERS
+                count * self.layers * LABEL_BLOCKS
+                    + columns * self.layers
                     + paths * leaf.depth
                     + leaf.commitments.iter().flatten().count()
             })
@@ -429,7 +423,7 @@ impl Public {
 /// epoch, node count, the three commitments), the challenge count, each held
 /// registration (member, leaf, epoch, node count, replica commitment), the
 /// query count and each frame (number, beacon, root, held registrations).
-fn statement_digest(statement: &EpochStatement) -> Digest {
+fn statement_digest(statement: &EpochStatement, layers: usize) -> Digest {
     use sha3::{Digest as _, Sha3_256};
     let mut h = Sha3_256::new();
     let mut put = |bytes: &[u8]| {
@@ -437,6 +431,10 @@ fn statement_digest(statement: &EpochStatement) -> Digest {
         h.update(bytes);
     };
     put(b"quil/storage-stark/epoch/v1");
+    if layers != 11 {
+        put(b"quil/storage-stark/profile/v1");
+        put(&(layers as u64).to_be_bytes());
+    }
     put(&(statement.seals.len() as u64).to_be_bytes());
     for s in &statement.seals {
         put(s.member);
@@ -498,7 +496,9 @@ pub enum SealAir {
     Merkle {
         periodic: Vec<Vec<Val>>,
     },
-    Check,
+    Check {
+        layers: usize,
+    },
     Bind {
         periodic: Vec<Vec<Val>>,
     },
@@ -679,6 +679,7 @@ pub(crate) mod frm {
 
 impl SealAir {
     fn tables(public: &Public) -> Vec<SealAir> {
+        let layers = public.layers;
         let heights = public.heights();
 
         let mut pub_p = vec![vec![Val::ZERO; heights[1]]; pubc::PERIODIC];
@@ -687,9 +688,9 @@ impl SealAir {
             for (s, &(node, active)) in leaf.slots[k].iter().enumerate() {
                 let row = g * SLOTS + s;
                 let reads = match s {
-                    0 => NODE_READS,
-                    s if s <= DRG => DRG_READS,
-                    _ => EXPANDER_READS,
+                    0 => layers as u32 + 5,
+                    s if s <= DRG => layers as u32 + 2,
+                    _ => layers as u32 + 1,
                 };
                 pub_p[pubc::P_G][row] = felt(g as u64);
                 pub_p[pubc::P_S][row] = felt(s as u64);
@@ -708,7 +709,7 @@ impl SealAir {
             for i in 0..D {
                 leaves_p[lvs::P_KEY + i][l] = leaf.key[i];
             }
-            leaves_p[lvs::P_KEY_READS][l] = felt(count * LAYERS as u64);
+            leaves_p[lvs::P_KEY_READS][l] = felt(count * layers as u64);
             leaves_p[lvs::P_DEPTH_READS][l] = felt(count * PATHS as u64 + leaf.openings);
         }
 
@@ -716,8 +717,8 @@ impl SealAir {
         for layer in 0..COLUMN_ROWS {
             column_p[col::P_LAYER][layer] = felt(layer as u64);
             column_p[col::P_FIRST][layer] = Val::from_bool(layer == 0);
-            column_p[col::P_LAST][layer] = Val::from_bool(layer == LAYERS - 1);
-            column_p[col::P_LIVE][layer] = Val::from_bool(layer < LAYERS);
+            column_p[col::P_LAST][layer] = Val::from_bool(layer == layers - 1);
+            column_p[col::P_LIVE][layer] = Val::from_bool(layer < layers);
             column_p[col::P_END][layer] = Val::from_bool(layer == COLUMN_ROWS - 1);
         }
 
@@ -725,7 +726,7 @@ impl SealAir {
         for row in 0..LABEL_ROWS {
             let (layer, block) = (row / LABEL_BLOCKS, row % LABEL_BLOCKS);
             label_p[lab::P_LAYER][row] = felt(layer as u64);
-            label_p[lab::P_LIVE][row] = Val::from_bool(layer < LAYERS);
+            label_p[lab::P_LIVE][row] = Val::from_bool(layer < layers);
             label_p[lab::P_FIRST_BLOCK][row] = Val::from_bool(block == 0);
             label_p[lab::P_LAST_BLOCK][row] = Val::from_bool(block == LABEL_BLOCKS - 1);
             label_p[lab::P_DRG][row] = Val::from_bool((1..=3).contains(&block));
@@ -795,7 +796,7 @@ impl SealAir {
             SealAir::Column { periodic: column_p },
             SealAir::Label { periodic: label_p },
             SealAir::Merkle { periodic: merkle_p },
-            SealAir::Check,
+            SealAir::Check { layers },
             SealAir::Bind { periodic: bind_p },
             SealAir::OPub { periodic: opub_p },
             SealAir::Frames { periodic: frames_p },
@@ -810,7 +811,7 @@ impl SealAir {
             SealAir::Column { .. } => col::WIDTH,
             SealAir::Label { .. } => lab::WIDTH,
             SealAir::Merkle { .. } => mrk::WIDTH,
-            SealAir::Check => chk::WIDTH,
+            SealAir::Check { .. } => chk::WIDTH,
             SealAir::Bind { .. } => bnd::WIDTH,
             SealAir::OPub { .. } => opb::WIDTH,
             SealAir::Frames { .. } => frm::WIDTH,
@@ -827,7 +828,7 @@ impl SealAir {
             | SealAir::Bind { periodic }
             | SealAir::OPub { periodic }
             | SealAir::Frames { periodic } => Some(periodic),
-            SealAir::Perm { .. } | SealAir::Check => None,
+            SealAir::Perm { .. } | SealAir::Check { .. } => None,
         }
     }
 
@@ -883,7 +884,7 @@ impl<AB: InteractionBuilder<F = Val>> Air<AB> for SealAir {
             SealAir::Column { .. } => eval_column(builder),
             SealAir::Label { .. } => eval_label(builder),
             SealAir::Merkle { .. } => eval_merkle(builder),
-            SealAir::Check => eval_check(builder),
+            SealAir::Check { layers } => eval_check(builder, *layers),
             SealAir::Bind { .. } => eval_bind(builder),
             SealAir::OPub { .. } => eval_opub(builder),
             SealAir::Frames { .. } => eval_frames(builder),
@@ -1361,7 +1362,7 @@ fn eval_merkle<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     );
 }
 
-fn eval_check<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
+fn eval_check<AB: InteractionBuilder<F = Val>>(builder: &mut AB, layers: usize) {
     let main = builder.main();
     let local = main.current_slice().to_vec();
     let v = |i: usize| -> AB::Expr { local[i].into() };
@@ -1389,7 +1390,7 @@ fn eval_check<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
             vec![
                 v(chk::LEAF),
                 v(chk::J),
-                constant::<AB>(felt(LAYERS as u64 - 1)),
+                constant::<AB>(felt(layers as u64 - 1)),
             ],
             &local,
             chk::LABEL,
@@ -1584,6 +1585,7 @@ struct PathWitness {
 }
 
 fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<Traces, String> {
+    let layers = public.layers;
     // Sealed leaves come first; they alone register a data commitment.
     let sealed = public
         .leaves
@@ -1642,7 +1644,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             if slot_columns
                 .iter()
                 .flatten()
-                .any(|c| c.labels.len() != LAYERS || c.path.len() != leaf.depth)
+                .any(|c| c.labels.len() != layers || c.path.len() != leaf.depth)
             {
                 return Err(format!(
                     "leaf {l} challenge {k}: a column of the wrong shape"
@@ -1659,7 +1661,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
     for g in 0..total {
         let (l, k, leaf) = public.challenge(g);
         let j = leaf.challenges[k];
-        for layer in 0..LAYERS {
+        for layer in 0..layers {
             for s in 1..SLOTS {
                 let (node, open) = leaf.slots[k][s];
                 if if s <= DRG { open } else { layer >= 1 } {
@@ -1669,7 +1671,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             }
             *demand.entry((l, j, layer)).or_default() += 1;
         }
-        *demand.entry((l, j, LAYERS - 1)).or_default() += 1;
+        *demand.entry((l, j, layers - 1)).or_default() += 1;
     }
 
     // Column table.
@@ -1690,7 +1692,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
                 row[col::ACTIVE] = Val::from_bool(active);
                 row[col::INSTANCE] = Val::ONE;
                 row[col::LEAF] = felt(l as u64);
-                if !active || layer >= LAYERS {
+                if !active || layer >= layers {
                     continue;
                 }
                 let label = columns[g][s]
@@ -1737,7 +1739,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
                 row[lab::J] = felt(j);
                 row[lab::LEAF] = felt(l as u64);
                 row[lab::REAL] = Val::ONE;
-                if layer >= LAYERS {
+                if layer >= layers {
                     continue;
                 }
                 let (a, b): (Digest, Digest);
@@ -1776,7 +1778,7 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
                 state = perms.run(input);
                 row[lab::OUT..lab::OUT + W].copy_from_slice(&state);
             }
-            if layer == LAYERS - 1 {
+            if layer == layers - 1 {
                 last_labels[g].copy_from_slice(&state[..D]);
             }
         }
@@ -1999,6 +2001,41 @@ fn perm_trace(inputs: &[[Val; W]], height: usize) -> RowMajorMatrix<Val> {
 }
 
 // ── Proving and verifying ───────────────────────────────────────────────────
+
+/// Conservative allocation estimate for the current AIR dimensions. Includes
+/// retained traces, fourfold LDEs and prover scratch. This is a preflight guard,
+/// not a measured RSS figure or a consensus parameter.
+pub fn estimate_proving_memory_bytes(
+    statement: &EpochStatement,
+    params: &SdrParams,
+) -> Result<u64, String> {
+    let public = Public::new(statement, params)?;
+    let widths = [
+        PERM_WIDTH,
+        pubc::WIDTH,
+        lvs::WIDTH,
+        col::WIDTH,
+        lab::WIDTH,
+        mrk::WIDTH,
+        chk::WIDTH,
+        bnd::WIDTH,
+        opb::WIDTH,
+        frm::WIDTH,
+    ];
+    public
+        .heights()
+        .iter()
+        .zip(widths)
+        .try_fold(64u64 << 20, |bytes, (&rows, width)| {
+            let amount = (rows as u64)
+                .checked_mul(width as u64)
+                .and_then(|n| n.checked_mul(4 * 8))
+                .ok_or("prover memory estimate overflow")?;
+            bytes
+                .checked_add(amount)
+                .ok_or("prover memory estimate overflow".into())
+        })
+}
 
 /// A member's epoch proof: its seals (`seals[i]` proving
 /// `statement.seals[i]`) and the openings it committed (`openings` in the

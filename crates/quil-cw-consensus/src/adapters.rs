@@ -831,10 +831,12 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
             // How long the turn took, from this ask to its end; a declined
             // one ends in the view's nullify.
             let asked = ctx.current();
-            let settle = |proposed: bool| {
+            // Where it went: pacing, waits between attempts, and the rest.
+            let mut split = TurnWait::default();
+            let settle = |proposed: bool, mut split: TurnWait| {
                 if let Some(liveness) = liveness.as_ref() {
-                    let took = ctx.current().duration_since(asked).unwrap_or_default();
-                    liveness.settle_turn(proposal_context.view, proposed, took);
+                    split.total = ctx.current().duration_since(asked).unwrap_or_default();
+                    liveness.settle_turn(proposal_context.view, proposed, split);
                 }
             };
             // Bounded under `leader_timeout` (30s); simplex drops the receiver
@@ -851,28 +853,31 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
                 // headers where the others carried about 95 (2026-11-04).
                 if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
                     ctx.sleep(pacing).await;
+                    split.pacing += pacing;
                     if tx.is_closed() {
-                        settle(false);
+                        settle(false, split);
                         return;
                     }
                 }
+                split.attempts = split.attempts.saturating_add(1);
                 if let Some((digest, bytes)) = proposer.propose_with_context(proposal_context) {
                     // Locally-produced bytes came directly from the application
                     // proposer and are the value Simplex is about to certify — seal
                     // them so peer ingress can't substitute a different body later.
                     store.seal(digest, bytes);
                     let _ = tx.send(digest);
-                    settle(true);
+                    settle(true, split);
                     return;
                 }
                 match proposer.propose_retry() {
                     Some(delay) if waited < PROPOSE_PATIENCE && !tx.is_closed() => {
                         ctx.sleep(delay).await;
                         waited += delay;
+                        split.retries += delay;
                     }
                     // drop tx → receiver cancelled → simplex nullifies the view.
                     _ => {
-                        settle(false);
+                        settle(false, split);
                         return;
                     }
                 }
@@ -1048,6 +1053,8 @@ struct LivenessState {
     /// [`Liveness::take_behind_give_ups`]: their count, the longest wait,
     /// and the first [`BEHIND_WAIT_SAMPLES`] waits in milliseconds.
     behind_give_ups: (u64, u64, Vec<u64>),
+    /// Where the longest of those waits went.
+    behind_longest: TurnWait,
 }
 
 #[derive(Default)]
@@ -1222,6 +1229,54 @@ pub struct BehindGiveUps {
     /// The middle wait (the upper one of an even count), in milliseconds.
     pub median_ms: u64,
     pub max_ms: u64,
+    /// Where the longest wait went.
+    pub longest: TurnWait,
+}
+
+/// One turn's wait, from the ask for a proposal to the turn's end, and
+/// where it went ([`Liveness::settle_turn`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnWait {
+    pub total: std::time::Duration,
+    /// Asleep for the proposer's pacing before its attempts.
+    pub pacing: std::time::Duration,
+    /// Asleep between declined attempts (the parent waits).
+    pub retries: std::time::Duration,
+    /// Times the proposer was asked to build.
+    pub attempts: u32,
+}
+
+impl TurnWait {
+    /// The rest of the wait: inside the proposer's calls (its parent read,
+    /// the behind probe, the pacing and retry asks).
+    pub fn calls(&self) -> std::time::Duration {
+        self.total.saturating_sub(self.pacing + self.retries)
+    }
+
+    /// `pacing 4100 ms, retries 500 ms between 3 attempts, calls 1300 ms`;
+    /// empty for a wait never split (no attempt).
+    pub fn describe(&self) -> String {
+        if self.attempts == 0 {
+            return String::new();
+        }
+        format!(
+            "pacing {} ms, retries {} ms between {} attempts, calls {} ms",
+            self.pacing.as_millis(),
+            self.retries.as_millis(),
+            self.attempts,
+            self.calls().as_millis(),
+        )
+    }
+}
+
+/// A wait known only in total.
+impl From<std::time::Duration> for TurnWait {
+    fn from(total: std::time::Duration) -> Self {
+        Self {
+            total,
+            ..Self::default()
+        }
+    }
 }
 
 impl Liveness {
@@ -1530,12 +1585,16 @@ impl Liveness {
 
     /// This member's turn in `view` ended after `waited` since it was asked
     /// for a proposal ([`Self::settle`]).
-    pub fn settle_turn(&self, view: u64, proposed: bool, waited: std::time::Duration) {
+    pub fn settle_turn(&self, view: u64, proposed: bool, waited: TurnWait) {
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
         if state.behind.remove(&view) && !proposed {
-            let wait = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+            let wait = u64::try_from(waited.total.as_millis()).unwrap_or(u64::MAX);
+            let longest = state.behind_give_ups.0 == 0 || wait > state.behind_give_ups.1;
+            if longest {
+                state.behind_longest = waited;
+            }
             let (turns, max, waits) = &mut state.behind_give_ups;
             *turns += 1;
             *max = (*max).max(wait);
@@ -1558,6 +1617,7 @@ impl Liveness {
             turns,
             median_ms: waits.get(waits.len() / 2).copied().unwrap_or_default(),
             max_ms,
+            longest: std::mem::take(&mut state.behind_longest),
         }
     }
 
@@ -2131,7 +2191,7 @@ mod liveness_tests {
     /// the maximum keep all of them.
     #[test]
     fn behind_give_ups_report_their_count_median_and_max_per_interval() {
-        let ms = std::time::Duration::from_millis;
+        let ms = |n: u64| TurnWait::from(std::time::Duration::from_millis(n));
         let liveness = Liveness::default();
         for (view, wait) in [(1, 30), (2, 10), (3, 20)] {
             liveness.note_behind(view, "parent unavailable", "global state sync in progress");
@@ -2147,7 +2207,8 @@ mod liveness_tests {
             BehindGiveUps {
                 turns: 3,
                 median_ms: 20,
-                max_ms: 30
+                max_ms: 30,
+                longest: ms(30),
             },
             "turns given up while behind: count, median and max"
         );
@@ -2170,9 +2231,48 @@ mod liveness_tests {
             BehindGiveUps {
                 turns,
                 median_ms: BEHIND_WAIT_SAMPLES as u64 / 2,
-                max_ms: turns - 1
+                max_ms: turns - 1,
+                longest: ms(turns - 1),
             },
             "turns given up while behind past the kept waits"
+        );
+    }
+
+    /// The longest turn given up while behind in an interval says where its
+    /// wait went: pacing, the waits between its attempts, and the rest in
+    /// the proposer's calls; an interval without one says nothing.
+    #[test]
+    fn the_longest_give_up_says_where_its_wait_went() {
+        let ms = std::time::Duration::from_millis;
+        let liveness = Liveness::default();
+        let longest = TurnWait {
+            total: ms(7_300),
+            pacing: ms(4_100),
+            retries: ms(500),
+            attempts: 3,
+        };
+        for (view, wait) in [
+            (1, TurnWait::from(ms(1_000))),
+            (2, longest),
+            (3, ms(900).into()),
+        ] {
+            liveness.note_behind(view, "parent unavailable", "global state sync in progress");
+            liveness.settle_turn(view, false, wait);
+        }
+        let gave_up = liveness.take_behind_give_ups();
+        assert_eq!(
+            gave_up.longest, longest,
+            "the longest says where its wait went"
+        );
+        assert_eq!(
+            gave_up.longest.describe(),
+            "pacing 4100 ms, retries 500 ms between 3 attempts, calls 2700 ms",
+            "the longest says where its wait went"
+        );
+        assert_eq!(
+            liveness.take_behind_give_ups().longest.describe(),
+            "",
+            "each interval starts over"
         );
     }
 

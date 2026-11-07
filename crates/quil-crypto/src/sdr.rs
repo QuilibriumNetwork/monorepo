@@ -51,6 +51,21 @@ impl Default for SdrParams {
     }
 }
 
+impl SdrParams {
+    pub fn for_profile(profile: quil_types::consensus::StorageSealProfile) -> Self {
+        Self {
+            layers: profile.layers(),
+            ..Self::default()
+        }
+    }
+    pub fn optimized(&self) -> bool {
+        self.drg_degree == 6
+            && self.expander_degree == 8
+            && self.node_bytes == 32
+            && matches!(self.layers, 2 | 3 | 11)
+    }
+}
+
 pub(crate) const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
 const DST_GRAPH: &[u8] = b"quil/porep/sdr-graph/v1";
 
@@ -506,7 +521,7 @@ fn epoch_replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] 
 /// epoch-bound key.
 pub fn stable_replica_key(member_id: &[u8], shard_id: &[u8]) -> [u8; 32] {
     let mut h = Sha3_256::new();
-    h.update(b"quil/porep/replica-key/v2");
+    h.update(b"quil/porep/replica-key/stable/v1");
     h.update((member_id.len() as u32).to_be_bytes());
     h.update(member_id);
     h.update((shard_id.len() as u32).to_be_bytes());
@@ -595,7 +610,7 @@ mod tests {
         set_stable_replica_key_epoch_for_thread(Some(1400));
         assert_eq!(
             hex::encode(replica_key(b"member0", b"shardA", 1400)),
-            "5a32fc2e420130476d5c47cd7903350863ed2518f379e3525bb77ee4cc808f88"
+            "166a9229ba56e9ab8d7516561e072b8d78a873705cb5bf4566633468dd0738e2"
         );
         let stable = stable_replica_key(b"member0", b"shardA");
         for epoch in [1400, 1401, 1500, u64::MAX - 1] {

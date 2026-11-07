@@ -13,6 +13,10 @@ use sha3::{Digest, Sha3_256};
 
 use crate::proposal_pool::Intake;
 
+mod cert_union;
+pub(crate) use cert_union::order_copies_by_signers;
+pub use cert_union::{session_committees, Committee, CommitteeSource};
+
 // NOTE: global consensus has NO per-frame request cap. The original
 // 100-message cap existed because a global proposal was gossiped and
 // BlossomSub has a ~1 MiB message-size ceiling; global consensus now
@@ -540,6 +544,8 @@ pub struct MessageCollector {
     verify_gate: std::sync::OnceLock<&'static crate::spawn_gate::SpawnGate>,
     /// What the last GLOBAL proposal copy found ([`Self::take_proposal_pool`]).
     last_pool: std::sync::Mutex<Option<crate::proposal_pool::ProposalPool>>,
+    /// The unions of a shard frame's copies ([`cert_union`]).
+    union: cert_union::UnionState,
 }
 
 /// How often submits refused for a full rank buffer are logged while they
@@ -809,6 +815,7 @@ impl MessageCollector {
             intake: Default::default(),
             verify_gate: std::sync::OnceLock::new(),
             last_pool: std::sync::Mutex::new(None),
+            union: Default::default(),
         }
     }
 
@@ -846,6 +853,9 @@ impl MessageCollector {
     /// `data` carries shard frames this collector would verify before holding
     /// them: a caller on an async runtime admits it off the runtime.
     pub fn requires_verification(&self, data: &[u8]) -> bool {
+        if let Some(verifies) = self.union_requires_verification(data) {
+            return verifies;
+        }
         if self.shard_frame_verifier.read().unwrap().is_none() {
             return false;
         }
@@ -1207,6 +1217,18 @@ impl MessageCollector {
             self.note_shard_frame_admitted(Instant::now());
         }
 
+        if !verified {
+            // A bundle of several shard frames could not be compared with the
+            // copies of each: its frames are admitted one by one.
+            if checks.len() > 1 && self.shard_frame_verifier.read().unwrap().is_some() {
+                return self.admit_parts(rank, &message.data, provenance);
+            }
+            // A copy of a verified frame adds the signers the held copy lacks.
+            if let Some(outcome) = self.union_copy(&message, provenance) {
+                return outcome;
+            }
+        }
+
         // A frame at or below a verified frame of its shard adds nothing: the
         // leader carries one proof per shard, the highest. Another member's
         // copy of the same frame lands here too.
@@ -1312,6 +1334,11 @@ impl MessageCollector {
                     }
                 }
             }
+        }
+
+        // This copy will supersede the unverified ones of its frame.
+        if message.verified && !verified {
+            self.absorb_unverified(&mut message, provenance);
         }
 
         // File nothing below the newest finalized frame: retention counts
@@ -1554,6 +1581,9 @@ impl MessageCollector {
                 }
             }
         }
+        for candidates in shards.values_mut() {
+            cert_union::most_signers_first(candidates);
+        }
         if let Some(frame) = frame {
             self.note_proposal_pool(frame, &buffers, &finalized, &consumed_keys, &shards);
         }
@@ -1780,6 +1810,7 @@ impl MessageCollector {
         if raw_msgs.is_empty() {
             return;
         }
+        self.note_included(raw_msgs);
         let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
         let frames: Vec<(Vec<u8>, u64)> = raw_msgs
             .iter()

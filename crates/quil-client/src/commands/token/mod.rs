@@ -572,11 +572,12 @@ pub enum TokenCommand {
     /// covering them. A submitted batch's coins stay out of new runs for two
     /// hours. Submissions are at least `--min-interval` seconds apart
     /// (default 300, at most 12 per hour).
-    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
-    /// or under 330 frames per hour as the head advanced across the sampled
-    /// window, judged once 10 minutes are sampled) and resumes after 10
-    /// minutes of healthy advance. Each pause, resume, submission and
-    /// inclusion is printed with the projected end.
+    /// The run pauses while the node reports GLOBAL degraded (its head
+    /// unchanged for 120 s, or under 330 frames in the last hour, judged
+    /// once 10 minutes are observed) or its report is unreadable for 60 s,
+    /// and resumes once the node has reported GLOBAL healthy for 10
+    /// minutes. Each pause, resume, submission and inclusion is printed
+    /// with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
@@ -601,10 +602,17 @@ pub enum TokenCommand {
         wait: u64,
     },
     /// Mint a custom token under its deployed policy.
+    ///
+    /// The mint's QUIL settlement pays for one exact bundle, so the bundle is
+    /// saved before the settlement is sent, as `custom-mint-<receipt>.txt` in
+    /// the config directory (the path is printed). When the settlement is not
+    /// certified within --pay-wait, `custom-mint --resume <file>` finishes
+    /// the mint; running custom-mint again pays a second settlement.
     #[cfg(feature = "native-proof")]
     CustomMint {
         /// Positive amount in base units.
-        amount: u128,
+        #[arg(required_unless_present = "resume")]
+        amount: Option<u128>,
         #[arg(long)]
         recipient: Option<String>,
         #[arg(long = "authority-key", default_value = "q-prover-key")]
@@ -622,9 +630,19 @@ pub enum TokenCommand {
         /// basis times the amount). The node rejects an underpayment.
         #[arg(long)]
         price: Option<u128>,
-        /// Seconds to wait for the payment settlement to be certified.
+        /// Seconds to wait for the payment settlement to be certified (with
+        /// --resume, for the saved mint's settlement).
         #[arg(long, default_value_t = 900)]
         pay_wait: u64,
+        /// Finish the mint saved at FILE without paying again: wait up to
+        /// --pay-wait for its settlement to be certified, then submit the
+        /// saved bundle.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["amount", "recipient", "permissionless", "payee", "price", "entitlement"]
+        )]
+        resume: Option<PathBuf>,
         /// Proof-basis policy: this mint's entitlement proof (hex), from
         /// `token entitlements`. The authority key must be the entitled key
         /// and the amount the entitled amount.
@@ -759,6 +777,9 @@ pub enum TokenCommand {
     Prefunded,
     /// Print the claim (hex) that spends a certified settlement in its destination
     /// bundle: `settlement-claim <Destination> <Receipt> <Amount> <Context>`.
+    ///
+    /// A paid settlement (a paid mint's) also recorded its payment, which the
+    /// claim must repeat: pass --payment-address and --payment together.
     #[cfg(feature = "native-proof")]
     SettlementClaim {
         destination: String,
@@ -768,6 +789,14 @@ pub enum TokenCommand {
         /// Seconds to wait for the settlement's GLOBAL record to be certified.
         #[arg(long, default_value_t = 0)]
         wait: u64,
+        /// Paid settlement: the payment address it paid (32 bytes of hex), the
+        /// payee's `Payment address` as `token payment-address` prints it.
+        #[arg(long, value_name = "HEX32", requires = "payment")]
+        payment_address: Option<String>,
+        /// Paid settlement: the payment it made in QUIL base units, the price
+        /// paid (a paid mint's --price).
+        #[arg(long, value_name = "AMOUNT", requires = "payment_address")]
+        payment: Option<String>,
     },
     /// Claim this prover's reward balance as new coins: `mint [<RecipientAddress>]`.
     /// The reward mint is two-stage: authorize, then `--claim <file>` once finalized.
@@ -1413,6 +1442,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     None,
                     args.page_cap(),
                     args.max_coins,
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -1441,14 +1471,23 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 amount,
                 context,
                 wait,
+                payment_address,
+                payment,
             } => {
-                let claim = wallet::settlement_claim(
-                    &tc,
+                // Clap takes both or neither.
+                let payment = match (payment_address, payment) {
+                    (Some(address), Some(value)) => {
+                        Some((parse_id(address)?, parse_amount(value)?))
+                    }
+                    _ => None,
+                };
+                let claim = wallet::run_settlement_claim(
+                    tc,
                     parse_id(destination)?,
                     parse_id(receipt)?,
                     parse_amount(amount)?,
-                    &wallet::ClaimBinding::Bundle(parse_id(context)?),
-                    None,
+                    parse_id(context)?,
+                    payment,
                     std::time::Duration::from_secs(*wait),
                 )
                 .await?;
@@ -1465,8 +1504,26 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 price,
                 pay_wait,
                 entitlement,
+                resume,
                 wait,
             } => {
+                if let Some(saved) = resume {
+                    // The saved bundle names its application; one given must match.
+                    let application: Option<[u8; 32]> = args
+                        .application
+                        .as_ref()
+                        .map(|_| decoded.as_slice().try_into().expect("checked above"));
+                    return wallet::run_custom_mint_resume(
+                        tc,
+                        application,
+                        saved,
+                        secs(*pay_wait),
+                        follow(*wait),
+                    )
+                    .await;
+                }
+                let amount =
+                    amount.ok_or_else(|| anyhow::anyhow!("custom-mint needs an amount"))?;
                 let paid = match (payee, price) {
                     (Some(payee), Some(price)) => Some((
                         payee.as_str(),
@@ -1483,7 +1540,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 return wallet::run_custom_mint(
                     &tc,
                     &application,
-                    *amount,
+                    amount,
                     recipient.as_deref(),
                     authority_key,
                     *permissionless,
@@ -1583,6 +1640,27 @@ mod tests {
                 TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
                     .is_ok()
             );
+            // Finishing a saved mint takes its file, no amount or mint form.
+            assert!(matches!(
+                TokenCli::try_parse_from(["token", "custom-mint", "--resume", "saved.txt"])
+                    .unwrap()
+                    .token
+                    .command,
+                TokenCommand::CustomMint {
+                    amount: None,
+                    resume: Some(_),
+                    ..
+                }
+            ));
+            assert!(TokenCli::try_parse_from(["token", "custom-mint"]).is_err());
+            assert!(TokenCli::try_parse_from([
+                "token",
+                "custom-mint",
+                "9",
+                "--resume",
+                "saved.txt"
+            ])
+            .is_err());
             // Paid and proof-basis mints, and the entitlement tree builder.
             assert!(TokenCli::try_parse_from([
                 "token",

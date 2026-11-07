@@ -230,6 +230,7 @@ impl World {
     fn step_with(&self, frame: u64, messages: impl FnOnce(&HypergraphState)) -> Observed {
         intrinsic::set_pending_repair_off_for_thread(self.repair_off);
         let state = HypergraphState::new(self.crdt.clone());
+        keep_sealed(&state, frame);
         messages(&state);
         self.intrinsic
             .apply_due_shard_changes(frame, &state)
@@ -353,6 +354,53 @@ fn seed(state: &HypergraphState, n: u8, seniority: u64, filter: &[u8]) -> Prover
         )
         .unwrap();
     Prover { key }
+}
+
+/// Every prover the tests seed: [`World::new_on`]'s, then those joining later.
+const MEMBERS: [u8; 9] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x40, 0x50, 0x60, 0x61];
+
+/// Each seeded prover holds a seat sealed before this epoch and the next on
+/// each of its allocations' shards, as storing provers do: from the sealed
+/// storage epoch the committee scan seats no member without one.
+fn keep_sealed(state: &HypergraphState, frame: u64) {
+    use quil_execution::global_intrinsic::storage_seat::{self, Seat, SeatSlot};
+    let epoch = frame / EPOCH;
+    let va = vertex_adds_discriminator().unwrap();
+    let ha = hyperedge_adds_discriminator().unwrap();
+    for n in MEMBERS {
+        let member = materialize::prover_address_from_pubkey(&[n; 897]).unwrap();
+        let hyperedge = state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &member, &ha)
+            .unwrap()
+            .unwrap_or_default();
+        for allocation in materialize::hyperedge_allocation_addresses(&hyperedge).unwrap() {
+            let Some(blob) = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation, &va)
+                .unwrap()
+                .filter(|blob| !blob.is_empty())
+            else {
+                continue;
+            };
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            let filter =
+                read_field(&tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap();
+            let seat = Seat {
+                slots: [epoch, epoch + 1]
+                    .map(|epoch| SeatSlot {
+                        epoch,
+                        leaves: vec![vec![0]],
+                        registered_at: epoch * EPOCH - 2,
+                        sealed_at: Some(epoch * EPOCH - 1),
+                        ..Default::default()
+                    })
+                    .to_vec(),
+                ..Seat::new(member, filter.clone())
+            };
+            if storage_seat::read(state, &member, &filter).unwrap() != Some(seat.clone()) {
+                storage_seat::write(state, frame, &seat).unwrap();
+            }
+        }
+    }
 }
 
 /// A prover with a Joining allocation on each of `filters`, joined at

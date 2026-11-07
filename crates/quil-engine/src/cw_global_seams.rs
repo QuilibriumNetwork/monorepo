@@ -1984,12 +1984,7 @@ pub fn activate_global_consensus_cw(
         },
         transport,
     );
-    crate::global_stall::spawn(
-        watch,
-        Arc::downgrade(&contact),
-        liveness,
-        clock_store.clone(),
-    );
+    crate::global_stall::spawn(watch, Arc::downgrade(&contact), liveness);
 
     // Another member may have stopped after voting but before keeping the old
     // candidate. Re-advertise this bounded recovered tail until finalized. The

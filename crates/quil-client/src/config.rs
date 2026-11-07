@@ -7,14 +7,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::system;
+use crate::system::{self, InstallLayout};
 
 /// `client/utils/types.go:3` — the qclient config, serialized as YAML with
 /// camelCase keys.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// Kept for the file format the Go client shares; qclient takes its
+    /// paths from [`system::install_layout`], never from this key.
     #[serde(rename = "dataDir", default)]
     pub data_dir: String,
+    /// Kept for the file format, like `data_dir`; not read.
     #[serde(rename = "symlinkPath", default)]
     pub symlink_path: String,
     #[serde(rename = "publicRpc", default)]
@@ -38,8 +41,13 @@ impl ClientConfig {
     /// The default written by `CreateDefaultConfig`
     /// (`client/utils/clientConfig.go:15`).
     pub fn default_for_create() -> Self {
+        Self::default_for_create_in(system::install_layout())
+    }
+
+    /// [`Self::default_for_create`] under `layout`.
+    fn default_for_create_in(layout: &InstallLayout) -> Self {
         Self {
-            data_dir: system::client_data_path().to_string_lossy().into_owned(),
+            data_dir: layout.client_data_path().to_string_lossy().into_owned(),
             symlink_path: system::default_qclient_symlink_path()
                 .to_string_lossy()
                 .into_owned(),
@@ -54,12 +62,18 @@ impl ClientConfig {
     /// missing (`client/utils/clientConfig.go:37`). Differs from
     /// `default_for_create` only in `symlink_path` (`<dataDir>/current`).
     fn default_for_load() -> Self {
+        Self::default_for_load_in(system::install_layout())
+    }
+
+    /// [`Self::default_for_load`] under `layout`.
+    fn default_for_load_in(layout: &InstallLayout) -> Self {
         Self {
-            symlink_path: system::client_data_path()
-                .join("current")
+            symlink_path: layout
+                .client_data_path()
+                .join(system::QCLIENT_ROOT_LINK)
                 .to_string_lossy()
                 .into_owned(),
-            ..Self::default_for_create()
+            ..Self::default_for_create_in(layout)
         }
     }
 }
@@ -159,6 +173,44 @@ mod tests {
         let cfg: ClientConfig = serde_yaml::from_str(go_yaml).unwrap();
         assert!(cfg.public_rpc);
         assert_eq!(cfg.custom_rpc, "example.com:8337");
+    }
+
+    /// A new config names the layout's qclient directory: /opt on macOS,
+    /// /var on macOS while only an earlier /var install exists, /var on
+    /// Linux.
+    #[test]
+    fn new_config_paths_follow_the_install_layout() {
+        fn check(case: &str, layout: &InstallLayout, dir: &str) {
+            let load = ClientConfig::default_for_load_in(layout);
+            assert_eq!(load.data_dir, dir, "LAYOUT-PATH load dataDir, {case}");
+            assert_eq!(
+                load.symlink_path,
+                format!("{dir}/current"),
+                "LAYOUT-PATH load symlinkPath, {case}"
+            );
+            let create = ClientConfig::default_for_create_in(layout);
+            assert_eq!(create.data_dir, dir, "LAYOUT-PATH create dataDir, {case}");
+            assert_eq!(
+                create.symlink_path, "/usr/local/bin/qclient",
+                "LAYOUT-PATH create symlinkPath, {case}"
+            );
+        }
+        let var_only = |p: &std::path::Path| p == std::path::Path::new(system::VAR_ROOT_PATH);
+        check(
+            "macOS",
+            &InstallLayout::for_os("darwin", &|_| false),
+            "/opt/quilibrium/bin/qclient",
+        );
+        check(
+            "macOS with only /var",
+            &InstallLayout::for_os("darwin", &var_only),
+            "/var/quilibrium/bin/qclient",
+        );
+        check(
+            "Linux",
+            &InstallLayout::for_os("linux", &|_| true),
+            "/var/quilibrium/bin/qclient",
+        );
     }
 
     #[test]

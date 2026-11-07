@@ -56,6 +56,7 @@ bs58 = "0.5"
 sysinfo = "0.37.2"
 
 [dev-dependencies]
+tempfile = "3"
 quil-store = { path = "../quil-store", features = ["test-utils"] }
 tokio = { version = "1", features = ["test-util"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }

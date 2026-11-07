@@ -68,12 +68,17 @@ struct SyncPass {
     anchor: RegistrySyncAnchor,
     registry_sync: u64,
     refresh_ms: u64,
+    /// The store as the sync's cursor checkpoint left it. The pass refreshes
+    /// the registry from it first; `None` when the sync task refreshed it.
+    capture: Option<Arc<dyn quil_types::store::SnapshotReadable>>,
 }
 
 #[derive(Default)]
 struct SyncReconcileState {
     /// When the running pass began; at most one runs.
     running_since: Option<std::time::Instant>,
+    /// Whether the running pass is still refreshing the registry.
+    refreshing: bool,
     /// The newest pass owed meanwhile, run when the one running ends.
     next: Option<SyncPass>,
     driver: Option<tokio::task::JoinHandle<()>>,
@@ -82,9 +87,25 @@ struct SyncReconcileState {
 type SyncReconcilePass =
     Arc<dyn Fn(&RegistrySyncAnchor) -> quil_types::error::Result<Option<u64>> + Send + Sync>;
 
+type SyncRegistryRefresh = Arc<
+    dyn Fn(&dyn quil_types::store::SnapshotReadable) -> quil_types::error::Result<()> + Send + Sync,
+>;
+
+/// The prover registry verified syncs refresh.
+struct SyncRegistry {
+    /// Refresh the registry from a capture of the store.
+    refresh: SyncRegistryRefresh,
+    /// The registry now reflects the sync numbered by the first argument,
+    /// which verified the GLOBAL view through the frame the second names.
+    noted: Arc<dyn Fn(u64, Option<u64>) + Send + Sync>,
+}
+
 /// Runs the passes verified registry syncs owe, off the sync task: a pass can
 /// take minutes on a node with many seats, and awaited there it held the next
-/// pull, and with it the view every session and storage duty reads.
+/// pull, and with it the view every session and storage duty reads. A pass
+/// carrying a capture refreshes the registry from it first, for the same
+/// reason: a full refresh took 10 min at an epoch boundary on a node with
+/// many workers (2026-11-07).
 ///
 /// One pass at a time. A sync finishing during a pass replaces any pass still
 /// waiting, since the newest anchor covers it, so what waits is bounded by one.
@@ -95,24 +116,84 @@ struct SyncReconciles {
     pass: SyncReconcilePass,
     /// After each pass, whatever its outcome.
     after_pass: Arc<dyn Fn() + Send + Sync>,
+    registry: SyncRegistry,
     cancel: tokio_util::sync::CancellationToken,
     state: std::sync::Mutex<SyncReconcileState>,
 }
 
 impl SyncReconciles {
+    /// Reconciles whose syncs never leave the registry refresh to them.
+    #[cfg(test)]
     fn new(
         archive_mode: bool,
         pass: SyncReconcilePass,
         after_pass: Arc<dyn Fn() + Send + Sync>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Arc<Self> {
+        let registry = SyncRegistry {
+            refresh: Arc::new(|_: &dyn quil_types::store::SnapshotReadable| {
+                Err(quil_types::error::QuilError::Internal(
+                    "these reconciles refresh no registry".into(),
+                ))
+            }),
+            noted: Arc::new(|_, _| {}),
+        };
+        Self::with_registry(archive_mode, pass, after_pass, registry, cancel)
+    }
+
+    fn with_registry(
+        archive_mode: bool,
+        pass: SyncReconcilePass,
+        after_pass: Arc<dyn Fn() + Send + Sync>,
+        registry: SyncRegistry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Arc<Self> {
         Arc::new(Self {
             archive_mode,
             pass,
             after_pass,
+            registry,
             cancel,
             state: Default::default(),
         })
+    }
+
+    /// Whether a sync at `anchor` owes a pass ([`Self::owe`] runs one).
+    fn owes(&self, anchor: &RegistrySyncAnchor) -> bool {
+        registry_sync_reconcile_frame(anchor, self.archive_mode).is_some()
+    }
+
+    /// Refresh the registry from `capture` and note `pass`'s sync as
+    /// reflected, recording the refresh's duration in `pass`. False when it
+    /// failed: nothing is noted.
+    async fn refresh_registry(
+        &self,
+        pass: &mut SyncPass,
+        capture: Arc<dyn quil_types::store::SnapshotReadable>,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        let refresh = self.registry.refresh.clone();
+        let refreshed = tokio::task::spawn_blocking(move || refresh(capture.as_ref())).await;
+        pass.refresh_ms = started.elapsed().as_millis() as u64;
+        let (registry_sync, refresh_ms) = (pass.registry_sync, pass.refresh_ms);
+        match refreshed {
+            Ok(Ok(())) => {
+                (self.registry.noted)(registry_sync, pass.anchor.cursor);
+                true
+            }
+            Ok(Err(error)) => {
+                warn!(%error, registry_sync, refresh_ms,
+                    "reconcile: prover registry refresh failed; the registry and the worker pass \
+                     wait for the next verified sync");
+                false
+            }
+            Err(error) => {
+                warn!(%error, registry_sync, refresh_ms,
+                    "reconcile: prover registry refresh task failed; the registry and the worker \
+                     pass wait for the next verified sync");
+                false
+            }
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, SyncReconcileState> {
@@ -127,11 +208,17 @@ impl SyncReconciles {
         }
         let mut state = self.state();
         if let Some(since) = state.running_since {
+            let step = if state.refreshing {
+                "registry refresh"
+            } else {
+                "worker reconcile"
+            };
             warn!(registry_sync = pass.registry_sync, frame = ?pass.anchor.cursor,
-                running_ms = since.elapsed().as_millis() as u64, scope = "this node",
-                action = "its `worker reconcile slow` line, when it ends, names the step",
-                "worker reconcile still running when the next prover tree sync finished: the view \
-                 keeps moving, and this sync's pass runs after it");
+                running_ms = since.elapsed().as_millis() as u64, step, scope = "this node",
+                action = "a registry refresh over 30 s or the `worker reconcile slow` line, when it \
+                          ends, names where the time went",
+                "registry refresh or worker reconcile still running when the next prover tree sync \
+                 finished: the view keeps moving, and this sync's pass runs after it");
             state.next = Some(pass);
             return true;
         }
@@ -143,6 +230,22 @@ impl SyncReconciles {
 
     async fn drive(self: Arc<Self>, mut pass: SyncPass) {
         loop {
+            if let Some(capture) = pass.capture.take() {
+                self.state().refreshing = true;
+                let refreshed = self.refresh_registry(&mut pass, capture).await;
+                self.state().refreshing = false;
+                // The pass reads the registry: a failed refresh leaves both,
+                // and the lifecycle gate, to the next verified sync.
+                if !refreshed {
+                    match self.next_pass() {
+                        Some(next) => {
+                            pass = next;
+                            continue;
+                        }
+                        None => return,
+                    }
+                }
+            }
             let started = std::time::Instant::now();
             let (run, anchor) = (self.pass.clone(), pass.anchor.clone());
             let outcome = tokio::task::spawn_blocking(move || run(&anchor)).await;
@@ -162,17 +265,19 @@ impl SyncReconciles {
                     "worker reconciliation after registry refresh task failed; retrying on next sync"),
             }
             (self.after_pass)();
-            let next = {
-                let mut state = self.state();
-                let next = state.next.take().filter(|_| !self.cancel.is_cancelled());
-                state.running_since = next.as_ref().map(|_| std::time::Instant::now());
-                next
-            };
-            let Some(next) = next else {
+            let Some(next) = self.next_pass() else {
                 return;
             };
             pass = next;
         }
+    }
+
+    /// The pass waiting to run next, or none, ending the driver.
+    fn next_pass(&self) -> Option<SyncPass> {
+        let mut state = self.state();
+        let next = state.next.take().filter(|_| !self.cancel.is_cancelled());
+        state.running_since = next.as_ref().map(|_| std::time::Instant::now());
+        next
     }
 
     /// Wait for the running pass: shutdown holds the stores and workers it uses
@@ -183,6 +288,40 @@ impl SyncReconciles {
             let _ = driver.await;
         }
     }
+}
+
+/// What a verified prover-tree sync owes once its GLOBAL cursor is recorded:
+/// a registry refresh from `capture`, the store as the sync left it, the
+/// note that the registry reflects the sync, then the worker pass. `defer`,
+/// for a sync that records the committed GLOBAL view, leaves the refresh to
+/// the pass, off the sync task: awaited there, it held the next sync and
+/// with it the view committee sessions and seal drains read, 10 min at an
+/// epoch boundary on a node with many workers (2026-11-07). Otherwise the
+/// task waits for it. `None` when the store could not be captured or the
+/// refresh failed (the caller tries the next peer); else whether a worker
+/// pass is owed.
+async fn settle_verified_sync(
+    reconciles: &Arc<SyncReconciles>,
+    capture: quil_types::error::Result<Arc<dyn quil_types::store::SnapshotReadable>>,
+    mut pass: SyncPass,
+    defer: bool,
+) -> Option<bool> {
+    let capture = match capture {
+        Ok(capture) => capture,
+        Err(error) => {
+            warn!(%error, registry_sync = pass.registry_sync,
+                "reconcile: could not capture the store for the prover registry refresh");
+            return None;
+        }
+    };
+    if defer && reconciles.owes(&pass.anchor) {
+        pass.capture = Some(capture);
+        return Some(reconciles.owe(pass));
+    }
+    if !reconciles.refresh_registry(&mut pass, capture).await {
+        return None;
+    }
+    Some(reconciles.owe(pass))
 }
 
 /// The next prover-tree pull: `None` for the periodic one, else the early pull
@@ -4662,7 +4801,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
                 let mut early_check = tokio::time::interval(quil_engine::global_view_refresh::CHECK_INTERVAL);
                 early_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let sync_reconciles = SyncReconciles::new(
+                let sync_reconciles = SyncReconciles::with_registry(
                     sync_archive_mode,
                     {
                         let allocator = sync_wa.clone();
@@ -4677,6 +4816,21 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         // planner must see those workers bound.
                         let lifecycle = sync_pl.clone();
                         Arc::new(move || lifecycle.set_sync_complete())
+                    },
+                    {
+                        let (registry, store, lifecycle) =
+                            (sync_pr.clone(), sync_hg.clone(), sync_pl.clone());
+                        SyncRegistry {
+                            refresh: Arc::new(move |capture: &dyn quil_types::store::SnapshotReadable| {
+                                registry.refresh_from_capture(store.as_ref(), capture)
+                            }),
+                            noted: Arc::new(move |sync, view| {
+                                lifecycle.note_registry_synced(sync);
+                                if let Some(view) = view {
+                                    lifecycle.note_registry_view(view);
+                                }
+                            }),
+                        }
                     },
                     sync_token.clone(),
                 );
@@ -4864,26 +5018,33 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 }
                                             }
                                         }
-                                        // Refresh registry with updated data.
-                                        let pr = sync_pr.clone();
-                                        let hs3 = sync_hg.clone();
-                                        let refresh_started = std::time::Instant::now();
-                                        let refreshed = tokio::task::spawn_blocking(move || pr.refresh_from_store(hs3.as_ref())).await;
-                                        let refresh_ms = refresh_started.elapsed().as_millis() as u64;
-                                        match refreshed {
-                                            Ok(Ok(())) => sync_pl.note_registry_synced(registry_sync),
-                                            Ok(Err(error)) => {
-                                                warn!(%error, "reconcile: prover registry refresh failed");
-                                                continue;
-                                            }
-                                            Err(error) => {
-                                                warn!(%error, "reconcile: prover registry refresh task failed");
-                                                continue;
-                                            }
-                                        }
-                                        if let Some(view) = anchor.cursor {
-                                            sync_pl.note_registry_view(view);
-                                        }
+                                        // Refresh the registry from the store as this sync
+                                        // left it; a sync recording the committed view
+                                        // leaves that to its worker pass, so the next sync
+                                        // is not held behind it. The pass uses the same
+                                        // captured state as committee authorization, after
+                                        // its cursor has been recorded. The allocator
+                                        // preserves workers still needed by a closing
+                                        // committee.
+                                        let capture = quil_types::store::HypergraphStore::capture_tree_snapshot(
+                                            sync_hg.as_ref(),
+                                        )
+                                        .and_then(|capture| capture.ok_or_else(|| {
+                                            quil_types::error::QuilError::Store(
+                                                "prover registry requires a consistent store snapshot".into(),
+                                            )
+                                        }));
+                                        let pass = SyncPass {
+                                            anchor: anchor.clone(),
+                                            registry_sync,
+                                            refresh_ms: 0,
+                                            capture: None,
+                                        };
+                                        let Some(owes_pass) =
+                                            settle_verified_sync(&sync_reconciles, capture, pass, record_view).await
+                                        else {
+                                            continue;
+                                        };
                                         reconcile_converged = true;
 
                                         // Archive mismatch recovery: if the sync
@@ -4896,14 +5057,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // (converged is meaningful) — a bootstrap
                                         // trust-sync (empty root) leaves the flag
                                         // for the normal verify path to set.
-                                        // Use the same captured state as committee authorization,
-                                        // after its cursor has been recorded. The allocator preserves
-                                        // workers still needed by a closing committee.
-                                        let owes_pass = sync_reconciles.owe(SyncPass {
-                                            anchor: anchor.clone(),
-                                            registry_sync,
-                                            refresh_ms,
-                                        });
                                         if conv.is_some()
                                             && (!expected_root.is_empty()
                                                 || (sync_archive_mode && mismatch_recovery))
@@ -5009,6 +5162,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 new_balance = %post_balance,
                                                 "local prover reward balance updated by sync"
                                             );
+                                            super::seat_certificates::credited(&delta);
                                         }
                                         // Recovery path: if the initial sync at
                                         // startup failed, the lifecycle gate stayed
@@ -5936,6 +6090,7 @@ mod validation_tests {
             anchor: cited_anchor(frame),
             registry_sync: frame,
             refresh_ms: 0,
+            capture: None,
         }
     }
 
@@ -6004,6 +6159,7 @@ mod validation_tests {
                         anchor: cited_anchor(2159),
                         registry_sync: sync,
                         refresh_ms: 0,
+                        capture: None,
                     });
                 }
             })
@@ -6113,6 +6269,7 @@ mod validation_tests {
                 anchor: uncited,
                 registry_sync: 1,
                 refresh_ms: 0,
+                capture: None,
             }));
         }
         let archive = SyncReconciles::new(
@@ -6133,6 +6290,283 @@ mod validation_tests {
         gate.open();
         reconciles.wait_idle().await;
         assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
+
+    /// Write a GLOBAL prover vertex into `store` for each public key byte.
+    fn add_provers(store: &quil_store::RocksHypergraphStore, keys: &[u8]) {
+        use quil_execution::global_intrinsic::materialize::{
+            create_prover_vertex_tree, prover_address_from_pubkey,
+        };
+        use quil_types::store::HypergraphStore;
+        let shard = quil_types::store::ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        let txn = HypergraphStore::new_transaction(store, false).unwrap();
+        for &byte in keys {
+            let public_key = vec![byte; 585];
+            let mut key = quil_execution::domains::GLOBAL.to_vec();
+            key.extend_from_slice(&prover_address_from_pubkey(&public_key).unwrap());
+            let tree = create_prover_vertex_tree(&public_key, 0).unwrap();
+            HypergraphStore::save_vertex_underlying(
+                store,
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &key,
+                &quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// A capture of the store whose first page of prover vertices waits for
+    /// `gate`: a registry refresh as slow as the gate keeps it, as the 10 min
+    /// refreshes at the epoch 1422 and 1423 boundaries were (2026-11-07).
+    struct SlowCapture {
+        inner: Arc<dyn quil_types::store::SnapshotReadable>,
+        gate: Arc<PassGate>,
+    }
+
+    impl quil_types::store::SnapshotReadable for SlowCapture {
+        fn read_record(&self, key: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> {
+            self.inner.read_record(key)
+        }
+
+        fn page_vertex_underlying_fixed(
+            &self,
+            set_type: &str,
+            phase_type: &str,
+            shard: &quil_types::store::ShardKey,
+            domain: &[u8; 32],
+            after: Option<&[u8; 32]>,
+            limits: quil_types::store::VertexPageLimits,
+        ) -> quil_types::error::Result<quil_types::store::VertexDataPage> {
+            if phase_type == "adds" && after.is_none() {
+                self.gate.pass(None);
+            }
+            self.inner
+                .page_vertex_underlying_fixed(set_type, phase_type, shard, domain, after, limits)
+        }
+
+        fn load_tree_blob(
+            &self,
+            set_type: &str,
+            phase_type: &str,
+            shard_key: &quil_types::store::ShardKey,
+        ) -> quil_types::error::Result<Option<Vec<u8>>> {
+            self.inner.load_tree_blob(set_type, phase_type, shard_key)
+        }
+
+        fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
+            self.inner.scan_point()
+        }
+    }
+
+    /// The sync task's turns on a regular node: each records the committed
+    /// GLOBAL view, then settles its sync, while the registry refresh the
+    /// first sync owes reads a store held by a gate. The view must keep
+    /// moving. The registry is noted as reflecting a sync, and the worker
+    /// pass reads it, only once it holds that sync's capture; the syncs
+    /// during the refresh run one more, from the newest capture.
+    #[tokio::test]
+    async fn a_slow_registry_refresh_does_not_hold_the_committed_view() {
+        use quil_types::store::HypergraphStore as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        /// Sync, view, provers in the registry when it was noted.
+        type Noted = (u64, Option<u64>, usize);
+        /// View, provers in the registry when the pass read it.
+        type Pass = (Option<u64>, usize);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(Arc::new(db).inner()));
+        add_provers(&store, &[0xA1]);
+        let registry = Arc::new(quil_execution::SharedProverRegistry::new());
+        let reads = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(reads.clone());
+        let provers = {
+            let registry = registry.clone();
+            move || registry.read(|r| r.distinct_provers())
+        };
+        let noted: Arc<std::sync::Mutex<Vec<Noted>>> = Default::default();
+        let passes: Arc<std::sync::Mutex<Vec<Pass>>> = Default::default();
+        let reconciles = SyncReconciles::with_registry(
+            false,
+            {
+                let (passes, provers) = (passes.clone(), provers.clone());
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    passes.lock().unwrap().push((anchor.cursor, provers()));
+                    Ok(anchor.cursor)
+                })
+            },
+            Arc::new(|| {}),
+            SyncRegistry {
+                refresh: {
+                    let (registry, store) = (registry.clone(), store.clone());
+                    Arc::new(move |capture: &dyn quil_types::store::SnapshotReadable| {
+                        registry.refresh_from_capture(store.as_ref(), capture)
+                    })
+                },
+                noted: {
+                    let (noted, provers) = (noted.clone(), provers.clone());
+                    Arc::new(move |sync, view| noted.lock().unwrap().push((sync, view, provers())))
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let clock = Arc::new(early_pull_clock(2160, 2100));
+        let synced = Arc::new(AtomicU64::new(0));
+        let task = {
+            let (reconciles, store, clock, reads, synced) = (
+                reconciles.clone(),
+                store.clone(),
+                clock.clone(),
+                reads.clone(),
+                synced.clone(),
+            );
+            tokio::spawn(async move {
+                for sync in 1..=4u64 {
+                    let view = 2100 + sync;
+                    // The committed view this sync records, before it settles.
+                    clock.put_global_materialized_cursor(view).unwrap();
+                    if sync == 3 {
+                        add_provers(&store, &[0xA2]);
+                    }
+                    let capture = store.capture_tree_snapshot().map(|capture| {
+                        Arc::new(SlowCapture {
+                            inner: capture.unwrap(),
+                            gate: reads.clone(),
+                        }) as Arc<dyn quil_types::store::SnapshotReadable>
+                    });
+                    let pass = SyncPass {
+                        anchor: cited_anchor(view),
+                        registry_sync: sync,
+                        refresh_ms: 0,
+                        capture: None,
+                    };
+                    assert_eq!(
+                        settle_verified_sync(&reconciles, capture, pass, true).await,
+                        Some(true)
+                    );
+                    synced.store(sync, Ordering::SeqCst);
+                }
+            })
+        };
+        assert!(came_within(PASS_STARTS_WITHIN, || reads.running() == 1).await);
+        let moved = came_within(PASS_STARTS_WITHIN, || synced.load(Ordering::SeqCst) == 4).await;
+        assert!(
+            moved,
+            "registry refresh held the sync task: {} sync(s) settled, committed view at {:?}",
+            synced.load(Ordering::SeqCst),
+            clock.get_global_materialized_cursor()
+        );
+        assert_eq!(clock.get_global_materialized_cursor(), Some(2104));
+        task.await.unwrap();
+        assert!(
+            noted.lock().unwrap().is_empty() && passes.lock().unwrap().is_empty(),
+            "the registry was noted as reflecting a sync before its refresh ended"
+        );
+        assert_eq!(provers(), 0, "readers keep the registry before the refresh");
+        reads.open();
+        assert!(came_within(PASS_STARTS_WITHIN, || passes.lock().unwrap().len() == 2).await);
+        reconciles.wait_idle().await;
+        assert_eq!(
+            (
+                noted.lock().unwrap().clone(),
+                passes.lock().unwrap().clone(),
+                reads.frames().len()
+            ),
+            (
+                vec![(1, Some(2101), 1), (4, Some(2104), 2)],
+                vec![(Some(2101), 1), (Some(2104), 2)],
+                2
+            ),
+            "the syncs during the refresh did not run one more, from the newest capture"
+        );
+    }
+
+    /// A capture holding nothing.
+    struct EmptyCapture;
+
+    impl quil_types::store::SnapshotReadable for EmptyCapture {
+        fn load_tree_blob(
+            &self,
+            _: &str,
+            _: &str,
+            _: &quil_types::store::ShardKey,
+        ) -> quil_types::error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+
+    /// The worker pass reads the registry: when the refresh before it fails,
+    /// neither the pass nor the lifecycle gate runs, nothing is noted, and
+    /// the next sync's pass refreshes and runs as usual.
+    #[tokio::test]
+    async fn a_failed_registry_refresh_leaves_its_pass_to_the_next_sync() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        type Noted = (u64, Option<u64>);
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let ended = Arc::new(AtomicU64::new(0));
+        let noted: Arc<std::sync::Mutex<Vec<Noted>>> = Default::default();
+        let passes: Arc<std::sync::Mutex<Vec<Option<u64>>>> = Default::default();
+        let reconciles = SyncReconciles::with_registry(
+            false,
+            {
+                let passes = passes.clone();
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    passes.lock().unwrap().push(anchor.cursor);
+                    Ok(anchor.cursor)
+                })
+            },
+            {
+                let ended = ended.clone();
+                Arc::new(move || {
+                    ended.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+            SyncRegistry {
+                refresh: {
+                    let refreshes = refreshes.clone();
+                    Arc::new(move |_: &dyn quil_types::store::SnapshotReadable| {
+                        match refreshes.fetch_add(1, Ordering::SeqCst) {
+                            0 => Err(quil_types::error::QuilError::Store("unreadable".into())),
+                            _ => Ok(()),
+                        }
+                    })
+                },
+                noted: {
+                    let noted = noted.clone();
+                    Arc::new(move |sync, view| noted.lock().unwrap().push((sync, view)))
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let state = || {
+            (
+                noted.lock().unwrap().clone(),
+                passes.lock().unwrap().clone(),
+                ended.load(Ordering::SeqCst),
+            )
+        };
+        for sync in [1u64, 2] {
+            let mut pass = sync_pass(2100 + sync);
+            pass.registry_sync = sync;
+            pass.capture = Some(Arc::new(EmptyCapture));
+            assert!(reconciles.owe(pass));
+            reconciles.wait_idle().await;
+            if sync == 1 {
+                assert_eq!(
+                    state(),
+                    (vec![], vec![], 0),
+                    "a failed registry refresh still ran its pass"
+                );
+            }
+        }
+        assert_eq!(state(), (vec![(2, Some(2102))], vec![Some(2102)], 1));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
     }
 
     /// Shutdown waits for the running pass and starts no waiting one.
@@ -6218,6 +6652,7 @@ mod validation_tests {
             anchor: cited_anchor(2101),
             registry_sync: 7,
             refresh_ms: 1234,
+            capture: None,
         }));
         reconciles.wait_idle().await;
         let completed = lines_with(&captured, "worker reconciliation completed");

@@ -1714,6 +1714,10 @@ impl GlobalIntrinsic {
             super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
                 let proof =
                     super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                if super::persistent_storage::capacity_message(&proof) {
+                    let records = self.verify_capacity_certificate(frame_number, &proof, state)?;
+                    return super::persistent_storage::apply(state, frame_number, &records);
+                }
                 let Some(settlements) =
                     self.verify_storage_epoch_proof(frame_number, &proof, state)?
                 else {
@@ -1721,6 +1725,11 @@ impl GlobalIntrinsic {
                 };
                 let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                 for (part, settlement) in proof.seats.iter().zip(&settlements) {
+                    super::persistent_storage::apply(
+                        state,
+                        frame_number,
+                        &settlement.persistent_records,
+                    )?;
                     for (address, tree) in &settlement.sealed {
                         let blob = crate::prover_registry::vertex_tree_to_blob(tree);
                         state.set(
@@ -3477,6 +3486,10 @@ impl GlobalIntrinsic {
         proof: &super::storage_epoch_proof::StorageEpochProof,
         state: &HypergraphState,
     ) -> Result<Option<Vec<super::storage_epoch_proof::Settlement>>> {
+        if super::persistent_storage::capacity_message(proof) {
+            self.verify_capacity_certificate(frame_number, proof, state)?;
+            return Ok(Some(Vec::new()));
+        }
         let clock_store = self.clock_store.as_ref().ok_or_else(|| {
             QuilError::Internal("storage epoch proof: clock_store not installed".into())
         })?;
@@ -3510,6 +3523,31 @@ impl GlobalIntrinsic {
             |frame| header(frame).map(|header| header.output),
             |frame| header(frame).map(|header| header.timestamp),
             &context,
+        )
+    }
+
+    fn verify_capacity_certificate(
+        &self,
+        frame: u64,
+        proof: &super::storage_epoch_proof::StorageEpochProof,
+        state: &HypergraphState,
+    ) -> Result<Vec<super::persistent_storage::StateRecord>> {
+        let clock = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("capacity certificate needs GLOBAL headers".into())
+        })?;
+        super::persistent_storage::check_capacity(
+            frame,
+            proof,
+            state,
+            self.key_manager.as_ref(),
+            &|at| {
+                clock
+                    .get_global_clock_frame_header(at)
+                    .map(|header| header.output)
+                    .map_err(|_| {
+                        QuilError::ExecutionUnavailable("capacity beacon header unavailable".into())
+                    })
+            },
         )
     }
 
@@ -9279,6 +9317,7 @@ mod tests {
                 seats: vec![epoch_proof::SeatClaim {
                     seal_epoch: epoch,
                     seals: vec![epoch_proof::SealedLeaf {
+                        persistent: None,
                         leaf_id: leaf_id.clone(),
                         n: encoded.n,
                         registered,
