@@ -48,6 +48,32 @@ pub struct ProdProverTreeSyncer {
 
 use crate::forest_sync::{is_empty_phase_root, phase_anchor};
 
+/// Add the archive endpoints this worker's master discovered to `pool`,
+/// each pinned first to the peer the master pinned it to: pins are per
+/// process, so without this every such dial of a worker accepts whoever
+/// answers. An endpoint this process already pinned to another peer keeps
+/// that pin and is not added.
+pub(crate) async fn add_master_endpoints(
+    pool: &quil_rpc::ArchiveEndpointPool,
+    endpoints: Vec<(String, Option<quil_p2p::PeerId>)>,
+) {
+    for (endpoint, peer) in endpoints {
+        if let Some(peer) = peer {
+            if let Err(held) = quil_rpc::archive_client::pin_archive_peer(&endpoint, peer) {
+                warn!(
+                    %endpoint,
+                    %peer,
+                    pinned_to = %held,
+                    scope = "peer",
+                    "master names another peer for an archive endpoint this worker pinned: not dialed"
+                );
+                continue;
+            }
+        }
+        pool.add(endpoint).await;
+    }
+}
+
 /// How long an archive that failed a shard read or a GLOBAL prover-tree
 /// sync is passed over while another is known. Process-wide: the master and
 /// every worker of this node read the same archives.
@@ -1299,14 +1325,12 @@ impl ProdProverTreeSyncer {
                         &self.falcon_signing_key,
                     )
                     .await?;
-                    client.get_archive_endpoints().await
+                    client.get_archive_directory().await
                 })
                 .await
                 .map_err(|_| QuilError::ExecutionUnavailable("archive discovery timed out".into()))?
                 .map_err(|e| QuilError::ExecutionUnavailable(format!("archive discovery: {e}")))?;
-                for endpoint in endpoints {
-                    pool.add(endpoint).await;
-                }
+                add_master_endpoints(pool, endpoints).await;
                 if let Some(ep) = pool.next().await {
                     return Ok(ep);
                 }
@@ -2314,6 +2338,48 @@ impl ProdProverTreeSyncer {
 #[cfg(test)]
 mod archive_routing_tests {
     use super::*;
+
+    /// R112-D-2: a cluster worker pins each endpoint its master discovered
+    /// to the peer the master pinned it to before its pool can dial it; an
+    /// endpoint it already pinned to another peer is not added.
+    #[tokio::test]
+    async fn r112_d2_a_cluster_worker_pins_master_discovered_endpoints() {
+        let peer = || {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
+        let (a, b, held) = (peer(), peer(), peer());
+        let (pinned, unpinned, taken) = (
+            "203.0.113.31:8340",
+            "203.0.113.32:8340",
+            "203.0.113.33:8340",
+        );
+        let _ = quil_rpc::archive_client::pin_archive_peer(taken, held);
+        let pool = quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO);
+        add_master_endpoints(
+            &pool,
+            vec![
+                (pinned.to_string(), Some(a)),
+                (unpinned.to_string(), None),
+                (taken.to_string(), Some(b)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            quil_rpc::archive_client::pinned_archive_peer(pinned),
+            Some(a),
+            "R112-D-2: a master-discovered archive endpoint is dialed unpinned by the worker"
+        );
+        let mut added = pool.get_all().await;
+        added.sort();
+        assert_eq!(
+            added,
+            vec![pinned.to_string(), unpinned.to_string()],
+            "R112-D-2: an endpoint pinned to another peer was added"
+        );
+    }
 
     #[tokio::test]
     async fn worker_tree_recovery_uses_archives_and_never_falls_back_to_master_state() {

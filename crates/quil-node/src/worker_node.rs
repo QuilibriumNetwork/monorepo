@@ -391,18 +391,13 @@ pub(crate) async fn start(
                     stream_addr.clone(),
                     falcon_sk.clone(),
                 ));
-            let prod_syncer = Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                master_stream_addr: stream_addr,
-                hg_store: hg_store.clone(),
-                falcon_signing_key: falcon_sk,
-                crdt: crdt.clone(),
-                // Discover through the authenticated master, then fetch
-                // app trees directly: a regular master has no app forest.
-                archive_pool: Some(Arc::new(quil_rpc::ArchiveEndpointPool::new(
-                    std::time::Duration::from_secs(30),
-                ))),
-                discover_archives_from_master: true,
-            });
+            let prod_syncer = Arc::new(worker_tree_syncer(
+                stream_addr,
+                hg_store.clone(),
+                falcon_sk,
+                crdt.clone(),
+                config.p2p.network,
+            ));
             worker_node =
                 worker_node.with_outgoing_history_source(prod_syncer.outgoing_history_source());
             quil_engine::storage_snapshot::install_remote(prod_syncer.storage_snapshot_remote(
@@ -714,4 +709,75 @@ pub(crate) async fn start(
     let reason = sup.run().await;
     info!(core_id, "worker node shut down");
     Ok(reason)
+}
+
+/// The tree syncer of a cluster worker process: it discovers archives
+/// through its authenticated master, then fetches app trees directly from
+/// them (a regular master has no app forest), over a pool whose genesis
+/// endpoints are pinned ([`worker_archive_pool`]).
+fn worker_tree_syncer(
+    master_stream_addr: String,
+    hg_store: Arc<quil_store::RocksHypergraphStore>,
+    falcon_signing_key: Vec<u8>,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    network: u8,
+) -> crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+    crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+        master_stream_addr,
+        hg_store,
+        falcon_signing_key,
+        crdt,
+        archive_pool: Some(worker_archive_pool(network)),
+        discover_archives_from_master: true,
+    }
+}
+
+/// The archive pool of a cluster worker process, filled later with the
+/// endpoints its master discovered. Archive pins are per process and the
+/// master's do not reach it, so on mainnet it pins the genesis archives'
+/// static endpoints itself, as the master does: a dial to one must reach
+/// that archive.
+fn worker_archive_pool(network: u8) -> Arc<quil_rpc::ArchiveEndpointPool> {
+    if network == 0 {
+        let pinned = crate::master_node::pin_genesis_archive_endpoints();
+        info!(
+            endpoints = pinned.len(),
+            "pinned the genesis archives' static endpoints for this worker"
+        );
+    }
+    Arc::new(quil_rpc::ArchiveEndpointPool::new(
+        std::time::Duration::from_secs(30),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_tree_syncer;
+
+    /// R112-D-2: a cluster worker process dials archives with its own pin
+    /// map; the master's pins do not reach it. On mainnet it pins each
+    /// genesis archive's static endpoint to that archive, as the master
+    /// does.
+    #[test]
+    fn r112_d2_a_cluster_worker_pins_the_genesis_archive_endpoints() {
+        let statics = quil_engine::genesis::genesis_archive_static_ips();
+        assert!(!statics.is_empty());
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = std::sync::Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(),
+            std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        // The syncer the worker process starts with.
+        let syncer = worker_tree_syncer(String::new(), hg_store, Vec::new(), crdt, 0);
+        assert!(syncer.discover_archives_from_master && syncer.archive_pool.is_some());
+        for (peer_id, ip) in statics {
+            let endpoint = format!("{ip}:8340");
+            assert_eq!(
+                quil_rpc::archive_client::pinned_archive_peer(&endpoint),
+                Some(peer_id.parse::<quil_p2p::PeerId>().unwrap()),
+                "R112-D-2: a cluster worker dials the genesis archive endpoint {endpoint} unpinned"
+            );
+        }
+    }
 }

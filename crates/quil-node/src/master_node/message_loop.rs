@@ -173,6 +173,59 @@ pub(crate) fn gap_fetched_frame_message(
     }
 }
 
+/// The stream endpoints a verified archive's PeerInfo names, each pinned to
+/// the archive that signed it before the pool dials it, so that whoever
+/// answers there must be that archive. An endpoint pinned to another
+/// archive is left out (its pin stays), as is every endpoint of a record
+/// whose peer id does not parse.
+pub(crate) fn archive_record_endpoints(
+    info: &quil_p2p::CanonicalPeerInfo,
+    network: u8,
+) -> Vec<String> {
+    let Ok(peer) = quil_p2p::PeerId::from_bytes(&info.peer_id) else {
+        return Vec::new();
+    };
+    let mut endpoints = Vec::new();
+    for reach in &info.reachability {
+        for ma in &reach.stream_multiaddrs {
+            let Some(addr) =
+                crate::util::multiaddr::multiaddr_to_host_port_with_network(ma, network)
+            else {
+                continue;
+            };
+            if let Err(held) = quil_rpc::archive_client::pin_archive_peer(&addr, peer) {
+                warn!(
+                    peer = %peer,
+                    endpoint = %addr,
+                    pinned_to = %held,
+                    scope = "peer",
+                    "archive record names an endpoint pinned to another archive: not dialed"
+                );
+                continue;
+            }
+            if !endpoints.contains(&addr) {
+                endpoints.push(addr);
+            }
+        }
+    }
+    endpoints
+}
+
+/// Add a verified archive record's stream endpoints to `pool`, each pinned
+/// to that archive first ([`archive_record_endpoints`]); returns the first.
+pub(crate) async fn add_archive_record_endpoints(
+    pool: &quil_rpc::ArchiveEndpointPool,
+    info: &quil_p2p::CanonicalPeerInfo,
+    network: u8,
+) -> Option<String> {
+    let endpoints = archive_record_endpoints(info, network);
+    let first = endpoints.first().cloned();
+    for addr in endpoints {
+        pool.add(addr).await;
+    }
+    first
+}
+
 fn shard_sender_key(
     keys: &mut super::shard_sender::ShardSenderKeys,
     peer: &[u8],
@@ -1258,17 +1311,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             // "am I behind?" without an RPC head-fetch.
                                             gossip_freshness_for_recv
                                                 .note_network_head(info.last_global_head_frame);
-                                            let mut first_addr: Option<String> = None;
-                                            for reach in &info.reachability {
-                                                for ma in &reach.stream_multiaddrs {
-                                                    if let Some(addr) = crate::util::multiaddr::multiaddr_to_host_port_with_network(ma, network_for_recv) {
-                                                        if first_addr.is_none() {
-                                                            first_addr = Some(addr.clone());
-                                                        }
-                                                        pool_for_recv.add(addr).await;
-                                                    }
-                                                }
-                                            }
+                                            let first_addr = add_archive_record_endpoints(&pool_for_recv, &info, network_for_recv).await;
                                             info!(
                                                 peer = bs58::encode(&info.peer_id).into_string(),
                                                 head_frame = info.last_global_head_frame,
@@ -2240,5 +2283,79 @@ mod tests {
         assert!(super::super::archive_ingest_queue::may_carry_shard_frame(
             &fetched.bitmask
         ));
+    }
+
+    /// R112-D-2: an endpoint a verified archive's PeerInfo names is pinned
+    /// to that archive before the pool dials it, so whoever answers there
+    /// must be that archive. Another archive's record naming the same
+    /// endpoint neither re-pins nor adds it.
+    #[test]
+    fn r112_d2_a_gossiped_archive_endpoint_is_pinned_to_its_record() {
+        use quil_rpc::archive_client::pinned_archive_peer;
+        let peer = || {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
+        let (a, b) = (peer(), peer());
+        let record = |peer: quil_p2p::PeerId, addrs: &[&str]| quil_p2p::CanonicalPeerInfo {
+            peer_id: peer.to_bytes(),
+            reachability: vec![quil_p2p::CanonicalReachability {
+                stream_multiaddrs: addrs.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shared = "203.0.113.7:8340";
+        assert_eq!(
+            archive_record_endpoints(&record(a, &["/ip4/203.0.113.7/tcp/8340"]), 0),
+            vec![shared.to_string()]
+        );
+        assert_eq!(
+            pinned_archive_peer(shared),
+            Some(a),
+            "R112-D-2: a gossiped archive endpoint is dialed unpinned"
+        );
+        let other = archive_record_endpoints(
+            &record(
+                b,
+                &["/ip4/203.0.113.7/tcp/8340", "/ip4/203.0.113.8/tcp/8340"],
+            ),
+            0,
+        );
+        assert_eq!(
+            (other, pinned_archive_peer(shared)),
+            (vec!["203.0.113.8:8340".to_string()], Some(a)),
+            "R112-D-2: another archive's record took over an endpoint pinned to the first"
+        );
+        assert_eq!(pinned_archive_peer("203.0.113.8:8340"), Some(b));
+    }
+
+    /// R112-D-2: what the gossip handler adds to the archive pool is pinned
+    /// to the archive whose record named it.
+    #[tokio::test]
+    async fn r112_d2_the_gossip_handler_adds_archive_endpoints_pinned() {
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let info = quil_p2p::CanonicalPeerInfo {
+            peer_id: peer.to_bytes(),
+            reachability: vec![quil_p2p::CanonicalReachability {
+                stream_multiaddrs: vec!["/ip4/203.0.113.21/tcp/8340".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pool = quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO);
+        let first = add_archive_record_endpoints(&pool, &info, 0).await;
+        assert_eq!(first.as_deref(), Some("203.0.113.21:8340"));
+        assert_eq!(pool.get_all().await, vec!["203.0.113.21:8340".to_string()]);
+        assert_eq!(
+            quil_rpc::archive_client::pinned_archive_peer("203.0.113.21:8340"),
+            Some(peer),
+            "R112-D-2: the gossip handler added an archive endpoint unpinned"
+        );
     }
 }
