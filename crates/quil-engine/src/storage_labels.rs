@@ -1661,7 +1661,10 @@ impl Admitted<'_> {
     ) -> Result<Labelling> {
         let paths = paths(&self.dir, self.n);
         let tally = FlushTally::default();
-        let result = self.write(params, &paths, stop, layers, &tally);
+        let result = quil_crypto::storage_proof::with_label_memory_budget(
+            quil_crypto::storage_proof::label_scratch_memory_bytes(self.n, params),
+            || self.write(params, &paths, stop, layers, &tally),
+        );
         tally.log(self.epoch, &self.leaf_id, self.n, self.stage);
         let keep = match &result {
             Ok(Labelling::Labelled(labelled)) => labelled.kept,

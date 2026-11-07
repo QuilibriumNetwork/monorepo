@@ -6,20 +6,65 @@ use crate::{sdr, storage_hash as hash};
 use hash::{Digest, Domain, Packed, PackedDigest};
 use p3_field::{PackedValue, PrimeCharacteristicRing};
 use std::{
+    cell::Cell,
     collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, OnceLock, TryLockError, Weak,
     },
     time::Duration,
 };
 
+static COMPUTE_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) fn metrics() -> crate::storage_proof::LabelComputeMetrics {
+    let counts = COMPUTE_COUNTS.each_ref().map(|n| n.load(Ordering::Relaxed));
+    crate::storage_proof::LabelComputeMetrics {
+        packing_width: hash::packing_width(),
+        graphs_built: counts[0],
+        resident_graphs_built: counts[1],
+        graph_cache_hits: counts[2],
+        resident_columns_created: counts[3],
+        scalar_batches: counts[4],
+        packed_batches: counts[5],
+    }
+}
+
 const BLOCK: usize = 1024;
-const MEMORY_GRAPH_BYTES: usize = 8 << 20;
-const MEMORY_COLUMN_BYTES: usize = 8 << 20;
+thread_local! {
+    // Unadmitted crypto callers retain bounded scratch storage. Node callers
+    // opt into resident buffers only under their matching RAM reservation.
+    static MEMORY_BUDGET: Cell<u64> = const { Cell::new(16 << 20) };
+}
+pub(crate) fn with_memory_budget<R>(bytes: u64, work: impl FnOnce() -> R) -> R {
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MEMORY_BUDGET.set(self.0);
+        }
+    }
+    let _restore = Restore(MEMORY_BUDGET.replace(bytes));
+    work()
+}
+fn memory_budget() -> u64 {
+    MEMORY_BUDGET.get()
+}
+fn resident_columns(n: usize, budget: u64) -> bool {
+    (n as u64).saturating_mul(hash::DIGEST_BYTES as u64) <= budget
+}
+fn resident_graph(key: GraphKey, budget: u64) -> bool {
+    let columns = if resident_columns(key.n, budget) {
+        (key.n as u64).saturating_mul(hash::DIGEST_BYTES as u64)
+    } else {
+        0
+    };
+    (key.n as u64)
+        .saturating_mul((key.drg + key.expander) as u64)
+        .saturating_mul(4)
+        <= budget.saturating_sub(columns)
+}
 const BATCH_WAIT: Duration = Duration::from_millis(2);
 
 static SCRATCH_DIRECTORY: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -54,26 +99,64 @@ enum GraphStorage {
 
 #[cfg(test)]
 fn graph(key: GraphKey) -> Arc<Graph> {
-    graph_until(key, &|| false)
+    graph_until(key, memory_budget(), &|| false)
 }
-fn graph_until(key: GraphKey, stop: &dyn Fn() -> bool) -> Arc<Graph> {
-    type Cache = HashMap<GraphKey, Weak<Graph>>;
+fn graph_until(key: GraphKey, budget: u64, stop: &dyn Fn() -> bool) -> Arc<Graph> {
+    // Each geometry/backend has its own construction lock. Unrelated graphs
+    // build concurrently, but followers never derive another copy of this one.
+    type Slot = Arc<Mutex<Weak<Graph>>>;
+    type Cache = HashMap<(GraphKey, bool), Slot>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(found) = cache.get(&key).and_then(Weak::upgrade) {
-        return found;
+    let resident = resident_graph(key, budget);
+    let slot = {
+        let mut cache = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, slot| {
+            Arc::strong_count(slot) > 1
+                || match slot.try_lock() {
+                    Ok(graph) => graph.strong_count() > 0,
+                    Err(_) => true,
+                }
+        });
+        cache.entry((key, resident)).or_default().clone()
+    };
+    let mut cached = loop {
+        if stop() {
+            return Arc::new(Graph {
+                key,
+                storage: GraphStorage::Derived,
+            });
+        }
+        match slot.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if let Some(graph) = cached.upgrade() {
+        COMPUTE_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+        return graph;
     }
-    cache.retain(|_, value| value.strong_count() != 0);
-    drop(cache);
     let bytes = key
         .n
         .saturating_mul(key.drg + key.expander)
         .saturating_mul(4);
-    let storage = if bytes <= MEMORY_GRAPH_BYTES {
-        GraphStorage::Memory(derive_rows(key, 0, key.n))
+    COMPUTE_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+    let storage = if resident {
+        COMPUTE_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+        let mut rows = Vec::with_capacity(bytes / 4);
+        for at in (0..key.n).step_by(BLOCK) {
+            if stop() {
+                return Arc::new(Graph {
+                    key,
+                    storage: GraphStorage::Derived,
+                });
+            }
+            rows.extend(derive_rows(key, at, BLOCK.min(key.n - at)));
+        }
+        GraphStorage::Memory(rows)
     } else {
         // The graph is deterministic and contains no key or replica data.
         // Failure to create scratch storage falls back to bounded derivation.
@@ -93,12 +176,9 @@ fn graph_until(key: GraphKey, stop: &dyn Fn() -> bool) -> Arc<Graph> {
         }
     };
     let result = Arc::new(Graph { key, storage });
-    let mut cache = CACHE
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    cache.insert(key, Arc::downgrade(&result));
+    if !stop() {
+        *cached = Arc::downgrade(&result);
+    }
     result
 }
 
@@ -109,6 +189,7 @@ pub(crate) fn with_prepared_graph<R>(n: usize, work: impl FnOnce() -> R) -> (R, 
             drg: 6,
             expander: 8,
         },
+        memory_budget(),
         &|| false,
     );
     let prepared = !matches!(graph.storage, GraphStorage::Derived);
@@ -159,8 +240,8 @@ enum Columns {
     Disk { file: File, n: usize },
 }
 impl Columns {
-    fn new(n: usize) -> Self {
-        if n * hash::DIGEST_BYTES > MEMORY_COLUMN_BYTES {
+    fn new(n: usize, budget: u64) -> Self {
+        if !resident_columns(n, budget) {
             if let Ok(file) = scratch_file().and_then(|file| {
                 file.set_len((n * hash::DIGEST_BYTES) as u64)?;
                 Ok(file)
@@ -168,15 +249,17 @@ impl Columns {
                 return Self::Disk { file, n };
             }
         }
+        COMPUTE_COUNTS[3].fetch_add(1, Ordering::Relaxed);
         Self::Memory(vec![hash::ZERO; n])
     }
     fn update(&mut self, layer: &[Digest]) -> std::io::Result<()> {
         match self {
             Self::Memory(columns) => {
+                let mut output = vec![hash::ZERO; BLOCK.min(columns.len())];
                 for (left, right) in columns.chunks_mut(BLOCK).zip(layer.chunks(BLOCK)) {
-                    let mut output = vec![hash::ZERO; left.len()];
-                    hash::compress_many(left, right, &mut output, Domain::Column);
-                    left.copy_from_slice(&output);
+                    let output = &mut output[..left.len()];
+                    hash::compress_many(left, right, output, Domain::Column);
+                    left.copy_from_slice(output);
                 }
             }
             Self::Disk { file, n } => {
@@ -220,6 +303,7 @@ impl Columns {
 }
 
 struct Request {
+    memory_budget: u64,
     layers: usize,
     n: usize,
     key: Digest,
@@ -271,6 +355,7 @@ pub(crate) fn label(
     let mut waiting = queue.lock().unwrap_or_else(|e| e.into_inner());
     let launch = waiting.is_empty();
     waiting.push(Request {
+        memory_budget: memory_budget(),
         layers,
         n,
         key,
@@ -302,7 +387,7 @@ pub(crate) fn label_resume(
     if stop() {
         return None;
     }
-    let mut columns = Columns::new(n);
+    let mut columns = Columns::new(n, memory_budget());
     let mut prev = vec![hash::ZERO; n];
     for layer in 0..kept {
         if stop() || !read_layer(layer, &mut prev) {
@@ -319,6 +404,7 @@ pub(crate) fn label_resume(
             drg: 6,
             expander: 8,
         },
+        memory_budget(),
         stop,
     );
     let mut cur = vec![hash::ZERO; n];
@@ -425,6 +511,7 @@ fn compute(requests: &[Request]) -> std::io::Result<()> {
     if requests.len() == 1 {
         return compute_scalar(&requests[0]);
     }
+    COMPUTE_COUNTS[5].fetch_add(1, Ordering::Relaxed);
     let mut graphs: Vec<_> = requests
         .iter()
         .map(|r| {
@@ -437,12 +524,16 @@ fn compute(requests: &[Request]) -> std::io::Result<()> {
                         drg: 6,
                         expander: 8,
                     },
+                    r.memory_budget,
                     &|| r.cancelled.load(Ordering::Relaxed),
                 ))
             }
         })
         .collect();
-    let mut columns: Vec<_> = requests.iter().map(|r| Columns::new(r.n)).collect();
+    let mut columns: Vec<_> = requests
+        .iter()
+        .map(|r| Columns::new(r.n, r.memory_budget))
+        .collect();
     let zero = [Packed::ZERO; 8];
     let key: PackedDigest = std::array::from_fn(|j| {
         Packed::from_fn(|lane| requests.get(lane).map_or(hash::ZERO[j], |r| r.key[j]))
@@ -594,6 +685,7 @@ fn release_cancelled(
 }
 
 fn compute_scalar(request: &Request) -> std::io::Result<()> {
+    COMPUTE_COUNTS[4].fetch_add(1, Ordering::Relaxed);
     let layers = request.layers;
     let graph = graph_until(
         GraphKey {
@@ -601,9 +693,13 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
             drg: 6,
             expander: 8,
         },
+        request.memory_budget,
         &|| request.cancelled.load(Ordering::Relaxed),
     );
-    let mut columns = Columns::new(request.n);
+    if request.cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let mut columns = Columns::new(request.n, request.memory_budget);
     let mut prev = Arc::new(vec![hash::ZERO; request.n]);
     let mut cur = vec![hash::ZERO; request.n];
     for layer in 0..layers {
@@ -645,6 +741,108 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_builders_share_one_resident_graph_and_cancellation_does_not_poison_it() {
+        let key = GraphKey {
+            n: 4096,
+            drg: 6,
+            expander: 8,
+        };
+        let barrier = std::sync::Barrier::new(9);
+        let graphs = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..9)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        graph_until(key, 1 << 20, &|| false)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(graphs.iter().all(|g| Arc::ptr_eq(g, &graphs[0])));
+        assert!(matches!(graphs[0].storage, GraphStorage::Memory(_)));
+        let key = GraphKey { n: 8193, ..key };
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = graph_until(key, 1 << 20, &|| polls.fetch_add(1, Ordering::Relaxed) >= 3);
+        assert!(matches!(cancelled.storage, GraphStorage::Derived));
+        let complete = graph_until(key, 1 << 20, &|| false);
+        assert_eq!(complete.rows(0, key.n).unwrap(), derive_rows(key, 0, key.n));
+    }
+
+    #[test]
+    fn resident_disk_and_resumed_labels_match_for_every_profile() {
+        let key = hash::key_digest(&[73; 32]);
+        for layers in [2, 3, 11] {
+            let mut disk_layers = Vec::new();
+            let disk = with_memory_budget(0, || {
+                label(
+                    73,
+                    key,
+                    layers,
+                    &mut |_, nodes| disk_layers.push(nodes.to_vec()),
+                    &|| false,
+                )
+            })
+            .unwrap();
+            let mut resident_layers = Vec::new();
+            let resident = with_memory_budget(1 << 20, || {
+                label(
+                    73,
+                    key,
+                    layers,
+                    &mut |_, nodes| resident_layers.push(nodes.to_vec()),
+                    &|| false,
+                )
+            })
+            .unwrap();
+            assert_eq!(disk, resident);
+            assert_eq!(disk_layers, resident_layers);
+            let resumed = with_memory_budget(1 << 20, || {
+                label_resume(
+                    73,
+                    key,
+                    layers,
+                    1,
+                    &mut |layer, buffer| {
+                        buffer.copy_from_slice(&disk_layers[layer]);
+                        true
+                    },
+                    &mut |_, _| {},
+                    &|| false,
+                )
+            })
+            .unwrap();
+            assert_eq!(disk, resumed);
+        }
+    }
+
+    #[test]
+    fn memory_policy_requires_its_full_reservation_and_restores_after_unwind() {
+        let key = GraphKey {
+            n: 1 << 24,
+            drg: 6,
+            expander: 8,
+        };
+        let columns = (key.n * hash::DIGEST_BYTES) as u64;
+        assert!(!resident_columns(key.n, columns - 1));
+        assert!(resident_columns(key.n, columns));
+        assert!(!resident_graph(key, columns));
+        let scratch = columns + (key.n * 14 * 4) as u64;
+        assert!(resident_graph(key, scratch));
+        let params = sdr::SdrParams::default();
+        assert!(
+            crate::storage_proof::label_leaf_peak_bytes(key.n as u64, &params)
+                >= scratch + (2 * key.n * hash::DIGEST_BYTES) as u64
+        );
+        let before = memory_budget();
+        let _ = std::panic::catch_unwind(|| with_memory_budget(123, || panic!("restore")));
+        assert_eq!(memory_budget(), before);
+    }
+
     #[test]
     fn disk_graph_and_columns_equal_their_memory_backends() {
         let key = GraphKey {

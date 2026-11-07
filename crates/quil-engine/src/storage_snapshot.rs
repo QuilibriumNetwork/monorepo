@@ -4748,7 +4748,11 @@ pub(crate) mod tests {
         let encode = quil_crypto::storage_proof::encoding_with_labels_bytes(n);
         let cold = quil_crypto::storage_proof::labelling_peak_bytes(n, &params) + (400 << 20);
         assert!(encode < 3 << 30);
-        assert!(cold < 4 << 30);
+        assert!(cold < 5 << 30);
+        // Resident graph memory is charged per job even when shared. Nine
+        // 512 MiB sectors still fit the normal-pressure 64 GiB Mac's share.
+        let normal_share = 54 * (1u64 << 30) * crate::storage_jobs::MEMORY_SHARE_PERCENT / 100;
+        assert!(9 * cold <= normal_share);
         // Budget the largest permitted local sector even on multi-seat nodes:
         // serialized cold admission, shared permanent L, no node-wide 11-layer
         // cache. A 4 GiB host must defer cold work when resident state needs 2 GiB.

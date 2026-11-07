@@ -66,6 +66,9 @@ pub struct Arguments {
     /// Multiply measured times by this operating headroom (at least 1).
     #[arg(long, default_value_t = 2.0)]
     pub benchmark_storage_headroom: f64,
+    /// Assumed share of GLOBAL storage-message bytes for the modeled inclusion scenario (1..100).
+    #[arg(long, default_value_t = 25, requires = "benchmark_storage")]
+    pub benchmark_storage_network_share_percent: u8,
     /// Memory reserved for the node's other work, outside the benchmark's RSS budget.
     #[arg(long, default_value_t = 2)]
     pub benchmark_storage_reserve_memory_gib: u64,
@@ -96,6 +99,10 @@ fn validate(args: &Arguments) -> anyhow::Result<()> {
         args.benchmark_storage_frames > 0
             && args.benchmark_storage_frames <= quil_types::consensus::EPOCH_LENGTH_FRAMES as usize,
         "frames must be 1..720"
+    );
+    ensure!(
+        (1..=100).contains(&args.benchmark_storage_network_share_percent),
+        "network share must be between 1 and 100 percent"
     );
     ensure!(
         args.benchmark_storage_headroom.is_finite() && args.benchmark_storage_headroom >= 1.,
@@ -517,6 +524,35 @@ impl Drop for Monitor {
         }
     }
 }
+fn collect_progress(directory: &Path) -> anyhow::Result<Value> {
+    let mut records = Vec::new();
+    if directory.exists() {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                paths.extend(
+                    std::fs::read_dir(entry.path())?
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path()),
+                );
+            } else {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        for path in paths {
+            if path.extension().is_some_and(|e| e == "json") {
+                let record: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                records.push(record);
+            }
+        }
+    }
+    Ok(
+        json!({"directory":directory,"records":records,"qualification":"partial records never substitute for a completed allocation"}),
+    )
+}
+
 fn save(path: &Path, report: &Value) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::File::create(&tmp)?;
@@ -554,10 +590,10 @@ pub async fn run(args: &Arguments) -> anyhow::Result<ExitCode> {
             .context("memory reserve overflow")?,
         timeout,
     )?;
-    let mut report = json!({"format":"quil-storage-readiness-v2","verdict":"incomplete","scope":"persistent-storage hardware rehearsal at one authenticated mainnet checkpoint; GLOBAL inclusion and concurrent node work are reserved, not submitted or measured",
+    let mut report = json!({"format":"quil-storage-readiness-v3","verdict":"incomplete","scope":"persistent-storage hardware rehearsal at one authenticated mainnet checkpoint; GLOBAL inclusion and concurrent node work are reserved, not submitted or measured",
         "started_at":chrono::Utc::now().to_rfc3339(),"build":{"version":quil_config::display_version(),"optimized":!cfg!(debug_assertions),"arch":std::env::consts::ARCH,"os":std::env::consts::OS},
         "available_cpus":std::thread::available_parallelism().map(|n|n.get()).unwrap_or(1),"rounds_requested":args.benchmark_storage_rounds,"settlement_frames_requested":args.benchmark_storage_frames,
-        "headroom_multiplier":args.benchmark_storage_headroom,"input_mode":"download_actual_authenticated_mainnet_snapshots","cache_condition":"OS page cache is not globally cleared; all rounds force full input reads and fresh replica outputs",
+        "headroom_multiplier":args.benchmark_storage_headroom,"modeled_network_share_percent":args.benchmark_storage_network_share_percent,"input_mode":"download_actual_authenticated_mainnet_snapshots","cache_condition":"OS page cache is not globally cleared; all rounds force full input reads and fresh replica outputs",
         "experimental_profile":args.benchmark_storage_layers != 11,"initial_setup_budget_seconds":quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS,"seal_profile_layers":args.benchmark_storage_layers as usize,"measurements":[],"phase":"starting"});
     save(&artifact, &report)?;
     let outcome = run_inner(
@@ -590,6 +626,28 @@ pub async fn run(args: &Arguments) -> anyhow::Result<ExitCode> {
         report["verdict"] = json!("no_go");
     }
     report["resources"] = monitor.sample();
+    report["local_startup"] = json!({
+        "complete":monitor.initial_setup_complete.load(Ordering::Relaxed),
+        "wall_seconds":report["resources"]["initial_setup_wall_seconds"],
+        "budget_seconds":quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS,
+        "verdict":if monitor.initial_deadline_exceeded.load(Ordering::Relaxed)
+            || monitor.initial_setup_seconds.load(Ordering::Relaxed) > quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS * 1000 { "no_go" }
+            else if monitor.initial_setup_complete.load(Ordering::Relaxed) && !cfg!(debug_assertions) { "go_for_checkpoint" }
+            else { "incomplete" },
+        "scope":"measured local work through verified first registration; no GLOBAL inclusion"});
+    let compute = quil_crypto::storage_proof::label_compute_metrics();
+    report["label_compute"] = json!({"packing_width":compute.packing_width,"graphs_built":compute.graphs_built,
+        "resident_graphs_built":compute.resident_graphs_built,"graph_cache_hits":compute.graph_cache_hits,
+        "resident_columns_created":compute.resident_columns_created,"scalar_batches":compute.scalar_batches,"packed_batches":compute.packed_batches});
+    match collect_progress(&root.join("storage/progress")) {
+        Ok(progress) => report["progress"] = progress,
+        Err(error) => {
+            report["progress_read_error"] = json!(error.to_string());
+            if report["verdict"] == "go_for_checkpoint" {
+                report["verdict"] = json!("incomplete");
+            }
+        }
+    }
     report["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
     if monitor.peak.load(Ordering::Relaxed) == 0 && report["verdict"] == "go_for_checkpoint" {
         report["verdict"] = json!("incomplete");
@@ -837,7 +895,10 @@ async fn run_inner(
         warmup_frames,
         registration_frames: quil_engine::app_shard_metadata::storage_snapshot_grace(),
         settlement_frames: end.saturating_sub(start),
-        inclusion_frames_per_sector: 4,
+        initial_local_setup_seconds: Some(monitor.initial_setup_seconds.load(Ordering::Relaxed))
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms as f64 / 1000.),
+        network_share_percent: args.benchmark_storage_network_share_percent,
         headroom: args.benchmark_storage_headroom,
         resource_exceeded: monitor.exceeded.load(Ordering::Relaxed),
     });
@@ -849,3 +910,22 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn final_report_collects_atomic_checkpoints_and_ignores_unfinished_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("shard")).unwrap();
+        std::fs::write(
+            dir.path().join("shard/sector.json"),
+            br#"{"stage":"certificate_proof","layers_completed":3}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shard/sector.json.tmp"), b"partial").unwrap();
+        let report = collect_progress(dir.path()).unwrap();
+        assert_eq!(report["records"].as_array().unwrap().len(), 1);
+        assert_eq!(report["records"][0]["layers_completed"], 3);
+    }
+}

@@ -3762,9 +3762,13 @@ mod tests {
             9,
             Box::new(move || Some(snapshot.headroom())),
         )));
+        let cold_bytes = quil_crypto::storage_proof::labelling_peak_bytes(
+            1 << 24,
+            &quil_crypto::sdr::SdrParams::default(),
+        ) + (400 << 20);
         let held: Vec<_> = (0..9)
             .map(|leaf| {
-                let held = hold_parallel(admission, 3_649_044_480, ahead(false, 1, leaf));
+                let held = hold_parallel(admission, cold_bytes, ahead(false, 1, leaf));
                 assert!(
                     granted(&held),
                     "every cold sector fits alongside the others"
@@ -3773,7 +3777,7 @@ mod tests {
             })
             .collect();
         assert_eq!(admission.state().holders, 9);
-        let extra = hold_parallel(admission, 3_649_044_480, ahead(false, 1, 9));
+        let extra = hold_parallel(admission, cold_bytes, ahead(false, 1, 9));
         assert!(still_waiting(&extra), "the CPU slot limit still applies");
         drop(held);
         assert!(granted(&extra));

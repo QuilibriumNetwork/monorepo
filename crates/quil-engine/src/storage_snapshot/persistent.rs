@@ -306,6 +306,19 @@ fn initialize(
     n: u64,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Sector> {
+    initialize_with_progress(store, member, epoch, dir, id, n, stop, &|_| {})
+}
+
+fn initialize_with_progress(
+    store: &LabelStore,
+    member: &[u8],
+    epoch: u64,
+    dir: PathBuf,
+    id: [u8; 32],
+    n: u64,
+    stop: &(dyn Fn() -> bool + Sync),
+    layers: &dyn Fn(usize),
+) -> Result<Sector> {
     let reservation = fs::read(dir.join("reservation")).map_err(io)?;
     let profile = match reservation.len() {
         48 => sector::Profile::Eleven,
@@ -342,7 +355,7 @@ fn initialize(
             let admitted = store
                 .admit(epoch, member, &id, n, Stage::Snapshot)
                 .ok_or_else(|| unavailable("no disk space to certify a new sector".into()))?;
-            match admitted.label_kept(params, stop, &|_| {})? {
+            match admitted.label_kept(params, stop, layers)? {
                 Labelling::Labelled(labelled) if labelled.kept => (labelled.last, labelled.comm_c),
                 _ => {
                     return Err(unavailable(

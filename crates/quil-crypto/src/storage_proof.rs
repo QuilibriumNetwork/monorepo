@@ -672,13 +672,40 @@ pub fn data_node_count(bytes: u64) -> u64 {
         .max(MIN_NODES as u64)
 }
 
+/// Process-wide diagnostics for the standalone readiness artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelComputeMetrics {
+    pub packing_width: usize,
+    pub graphs_built: u64,
+    pub resident_graphs_built: u64,
+    pub graph_cache_hits: u64,
+    pub resident_columns_created: u64,
+    pub scalar_batches: u64,
+    pub packed_batches: u64,
+}
+pub fn label_compute_metrics() -> LabelComputeMetrics {
+    crate::storage_labels_compute::metrics()
+}
+
+/// Extra resident graph and column RAM, in addition to the two label layers.
+/// Every node reservation charges the full graph even when workers share it.
+pub fn label_scratch_memory_bytes(n: u64, params: &SdrParams) -> u64 {
+    n.saturating_mul((NODE_BYTES + 4 * (params.drg_degree.max(1) + params.expander_degree)) as u64)
+}
+
+/// Use resident label scratch only under a reservation that includes `bytes`.
+/// The override is scoped to this call and captured by fresh SIMD workers.
+pub fn with_label_memory_budget<R>(bytes: u64, work: impl FnOnce() -> R) -> R {
+    crate::storage_labels_compute::with_memory_budget(bytes, work)
+}
+
 /// Peak for labelling alone: two label layers and at most one in-memory
-/// column accumulator. Graph tables are shared or disk-backed; callbacks
+/// column accumulator. Graph tables are shared; each reservation covers their full resident size; callbacks
 /// borrow immutable layers without retaining an extra complete copy.
 pub fn label_working_bytes(n: u64, params: &SdrParams) -> u64 {
     if params.optimized() {
         n.saturating_mul((3 * NODE_BYTES) as u64)
-            .saturating_add(n.saturating_mul(56).min(8 << 20))
+            .saturating_add(n.saturating_mul(56))
             .saturating_add(4 << 20)
     } else {
         labelling_peak_bytes(n, params)
@@ -692,16 +719,14 @@ pub fn encoding_with_labels_bytes(n: u64) -> u64 {
         .saturating_add(4 << 20)
 }
 
-/// Conservative encoding / dense-seal peak for a leaf of `n` nodes. The
-/// standard labeller bounds graph memory; custom parameters retain the
-/// original in-memory graph implementation.
+/// Conservative encoding / dense-seal peak for a leaf of `n` nodes. Resident graph and column scratch is included even when shared.
 pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
     if params.optimized() {
         // Includes encoding buffers and the compatible dense proof fallback.
-        // Large graph tables and column accumulators use scratch storage.
+        // Covers resident graph and column scratch under node admission.
         n.saturating_mul((6 * NODE_BYTES) as u64)
-            .saturating_add(n.saturating_mul(parents as u64).min(8 << 20))
+            .saturating_add(n.saturating_mul(parents as u64))
     } else {
         n.saturating_mul((6 * NODE_BYTES + parents) as u64)
     }

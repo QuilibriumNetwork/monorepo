@@ -2,6 +2,7 @@
 //! same sector pool, encoders, bindings and proof builders as the worker.
 use super::*;
 mod parallel;
+mod progress;
 pub use parallel::{measure_allocation, BenchmarkInput};
 use quil_execution::global_intrinsic::{
     persistent_storage as protocol, storage_epoch_proof as epoch_proof,
@@ -58,6 +59,7 @@ pub struct SnapshotMeasurement {
     pub canonical_node_payload_bytes: u64,
     pub estimated_settlement_peak_bytes: u64,
     pub sectors: usize,
+    pub capacity_messages: Vec<crate::storage_readiness::CapacityInclusion>,
     pub replica_bytes: u64,
     pub cold_label_seconds: f64,
     pub certificate_witness_seconds: f64,
@@ -71,6 +73,7 @@ struct Gates(
     Option<u64>,
     Option<quil_types::consensus::StorageSealProfile>,
     Option<u64>,
+    Option<u64>,
 );
 impl Gates {
     fn new(epoch: u64, profile: quil_types::consensus::StorageSealProfile) -> Self {
@@ -83,7 +86,11 @@ impl Gates {
         quil_types::consensus::set_min_sector_nodes_for_thread(Some(
             quil_types::consensus::MIN_SECTOR_NODES,
         ));
-        Self(old, old_profile, old_floor)
+        // This is a rehearsal of the future persistent protocol over a
+        // historical authenticated snapshot, independent of mainnet activation.
+        let old_stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(epoch));
+        Self(old, old_profile, old_floor, old_stable)
     }
 }
 impl Drop for Gates {
@@ -91,6 +98,7 @@ impl Drop for Gates {
         quil_types::consensus::set_persistent_storage_epoch_for_thread(self.0);
         quil_types::consensus::set_storage_seal_profile_for_thread(self.1);
         quil_types::consensus::set_min_sector_nodes_for_thread(self.2);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(self.3);
     }
 }
 fn check(options: &BenchmarkOptions) -> Result<()> {
@@ -223,8 +231,22 @@ fn measure_with_store(
         options,
         "settlement preparation",
     )?;
+    progress::save(
+        &options
+            .directory
+            .join("progress/shards")
+            .join(format!("{}.json", measured.filter)),
+        &measured,
+    )?;
     let indexed: Vec<_> = plans.iter().enumerate().collect();
     let cold = crate::storage_jobs::for_each_parallel(&indexed, |&(index, (prefix, exact, n))| {
+        let journal = progress::Journal::new(
+            &options.directory,
+            &measured.filter,
+            index + 1,
+            plans.len(),
+            *n,
+        )?;
         let result = (|| {
             let mut stats = SnapshotMeasurement::default();
             check(options)?;
@@ -268,8 +290,10 @@ fn measure_with_store(
                     "cold benchmark found pre-existing capacity; use a fresh directory".into(),
                 ));
             }
+            journal.admitted(&id)?;
             let start = Instant::now();
-            let mut capacity = initialize(
+            let progress_error = std::sync::Mutex::new(None);
+            let initialized = initialize_with_progress(
                 &store,
                 &options.member,
                 snapshot.epoch,
@@ -277,8 +301,19 @@ fn measure_with_store(
                 id,
                 *n,
                 &|| options.stop.load(Ordering::Relaxed),
-            )?;
+                &|layers| {
+                    if let Err(error) = journal.layer(layers) {
+                        *progress_error.lock().unwrap() = Some(error);
+                        options.stop.store(true, Ordering::Relaxed);
+                    }
+                },
+            );
+            if let Some(error) = progress_error.into_inner().unwrap() {
+                return Err(error);
+            }
+            let mut capacity = initialized?;
             stats.cold_label_seconds += start.elapsed().as_secs_f64();
+            journal.stage("certificate_witness", &stats)?;
             let message = protocol::CapacityMessage {
                 member: options.member,
                 epoch: snapshot.epoch,
@@ -319,6 +354,7 @@ fn measure_with_store(
                 )
                 .map_err(QuilError::InvalidArgument)?;
                 stats.certificate_witness_seconds += start.elapsed().as_secs_f64();
+                journal.stage("certificate_proof", &stats)?;
                 let start = Instant::now();
                 let proof = protocol::prove_certificate(
                     &options.member,
@@ -333,6 +369,7 @@ fn measure_with_store(
                 stats.certificate_prove_seconds += start.elapsed().as_secs_f64();
                 proof
             };
+            journal.stage("certificate_verify", &stats)?;
             let start = Instant::now();
             protocol::verify_certificate(
                 &options.member,
@@ -348,12 +385,26 @@ fn measure_with_store(
             let mut envelope = message;
             envelope.proof = certificate;
             let bytes = envelope.envelope().to_canonical_bytes().len() as u64;
-            if bytes > quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME as u64 {
+            let wire_bytes = crate::storage_readiness::storage_wire_bytes(bytes);
+            if wire_bytes > quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME as u64 {
                 return Err(unavailable(
                     "capacity certificate exceeds GLOBAL message budget".into(),
                 ));
             }
             stats.certificate_message_bytes += bytes;
+            let mut precommit = envelope.clone();
+            precommit.proof.clear();
+            // Accepted BLS precommits are bounded at 2048 signature bytes.
+            precommit.signature = vec![0; 2048];
+            stats
+                .capacity_messages
+                .push(crate::storage_readiness::CapacityInclusion {
+                    bucket: id[0] % 16,
+                    precommit_bytes: crate::storage_readiness::storage_wire_bytes(
+                        precommit.envelope().to_canonical_bytes().len() as u64,
+                    ),
+                    certificate_bytes: wire_bytes,
+                });
             stats.temporary_disk_peak_bytes = stats
                 .temporary_disk_peak_bytes
                 .max(directory_bytes(&options.directory));
@@ -362,6 +413,7 @@ fn measure_with_store(
             capacity.certified = true;
             capacity.save()?;
             store.release_certified_sector(snapshot.epoch, &options.member, &id);
+            journal.stage("certified", &stats)?;
             eprintln!(
                 "storage benchmark {}: cold sector {}/{} certified",
                 measured.filter,
@@ -371,6 +423,7 @@ fn measure_with_store(
             Ok((id, capacity.cert, stats))
         })();
         if let Err(error) = &result {
+            let _ = journal.failed(error);
             if let Some(coordinator) = coordinator {
                 coordinator.fail(error);
             } else {
@@ -387,10 +440,18 @@ fn measure_with_store(
         measured.certificate_prove_seconds += stats.certificate_prove_seconds;
         measured.certificate_verify_seconds += stats.certificate_verify_seconds;
         measured.certificate_message_bytes += stats.certificate_message_bytes;
+        measured.capacity_messages.extend(stats.capacity_messages);
         measured.temporary_disk_peak_bytes = measured
             .temporary_disk_peak_bytes
             .max(stats.temporary_disk_peak_bytes);
     }
+    progress::save(
+        &options
+            .directory
+            .join("progress/shards")
+            .join(format!("{}.json", measured.filter)),
+        &measured,
+    )?;
     if let Some(coordinator) = coordinator {
         coordinator.arrive(0)?;
     }
@@ -452,6 +513,14 @@ fn measure_with_store(
                     &|| options.stop.load(Ordering::Relaxed),
                 )?;
                 timing.encode_seconds += start.elapsed().as_secs_f64();
+                progress::registration(
+                    &options.directory,
+                    &measured.filter,
+                    prefix,
+                    round,
+                    "binding",
+                    &timing,
+                )?;
                 let _memory = crate::storage_jobs::reserve_until(64 << 20, &|| {
                     options.stop.load(Ordering::Relaxed)
                 })
@@ -477,6 +546,14 @@ fn measure_with_store(
                 let binding = captured.prove_binding_sparse(&leaf_claim, &source)?;
                 binding::verify(&leaf_claim, &binding).map_err(QuilError::InvalidArgument)?;
                 timing.binding_seconds += start.elapsed().as_secs_f64();
+                progress::registration(
+                    &options.directory,
+                    &measured.filter,
+                    prefix,
+                    round,
+                    "fresh_proof",
+                    &timing,
+                )?;
                 let start = Instant::now();
                 let fresh = sector::prove(
                     &options.member,
@@ -489,6 +566,14 @@ fn measure_with_store(
                 )
                 .map_err(QuilError::InvalidArgument)?;
                 timing.fresh_proof_seconds += start.elapsed().as_secs_f64();
+                progress::registration(
+                    &options.directory,
+                    &measured.filter,
+                    prefix,
+                    round,
+                    "encoded_and_proved",
+                    &timing,
+                )?;
                 let leaf = epoch_proof::SealedLeaf {
                     leaf_id: leaf,
                     n: count,
@@ -644,6 +729,13 @@ fn measure_with_store(
             return Err(unavailable("settlement exceeds GLOBAL frame budget".into()));
         }
         measured.rounds.push(timing);
+        progress::save(
+            &options
+                .directory
+                .join("progress/shards")
+                .join(format!("{}.json", measured.filter)),
+            &measured,
+        )?;
         if let Some(coordinator) = coordinator {
             coordinator.arrive(3 + round * 3)?;
         }
@@ -699,6 +791,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_rehearsal_enables_stable_keys_for_leaf_threads_and_restores_the_caller() {
+        use quil_types::consensus::*;
+        let prior = stable_replica_key_epoch_thread_override();
+        set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
+        let expected = quil_crypto::sdr::stable_replica_key(&[3; 32], &[4; 32]);
+        assert_ne!(
+            quil_crypto::sdr::replica_key(&[3; 32], &[4; 32], 1424),
+            expected
+        );
+        {
+            let _gates = Gates::new(1424, StorageSealProfile::Three);
+            let keys = crate::storage_jobs::for_each_parallel(&[0, 1], |_| {
+                Ok(quil_crypto::sdr::replica_key(&[3; 32], &[4; 32], 1424))
+            })
+            .unwrap();
+            assert_eq!(keys, vec![expected; 2]);
+        }
+        assert_eq!(stable_replica_key_epoch_thread_override(), Some(u64::MAX));
+        set_stable_replica_key_epoch_for_thread(prior);
+    }
+
+    #[test]
     fn authentic_snapshot_runs_cold_and_two_full_encode_settlement_rounds() {
         for profile in [
             sector::Profile::Eleven,
@@ -706,7 +820,7 @@ mod tests {
             sector::Profile::Two,
         ] {
             quil_crypto::init();
-            quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
             crate::storage_jobs::set_available_for_test(Some(64 << 30));
             let graph = super::super::super::tests::test_crdt();
             let app = [87; 32];
@@ -720,7 +834,7 @@ mod tests {
                 )
                 .unwrap();
             graph.commit(1).unwrap();
-            let snapshot = current_source(&graph, &app, 1500).snapshot;
+            let snapshot = current_source(&graph, &app, 1424).snapshot;
             let dir = tempfile::tempdir().unwrap();
             let options = BenchmarkOptions {
                 profile,
@@ -752,10 +866,30 @@ mod tests {
                 quil_types::consensus::persistent_storage_epoch_thread_override(),
                 before
             );
+            assert_eq!(
+                quil_types::consensus::stable_replica_key_epoch_thread_override(),
+                Some(u64::MAX),
+                "benchmark restores the caller's disabled gate"
+            );
             assert!(options.initial_setup_complete.load(Ordering::Relaxed));
             assert!(measured.regeneration.as_ref().unwrap().roots_match);
             assert_eq!(measured.rounds.len(), 2);
             assert_eq!(measured.sectors, 1);
+            assert_eq!(measured.capacity_messages.len(), 1);
+            let journal = options
+                .directory
+                .join("progress")
+                .join(hex::encode(&app))
+                .join("00001.json");
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+            assert_eq!(record["stage"], "certified");
+            assert_eq!(record["layers_completed"], profile.layers());
+            assert!(options
+                .directory
+                .join("progress/shards")
+                .join(format!("{}.json", hex::encode(&app)))
+                .is_file());
             assert_eq!(
                 measured.roots,
                 snapshot.roots.iter().map(hex::encode).collect::<Vec<_>>()

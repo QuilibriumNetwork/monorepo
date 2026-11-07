@@ -2,6 +2,21 @@
 //! sector, missing snapshot, debug build or reduced frame load can yield GO.
 use crate::storage_snapshot::SnapshotMeasurement;
 use serde::Serialize;
+mod network;
+pub use network::{inclusion_model, NetworkModel};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapacityInclusion {
+    pub bucket: u8,
+    pub precommit_bytes: u64,
+    pub certificate_bytes: u64,
+}
+
+/// A single storage proof's canonical request and bundle overhead. The wire
+/// format uses fixed-width lengths and timestamp; tested against the encoder.
+pub fn storage_wire_bytes(payload: u64) -> u64 {
+    payload.saturating_add(28)
+}
 
 /// Whether unfinished local setup has reached the two-hour deadline.
 pub fn initial_setup_expired(elapsed: std::time::Duration, ready: bool) -> bool {
@@ -38,6 +53,10 @@ pub enum Verdict {
 pub struct Assessment {
     pub verdict: Verdict,
     pub reasons: Vec<String>,
+    pub local_startup_verdict: Verdict,
+    pub initial_local_setup_seconds: Option<f64>,
+    pub modeled_network_inclusion: Option<NetworkModel>,
+    pub modeled_network_inclusion_seconds: f64,
     pub cold_measured_seconds: f64,
     pub cold_with_inclusion_and_headroom_seconds: f64,
     pub cold_budget_seconds: f64,
@@ -68,7 +87,8 @@ pub struct Evidence<'a> {
     pub warmup_frames: u64,
     pub registration_frames: u64,
     pub settlement_frames: u64,
-    pub inclusion_frames_per_sector: u64,
+    pub initial_local_setup_seconds: Option<f64>,
+    pub network_share_percent: u8,
     pub headroom: f64,
     pub resource_exceeded: bool,
 }
@@ -76,6 +96,10 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
     let mut out = Assessment {
         verdict: Verdict::GoForCheckpoint,
         reasons: Vec::new(),
+        local_startup_verdict: Verdict::Incomplete,
+        initial_local_setup_seconds: e.initial_local_setup_seconds,
+        modeled_network_inclusion: None,
+        modeled_network_inclusion_seconds: 0.,
         cold_measured_seconds: e.download_seconds,
         cold_with_inclusion_and_headroom_seconds: 0.,
         cold_budget_seconds: (e.warmup_frames as f64 * e.frame_seconds)
@@ -123,7 +147,8 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
     {
         incomplete.push("invalid headroom or deadline settings".into());
     }
-    let mut sectors = 0;
+    let mut capacity = Vec::new();
+    let mut registration_messages = Vec::new();
     for m in e.measurements {
         let cold = [
             m.cold_label_seconds,
@@ -135,7 +160,12 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
             incomplete.push("invalid cold timing".into());
         }
         out.cold_measured_seconds += cold.iter().sum::<f64>();
-        sectors += m.sectors as u64;
+        if m.sectors == 0 || m.capacity_messages.len() != m.sectors {
+            incomplete.push(
+                "per-sector capacity message sizes and buckets were not fully measured".into(),
+            );
+        }
+        capacity.extend(m.capacity_messages.iter().cloned());
         let (mut registration, mut settlement, mut frame_openings) = (0f64, 0f64, 0f64);
         let (mut seal_bytes, mut settle_bytes) = (0, 0);
         for round in &m.rounds {
@@ -171,6 +201,11 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
         out.worst_frame_openings_seconds += frame_openings;
         out.worst_registration_seconds += registration;
         out.worst_settlement_seconds += settlement;
+        registration_messages.push(if seal_bytes == 0 {
+            0
+        } else {
+            storage_wire_bytes(seal_bytes)
+        });
         out.measured_allocation_seal_bytes += seal_bytes;
         out.measured_allocation_settlement_bytes += settle_bytes;
     }
@@ -216,10 +251,48 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
         * e.headroom;
     out.registration_with_headroom_seconds = out.worst_registration_seconds * e.headroom;
     out.settlement_with_headroom_seconds = out.worst_settlement_seconds * e.headroom;
-    out.cold_with_inclusion_and_headroom_seconds = (out.cold_measured_seconds
-        + out.worst_registration_seconds
-        + sectors as f64 * e.inclusion_frames_per_sector as f64 * e.frame_seconds)
-        * e.headroom;
+    match inclusion_model(
+        &capacity,
+        &registration_messages,
+        e.network_share_percent,
+        e.allocation.map_or(1, |a| a.parallel_jobs),
+    ) {
+        Ok(model) => {
+            out.modeled_network_inclusion_seconds = model.frames as f64 * e.frame_seconds;
+            out.modeled_network_inclusion = Some(model);
+        }
+        Err(error) => incomplete.push(error.into()),
+    }
+    let first_registration = e
+        .allocation
+        .and_then(|a| a.rounds.first())
+        .map_or(out.worst_registration_seconds, |r| {
+            r.registration_wall_seconds
+        });
+    let startup_overhead = e.initial_local_setup_seconds.unwrap_or(0.)
+        - out.cold_measured_seconds
+        - first_registration;
+    // Fixed download and modeled network latency are not multiplied by CPU
+    // headroom. This conservatively adds the network pipeline after local work;
+    // it does not assume that all capacity messages wait four serial frames.
+    out.cold_with_inclusion_and_headroom_seconds = e.download_seconds
+        + startup_overhead.max(0.)
+        + (out.cold_measured_seconds - e.download_seconds + out.worst_registration_seconds)
+            * e.headroom
+        + out.modeled_network_inclusion_seconds;
+    match e.initial_local_setup_seconds {
+        Some(seconds)
+            if seconds.is_finite() && seconds >= 0. && e.roots_verified && e.release_build =>
+        {
+            out.local_startup_verdict =
+                if seconds <= quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS as f64 {
+                    Verdict::GoForCheckpoint
+                } else {
+                    Verdict::NoGo
+                };
+        }
+        _ => incomplete.push("authenticated initial local setup milestone was not measured".into()),
+    }
     if !incomplete.is_empty() {
         out.verdict = Verdict::Incomplete;
         out.reasons = incomplete;
@@ -229,9 +302,15 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
         out.reasons
             .push("measured RSS, disk or execution-time budget was exceeded".into());
     }
-    if out.cold_with_inclusion_and_headroom_seconds > out.cold_budget_seconds {
+    if out.local_startup_verdict == Verdict::NoGo {
         out.reasons
-            .push("cold setup exceeds the initial setup budget (at most two hours)".into());
+            .push("measured initial local setup exceeds two hours".into());
+    }
+    if out.cold_with_inclusion_and_headroom_seconds > out.cold_budget_seconds {
+        out.reasons.push(
+            "modeled network-ready setup with compute headroom exceeds the initial setup budget"
+                .into(),
+        );
     }
     if out.registration_with_headroom_seconds > out.registration_budget_seconds {
         out.reasons
@@ -266,6 +345,11 @@ mod tests {
         (0..2)
             .map(|_| SnapshotMeasurement {
                 sectors: 1,
+                capacity_messages: vec![CapacityInclusion {
+                    bucket: 0,
+                    precommit_bytes: 256,
+                    certificate_bytes: 1024,
+                }],
                 cold_label_seconds: 1.,
                 rounds: vec![
                     RoundMeasurement {
@@ -296,7 +380,8 @@ mod tests {
             warmup_frames: 100,
             registration_frames: 100,
             settlement_frames: 100,
-            inclusion_frames_per_sector: 4,
+            initial_local_setup_seconds: Some(9.),
+            network_share_percent: 25,
             headroom: 2.,
             resource_exceeded: false,
         }
@@ -349,8 +434,25 @@ mod tests {
         let r = assess(evidence(&m));
         assert_eq!(r.verdict, Verdict::GoForCheckpoint);
         assert_eq!(r.worst_registration_seconds, 6.);
-        assert_eq!(r.cold_with_inclusion_and_headroom_seconds, 178.);
+        assert_eq!(r.local_startup_verdict, Verdict::GoForCheckpoint);
+        assert_eq!(r.cold_with_inclusion_and_headroom_seconds, 77.);
     }
+    #[test]
+    fn local_deadline_and_modeled_network_readiness_are_distinct() {
+        let m = measurements();
+        let mut e = evidence(&m);
+        e.initial_local_setup_seconds = Some(7199.);
+        let result = assess(e);
+        assert_eq!(result.local_startup_verdict, Verdict::GoForCheckpoint);
+        assert_eq!(result.verdict, Verdict::NoGo);
+        let mut e = evidence(&m);
+        e.initial_local_setup_seconds = Some(7201.);
+        assert_eq!(assess(e).local_startup_verdict, Verdict::NoGo);
+        let mut incomplete = measurements();
+        incomplete[0].capacity_messages.clear();
+        assert_eq!(assess(evidence(&incomplete)).verdict, Verdict::Incomplete);
+    }
+
     #[test]
     fn partial_debug_or_reduced_workloads_never_pass() {
         let m = measurements();

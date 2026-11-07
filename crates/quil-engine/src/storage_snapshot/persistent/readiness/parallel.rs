@@ -22,11 +22,13 @@ pub(super) struct Coordinator {
     state: Mutex<Phase>,
     changed: Condvar,
     stop: Arc<AtomicBool>,
+    progress_directory: Option<PathBuf>,
 }
 impl Coordinator {
     fn new(count: usize, stop: Arc<AtomicBool>) -> Self {
         Self {
             count,
+            progress_directory: None,
             state: Mutex::new(Phase {
                 generation: 0,
                 arrived: 0,
@@ -61,6 +63,12 @@ impl Coordinator {
         if state.arrived == self.count {
             let seconds = state.started.elapsed().as_secs_f64();
             state.seconds.push(seconds);
+            if let Some(directory) = &self.progress_directory {
+                progress::save(
+                    &directory.join(format!("allocation-{phase:03}.json")),
+                    &serde_json::json!({"kind":"allocation_phase","phase":phase,"seconds":seconds}),
+                )?;
+            }
             state.generation += 1;
             state.arrived = 0;
             state.started = Instant::now();
@@ -123,7 +131,8 @@ pub fn measure_allocation(
     let store = LabelStore::new(options.directory.join("labels"))
         .for_profile(options.profile)
         .with_disk_floor(crate::storage_readiness::disk_floor);
-    let coordinator = Coordinator::new(inputs.len(), options.stop.clone());
+    let mut coordinator = Coordinator::new(inputs.len(), options.stop.clone());
+    coordinator.progress_directory = Some(options.directory.join("progress"));
     let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
     let results = std::thread::scope(|scope| {
         let mut workers = Vec::new();
