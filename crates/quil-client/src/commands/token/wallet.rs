@@ -6546,9 +6546,112 @@ pub(crate) async fn run_claim(
     inclusion::follow(tc, &wallet, "escrow claim", submitted, follow).await
 }
 
-/// Custom-token issuance. The keystore authority must be the token's configured
-/// mint authority; `--permissionless` builds an unsigned statement for a free
-/// payment policy. Delivery is not finality; admission checks the deployed policy.
+/// Whether a custom mint's statement is signed, decided from the token's
+/// deployed mint policy before anything is paid; an unusable combination is
+/// refused here, since the node refuses it only after the settlement that
+/// funds it has been paid. A payment policy mints unsigned statements, and a
+/// paid one needs its price paid to the token's payment address; authority,
+/// signature and entitlement policies sign. `paid` is the settlement's
+/// payment address and value.
+#[cfg(feature = "native-proof")]
+pub(super) fn custom_mint_signs(
+    policy: &quil_execution::token_intrinsic::custom_mint::MintPolicy,
+    permissionless: bool,
+    amount: u128,
+    paid: Option<([u8; 32], u128)>,
+    entitlement: bool,
+) -> anyhow::Result<bool> {
+    use quil_execution::token_intrinsic::config_resolver::MintVariant;
+    anyhow::ensure!(
+        policy.behavior & quil_execution::token_intrinsic::constants::MINTABLE != 0,
+        "this token is not mintable"
+    );
+    let entry = &policy.entry;
+    let signs = match entry.variant {
+        MintVariant::Payment => {
+            anyhow::ensure!(!entitlement, "a payment-policy mint takes no --entitlement");
+            match &entry.payment_fee_baseline {
+                Some(baseline) => {
+                    let price = baseline * num_bigint::BigInt::from(amount);
+                    let Some((address, payment)) = paid else {
+                        anyhow::bail!(
+                            "this token's mints are paid: pass --payee (its payee) and \
+                             --price {price}"
+                        );
+                    };
+                    anyhow::ensure!(
+                        entry.payment_address.as_deref() == Some(&address[..]),
+                        "--payee does not pay this token's payment address {}",
+                        hex::encode(entry.payment_address.as_deref().unwrap_or_default())
+                    );
+                    anyhow::ensure!(
+                        payment > 0 && num_bigint::BigInt::from(payment) >= price,
+                        "--price {payment} is below this mint's price {price}"
+                    );
+                }
+                None => anyhow::ensure!(
+                    paid.is_none(),
+                    "this token mints free: drop --payee and --price"
+                ),
+            }
+            false
+        }
+        MintVariant::Authority | MintVariant::Signature => true,
+        MintVariant::MerkleEntitlementWithSignature => {
+            anyhow::ensure!(
+                entitlement,
+                "this token mints by entitlement: pass --entitlement"
+            );
+            true
+        }
+        _ => anyhow::bail!("this token's mint policy does not permit a custom mint"),
+    };
+    if signs {
+        anyhow::ensure!(
+            !permissionless,
+            "this token mints only under a signing key: drop --permissionless"
+        );
+        anyhow::ensure!(
+            paid.is_none(),
+            "this token does not mint by payment: drop --payee and --price"
+        );
+    }
+    Ok(signs)
+}
+
+/// The token's deployed mint policy, read from its metadata vertex.
+#[cfg(feature = "native-proof")]
+async fn fetch_mint_policy(
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
+    application: &[u8; 32],
+) -> anyhow::Result<quil_execution::token_intrinsic::custom_mint::MintPolicy> {
+    let mut address = application.to_vec();
+    address.extend_from_slice(&quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS);
+    let response = client
+        .clone()
+        .max_decoding_message_size(64 << 20)
+        .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
+            address,
+            full_data: true,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("token configuration: {e}"))?
+        .into_inner();
+    anyhow::ensure!(
+        !response.raw_data.is_empty(),
+        "token {} has no deployed configuration",
+        hex::encode(application)
+    );
+    quil_execution::token_intrinsic::custom_mint::policy_from_metadata(&response.raw_data)
+        .map_err(|e| anyhow::anyhow!("token configuration: {e}"))
+}
+
+/// Custom-token issuance under the token's deployed policy, read first: an
+/// authority or signature policy signs with the keystore authority, an
+/// entitlement policy with the entitled key, and a payment policy mints an
+/// unsigned statement. Delivery is not finality.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_custom_mint(
     tc: &TokenCtx,
@@ -6579,16 +6682,55 @@ pub(super) async fn run_custom_mint(
         .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))?,
         None => wallet.address().clone(),
     };
-    let authority: Option<std::sync::Arc<dyn quil_types::crypto::Signer>> = if permissionless {
-        None
-    } else {
-        Some(std::sync::Arc::from(
+    // Paid mint: the claim's settlement pays the provers; its payment coin
+    // pays the price to the token's payee.
+    let paid = match paid {
+        Some((payee, price, wait)) => {
+            let quil_context = quil_lattice_ct::confidential::transfer::parameter_context(
+                &network,
+                &quil_execution::domains::QUIL_TOKEN,
+            );
+            let payee = RecipientAddress::decode(
+                &hex::decode(payee.strip_prefix("0x").unwrap_or(payee))?,
+                &quil_context,
+            )
+            .map_err(|e| anyhow::anyhow!("payee address: {e:?}"))?;
+            Some((payee, price, wait))
+        }
+        None => None,
+    };
+    let paid_to = match &paid {
+        Some((payee, price, _)) => Some((
+            quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())?,
+            *price,
+        )),
+        None => None,
+    };
+    let mut client = tc.connect().await?;
+    let policy = fetch_mint_policy(&client, &application).await?;
+    let signs = custom_mint_signs(
+        &policy,
+        permissionless,
+        amount,
+        paid_to,
+        !entitlement.is_empty(),
+    )?;
+    let authority: Option<std::sync::Arc<dyn quil_types::crypto::Signer>> = if signs {
+        let signer: std::sync::Arc<dyn quil_types::crypto::Signer> = std::sync::Arc::from(
             tc.key_manager
                 .get_signer_by_id(authority_key)
                 .map_err(|e| anyhow::anyhow!("mint authority key {authority_key}: {e}"))?,
-        ))
+        );
+        if let Some(configured) = &policy.entry.authority_public_key {
+            anyhow::ensure!(
+                configured.as_slice() == signer.public_key(),
+                "key {authority_key} is not this token's mint authority"
+            );
+        }
+        Some(signer)
+    } else {
+        None
     };
-    let mut client = tc.connect().await?;
     let bytes = wallet
         .clone()
         .create_custom_mint(
@@ -6602,17 +6744,6 @@ pub(super) async fn run_custom_mint(
         )
         .await?;
     if let Some((payee, price, wait)) = paid {
-        // Paid mint: the claim's settlement pays the provers; its payment coin
-        // pays the price to the token's payee.
-        let quil_context = quil_lattice_ct::confidential::transfer::parameter_context(
-            &network,
-            &quil_execution::domains::QUIL_TOKEN,
-        );
-        let payee = RecipientAddress::decode(
-            &hex::decode(payee.strip_prefix("0x").unwrap_or(payee))?,
-            &quil_context,
-        )
-        .map_err(|e| anyhow::anyhow!("payee address: {e:?}"))?;
         let submitted =
             submit_paid_operation(tc, &wallet, bytes, Some((payee, price)), wait).await?;
         return inclusion::follow(tc, &wallet, "paid custom-token mint", submitted, follow).await;
@@ -6878,6 +7009,96 @@ mod tests {
             coins_header(&coins, true, true).unwrap(),
             "2 unspent coins, 12.750000000000 QUIL (102000000000 base units), reported unspent \
              by the configured node:"
+        );
+    }
+
+    /// A/B reproducer: a payment-policy token mints unsigned statements. A
+    /// wallet that signed them by default paid the settlement, then saw the
+    /// mint refused ("permissionless mint carries no authority"). The form
+    /// comes from the deployed policy, and an unusable combination is refused
+    /// before anything is paid.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn custom_mint_form_follows_the_deployed_policy_before_paying() {
+        use super::custom_mint_signs as signs;
+        use quil_execution::token_intrinsic::{
+            config_resolver::{MintVariant, StaticTokenEntry},
+            custom_mint::MintPolicy,
+        };
+        const MSG: &str = "mint form ignores the deployed policy";
+        let policy = |variant, baseline: Option<i64>| MintPolicy {
+            behavior: 1,
+            entry: StaticTokenEntry {
+                variant,
+                authority_key_type: None,
+                authority_public_key: None,
+                entitlement_root: None,
+                payment_fee_baseline: baseline.map(num_bigint::BigInt::from),
+                payment_address: Some(vec![9; 32]),
+            },
+        };
+        let paid = policy(MintVariant::Payment, Some(7));
+        let free = policy(MintVariant::Payment, None);
+        // Payment policies mint unsigned without --permissionless; on mainnet
+        // both the paid and the free form were refused after the fee.
+        assert_eq!(
+            signs(&paid, false, 3, Some(([9; 32], 21)), false).ok(),
+            Some(false),
+            "{MSG}: a paid mint was signed"
+        );
+        assert_eq!(
+            signs(&free, false, 3, None, false).ok(),
+            Some(false),
+            "{MSG}: a free payment mint was signed"
+        );
+        // A paid mint without its price, below it, or to another payee.
+        assert!(signs(&paid, true, 3, None, false).is_err(), "{MSG}: unpaid");
+        assert!(
+            signs(&paid, true, 3, Some(([9; 32], 20)), false).is_err(),
+            "{MSG}: underpaid"
+        );
+        assert!(
+            signs(&paid, true, 3, Some(([8; 32], 21)), false).is_err(),
+            "{MSG}: another payee"
+        );
+        // A price paid under a free or an authority policy buys nothing.
+        assert!(
+            signs(&free, true, 3, Some(([9; 32], 21)), false).is_err(),
+            "{MSG}: a free mint paid a price"
+        );
+        let authority = policy(MintVariant::Authority, None);
+        assert_eq!(
+            signs(&authority, false, 3, None, false).ok(),
+            Some(true),
+            "{MSG}: an authority mint was unsigned"
+        );
+        assert!(
+            signs(&authority, true, 3, None, false).is_err(),
+            "{MSG}: an authority mint built unsigned"
+        );
+        assert!(
+            signs(&authority, false, 3, Some(([9; 32], 21)), false).is_err(),
+            "{MSG}: an authority mint paid a price"
+        );
+        let entitled = policy(MintVariant::MerkleEntitlementWithSignature, None);
+        assert_eq!(
+            signs(&entitled, false, 3, None, true).ok(),
+            Some(true),
+            "{MSG}: an entitlement mint was unsigned"
+        );
+        assert!(
+            signs(&entitled, false, 3, None, false).is_err(),
+            "{MSG}: an entitlement mint without its proof"
+        );
+        assert!(
+            signs(&policy(MintVariant::NoMint, None), false, 3, None, false).is_err(),
+            "{MSG}: a non-minting policy"
+        );
+        let mut unmintable = policy(MintVariant::Authority, None);
+        unmintable.behavior = 0;
+        assert!(
+            signs(&unmintable, false, 3, None, false).is_err(),
+            "{MSG}: an unmintable token"
         );
     }
 

@@ -578,7 +578,9 @@ pub enum TokenCommand {
         recipient: Option<String>,
         #[arg(long = "authority-key", default_value = "q-prover-key")]
         authority_key: String,
-        /// Use a free permissionless mint policy.
+        /// Require an unsigned mint. Optional: the token's deployed policy
+        /// decides whether the mint is signed; this only refuses a policy
+        /// that needs a signature.
         #[arg(long)]
         permissionless: bool,
         /// Paid mint policy: the token's payee QUIL address (hex, from
