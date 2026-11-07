@@ -8360,9 +8360,13 @@ impl AppConsensusEngine {
 
     /// The delivery summary of this shard's frame bodies, and the warning when
     /// their stalls take a real share of this worker's time
-    /// ([`crate::app_body_delivery`]).
+    /// ([`crate::app_body_delivery`]), named by the reason this worker
+    /// refused most in the same hour. Called every tick, so each refusal
+    /// joins the hour within a tick of its host counting it.
     fn log_body_delivery(&mut self, now: std::time::Instant) {
         use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        self.body_delivery
+            .read_refusals(now, self.session_liveness.as_ref());
         let summary = self.body_delivery.take_summary(now);
         let signal = self.body_delivery.share_signal(now);
         if summary.is_none() && signal.is_none() {
@@ -8386,8 +8390,8 @@ impl AppConsensusEngine {
             );
         }
         if let Some(signal) = signal {
-            let other = refused.values().sum::<u64>() - not_delivered;
-            crate::app_body_delivery::log_share(&self.filter, &signal, not_delivered, other);
+            let window = self.body_delivery.refused_within(now);
+            crate::app_body_delivery::log_share(&self.filter, &signal, &window);
         }
     }
 
@@ -23780,11 +23784,11 @@ mod tests {
             "{}",
             lines[2]
         );
-        // The share warning weighs the same refusals.
-        liveness.note(Step::Verify, 2, "not at the parent frame", "");
-        liveness.settle(Step::Verify, 2, false);
-        liveness.note(Step::Verify, 3, "not at the parent frame", "");
-        liveness.settle(Step::Verify, 3, false);
+        // The share warning weighs the hour's refusals, the replaced host's too.
+        for view in 2..=4 {
+            liveness.note(Step::Verify, view, "not at the parent frame", "");
+            liveness.settle(Step::Verify, view, false);
+        }
         engine
             .body_delivery
             .stall_noted(start + Duration::from_secs(1000));
@@ -23794,13 +23798,213 @@ mod tests {
         engine.log_body_delivery(start + Duration::from_secs(1050));
         let warned = logs.lines_with("over 1% of the last hour");
         assert_eq!(warned.len(), 1, "{warned:?}");
+        for field in [
+            "refused_mostly=not at the parent frame 5 of 9",
+            "refused_block_not_delivered=4",
+            "refused_other=5",
+            "disk",
+        ] {
+            assert!(warned[0].contains(field), "{field}: {}", warned[0]);
+        }
+        drop(handle);
+    }
+
+    /// Refuse `n` proposals for each `(reason, n)`, one view each from `view`.
+    fn refuse_views(
+        liveness: &quil_cw_consensus::adapters::Liveness,
+        mut view: u64,
+        refusals: &[(&'static str, u64)],
+    ) {
+        use quil_cw_consensus::adapters::Step;
+        for (reason, n) in refusals {
+            for _ in 0..*n {
+                liveness.note(Step::Verify, view, reason, "");
+                liveness.settle(Step::Verify, view, false);
+                view += 1;
+            }
+        }
+    }
+
+    /// The share warnings once `engine`'s worker stalled 40 s in the minute
+    /// before `start + at` s, read at that time.
+    fn share_warnings_at(
+        engine: &mut AppConsensusEngine,
+        logs: &crate::outage::test_logs::CapturedLogs,
+        start: std::time::Instant,
+        at: u64,
+    ) -> Vec<String> {
+        use std::time::Duration;
+        engine
+            .body_delivery
+            .stall_noted(start + Duration::from_secs(at - 50));
+        engine
+            .body_delivery
+            .stall_ended(start + Duration::from_secs(at - 10));
+        engine.log_body_delivery(start + Duration::from_secs(at));
+        logs.lines_with("over 1% of the last hour")
+    }
+
+    /// A worker that refused mostly for an unreadable parent waits on this
+    /// node's GLOBAL view (a GLOBAL state sync), not on its disk: the warning
+    /// names the reason with its count and points at the GLOBAL sync.
+    #[test]
+    fn a_stall_share_of_parent_waits_names_them_and_points_at_global_sync() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::Liveness;
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        refuse_views(
+            &liveness,
+            1,
+            &[("parent unavailable", 10), (BLOCK_NOT_DELIVERED, 2)],
+        );
+        let warned = share_warnings_at(&mut engine, &logs, start, 150);
+        assert_eq!(warned.len(), 1, "{warned:?}");
         assert!(
-            warned[0].contains("refused_block_not_delivered=1"),
-            "{}",
+            warned[0].contains("refused_mostly=parent unavailable 10 of 12"),
+            "the warn names the hour's commonest refusal: {}",
             warned[0]
         );
-        assert!(warned[0].contains("refused_other=2"), "{}", warned[0]);
-        assert!(warned[0].contains("disk"), "{}", warned[0]);
+        assert!(
+            warned[0].contains("archive connection still failing") && !warned[0].contains("disk"),
+            "a parent wait is routed to this node's GLOBAL sync: {}",
+            warned[0]
+        );
+        drop(handle);
+    }
+
+    /// Refusals older than the hour do not name a stall in it: refusals of
+    /// the same host an hour earlier are left out.
+    #[test]
+    fn the_stall_share_weighs_only_the_refusals_of_its_hour() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::Liveness;
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        use std::time::Duration;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        refuse_views(&liveness, 1, &[("not at the parent frame", 20)]);
+        engine.log_body_delivery(start + Duration::from_secs(300));
+        refuse_views(&liveness, 21, &[(BLOCK_NOT_DELIVERED, 3)]);
+        let warned = share_warnings_at(&mut engine, &logs, start, 3950);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("refused_mostly=block not delivered 3 of 3"),
+            "the warn names the hour's commonest refusal; older ones are left out: {}",
+            warned[0]
+        );
+        assert!(warned[0].contains("p2p port"), "{}", warned[0]);
+        drop(handle);
+    }
+
+    /// A replaced host's refusals stay in the hour, and the new host's count
+    /// from zero.
+    #[test]
+    fn the_stall_share_keeps_a_replaced_hosts_refusals_in_its_hour() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::Liveness;
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        use std::time::Duration;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        refuse_views(&liveness, 1, &[("parent unavailable", 6)]);
+        engine.log_body_delivery(start + Duration::from_secs(60));
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        refuse_views(
+            &liveness,
+            1,
+            &[("parent unavailable", 2), (BLOCK_NOT_DELIVERED, 2)],
+        );
+        let warned = share_warnings_at(&mut engine, &logs, start, 150);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("refused_mostly=parent unavailable 8 of 10"),
+            "the warn names the hour's commonest refusal, a replaced host's counted: {}",
+            warned[0]
+        );
+        drop(handle);
+    }
+
+    /// With no refusal in the hour the warning says no refusal names the
+    /// cause, rather than guessing the link.
+    #[test]
+    fn the_stall_share_says_when_no_refusal_names_its_cause() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::Liveness;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        engine.session_liveness = Some(Arc::new(Liveness::default()));
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        let warned = share_warnings_at(&mut engine, &logs, start, 150);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("refused_mostly=none"),
+            "the warn names the hour's commonest refusal, or none: {}",
+            warned[0]
+        );
+        assert!(
+            warned[0].contains("pending finalization") && !warned[0].contains("p2p port"),
+            "with no refusal the warn leaves the cause unnamed: {}",
+            warned[0]
+        );
+        drop(handle);
+    }
+
+    /// A reason about the proposals themselves is named plainly, neither the
+    /// link nor the disk.
+    #[test]
+    fn the_stall_share_names_another_refusal_plainly() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::Liveness;
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        refuse_views(
+            &liveness,
+            1,
+            &[("digest mismatch", 4), (BLOCK_NOT_DELIVERED, 1)],
+        );
+        let warned = share_warnings_at(&mut engine, &logs, start, 150);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("refused_mostly=digest mismatch 4 of 5"),
+            "the warn names the hour's commonest refusal: {}",
+            warned[0]
+        );
+        assert!(
+            warned[0].contains("report this line") && !warned[0].contains("disk"),
+            "another reason is named plainly: {}",
+            warned[0]
+        );
         drop(handle);
     }
 
