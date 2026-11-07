@@ -538,6 +538,9 @@ struct RunningLeaf {
     /// Its layers labelled when it started, now, and of how many
     /// ([`LeafProgress::layers`]); none when not reported.
     layers: Option<(usize, usize, usize)>,
+    /// Whether its labelled layers are kept on disk, so a restart goes on
+    /// from them ([`LeafProgress::labels_kept`]); none until known.
+    kept: Option<bool>,
     /// How long it paused ([`LeafProgress::paused`]).
     paused: std::time::Duration,
     /// Whether its start was logged, or it was reported running long: its
@@ -554,6 +557,9 @@ struct RunningLeaves {
     /// Each leaf's epoch, shard, work and outcome as it ended, for tests.
     #[cfg(test)]
     ended: Vec<(u64, Vec<u8>, LeafWork, LeafOutcome)>,
+    /// Each ended leaf's shard and whether it had noted its labels kept.
+    #[cfg(test)]
+    ended_kept: Vec<(Vec<u8>, Option<bool>)>,
 }
 
 fn running_leaves() -> std::sync::MutexGuard<'static, RunningLeaves> {
@@ -606,6 +612,14 @@ impl LeafProgress {
                 }
             };
             leaf.layers = Some((from, done, of));
+        }
+    }
+
+    /// Note whether the leaf's labelled layers are kept on disk (room was
+    /// admitted for them): a restart goes on from them, else redoes the leaf.
+    pub fn labels_kept(&self, kept: bool) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            leaf.kept = Some(kept);
         }
     }
 
@@ -694,6 +708,8 @@ pub fn leaf_started_from(
             started: std::time::Instant::now(),
             estimate,
             layers: None,
+            // Encoded from layers kept ahead: nothing is lost to labelling.
+            kept: (work == LeafWork::FromLabelsAhead).then_some(true),
             paused: std::time::Duration::ZERO,
             logged,
         },
@@ -714,9 +730,13 @@ impl Drop for LeafProgress {
             }
         });
         #[cfg(test)]
-        running_leaves()
-            .ended
-            .push((leaf.epoch, leaf.filter.clone(), leaf.work, outcome));
+        {
+            let mut running = running_leaves();
+            running
+                .ended
+                .push((leaf.epoch, leaf.filter.clone(), leaf.work, outcome));
+            running.ended_kept.push((leaf.filter.clone(), leaf.kept));
+        }
         if leaf.logged {
             info!(epoch = leaf.epoch, filter = %hex::encode(&leaf.filter), nodes = leaf.nodes,
                 work = leaf.work.name(), seconds = leaf.started.elapsed().as_secs(),
@@ -753,6 +773,72 @@ pub fn snapshot_progress(filters: &[Vec<u8>], epoch: u64) -> Option<SnapshotProg
         }
     }
     (progress.leaves > 0).then_some(progress)
+}
+
+/// The snapshot encode of the leaves of `filters` running now, for a restart
+/// verdict (`crate::restart_readiness`); `None` when none is.
+pub(crate) fn seat_encode(filters: &[Vec<u8>]) -> Option<crate::restart_readiness::EncodeState> {
+    use crate::restart_readiness::EncodeState;
+    let frame = global_frame();
+    let default_layers = quil_crypto::sdr::SdrParams::default().layers;
+    let running = running_leaves();
+    let mut state: Option<EncodeState> = None;
+    for leaf in running
+        .leaves
+        .values()
+        .filter(|leaf| leaf.work != LeafWork::LabellingAhead && filters.contains(&leaf.filter))
+    {
+        let elapsed = leaf.started.elapsed();
+        let worked = elapsed.saturating_sub(leaf.paused);
+        let (done, of) = match (leaf.layers, leaf.work) {
+            (Some((_, done, of)), _) => (done, of),
+            (None, LeafWork::FromLabelsAhead) => (default_layers, default_layers),
+            (None, _) => (0, default_layers),
+        };
+        let kept = leaf.kept == Some(true);
+        let one_layer = label_estimate(leaf.nodes) / u32::try_from(of).unwrap_or(1).max(1);
+        // Encoding from kept labels redoes its encode; labelling from kept
+        // layers loses at most the layer in progress.
+        let lost = if kept && leaf.work != LeafWork::FromLabelsAhead {
+            worked.min(one_layer)
+        } else {
+            worked
+        };
+        let remaining = leaf
+            .estimate
+            .map_or(std::time::Duration::ZERO, |e| e.saturating_sub(elapsed));
+        let to_grace = frame.map(|frame| {
+            let grace = quil_types::consensus::storage_snapshot_frame(leaf.epoch)
+                .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
+            std::time::Duration::from_millis(
+                grace
+                    .saturating_sub(frame)
+                    .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(frame)),
+            )
+        });
+        state = Some(match state {
+            None => EncodeState {
+                labels_kept: kept,
+                layers_done: done,
+                layers: of,
+                remaining,
+                lost,
+                to_grace,
+            },
+            Some(s) => EncodeState {
+                labels_kept: s.labels_kept && kept,
+                layers_done: s.layers_done.min(done),
+                layers: s.layers.max(of),
+                remaining: s.remaining.max(remaining),
+                lost: s.lost.max(lost),
+                to_grace: match (s.to_grace, to_grace) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                },
+            },
+        });
+    }
+    state
 }
 
 /// Report, every [`LEAF_PROGRESS_INTERVAL`] at most once a seat, the leaves
@@ -807,6 +893,10 @@ fn report_long_leaves() {
             }
         }
         for ((epoch, filter, work), seat) in seats {
+            let (ready, verdict) = crate::restart_readiness::shards_readiness(
+                std::slice::from_ref(&filter),
+                crate::restart_readiness::noted_margin(&filter),
+            );
             let estimated = seat
                 .estimate
                 .map_or_else(|| "unknown".to_string(), |e| (e.as_secs() / 60).to_string());
@@ -846,13 +936,21 @@ fn report_long_leaves() {
                 // ahead) this is the expected wait of a renewal.
                 _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,
                     nodes = seat.nodes, longest_minutes = longest, estimated_minutes = %estimated,
-                    grace_frame, work = work.name(), scope = "local",
+                    grace_frame, work = work.name(), labels_kept = ready.labels_kept,
+                    layers_done = ready.layers_done, layers = ready.layers,
+                    restart_cost_minutes = ready.restart_cost_minutes,
+                    minutes_to_grace = ready.minutes_to_grace, restart = verdict.text(),
+                    scope = "local",
                     action = "no action needed: the seat's renewal registers its storage once \
                               they end; this warns if they pass their estimate",
                     "this node is still preparing a seat's storage proof data; its renewal waits for it"),
                 _ => warn!(epoch, filter = %filter, leaves = seat.leaves, nodes = seat.nodes,
                     longest_minutes = longest, estimated_minutes = %estimated, grace_frame,
-                    work = work.name(), scope = "local",
+                    work = work.name(), labels_kept = ready.labels_kept,
+                    layers_done = ready.layers_done, layers = ready.layers,
+                    restart_cost_minutes = ready.restart_cost_minutes,
+                    minutes_to_grace = ready.minutes_to_grace, restart = verdict.text(),
+                    scope = "local",
                     action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
                               if the leaves have not ended by the grace frame, the seat renews \
                               without a storage registration that epoch",
@@ -1011,6 +1109,7 @@ fn encode_member_until(
             (None, Some(store)) => {
                 match store.admit(captured.epoch, member, &leaf_id, count, Stage::Snapshot) {
                     Some(admitted) => {
+                        progress.labels_kept(true);
                         let layers = params.layers;
                         if let Some(kept) = admitted.resumed() {
                             resumed = kept.layers;
@@ -1048,8 +1147,15 @@ fn encode_member_until(
                             }
                         }
                     }
-                    None => None,
+                    None => {
+                        progress.labels_kept(false);
+                        None
+                    }
                 }
+            }
+            (None, None) => {
+                progress.labels_kept(false);
+                None
             }
             _ => None,
         };
@@ -3909,6 +4015,111 @@ pub(crate) mod tests {
         assert!(snapshot_given_up(&early, &app, epoch));
         assert_eq!(replicas.get_partition(epoch, &app).unwrap(), None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Whether the leaf of `captured`'s seat noted its labels kept when its
+    /// encode ended. A leaf this small ends before any stop check could
+    /// sample it mid-labelling, so the flag is read as the leaf ends.
+    fn encode_kept(
+        captured: &Captured,
+        member: &[u8],
+        store: Option<&crate::storage_labels::LabelStore>,
+    ) -> Option<bool> {
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let before = running_leaves().ended_kept.len();
+        encode_member_until(captured, member, &replicas, store, &|| false).unwrap();
+        let running = running_leaves();
+        let ended = &running.ended_kept[before..];
+        assert!(ended.iter().all(|(filter, _)| *filter == captured.filter));
+        assert!(!ended.is_empty(), "a leaf ran");
+        assert!(
+            ended.iter().all(|(_, kept)| *kept == ended[0].1),
+            "{ended:?}"
+        );
+        ended[0].1
+    }
+
+    /// A restart verdict reads whether a labelling leaf keeps its layers on
+    /// disk: kept where the filesystem has room, not where it refused room
+    /// or the node keeps no labels (2026-11-05: a restart redoes the second
+    /// from zero).
+    #[test]
+    fn a_labelling_leaf_reports_whether_its_layers_are_kept() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        let crdt = test_crdt();
+        let app = [0x7Du8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let member = [0x62u8; 32];
+        let dir = std::env::temp_dir().join(format!("quil-labels-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let roomy = LabelStore::with_space(dir.clone(), ample_space());
+        assert_eq!(encode_kept(&captured, &member, Some(&roomy)), Some(true));
+        // Its own directory: the roomy call's complete labels would be found
+        // and the leaf encoded from them (kept), whatever the room.
+        let cramped_dir = dir.with_extension("cramped");
+        let _ = std::fs::remove_dir_all(&cramped_dir);
+        let cramped = LabelStore::with_space(
+            cramped_dir.clone(),
+            Box::new(|_| {
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 100 << 30,
+                    free_bytes: 9 << 30,
+                    ..Default::default()
+                })
+            }),
+        );
+        assert_eq!(
+            encode_kept(&captured, &member, Some(&cramped)),
+            Some(false),
+            "room refused"
+        );
+        assert_eq!(
+            encode_kept(&captured, &member, None),
+            Some(false),
+            "no store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cramped_dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// What a restart loses of a seat's running leaf: at most one layer when
+    /// its layers are kept, everything it did otherwise; labelling ahead is
+    /// no part of a snapshot's seat.
+    #[test]
+    fn a_restart_loses_a_layer_of_kept_labels_and_all_of_unkept() {
+        let filter = b"seat-encode-loss".to_vec();
+        let leaf = leaf_started(9, &filter, b"leaf", 15_000_000, LeafWork::LabellingNow);
+        let ahead = leaf_started(9, &filter, b"other", 15_000_000, LeafWork::LabellingAhead);
+        leaf.layers(4, 11);
+        let hour = std::time::Duration::from_secs(3600);
+        running_leaves().leaves.get_mut(&leaf.id).unwrap().started =
+            std::time::Instant::now() - hour;
+        let unkept = seat_encode(std::slice::from_ref(&filter)).unwrap();
+        assert!(!unkept.labels_kept);
+        assert!(unkept.lost >= hour, "{:?}", unkept.lost);
+        assert_eq!((unkept.layers_done, unkept.layers), (4, 11));
+        leaf.labels_kept(true);
+        let kept = seat_encode(std::slice::from_ref(&filter)).unwrap();
+        assert!(kept.labels_kept);
+        assert_eq!(kept.lost, label_estimate(15_000_000) / 11);
+        drop(ahead);
+        drop(leaf);
+        assert_eq!(seat_encode(std::slice::from_ref(&filter)), None);
     }
 
     /// A leaf whose labels' filesystem has no room for them

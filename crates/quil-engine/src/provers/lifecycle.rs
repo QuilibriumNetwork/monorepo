@@ -2975,6 +2975,13 @@ impl ProverLifecycle {
                     .iter()
                     .find(|(id, reported, _)| id == core_id && reported == filter)
                     .map(|(_, _, execution)| execution);
+                // The committee's spare voters, for the restart verdict on
+                // the pipeline and leaf lines.
+                crate::restart_readiness::note_committee(
+                    filter,
+                    report.unwrap_or(&Default::default()),
+                    now,
+                );
                 let seat = if members.contains(filter) {
                     Seat::Member
                 } else if lapsed.contains(filter.as_slice()) {
