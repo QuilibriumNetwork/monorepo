@@ -1042,3 +1042,45 @@ fn sca_full_scale_cost_at_109_shards() {
         }
     }
 }
+
+/// A union takes the place of the verified copy it extends, and a coin that
+/// copy's shield held stays held by the union: no other shield of the coin is
+/// taken while it is pending.
+#[test]
+fn a_union_keeps_the_coin_the_copy_it_extended_held() {
+    let (shard, mc, _, _) = one_shard(true);
+    let first = shard.copy(&[0, 1, 2, 3, 4]);
+    assert_eq!(submit(&mc, first.clone()), SubmitOutcome::Accepted);
+    let claim = |statement: u8| {
+        [quil_execution::manager::ShieldClaim {
+            coin: [9; 32],
+            statement: [statement; 32],
+        }]
+    };
+    let now = Instant::now();
+    mc.shield_claims
+        .lock()
+        .unwrap()
+        .hold(super::super::message_key(&first), &claim(1), now);
+    assert_eq!(
+        submit(&mc, shard.copy(&[2, 3, 4, 5, 6])),
+        SubmitOutcome::Accepted
+    );
+    assert_eq!(shard.held_pays(&mc), ALL);
+    let held: Vec<[u8; 32]> = mc
+        .collect_for_rank(RANK)
+        .iter()
+        .map(|raw| super::super::message_key(raw))
+        .collect();
+    let taken = mc.shield_claims.lock().unwrap().taken(
+        &[5; 32],
+        &claim(2),
+        now,
+        |key| held.contains(key),
+        |_| None,
+    );
+    assert!(
+        taken,
+        "VULNERABLE: the union gave up the coin its copy held, and another shield of it was taken"
+    );
+}

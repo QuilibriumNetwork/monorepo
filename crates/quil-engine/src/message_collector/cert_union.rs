@@ -475,7 +475,11 @@ impl MessageCollector {
         };
         let mut union = CollectedMessage::new(union);
         union.verified = true;
+        let union_key = union.hash;
         if buffer.replace(&key, union) {
+            // Under the buffers' lock, as admission checks the claims: no
+            // shield of a coin the held copy claimed may come in between.
+            self.shield_claims.lock().unwrap().rekey(&key, union_key);
             drop(buffers);
             self.intake.note(Intake::Accepted, Instant::now());
             let added = added.len() as u64;

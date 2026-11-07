@@ -1308,6 +1308,319 @@ pub fn apply_orphan_attestation(
     Ok(true)
 }
 
+/// One refusal [`commit_entry`] makes from GLOBAL state alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// No later GLOBAL frame lifts it: a consumed marker, a claimed escrow,
+    /// a binding its escrow never had. The commit can only reject.
+    Lasting(&'static str),
+    /// A later GLOBAL frame may lift it: a root or an escrow the state does
+    /// not hold yet, as a view behind GLOBAL does not.
+    Pending(&'static str),
+}
+
+impl Standing {
+    /// The reason the commit records for it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Lasting(reason) | Self::Pending(reason) => reason,
+        }
+    }
+}
+
+/// What an operation needs of GLOBAL state to commit, as its spend entry
+/// carries it ([`super::spend_entries::commit_needs`] reads it from the
+/// operation's bytes, verifying nothing).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitNeeds {
+    pub context: [u8; 32],
+    pub root_digest: Option<[u8; 32]>,
+    pub consumptions: Vec<[u8; 32]>,
+    pub escrow_claim: Option<EscrowClaim>,
+}
+
+/// [`commit_entry`]'s refusals that read GLOBAL state only, in its order,
+/// each handed to `visit` until it breaks. At `frame`, the committing
+/// GLOBAL frame, a refund is held to its escrow's refund frame; ahead of the
+/// commit (`None`) that is not judged: a later frame lifts it.
+#[allow(clippy::too_many_arguments)]
+fn state_refusals(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    context: &[u8; 32],
+    root_digest: Option<&[u8; 32]>,
+    consumptions: &[[u8; 32]],
+    escrow_claim: Option<&EscrowClaim>,
+    frame: Option<u64>,
+    visit: &mut dyn FnMut(Standing) -> std::ops::ControlFlow<()>,
+) -> Result<()> {
+    if let Some(digest) = root_digest {
+        let retained = match records::read_root_history(state, application)? {
+            Some(history) => roots::history_retains_digest(&history, context, digest)?,
+            None => false,
+        };
+        if !retained
+            && visit(Standing::Pending(
+                "root is not in the application's canonical history",
+            ))
+            .is_break()
+        {
+            return Ok(());
+        }
+    }
+    for marker in consumptions {
+        if is_consumed(state, application, marker)?
+            && visit(Standing::Lasting("already consumed")).is_break()
+        {
+            return Ok(());
+        }
+    }
+    if let Some(claim) = escrow_claim {
+        let standing = match escrow(state, application, &claim.address)? {
+            None => Some(Standing::Pending("escrow does not exist")),
+            Some((_, _, true)) => Some(Standing::Lasting("escrow already consumed")),
+            Some((binding, _, _)) if binding != claim.binding => {
+                Some(Standing::Lasting("claim does not match the escrow"))
+            }
+            Some((_, refund_after, _))
+                if claim.refund && frame.is_some_and(|frame| frame < refund_after) =>
+            {
+                Some(Standing::Pending("refund before the escrow's refund frame"))
+            }
+            Some(_) => None,
+        };
+        if let Some(standing) = standing {
+            let _ = visit(standing);
+        }
+    }
+    Ok(())
+}
+
+/// What the global commit would make of an operation needing `needs`, read
+/// ahead of it from `state`: `None` when no state check refuses it, else the
+/// first lasting refusal, or the first pending one when none is lasting.
+/// Nothing is pending on a view holding no root history of the application
+/// or of the QUIL token: it follows no GLOBAL state (or not yet), so it
+/// cannot tell a root or an escrow GLOBAL never published from one it has.
+pub fn precheck(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    needs: &CommitNeeds,
+) -> Result<Option<Standing>> {
+    let mut found = None;
+    state_refusals(
+        state,
+        application,
+        &needs.context,
+        needs.root_digest.as_ref(),
+        &needs.consumptions,
+        needs.escrow_claim.as_ref(),
+        None,
+        &mut |standing| match standing {
+            Standing::Lasting(_) => {
+                found = Some(standing);
+                std::ops::ControlFlow::Break(())
+            }
+            Standing::Pending(_) => {
+                found.get_or_insert(standing);
+                std::ops::ControlFlow::Continue(())
+            }
+        },
+    )?;
+    if matches!(found, Some(Standing::Pending(_)))
+        && records::read_root_history(state, application)?.is_none()
+        && records::read_root_history(state, &crate::domains::QUIL_TOKEN)?.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(found)
+}
+
+/// Whether `entry` creates an escrow GLOBAL state already holds.
+fn escrow_taken(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    entry: &SpendEntry,
+) -> Result<bool> {
+    match &entry.escrow_create {
+        Some(create) => Ok(escrow(state, application, &create.address)?.is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Next delivery sequence per block, of the blocks [`place_outputs`] fills.
+type Sequences = std::collections::BTreeMap<u64, u64>;
+
+/// Where `outputs` land at placement `width`: each output's block and
+/// sequence, and each block's next sequence after them; `None` when one of
+/// their blocks is full.
+fn place_outputs(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    width: u8,
+    outputs: &[[u8; 32]],
+) -> Result<Option<(Vec<Placement>, Sequences)>> {
+    let mut placements = Vec::with_capacity(outputs.len());
+    let mut sequences = Sequences::new();
+    for address in outputs {
+        let block = coin_blocks::block_for_address(width, address)?;
+        let next = match sequences.get(&block) {
+            Some(next) => *next,
+            None => block_sequence(state, application, block)?,
+        };
+        if next >= BLOCK_CAPACITY {
+            return Ok(None);
+        }
+        sequences.insert(block, next + 1);
+        placements.push(Placement {
+            address: *address,
+            block,
+            seq: next,
+        });
+    }
+    Ok(Some((placements, sequences)))
+}
+
+/// Why [`commit_entry`] would refuse `entry` at GLOBAL frame `frame` (as
+/// executed by `source_shard`), read from `state` without writing anything:
+/// its first refusal, in its order (decided already, context, the state
+/// checks [`precheck`] also makes, the escrow it creates, a full block), or
+/// `None` when it would commit. The global venue reads it before verifying
+/// the operation's proof, at the frame that commits it.
+pub fn refusal(
+    state: &HypergraphState,
+    frame: u64,
+    application: &[u8; 32],
+    entry: &SpendEntry,
+    source_shard: quil_types::execution::ShardPath,
+) -> Result<Option<&'static str>> {
+    entry.validate_at(frame)?;
+    let decision = decision_address(application, &entry.tx_id)?;
+    if read(state, &decision, KIND_DECISION, &[&[0]])?.is_some() {
+        return Ok(Some("operation already decided"));
+    }
+    if let Some(fields) = read(state, &context_address(application)?, KIND_CONTEXT, &[&[0]])? {
+        if fields[0] != entry.context {
+            return Ok(Some("context differs from the application's"));
+        }
+    }
+    let mut refused = None;
+    state_refusals(
+        state,
+        application,
+        &entry.context,
+        entry.root_digest.as_ref(),
+        &entry.consumptions,
+        entry.escrow_claim.as_ref(),
+        Some(frame),
+        &mut |standing| {
+            refused = Some(standing.reason());
+            std::ops::ControlFlow::Break(())
+        },
+    )?;
+    if refused.is_some() {
+        return Ok(refused);
+    }
+    if escrow_taken(state, application, entry)? {
+        return Ok(Some("escrow already exists"));
+    }
+    // The width the commit raises placement to, unwritten.
+    let depth = source_shard.bits().map_or(0, |bits| bits.len());
+    let width = placement_width(state, application)?
+        .max(depth.min(usize::from(coin_blocks::MAX_BLOCK_BITS)) as u8);
+    Ok(place_outputs(state, application, width, &entry.outputs)?
+        .is_none()
+        .then_some("block is full"))
+}
+
+/// `source` with the whitespace after each opening parenthesis dropped, so
+/// a call rustfmt wraps onto several lines reads like one it does not; for
+/// the class guards that read this crate's source.
+#[cfg(test)]
+pub(crate) fn guard_source(source: &str) -> String {
+    let mut out = String::new();
+    let mut open = false;
+    for c in source.chars() {
+        if open && c.is_whitespace() {
+            continue;
+        }
+        open = c == '(';
+        out.push(c);
+    }
+    out
+}
+
+/// The text of function `head` (`pub fn name`, say) in `source`, from its
+/// name to its closing brace; for the class guards.
+#[cfg(test)]
+pub(crate) fn guard_body<'a>(source: &'a str, head: &str) -> &'a str {
+    let start = source
+        .find(&format!("\n{head}("))
+        .unwrap_or_else(|| panic!("{head} not found"));
+    let rest = &source[start + 1..];
+    &rest[..rest.find("\n}\n").expect("end of the function")]
+}
+
+/// The calls in `text` whose error `?` returns (`name(..)?`, the receiver's
+/// name for `name(..).map_err(..)?`), by their path as written (`read`,
+/// `shield::check_sources`, a method's own name); for the class guards.
+#[cfg(test)]
+pub(crate) fn guard_fallible_calls(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    // The name of the call whose closing parenthesis is at `close`.
+    let call = |close: usize| -> Option<(String, usize)> {
+        let mut depth = 0usize;
+        let mut at = close;
+        loop {
+            match bytes[at] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            at = at.checked_sub(1)?;
+        }
+        let end = at;
+        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || b"_:".contains(&bytes[at - 1])) {
+            at -= 1;
+        }
+        (at < end).then(|| (text[at..end].to_string(), at))
+    };
+    let mut calls = Vec::new();
+    for (at, _) in text.match_indices(")?") {
+        let Some((mut name, mut start)) = call(at) else {
+            continue;
+        };
+        while name == "map_err" {
+            let mut before = start.saturating_sub(1);
+            while before > 0 && bytes[before].is_ascii_whitespace() {
+                before -= 1;
+            }
+            // `.map_err` after a call: name that call.
+            if bytes[before] != b'.' {
+                break;
+            }
+            before -= 1;
+            while before > 0 && bytes[before].is_ascii_whitespace() {
+                before -= 1;
+            }
+            if bytes[before] != b')' {
+                break;
+            }
+            match call(before) {
+                Some(receiver) => (name, start) = receiver,
+                None => break,
+            }
+        }
+        calls.push(name);
+    }
+    calls
+}
+
 /// Decide one relayed entry for `application` at global frame `frame`.
 pub fn commit_entry(
     state: &HypergraphState,
@@ -1348,37 +1661,27 @@ pub fn commit_entry(
         )?,
     }
 
-    if let Some(digest) = &entry.root_digest {
-        let retained = match records::read_root_history(state, application)? {
-            Some(history) => roots::history_retains_digest(&history, &entry.context, digest)?,
-            None => false,
-        };
-        if !retained {
-            return reject("root is not in the application's canonical history");
-        }
+    // The first of the state checks a node also makes ahead of the commit
+    // ([`precheck`]), in the same order, so the two cannot diverge.
+    let mut refused = None;
+    state_refusals(
+        state,
+        application,
+        &entry.context,
+        entry.root_digest.as_ref(),
+        &entry.consumptions,
+        entry.escrow_claim.as_ref(),
+        Some(frame),
+        &mut |standing| {
+            refused = Some(standing.reason());
+            std::ops::ControlFlow::Break(())
+        },
+    )?;
+    if let Some(reason) = refused {
+        return reject(reason);
     }
-    for marker in &entry.consumptions {
-        if is_consumed(state, application, marker)? {
-            return reject("already consumed");
-        }
-    }
-    if let Some(claim) = &entry.escrow_claim {
-        match escrow(state, application, &claim.address)? {
-            None => return reject("escrow does not exist"),
-            Some((_, _, true)) => return reject("escrow already consumed"),
-            Some((binding, _, _)) if binding != claim.binding => {
-                return reject("claim does not match the escrow")
-            }
-            Some((_, refund_after, _)) if claim.refund && frame < refund_after => {
-                return reject("refund before the escrow's refund frame")
-            }
-            Some(_) => {}
-        }
-    }
-    if let Some(create) = &entry.escrow_create {
-        if escrow(state, application, &create.address)?.is_some() {
-            return reject("escrow already exists");
-        }
+    if escrow_taken(state, application, entry)? {
+        return reject("escrow already exists");
     }
     // A shard that commits an operation exists, whatever route registered it:
     // an application whose grid was already deep before this record existed
@@ -1390,24 +1693,10 @@ pub fn commit_entry(
         application,
         source_shard.bits().map_or(0, |bits| bits.len()),
     )?;
-    let mut placements = Vec::with_capacity(entry.outputs.len());
-    let mut sequences: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    for address in &entry.outputs {
-        let block = coin_blocks::block_for_address(width, address)?;
-        let next = match sequences.get(&block) {
-            Some(next) => *next,
-            None => block_sequence(state, application, block)?,
-        };
-        if next >= BLOCK_CAPACITY {
-            return reject("block is full");
-        }
-        sequences.insert(block, next + 1);
-        placements.push(Placement {
-            address: *address,
-            block,
-            seq: next,
-        });
-    }
+    let Some((placements, sequences)) = place_outputs(state, application, width, &entry.outputs)?
+    else {
+        return reject("block is full");
+    };
 
     // Commit.
     for marker in &entry.consumptions {
@@ -2718,6 +3007,366 @@ mod tests {
         assert!(!canonical_owners_active(Some(999)));
         assert!(!canonical_owners_active(None));
         set_canonical_owner_frame_for_thread(None);
+    }
+
+    /// The commit decides by the first of its state refusals, in its order
+    /// (a root before a marker); ahead of it, a lasting refusal outranks a
+    /// pending one, and nothing is pending on a view holding no roots of the
+    /// application or of the QUIL token.
+    #[test]
+    fn the_commit_refuses_for_its_first_reason_and_a_precheck_for_a_lasting_one() {
+        let state = mem_state();
+        assert!(matches!(
+            commit_entry(&state, 100, &APP, &entry(1, &[20], &[1]), SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        let needs = |consumed: u8| CommitNeeds {
+            context: CONTEXT,
+            root_digest: Some([9; 32]),
+            consumptions: vec![[consumed; 32]],
+            escrow_claim: None,
+        };
+        assert_eq!(
+            precheck(&state, &APP, &needs(20)).unwrap(),
+            Some(Standing::Lasting("already consumed"))
+        );
+        assert_eq!(precheck(&state, &APP, &needs(21)).unwrap(), None);
+        let root = Node::from_bytes(&[1u8; NODE_BYTES]).unwrap();
+        let history = roots::publish_history(
+            None,
+            quil_lattice_ct::confidential::coin_tree::RootRecord {
+                context: CONTEXT,
+                depth: 32,
+                coins: 1,
+                root,
+            },
+        )
+        .unwrap();
+        records::write_record(
+            &state,
+            100,
+            &records::root_history_address(&APP).unwrap(),
+            &[
+                (
+                    vec![0xff; 32],
+                    records::kind("quil/accumulator/root-history-record/v1\0")
+                        .unwrap()
+                        .to_vec(),
+                ),
+                (vec![0], history),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            precheck(&state, &APP, &needs(21)).unwrap(),
+            Some(Standing::Pending(
+                "root is not in the application's canonical history"
+            ))
+        );
+        assert_eq!(
+            precheck(&state, &APP, &needs(20)).unwrap(),
+            Some(Standing::Lasting("already consumed"))
+        );
+        let mut both = entry(2, &[20], &[2]);
+        both.root_digest = Some([9; 32]);
+        assert_eq!(
+            commit_entry(&state, 101, &APP, &both, SHARD).unwrap(),
+            Outcome::Rejected("root is not in the application's canonical history")
+        );
+    }
+
+    /// The global venue reads every refusal of the commit before the proof
+    /// work ([`refusal`]) as the commit then makes it, in its order, and
+    /// reading writes nothing (not even the context record a first commit
+    /// writes).
+    #[test]
+    fn the_venue_reads_each_commit_refusal_before_the_proof_as_the_commit_makes_it() {
+        let state = mem_state();
+        let first = entry(1, &[20], &[1]);
+        let mut foreign = entry(2, &[21], &[2]);
+        foreign.context = [99; 32];
+        assert_eq!(refusal(&state, 100, &APP, &first, SHARD).unwrap(), None);
+        assert_eq!(
+            refusal(&state, 100, &APP, &foreign, SHARD).unwrap(),
+            None,
+            "reading the first entry wrote the application's context"
+        );
+        assert!(matches!(
+            commit_entry(&state, 100, &APP, &first, SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        let binding = escrow_binding(&CONTEXT, &[50; 32], b"source", b"recipient", b"refund", 200);
+        let mut create = entry(3, &[22], &[3]);
+        create.escrow_create = Some(EscrowCreate {
+            address: [50; 32],
+            binding,
+            refund_after_global_frame: 200,
+        });
+        assert!(matches!(
+            commit_entry(&state, 101, &APP, &create, SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        let claim = |tx: u8, address: u8, binding: [u8; 32], refund: bool| {
+            let mut claim = entry(tx, &[], &[4]);
+            claim.escrow_claim = Some(EscrowClaim {
+                address: [address; 32],
+                binding,
+                refund,
+            });
+            claim
+        };
+        assert!(matches!(
+            commit_entry(&state, 102, &APP, &claim(4, 50, binding, false), SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        let mut rooted = entry(5, &[23], &[5]);
+        rooted.root_digest = Some([9; 32]);
+        let mut again = entry(6, &[24], &[6]);
+        again.escrow_create = create.escrow_create.clone();
+        let binding_51 =
+            escrow_binding(&CONTEXT, &[51; 32], b"source", b"recipient", b"refund", 300);
+        let mut create_51 = entry(8, &[26], &[8]);
+        create_51.escrow_create = Some(EscrowCreate {
+            address: [51; 32],
+            binding: binding_51,
+            refund_after_global_frame: 300,
+        });
+        assert!(matches!(
+            commit_entry(&state, 103, &APP, &create_51, SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        let cases = [
+            ("decided", first.clone(), "operation already decided"),
+            ("context", foreign, "context differs from the application's"),
+            (
+                "root",
+                rooted,
+                "root is not in the application's canonical history",
+            ),
+            ("consumed", entry(9, &[20], &[9]), "already consumed"),
+            (
+                "absent escrow",
+                claim(10, 52, binding, false),
+                "escrow does not exist",
+            ),
+            (
+                "claimed escrow",
+                claim(11, 50, binding, false),
+                "escrow already consumed",
+            ),
+            (
+                "binding",
+                claim(12, 51, [0; 32], false),
+                "claim does not match the escrow",
+            ),
+            (
+                "early refund",
+                claim(13, 51, binding_51, true),
+                "refund before the escrow's refund frame",
+            ),
+            ("escrow exists", again, "escrow already exists"),
+        ];
+        for (name, refused, reason) in cases {
+            assert_eq!(
+                refusal(&state, 110, &APP, &refused, SHARD).unwrap(),
+                Some(reason),
+                "{name}"
+            );
+            let outcome = commit_entry(&state, 110, &APP, &refused, SHARD).unwrap();
+            if name == "decided" {
+                assert_eq!(outcome, Outcome::AlreadyDecided, "{name}");
+            } else {
+                assert_eq!(outcome, Outcome::Rejected(reason), "{name}");
+            }
+        }
+        let open = claim(14, 51, binding_51, false);
+        assert_eq!(refusal(&state, 111, &APP, &open, SHARD).unwrap(), None);
+        assert!(matches!(
+            commit_entry(&state, 111, &APP, &open, SHARD).unwrap(),
+            Outcome::Committed { .. }
+        ));
+        // Every fixture output lands in one block; fill it.
+        let full = entry(7, &[25], &[7]);
+        let width = placement_width(&state, &APP).unwrap();
+        let block = coin_blocks::block_for_address(width, &output(7)).unwrap();
+        records::write_record(
+            &state,
+            111,
+            &block_sequence_address(&APP, block).unwrap(),
+            &[
+                kind_field(KIND_SEQUENCE).unwrap(),
+                (vec![0], BLOCK_CAPACITY.to_be_bytes().to_vec()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(&state, 112, &APP, &full, SHARD).unwrap(),
+            Some("block is full")
+        );
+        assert_eq!(
+            commit_entry(&state, 112, &APP, &full, SHARD).unwrap(),
+            Outcome::Rejected("block is full")
+        );
+    }
+
+    /// Class guard (filing gate, section 3): every reason [`commit_entry`]
+    /// rejects for is read ahead of the commit by [`precheck`] (lasting or
+    /// pending: the checks of [`state_refusals`]), so no node verifies a
+    /// proof for it; or it is classed here with the reason no node can read
+    /// it before the proof work. A new refusal fails this test until it is
+    /// one or the other, and the global venue's [`refusal`] reads each.
+    #[test]
+    fn every_commit_refusal_is_prechecked_or_classed() {
+        const CLASSED: [(&str, &str); 3] = [
+            (
+                "context differs from the application's",
+                "never past preflight: an operation's context is its network's with the \
+                 application, dispatch decodes it against the node's own network before any \
+                 proof work, and so every committed entry, and the context record the first \
+                 one writes, carries that network's context",
+            ),
+            (
+                "escrow already exists",
+                "frame-dependent: the escrow's address binds the frame that executes the \
+                 operation, unknown ahead of it",
+            ),
+            (
+                "block is full",
+                "frame-dependent: output addresses bind the executing frame, and the width \
+                 and sequences are the committing frame's",
+            ),
+        ];
+        let source = guard_source(include_str!("global_commit.rs"));
+        let body = guard_body;
+        /// The string literals `text` passes to `call` (`call` ends `("`).
+        fn literals(text: &str, call: &str) -> Vec<String> {
+            text.match_indices(call)
+                .map(|(at, _)| {
+                    let rest = &text[at + call.len()..];
+                    rest[..rest.find('"').expect("end of the literal")].to_string()
+                })
+                .collect()
+        }
+        // The commit's literal refusals that are neither read ahead nor
+        // classed (its state refusals reach it as one computed reason).
+        let unclassed = |source: &str| -> Vec<String> {
+            literals(body(source, "pub fn commit_entry"), "reject(\"")
+                .into_iter()
+                .filter(|reason| !CLASSED.iter().any(|(classed, _)| classed == reason))
+                .collect()
+        };
+        let commit = body(&source, "pub fn commit_entry");
+        let rejected = literals(commit, "reject(\"");
+        let state_checks = body(&source, "fn state_refusals");
+        let mut prechecked = literals(state_checks, "Standing::Lasting(\"");
+        prechecked.extend(literals(state_checks, "Standing::Pending(\""));
+        assert!(
+            prechecked.len() >= 6,
+            "state_refusals' reasons not found: {prechecked:?}"
+        );
+        assert_eq!(
+            commit.matches("reject(reason)").count(),
+            1,
+            "the commit rejects for a computed reason other than state_refusals' first"
+        );
+        assert!(commit.contains("state_refusals("));
+        let unread = unclassed(&source);
+        assert!(
+            unread.is_empty(),
+            "commit_entry rejects for {unread:?}, which no node reads before verifying the \
+             operation's proof: read it in state_refusals (lasting or pending), or class it \
+             here with why it cannot be read ahead"
+        );
+        for (classed, why) in CLASSED {
+            assert!(
+                rejected.iter().any(|reason| reason == classed),
+                "{classed:?} ({why}) is no longer a commit refusal: drop it here"
+            );
+        }
+        // The guard catches a refusal added to the commit.
+        let planted = source.replacen(
+            "return reject(\"block is full\");",
+            "return reject(\"planted refusal\");\nreturn reject(\"block is full\");",
+            1,
+        );
+        assert_eq!(unclassed(&planted), ["planted refusal"]);
+        let venue = body(&source, "pub fn refusal");
+        let mut read_ahead = literals(venue, "Some(\"");
+        read_ahead.extend(literals(venue, "then_some(\""));
+        assert!(venue.contains("state_refusals("));
+        for reason in &rejected {
+            assert!(
+                read_ahead.contains(reason),
+                "the global venue does not read {reason:?} before the proof"
+            );
+        }
+        // Refusals that are not a literal `reject`: the shape of the commit
+        // ahead of its writes.
+        let faults = commit_shape_faults(&source);
+        assert!(
+            faults.is_empty(),
+            "commit_entry refuses in a way no node reads before the proof: {faults:?}"
+        );
+        let planted = source.replacen(
+            "    // Commit.\n",
+            "    if planted_check(state)? { return Ok(Outcome::Rejected(\"planted\")); }\n\
+             return Err(QuilError::InvalidArgument(\"planted\".into()));\n\
+             return reject(computed);\n    // Commit.\n",
+            1,
+        );
+        assert_eq!(
+            commit_shape_faults(&planted).len(),
+            4,
+            "the guard missed a planted refusal: {:?}",
+            commit_shape_faults(&planted)
+        );
+    }
+
+    /// How [`commit_entry`], in guard source `source`, refuses other than by
+    /// a literal `reject` before its writes (`// Commit.`), or by the one
+    /// computed reason [`state_refusals`] gives: an `Outcome::Rejected` not
+    /// built by its `reject`, a `reject` of another computed reason, an
+    /// error it builds, or a call whose error `?` returns that the global
+    /// venue's [`refusal`] does not make too (writes and the encodings of
+    /// what it writes excepted). Each is a refusal no node reads before
+    /// verifying the operation's proof.
+    fn commit_shape_faults(source: &str) -> Vec<String> {
+        /// Calls of the commit whose errors are not refusals: its writes,
+        /// and the encodings of what it writes (`raise_placement_width`
+        /// writes the width `refusal` reads with `placement_width`).
+        const WRITES: [&str; 4] = [
+            "records::write_record",
+            "kind_field",
+            "decision_fields",
+            "raise_placement_width",
+        ];
+        let commit = guard_body(source, "pub fn commit_entry");
+        let venue = guard_body(source, "pub fn refusal");
+        let checks = &commit[..commit.find("// Commit.").expect("the commit's writes")];
+        let mut faults = Vec::new();
+        let built = commit.matches("Outcome::Rejected(").count();
+        if built != 1 {
+            faults.push(format!(
+                "{built} Outcome::Rejected built, 1 expected (its reject)"
+            ));
+        }
+        let computed = commit.matches("reject(").count() - commit.matches("reject(\"").count();
+        if computed != 1 {
+            faults.push(format!(
+                "{computed} rejects of a computed reason, 1 expected (state_refusals')"
+            ));
+        }
+        if checks.contains("Err(") {
+            faults.push("an error built before its writes".into());
+        }
+        for call in guard_fallible_calls(checks) {
+            if !WRITES.contains(&call.as_str()) && !venue.contains(&format!("{call}(")) {
+                faults.push(format!(
+                    "{call}: its error is a refusal refusal() does not read"
+                ));
+            }
+        }
+        faults
     }
 
     /// A batch shield commits every source or none: one already-shielded

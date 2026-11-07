@@ -511,7 +511,7 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 7] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 8] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
@@ -519,6 +519,7 @@ const SUBMIT_REFUSAL_NAMES: [&str; 7] = [
     "awaiting_execution",
     "no_proposer",
     "invalid_alt_shard_update",
+    "shield_claimed",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -531,6 +532,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::AwaitingExecution => 4,
         Refusal::NoProposer => 5,
         Refusal::InvalidAltShardUpdate => 6,
+        Refusal::ShieldClaimed => 7,
     }
 }
 
@@ -538,7 +540,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
 /// first is logged at once, the rest at most once per
 /// [`SUBMIT_REFUSAL_REPORT_INTERVAL`], with the next refusal after it.
 struct SubmitRefusals {
-    counts: [u64; 7],
+    counts: [u64; SUBMIT_REFUSAL_NAMES.len()],
     latest_peer: String,
     latest_reason: &'static str,
     logged_at: Option<std::time::Instant>,
@@ -546,7 +548,7 @@ struct SubmitRefusals {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SubmitRefusalSummary {
-    counts: [u64; 7],
+    counts: [u64; SUBMIT_REFUSAL_NAMES.len()],
     latest_peer: String,
     latest_reason: &'static str,
     since_previous: Option<std::time::Duration>,
@@ -555,7 +557,7 @@ struct SubmitRefusalSummary {
 impl SubmitRefusals {
     const fn new() -> Self {
         Self {
-            counts: [0; 7],
+            counts: [0; SUBMIT_REFUSAL_NAMES.len()],
             latest_peer: String::new(),
             latest_reason: "",
             logged_at: None,
@@ -6057,7 +6059,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0, 0],
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -6077,7 +6079,7 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0, 0],
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),

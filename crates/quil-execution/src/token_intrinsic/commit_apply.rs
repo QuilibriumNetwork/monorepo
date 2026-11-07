@@ -20,6 +20,33 @@ fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("global commit: {message}"))
 }
 
+/// What [`commit_and_place`] would refuse operation `bytes` (type `tp`) of
+/// `application` for at GLOBAL frame `frame`, read from `state` without
+/// writing and without verifying its proof: the same error, so the venue
+/// can refuse it before the proof work its commit would only waste. `None`
+/// when the commit would accept it, or when what it reads cannot be read
+/// (the commit then decides as before).
+pub fn refused_before_proof(
+    state: &HypergraphState,
+    frame: u64,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    tp: u32,
+    bytes: &[u8],
+) -> Option<QuilError> {
+    let entry = spend_entries::commit_entry(state, network, application, tp, bytes, frame).ok()?;
+    global_commit::refusal(
+        state,
+        frame,
+        application,
+        &entry,
+        quil_types::execution::ShardPath::WHOLE,
+    )
+    .ok()
+    .flatten()
+    .map(invalid)
+}
+
 /// Commit one verified operation and apply everything it created. Returns the
 /// addresses of the coins it placed, in the entry's output order.
 ///

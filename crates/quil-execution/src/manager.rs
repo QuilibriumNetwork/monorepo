@@ -186,6 +186,94 @@ pub enum ArrivalRefusal {
     Malformed,
     /// The global commit already decided one of its operations.
     Decided,
+    /// One of its operations can only be rejected, whatever GLOBAL frame
+    /// decides it: it spends a marker the global commit already holds as
+    /// consumed (a coin shielded, a key image spent), claims an escrow
+    /// already claimed or under another binding, or shields a coin its key
+    /// does not own or did not sign for.
+    Rejected,
+    /// One of its operations names what this node's GLOBAL view does not
+    /// hold yet (a root, an escrow), or a legacy source or mint policy its
+    /// store does not hold: it is held unverified until the view does.
+    Pending,
+}
+
+/// What a shield its owner key signed claims on its shard, per legacy source
+/// ([`ExecutionEngineManager::shield_claims`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShieldClaim {
+    /// The coin under that key: the application, the source and the key.
+    pub coin: [u8; 32],
+    /// The statement the key signed. The signature does not cover the
+    /// proof, so copies of a shield with other proof bytes make the same
+    /// statement.
+    pub statement: [u8; 32],
+}
+
+/// Which bundles failed their proof verification on this node
+/// ([`ExecutionEngineManager::proof_failures`]).
+#[derive(Clone)]
+pub struct ProofFailures {
+    #[cfg(feature = "native-proof")]
+    policy: crate::token_intrinsic::dispatch::TokenPolicy,
+    #[cfg(feature = "native-proof")]
+    application: Vec<u8>,
+}
+
+impl ProofFailures {
+    /// Whether a confidential operation of canonical bundle `bundle_bytes`
+    /// failed its proof verification on this node (its verdict is cached as
+    /// rejected), with the statements of the shields among them whose own
+    /// proof failed. A verdict is a pure function of the operation and the
+    /// network policy, and a bundle executes whole or not at all, so no
+    /// frame executes the bundle on any node of that policy. A cache lookup
+    /// per operation, no proof work. `None` when none failed.
+    pub fn of(&self, bundle_bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
+        #[cfg(feature = "native-proof")]
+        {
+            let bundle =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+                    .ok()?;
+            let mut failed = None::<Vec<[u8; 32]>>;
+            for request in bundle.requests.iter().flatten() {
+                let tp = request.inner_type_prefix;
+                if crate::token_intrinsic::dispatch::is_confidential_type(tp)
+                    && self
+                        .policy
+                        .verdict_rejected(&self.application, &request.inner_bytes, tp)
+                {
+                    let statements = failed.get_or_insert_with(Vec::new);
+                    for claim in ExecutionEngineManager::request_claims(request) {
+                        if !statements.contains(&claim.statement) {
+                            statements.push(claim.statement);
+                        }
+                    }
+                }
+            }
+            failed
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = bundle_bytes;
+            None
+        }
+    }
+}
+
+/// What the global commit can make of a canonical bundle, read ahead of it
+/// from this node's GLOBAL view and shard store
+/// ([`ExecutionEngineManager::commit_outlook`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitOutlook {
+    /// Nothing this node holds refuses it.
+    Open,
+    /// Decided, or an operation can only be rejected (see
+    /// [`ArrivalRefusal::Rejected`]): no shard needs to verify or propose it.
+    Settled,
+    /// An operation names what this node does not hold yet (see
+    /// [`ArrivalRefusal::Pending`]): verifying or proposing it waits until
+    /// this node holds it; a later GLOBAL frame may settle it either way.
+    Pending,
 }
 
 impl PreverifyCounts {
@@ -463,11 +551,38 @@ impl ExecutionEngineManager {
     /// [`Self::preverify_bundles`] paced by `pacing`. The engines are read
     /// only to take the token policy and worker client: a verification runs
     /// for minutes, and a held read guard would keep every engine writer,
-    /// and the readers queued behind it, waiting that long.
+    /// and the readers queued behind it, waiting that long. Operations
+    /// execution against this node's store refuses before their proof (a
+    /// shield of a coin its key does not own, or did not sign; a source the
+    /// store does not hold; an unauthorized custom mint) are not verified:
+    /// no frame carrying them verifies them either, here or on an archive.
     pub fn preverify_bundles_paced(
         &self,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
+    ) -> PreverifyCounts {
+        self.preverify_routed(bundles, pacing, None)
+    }
+
+    /// [`Self::preverify_bundles`] ahead of the global venue's execution of
+    /// GLOBAL frame `frame`: what that frame's commit refuses from GLOBAL
+    /// state alone (a root GLOBAL does not hold, a consumed marker, a
+    /// claimed escrow, ...) is not verified either, as the venue refuses it
+    /// before the proof. One an earlier operation of the frame lifts (it
+    /// publishes the root) is verified when it executes.
+    pub fn preverify_global_bundles(
+        &self,
+        frame: u64,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> PreverifyCounts {
+        self.preverify_routed(bundles, &PreverifyPacing::default(), Some(frame))
+    }
+
+    fn preverify_routed(
+        &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+        pacing: &PreverifyPacing<'_>,
+        commit_frame: Option<u64>,
     ) -> PreverifyCounts {
         #[cfg(feature = "native-proof")]
         {
@@ -493,22 +608,27 @@ impl ExecutionEngineManager {
             };
             match verifier {
                 Some((policy, worker)) => {
-                    TokenExecutionEngine::preverify_with(policy, &worker, &routed, pacing)
+                    let network = policy.network;
+                    let refused = |address: &[u8], bytes: &[u8], tp: u32| {
+                        self.proof_refused(&network, address, bytes, tp, commit_frame)
+                    };
+                    TokenExecutionEngine::preverify_with(policy, &worker, &routed, pacing, &refused)
                 }
                 None => PreverifyCounts::default(),
             }
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = (bundles, pacing);
+            let _ = (bundles, pacing, commit_frame);
             PreverifyCounts::default()
         }
     }
 
     /// The confidential token operations in `bundles` whose verdicts are not
     /// cached yet, as their verification is estimated: what materializing
-    /// them would still verify. Empty when every proof is verified, and
-    /// without a worker.
+    /// them would still verify (not those execution refuses before their
+    /// proof, which [`Self::preverify_bundles_paced`] leaves unverified).
+    /// Empty when every proof is verified, and without a worker.
     pub fn unverified_confidential_operations(
         &self,
         bundles: &[(Vec<u8>, Vec<u8>)],
@@ -538,7 +658,10 @@ impl ExecutionEngineManager {
             };
             match policy {
                 Some(policy) => {
-                    TokenExecutionEngine::unverified_operation_estimates(&policy, &routed)
+                    let refused = |address: &[u8], bytes: &[u8], tp: u32| {
+                        self.proof_refused(&policy.network, address, bytes, tp, None)
+                    };
+                    TokenExecutionEngine::unverified_operation_estimates(&policy, &routed, &refused)
                 }
                 None => Vec::new(),
             }
@@ -784,11 +907,373 @@ impl ExecutionEngineManager {
         }
     }
 
-    /// Whether the global commit has decided every request of a canonical
-    /// bundle, so no shard needs to execute it again. Only globally committed
-    /// operations are ever decided, so a bundle holding anything else never
-    /// is. `global` holds GLOBAL state; false when it cannot say. `address`
-    /// is the application, or a shard filter under it (its first 32 bytes).
+    /// What each shield of a canonical bundle that its owner key signed
+    /// claims on its shard: one coin per legacy source it consumes, of its
+    /// application, the source and that key, with the digest of the
+    /// statement the key signed. Decoding and one signature check per
+    /// shield, no proof and no state. A shield whose signature does not
+    /// verify claims nothing, so no key can claim a source for another.
+    /// Empty without the native prover.
+    pub fn shield_claims(bundle_bytes: &[u8]) -> Vec<ShieldClaim> {
+        #[cfg(feature = "native-proof")]
+        {
+            let Ok(bundle) =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+            else {
+                return Vec::new();
+            };
+            bundle
+                .requests
+                .iter()
+                .flatten()
+                .flat_map(Self::request_claims)
+                .collect()
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = bundle_bytes;
+            Vec::new()
+        }
+    }
+
+    /// [`Self::shield_claims`] of one request.
+    #[cfg(feature = "native-proof")]
+    fn request_claims(
+        request: &crate::message_envelope::CanonicalMessageRequest,
+    ) -> Vec<ShieldClaim> {
+        use sha3::Digest;
+        if request.inner_type_prefix != crate::token_engine::TYPE_LATTICE_SHIELD {
+            return Vec::new();
+        }
+        let bytes = &request.inner_bytes;
+        let context = |range: std::ops::Range<usize>| {
+            bytes
+                .get(range)
+                .and_then(|field| <[u8; 32]>::try_from(field).ok())
+        };
+        let (Some(network), Some(application)) = (context(12..44), context(44..76)) else {
+            return Vec::new();
+        };
+        let Ok(shield) =
+            quil_lattice_ct::confidential::shield::AnyShield::decode(bytes, &network, &application)
+        else {
+            return Vec::new();
+        };
+        if crate::token_intrinsic::shield::check_authorization(&shield).is_err() {
+            return Vec::new();
+        }
+        let Ok(signed) = shield.context_bytes() else {
+            return Vec::new();
+        };
+        let mut statement = sha3::Sha3_256::new();
+        statement.update(b"quil/shield-statement/v1\0");
+        statement.update(&signed);
+        let statement: [u8; 32] = statement.finalize().into();
+        shield
+            .sources()
+            .iter()
+            .map(|source| {
+                let mut hash = sha3::Sha3_256::new();
+                hash.update(b"quil/shield-claim/v1\0");
+                hash.update(application);
+                hash.update(source.address);
+                hash.update(shield.owner_public_key());
+                ShieldClaim {
+                    coin: hash.finalize().into(),
+                    statement,
+                }
+            })
+            .collect()
+    }
+
+    /// The token policy, if a token worker is configured.
+    #[cfg(feature = "native-proof")]
+    fn token_policy(&self) -> Option<crate::token_intrinsic::dispatch::TokenPolicy> {
+        match self.engines.read() {
+            Ok(engines) => engines
+                .get("token")
+                .and_then(|e| e.as_any())
+                .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                .and_then(TokenExecutionEngine::token_verifier)
+                .map(|(policy, _)| policy),
+            Err(_) => None,
+        }
+    }
+
+    /// What tells which bundles of `address` (an application, or a shard
+    /// filter under it) failed their proof verification on this node
+    /// ([`ProofFailures::of`]), with the token policy read now: it reads
+    /// only the verdict cache, never the engines' lock, so a caller may hold
+    /// its own locks while it judges. `None` without a token policy and
+    /// without the native prover.
+    pub fn proof_failures(&self, address: &[u8]) -> Option<ProofFailures> {
+        #[cfg(feature = "native-proof")]
+        {
+            Some(ProofFailures {
+                policy: self.token_policy()?,
+                application: address[..address.len().min(32)].to_vec(),
+            })
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = address;
+            None
+        }
+    }
+
+    /// What stops a confidential operation of `application` from committing,
+    /// read before any proof work: the global commit's state checks
+    /// ([`global_commit::precheck`]: consumed markers, a root or an escrow
+    /// GLOBAL holds, an escrow's binding and claim) against `global`, GLOBAL
+    /// state as this node holds it; and, with `shard` (this node's store and
+    /// its token policy's network), what execution refuses before the proof
+    /// (a shield's legacy sources and signature, a custom mint's authority)
+    /// and a custom mint's policy-bound markers. A record that cannot be read
+    /// refuses nothing. A lasting refusal (one no later GLOBAL frame lifts)
+    /// comes first. Every lasting refusal here only grows as GLOBAL advances
+    /// (a consumed marker, a claimed escrow, an escrow's binding, a legacy
+    /// coin, a signature), so a view behind GLOBAL refuses less, never more;
+    /// what it does not hold yet is pending, never refused.
+    ///
+    /// [`global_commit::precheck`]: crate::token_intrinsic::global_commit::precheck
+    #[cfg(feature = "native-proof")]
+    fn request_standing(
+        global: &crate::hypergraph_state::HypergraphState,
+        shard: Option<(&crate::hypergraph_state::HypergraphState, &[u8; 32])>,
+        application: &[u8; 32],
+        request: &crate::message_envelope::CanonicalMessageRequest,
+    ) -> Option<crate::token_intrinsic::global_commit::Standing> {
+        use crate::token_engine::TYPE_LATTICE_MINT;
+        use crate::token_intrinsic::{
+            custom_mint,
+            global_commit::{self, Standing},
+            spend_entries,
+        };
+        let (tp, bytes) = (request.inner_type_prefix, request.inner_bytes.as_slice());
+        let mut needs = spend_entries::commit_needs(application, tp, bytes)?;
+        let mut held = None;
+        if let Some((shard, network)) = shard {
+            match Self::execution_standing(shard, network, application, tp, bytes) {
+                Some(lasting @ Standing::Lasting(_)) => return Some(lasting),
+                pending => held = pending,
+            }
+            if tp == TYPE_LATTICE_MINT && application != &crate::domains::QUIL_TOKEN {
+                if let Ok(markers) =
+                    custom_mint::commit_consumptions(shard, bytes, network, application)
+                {
+                    needs.consumptions = markers;
+                }
+            }
+        }
+        match global_commit::precheck(global, application, &needs) {
+            Ok(Some(lasting @ Standing::Lasting(_))) => Some(lasting),
+            Ok(pending) => held.or(pending),
+            Err(_) => held,
+        }
+    }
+
+    /// What execution against `shard` (a store holding the operation's
+    /// shard, of a node on `network`) refuses before verifying the proof of
+    /// operation `bytes` of type `tp`: a shield's legacy sources and
+    /// signature (lasting when a source is another key's coin or the key
+    /// did not sign, pending when the store does not hold a source), a
+    /// pending claim its branch's authority did not sign and a settlement
+    /// whose terms execution refuses (lasting: both are read from the bytes
+    /// alone, by execution's own checks), a custom mint the policy held here
+    /// does not authorize (pending). `None` for every other operation and
+    /// when it cannot say. When a refund falls due, a batch shield's
+    /// activation and a source outside the executing shard are judged by
+    /// the executing frame only: no frame is known ahead of it.
+    #[cfg(feature = "native-proof")]
+    fn execution_standing(
+        shard: &crate::hypergraph_state::HypergraphState,
+        network: &[u8; 32],
+        application: &[u8; 32],
+        tp: u32,
+        bytes: &[u8],
+    ) -> Option<crate::token_intrinsic::global_commit::Standing> {
+        use crate::token_engine::{
+            TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SETTLEMENT,
+            TYPE_LATTICE_SHIELD,
+        };
+        use crate::token_intrinsic::{
+            commit_verify, custom_mint,
+            global_commit::Standing,
+            shield::{self, SourceStanding},
+        };
+        if tp == TYPE_LATTICE_PENDING_CLAIM {
+            let claim = quil_lattice_ct::confidential::pending_claim::PendingClaim::decode(
+                bytes,
+                network,
+                application,
+            )
+            .ok()?;
+            return commit_verify::claim_signature_refused(&claim, network, application)
+                .then_some(Standing::Lasting("invalid selected authority signature"));
+        }
+        if tp == TYPE_LATTICE_SETTLEMENT {
+            let tx = quil_lattice_ct::confidential::settlement::Settlement::decode(
+                bytes,
+                network,
+                application,
+            )
+            .ok()?;
+            return commit_verify::settlement_terms(&tx)
+                .is_err()
+                .then_some(Standing::Lasting("settlement terms refused"));
+        }
+        if tp == TYPE_LATTICE_SHIELD {
+            let tx = quil_lattice_ct::confidential::shield::AnyShield::decode(
+                bytes,
+                network,
+                application,
+            )
+            .ok()?;
+            return match shield::source_standing(shard, application, &tx)? {
+                SourceStanding::Unowned => {
+                    Some(Standing::Lasting("shield source is not its key's coin"))
+                }
+                SourceStanding::Unsigned => Some(Standing::Lasting("invalid source authorization")),
+                SourceStanding::Missing => Some(Standing::Pending("shield source not held here")),
+                SourceStanding::Owned => None,
+            };
+        }
+        if tp == TYPE_LATTICE_MINT
+            && application != &crate::domains::QUIL_TOKEN
+            && custom_mint::refused_before_proof(shard, network, application, bytes) == Some(true)
+        {
+            return Some(Standing::Pending(
+                "custom mint not authorized by the policy held here",
+            ));
+        }
+        None
+    }
+
+    /// Whether the proof of confidential operation `bytes` (type `tp`) of
+    /// `address` needs no verification here: execution against this node's
+    /// store refuses it before its proof ([`Self::execution_standing`]), so
+    /// no frame that carries it verifies it, here or on any node holding
+    /// that state; and, with `commit_frame`, in the global venue that
+    /// commits it at that frame, the commit refuses it from GLOBAL state
+    /// alone (`commit_apply::refused_before_proof`), as the venue does
+    /// before the proof. A frame reading a store that gains what refused it
+    /// (a source still syncing, a root an earlier operation of the frame
+    /// publishes) verifies it when it executes, as before.
+    #[cfg(feature = "native-proof")]
+    fn proof_refused(
+        &self,
+        network: &[u8; 32],
+        address: &[u8],
+        bytes: &[u8],
+        tp: u32,
+        commit_frame: Option<u64>,
+    ) -> bool {
+        let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
+            return false;
+        };
+        let store = crate::hypergraph_state::HypergraphState::new(self.crdt());
+        if Self::execution_standing(&store, network, &application, tp, bytes).is_some() {
+            return true;
+        }
+        commit_frame.is_some_and(|frame| {
+            crate::token_intrinsic::spend_entries::commits_globally(&application, tp)
+                && crate::token_intrinsic::commit_apply::refused_before_proof(
+                    &store,
+                    frame,
+                    network,
+                    &application,
+                    tp,
+                    bytes,
+                )
+                .is_some()
+        })
+    }
+
+    /// Whether the global commit has decided every request of `bundle`.
+    #[cfg(feature = "native-proof")]
+    fn all_decided(
+        state: &crate::hypergraph_state::HypergraphState,
+        application: &[u8; 32],
+        bundle: &crate::message_envelope::CanonicalMessageBundle,
+    ) -> bool {
+        use crate::token_intrinsic::global_commit;
+        bundle.requests.iter().all(|request| {
+            request.as_ref().is_some_and(|request| {
+                global_commit::is_decided(
+                    state,
+                    application,
+                    &global_commit::tx_id(&request.inner_bytes),
+                )
+                .unwrap_or(false)
+            })
+        })
+    }
+
+    /// What the global commit can make of a canonical bundle, read before
+    /// any proof work from `global` (GLOBAL state as this node holds it) and
+    /// this node's store: settled when it decided every request or one can
+    /// only be rejected; pending when one names what this node does not hold
+    /// yet (`request_standing`). `address` is the application, or a shard
+    /// filter under it (its first 32 bytes). Open when it cannot say, and
+    /// without the native prover. Without a token policy only GLOBAL state is
+    /// read.
+    pub fn commit_outlook(
+        &self,
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        address: &[u8],
+        bundle_bytes: &[u8],
+    ) -> CommitOutlook {
+        #[cfg(feature = "native-proof")]
+        {
+            use crate::token_intrinsic::global_commit::Standing;
+            let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
+                return CommitOutlook::Open;
+            };
+            let Ok(bundle) =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+            else {
+                return CommitOutlook::Open;
+            };
+            if bundle.requests.is_empty() {
+                return CommitOutlook::Open;
+            }
+            let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+            let store = crate::hypergraph_state::HypergraphState::new(self.crdt());
+            let network = self.token_policy().map(|policy| policy.network);
+            let shard = network.as_ref().map(|network| (&store, network));
+            let mut pending = false;
+            for request in bundle.requests.iter().flatten() {
+                match Self::request_standing(&state, shard, &application, request) {
+                    Some(Standing::Lasting(_)) => return CommitOutlook::Settled,
+                    Some(Standing::Pending(_)) => pending = true,
+                    None => {}
+                }
+            }
+            if Self::all_decided(&state, &application, &bundle) {
+                return CommitOutlook::Settled;
+            }
+            if pending {
+                CommitOutlook::Pending
+            } else {
+                CommitOutlook::Open
+            }
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (global, address, bundle_bytes);
+            CommitOutlook::Open
+        }
+    }
+
+    /// Whether no shard needs to execute a canonical bundle again: the global
+    /// commit has decided every request, or GLOBAL state alone shows it can
+    /// only reject one (a re-shield of a shielded coin, a re-spend of a spent
+    /// key image, a claim of a claimed escrow). Only globally committed
+    /// operations are ever decided, so a bundle holding anything else is
+    /// not, unless one of its operations can only be rejected. `global`
+    /// holds GLOBAL state; false when it cannot say. `address` is the
+    /// application, or a shard filter under it (its first 32 bytes).
+    /// [`Self::commit_outlook`] also reads this node's store.
     pub fn decided_globally(
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         address: &[u8],
@@ -809,16 +1294,15 @@ impl ExecutionEngineManager {
                 return false;
             }
             let state = crate::hypergraph_state::HypergraphState::new(global);
-            return bundle.requests.iter().all(|request| {
-                request.as_ref().is_some_and(|request| {
-                    global_commit::is_decided(
-                        &state,
-                        &application,
-                        &global_commit::tx_id(&request.inner_bytes),
-                    )
-                    .unwrap_or(false)
-                })
-            });
+            if bundle.requests.iter().flatten().any(|request| {
+                matches!(
+                    Self::request_standing(&state, None, &application, request),
+                    Some(global_commit::Standing::Lasting(_))
+                )
+            }) {
+                return true;
+            }
+            Self::all_decided(&state, &application, &bundle)
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -833,13 +1317,14 @@ impl ExecutionEngineManager {
     /// record reads, no proof. Operations whose verdict is cached, or that
     /// dispatch refuses before native work (encoding, context, dimensions,
     /// fee: they fail execution without a proof), are left out. Refused
-    /// when the bundle does not decode, or when the global commit already
-    /// decided one of its operations (`global` holds GLOBAL state; a record
-    /// it cannot read counts as undecided): executing it again changes
-    /// nothing, and the collector keeps it from proposals once a finalized
-    /// frame carried it. `address` is the application, or a shard filter
-    /// under it. Empty without the native prover, and for bundles routed to
-    /// other engines.
+    /// when the bundle does not decode, when the global commit already
+    /// decided one of its operations (executing it again changes nothing,
+    /// and the collector keeps it from proposals once a finalized frame
+    /// carried it), when one can only be rejected, and while one names what
+    /// this node does not hold yet ([`Self::commit_outlook`]); `global` holds
+    /// GLOBAL state, and a record it cannot read refuses nothing. `address`
+    /// is the application, or a shard filter under it. Empty without the
+    /// native prover, and for bundles routed to other engines.
     pub fn arrival_operations(
         &self,
         global: &Arc<quil_hypergraph::HypergraphCrdt>,
@@ -848,7 +1333,10 @@ impl ExecutionEngineManager {
     ) -> std::result::Result<Vec<usize>, ArrivalRefusal> {
         #[cfg(feature = "native-proof")]
         {
-            use crate::token_intrinsic::{dispatch::is_confidential_type, global_commit};
+            use crate::token_intrinsic::{
+                dispatch::is_confidential_type,
+                global_commit::{self, Standing},
+            };
             let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
                 return Ok(Vec::new());
             };
@@ -861,17 +1349,12 @@ impl ExecutionEngineManager {
             let bundle =
                 crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
                     .map_err(|_| ArrivalRefusal::Malformed)?;
-            let policy = match self.engines.read() {
-                Ok(engines) => engines
-                    .get("token")
-                    .and_then(|e| e.as_any())
-                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                    .and_then(TokenExecutionEngine::token_verifier)
-                    .map(|(policy, _)| policy),
-                Err(_) => None,
-            };
+            let policy = self.token_policy();
             let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+            let store = crate::hypergraph_state::HypergraphState::new(self.crdt());
+            let shard = policy.as_ref().map(|policy| (&store, &policy.network));
             let mut sizes = Vec::new();
+            let mut pending = false;
             for request in bundle.requests.iter().flatten() {
                 if !is_confidential_type(request.inner_type_prefix) {
                     continue;
@@ -879,6 +1362,11 @@ impl ExecutionEngineManager {
                 let tx_id = global_commit::tx_id(&request.inner_bytes);
                 if global_commit::is_decided(&state, &application, &tx_id).unwrap_or(false) {
                     return Err(ArrivalRefusal::Decided);
+                }
+                match Self::request_standing(&state, shard, &application, request) {
+                    Some(Standing::Lasting(_)) => return Err(ArrivalRefusal::Rejected),
+                    Some(Standing::Pending(_)) => pending = true,
+                    None => {}
                 }
                 if let Some(policy) = policy.as_ref() {
                     if policy
@@ -900,6 +1388,9 @@ impl ExecutionEngineManager {
                     }
                 }
                 sizes.push(request.inner_bytes.len());
+            }
+            if pending {
+                return Err(ArrivalRefusal::Pending);
             }
             Ok(sizes)
         }
@@ -2486,40 +2977,21 @@ mod tests {
     #[cfg(feature = "native-proof")]
     #[test]
     fn arrival_operations_leave_out_decided_and_malformed_submissions() {
+        use super::prework_tests::{key_address, legacy_coin};
         use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         use crate::token_intrinsic::{dispatch::TokenPolicy, global_commit, state::SnapshotLimits};
         use quil_lattice_ct::confidential::{
             relation::backend::{native::NativeBudget, worker_client::WorkerVerifier},
-            shield::{Shield, ShieldStatement},
-            transfer::{parameter_context, CompileLimits, Output, MEMO_BYTES},
-            AmountOpening, CommitmentKey,
+            transfer::CompileLimits,
         };
         let network = [1; 32];
         let application = domains::QUIL_TOKEN;
-        let context = parameter_context(&network, &application);
-        let key = CommitmentKey::derive(&context);
-        let opening = AmountOpening::from_seed(&context, &[2; 32]);
-        let mut proof = vec![0; 40];
-        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        // Structurally valid only: no valid signature or native proof.
-        let tx = Shield {
-            statement: ShieldStatement {
-                network,
-                application,
-                transparent_address: [3; 32],
-                owner_public_key: [4; 57],
-                amount: 12,
-                fee: 2,
-                outputs: vec![Output {
-                    commitment: key.commit(10, &opening),
-                    owner: [5; IDENTITY_BYTES],
-                    memo: [6; MEMO_BYTES],
-                }],
-            },
-            signature: [0; 114],
-            proof,
-        };
-        let shield = CanonicalMessageRequest::wrap(tx.encode().unwrap()).unwrap();
+        // A shield of a legacy coin its key owns (the coin is written into
+        // the node's store below), signed by that key; no valid native proof.
+        let source = legacy_coin(&super::prework_tests::global_view(), key_address(4), 12, 1);
+        let shield =
+            CanonicalMessageRequest::wrap(super::prework_tests::shield(4, source, 2, true))
+                .unwrap();
         let mut truncated = shield.inner_bytes.clone();
         truncated.pop();
         let malformed = CanonicalMessageRequest::wrap(truncated).unwrap();
@@ -2562,6 +3034,7 @@ mod tests {
         let manager = build_manager(false)
             .with_token_worker(policy, worker)
             .unwrap();
+        legacy_coin(&manager.crdt(), key_address(4), 12, 1);
         let fresh = bundle(vec![Some(shield.clone())]);
         assert_eq!(
             manager.arrival_operations(&global, &application, &fresh),
@@ -2630,6 +3103,272 @@ mod tests {
         assert_eq!(
             manager.arrival_operations(&global, &crate::domains::GLOBAL, &fresh),
             Ok(Vec::new())
+        );
+    }
+
+    /// A legacy coin is shielded once: the global commit marks its source
+    /// consumed. Another shield of the same coin (new outputs, so a new
+    /// operation id) can then only be rejected by the global commit, which
+    /// credits no fee for it. It is refused before any proof work: on
+    /// arrival, and by the filter a shard proposal drops settled bundles
+    /// with. Otherwise each such shield is verified by the shard and by
+    /// every archive (minutes of CPU each) before the global commit rejects
+    /// it, free of charge.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_reshield_of_a_consumed_source_is_refused_before_any_proof_work() {
+        use super::prework_tests::{key_address, legacy_coin};
+        use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use crate::token_engine::TYPE_LATTICE_SHIELD;
+        use crate::token_intrinsic::{
+            dispatch::TokenPolicy, global_commit, spend_entries, spend_relay,
+            spent_check::key_image_spent_address, state::SnapshotLimits,
+        };
+        use quil_lattice_ct::confidential::{
+            relation::backend::{native::NativeBudget, worker_client::WorkerVerifier},
+            transfer::CompileLimits,
+        };
+        let network = [1; 32];
+        let application = domains::QUIL_TOKEN;
+        // Two shields of one legacy coin by its owner (the coin is written
+        // into the node's store below), told apart by their outputs only:
+        // signed, no valid native proof, which nothing before the proof
+        // worker checks.
+        let source = legacy_coin(&super::prework_tests::global_view(), key_address(4), 12, 1);
+        let shield = |seed: u8| {
+            CanonicalMessageRequest::wrap(super::prework_tests::shield(4, source, seed, true))
+                .unwrap()
+        };
+        let (first, second) = (shield(5), shield(7));
+        assert_ne!(
+            global_commit::tx_id(&first.inner_bytes),
+            global_commit::tx_id(&second.inner_bytes)
+        );
+        let bundle = |request: &CanonicalMessageRequest| {
+            CanonicalMessageBundle {
+                requests: vec![Some(request.clone())],
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let policy = TokenPolicy {
+            network,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 3,
+            },
+            snapshots: SnapshotLimits {
+                max_coins: 8,
+                max_depth: 3,
+                max_nodes: 24,
+            },
+            native_budget: NativeBudget {
+                max_native_bytes: 0,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let worker = WorkerVerifier::new(
+            directory.path().join("absent-worker"),
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let manager = build_manager(false)
+            .with_token_worker(policy, worker)
+            .unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+        legacy_coin(&manager.crdt(), key_address(4), 12, 1);
+        // Shard frame 40 executed the operation and relayed its spend entry;
+        // header 41 carries it into GLOBAL frame `frame`. The fees credited,
+        // and the decision recorded.
+        let commit = |request: &CanonicalMessageRequest, frame: u64| {
+            let entry = spend_entries::spend_entry(
+                &network,
+                &application,
+                TYPE_LATTICE_SHIELD,
+                &request.inner_bytes,
+                40,
+            )
+            .unwrap();
+            let relay = spend_relay::encode_relay(&[(40, vec![entry.encode().unwrap()])]).unwrap();
+            let fees =
+                global_commit::materialize_relay(&state, frame, &application, 41, &relay).unwrap();
+            state.commit().unwrap();
+            state.abort();
+            let decision = state
+                .get(
+                    &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+                    &global_commit::decision_address(&application, &entry.tx_id).unwrap(),
+                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+                )
+                .unwrap()
+                .map(|blob| global_commit::decode_decision(&blob).unwrap());
+            (fees, decision)
+        };
+        // New to the network, either shield passes arrival.
+        assert!(manager
+            .arrival_operations(&global, &application, &bundle(&second))
+            .is_ok());
+        let (fees, decision) = commit(&first, 100);
+        assert_eq!(fees, 2, "the first shield commits and pays its fee");
+        assert!(matches!(
+            decision,
+            Some(Some(global_commit::Decision::Committed { .. }))
+        ));
+        let marker = key_image_spent_address(&source).unwrap();
+        assert!(global_commit::is_consumed(&state, &application, &marker).unwrap());
+
+        // The second shield arrives once the first has committed.
+        let arrival = manager.arrival_operations(&global, &application, &bundle(&second));
+        let proposal_drops = ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &application,
+            &bundle(&second),
+        );
+        // What the global commit makes of it once it was verified.
+        let (fees, decision) = commit(&second, 101);
+        assert_eq!(fees, 0, "a rejected shield credits no fee");
+        assert!(
+            arrival.is_err() && proposal_drops,
+            "VULNERABLE: re-shield of a consumed source passed arrival (arrival_operations: \
+             {arrival:?}; dropped by the shard proposal filter: {proposal_drops}); only the \
+             global commit refused it, after its proof was verified, crediting fees {fees} \
+             ({decision:?})"
+        );
+    }
+
+    /// A transfer spending a key image the global commit already holds as
+    /// spent can only be rejected there: refused on arrival as consumed, and
+    /// dropped by the shard proposal filter, before any proof work.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_respend_of_a_spent_key_image_is_refused_before_any_proof_work() {
+        use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use crate::token_intrinsic::{
+            dispatch::TokenPolicy, global_commit, spent, state::SnapshotLimits,
+        };
+        use quil_lattice_ct::confidential::{
+            relation::{
+                backend::{native::NativeBudget, worker_client::WorkerVerifier},
+                membership::{Node, NODE_BYTES},
+            },
+            transfer::{
+                parameter_context, CompileLimits, Output, Transfer, TransferStatement, MEMO_BYTES,
+            },
+            AmountOpening, CommitmentKey,
+        };
+        let network = [1; 32];
+        let application = domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &application);
+        let image = [4; IDENTITY_BYTES];
+        let transfer = Transfer {
+            statement: TransferStatement {
+                network,
+                application,
+                depth: 1,
+                root: Node::from_bytes(&[3; NODE_BYTES]).unwrap(),
+                images: vec![image],
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context)
+                        .commit(10, &AmountOpening::from_seed(&context, &[5; 32])),
+                    owner: [5; IDENTITY_BYTES],
+                    memo: [6; MEMO_BYTES],
+                }],
+                fee: 2,
+            },
+            proof: {
+                let mut proof = vec![0; 40];
+                proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+                proof
+            },
+        }
+        .encode()
+        .unwrap();
+        let bundle = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(transfer).unwrap())],
+            timestamp: 1,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let policy = TokenPolicy {
+            network,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 3,
+            },
+            snapshots: SnapshotLimits {
+                max_coins: 8,
+                max_depth: 3,
+                max_nodes: 24,
+            },
+            native_budget: NativeBudget {
+                max_native_bytes: 0,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let worker = WorkerVerifier::new(
+            directory.path().join("absent-worker"),
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let manager = build_manager(false)
+            .with_token_worker(policy, worker)
+            .unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        assert!(manager
+            .arrival_operations(&global, &application, &bundle)
+            .is_ok());
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &application,
+            &bundle
+        ));
+        // Another operation spent the image.
+        let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+        let entry = global_commit::SpendEntry {
+            kind: crate::token_engine::TYPE_LATTICE_TRANSACTION,
+            tx_id: [7; 32],
+            source_frame: 40,
+            context,
+            root_digest: None,
+            consumptions: vec![spent::marker_address(&network, &application, &image).unwrap()],
+            outputs: vec![[8; 32]],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 2,
+            settlement: None,
+        };
+        assert!(matches!(
+            global_commit::commit_entry(
+                &state,
+                100,
+                &application,
+                &entry,
+                quil_types::execution::ShardPath::WHOLE,
+            )
+            .unwrap(),
+            global_commit::Outcome::Committed { .. }
+        ));
+        state.commit().unwrap();
+        assert_eq!(
+            manager.arrival_operations(&global, &application, &bundle),
+            Err(ArrivalRefusal::Rejected),
+            "a re-spend of a spent key image passed arrival"
+        );
+        assert!(
+            ExecutionEngineManager::decided_globally(global.clone(), &application, &bundle),
+            "a re-spend of a spent key image passed the shard proposal filter"
         );
     }
 
@@ -4467,3 +5206,7 @@ mod tests {
         assert!(matches!(err, QuilError::NotFound(_)));
     }
 }
+
+#[cfg(all(test, feature = "native-proof"))]
+#[path = "manager_prework_tests.rs"]
+mod prework_tests;

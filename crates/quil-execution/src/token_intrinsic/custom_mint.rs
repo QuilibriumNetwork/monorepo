@@ -251,6 +251,32 @@ fn check_state(state: &HypergraphState, s: &CustomMintStatement) -> Result<([u8;
     Ok((receipt_address(s)?, policy))
 }
 
+/// Whether execution against the policy `state` holds now refuses a custom
+/// mint before verifying its proof (domain, coverage, deployed policy, its
+/// authority): `None` when this cannot tell (the bytes do not decode, the
+/// state cannot be read, or a paid mint's price, which its bundle's
+/// settlement claim pays, is due). A policy update this state has not
+/// applied yet may authorize it later.
+pub(crate) fn refused_before_proof(
+    state: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    bytes: &[u8],
+) -> Option<bool> {
+    let mint = CustomMint::decode(bytes, network, application).ok()?;
+    let policy = match check_state(state, &mint.statement) {
+        Ok((_, policy)) => policy,
+        Err(e) if e.is_execution_unavailable() => return None,
+        Err(_) => return Some(true),
+    };
+    if matches!(policy.entry.variant, MintVariant::Payment)
+        && policy.entry.payment_fee_baseline.is_some()
+    {
+        return None;
+    }
+    Some(check_authorization(&mint, &policy, None).is_err())
+}
+
 /// Only successful policy authorization and native verification construct it.
 // Retained verified payload and payment authorization for consumption.
 #[allow(dead_code)]
