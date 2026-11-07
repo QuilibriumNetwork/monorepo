@@ -922,6 +922,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         app_engine_mempool_mb = %crate::mem_stats::fmt_mb(sizes.app_engine_mempool_bytes as u64),
                         global_mempool_messages = global_mempool.0,
                         global_mempool_mb = %crate::mem_stats::fmt_mb(global_mempool.1 as u64),
+                        // Arrival stamps the shard engines keep for the
+                        // routing fallback, per shard at most 65,536 plus
+                        // the bundles of one leader's turn.
+                        app_engine_routing_seen = sizes.app_engine_routing_seen,
                         app_engine_proposal_cache = sizes.app_engine_proposal_cache,
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
                         // Finalized GLOBAL frames cached with their request

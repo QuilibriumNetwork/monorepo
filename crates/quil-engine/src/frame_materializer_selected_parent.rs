@@ -1200,16 +1200,34 @@ impl GlobalParentExecutor {
             Ok(_) | Err(QuilError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        let bytes = blocks
-            .get_bounded(&digest, self.limits.branch.max_frame_bytes)
-            .ok_or_else(|| unavailable("selected GLOBAL ancestor body unavailable or too large"))?;
-        let frame = crate::consensus_wire::decode_global_frame(&bytes)?;
-        if !valid(&frame)? {
+        // Peer ingress keeps a different later body beside the first one
+        // instead of replacing it (`BlockStore::put`): take the first that
+        // authenticates.
+        let bodies = blocks.candidates_bounded(&digest, self.limits.branch.max_frame_bytes);
+        if bodies.is_empty() {
             return Err(unavailable(
-                "selected GLOBAL ancestor authentication failed",
+                "selected GLOBAL ancestor body unavailable or too large",
             ));
         }
-        Ok(frame)
+        let mut undecodable = None;
+        let mut decoded = false;
+        for bytes in bodies {
+            match crate::consensus_wire::decode_global_frame(&bytes) {
+                Ok(frame) if valid(&frame)? => return Ok(frame),
+                Ok(_) => decoded = true,
+                Err(error) => {
+                    if undecodable.is_none() {
+                        undecodable = Some(error);
+                    }
+                }
+            }
+        }
+        match undecodable {
+            Some(error) if !decoded => Err(error),
+            _ => Err(unavailable(
+                "selected GLOBAL ancestor authentication failed",
+            )),
+        }
     }
 }
 

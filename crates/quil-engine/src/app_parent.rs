@@ -32,6 +32,31 @@ struct Refused {
 /// One validated unfinalized frame: `(digest, frame number, exact bytes)`.
 pub(crate) type ChainBody = (Digest, u64, Vec<u8>);
 
+/// Bodies one walk down an unfinalized chain tries at most, alternates
+/// included: a block store keeps a body per sending member under a digest
+/// ([`BlockStore::candidates`]), and bodies sharing a digest could otherwise
+/// branch the walk at every frame.
+const MAX_WALKED_BODIES: usize = 64;
+
+/// What a body must pass before a walk takes it, besides its place in the
+/// chain: given the frame and whether it is the materialized tip's child.
+type BodyCheck<'a> = &'a dyn Fn(&AppShardFrame, bool) -> Result<()>;
+
+/// One walk down an unfinalized chain ([`AppParentExecutor::walk_chain`]).
+struct ChainWalk<'a> {
+    blocks: &'a BlockStore,
+    tip: &'a Tip,
+    parent_view: u64,
+    check: BodyCheck<'a>,
+    /// The frames taken so far, the selected parent first.
+    chain: Vec<AppShardFrame>,
+    bodies: Vec<ChainBody>,
+    /// The selected parent's height above the tip, once a body showed it.
+    depth: Option<u64>,
+    /// Bodies the walk may still try.
+    budget: usize,
+}
+
 /// Proposal validation (output, committee, storage attestation, structure).
 pub(crate) type ProposalValidation = Arc<dyn Fn(&AppShardFrame) -> Result<bool> + Send + Sync>;
 
@@ -329,7 +354,8 @@ impl AppParentExecutor {
         let verdict = if tip.digest == parent.0 {
             None
         } else {
-            match self.walk_chain(&tip, parent, view) {
+            let bodies_only = |_: &AppShardFrame, _: bool| -> Result<()> { Ok(()) };
+            match self.walk_chain(&tip, parent, view, &bodies_only) {
                 Ok(Ok((chain, _))) if chain.len() >= MAX_PRIVATE_CHAIN => Some(Refused {
                     depth: chain.len() as u64,
                 }),
@@ -400,31 +426,37 @@ impl AppParentExecutor {
         // notarized but not finalized; executing only a child of the tip, every
         // member abstained from a parent two frames up and the shard stopped
         // (e.g. frames 5403 and 5404 above tip 5402).
-        let (chain, chain_bodies) = self.unfinalized_chain(&tip, parent, parent_view)?;
-        // Each frame's own checks; its requests root is checked against the
-        // state it extends, which for all but the first is the branch below.
-        for frame in &chain {
+        // Each frame's own checks, as the walk takes it, so that a body
+        // failing them leaves the walk to another body held under its
+        // digest; its requests root is checked against the state it extends,
+        // which for all but the first is the branch below.
+        let check = |frame: &AppShardFrame, tip_child: bool| -> Result<()> {
             if !(self.validate)(frame)? {
                 return Err(unavailable("selected parent fails proposal validation"));
             }
-        }
-        if let Err((reason, detail)) = (self.canonical_check)(&chain[0]) {
-            return Err(unavailable(format!(
-                "selected parent fails proposal validation: {reason} ({detail})"
-            )));
-        }
-        // Every GLOBAL frame the chain's reward citations name is held before
-        // any of it executes, as for canonical execution.
-        self.hold_cited_frames(&chain)?;
-        let frame = chain
+            if tip_child {
+                if let Err((reason, detail)) = (self.canonical_check)(frame) {
+                    return Err(unavailable(format!(
+                        "selected parent fails proposal validation: {reason} ({detail})"
+                    )));
+                }
+            }
+            Ok(())
+        };
+        let (mut chain, mut chain_bodies) =
+            self.unfinalized_chain(&tip, parent, parent_view, &check)?;
+        let header = chain
             .last()
-            .expect("a chain holds the selected parent")
-            .clone();
-        let header = frame
-            .header
-            .clone()
+            .and_then(|frame| frame.header.clone())
             .ok_or_else(|| unavailable("selected parent has no header"))?;
         let number = header.frame_number;
+        // Every GLOBAL frame a frame's reward citations name is held before
+        // it executes, as for canonical execution, but only once its requests
+        // root passed: above the tip's child the walked body may be another
+        // member's, whose citations would force fetches, or a refusal, before
+        // the leader's body beside it is tried. The walk checked the tip's
+        // child's root.
+        self.hold_cited_frames(&chain[0], &header)?;
 
         // Drop any stale branch before capturing another, but only now: a
         // proposal on a parent that cannot be executed keeps the one in use.
@@ -451,8 +483,7 @@ impl AppParentExecutor {
             .clone();
         let outflows: Arc<FrameOutflows> = Arc::new(std::sync::Mutex::new(copy));
         let mut processed = 0;
-        for (offset, frame) in chain.iter().enumerate() {
-            let header = frame.header.as_ref().expect("checked above");
+        for offset in 0..chain.len() {
             let at = first + offset as u64;
             if offset > 0 {
                 let check = build_requests_root_check(
@@ -467,12 +498,25 @@ impl AppParentExecutor {
                     self.leader.shard_drain.clone(),
                     None,
                 );
-                if let Err((reason, detail)) = check(frame) {
-                    return Err(unavailable(format!(
-                        "selected parent fails proposal validation: {reason} ({detail})"
-                    )));
+                if let Err((reason, detail)) = check(&chain[offset]) {
+                    // The walk checks no requests root above the tip's child
+                    // (it needs this branch), so it may have taken another
+                    // member's body with the leader's header and other
+                    // requests: take a body held beside it that passes.
+                    let Some((alternate, bytes)) =
+                        self.alternate_body(&chain[offset], &chain_bodies[offset], &check)
+                    else {
+                        return Err(unavailable(format!(
+                            "selected parent fails proposal validation: {reason} ({detail})"
+                        )));
+                    };
+                    chain[offset] = alternate;
+                    chain_bodies[offset].2 = bytes;
                 }
+                self.hold_cited_frames(&chain[offset], &header)?;
             }
+            let frame = &chain[offset];
+            let header = frame.header.as_ref().expect("checked above");
             let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();
             let txn = clock.new_transaction(false)?;
             clock.stage_shard_clock_frame(&selector, frame, txn.as_ref())?;
@@ -505,6 +549,7 @@ impl AppParentExecutor {
                 outflow.accumulator = Some(digest);
             });
         }
+        end_cited_wait(self.core_id, &self.filter, number, CITED_PRIVATE_PARENT);
         let crdt = manager.crdt();
         let check = build_requests_root_check(
             manager.clone(),
@@ -529,6 +574,10 @@ impl AppParentExecutor {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "executed unfinalized selected app parent privately"
         );
+        let frame = chain
+            .last()
+            .expect("a chain holds the selected parent")
+            .clone();
         let result = Arc::new(PrivateAppParent {
             frame,
             digest: parent,
@@ -552,34 +601,31 @@ impl AppParentExecutor {
     }
 
     /// Whether this member holds every GLOBAL frame the reward citations of
-    /// `chain` name. If not, they are fetched from its master in the
-    /// background, at most one fetch at a time and
-    /// [`CITED_PARENT_FETCH_RETRY`] after one that left frames missing, and the
-    /// chain is refused until they are here: executed without them, it would
-    /// fail part-way on every member lacking them, and a parent that can only
-    /// finalize through a child would never execute anywhere.
-    fn hold_cited_frames(&self, chain: &[AppShardFrame]) -> Result<()> {
-        let parent = chain
-            .last()
-            .and_then(|frame| frame.header.as_ref())
-            .ok_or_else(|| unavailable("selected parent has no header"))?;
+    /// `frame`, in the chain of the selected parent `parent`, name. If not,
+    /// they are fetched from its master in the background, at most one fetch
+    /// at a time and [`CITED_PARENT_FETCH_RETRY`] after one that left frames
+    /// missing, and the chain is refused until they are here: executed
+    /// without them, it would fail part-way on every member lacking them, and
+    /// a parent that can only finalize through a child would never execute
+    /// anywhere. The wait ends ([`end_cited_wait`]) once the whole chain
+    /// executed.
+    fn hold_cited_frames(
+        &self,
+        frame: &AppShardFrame,
+        parent: &quil_types::proto::global::FrameHeader,
+    ) -> Result<()> {
         let (number, anchor) = (parent.frame_number, parent.global_frame_number);
-        let mut unheld = std::collections::BTreeSet::new();
-        for frame in chain {
-            let Some(header) = frame.header.as_ref() else {
-                continue;
-            };
-            unheld.extend(cited_frames_not_held(
-                self.exec.as_ref(),
-                self.global_anchor_store.as_ref(),
-                &self.app_address,
-                &frame.requests,
-                header.global_frame_number,
-            ));
-        }
-        let frames: Vec<u64> = unheld.into_iter().collect();
+        let Some(header) = frame.header.as_ref() else {
+            return Ok(());
+        };
+        let frames = cited_frames_not_held(
+            self.exec.as_ref(),
+            self.global_anchor_store.as_ref(),
+            &self.app_address,
+            &frame.requests,
+            header.global_frame_number,
+        );
         let (Some(&first), Some(&last)) = (frames.first(), frames.last()) else {
-            end_cited_wait(self.core_id, &self.filter, number, CITED_PRIVATE_PARENT);
             return Ok(());
         };
         match self.cited_source.clone() {
@@ -597,8 +643,9 @@ impl AppParentExecutor {
             ),
         }
         Err(unavailable(format!(
-            "{CITED_FRAMES_UNFETCHED}: the selected parent's chain cites {} not held, {first} to \
-             {last}",
+            "{CITED_FRAMES_UNFETCHED}: frame {} of the selected parent's chain cites {} not \
+             held, {first} to {last}",
+            header.frame_number,
             frames.len()
         )))
     }
@@ -694,112 +741,231 @@ impl AppParentExecutor {
             .blocks
             .get()
             .ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
-        let bytes = blocks
-            .get(&digest)
-            .ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
-        if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
-            return Err(unavailable("seal checkpoint body is a terminal seal"));
+        // The first body held under the digest that is the checkpoint's data
+        // frame ([`BlockStore::candidates`]) and, with several, passes
+        // validation, else why the first is not.
+        let mut refusal = None;
+        let candidates = blocks.candidates(&digest);
+        let several = candidates.len() > 1;
+        for bytes in candidates {
+            // The digest covers only the output, so another member's body
+            // under it may name another view: with several held, only a body
+            // passing proposal validation (which binds the header to the
+            // output) names the data frame's view. A lone body is validated
+            // by the walk.
+            let validated = |view| {
+                (!several
+                    || decode_app_frame(&bytes)
+                        .is_some_and(|frame| (self.validate)(&frame).unwrap_or(false)))
+                .then_some(view)
+                .ok_or_else(|| unavailable("seal checkpoint body fails proposal validation"))
+            };
+            match checkpoint_view(&bytes, checkpoint.frame, digest).and_then(validated) {
+                Ok(view) => return self.prepare(digest, view),
+                Err(error) => {
+                    if refusal.is_none() {
+                        refusal = Some(error);
+                    }
+                }
+            }
         }
-        let frame = decode_app_frame(&bytes)
-            .ok_or_else(|| unavailable("seal checkpoint body is not a data frame"))?;
-        let header = frame
-            .header
-            .as_ref()
-            .ok_or_else(|| unavailable("seal checkpoint has no header"))?;
-        if header.frame_number != checkpoint.frame || app_frame_digest(&frame) != Some(digest) {
-            return Err(unavailable(
-                "seal checkpoint body differs from its frame or digest",
-            ));
-        }
-        self.prepare(digest, header.rank)
+        Err(refusal.unwrap_or_else(|| unavailable("seal checkpoint body is not available")))
+    }
+
+    /// Another body held under `walked`'s digest ([`BlockStore::candidates`])
+    /// that carries the same header, passes proposal validation and passes
+    /// `check` against the branch below it, with its bytes; at most
+    /// [`MAX_WALKED_BODIES`] are tried. A body under a digest passing
+    /// validation carries the leader's header (the output binds it), so only
+    /// the requests and what else the header does not cover can differ.
+    fn alternate_body(
+        &self,
+        walked: &AppShardFrame,
+        (digest, _, refused): &ChainBody,
+        check: &AppRequestsRootCheck,
+    ) -> Option<(AppShardFrame, Vec<u8>)> {
+        self.blocks
+            .get()?
+            .candidates(digest)
+            .into_iter()
+            .filter(|bytes| bytes != refused)
+            .take(MAX_WALKED_BODIES)
+            .find_map(|bytes| {
+                if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
+                    return None;
+                }
+                let frame = decode_app_frame(&bytes)?;
+                (frame.header == walked.header
+                    && (self.validate)(&frame).unwrap_or(false)
+                    && check(&frame).is_ok())
+                .then_some((frame, bytes))
+            })
     }
 
     /// The selected parent and its unfinalized ancestors down to the child of
     /// the materialized tip, oldest first, from the stored bodies. Each frame
     /// names the one below as its parent, numbers rise by one from the tip,
-    /// views rise strictly above the tip's, and the selected parent carries the
-    /// selected view. At most [`MAX_PRIVATE_CHAIN`] frames, with the bytes
-    /// each was decoded from.
+    /// views rise strictly above the tip's, the selected parent carries the
+    /// selected view, and each passes `check`. At most [`MAX_PRIVATE_CHAIN`]
+    /// frames, with the bytes each was decoded from.
     fn unfinalized_chain(
         &self,
         tip: &Tip,
         parent: Digest,
         parent_view: u64,
+        check: BodyCheck<'_>,
     ) -> Result<(Vec<AppShardFrame>, Vec<ChainBody>)> {
-        self.walk_chain(tip, parent, parent_view)?
+        self.walk_chain(tip, parent, parent_view, check)?
             .map_err(|_| unavailable("selected parent does not extend the materialized tip"))
     }
 
     /// [`Self::unfinalized_chain`], telling the bodies' definitive refusal
     /// apart from what this member cannot read (a missing, undecodable or
-    /// seal body).
+    /// seal body) or check.
     fn walk_chain(
         &self,
         tip: &Tip,
         parent: Digest,
         parent_view: u64,
+        check: BodyCheck<'_>,
     ) -> Result<std::result::Result<(Vec<AppShardFrame>, Vec<ChainBody>), Refused>> {
         let blocks = self
             .blocks
             .get()
             .ok_or_else(|| unavailable("selected parent body is not available"))?;
-        let mut chain: Vec<AppShardFrame> = Vec::new();
-        let mut bodies = Vec::new();
-        let mut next = parent;
-        let mut depth = None;
-        loop {
-            let bytes = blocks
-                .get(&next)
-                .ok_or_else(|| unavailable("selected parent body is not available"))?;
-            if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
-                return Err(unavailable("selected parent body is a terminal seal"));
-            }
-            let frame = decode_app_frame(&bytes)
-                .ok_or_else(|| unavailable("undecodable selected parent"))?;
-            let header = frame
-                .header
-                .as_ref()
-                .ok_or_else(|| unavailable("selected parent has no header"))?;
-            let refused = Refused {
-                depth: *depth.get_or_insert(header.frame_number.saturating_sub(tip.cursor)),
-            };
-            if app_frame_digest(&frame) != Some(next)
-                || header.address != self.filter
-                || header.rank <= tip.view
-            {
-                return Ok(Err(refused));
-            }
-            match chain.last().and_then(|above| above.header.as_ref()) {
-                Some(above)
-                    if above.frame_number != header.frame_number + 1
-                        || above.rank <= header.rank =>
-                {
-                    return Ok(Err(refused));
-                }
-                None if header.rank != parent_view => return Ok(Err(refused)),
-                _ => {}
-            }
-            let reaches_tip = header.parent_selector == digest_from_identity(tip.digest).as_ref();
-            let (number, selector) = (header.frame_number, header.parent_selector.clone());
-            chain.push(frame);
-            bodies.push((next, number, bytes));
-            if reaches_tip {
-                if number != tip.cursor + 1 {
-                    return Ok(Err(refused));
-                }
-                break;
-            }
-            if chain.len() >= MAX_PRIVATE_CHAIN || number <= tip.cursor + 1 {
-                return Ok(Err(refused));
-            }
-            let Ok(identity) = <[u8; 32]>::try_from(selector.as_slice()) else {
-                return Ok(Err(refused));
-            };
-            next = digest_from_identity(identity);
+        let mut walk = ChainWalk {
+            blocks,
+            tip,
+            parent_view,
+            check,
+            chain: Vec::new(),
+            bodies: Vec::new(),
+            depth: None,
+            budget: MAX_WALKED_BODIES,
+        };
+        if let Err(refused) = self.walk_from(&mut walk, parent)? {
+            return Ok(Err(refused));
         }
+        let ChainWalk {
+            mut chain,
+            mut bodies,
+            ..
+        } = walk;
         chain.reverse();
         bodies.reverse();
         Ok(Ok((chain, bodies)))
+    }
+
+    /// Walk down from `digest`, trying the bodies held under it in arrival
+    /// order and taking the first that leads to the tip. A peer may deliver
+    /// a different body first under a frame's digest, which does not cover
+    /// the body. When none leads there, what the walk could not read or
+    /// check goes before a definitive refusal: another body may yet arrive.
+    fn walk_from(
+        &self,
+        walk: &mut ChainWalk<'_>,
+        digest: Digest,
+    ) -> Result<std::result::Result<(), Refused>> {
+        let held = walk.blocks.candidates(&digest);
+        if held.is_empty() {
+            return Err(unavailable("selected parent body is not available"));
+        }
+        let mut unjudged = None;
+        let mut refused = None;
+        for bytes in held {
+            if walk.budget == 0 {
+                return Err(unavailable(
+                    "selected parent ancestry holds too many alternate bodies",
+                ));
+            }
+            walk.budget -= 1;
+            match self.walk_body(walk, digest, bytes) {
+                Ok(Ok(())) => return Ok(Ok(())),
+                Ok(Err(refusal)) => {
+                    if refused.is_none() {
+                        refused = Some(refusal);
+                    }
+                }
+                Err(error) => {
+                    if unjudged.is_none() {
+                        unjudged = Some(error);
+                    }
+                }
+            }
+        }
+        match (unjudged, refused) {
+            (Some(error), _) => Err(error),
+            (None, Some(refusal)) => Ok(Err(refusal)),
+            (None, None) => Err(unavailable("selected parent body is not available")),
+        }
+    }
+
+    /// `bytes`, held under `digest`, as the next frame down the walk, and
+    /// the walk below it.
+    fn walk_body(
+        &self,
+        walk: &mut ChainWalk<'_>,
+        digest: Digest,
+        bytes: Vec<u8>,
+    ) -> Result<std::result::Result<(), Refused>> {
+        if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
+            return Err(unavailable("selected parent body is a terminal seal"));
+        }
+        let frame =
+            decode_app_frame(&bytes).ok_or_else(|| unavailable("undecodable selected parent"))?;
+        let header = frame
+            .header
+            .as_ref()
+            .ok_or_else(|| unavailable("selected parent has no header"))?;
+        let tip = walk.tip;
+        let refused = Refused {
+            depth: *walk
+                .depth
+                .get_or_insert(header.frame_number.saturating_sub(tip.cursor)),
+        };
+        if app_frame_digest(&frame) != Some(digest)
+            || header.address != self.filter
+            || header.rank <= tip.view
+        {
+            return Ok(Err(refused));
+        }
+        match walk.chain.last().and_then(|above| above.header.as_ref()) {
+            Some(above)
+                if above.frame_number != header.frame_number + 1 || above.rank <= header.rank =>
+            {
+                return Ok(Err(refused));
+            }
+            None if header.rank != walk.parent_view => return Ok(Err(refused)),
+            _ => {}
+        }
+        let tip_child = header.parent_selector == digest_from_identity(tip.digest).as_ref();
+        let number = header.frame_number;
+        let below = if tip_child {
+            if number != tip.cursor + 1 {
+                return Ok(Err(refused));
+            }
+            None
+        } else {
+            if walk.chain.len() + 1 >= MAX_PRIVATE_CHAIN || number <= tip.cursor + 1 {
+                return Ok(Err(refused));
+            }
+            let Ok(identity) = <[u8; 32]>::try_from(header.parent_selector.as_slice()) else {
+                return Ok(Err(refused));
+            };
+            Some(digest_from_identity(identity))
+        };
+        (walk.check)(&frame, tip_child)?;
+        walk.chain.push(frame);
+        walk.bodies.push((digest, number, bytes));
+        let Some(below) = below else {
+            return Ok(Ok(()));
+        };
+        let outcome = self.walk_from(walk, below);
+        if !matches!(outcome, Ok(Ok(()))) {
+            walk.chain.pop();
+            walk.bodies.pop();
+        }
+        outcome
     }
 
     /// The canonical leader rebound to a prepared parent for `rank`.
@@ -810,6 +976,26 @@ impl AppParentExecutor {
     ) -> Result<Arc<dyn quil_consensus::leader_provider::LeaderProvider<AppShardState>>> {
         Ok(Arc::new(self.leader.for_parent(parent, rank)?))
     }
+}
+
+/// The view of a seal checkpoint's data frame `frame_number`, held as
+/// `bytes` under `digest`.
+fn checkpoint_view(bytes: &[u8], frame_number: u64, digest: Digest) -> Result<u64> {
+    if quil_cw_consensus::handoff::Seal::is_encoding(bytes) {
+        return Err(unavailable("seal checkpoint body is a terminal seal"));
+    }
+    let frame = decode_app_frame(bytes)
+        .ok_or_else(|| unavailable("seal checkpoint body is not a data frame"))?;
+    let header = frame
+        .header
+        .as_ref()
+        .ok_or_else(|| unavailable("seal checkpoint has no header"))?;
+    if header.frame_number != frame_number || app_frame_digest(&frame) != Some(digest) {
+        return Err(unavailable(
+            "seal checkpoint body differs from its frame or digest",
+        ));
+    }
+    Ok(header.rank)
 }
 
 /// A leader skips notarized parents that were nullified (they can never

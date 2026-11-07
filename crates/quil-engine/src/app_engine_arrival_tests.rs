@@ -447,3 +447,295 @@ fn the_last_count_of_refused_arrivals_is_logged_when_they_stop() {
     refused.report(b"filter");
     assert_eq!(logs.lines_with(text).len(), 2, "nothing left to report");
 }
+
+/// A shield of legacy coin `source` by the key derived from `owner`, told
+/// apart by `seed` (its output): structurally valid, signed by that key when
+/// `signed`, with no valid proof.
+fn owned_shield(owner: u8, source: [u8; 32], seed: u8, signed: bool) -> Vec<u8> {
+    use quil_lattice_ct::confidential::{
+        relation::membership::IDENTITY_BYTES,
+        shield::{Shield, ShieldStatement},
+        transfer::{parameter_context, Output, MEMO_BYTES},
+        AmountOpening, CommitmentKey,
+    };
+    use quil_types::crypto::Signer as _;
+    let (network, application) = ([1; 32], quil_execution::domains::QUIL_TOKEN);
+    let context = parameter_context(&network, &application);
+    let private = [owner; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+    let statement = ShieldStatement {
+        network,
+        application,
+        transparent_address: source,
+        owner_public_key: public.clone().try_into().unwrap(),
+        amount: 12,
+        fee: 2,
+        outputs: vec![Output {
+            commitment: CommitmentKey::derive(&context)
+                .commit(10, &AmountOpening::from_seed(&context, &[seed; 32])),
+            owner: [seed; IDENTITY_BYTES],
+            memo: [6; MEMO_BYTES],
+        }],
+    };
+    let signature = if signed {
+        quil_crypto::Ed448Signer::from_bytes(&private, &public)
+            .unwrap()
+            .sign(&statement.context_bytes().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    } else {
+        [0; 114]
+    };
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    Shield {
+        statement,
+        signature,
+        proof,
+    }
+    .encode()
+    .unwrap()
+}
+
+/// Once a coin's shield commits, the global commit holds its source as
+/// consumed, and any other shield of it can only be rejected there, free of
+/// charge. Such a shield is neither collected nor queued for proof
+/// verification on arrival: otherwise the shard proposes it, and the shard
+/// and every archive verify its proof (minutes of CPU each, GLOBAL waiting on
+/// the archives) for nothing.
+#[tokio::test]
+async fn a_reshield_of_a_consumed_source_is_neither_collected_nor_verified_on_arrival() {
+    use quil_execution::token_intrinsic::{global_commit, spend_entries};
+    let (mut engine, collector) = engine_with_execution();
+    let source = [3; 32];
+    let (first, second) = (
+        owned_shield(9, source, 1, false),
+        owned_shield(9, source, 2, false),
+    );
+    if !counts_confidential(&token_bundle(first.clone())) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    let queue = crate::admission_verify::global();
+    let (queued, held) = (queue.stats().queued, collector.total_pending());
+    engine.add_app_message(&token_bundle(first.clone()));
+    assert_eq!(
+        (queue.stats().queued, collector.total_pending()),
+        (queued + 1, held + 1),
+        "a new shield is collected and verified on arrival"
+    );
+    // A frame carried it, and the global commit consumed its source.
+    collector.mark_finalized(&[canonical_app_message(&token_bundle(first.clone()))]);
+    let state = quil_execution::hypergraph_state::HypergraphState::new(
+        engine.execution_engine.as_ref().unwrap().crdt(),
+    );
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let entry = spend_entries::spend_entry(
+        &[1; 32],
+        &application,
+        quil_execution::token_engine::TYPE_LATTICE_SHIELD,
+        &first,
+        40,
+    )
+    .unwrap();
+    assert!(matches!(
+        global_commit::commit_entry(
+            &state,
+            100,
+            &application,
+            &entry,
+            quil_types::execution::ShardPath::WHOLE,
+        )
+        .unwrap(),
+        global_commit::Outcome::Committed { .. }
+    ));
+    state.commit().unwrap();
+    state.abort();
+
+    let (queued, held) = (queue.stats().queued, collector.total_pending());
+    engine.add_app_message(&token_bundle(second));
+    let (queued_now, held_now) = (queue.stats().queued, collector.total_pending());
+    assert!(
+        queued_now == queued && held_now == held,
+        "VULNERABLE: re-shield of a consumed source passed arrival: collected ({held} -> \
+         {held_now} held) and queued for proof verification ({queued} -> {queued_now} queued)"
+    );
+}
+
+/// A coin's owner has one shield of it pending on its shard at a time:
+/// another shield of the coin signed by the same key is refused while the
+/// first is held, and once a finalized frame carried the first, while the
+/// global commit decides it. Otherwise each copy is verified and proposed,
+/// and all but one are rejected by the global commit, free of charge. Only a
+/// shield its key signed holds a coin, so a forged one cannot keep the
+/// owner's out, and no key's shield keeps another key's out.
+#[tokio::test]
+async fn an_owner_has_one_shield_of_a_coin_pending_at_a_time() {
+    let (mut engine, collector) = engine_with_execution();
+    let source = [3; 32];
+    if !counts_confidential(&token_bundle(owned_shield(9, source, 1, true))) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    engine.add_app_message(&token_bundle(owned_shield(9, source, 1, false)));
+    assert_eq!(collector.total_pending(), 1);
+    let first = token_bundle(owned_shield(9, source, 2, true));
+    engine.add_app_message(&first);
+    assert_eq!(
+        collector.total_pending(),
+        2,
+        "a forged shield kept its key's own out"
+    );
+    engine.add_app_message(&token_bundle(owned_shield(8, source, 3, true)));
+    assert_eq!(
+        collector.total_pending(),
+        3,
+        "a key's pending shield kept another key's out"
+    );
+    engine.add_app_message(&token_bundle(owned_shield(9, source, 4, true)));
+    let pending = collector.total_pending();
+    collector.mark_finalized(&[canonical_app_message(&first)]);
+    engine.add_app_message(&token_bundle(owned_shield(9, source, 5, true)));
+    let carried = collector.total_pending();
+    assert!(
+        pending == 3 && carried == 2,
+        "VULNERABLE: another shield of a coin by its owner was collected while the first was \
+         pending ({pending} held, 3 expected) or awaited its GLOBAL decision ({carried} held, \
+         2 expected)"
+    );
+}
+
+/// The owner's signature covers a shield's statement, not its proof, so
+/// anyone who sees a shield can send copies of it with other proof bytes. A
+/// copy that reaches a shard first must not keep the owner's own shield out
+/// of its mempool: the copies make the same statement, and only a proof
+/// decides which of them executes.
+#[tokio::test]
+async fn a_copy_of_a_shield_with_other_proof_bytes_does_not_keep_the_shield_out() {
+    let (mut engine, collector) = engine_with_execution();
+    let source = [3; 32];
+    let shield = owned_shield(9, source, 1, true);
+    if !counts_confidential(&token_bundle(shield.clone())) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    // The proof ends the encoding: the copy differs in its last proof byte.
+    let mut copy = shield.clone();
+    *copy.last_mut().unwrap() ^= 1;
+    engine.add_app_message(&token_bundle(copy));
+    assert_eq!(collector.total_pending(), 1, "the copy is collected");
+    engine.add_app_message(&token_bundle(shield));
+    let held = collector.total_pending();
+    assert!(
+        held == 2,
+        "VULNERABLE: a copy of an owner's signed shield with other proof bytes, arriving \
+         first, kept the owner's own shield out of the mempool ({held} held, 2 expected): \
+         refused as another shield of the coin by the same key"
+    );
+    // The owner's one pending shield still holds the coin against another
+    // statement of the same key.
+    engine.add_app_message(&token_bundle(owned_shield(9, source, 2, true)));
+    assert_eq!(collector.total_pending(), 2, "another statement of the key");
+}
+
+/// A canonical bundle of one confidential transfer of the QUIL token proving
+/// membership against root `root`, told apart by `seed`: structurally
+/// valid, no valid proof.
+fn rooted_transfer_bundle(root: u8, seed: u8) -> Vec<u8> {
+    use quil_lattice_ct::confidential::{
+        relation::membership::{Node, IDENTITY_BYTES, NODE_BYTES},
+        transfer::{parameter_context, Output, Transfer, TransferStatement, MEMO_BYTES},
+        AmountOpening, CommitmentKey,
+    };
+    let (network, application) = ([1; 32], quil_execution::domains::QUIL_TOKEN);
+    let context = parameter_context(&network, &application);
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let inner = Transfer {
+        statement: TransferStatement {
+            network,
+            application,
+            depth: 1,
+            root: Node::from_bytes(&[root; NODE_BYTES]).unwrap(),
+            images: vec![[seed; IDENTITY_BYTES]],
+            outputs: vec![Output {
+                commitment: CommitmentKey::derive(&context)
+                    .commit(10, &AmountOpening::from_seed(&context, &[seed; 32])),
+                owner: [seed; IDENTITY_BYTES],
+                memo: [6; MEMO_BYTES],
+            }],
+            fee: 2,
+        },
+        proof,
+    }
+    .encode()
+    .unwrap();
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: quil_execution::token_engine::TYPE_LATTICE_TRANSACTION,
+            inner_bytes: inner,
+        })],
+        timestamp: 1,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// Publish root `root` (depth 1) into the QUIL token's canonical root
+/// history in `crdt`, as GLOBAL does.
+fn publish_root(crdt: Arc<quil_hypergraph::HypergraphCrdt>, root: u8) {
+    use quil_lattice_ct::confidential::{
+        coin_tree::RootRecord,
+        relation::membership::{Node, NODE_BYTES},
+        transfer::parameter_context,
+    };
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt);
+    quil_execution::token_intrinsic::global_accumulator::publish_root_for_tests(
+        &state,
+        1,
+        &application,
+        RootRecord {
+            context: parameter_context(&[1; 32], &application),
+            depth: 1,
+            coins: 1,
+            root: Node::from_bytes(&[root; NODE_BYTES]).unwrap(),
+        },
+    )
+    .unwrap();
+    state.commit().unwrap();
+    state.abort();
+}
+
+/// A submission naming a root this node's GLOBAL view does not hold (one
+/// GLOBAL never published, or one the view has not caught up to) is
+/// collected but not verified on arrival: verified, it would cost this node
+/// minutes of CPU for what the global commit may only reject. Once the view
+/// holds the root, submissions citing it are verified on arrival again.
+#[tokio::test]
+async fn a_submission_naming_a_root_this_node_lacks_is_collected_but_not_verified() {
+    let (mut engine, collector) = engine_with_execution();
+    if !counts_confidential(&rooted_transfer_bundle(3, 1)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    let crdt = engine.execution_engine.as_ref().unwrap().crdt();
+    publish_root(crdt.clone(), 3);
+    let queue = crate::admission_verify::global();
+    let (queued, held) = (queue.stats().queued, collector.total_pending());
+    engine.add_app_message(&rooted_transfer_bundle(9, 2));
+    let (queued_now, held_now) = (queue.stats().queued, collector.total_pending());
+    assert!(
+        held_now == held + 1 && queued_now == queued,
+        "a submission naming a root this node lacks: collected ({held} -> {held_now} held, 1 \
+         more expected), verified on arrival ({queued} -> {queued_now} queued, none expected)"
+    );
+    publish_root(crdt, 9);
+    engine.add_app_message(&rooted_transfer_bundle(9, 3));
+    assert_eq!(
+        (queue.stats().queued, collector.total_pending()),
+        (queued_now + 1, held_now + 1),
+        "once the view holds the root, a submission citing it is collected and verified"
+    );
+}

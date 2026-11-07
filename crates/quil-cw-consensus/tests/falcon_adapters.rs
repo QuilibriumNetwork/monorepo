@@ -299,6 +299,56 @@ fn pacing_leader_holds_its_turn_and_others_give_it_up() {
     );
 }
 
+/// Votes only for the leader's body.
+struct LeaderOnlyVerifier;
+impl GlobalProposer for LeaderOnlyVerifier {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        None
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+        bytes.as_deref() == Some(&b"leader body"[..])
+    }
+}
+
+/// One committee member's bodies under a proposal's digest, however many
+/// arrive first, hold one place: the leader's body arriving after them is
+/// still held, voted for and sealed.
+#[test]
+fn one_member_cannot_crowd_out_the_leaders_body() {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+        let store = BlockStore::new();
+        let payload = Sha256Digest([11; 32]);
+        for n in 0..8u8 {
+            store.put_from(payload, vec![n; 16], b"member");
+        }
+        store.put_from(payload, b"leader body".to_vec(), b"leader");
+        assert_eq!(store.candidates(&payload).len(), 2);
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"),
+            Arc::new(LeaderOnlyVerifier),
+            store.clone(),
+        );
+        let round = Round::new(Epoch::new(1), View::new(5));
+        let pending = automaton
+            .verify(
+                Context {
+                    round,
+                    leader,
+                    parent: (View::new(4), Sha256Digest([1; 32])),
+                },
+                payload,
+            )
+            .await;
+        assert_eq!(pending.await.ok(), Some(true));
+        assert_eq!(
+            store.get_with_verification(&payload),
+            Some((b"leader body".to_vec(), true))
+        );
+    });
+}
+
 /// Builds at once when asked, but paces itself first.
 struct PacingProposer {
     calls: std::sync::atomic::AtomicU32,
@@ -661,4 +711,335 @@ fn a_behind_give_up_says_where_its_wait_went() {
         },
         "the give-up says where its wait went"
     );
+}
+
+/// Accepts only the leader's body, counting the bodies it is asked about.
+struct LeaderBodyVerifier {
+    asked: std::sync::atomic::AtomicU32,
+}
+impl GlobalProposer for LeaderBodyVerifier {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        None
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        bytes.as_deref() == Some(&b"leader body"[..])
+    }
+}
+
+/// A voter's verdict on a proposal whose digest these bodies arrived under,
+/// in this order, and the body it then holds, with whether it is sealed.
+fn verify_with_bodies(bodies: &[&[u8]]) -> (Option<bool>, Option<(Vec<u8>, bool)>) {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let bodies: Vec<Vec<u8>> = bodies.iter().map(|body| body.to_vec()).collect();
+    deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+        let store = BlockStore::new();
+        let payload = Sha256Digest([10; 32]);
+        for body in bodies {
+            store.put(payload, body);
+        }
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"),
+            Arc::new(LeaderBodyVerifier { asked: 0.into() }),
+            store.clone(),
+        );
+        let round = Round::new(Epoch::new(1), View::new(5));
+        let pending = automaton
+            .verify(
+                Context {
+                    round,
+                    leader,
+                    parent: (View::new(4), Sha256Digest([1; 32])),
+                },
+                payload,
+            )
+            .await;
+        let verdict = pending.await.ok();
+        (verdict, store.get_with_verification(&payload))
+    })
+}
+
+/// The digest of a proposal names its header's output, not its body: a body
+/// another peer sends under it after the leader's must not make a voter
+/// refuse the leader's proposal, and the voter seals the body it accepted.
+#[test]
+fn reproduces_substituted_body_refuses_honest_proposal() {
+    let (verdict, held) = verify_with_bodies(&[b"leader body", b"substituted body"]);
+    assert_eq!(
+        verdict,
+        Some(true),
+        "honest proposal refused: a later delivery under its digest replaced the leader's \
+         body (voter holds {:?})",
+        held.as_ref()
+            .map(|(bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+    );
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
+    let (verdict, held) = verify_with_bodies(&[b"substituted body", b"leader body"]);
+    assert_eq!(verdict, Some(true), "the leader's body arrived second");
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
+    let (verdict, held) = verify_with_bodies(&[b"substituted body"]);
+    assert_eq!(verdict, Some(false), "no body passes");
+    assert_eq!(held, Some((b"substituted body".to_vec(), false)));
+}
+
+/// Stands for the view leader's committee key in [`verify_from`].
+const LEADER: &[u8] = b"the view's leader";
+
+/// A body and the committee member that sent it.
+type Delivery<'a> = (&'a [u8], &'a [u8]);
+
+/// A voter's verdict, how many bodies it checked, and the body it holds
+/// with whether it is sealed.
+type Checked = (Option<bool>, u32, Option<(Vec<u8>, bool)>);
+
+/// A voter's verdict on a proposal, given the bodies delivered under its
+/// digest with their senders ([`LEADER`] for the view's leader): `early`
+/// ones before the voter starts, `late` ones `after` it started. Also how
+/// many bodies it checked, and the body it then holds, with whether it is
+/// sealed.
+fn verify_from(early: &[Delivery<'_>], late: &[Delivery<'_>], after: Duration) -> Checked {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use commonware_runtime::Clock as _;
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let named = |deliveries: &[Delivery<'_>]| -> Vec<(Vec<u8>, Vec<u8>)> {
+        deliveries
+            .iter()
+            .map(|(body, sender)| {
+                let sender: &[u8] = if *sender == LEADER {
+                    AsRef::<[u8]>::as_ref(&leader)
+                } else {
+                    sender
+                };
+                (body.to_vec(), sender.to_vec())
+            })
+            .collect()
+    };
+    let (early, late) = (named(early), named(late));
+    deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+        let store = BlockStore::new();
+        let payload = Sha256Digest([12; 32]);
+        for (body, sender) in early {
+            store.put_from(payload, body, &sender);
+        }
+        let verifier = Arc::new(LeaderBodyVerifier { asked: 0.into() });
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"),
+            verifier.clone(),
+            store.clone(),
+        );
+        let round = Round::new(Epoch::new(1), View::new(5));
+        let pending = automaton
+            .verify(
+                Context {
+                    round,
+                    leader,
+                    parent: (View::new(4), Sha256Digest([1; 32])),
+                },
+                payload,
+            )
+            .await;
+        context.sleep(after).await;
+        for (body, sender) in late {
+            store.put_from(payload, body, &sender);
+        }
+        let verdict = pending.await.ok();
+        (
+            verdict,
+            verifier.asked.load(std::sync::atomic::Ordering::Acquire),
+            store.get_with_verification(&payload),
+        )
+    })
+}
+
+/// A member hears the leader's body a hop early and can send another body
+/// under its digest ahead of it: a voter that checked that body while the
+/// leader's was on its way still waits for the leader's, checks it and
+/// votes for it.
+#[test]
+fn a_leaders_body_arriving_after_a_members_is_still_checked() {
+    let (verdict, asked, held) = verify_from(
+        &[(b"substituted body", b"member")],
+        &[(b"leader body", LEADER)],
+        Duration::from_millis(300),
+    );
+    assert_eq!(
+        verdict,
+        Some(true),
+        "honest proposal refused: the voter checked a member's body that arrived first and \
+         never the leader's, delivered 300 ms later (checked {asked} bodies, holds {:?})",
+        held.as_ref()
+            .map(|(bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+    );
+    assert_eq!(asked, 2);
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
+}
+
+/// The leader's body is checked first, whatever arrived before it, and a
+/// body that fails it is refused without checking the others.
+#[test]
+fn the_leaders_body_is_checked_first() {
+    let members: [Delivery<'_>; 3] = [
+        (b"substituted body", b"member"),
+        (b"another body", b"other member"),
+        (b"leader body", LEADER),
+    ];
+    let (verdict, asked, held) = verify_from(&members, &[], Duration::ZERO);
+    assert_eq!(
+        (verdict, asked),
+        (Some(true), 1),
+        "the leader's body was not the first checked"
+    );
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
+    let (verdict, asked, _) = verify_from(
+        &[
+            (b"substituted body", b"member"),
+            (b"invalid body", LEADER),
+            (b"leader body", b"other member"),
+        ],
+        &[],
+        Duration::ZERO,
+    );
+    assert_eq!(
+        (verdict, asked),
+        (Some(false), 1),
+        "the leader's own body failed: the proposal is refused"
+    );
+}
+
+/// Defers a body as the app proposer defers one whose anchored GLOBAL frame
+/// is just ahead of this node's latest ([`GlobalProposer::verify_delay`]),
+/// before checking anything else of it; accepts only the leader's body.
+struct AnchorAheadVerifier {
+    asked: std::sync::atomic::AtomicU32,
+}
+impl GlobalProposer for AnchorAheadVerifier {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        None
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        bytes.as_deref() == Some(&b"leader body"[..])
+    }
+    fn verify_delay(
+        &self,
+        _: quil_cw_consensus::adapters::ProposalContext,
+        bytes: &[u8],
+    ) -> Option<Duration> {
+        (bytes == b"anchor ahead body").then_some(Duration::from_millis(250))
+    }
+}
+
+/// A member's body under the leader's digest, which does not cover the body,
+/// can name a GLOBAL anchor up to two frames ahead of a voter's latest, and
+/// the voter defers on that before checking the body. The leader's body,
+/// arriving 300 ms later, must still be checked and voted for, not left
+/// unchecked while the voter waits out its patience on the member's.
+#[test]
+fn a_members_body_deferred_on_its_anchor_does_not_keep_the_leaders_unchecked() {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use commonware_runtime::Clock as _;
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let (verdict, asked, held) =
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let store = BlockStore::new();
+            let payload = Sha256Digest([13; 32]);
+            store.put_from(payload, b"anchor ahead body".to_vec(), b"member");
+            let verifier = Arc::new(AnchorAheadVerifier { asked: 0.into() });
+            let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+                context.child("automaton"),
+                verifier.clone(),
+                store.clone(),
+            );
+            let round = Round::new(Epoch::new(1), View::new(5));
+            let pending = automaton
+                .verify(
+                    Context {
+                        round,
+                        leader: leader.clone(),
+                        parent: (View::new(4), Sha256Digest([1; 32])),
+                    },
+                    payload,
+                )
+                .await;
+            context.sleep(Duration::from_millis(300)).await;
+            store.put_from(
+                payload,
+                b"leader body".to_vec(),
+                AsRef::<[u8]>::as_ref(&leader),
+            );
+            let verdict = pending.await.ok();
+            (
+                verdict,
+                verifier.asked.load(std::sync::atomic::Ordering::Acquire),
+                store.get_with_verification(&payload),
+            )
+        });
+    assert_eq!(
+        verdict,
+        Some(true),
+        "VULNERABLE: honest proposal refused: the voter deferred on a member's body naming an \
+         anchor ahead until its patience ran out and never checked the leader's body (checked \
+         {asked} bodies, holds {:?})",
+        held.as_ref()
+            .map(|(bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+    );
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
+}
+
+/// Another member relaying the leader's exact body before the leader's own
+/// delivery arrives must not hide that the leader delivered it: with a
+/// member's deferred body first under the digest, the voter still leaves it
+/// for the leader's once the leader's copy arrives, and votes for it.
+#[test]
+fn a_relayed_copy_of_the_leaders_body_still_counts_as_the_leaders() {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use commonware_runtime::Clock as _;
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let (verdict, asked, held) =
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let store = BlockStore::new();
+            let payload = Sha256Digest([14; 32]);
+            store.put_from(payload, b"anchor ahead body".to_vec(), b"member");
+            store.put_from(payload, b"leader body".to_vec(), b"relaying member");
+            let verifier = Arc::new(AnchorAheadVerifier { asked: 0.into() });
+            let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+                context.child("automaton"),
+                verifier.clone(),
+                store.clone(),
+            );
+            let round = Round::new(Epoch::new(1), View::new(5));
+            let pending = automaton
+                .verify(
+                    Context {
+                        round,
+                        leader: leader.clone(),
+                        parent: (View::new(4), Sha256Digest([1; 32])),
+                    },
+                    payload,
+                )
+                .await;
+            context.sleep(Duration::from_millis(300)).await;
+            store.put_from(
+                payload,
+                b"leader body".to_vec(),
+                AsRef::<[u8]>::as_ref(&leader),
+            );
+            let verdict = pending.await.ok();
+            (
+                verdict,
+                verifier.asked.load(std::sync::atomic::Ordering::Acquire),
+                store.get_with_verification(&payload),
+            )
+        });
+    assert_eq!(
+        verdict,
+        Some(true),
+        "VULNERABLE: honest proposal refused: the leader's copy of a body another member \
+         relayed first was not counted as the leader's, and the voter waited out its patience \
+         on a member's deferred body (checked {asked} bodies, holds {:?})",
+        held.as_ref()
+            .map(|(bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+    );
+    assert_eq!(held, Some((b"leader body".to_vec(), true)));
 }

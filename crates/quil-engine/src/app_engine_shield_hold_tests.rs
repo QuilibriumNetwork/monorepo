@@ -24,7 +24,13 @@ enum Proofs {
     Absent,
     /// A policy over a worker all of whose slots are taken.
     Busy,
+    /// A policy over a worker that rejects a proof holding
+    /// [`REFUTED_PROOF`] and fails on any other, giving it no verdict.
+    Refuting,
 }
+
+/// What a proof holds for the [`Proofs::Refuting`] worker to reject it.
+const REFUTED_PROOF: &[u8] = b"REFUTEDPROOF";
 
 struct Rig {
     engine: AppConsensusEngine,
@@ -67,7 +73,25 @@ fn rig(filter: Vec<u8>, proofs: Proofs) -> Rig {
         let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0);
         let timeout = std::time::Duration::from_secs(2);
         let worker = WorkerVerifier::new(dir.join("absent-worker"), 1, timeout).unwrap();
-        let worker = if proofs == Proofs::Busy {
+        let worker = if proofs == Proofs::Refuting {
+            use std::os::unix::fs::PermissionsExt;
+            let script = dir.join("refuting-worker");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nin=\"$0.in.$$\"\ncat > \"$in\"\n\
+                     if grep -qa {} \"$in\"; then rm -f \"$in\"; exit 81; fi\n\
+                     rm -f \"$in\"\nexit 1\n",
+                    std::str::from_utf8(REFUTED_PROOF).unwrap()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            WorkerVerifier::new(script, 1, timeout)
+                .unwrap()
+                .with_concurrency(8)
+                .unwrap()
+        } else if proofs == Proofs::Busy {
             let path = dir.join("slots");
             let worker = worker
                 .with_concurrency(2)
@@ -215,36 +239,85 @@ fn junk_transfer(n: u64, pad: usize) -> Vec<u8> {
     inner
 }
 
-/// A single shield that passes every check before native work; its signature
-/// and proof are not valid, as a replayed or forged one's are not.
-fn formed_shield(source: [u8; 32]) -> Vec<u8> {
+/// A single shield that passes every check before its proof: of a legacy
+/// coin its key owns, written into the rig's store in the rig's shard, and
+/// signed by that key. Its proof is not valid, as a replayed one's is not.
+/// A coin's content address is a BN254 element (big-endian, below
+/// `0x3064..`), so every legacy coin lies in `half(false)`.
+fn formed_shield(rig: &Rig) -> Vec<u8> {
+    formed_shield_with(rig, 2, &[])
+}
+
+/// [`formed_shield`] of the same coin and key, its statement told apart by
+/// `opening` (its output's opening seed) and its proof by `proof_tail`.
+fn formed_shield_with(rig: &Rig, opening: u8, proof_tail: &[u8]) -> Vec<u8> {
+    use quil_execution::token_intrinsic::{legacy_migration, materialize};
     use quil_lattice_ct::confidential::{
         relation::membership::IDENTITY_BYTES,
         shield::{Shield, ShieldStatement},
         transfer::{parameter_context, Output, MEMO_BYTES},
         AmountOpening, CommitmentKey,
     };
+    use quil_types::crypto::Signer as _;
     let application = quil_execution::domains::QUIL_TOKEN;
+    let private = [23; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+    let coin = legacy_migration::TransparentCoin {
+        owner_address: quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap(),
+        amount: 12,
+    };
+    let type_hash = legacy_migration::transparent_type_hash(&application).unwrap();
+    let (source, tree) = (0..=u8::MAX)
+        .map(|salt| {
+            let tree =
+                legacy_migration::create_transparent_coin_tree(&coin, &type_hash, &[salt; 32])
+                    .unwrap();
+            (materialize::coin_content_address(&tree).unwrap(), tree)
+        })
+        .find(|(address, _)| shard_covers(&rig.leader.filter, address))
+        .expect("no legacy coin lies in the rig's shard");
+    let state = quil_execution::hypergraph_state::HypergraphState::new(
+        rig.engine.execution_engine.as_ref().unwrap().crdt(),
+    );
+    state
+        .set(
+            &application,
+            &source,
+            &quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap(),
+            1,
+            quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+    state.commit().unwrap();
+    state.abort();
     let context = parameter_context(&network(), &application);
     let key = CommitmentKey::derive(&context);
-    let opening = AmountOpening::from_seed(&context, &[2; 32]);
+    let opening = AmountOpening::from_seed(&context, &[opening; 32]);
     let mut proof = vec![0; 40];
     proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    proof[8..8 + proof_tail.len()].copy_from_slice(proof_tail);
+    let statement = ShieldStatement {
+        network: network(),
+        application,
+        transparent_address: source,
+        owner_public_key: public.clone().try_into().unwrap(),
+        amount: 12,
+        fee: 2,
+        outputs: vec![Output {
+            commitment: key.commit(10, &opening),
+            owner: [5; IDENTITY_BYTES],
+            memo: [6; MEMO_BYTES],
+        }],
+    };
+    let signature = quil_crypto::Ed448Signer::from_bytes(&private, &public)
+        .unwrap()
+        .sign(&statement.context_bytes().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
     Shield {
-        statement: ShieldStatement {
-            network: network(),
-            application,
-            transparent_address: source,
-            owner_public_key: [4; 57],
-            amount: 12,
-            fee: 2,
-            outputs: vec![Output {
-                commitment: key.commit(10, &opening),
-                owner: [5; IDENTITY_BYTES],
-                memo: [6; MEMO_BYTES],
-            }],
-        },
-        signature: [0; 114],
+        statement,
+        signature,
         proof,
     }
     .encode()
@@ -359,15 +432,15 @@ async fn tiny_forged_shields_of_another_shard_do_not_hold_the_count_cap() {
 /// have proposed it, whatever a signer vouches: no room, no proposal's time.
 #[tokio::test]
 async fn submissions_no_frame_could_execute_are_refused_on_arrival() {
-    let mut rig = rig(half(true), Proofs::Absent);
-    let mine = [0xbf; 32];
+    let mut rig = rig(half(false), Proofs::Absent);
+    let mine = [0x3f; 32];
     let cases = [
         ("a tiny shield", bundle(vec![junk_shield(1, mine, 0)])),
         ("a padded shield", bundle(vec![junk_shield(2, mine, 4096)])),
         ("a junk transfer", bundle(vec![junk_transfer(3, 4096)])),
         (
             "a formed shield with a junk one",
-            bundle(vec![formed_shield(mine), junk_shield(4, mine, 0)]),
+            bundle(vec![formed_shield(&rig), junk_shield(4, mine, 0)]),
         ),
     ];
     for (name, data) in cases {
@@ -380,9 +453,340 @@ async fn submissions_no_frame_could_execute_are_refused_on_arrival() {
         );
     }
     // The gate's other side: a shield that passes them is collected.
-    rig.engine
-        .handle_prover_message(&bundle(vec![formed_shield(mine)]));
+    let data = bundle(vec![formed_shield(&rig)]);
+    rig.engine.handle_prover_message(&data);
     assert_eq!(rig.collector.total_pending(), 1);
+}
+
+/// Nothing in a shield limits when its owner's signature may be used: an
+/// earlier shield of the coin the owner signed (one that never committed)
+/// can be sent again, with any proof bytes, by anyone who saw it. Held
+/// first, it claims the coin; once its proof failed to verify here it can
+/// never execute, and neither it nor a later copy of its statement may keep
+/// the owner's new shield out. The worker here rejects the replayed copy's
+/// proof and gives no verdict on the others.
+#[tokio::test]
+async fn a_replayed_shield_whose_proof_failed_here_keeps_no_coin() {
+    let mut rig = rig(half(false), Proofs::Refuting);
+    let mut tail = REFUTED_PROOF.to_vec();
+    let replayed = bundle(vec![formed_shield_with(&rig, 1, &tail)]);
+    tail[0] ^= 1;
+    let again = bundle(vec![formed_shield_with(&rig, 1, &tail)]);
+    let new = bundle(vec![formed_shield_with(&rig, 2, &[])]);
+    rig.engine.handle_prover_message(&replayed);
+    assert_eq!(
+        rig.collector.total_pending(),
+        1,
+        "the replayed shield is collected"
+    );
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let pair = vec![(quil_execution::domains::QUIL_TOKEN.to_vec(), replayed)];
+    exec.preverify_bundles(&pair);
+    assert!(
+        exec.unverified_confidential_operations(&pair).is_empty(),
+        "setup: the replayed shield's proof has its verdict here"
+    );
+    // A fresh copy of the replayed statement, then the owner's new shield.
+    rig.engine.handle_prover_message(&again);
+    rig.engine.handle_prover_message(&new);
+    let held = rig.collector.total_pending();
+    assert!(
+        held == 3,
+        "VULNERABLE: an owner's new shield was refused ({held} held, 3 expected: the replayed \
+         shield, a fresh copy of it and the new one) while a replayed earlier shield of the \
+         coin, whose proof failed to verify here, or a copy of it held the coin"
+    );
+    // The new shield now holds the coin against another statement.
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 3, &[])]));
+    assert_eq!(
+        rig.collector.total_pending(),
+        3,
+        "another statement of the key"
+    );
+}
+
+/// A bundle whose proof failed to verify on this node can never execute (a
+/// verdict depends on the operation and the network's policy alone), yet
+/// every proposal of this node carried it again while it stayed in the
+/// pool, and every archive verifies the proofs a frame carries: a
+/// well-formed operation with a garbage proof needs no coin and no proving.
+/// It is left out of every proposal and out of the pool, for good; another
+/// copy of its statement is not.
+#[tokio::test]
+async fn a_bundle_whose_proof_failed_here_is_neither_proposed_nor_kept() {
+    let mut rig = rig(half(false), Proofs::Refuting);
+    let garbage = bundle(vec![formed_shield_with(&rig, 1, REFUTED_PROOF)]);
+    rig.engine.handle_prover_message(&garbage);
+    assert_eq!(rig.collector.total_pending(), 1, "the bundle is collected");
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let pair = vec![(
+        quil_execution::domains::QUIL_TOKEN.to_vec(),
+        garbage.clone(),
+    )];
+    exec.preverify_bundles(&pair);
+    assert!(
+        exec.unverified_confidential_operations(&pair).is_empty(),
+        "setup: the bundle's proof has its verdict here"
+    );
+    let mut proposed = 0;
+    for rank in [1, 2] {
+        rig.leader.frame_requests.lock().unwrap().clear();
+        turn(&rig.leader, rank);
+        proposed += rig
+            .leader
+            .frame_requests
+            .lock()
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+    }
+    let held = rig.collector.total_pending();
+    assert!(
+        proposed == 0 && held == 0,
+        "VULNERABLE: a bundle whose proof failed to verify on this node was proposed \
+         {proposed} times in 2 turns and is still held ({held}): every archive verifies the \
+         proofs a frame carries"
+    );
+    rig.engine.handle_prover_message(&garbage);
+    assert_eq!(rig.collector.total_pending(), 0, "it is never held again");
+    // Another copy of its statement, with other proof bytes, is collected.
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 1, &[])]));
+    assert_eq!(
+        rig.collector.total_pending(),
+        1,
+        "a copy of the statement with other proof bytes was refused"
+    );
+}
+
+/// A replayed shield whose proof failed here, once a proposal dropped it from
+/// the pool, leaves its statement marked as failed: a fresh copy of it with
+/// other proof bytes (free to make, no verdict yet) must not take the coin
+/// again and keep the owner's new shield out until its own proof fails, once
+/// per proposal cycle.
+#[tokio::test]
+async fn a_replayed_shield_a_proposal_dropped_takes_no_coin_again() {
+    let mut rig = rig(half(false), Proofs::Refuting);
+    let replayed = bundle(vec![formed_shield_with(&rig, 1, REFUTED_PROOF)]);
+    rig.engine.handle_prover_message(&replayed);
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let pair = vec![(quil_execution::domains::QUIL_TOKEN.to_vec(), replayed)];
+    exec.preverify_bundles(&pair);
+    assert!(
+        exec.unverified_confidential_operations(&pair).is_empty(),
+        "setup: the replayed shield's proof has its verdict here"
+    );
+    turn(&rig.leader, 1);
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "setup: the proposal dropped the replayed shield"
+    );
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 1, b"FRESHCOPY")]));
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 2, &[])]));
+    let held = rig.collector.total_pending();
+    assert!(
+        held == 2,
+        "VULNERABLE: the owner's new shield was refused ({held} held, 2 expected: a fresh \
+         copy of the dropped replayed shield and the new one) while the fresh copy, of a \
+         statement whose proof failed here, held the coin"
+    );
+}
+
+/// A fresh copy of a replayed shield's statement submitted while a proposal
+/// drops the replayed shield (between the drop's steps, so not reachable
+/// from a test but by a hook) must not take the coin: the statement is
+/// marked failed before the coin is free.
+#[tokio::test]
+async fn a_copy_submitted_while_a_proposal_drops_its_statement_takes_no_coin() {
+    let mut rig = rig(half(false), Proofs::Refuting);
+    let replayed = bundle(vec![formed_shield_with(&rig, 1, REFUTED_PROOF)]);
+    rig.engine.handle_prover_message(&replayed);
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let pair = vec![(quil_execution::domains::QUIL_TOKEN.to_vec(), replayed)];
+    exec.preverify_bundles(&pair);
+    let copy = bundle(vec![formed_shield_with(&rig, 1, b"GAPCOPY")]);
+    let collector = rig.collector.clone();
+    crate::message_collector::set_drop_gap_hook(Box::new(move || {
+        collector.add_message_newest(copy);
+    }));
+    turn(&rig.leader, 1);
+    assert_eq!(
+        rig.collector.total_pending(),
+        1,
+        "setup: the replayed shield was dropped and the copy collected"
+    );
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 2, &[])]));
+    let held = rig.collector.total_pending();
+    assert!(
+        held == 2,
+        "VULNERABLE: the owner's new shield was refused ({held} held, 2 expected) while a copy \
+         of the replayed statement, submitted as the proposal dropped it, held the coin"
+    );
+}
+
+/// An honest shield that a peer bundled with an operation whose proof
+/// failed here leaves with that bundle, but is not marked failed: its own
+/// message, sent alone, holds the coin as before.
+#[tokio::test]
+async fn an_honest_shield_bundled_with_a_failed_operation_is_not_marked_failed() {
+    let mut rig = rig(half(false), Proofs::Refuting);
+    let honest = formed_shield_with(&rig, 2, &[]);
+    let pairing = bundle(vec![
+        honest.clone(),
+        formed_shield_with(&rig, 1, REFUTED_PROOF),
+    ]);
+    rig.engine.handle_prover_message(&pairing);
+    assert_eq!(rig.collector.total_pending(), 1, "the pairing is collected");
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let pair = vec![(quil_execution::domains::QUIL_TOKEN.to_vec(), pairing)];
+    exec.preverify_bundles(&pair);
+    turn(&rig.leader, 1);
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "setup: the proposal dropped the pairing"
+    );
+    rig.engine.handle_prover_message(&bundle(vec![honest]));
+    rig.engine
+        .handle_prover_message(&bundle(vec![formed_shield_with(&rig, 3, &[])]));
+    let held = rig.collector.total_pending();
+    assert!(
+        held == 1,
+        "the honest shield was marked failed ({held} held, 1 expected): sent alone it held \
+         no coin, and another statement of the key was collected beside it"
+    );
+}
+
+/// The header of frame `frame` of a shard of another application, as a
+/// leader's bundle carries it beside the requests it relays.
+fn shard_header(frame: u64) -> Vec<u8> {
+    use quil_execution::global_intrinsic::frame_header::FrameHeader;
+    FrameHeader {
+        address: vec![0x51; 32],
+        frame_number: frame,
+        global_frame_number: 99,
+        ..Default::default()
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// Two held messages carry the same shield. The first leaves the pool
+/// without its shield failing: a newer frame of its shard supersedes it, a
+/// proposal drops it for another operation whose proof failed here, a
+/// contending shield finds that failure first, the leader removes it, or
+/// retention prunes it. The second still carries the shield, so another
+/// statement of the coin must still be refused: else the coin has two
+/// pending shields, and the global commit refuses one, with no fee, after
+/// this shard and every archive verified its proof.
+#[tokio::test]
+async fn a_coin_stays_held_while_another_message_carries_its_shield() {
+    let mut vulnerable = Vec::new();
+    let mut unset = Vec::new();
+    for exit in ["supersede", "drop", "judged", "remove", "prune"] {
+        let rig = rig(half(false), Proofs::Refuting);
+        let collector = rig.collector.clone();
+        let copy = |tail: &[u8]| formed_shield_with(&rig, 2, tail);
+        // A failing operation of this arm's own bytes: verdicts are cached
+        // for the process, so an earlier arm's would be judged at once.
+        let failing = || formed_shield_with(&rig, 1, &[REFUTED_PROOF, exit.as_bytes()].concat());
+        let (first, second, rank) = match exit {
+            "supersede" => (
+                bundle(vec![shard_header(5), copy(b"FIRSTCOPY")]),
+                bundle(vec![shard_header(6), copy(b"SECONDCOPY")]),
+                1,
+            ),
+            "drop" | "judged" => (
+                bundle(vec![copy(b"FIRSTCOPY"), failing()]),
+                bundle(vec![copy(b"SECONDCOPY")]),
+                1,
+            ),
+            "prune" => (
+                bundle(vec![copy(b"FIRSTCOPY")]),
+                bundle(vec![copy(b"SECONDCOPY")]),
+                20,
+            ),
+            _ => (
+                bundle(vec![copy(b"FIRSTCOPY")]),
+                bundle(vec![copy(b"SECONDCOPY")]),
+                1,
+            ),
+        };
+        let filed = if exit == "supersede" {
+            collector.add_verified_message(1, first.clone())
+                && collector.add_verified_message(1, second)
+        } else {
+            use crate::message_collector::SubmitOutcome::Accepted;
+            collector.add_message_outcome(1, first.clone()) == Accepted
+                && collector.add_message_outcome(rank, second) == Accepted
+        };
+        if exit == "drop" || exit == "judged" {
+            let exec = rig.engine.execution_engine.clone().unwrap();
+            let application = quil_execution::domains::QUIL_TOKEN.to_vec();
+            exec.preverify_bundles(&[(application.clone(), first.clone())]);
+            // Its failing operation has its verdict here; its shield has none.
+            if !exec
+                .unverified_confidential_operations(&[(application, bundle(vec![failing()]))])
+                .is_empty()
+            {
+                unset.push(format!("{exit}: the failing operation has no verdict"));
+                continue;
+            }
+        }
+        match exit {
+            "drop" => turn(&rig.leader, 1),
+            // The first was asked about its proofs when the second message
+            // came, before its verdict: it is asked again once a second
+            // passed (the collector's recheck interval), and the contending
+            // shield finds it failed.
+            "judged" => std::thread::sleep(std::time::Duration::from_millis(1100)),
+            "remove" => collector.remove(&[first]),
+            "prune" => {
+                for finalized in 2..=13 {
+                    collector.prune_after_finalization(finalized);
+                }
+            }
+            _ => {}
+        }
+        // Held now: the second message alone, or both when the contending
+        // shield is to find the first one's failure.
+        let held = if exit == "judged" { 2 } else { 1 };
+        if !filed || collector.total_pending() != held {
+            unset.push(format!(
+                "{exit}: filed {filed}, {} held, {held} expected",
+                collector.total_pending()
+            ));
+            continue;
+        }
+        collector.add_message_outcome(rank, bundle(vec![formed_shield_with(&rig, 3, &[])]));
+        if collector.total_pending() != held {
+            vulnerable.push(exit);
+        }
+    }
+    assert!(
+        vulnerable.is_empty() && unset.is_empty(),
+        "{}{}",
+        if vulnerable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "VULNERABLE: another statement of a coin was collected while a held message \
+                 carried its pending shield, once the first message carrying it left by \
+                 {vulnerable:?}. "
+            )
+        },
+        if unset.is_empty() {
+            String::new()
+        } else {
+            format!("setup did not hold: {unset:?}")
+        }
+    );
 }
 
 /// Without a token policy nothing can tell, so nothing is refused.
@@ -399,8 +803,8 @@ async fn a_node_without_a_token_policy_collects_as_before() {
 /// shield.
 #[tokio::test]
 async fn a_real_shield_outlasts_a_stall_of_refused_turns() {
-    let mut rig = rig(half(true), Proofs::Busy);
-    let data = bundle(vec![formed_shield([0xbf; 32])]);
+    let mut rig = rig(half(false), Proofs::Busy);
+    let data = bundle(vec![formed_shield(&rig)]);
     rig.engine.handle_prover_message(&data);
     assert_eq!(rig.collector.total_pending(), 1);
     let id: quil_consensus::models::Identity = vec![9; 32];
@@ -418,9 +822,9 @@ async fn a_real_shield_outlasts_a_stall_of_refused_turns() {
 /// to each turn's rank instead of ageing out.
 #[tokio::test]
 async fn a_real_shield_outlasts_a_stall_of_turns_waiting_for_its_proofs() {
-    let mut rig = rig(half(true), Proofs::Busy);
-    rig.engine
-        .handle_prover_message(&bundle(vec![formed_shield([0xbf; 32])]));
+    let mut rig = rig(half(false), Proofs::Busy);
+    let data = bundle(vec![formed_shield(&rig)]);
+    rig.engine.handle_prover_message(&data);
     assert_eq!(rig.collector.total_pending(), 1);
     for rank in 1..=STALL_RANKS {
         turn(&rig.leader, rank);
@@ -506,6 +910,47 @@ async fn arrivals_no_turn_routes_leave_no_routing_stamp() {
         .handle_prover_message(&bundle(vec![junk_shield(1, [0xbf; 32], 64)]));
     assert_eq!(rig.collector.total_pending(), 1);
     assert_eq!(stamps(&rig), 1);
+}
+
+/// A confidential bundle the mempool took keeps its arrival stamp after the
+/// mempool let it go: only a turn holding a confidential bundle prunes the
+/// stamps, and only those an hour old. A peer refilling the rank's count cap
+/// with tiny junk shields of this shard leaves a stamp per shield, past
+/// anything the mempool holds, for as long as it keeps sending.
+#[tokio::test]
+async fn reproduces_routing_stamps_outliving_the_mempool() {
+    const COUNT_CAP: usize = 65_536;
+    let mut rig = rig(half(true), Proofs::Unconfigured);
+    let mine = [0xbf; 32];
+    let mut n = 0u64;
+    for fill in 1..=2u64 {
+        for _ in 0..COUNT_CAP {
+            n += 1;
+            rig.engine
+                .handle_prover_message(&bundle(vec![junk_shield(n, mine, 0)]));
+        }
+        assert_eq!(
+            rig.collector.total_pending(),
+            COUNT_CAP,
+            "rig check: fill {fill} did not reach the rank's count cap"
+        );
+        // The mempool lets them go once their rank leaves the retention
+        // window, as a later collection or a finalized frame's prune does.
+        rig.collector.collect_for_rank(fill * 1000);
+        assert_eq!(
+            rig.collector.total_pending(),
+            0,
+            "rig check: fill {fill} did not age out"
+        );
+    }
+    let stamps = rig.engine.routing_seen.lock().unwrap().len();
+    assert!(
+        stamps <= COUNT_CAP,
+        "{stamps} arrival stamps kept while the mempool holds nothing, \
+         {} past the rank's count cap: each refill by a peer adds {COUNT_CAP} more, \
+         and no turn prunes a stamp under an hour old",
+        stamps - COUNT_CAP
+    );
 }
 
 /// What is left open: a well-formed non-shield waits for its routing

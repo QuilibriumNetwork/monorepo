@@ -530,6 +530,32 @@ fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
 }
 
+/// The selected parent is read from the body that authenticates, though a
+/// substituted body came first under its identity: peer ingress keeps a
+/// later body beside the first, as the identity does not cover the body.
+#[test]
+fn selected_parent_reads_the_authenticated_body_though_another_came_first() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    let context = rig.context(&parent);
+    let mut bad = parent.clone();
+    bad.requests.clear();
+    rig.blocks.put(
+        context.parent,
+        crate::consensus_wire::encode_global_frame(&bad).unwrap(),
+    );
+    assert!(rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .is_err());
+    rig.put(&parent);
+    assert_eq!(rig.blocks.candidates(&context.parent).len(), 2);
+    assert!(rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .is_ok());
+}
+
 /// A leader waits out its interval pacing before preparing a proposal, so it
 /// does not hold the execution lease through it: the wait runs until the
 /// selected parent's timestamp, at most one interval.
@@ -545,7 +571,13 @@ fn proposal_pacing_runs_until_the_parent_timestamp_and_no_longer_than_an_interva
         .as_millis() as i64;
     let pacing = |timestamp: i64| {
         let mut paced = parent.clone();
-        paced.header.as_mut().unwrap().timestamp = timestamp;
+        let header = paced.header.as_mut().unwrap();
+        header.timestamp = timestamp;
+        // An identity of its own: a block store keeps the first body that
+        // arrives under one.
+        header.output = timestamp.to_be_bytes().repeat(8);
+        let number = header.frame_number;
+        seam.note_frame(id(&paced), number);
         rig.put(&paced);
         seam.proposal_pacing(rig.context(&paced))
     };

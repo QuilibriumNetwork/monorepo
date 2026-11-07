@@ -598,6 +598,10 @@ pub struct TokenExecutionEngine {
     config_resolver: Arc<dyn crate::token_intrinsic::config_resolver::TokenConfigResolver>,
 }
 
+/// Whether a confidential operation `(address, bytes, type)` is refused
+/// before its proof, so no verification of it is needed.
+pub type RefusedBeforeProof<'a> = dyn Fn(&[u8], &[u8], u32) -> bool + 'a;
+
 impl TokenExecutionEngine {
     /// Select the token suite explicitly for this engine. Requires real
     /// state; unintegrated confidential operations reject without old fallback.
@@ -708,6 +712,7 @@ impl TokenExecutionEngine {
                 &worker,
                 bundles,
                 &crate::manager::PreverifyPacing::default(),
+                &|_, _, _| false,
             ),
             None => Default::default(),
         }
@@ -727,21 +732,25 @@ impl TokenExecutionEngine {
 
     /// [`Self::preverify_bundles`] with `policy` and `worker`, paced by
     /// `pacing`: at most its parallelism at once, each operation counted
-    /// into its progress, and none started while its pause holds.
+    /// into its progress, and none started while its pause holds. An
+    /// operation `refused(address, bytes, type)` is not verified (it counts
+    /// in `operations` only): execution refuses it before its proof.
     #[cfg(feature = "native-proof")]
     pub fn preverify_with(
         policy: crate::token_intrinsic::dispatch::TokenPolicy,
         worker: &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &crate::manager::PreverifyPacing<'_>,
+        refused: &RefusedBeforeProof<'_>,
     ) -> crate::manager::PreverifyCounts {
         use crate::token_intrinsic::dispatch::Preverified;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let operations = Self::confidential_operations(bundles);
+        let mut operations = Self::confidential_operations(bundles);
         let mut counts = crate::manager::PreverifyCounts {
             operations: operations.len(),
             ..Default::default()
         };
+        operations.retain(|(address, bytes, tp)| !refused(address, bytes, *tp));
         if operations.is_empty() {
             return counts;
         }
@@ -803,15 +812,19 @@ impl TokenExecutionEngine {
 
     /// The confidential operations in `bundles` whose verdicts `policy` has
     /// not cached yet, with their structure's verification floor: what
-    /// executing them would still verify.
+    /// executing them would still verify (not those `refused`, which
+    /// execution refuses before their proof).
     #[cfg(feature = "native-proof")]
     pub fn unverified_operation_estimates(
         policy: &crate::token_intrinsic::dispatch::TokenPolicy,
         bundles: &[(Vec<u8>, Vec<u8>)],
+        refused: &RefusedBeforeProof<'_>,
     ) -> Vec<crate::manager::OperationEstimate> {
         Self::confidential_operations(bundles)
             .into_iter()
-            .filter(|(address, bytes, tp)| !policy.verdict_cached(address, bytes, *tp))
+            .filter(|(address, bytes, tp)| {
+                !policy.verdict_cached(address, bytes, *tp) && !refused(address, bytes, *tp)
+            })
             .map(|(_, bytes, tp)| crate::manager::OperationEstimate {
                 bytes: bytes.len(),
                 floor_secs: crate::token_intrinsic::dispatch::verify_floor_secs(&bytes, tp),
