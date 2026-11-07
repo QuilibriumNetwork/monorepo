@@ -62,8 +62,9 @@ fn seconds_since_start() -> u64 {
 /// comes from a QUIL shard's anchor. The claim executes in an app-shard frame
 /// and is rejected if it cites a global frame after that frame's anchor.
 /// Anchors only grow, so citing at or before the shard's latest certified
-/// anchor is always admissible. Without a shard view, fall back to a lag behind
-/// the global head.
+/// anchor is always admissible. Without a shard view, or when every QUIL shard
+/// it holds has stopped materializing frames, fall back to a lag behind the
+/// global head.
 fn claim_cap(clock: &dyn ClockStore, shard_anchor: Option<u64>) -> Result<(u64, bool)> {
     Ok(match shard_anchor {
         Some(anchor) => (anchor, true),
@@ -136,7 +137,8 @@ pub fn witness(
     clock: &dyn ClockStore,
     receipt: &[u8; 32],
     // The QUIL shard's latest certified global anchor, when this node runs
-    // or reaches a QUIL shard engine. Later frames anchor at or after it.
+    // or reaches a QUIL shard engine keeping up with the global head. Later
+    // frames anchor at or after it.
     shard_anchor: Option<u64>,
 ) -> Result<MintAuthorizationWitnessData> {
     witness_logged(state, clock, receipt, shard_anchor, &CLAIM_WAIT_LOG)

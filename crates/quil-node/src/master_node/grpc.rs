@@ -9,13 +9,20 @@ use quil_lifecycle::Supervisor;
 type RemoteAppShardMap =
     std::collections::HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>>;
 
-/// The global anchor a mint claim through this node may cite: the least
-/// anchor among its QUIL shard engines that are keeping up, so the claim is
-/// admissible at any of them. An engine more than `MINT_CLAIM_CITATION_LAG`
-/// behind the freshest has stopped producing; on a live width run one
-/// wedged shard held a node's anchor at 1180 while GLOBAL passed 1300, and no
-/// newer mint authorization could be claimed through that node.
-fn claim_anchor(anchors: &[Option<u64>]) -> Option<u64> {
+/// The global anchor a mint or settlement claim through this node may cite:
+/// the least anchor among its QUIL shard engines that are keeping up with the
+/// GLOBAL `head`, so the claim is admissible at any of them. `None` when none
+/// is: the caller then caps at the head less `MINT_CLAIM_CITATION_LAG`, which
+/// any shard whose proposer holds a GLOBAL frame within
+/// `GLOBAL_ANCHOR_SAFETY_MARGIN` of the head admits.
+///
+/// An engine's anchor moves only when it materializes a frame, so one more
+/// than the lag behind the head (or behind the freshest engine, when this
+/// node's GLOBAL view trails its engines) has stopped producing. Judged
+/// against the freshest engine alone, engines that all stopped together held
+/// the cap where they stopped while GLOBAL moved on, and a settlement
+/// included after it could not be claimed through the node.
+fn claim_anchor(anchors: &[Option<u64>], head: u64) -> Option<u64> {
     let lag = quil_execution::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
     let live: Vec<u64> = anchors
         .iter()
@@ -23,10 +30,47 @@ fn claim_anchor(anchors: &[Option<u64>]) -> Option<u64> {
         .copied()
         .filter(|anchor| *anchor > 0)
         .collect();
-    let newest = *live.iter().max()?;
+    let reference = live.iter().copied().max()?.max(head);
     live.into_iter()
-        .filter(|anchor| newest - anchor <= lag)
+        .filter(|anchor| reference - anchor <= lag)
         .min()
+}
+
+/// Where the last claim cap through this node came from, for the line logged
+/// when it changes: 0 not yet asked, 1 a QUIL shard anchor, 2 the GLOBAL head
+/// less the citation lag.
+static CLAIM_CAP_SOURCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Logs one line when the claim cap's source changes, so an operator sees
+/// when this node's QUIL engines stop standing for the network's anchors and
+/// when they recover. Bounded by the changes, at most a few per frame.
+fn note_claim_cap_source(anchor: Option<u64>, head: u64, anchors: &[Option<u64>]) {
+    let lag = quil_execution::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+    let source = if anchor.is_some() { 1 } else { 2 };
+    let previous = CLAIM_CAP_SOURCE.swap(source, std::sync::atomic::Ordering::Relaxed);
+    if previous == source {
+        return;
+    }
+    match anchor {
+        Some(cap) => info!(
+            cap,
+            head,
+            ?anchors,
+            cap_source = "QUIL shard anchor",
+            "mint claim witness: claim cap source changed"
+        ),
+        None => info!(
+            cap = head.saturating_sub(lag),
+            head,
+            lag,
+            ?anchors,
+            cap_source = "GLOBAL head minus citation lag",
+            reason = "no QUIL engine of this node has materialized a frame anchored within the \
+                      lag of the GLOBAL head",
+            ends_when = "a QUIL engine materializes a frame; check its workers' frame progress",
+            "mint claim witness: claim cap source changed"
+        ),
+    }
 }
 
 fn has_nonzero_remote_shard_size(shards: &RemoteAppShardMap) -> bool {
@@ -2481,8 +2525,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         shard_anchor: {
             let engines = shard_engines.clone();
             let remote_workers = remote_fee_workers.clone();
+            let clock = clock_store.clone();
             Arc::new(move || {
                 let quil = quil_execution::domains::QUIL_TOKEN;
+                // The head `claim_cap` falls back to when no engine keeps up.
+                let head = clock
+                    .get_latest_global_clock_frame()
+                    .ok()
+                    .and_then(|frame| frame.header)
+                    .map(|header| header.frame_number)
+                    .unwrap_or(0);
                 // Minimum over this node's QUIL shard engines: conservative
                 // when sub-shards anchor at different frames.
                 let (engine_count, quil_engines, anchors) = {
@@ -2498,22 +2550,26 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         .collect();
                     (map.len(), quil_handles.len(), anchors)
                 };
-                let local = claim_anchor(&anchors);
+                let local = claim_anchor(&anchors, head);
                 tracing::info!(
                     engine_count,
                     quil_engines,
                     ?anchors,
+                    head,
                     "mint claim witness: QUIL shard anchor view"
                 );
-                local.or_else(|| {
+                let anchor = local.or_else(|| {
                     let remote = remote_workers.get()?.clone();
-                    tokio::runtime::Handle::try_current()
+                    let remote = tokio::runtime::Handle::try_current()
                         .ok()?
                         .block_on(remote.app_fee_snapshot(quil))
                         .ok()
-                        .map(|snapshot| snapshot.global_frame_number)
-                        .filter(|anchor| *anchor > 0)
-                })
+                        .map(|snapshot| snapshot.global_frame_number);
+                    // A remote worker's anchor goes stale the same way.
+                    claim_anchor(&[remote], head)
+                });
+                note_claim_cap_source(anchor, head, &anchors);
+                anchor
             }) as Arc<dyn Fn() -> Option<u64> + Send + Sync>
         },
         worker_app_states: worker_app_states.clone(),
@@ -5197,23 +5253,108 @@ mod coverage_tests {
     fn a_stalled_engine_does_not_pin_the_mint_claim_anchor() {
         use super::claim_anchor;
         assert_eq!(
-            claim_anchor(&[
-                None,
-                Some(1293),
-                Some(1292),
-                Some(1293),
-                Some(1180),
-                Some(1261)
-            ]),
+            claim_anchor(
+                &[
+                    None,
+                    Some(1293),
+                    Some(1292),
+                    Some(1293),
+                    Some(1180),
+                    Some(1261)
+                ],
+                1297
+            ),
             Some(1292),
-            "the live run: two stalled engines are left out"
+            "LIVE-ANCHOR: the live run, two stalled engines are left out"
         );
         assert_eq!(
-            claim_anchor(&[Some(100), Some(97)]),
+            claim_anchor(&[Some(100), Some(97)], 104),
             Some(97),
             "engines keeping up: the least"
         );
-        assert_eq!(claim_anchor(&[None, Some(0)]), None);
+        assert_eq!(
+            claim_anchor(&[Some(100), Some(97)], 0),
+            Some(97),
+            "no GLOBAL head yet: judged against the freshest engine"
+        );
+        assert_eq!(
+            claim_anchor(&[Some(100), Some(93)], 95),
+            Some(93),
+            "a GLOBAL view trailing the engines: judged against the freshest"
+        );
+        assert_eq!(claim_anchor(&[None, Some(0)], 1300), None);
+    }
+
+    #[test]
+    fn engines_all_behind_the_head_yield_to_the_head_minus_the_lag() {
+        use super::claim_anchor;
+        // The mainnet case: no QUIL engine materialized for many frames, so
+        // every anchor trails the head by far more than the lag. Their own
+        // least anchor would hold the cap there until one materializes.
+        let cap = claim_anchor(&[Some(5180), Some(5181), None], 5300);
+        assert!(
+            cap.is_none(),
+            "STALE-CAP: engines {} behind the head still set the claim cap {cap:?}",
+            5300 - 5181
+        );
+        // One within the lag of the head is live; the stale one is left out.
+        assert_eq!(claim_anchor(&[Some(5180), Some(5292)], 5300), Some(5292));
+        // A remote worker's single anchor is judged the same way.
+        assert_eq!(claim_anchor(&[Some(5291)], 5300), None);
+    }
+
+    #[test]
+    fn a_node_whose_quil_engines_lag_the_head_offers_near_the_head() {
+        use super::claim_anchor;
+        let lag = quil_execution::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+        // One node's eight QUIL engines over 15 minutes, as (engine, anchor)
+        // for those reporting one, with the GLOBAL head interpolated between
+        // its two readings: five engines sync and never materialize, two
+        // trail by hundreds of frames, and one materializes once near the
+        // head and stops.
+        type View = (&'static str, &'static [(usize, u64)], u64);
+        let views: [View; 6] = [
+            ("12:29:04", &[(2, 1027583), (7, 1026253)], 1027865),
+            ("12:32:25", &[(2, 1027584), (7, 1026253)], 1027883),
+            (
+                "12:33:00",
+                &[(1, 1027881), (2, 1027584), (7, 1026254)],
+                1027886,
+            ),
+            (
+                "12:33:25",
+                &[(1, 1027881), (2, 1027603), (7, 1026267)],
+                1027889,
+            ),
+            (
+                "12:38:25",
+                &[(1, 1027881), (2, 1027603), (7, 1026268)],
+                1027916,
+            ),
+            (
+                "12:44:05",
+                &[(1, 1027881), (2, 1027603), (7, 1026269)],
+                1027947,
+            ),
+        ];
+        for (at, reported, head) in views {
+            let mut anchors = [None; 8];
+            for &(engine, anchor) in reported {
+                anchors[engine] = Some(anchor);
+            }
+            // `claim_cap` takes the head less the lag when no engine keeps up.
+            let cap = claim_anchor(&anchors, head).unwrap_or(head - lag);
+            assert!(
+                cap >= head - lag,
+                "STALE-CAP at {at}: cap {cap} is {} frames behind head {head}",
+                head - cap
+            );
+            // Above the head less the lag only at an anchor a shard certified.
+            assert!(
+                cap <= head && (cap == head - lag || anchors.contains(&Some(cap))),
+                "cap {cap} at {at} is no certified anchor (head {head})"
+            );
+        }
     }
 
     #[test]
