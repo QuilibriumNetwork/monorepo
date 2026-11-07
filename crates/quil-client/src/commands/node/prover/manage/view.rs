@@ -20,7 +20,7 @@ use super::super::format_quil_daily_round;
 use super::coins;
 use super::model::*;
 use super::util::{center_trunc, clamp_offset, filter_label, shared_filter_address};
-use quil_types::proto::diagnostics::ConditionSeverity;
+use quil_types::proto::diagnostics::{ConditionKind, ConditionSeverity};
 
 #[path = "coins_view.rs"]
 mod coins_view;
@@ -66,20 +66,29 @@ fn status_color(name: &str) -> Color {
         _ => HELP,
     }
 }
+/// The Status cell's color: the lifecycle palette, except that a status the
+/// node judges (`re-confirm!`, `paused`, `bound`) is marked only while the
+/// node reports its condition for the row.
+fn alloc_status_color(m: &Model, a: &AllocationRow) -> Color {
+    let reported = match a.status_name.as_str() {
+        "re-confirm!" => m.allocation_flagged(ConditionKind::AllocationEpochStale, a),
+        "paused" => m.allocation_flagged(ConditionKind::AllocationsPaused, a),
+        "bound" => m.worker_flagged(ConditionKind::WorkersBoundWithoutAllocation, a),
+        _ => true,
+    };
+    if reported {
+        status_color(&a.status_name)
+    } else {
+        HELP
+    }
+}
+
 fn materialization_state_color(state: &str) -> Color {
     match state {
         "current" => SUCCESS,
         "lag" | "unmat" => WARNING,
         _ => HELP,
     }
-}
-
-/// A worker id is only worth colouring when it says the allocation is not
-/// being proved: `-1` is "no worker bound", which is the one value in the
-/// column that asks the operator to do something. Assigned ids are left plain
-/// rather than coloured green, so twelve bound rows stay quiet.
-fn worker_color(worker_id: i64) -> Option<Color> {
-    (worker_id < 0).then_some(ERROR)
 }
 
 fn mode_color(mode: &str) -> Color {
@@ -2027,41 +2036,19 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
         .clamp(MIN_FILTER_WIDTH, cap)
 }
 
+/// The node reports the row's worker running without a materialized frame.
 fn local_warning(m: &Model, a: &AllocationRow) -> bool {
-    matches!(
-        m.execution_state(a.execution.as_ref()),
-        "running" | "serving"
-    ) && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
+    m.worker_flagged(ConditionKind::LocalAppFramesNoneMaterialized, a)
 }
 
-/// Frames a materializing worker normally trails the head peers report
-/// (the Available Shards footer says "1-2 frames").
-const RECOVERY_TRAIL_FRAMES: u64 = 2;
-
-/// The worker's own height is within the normal trail of the shard head peers
-/// report. Without both numbers nothing is known, so nothing counts as caught
-/// up.
-fn recovery_caught_up(a: &AllocationRow) -> bool {
-    a.latest_frame > 0
-        && a.execution
-            .as_ref()
-            .and_then(|e| e.materialized_frame)
-            .is_some_and(|h| h > 0 && h + RECOVERY_TRAIL_FRAMES >= a.latest_frame)
-}
-
-/// The latest recovery attempt failed and the worker is still behind; once
-/// it has caught up by another path the notice ends with the condition.
-fn recovery_failed(a: &AllocationRow) -> bool {
-    a.execution
-        .as_ref()
-        .and_then(|e| e.recovery.as_ref())
-        .is_some_and(|r| r.last_error_unix_ms > r.last_outcome_unix_ms)
-        && !recovery_caught_up(a)
-}
-
+/// The LocalMat and Execution color: `red` while the node reports the
+/// worker's execution stopped, `yellow` while it reports its frames
+/// unchanged or none materialized.
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
-    let state = m.execution_state(a.execution.as_ref());
-    if matches!(state, "running" | "serving")
+    let state = m.execution_state(a);
+    if m.worker_flagged(ConditionKind::LocalExecutionStopped, a) {
+        ERROR
+    } else if matches!(state, "running" | "serving")
         && (local_warning(m, a) || m.local_app_stalled(&a.filter, a.worker_id))
     {
         Color::Yellow
@@ -2070,9 +2057,9 @@ fn local_color(m: &Model, a: &AllocationRow) -> Color {
     }
 }
 
+/// The palette of an Execution state the node reports nothing about.
 fn execution_color(state: &str) -> Color {
     match state {
-        "blocked" | "stopped" => ERROR,
         "running" | "serving" => SUCCESS,
         _ => HELP,
     }
@@ -2160,7 +2147,6 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
             advance_age(execution.last_advance_unix_ms)
         }
     );
-    let state = m.execution_state(Some(execution));
     if !execution.blocker.is_empty() {
         let label = if matches!(execution.state.as_str(), "blocked" | "stopped")
             && execution.blocker != "awaiting successor"
@@ -2184,11 +2170,15 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         text += &format!(" | {share}");
     }
     if let Some(r) = execution.recovery.as_ref() {
+        let failing = m.worker_flagged(ConditionKind::RecoveryFailing, a);
         text += &format!(
             " | {}",
             if m.compact_actions {
-                recovery_summary(r, recovery_caught_up(a))
-            } else if r.last_error_unix_ms > r.last_outcome_unix_ms && recovery_caught_up(a) {
+                recovery_summary(r, failing)
+            } else if r.last_error_unix_ms > r.last_outcome_unix_ms
+                && !failing
+                && m.condition_judged(ConditionKind::RecoveryFailing)
+            {
                 format!("{}; the worker has since caught up", recovery(r))
             } else {
                 recovery(r)
@@ -2205,8 +2195,9 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
             }
         );
     }
-    // A cached or stale observation is `cached` / `stale`, not `blocked`.
-    let color = if matches!(state, "blocked" | "stopped") {
+    // Only the node's judgement makes a blocker an error: a cached or stale
+    // observation, or the handoff wait, is not one.
+    let color = if m.worker_flagged(ConditionKind::LocalExecutionStopped, a) {
         ERROR
     } else if restart_warns {
         WARNING
@@ -2510,12 +2501,15 @@ fn render_alloc_panel(
                     && cert_share_percent(a.certificate_share.as_ref()).is_none()
                 {
                     DIM
-                } else if ci == 10 && m.color_coding && a.worker_id < 0 {
+                } else if ci == 10
+                    && m.color_coding
+                    && m.allocation_flagged(ConditionKind::AllocationsWithoutWorker, a)
+                {
                     ERROR
                 } else if matches!(ci, 10 | 16) && m.color_coding && m.app_cadence_stale() {
                     WARNING
                 } else if ci == 12 && m.color_coding {
-                    status_color(&a.status_name)
+                    alloc_status_color(m, a)
                 } else {
                     TEXT
                 };
@@ -2578,18 +2572,17 @@ fn render_alloc_panel(
                     {
                         Span::styled(cell.clone(), Style::new().fg(DIM))
                     }
-                    11 if m.color_coding => match worker_color(a.worker_id) {
-                        Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
-                        None => Span::raw(cell.clone()),
-                    },
-                    10 if m.color_coding && a.worker_id < 0 => {
+                    10 | 11
+                        if m.color_coding
+                            && m.allocation_flagged(ConditionKind::AllocationsWithoutWorker, a) =>
+                    {
                         Span::styled(cell.clone(), Style::new().fg(ERROR))
                     }
                     10 | 16 if m.color_coding && m.app_cadence_stale() => {
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
                     12 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
+                        Span::styled(cell.clone(), Style::new().fg(alloc_status_color(m, a)))
                     }
                     13 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(mode_color(a.mode())))
@@ -3385,26 +3378,6 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Staffed earning allocations past their activation waits; local progress
-/// and execution notices judge only these.
-fn earning_allocations(m: &Model) -> Vec<&AllocationRow> {
-    m.allocations
-        .iter()
-        .filter(|a| {
-            matches!(
-                a.reward_status(m.epoch_frame(), m.epoch_length),
-                Some(EffectiveStatus::Active | EffectiveStatus::Leaving)
-            )
-        })
-        .filter(|a| {
-            !matches!(
-                m.execution_state(a.execution.as_ref()),
-                "waiting" | "syncing" | "closing" | "handoff"
-            )
-        })
-        .collect()
-}
-
 /// Current active + leaving forecasts in the 60m and 24h windows when the
 /// 60m one is below half the 24h one. Only rows whose shard has 30 min of
 /// 60m and 2h of 24h coverage count; both windows price frames alike.
@@ -3484,91 +3457,7 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
-    let worker_fresh = m
-        .worker_snapshot_received
-        .is_some_and(|(t, _)| t.elapsed().as_secs() <= m.refresh_seconds * 2 + 30);
     let allocations: Vec<_> = m.allocations.iter().filter(|a| a.status != 0).collect();
-    let due: Vec<_> = allocations
-        .iter()
-        .filter(|a| {
-            matches!(
-                a.status_name.as_str(),
-                "active" | "leaving" | "departing" | "re-confirm!"
-            )
-        })
-        .collect();
-    let workerless = due.iter().filter(|a| a.worker_id < 0).count();
-    if worker_fresh && workerless > 0 {
-        notices.push((
-            "allocation-workerless",
-            NoticeSeverity::Error,
-            format!("Allocations without a worker: {workerless}/{}.", due.len()),
-        ));
-    }
-    let observed: Vec<_> = earning_allocations(m)
-        .into_iter()
-        .filter(|a| {
-            matches!(
-                m.execution_state(a.execution.as_ref()),
-                "starting" | "running" | "serving" | "blocked" | "stopped"
-            )
-        })
-        .collect();
-    let failed = observed
-        .iter()
-        .filter(|a| {
-            matches!(
-                m.execution_state(a.execution.as_ref()),
-                "blocked" | "stopped"
-            )
-        })
-        .count();
-    if failed > 0 {
-        notices.push((
-            "local-execution-failed",
-            NoticeSeverity::Error,
-            format!(
-                "Local execution blocked or stopped: {failed}/{} allocations.",
-                observed.len()
-            ),
-        ));
-    }
-    let stale = allocations
-        .iter()
-        .filter(|a| a.status_name == "re-confirm!")
-        .count();
-    if stale > 0 {
-        notices.push((
-            "allocation-epoch-stale",
-            NoticeSeverity::Warning,
-            format!(
-                "Allocation epoch stale (re-confirm!): {stale}/{} allocations.",
-                allocations.len()
-            ),
-        ));
-    }
-    let withheld = allocations
-        .iter()
-        .filter(|a| {
-            !matches!(
-                m.execution_state(a.execution.as_ref()),
-                "unknown" | "stale" | "cached"
-            ) && a
-                .execution
-                .as_ref()
-                .is_some_and(|e| e.blocker == quil_types::consensus::SILENT_RENEWAL_BLOCKER)
-        })
-        .count();
-    if withheld > 0 {
-        notices.push((
-            "renewal-withheld-no-vote",
-            NoticeSeverity::Warning,
-            format!(
-                "Renewal withheld, no vote sent: {withheld}/{} allocations.",
-                allocations.len()
-            ),
-        ));
-    }
     let counted: Vec<_> = allocations
         .iter()
         .filter(|a| a.certificate_share.is_some())
@@ -3584,27 +3473,6 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             format!(
                 "Low certificate share (60m): {low}/{} allocations.",
                 counted.len()
-            ),
-        ));
-    }
-    let workers: Vec<_> = m
-        .allocations
-        .iter()
-        .filter(|a| {
-            !matches!(
-                m.execution_state(a.execution.as_ref()),
-                "unknown" | "stale" | "cached"
-            )
-        })
-        .collect();
-    let recovery_failed = workers.iter().filter(|a| recovery_failed(a)).count();
-    if recovery_failed > 0 {
-        notices.push((
-            "recovery-failed",
-            NoticeSeverity::Warning,
-            format!(
-                "Last recovery attempt failed: {recovery_failed}/{} workers.",
-                workers.len()
             ),
         ));
     }
@@ -3727,11 +3595,7 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
             lines.extend(wrap_message(
                 Line::from(Span::styled(
                     text,
-                    Style::new().fg(if severity == NoticeSeverity::Error {
-                        ERROR
-                    } else {
-                        WARNING
-                    }),
+                    Style::new().fg(severity_color(severity)),
                 )),
                 width,
             ));
@@ -4528,6 +4392,8 @@ fn help_value_color(entry: &str, value: &str) -> Option<Color> {
         {
             Some(status_color(status))
         }
+        // Red where the node reports the execution stopped.
+        ("Execution", "blocked" | "stopped") => Some(ERROR),
         ("Execution", label) => EXECUTION_STATES
             .iter()
             .find(|state| execution_label(state) == label)
@@ -4535,7 +4401,7 @@ fn help_value_color(entry: &str, value: &str) -> Option<Color> {
         ("PeerState", state @ ("current" | "lag" | "unmat" | "unknown")) => {
             Some(materialization_state_color(state))
         }
-        ("Worker", "-1") => worker_color(-1),
+        ("Worker", "-1") => Some(ERROR),
         ("Mode", mode @ ("a" | "m")) => Some(mode_color(mode)),
         _ => None,
     }
@@ -4624,7 +4490,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Shards", "Data shards the filter covers"),
         kv("LocalMat", "Local materialized height:"),
         item("`-`: unknown"),
-        item("`0!`: no materialized frames, with colors off; colors show a `yellow` `0`"),
+        item("`0!`: the node reports no materialized frames for its window, with colors off; colors show a `yellow` `0`"),
         item("`yellow` (or `!` with colors off): unchanged for its window; see Local app notice"),
         kv("PeerMat", "Peer-reported materialized height; compared with PeerHead"),
         kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks a shard the node reports unchanged; see Reported app heads"),
@@ -4639,8 +4505,8 @@ fn help_items() -> Vec<HelpItem> {
         item("`close`: awaiting closing certificate"),
         item("`handoff`: sealed, awaiting successor"),
         item("`wait`: awaiting the event the row footer names: allocation activation, a seat or committee session, a GLOBAL state sync or a shard re-anchor"),
-        item("`blocked`: preparation/admission failure"),
-        item("`stopped`: engine exited"),
+        item("`blocked`: preparation/admission failure; `red` while the node reports it for its window (see Allocation notices)"),
+        item("`stopped`: engine exited; `red` likewise"),
         item("`running`: an older node reports host startup only"),
         item("`stale` / `cached`: old observation (see Freshness)"),
         item("`-`: joining without observations"),
@@ -4651,13 +4517,13 @@ fn help_items() -> Vec<HelpItem> {
         item("`unmat`: nothing materialized"),
         item("`unknown`: no head"),
         kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical, see Reward estimates; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
-        kv("Worker", "Core the allocation is bound to; `-1` means none is bound"),
+        kv("Worker", "Core the allocation is bound to; `-1` means none is bound, `red` while the node reports the allocation without a worker"),
         kv("Status", "Effective protocol status of the row:"),
         item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
         item("`activating`: join confirmed; it joins its committee at the next epoch boundary"),
         item("`departing`: leave confirmed; it keeps serving until the next epoch boundary"),
         item("`expiredJoin` / `expiredLeave`: confirm window missed"),
-        item("`re-confirm!`: the allocation's epoch is stale but recoverable"),
+        item("`re-confirm!`: the allocation's epoch is stale but recoverable; `yellow` like `paused` and `bound` while the node reports their condition"),
         item("`bound`: a worker bound to a filter with no live allocation row, usually because a closing session it still belongs to keeps it until that session seals or GLOBAL fences it; it is then released for a waiting allocation. Shown with its local execution, excluded from rewards"),
         item("`idle`: a worker with no filter; every reported worker remains visible alongside unassigned allocations"),
         item("`unknown`: a raw allocation status this client cannot classify"),
@@ -4674,7 +4540,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Restart cost", "What restarting the node now costs the seat, from data the node holds. `ok`; `costs this seat's storage share this epoch` when its running storage encode, delayed by the work a restart loses and the start-up (`adds N min`), would end past the renewal's grace frame (`N min to grace`); `stops this shard` when its committee has no spare voter (margin: voters in recent views minus quorum); `cost unknown; no GLOBAL frame seen yet`. Absent on older nodes"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
-        item("`stale`: node observation already >30s old at receipt"),
+        item("`stale`: the node reports the worker's observation >30s old on its own clock"),
         item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
         kv("Health conditions", "The node judges every condition below from its own observations, logs each when it starts, every 10 min while it lasts and when it ends, and serves them in its health report (`qclient node diagnostics health --self`); this manager reads that report each refresh and only shows it. A condition is shown only while the node's last evaluation found it: it ends after 60s clear, and one recurring sooner is shown again under its first start, so the log can hold a condition open while none is shown; its lasting and end lines count those clear spells (`clear_spells`, `unserved_secs`). A stall window is 60s, or 3 of the shard's node-measured mean frame intervals on a slower shard (the shorter of the fresh 60m and 24h means), so a healthy slow shard is not reported between frames; notices state the 60s base. Missing or old observations establish no condition. Expected waits are info and name the event that ends them: `GLOBAL state sync installing` (committed shard heads, and so the GlobalHead cells, show again once its last chunk is in), `Prover ops wait for the next epoch` (leave, pause and resume sign from the frame it names) and `Legacy coin shields admitted from GLOBAL frame …`; one past its expected time (10 min) is a warning. `Health conditions not reported by this node version`: the node predates them, so none are shown; update the node. `Health report unavailable`: this manager could not read the report from the node's peer listener"),
         kv("Local app notice", "`Local app frames unchanged >60s`: earning allocations whose worker's LocalMat has not advanced for their window, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
@@ -4685,13 +4551,18 @@ fn help_items() -> Vec<HelpItem> {
         item("`Global app frames >100 behind app heads`: GlobalHead trails the app head by more than 100 frames"),
         item("Either way GLOBAL has not applied the newer shard frames, so their shard state and rewards are not credited yet. On most tracked shards it is network-wide: GLOBAL frames are not carrying shard frames; report it with the GLOBAL frame and shard filters. On a few shards, check those shards' committees"),
         kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the active + leaving forecast over the last 60m is below half its 24h value. Counts rows whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
-        kv("Allocation notices", "Allocations or workers with a condition, out of those it applies to:"),
-        item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
-        item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
+        kv("Allocation notices", "Allocations or workers with a condition the node reports, out of those it applies to; the node judges each from its prover registry and worker view on its own clock:"),
+        item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with no worker bound for 60s; they do no work and earn nothing until a worker is bound. Their Worker and Reward cells are `red`"),
+        item("`Local execution blocked or stopped`: earning allocations whose Execution has been `blocked` or `stopped` for 60s, of those with fresh observations in a frame-advancing phase; the handoff wait is excluded and the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
         item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
+        item("`Allocations rejected or kicked`: allocations rejected, kicked or whose join missed its confirm window, in this epoch or the last, of this prover's allocations; they earn nothing until a new join is confirmed"),
+        item("`Allocations paused`: paused allocations; they serve no committee and earn nothing until resumed"),
+        item("`Workers bound without an allocation` (info): workers bound to a shard where this prover holds no live allocation, usually while a closing session they belong to seals"),
+        item("`Local app frames: none materialized`: running or serving workers with LocalMat 0 for 60s"),
+        item("`Worker observations stale >30s` (info): workers whose latest report is over 30s old on the node's clock; their Execution reads `stale`"),
         item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
-        item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
+        item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat still trails the head peers report by over 2 frames, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Seat concentration notice", "`Seat concentration`: committee sessions where the members on this node's network (IPv4 /24 or IPv6 /48 of their announced addresses, this node included) hold at least size less quorum less one seats, of the sessions this node sits in; the node evaluates each once per session and epoch. An outage of that site, or a restart or upgrade of its nodes together, then leaves the committee at most one seat above quorum, where shards stall. Members without a public address are not counted, so it is a lower bound. To fix: spread provers across sites. The node's `seat concentration` log lines name each shard"),
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
@@ -5717,6 +5588,7 @@ mod tests {
         assert_ne!(mode_color("a"), ERROR);
         assert_eq!(materialization_state_color("lag"), WARNING);
         let mut a = row("a", 1, 1, 1, "", "");
+        a.filter = vec![0x0a];
         a.execution = Some(quil_types::proto::node::WorkerExecution {
             state: "blocked".into(),
             observed_unix_ms: std::time::SystemTime::now()
@@ -5725,7 +5597,20 @@ mod tests {
                 .as_millis() as u64,
             ..Default::default()
         });
-        assert_eq!(local_color(&Model::new(), &a), ERROR);
+        // A blocked phase is an error once the node reports it so.
+        let mut m = Model::new();
+        assert_eq!(local_color(&m, &a), HELP);
+        node_report(
+            &mut m,
+            vec![node_condition(
+                ConditionKind::LocalExecutionStopped,
+                ConditionSeverity::Error,
+                &[(&[0x0a], 1)],
+                1,
+            )],
+            &[],
+        );
+        assert_eq!(local_color(&m, &a), ERROR);
     }
 
     #[test]
@@ -5990,20 +5875,20 @@ mod tests {
         assert!(reward_drop(&m).is_none());
     }
 
+    /// The node's allocation and worker conditions show as its notices at
+    /// their level and color only the rows they list. This manager judges
+    /// none of them: a fresh report without them flags nothing.
     #[test]
-    fn allocation_notices_count_workerless_failed_stale_and_recovering_rows() {
-        use quil_types::proto::node::{ShardRecovery, WorkerExecution};
-        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-        let mut m = Model::new();
-        m.frame_number = 2160;
-        m.epoch_length = 720;
-        m.reachable = true;
-        m.last_fetch_success = Some(Instant::now());
+    fn node_allocation_conditions_drive_notices_and_cells() {
+        use quil_types::proto::node::WorkerExecution;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        m.worker_snapshot_received = Some((Instant::now(), now_ms));
+        let mut m = Model::new();
+        m.last_fetch_success = Some(Instant::now());
+        m.worker_snapshot_received = Some(Instant::now());
         let execution = |state: &str| {
             Some(WorkerExecution {
                 state: state.into(),
@@ -6013,124 +5898,136 @@ mod tests {
                 ..Default::default()
             })
         };
-        let allocation =
-            |filter: u8, worker: i64, epoch: u64, status: &str, state: Option<&str>| {
-                let mut a = row(&format!("{filter:02x}"), 1, 1, worker, "", "");
-                a.filter = vec![filter];
-                a.status = 2;
-                a.epoch = epoch;
-                a.status_name = status.into();
-                a.execution = state.and_then(|state| execution(state));
-                a
-            };
-        m.allocations = vec![
-            allocation(1, 3, 3, "active", Some("serving")),
-            allocation(2, -1, 3, "active", None),
-            allocation(3, 4, 1, "re-confirm!", Some("serving")),
-            allocation(4, 5, 3, "active", Some("blocked")),
-        ];
-        m.allocations[0].execution.as_mut().unwrap().recovery = Some(ShardRecovery {
-            last_error_unix_ms: now_ms,
-            last_outcome_unix_ms: now_ms - 1000,
-            consecutive_failures: 1,
-            ..Default::default()
-        });
-        m.allocations[2].execution.as_mut().unwrap().blocker =
-            quil_types::consensus::SILENT_RENEWAL_BLOCKER.into();
-        // A bound worker's stopped engine is a lifecycle wait, not an allocation's failure.
-        let mut bound = row("w9", 1, 1, 9, "", "");
-        bound.status = 0;
-        bound.status_name = "bound".into();
-        bound.execution = execution("stopped");
-        m.allocations.push(bound);
-        update_message_lifetime(&mut m);
-        let lines = message_lines(&m, Line::default(), 300);
-        let find = |text: &str| {
-            lines
-                .iter()
-                .find(|l| l.to_string().contains(text))
-                .unwrap_or_else(|| panic!("`{text}` missing"))
+        let allocation = |filter: u8, worker: i64, status: &str, state: Option<&str>| {
+            let mut a = row(&format!("{filter:02x}"), 1, 1, worker, "", "");
+            a.filter = vec![filter];
+            a.status = 2;
+            a.status_name = status.into();
+            a.execution = state.and_then(execution);
+            a
         };
-        for (key, text, color) in [
-            (
-                "allocation-workerless",
-                "Allocations without a worker: 1/4.",
-                ERROR,
-            ),
-            (
-                "local-execution-failed",
-                "Local execution blocked or stopped: 1/2 allocations.",
-                ERROR,
-            ),
-            (
-                "allocation-epoch-stale",
-                "Allocation epoch stale (re-confirm!): 1/4 allocations.",
-                WARNING,
-            ),
-            (
-                "renewal-withheld-no-vote",
-                "Renewal withheld, no vote sent: 1/4 allocations.",
-                WARNING,
-            ),
-            (
-                "recovery-failed",
-                "Last recovery attempt failed: 1/4 workers.",
-                WARNING,
-            ),
+        let workerless = allocation(1, -1, "active", None);
+        let blocked = allocation(2, 5, "active", Some("blocked"));
+        let reconfirm = allocation(3, 6, "re-confirm!", Some("serving"));
+        let paused = allocation(4, 7, "paused", Some("serving"));
+        let mut bound = allocation(9, 9, "bound", Some("serving"));
+        bound.status = 0;
+        let mut empty = allocation(7, 10, "active", Some("serving"));
+        empty.execution.as_mut().unwrap().materialized_frame = Some(0);
+        let quiet = allocation(8, 11, "active", Some("serving"));
+        m.allocations = vec![
+            workerless.clone(),
+            blocked.clone(),
+            reconfirm.clone(),
+            paused.clone(),
+            bound.clone(),
+            empty.clone(),
+            quiet.clone(),
+        ];
+        let text = |m: &Model| {
+            message_lines(m, Line::default(), 300)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        m.notice_minimum = NoticeSeverity::Info;
+        node_report(&mut m, Vec::new(), &[]);
+        for old in [
+            "Allocations without a worker",
+            "Local execution blocked",
+            "Allocation epoch stale",
         ] {
-            let line = find(text);
-            assert!(line
-                .to_string()
-                .starts_with(&message_timestamp(Some(m.notice_since[key]))));
-            assert_eq!(line.spans[0].style.fg, Some(color), "{text}");
-            assert!(line.to_string().chars().count() <= 80, "{text}");
+            assert!(!text(&m).contains(old), "{old}");
         }
-        m.notice_minimum = NoticeSeverity::Error;
-        let errors = message_lines(&m, Line::default(), 300)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(errors.contains("Allocations without a worker"));
-        assert!(!errors.contains("Last recovery attempt failed"));
-        // Old worker data cannot establish a worker, execution or recovery claim.
-        m.worker_snapshot_received = Some((Instant::now() - Duration::from_secs(120), now_ms));
-        update_message_lifetime(&mut m);
-        assert_eq!(
-            m.notice_since.keys().copied().collect::<Vec<_>>(),
-            vec!["allocation-epoch-stale"]
+        assert_eq!(local_color(&m, &blocked), HELP);
+        assert_eq!(alloc_status_color(&m, &reconfirm), HELP);
+        assert_eq!(alloc_status_color(&m, &paused), HELP);
+        assert_eq!(alloc_status_color(&m, &bound), HELP);
+        assert!(!local_warning(&m, &empty));
+        assert_eq!(m.execution_state(&quiet), "serving");
+
+        let c = node_condition;
+        let (e, w, i) = (
+            ConditionSeverity::Error,
+            ConditionSeverity::Warning,
+            ConditionSeverity::Info,
         );
-        m.worker_snapshot_received = Some((Instant::now(), now_ms));
-        m.allocations[0].execution.as_mut().unwrap().recovery = Some(ShardRecovery {
-            last_error_unix_ms: now_ms - 1000,
-            last_outcome_unix_ms: now_ms,
-            ..Default::default()
-        });
-        m.allocations[1].worker_id = 6;
-        m.allocations[1].execution = execution("serving");
-        m.allocations[2].epoch = 3;
-        m.allocations[2].status_name = "active".into();
-        m.allocations[2].execution = execution("serving");
-        m.allocations[3].execution = execution("serving");
-        assert!(condition_notices(&m).is_empty());
-        update_message_lifetime(&mut m);
-        assert!(m.notice_since.is_empty());
+        let mut stale = c(ConditionKind::WorkerObservationsStale, i, &[(&[8], 11)], 6);
+        stale.threshold = 30;
+        let conditions = vec![
+            c(ConditionKind::AllocationsWithoutWorker, e, &[(&[1], 0)], 4),
+            c(ConditionKind::LocalExecutionStopped, e, &[(&[2], 5)], 3),
+            c(ConditionKind::AllocationEpochStale, w, &[(&[3], 0)], 4),
+            c(ConditionKind::AllocationsPaused, w, &[(&[4], 0)], 4),
+            c(ConditionKind::RenewalWithheld, w, &[(&[3], 6)], 4),
+            c(ConditionKind::RecoveryFailing, w, &[(&[3], 6)], 5),
+            c(ConditionKind::AllocationsRejected, e, &[(&[6], 0)], 5),
+            c(
+                ConditionKind::WorkersBoundWithoutAllocation,
+                i,
+                &[(&[9], 9)],
+                6,
+            ),
+            c(
+                ConditionKind::LocalAppFramesNoneMaterialized,
+                w,
+                &[(&[7], 10)],
+                5,
+            ),
+            stale,
+        ];
+        node_report(&mut m, conditions.clone(), &[]);
+        let lines = message_lines(&m, Line::default(), 300);
+        for condition in &conditions {
+            let notice = quil_rpc::health_conditions::notice_text(condition);
+            let line = lines
+                .iter()
+                .find(|l| l.to_string().contains(&notice))
+                .unwrap_or_else(|| panic!("`{notice}` missing"));
+            let severity = ConditionSeverity::try_from(condition.severity).unwrap();
+            let expected = match severity {
+                ConditionSeverity::Error => ERROR,
+                ConditionSeverity::Info => PRIMARY,
+                _ => WARNING,
+            };
+            assert_eq!(line.spans[0].style.fg, Some(expected), "{notice}");
+            assert!(line.to_string().chars().count() <= 80, "{notice}");
+        }
+        assert!(text(&m).contains("Workers bound without an allocation: 1/6 workers."));
+        assert!(text(&m).contains("Worker observations stale >30s: 1/6 workers."));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(text(&m).contains("Allocations without a worker: 1/4."));
+        assert!(text(&m).contains("Allocations rejected or kicked: 1/5."));
+        assert!(!text(&m).contains("Allocation epoch stale"));
+        assert_eq!(local_color(&m, &blocked), ERROR);
+        assert_eq!(
+            allocation_detail(&m, &blocked).spans[0].style.fg,
+            Some(ERROR)
+        );
+        assert_eq!(alloc_status_color(&m, &reconfirm), WARNING);
+        assert_eq!(alloc_status_color(&m, &paused), WARNING);
+        assert_eq!(alloc_status_color(&m, &bound), WARNING);
+        assert!(local_warning(&m, &empty));
+        assert_eq!(alloc_cell(&m, &empty, 6, 12), "0!");
+        assert_eq!(m.execution_state(&quiet), "stale");
+        assert_eq!(m.execution_state(&paused), "serving");
     }
 
+    /// The Recovery footer notes a failed attempt only while the node
+    /// reports the recovery failing, and says the worker caught up only
+    /// once the node judged it and lists it no longer.
     #[test]
-    fn recovery_failure_ends_when_the_worker_catches_up() {
+    fn the_recovery_footer_follows_the_node_judgement() {
         use quil_types::proto::node::{ShardRecovery, WorkerExecution};
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let mut m = Model::new();
-        m.compact_actions = false;
-        m.last_fetch_success = Some(std::time::Instant::now());
-        m.worker_snapshot_received = Some((std::time::Instant::now(), now_ms));
         let mut a = row("0c", 1, 1, 12, "", "");
+        a.filter = vec![0x0c];
         a.status_name = "active".into();
-        a.latest_frame = 800;
         a.execution = Some(WorkerExecution {
             state: "syncing".into(),
             observed_unix_ms: now_ms,
@@ -6144,48 +6041,30 @@ mod tests {
             }),
             ..Default::default()
         });
-        m.allocations = vec![a];
-        let failed = |m: &Model| {
-            condition_notices(m)
-                .iter()
-                .any(|(key, _, _)| *key == "recovery-failed")
+        let footer = |m: &mut Model, compact: bool| {
+            m.compact_actions = compact;
+            allocation_detail(m, &a).to_string()
         };
-        assert!(failed(&m), "behind: the failed attempt is current");
-        m.allocations[0]
-            .execution
-            .as_mut()
-            .unwrap()
-            .materialized_frame = Some(800);
-        assert!(!failed(&m), "caught up by another path: the notice ends");
-        m.allocations[0]
-            .execution
-            .as_mut()
-            .unwrap()
-            .materialized_frame = Some(799);
-        assert!(!failed(&m), "one frame behind is the normal trail");
-        m.allocations[0]
-            .execution
-            .as_mut()
-            .unwrap()
-            .materialized_frame = Some(797);
-        assert!(failed(&m), "three frames behind is still behind");
-        m.allocations[0]
-            .execution
-            .as_mut()
-            .unwrap()
-            .materialized_frame = Some(800);
-        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
-        assert!(footer.contains("did not commit"), "{footer}");
-        assert!(footer.contains("since caught up"), "{footer}");
-        m.compact_actions = true;
-        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
-        assert!(!footer.contains("Last recovery attempt failed"), "{footer}");
-        m.allocations[0].latest_frame = 0;
-        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
-        assert!(
-            footer.contains("Last recovery attempt failed"),
-            "unknown head: {footer}"
+        let note = "Last recovery attempt failed";
+        // Without the node's judgement, neither the failure nor its end.
+        assert!(!footer(&mut m, true).contains(note));
+        let expanded = footer(&mut m, false);
+        assert!(expanded.contains("did not commit"), "{expanded}");
+        assert!(!expanded.contains("since caught up"), "{expanded}");
+        let failing = node_condition(
+            ConditionKind::RecoveryFailing,
+            ConditionSeverity::Warning,
+            &[(&[0x0c], 12)],
+            1,
         );
+        node_report(&mut m, vec![failing], &[ConditionKind::RecoveryFailing]);
+        assert!(footer(&mut m, true).contains(note));
+        assert!(!footer(&mut m, false).contains("since caught up"));
+        node_report(&mut m, Vec::new(), &[ConditionKind::RecoveryFailing]);
+        assert!(!footer(&mut m, true).contains(note));
+        let expanded = footer(&mut m, false);
+        assert!(expanded.contains("did not commit"), "{expanded}");
+        assert!(expanded.contains("since caught up"), "{expanded}");
     }
 
     #[test]
@@ -6276,6 +6155,18 @@ mod tests {
             .to_string()
             .contains("not observed since start"));
         worker.execution.as_mut().unwrap().materialized_frame = Some(0);
+        assert!(!local_warning(&m, &worker), "the node judges it");
+        worker.filter = vec![0x01];
+        node_report(
+            &mut m,
+            vec![node_condition(
+                ConditionKind::LocalAppFramesNoneMaterialized,
+                ConditionSeverity::Warning,
+                &[(&[0x01], 7)],
+                1,
+            )],
+            &[],
+        );
         assert!(local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
         assert_eq!(local_color(&m, &worker), Color::Yellow);
@@ -6500,6 +6391,7 @@ mod tests {
             });
             assert_eq!(alloc_cell(&m, &allocation, 9, STATE_WIDTH), label);
             assert_eq!(alloc_cell(&m, &allocation, 6, MAT_WIDTH), "0");
+            assert!(!local_warning(&m, &allocation), "{state}");
             assert_eq!(local_color(&m, &allocation), HELP);
             assert!(allocation_detail(&m, &allocation)
                 .to_string()
@@ -6508,7 +6400,6 @@ mod tests {
         }
         m.allocations[0].execution.as_mut().unwrap().state = "serving".into();
         assert_eq!(alloc_cell(&m, &m.allocations[0], 9, STATE_WIDTH), "serve");
-        assert!(local_warning(&m, &m.allocations[0]));
     }
 
     #[test]
@@ -7029,6 +6920,54 @@ mod tests {
         }
     }
 
+    /// The node's `kind` condition of `severity` listing `rows` (filter,
+    /// worker core) of `tracked`.
+    pub(super) fn node_condition(
+        kind: ConditionKind,
+        severity: ConditionSeverity,
+        rows: &[(&[u8], u32)],
+        tracked: u32,
+    ) -> quil_types::proto::diagnostics::HealthCondition {
+        quil_types::proto::diagnostics::HealthCondition {
+            kind: kind as i32,
+            severity: severity as i32,
+            affected: rows.len() as u32,
+            tracked,
+            shards: rows
+                .iter()
+                .map(
+                    |(filter, core_id)| quil_types::proto::diagnostics::AffectedShard {
+                        filter: filter.to_vec(),
+                        core_id: *core_id,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Give `m` a fresh health report: `conditions`, and every kind in
+    /// `judged` observed now.
+    pub(super) fn node_report(
+        m: &mut Model,
+        conditions: Vec<quil_types::proto::diagnostics::HealthCondition>,
+        judged: &[ConditionKind],
+    ) {
+        m.health = HealthAnswer::Reported(quil_types::proto::diagnostics::HealthConditions {
+            conditions,
+            sources: judged
+                .iter()
+                .map(|kind| quil_types::proto::diagnostics::ConditionSource {
+                    kind: *kind as i32,
+                    observed_unix_ms: 1,
+                    tracked: 1,
+                })
+                .collect(),
+        });
+        m.health_received = Some(std::time::Instant::now());
+    }
+
     #[test]
     fn filter_prefixes_align_in_both_panels_with_selected_rows() {
         let mut m = Model::new();
@@ -7118,7 +7057,7 @@ mod tests {
         });
         assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
         assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
-        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "stale");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "unknown");
         assert_eq!(alloc_cell(&model, &allocation, 10, 12), "-/-/0.0");
     }
 
@@ -7190,6 +7129,8 @@ mod tests {
         assert_eq!(fmt_reward_change(&BigInt::from(-249_921_760)), "-269.9");
     }
 
+    /// The reward of an allocation the node reports without a worker is red,
+    /// on the selected row too; without the node's condition it is not.
     #[test]
     fn unassigned_reward_is_red_even_on_the_selected_row() {
         for selected in [false, true] {
@@ -7197,18 +7138,35 @@ mod tests {
             m.color_coding = true;
             m.alloc_cursor = if selected { 0 } else { 1 };
             let mut allocation = row("aa", 1, 1, -1, "", "");
+            allocation.filter = vec![0xaa];
             allocation.estimated_reward = BigInt::from(123456);
             let reward = reward_cell(&m, &allocation.estimated_reward, &allocation.filter);
-            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5), None);
-            let span = lines[1]
-                .spans
-                .iter()
-                .find(|s| s.content.trim() == reward)
-                .expect("reward cell");
-            assert_eq!(span.style.fg, Some(ERROR));
-            if selected {
-                assert_eq!(lines[1].style.bg, Some(CURSOR_BG));
-            }
+            let reward_fg = |m: &mut Model| {
+                let lines =
+                    render_alloc_panel(m, &[allocation.clone()], Rect::new(0, 0, 240, 5), None);
+                if selected {
+                    assert_eq!(lines[1].style.bg, Some(CURSOR_BG));
+                }
+                lines[1]
+                    .spans
+                    .iter()
+                    .find(|s| s.content.trim() == reward)
+                    .expect("reward cell")
+                    .style
+                    .fg
+            };
+            assert_ne!(reward_fg(&mut m), Some(ERROR), "not judged here");
+            node_report(
+                &mut m,
+                vec![node_condition(
+                    ConditionKind::AllocationsWithoutWorker,
+                    ConditionSeverity::Error,
+                    &[(&[0xaa], 0)],
+                    1,
+                )],
+                &[],
+            );
+            assert_eq!(reward_fg(&mut m), Some(ERROR));
         }
     }
 
@@ -7760,6 +7718,7 @@ mod tests {
             .as_millis() as u64;
         let worker = |state: &str, frame: u64| {
             let mut a = row("01", 2, 1, 7, "", "");
+            a.filter = vec![0x01];
             a.execution = Some(WorkerExecution {
                 state: state.into(),
                 observed_unix_ms: now,
@@ -7776,21 +7735,30 @@ mod tests {
             ("handoff", "handoff", HELP),
             ("waiting", "wait", HELP),
             ("starting", "start", HELP),
-            ("blocked", "blocked", ERROR),
-            ("stopped", "stopped", ERROR),
+            // Red only once the node reports the execution stopped.
+            ("blocked", "blocked", HELP),
+            ("stopped", "stopped", HELP),
         ] {
             let a = worker(state, 124);
             assert_eq!(alloc_cell(&m, &a, 9, 12), label);
             assert_eq!(local_color(&m, &a), color, "{state}");
             assert!(!local_warning(&m, &a), "{state}");
         }
+        let mut m = m;
+        node_report(
+            &mut m,
+            vec![node_condition(
+                ConditionKind::LocalAppFramesNoneMaterialized,
+                ConditionSeverity::Warning,
+                &[(&[0x01], 7)],
+                1,
+            )],
+            &[],
+        );
         for state in ["running", "serving"] {
             let a = worker(state, 0);
             assert!(local_warning(&m, &a), "{state}");
             assert_eq!(local_color(&m, &a), Color::Yellow, "{state}");
-        }
-        for state in ["syncing", "closing", "handoff", "waiting"] {
-            assert!(!local_warning(&m, &worker(state, 0)), "{state}");
         }
     }
 
@@ -7809,10 +7777,29 @@ mod tests {
             ..Default::default()
         });
         a.status_name = "re-confirm!".into();
+        a.filter = vec![0x01];
         let mut normal = a.clone();
         normal.worker_id = 8;
         normal.execution.as_mut().unwrap().state = "blocked".into();
         let allocations = vec![a, normal];
+        node_report(
+            &mut m,
+            vec![
+                node_condition(
+                    ConditionKind::LocalAppFramesNoneMaterialized,
+                    ConditionSeverity::Warning,
+                    &[(&[0x01], 7)],
+                    2,
+                ),
+                node_condition(
+                    ConditionKind::AllocationEpochStale,
+                    ConditionSeverity::Warning,
+                    &[(&[0x01], 0)],
+                    2,
+                ),
+            ],
+            &[],
+        );
         let mut peer = shard("02", 1, 1);
         peer.materialized_frame = 44;
         peer.latest_frame = 47;
@@ -8090,15 +8077,6 @@ mod tests {
         );
         assert_eq!(pad_cell("renew@f804960", 16, false), "   renew@f804960");
         assert_eq!(pad_cell("expire@f805680", 16, false), "  expire@f805680");
-    }
-
-    /// Colouring every bound worker green would tint most of the table and
-    /// leave the one row that needs attention no louder than the rest.
-    #[test]
-    fn an_unbound_worker_is_the_only_id_worth_colouring() {
-        assert_eq!(worker_color(-1), Some(ERROR));
-        assert_eq!(worker_color(0), None);
-        assert_eq!(worker_color(57), None);
     }
 
     #[test]
@@ -9917,7 +9895,7 @@ mod visibility_grid_tests {
 
 #[cfg(test)]
 mod cursor_rule_tests {
-    use super::tests::{row, shard};
+    use super::tests::{node_condition, node_report, row, shard};
     use super::*;
     use quil_types::proto::node::WorkerExecution;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
@@ -9929,8 +9907,8 @@ mod cursor_rule_tests {
             .as_millis() as u64
     }
 
-    /// Two allocations, one serving (a `HELP` detail) and one blocked (a
-    /// red one), and two available shards, one 5 frames behind its head
+    /// Two allocations, one serving (a `HELP` detail) and one blocked (red
+    /// once the node reports it), and two available shards, one 5 frames behind its head
     /// (a yellow detail) and one current.
     fn model() -> Model {
         let now = now_ms();
@@ -10121,6 +10099,18 @@ mod cursor_rule_tests {
         check(&mut m, "Last advance: <60s", HELP, true);
         check(&mut m, "trails its head by 5 frames", WARNING, false);
         point(&mut m, '2', '3');
+        check(&mut m, "Blocker: closing session", HELP, true);
+        // Red once the node reports the execution stopped.
+        node_report(
+            &mut m,
+            vec![node_condition(
+                ConditionKind::LocalExecutionStopped,
+                ConditionSeverity::Error,
+                &[(&[], 5)],
+                2,
+            )],
+            &[],
+        );
         check(&mut m, "Blocker: closing session", ERROR, false);
     }
 

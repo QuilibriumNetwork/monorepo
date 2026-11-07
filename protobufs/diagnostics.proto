@@ -205,7 +205,35 @@ enum ConditionKind {
   // Shards whose head in committed GLOBAL state trails their app head by
   // more than `HealthCondition.threshold` frames.
   CONDITION_KIND_GLOBAL_APP_FRAMES_BEHIND = 4;
-  // 5-24 are taken by other conditions.
+  // 5-14 are taken by other conditions.
+  // Active, leaving or epoch-stale allocations of this prover with no
+  // worker bound to their shard for the base window.
+  CONDITION_KIND_ALLOCATIONS_WITHOUT_WORKER = 15;
+  // Earning allocations whose worker's execution is blocked or stopped for
+  // the base window (the handoff wait excluded).
+  CONDITION_KIND_LOCAL_EXECUTION_STOPPED = 16;
+  // Active allocations whose recorded epoch is older than the current one:
+  // their re-confirm for this epoch has not been recorded.
+  CONDITION_KIND_ALLOCATION_EPOCH_STALE = 17;
+  // Allocations whose renewal this node withholds: their worker sent no
+  // vote for an epoch while the other members voted.
+  CONDITION_KIND_RENEWAL_WITHHELD = 18;
+  // Workers whose latest archive recovery attempt failed and that still
+  // trail the head peers report for their shard.
+  CONDITION_KIND_RECOVERY_FAILING = 19;
+  // Allocations rejected or kicked in this epoch or the previous one,
+  // joins that missed their confirm window included.
+  CONDITION_KIND_ALLOCATIONS_REJECTED = 20;
+  // Paused allocations: they serve no committee and earn nothing.
+  CONDITION_KIND_ALLOCATIONS_PAUSED = 21;
+  // Workers bound to a shard where this prover holds no live allocation.
+  CONDITION_KIND_WORKERS_BOUND_WITHOUT_ALLOCATION = 22;
+  // Running or serving workers that have materialized no app frame for
+  // the base window.
+  CONDITION_KIND_LOCAL_APP_FRAMES_NONE_MATERIALIZED = 23;
+  // Workers whose latest observation is older than `threshold` seconds, so
+  // their execution state is unknown.
+  CONDITION_KIND_WORKER_OBSERVATIONS_STALE = 24;
   // An expected wait: an archive state sync of GLOBAL has installed some of
   // its chunks but not the last, so committed GLOBAL state (each shard's
   // committed head among it) is unreadable until it does. A warning once it
@@ -252,7 +280,27 @@ enum ConditionAction {
   // GLOBAL's inclusion of the shard on the explorer: advancing there means
   // this node's GLOBAL view trails.
   CONDITION_ACTION_CHECK_GLOBAL_INCLUSION = 3;
-  // 4-20 are taken by other conditions.
+  // 4-11 are taken by other conditions.
+  // The worker allocator's log lines and the free workers: an allocation
+  // without a worker does no work.
+  CONDITION_ACTION_BIND_WORKERS = 12;
+  // Each affected row's blocker and its worker's log.
+  CONDITION_ACTION_CHECK_BLOCKERS = 13;
+  // The node's prover confirmation log lines.
+  CONDITION_ACTION_CHECK_PROVER_CONFIRMATIONS = 14;
+  // The silent workers: restart one that stays silent.
+  CONDITION_ACTION_CHECK_SILENT_WORKERS = 15;
+  // The recovery's error and failure streak, and the archives it reads.
+  CONDITION_ACTION_CHECK_ARCHIVE_RECOVERY = 16;
+  // The allocations on the explorer and the node's join and confirmation
+  // log lines.
+  CONDITION_ACTION_CHECK_ALLOCATIONS = 17;
+  // Resume the paused allocations or leave them.
+  CONDITION_ACTION_RESUME_OR_LEAVE = 18;
+  // The workers' bindings, once their closing sessions sealed.
+  CONDITION_ACTION_CHECK_WORKER_BINDINGS = 19;
+  // The worker processes: their reports stopped arriving.
+  CONDITION_ACTION_CHECK_WORKER_PROCESSES = 20;
   // None while the GLOBAL state sync installs; past its expected time, the
   // node's `sync phase` and prover tree sync log lines.
   CONDITION_ACTION_WAIT_FOR_GLOBAL_SYNC = 21;
