@@ -15,9 +15,15 @@ use std::time::{Duration, Instant};
 use quil_forest::WriteTimesSample;
 use tracing::{info, warn};
 
-/// A 4 KiB write and fsync past this is a disk at its limit: an idle SSD takes
-/// single-digit milliseconds, and a store write usually waits for one.
-const FSYNC_BOUND_MS: u64 = 1000;
+/// A 4 KiB write and fsync past this costs this node certificate signatures.
+/// A frame's two votes wait on about eight fsyncs in series: the proposal's
+/// sealed body (file, directory), the view's new consensus journal file (file,
+/// directory, header) and the journal sync before the notarize vote, then two
+/// journal syncs before the finalize vote. Past this they take most of a second
+/// of a ~10 s frame, while members on disks syncing in 2-4 ms spend tens of
+/// milliseconds; an operator's node syncing in about 1 s signed half its
+/// certificates, and nearly all of them on a faster disk (2026-11).
+const FSYNC_BOUND_MS: u64 = 100;
 /// A store write past this outlasts most of a worker thread's 6 s budget.
 const WRITE_BOUND_MS: u64 = 5000;
 /// A wait for a store's write barrier past this is contention worth naming.
@@ -153,7 +159,7 @@ impl Reading {
 
     fn action(self) -> &'static str {
         match self {
-            Self::Disk => "this node's disk is at its limit: check it with iostat and what else uses it; fewer seats or a faster disk are the remedies",
+            Self::Disk => "this node's disk is slow enough to delay its votes: check it with iostat and what else uses it; a DRAM-less drive under load, storage label writes included, is a common cause; move the store to a drive with a DRAM cache, or run fewer seats",
             Self::Contention => "the disk answers quickly while writers queue for one store: report this line with any 'GLOBAL frame writer lock held for seconds' line",
             Self::Compaction => "the store's compaction is behind its writes, which slows every read: check the disk's throughput; report this line if the disk is idle",
             Self::SlowWrites => "report this line with its 'worker thread blocked' lines",
@@ -388,6 +394,32 @@ mod tests {
             Sample::default().reading(),
             None,
             "nothing known, nothing claimed"
+        );
+    }
+
+    /// A probe at the bound warns and one a millisecond under it does not: at
+    /// 100 ms, not 1 s, a frame's eight vote-path fsyncs stay within a tenth of
+    /// the frame.
+    #[test]
+    fn a_probe_at_the_signing_bound_warns_and_one_below_does_not() {
+        let at = Sample {
+            fsync_ms: Some(100),
+            ..Default::default()
+        };
+        let below = Sample {
+            fsync_ms: Some(99),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        assert_eq!(
+            StoreLatency::default().observe_at(at, at.reading(), now),
+            Logged::Warned,
+            "fsync_at_bound_did_not_warn"
+        );
+        assert_eq!(
+            StoreLatency::default().observe_at(below, below.reading(), now),
+            Logged::Nothing,
+            "fsync_below_bound_warned"
         );
     }
 
