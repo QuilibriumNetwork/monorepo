@@ -912,6 +912,47 @@ async fn arrivals_no_turn_routes_leave_no_routing_stamp() {
     assert_eq!(stamps(&rig), 1);
 }
 
+/// A confidential bundle the mempool took keeps its arrival stamp after the
+/// mempool let it go: only a turn holding a confidential bundle prunes the
+/// stamps, and only those an hour old. A peer refilling the rank's count cap
+/// with tiny junk shields of this shard leaves a stamp per shield, past
+/// anything the mempool holds, for as long as it keeps sending.
+#[tokio::test]
+async fn reproduces_routing_stamps_outliving_the_mempool() {
+    const COUNT_CAP: usize = 65_536;
+    let mut rig = rig(half(true), Proofs::Unconfigured);
+    let mine = [0xbf; 32];
+    let mut n = 0u64;
+    for fill in 1..=2u64 {
+        for _ in 0..COUNT_CAP {
+            n += 1;
+            rig.engine
+                .handle_prover_message(&bundle(vec![junk_shield(n, mine, 0)]));
+        }
+        assert_eq!(
+            rig.collector.total_pending(),
+            COUNT_CAP,
+            "rig check: fill {fill} did not reach the rank's count cap"
+        );
+        // The mempool lets them go once their rank leaves the retention
+        // window, as a later collection or a finalized frame's prune does.
+        rig.collector.collect_for_rank(fill * 1000);
+        assert_eq!(
+            rig.collector.total_pending(),
+            0,
+            "rig check: fill {fill} did not age out"
+        );
+    }
+    let stamps = rig.engine.routing_seen.lock().unwrap().len();
+    assert!(
+        stamps <= COUNT_CAP,
+        "{stamps} arrival stamps kept while the mempool holds nothing, \
+         {} past the rank's count cap: each refill by a peer adds {COUNT_CAP} more, \
+         and no turn prunes a stamp under an hour old",
+        stamps - COUNT_CAP
+    );
+}
+
 /// What is left open: a well-formed non-shield waits for its routing
 /// fallback on a shard its hash does not designate, so it is held up to about
 /// shards x `ROUTED_FALLBACK`. Bounded: the fallback ends the hold.

@@ -99,6 +99,29 @@ fn frame_digest(header: &GlobalFrameHeader) -> Option<Digest> {
     Some(digest_from_identity(id))
 }
 
+/// Whether `bytes` are a GLOBAL frame that `digest` names, at `view` when
+/// given, with a header proof `verifier` accepts and the requests its header
+/// commits: what a voter checks of a body before it executes it. The digest
+/// covers only the header's output, so a member can deliver under it a body
+/// with another frame number, parent or roots; the header proof binds those.
+fn global_body_authenticates(
+    verifier: &GlobalFrameVerifier,
+    view: Option<u64>,
+    digest: &Digest,
+    bytes: &[u8],
+) -> bool {
+    let Ok(frame) = decode_global_frame(bytes) else {
+        return false;
+    };
+    let Some(header) = frame.header.as_ref() else {
+        return false;
+    };
+    view.is_none_or(|view| header.rank == view)
+        && frame_digest(header) == Some(*digest)
+        && verifier.verify_global_requests_root(header, &frame.requests)
+        && verifier.validate(&frame).unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // GlobalProposer
 // ---------------------------------------------------------------------------
@@ -484,7 +507,9 @@ impl GlobalSeamProposer {
     /// Build peer ingress without capturing the validated parent-height index.
     /// Peer bytes are candidates until consensus verifies them; the digest does
     /// not authenticate a claimed height. Only validated or recovered frames
-    /// may populate `block_meta`. `name` labels a sender in logs.
+    /// may populate `block_meta`. A block is held as its sending member's
+    /// ([`BlockStore::put_from`]), so one member's bodies under a digest
+    /// cannot crowd out another's. `name` labels a sender in logs.
     fn peer_ingress(
         self: &Arc<Self>,
         store: BlockStore,
@@ -503,7 +528,7 @@ impl GlobalSeamProposer {
                 return;
             };
             let (frame_number, len) = (header.frame_number, bytes.len());
-            store.put(digest, bytes);
+            store.put_from(digest, bytes, from.as_ref());
             tracing::debug!(
                 frame = frame_number,
                 bytes = len,
@@ -573,7 +598,17 @@ impl GlobalSeamProposer {
                     .and_then(|frame| frame.header)
                     .map_or(0, |header| header.rank)
             },
-            |digest| self.block_store.as_ref()?.get_bounded(digest, max_bytes),
+            |digest| {
+                // Peer ingress keeps a different later body beside the first
+                // one (`BlockStore::put_from`), and any member can send one
+                // under the leader's digest: hand over the first that
+                // authenticates, and none while none does.
+                self.block_store
+                    .as_ref()?
+                    .candidates_bounded(digest, max_bytes)
+                    .into_iter()
+                    .find(|bytes| global_body_authenticates(&self.verifier, None, digest, bytes))
+            },
             self.unheld_patience,
         )
     }
@@ -636,21 +671,23 @@ impl GlobalSeamProposer {
         {
             return true;
         }
-        let Some(bytes) = store.get(&digest) else {
-            return false;
-        };
-        let Ok(frame) = decode_global_frame(&bytes) else {
-            return false;
-        };
-        if !matches(&frame)
-            || !self.verifier.validate(&frame).unwrap_or(false)
-            || !self
-                .verifier
-                .verify_global_requests_root(frame.header.as_ref().unwrap(), &frame.requests)
-        {
-            return false;
+        // Peer ingress keeps a different later body beside the first one
+        // instead of replacing it (`BlockStore::put`): persist the first that
+        // authenticates.
+        for bytes in store.candidates(&digest) {
+            let Ok(frame) = decode_global_frame(&bytes) else {
+                continue;
+            };
+            if matches(&frame)
+                && self.verifier.validate(&frame).unwrap_or(false)
+                && self
+                    .verifier
+                    .verify_global_requests_root(frame.header.as_ref().unwrap(), &frame.requests)
+            {
+                return self.persist_candidate(&frame);
+            }
         }
-        self.persist_candidate(&frame)
+        false
     }
 
     /// Restore the canonical tip and all outstanding candidate bodies before
@@ -1423,6 +1460,10 @@ pub struct GlobalSeamFinalizer {
     /// Those finalizations and their bodies that arrived later, for the
     /// summary line ([`Self::report_late_bodies`]).
     late_bodies: Mutex<crate::unheld_finalization::LateBodies>,
+    /// Authenticates a certified body this node never verified
+    /// ([`FrameFinalizer::authenticates`]); without it no such body is
+    /// taken.
+    verifier: Option<Arc<GlobalFrameVerifier>>,
 }
 
 impl GlobalSeamFinalizer {
@@ -1444,7 +1485,15 @@ impl GlobalSeamFinalizer {
             pipeline: None,
             unheld: Mutex::default(),
             late_bodies: Mutex::default(),
+            verifier: None,
         }
+    }
+
+    /// Authenticate with `verifier` the certified bodies this node did not
+    /// verify before it takes one.
+    pub fn with_verifier(mut self, verifier: Arc<GlobalFrameVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     pub fn with_pipeline(
@@ -1514,6 +1563,16 @@ impl FrameFinalizer for GlobalSeamFinalizer {
             return;
         };
         self.finalize_body(view, digest, &bytes, cert);
+    }
+
+    /// A body this node never verified is taken only if it authenticates as
+    /// a voter would check it: the first body held under a digest may be
+    /// another member's, with the leader's output but its own frame number,
+    /// parent or roots.
+    fn authenticates(&self, view: u64, digest: &Digest, bytes: &[u8]) -> bool {
+        self.verifier
+            .as_ref()
+            .is_some_and(|verifier| global_body_authenticates(verifier, Some(view), digest, bytes))
     }
 }
 
@@ -1824,6 +1883,29 @@ pub struct GlobalConsensusCwHandle {
     pub contact: Arc<crate::global_stall::GlobalContact>,
 }
 
+/// The finalizer a GLOBAL consensus host reports to. It authenticates with
+/// `verifier` a certified body this node did not verify before it takes
+/// one; without it, no such body is taken.
+fn host_finalizer(
+    clock_store: Arc<dyn ClockStore>,
+    mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
+    head_hook: HeadHook,
+    global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    local_prover_address: Vec<u8>,
+    pipeline: Option<Arc<crate::global_finalization::GlobalFinalizationPipeline>>,
+    verifier: Arc<GlobalFrameVerifier>,
+) -> GlobalSeamFinalizer {
+    GlobalSeamFinalizer::new(
+        clock_store,
+        mat_job_tx,
+        head_hook,
+        global_frame_publisher,
+        local_prover_address,
+    )
+    .with_pipeline(pipeline)
+    .with_verifier(verifier)
+}
+
 /// Assemble + start the simplex-backed global consensus from real dependencies.
 /// Must be called from within the node's tokio runtime (spawns the outbound
 /// drain task there); the engine itself runs on its own runtime thread.
@@ -1921,16 +2003,15 @@ pub fn activate_global_consensus_cw(
 
     // The finalizer is built first: the proposer hands it the bodies of
     // finalizations reported without them once they arrive.
-    let finalizer = Arc::new(
-        GlobalSeamFinalizer::new(
-            clock_store.clone(),
-            mat_job_tx,
-            head_hook,
-            global_frame_publisher,
-            local_prover_address,
-        )
-        .with_pipeline(pipeline),
-    );
+    let finalizer = Arc::new(host_finalizer(
+        clock_store.clone(),
+        mat_job_tx,
+        head_hook,
+        global_frame_publisher,
+        local_prover_address,
+        pipeline,
+        verifier.clone(),
+    ));
     // Seams over real state. The proposer keeps a clock-store handle so it can
     // recover the parent frame number from the latest committed head when the
     // in-memory block map misses it after a restart.
@@ -2027,6 +2108,10 @@ pub fn activate_global_consensus_cw(
 }
 
 #[cfg(test)]
+#[path = "cw_global_reporter_tests.rs"]
+mod reporter_tests;
+
+#[cfg(test)]
 mod ingress_tests {
     use super::*;
 
@@ -2061,11 +2146,9 @@ mod ingress_tests {
             None,
         ));
         let store = BlockStore::new();
-        let ingress = {
-            let ingress = proposer.peer_ingress(store.clone(), |_| "…peer".into());
-            let sender = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
-            move |bytes: Vec<u8>| ingress(&sender, bytes)
-        };
+        let ingress = proposer.peer_ingress(store.clone(), |_| "…peer".into());
+        let leader = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
+        let member = FalconPublicKey::from_bytes(&[8; 897]).unwrap();
         let mut frame = GlobalFrame {
             header: Some(GlobalFrameHeader {
                 frame_number: 7,
@@ -2077,22 +2160,37 @@ mod ingress_tests {
         let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
         let honest = encode_global_frame(&frame).unwrap();
         proposer.note_frame(digest, 7);
-        ingress(honest.clone());
+        ingress(&leader, honest.clone());
         assert_eq!(store.get(&digest), Some(honest.clone()));
         frame.header.as_mut().unwrap().frame_number = u64::MAX / 2;
         assert_eq!(frame_digest(frame.header.as_ref().unwrap()), Some(digest));
         let forged = encode_global_frame(&frame).unwrap();
-        ingress(forged.clone());
-        assert_eq!(store.get(&digest), Some(forged.clone()));
+        ingress(&member, forged.clone());
+        // The first body stays; another member's different later one waits
+        // beside it, and that member's later bodies are not held.
+        assert_eq!(store.get(&digest), Some(honest.clone()));
+        assert_eq!(
+            store.candidates(&digest),
+            vec![honest.clone(), forged.clone()]
+        );
+        for n in 0..4u64 {
+            frame.header.as_mut().unwrap().frame_number = u64::MAX / 3 + n;
+            ingress(&member, encode_global_frame(&frame).unwrap());
+        }
+        assert_eq!(
+            store.candidates(&digest),
+            vec![honest.clone(), forged.clone()],
+            "one body per member"
+        );
         assert_eq!(proposer.selected_parent_number(digest), Some(7));
         store.seal(digest, honest.clone());
-        ingress(forged);
-        assert_eq!(store.get(&digest), Some(honest));
-        ingress(vec![0xff]);
+        ingress(&member, forged);
+        assert_eq!(store.candidates(&digest), vec![honest]);
+        ingress(&leader, vec![0xff]);
         assert_eq!(proposer.selected_parent_number(digest), Some(7));
         frame.header.as_mut().unwrap().output = vec![4; 516];
         let unknown = frame_digest(frame.header.as_ref().unwrap()).unwrap();
-        ingress(encode_global_frame(&frame).unwrap());
+        ingress(&leader, encode_global_frame(&frame).unwrap());
         assert_eq!(proposer.selected_parent_number(unknown), None);
     }
 

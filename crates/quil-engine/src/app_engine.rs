@@ -339,6 +339,8 @@ pub struct AppEngineSizes {
     /// Messages this shard's mempool holds, across its ranks, and their bytes.
     pub mempool_messages: usize,
     pub mempool_bytes: usize,
+    /// Submission arrival stamps held for the routing fallback.
+    pub routing_seen: usize,
     pub proposal_cache: usize,
     pub pending_certified_parents: usize,
     pub current_rank: u64,
@@ -989,6 +991,13 @@ struct RoutingSeen {
 /// How long an arrival stays stamped once no collection holds it.
 const ROUTING_CLOCK_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Arrival stamps a new arrival finds a shard keeping at most: as many
+/// messages as its collector holds for one rank. Over it, expired stamps go
+/// first, then the oldest arrivals, down to three quarters of it. A leader's
+/// turn stamps its collected bundles without the cap, so the clock holds at
+/// most this plus one turn's bundles.
+const ROUTING_CLOCK_CAP: usize = 65_536;
+
 /// How long each collected bundle has waited since it reached this shard, and
 /// whether this is the first collection to hold it. A bundle without a stamped
 /// arrival starts waiting now; a bundle without confidential operations does
@@ -1000,9 +1009,12 @@ fn routing_waits(
     operations: &[usize],
     now: std::time::Instant,
 ) -> (Vec<std::time::Duration>, Vec<bool>) {
+    // Each stamp is looked up among the turn's bundles: in a set, built once
+    // per turn, not by a scan of the list for every stamp.
+    let held: std::collections::HashSet<&[u8; 32]> = hashes.iter().collect();
     let mut seen = clock.lock().unwrap_or_else(|e| e.into_inner());
     seen.retain(|hash, entry| {
-        hashes.contains(hash) || now.saturating_duration_since(entry.arrived) < ROUTING_CLOCK_TTL
+        held.contains(hash) || now.saturating_duration_since(entry.arrived) < ROUTING_CLOCK_TTL
     });
     hashes
         .iter()
@@ -1021,17 +1033,55 @@ fn routing_waits(
         .unzip()
 }
 
-fn stamp_arrival(clock: &RoutingClock, canonical: &[u8], now: std::time::Instant) {
+/// The key of a submission's canonical bytes in a [`RoutingClock`].
+fn routing_key(canonical: &[u8]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
-    let hash: [u8; 32] = Sha3_256::digest(canonical).into();
-    clock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(hash)
-        .or_insert(RoutingSeen {
+    Sha3_256::digest(canonical).into()
+}
+
+/// Stamp the arrival of `canonical` unless it is stamped already; true when
+/// this call stamped it. A full clock is pruned first
+/// ([`prune_routing_clock`]).
+fn stamp_arrival(clock: &RoutingClock, canonical: &[u8], now: std::time::Instant) -> bool {
+    let hash = routing_key(canonical);
+    let mut seen = clock.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains_key(&hash) {
+        return false;
+    }
+    if seen.len() >= ROUTING_CLOCK_CAP {
+        prune_routing_clock(&mut seen, now);
+    }
+    seen.insert(
+        hash,
+        RoutingSeen {
             arrived: now,
             logged: false,
-        });
+        },
+    );
+    true
+}
+
+/// Drop the stamps older than [`ROUTING_CLOCK_TTL`] and, while the clock
+/// still holds [`ROUTING_CLOCK_CAP`] or more, the oldest arrivals down to
+/// three quarters of the cap. Run on the engine's cleanup timer as well as
+/// when a stamp would exceed the cap: a collection prunes only on a
+/// leader's turn, and a shard whose members seldom lead kept every stamp.
+/// A bundle a collection still holds after its stamp went waits from that
+/// collection.
+fn prune_routing_clock(seen: &mut HashMap<[u8; 32], RoutingSeen>, now: std::time::Instant) {
+    seen.retain(|_, entry| now.saturating_duration_since(entry.arrived) < ROUTING_CLOCK_TTL);
+    if seen.len() < ROUTING_CLOCK_CAP {
+        return;
+    }
+    let mut arrivals: Vec<([u8; 32], std::time::Instant)> = seen
+        .iter()
+        .map(|(hash, entry)| (*hash, entry.arrived))
+        .collect();
+    arrivals.sort_unstable_by_key(|(_, arrived)| *arrived);
+    let excess = seen.len() - ROUTING_CLOCK_CAP * 3 / 4;
+    for (hash, _) in arrivals.into_iter().take(excess) {
+        seen.remove(&hash);
+    }
 }
 
 /// Anchor to `latest − K`, not the bleeding-edge head: app-shard committees are
@@ -3185,6 +3235,9 @@ pub struct AppConsensusEngine {
     /// The authorized committee session the running `cw_handle` was built for.
     /// `None` on the legacy registry-committee path.
     cw_session: Option<quil_cw_consensus::handoff::Session>,
+    /// The committee keys of the running `cw_handle`, sorted: block ingress
+    /// stores bodies only from them ([`Self::admits_block_sender`]).
+    cw_members: Vec<Vec<u8>>,
     /// Shared with the session's parent reader and the leader (request-free
     /// frames while the session closes).
     session_closing: Arc<std::sync::atomic::AtomicBool>,
@@ -3461,6 +3514,7 @@ impl AppConsensusEngine {
             cw_discarded_through_epoch: None,
             cw_committee_fp: None,
             cw_session: None,
+            cw_members: Vec::new(),
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
@@ -3507,6 +3561,11 @@ impl AppConsensusEngine {
             frame_store: self.frame_store.len(),
             mempool_messages,
             mempool_bytes,
+            routing_seen: self
+                .routing_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
             proposal_cache: self.proposal_cache.len(),
             pending_certified_parents: self.pending_certified_parents.len(),
             current_rank: self.current_rank,
@@ -7918,15 +7977,12 @@ impl AppConsensusEngine {
                             }
                             if let Some(h) = self.cw_handle.as_ref() {
                                 if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
-                                    // Authorize the block channel like channels 0/1/2:
-                                    // require the sender key to
-                                    // resolve (the master resolves it from committee
-                                    // membership) before storing. Previously channel 3
-                                    // ingested any bytes, ignoring `from` — letting an
-                                    // unresolved peer feed/overwrite the block store
-                                    // (the block is still verified at `verify`, so this
-                                    // is authorization/DoS hardening, not a safety hole).
-                                    if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
+                                    // Store a block only from a member of the
+                                    // host's committee: a body any peer sent
+                                    // could stand first under a proposal's
+                                    // digest, and its voters would refuse
+                                    // the leader's (`admits_block_sender`).
+                                    if self.admits_block_sender(&from) {
                                         let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
                                         let session = || self.cw_session.as_ref().and_then(|session| session.id().ok());
                                         if let Some(missing) = block_sync_from(&data, cursor, session) {
@@ -7946,11 +8002,11 @@ impl AppConsensusEngine {
                                                 AncestorSync::Hold { .. } => {}
                                             }
                                         }
-                                        (h.ingest_block)(data);
+                                        (h.ingest_block)(data, &from);
                                     } else {
                                         tracing::debug!(
                                             core_id = self.core_id,
-                                            "cw app block: unresolved sender key, dropping block",
+                                            "cw app block from a non-member, dropping",
                                         );
                                     }
                                 } else if (channel as usize) < h.inbound.len() {
@@ -8008,16 +8064,7 @@ impl AppConsensusEngine {
                 // Periodic cleanup
                 _ = cleanup_timer.tick() => {
                     probe::step(probe::Section::EngineCleanupTimer);
-                    if self.fence_reanchor.evicted_waiting && self.cw_handle.is_none() {
-                        self.check_evicted_lineage(std::time::Instant::now());
-                    }
-                    self.retry_certified_parent_seals().await;
-                    if self.pending_follower_clock.is_some() {
-                        self.try_materialize_follower_frames().await;
-                    }
-                    self.cleanup_frame_store();
-                    self.note_gossip_refusals_quiet();
-                    self.report_arrivals_left();
+                    self.cleanup_tick(std::time::Instant::now()).await;
                 }
 
                 // Passive-mode CW retry: keep trying to start simplex until the
@@ -11002,8 +11049,22 @@ impl AppConsensusEngine {
             None => self.own_votes.stop("its consensus host restarted"),
         };
         self.log_own_votes(ended);
+        let mut members = member_pubkeys;
+        members.sort_unstable();
+        self.cw_members = members;
         self.cw_session = session;
         Ok(handle)
+    }
+
+    /// Whether a consensus block from `from` may enter the block store: only
+    /// a member of the running host's committee proposes or forwards the
+    /// bodies its voters check. A block store keeps the first body that
+    /// arrives under a proposal's digest, which does not cover the body, so
+    /// a body from any gossip peer could stand first.
+    fn admits_block_sender(&self, from: &[u8]) -> bool {
+        self.cw_members
+            .binary_search_by(|member| member.as_slice().cmp(from))
+            .is_ok()
     }
 
     // ---------------------------------------------------------------
@@ -12140,7 +12201,11 @@ impl AppConsensusEngine {
     /// shard of an application gets each of its submissions, and a stalled
     /// shard's mempool stays full; kept aside for a rank that never came,
     /// refused copies grew without bound (2026-10-31: 1,515 to 6,888 of
-    /// about 190 KB in 8 h on one node) and no proposal read them.
+    /// about 190 KB in 8 h on one node) and no proposal read them. Only a
+    /// confidential bundle the mempool takes is stamped for the routing
+    /// fallback, and a repeat keeps its first stamp: stamped on every
+    /// arrival, refused messages kept stamps no collection held until a
+    /// collection pruned them.
     ///
     /// A shield another shard must propose is not held at all
     /// ([`shield_proposed_elsewhere`]): no other shard can execute it, and
@@ -12711,6 +12776,26 @@ impl AppConsensusEngine {
         let cutoff = self.current_rank.saturating_sub(10);
         self.pending_certified_parents
             .retain(|&r, _| r >= cutoff || self.retry_parent_seals.contains(&r));
+    }
+
+    /// What the engine's cleanup timer does at `now`. It also expires the
+    /// routing stamps ([`prune_routing_clock`]): a collection prunes them
+    /// only on a leader's turn.
+    async fn cleanup_tick(&mut self, now: std::time::Instant) {
+        if self.fence_reanchor.evicted_waiting && self.cw_handle.is_none() {
+            self.check_evicted_lineage(now);
+        }
+        self.retry_certified_parent_seals().await;
+        if self.pending_follower_clock.is_some() {
+            self.try_materialize_follower_frames().await;
+        }
+        self.cleanup_frame_store();
+        prune_routing_clock(
+            &mut self.routing_seen.lock().unwrap_or_else(|e| e.into_inner()),
+            now,
+        );
+        self.note_gossip_refusals_quiet();
+        self.report_arrivals_left();
     }
 
     /// Retry only previously authorized seals, in rank order, at cleanup cadence.
@@ -23093,6 +23178,132 @@ mod tests {
         );
     }
 
+    /// The routing clock holds at most its cap of stamps: over it, expired
+    /// stamps go first, then the oldest arrivals; the cleanup timer's prune
+    /// drops expired ones without a collection.
+    #[test]
+    fn the_routing_clock_is_bounded() {
+        use std::time::Duration;
+        let clock: RoutingClock = Default::default();
+        let t0 = std::time::Instant::now();
+        let at = |n: u32| t0 + Duration::from_millis(n.into());
+        let cap = ROUTING_CLOCK_CAP as u32;
+        for n in 0..cap {
+            assert!(stamp_arrival(&clock, &n.to_be_bytes(), at(n)));
+        }
+        assert!(
+            !stamp_arrival(&clock, &0u32.to_be_bytes(), at(cap)),
+            "a stamped arrival keeps its first stamp"
+        );
+        assert!(stamp_arrival(&clock, &cap.to_be_bytes(), at(cap)));
+        let kept = ROUTING_CLOCK_CAP * 3 / 4;
+        {
+            let seen = clock.lock().unwrap();
+            assert_eq!(seen.len(), kept + 1);
+            let first_kept = cap - kept as u32;
+            assert!(!seen.contains_key(&routing_key(&(first_kept - 1).to_be_bytes())));
+            assert!(seen.contains_key(&routing_key(&first_kept.to_be_bytes())));
+            assert!(seen.contains_key(&routing_key(&cap.to_be_bytes())));
+        }
+        // The cleanup prune: stamps older than the expiry go.
+        let expiry = ROUTING_CLOCK_TTL.as_millis() as u32;
+        let now = at(expiry + 30_000);
+        prune_routing_clock(&mut clock.lock().unwrap(), now);
+        let seen = clock.lock().unwrap();
+        assert_eq!(seen.len(), (cap - 30_000) as usize);
+        assert!(!seen.contains_key(&routing_key(&30_000u32.to_be_bytes())));
+        assert!(seen.contains_key(&routing_key(&30_001u32.to_be_bytes())));
+    }
+
+    /// The cleanup timer expires routing stamps without a collection: a
+    /// shard whose members seldom lead would otherwise keep each one until
+    /// the cap.
+    #[tokio::test]
+    async fn the_cleanup_timer_expires_routing_stamps() {
+        let (mut engine, _handle, _events) =
+            test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        let now = std::time::Instant::now();
+        for n in 0..3u32 {
+            assert!(stamp_arrival(&engine.routing_seen, &n.to_be_bytes(), now));
+        }
+        engine.cleanup_tick(now + ROUTING_CLOCK_TTL).await;
+        let left = engine.routing_seen.lock().unwrap().len();
+        assert_eq!(
+            left, 0,
+            "the cleanup timer left {left} expired routing stamps"
+        );
+    }
+
+    /// A message the collector does not take keeps no arrival stamp, nor one
+    /// without a confidential operation; a confidential bundle it takes keeps
+    /// its first, and a repeat changes nothing.
+    #[tokio::test]
+    async fn only_collected_messages_keep_an_arrival_stamp() {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let (mut engine, handle, _events) =
+            test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        let stamped = |engine: &AppConsensusEngine| engine.routing_seen.lock().unwrap().len();
+        engine.add_app_message(b"application message");
+        assert_eq!(engine.message_collector.total_pending(), 1);
+        assert_eq!(
+            stamped(&engine),
+            0,
+            "a message without a confidential operation keeps no stamp"
+        );
+        // A valid carrier header (type, version, network, application), so the
+        // transfer survives the wire conversion an arrival goes through: a
+        // bare type prefix converts to an empty request, which holds no
+        // confidential operation.
+        let transfer = |body: &[u8]| {
+            let tp = quil_execution::token_engine::TYPE_LATTICE_TRANSACTION;
+            let mut inner = tp.to_be_bytes().to_vec();
+            inner.extend_from_slice(b"QCT3TX\0\x02");
+            inner.extend_from_slice(&[1; 32]);
+            inner.extend_from_slice(&quil_execution::domains::QUIL_TOKEN);
+            inner.extend_from_slice(body);
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: tp,
+                    inner_bytes: inner,
+                })],
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let message = transfer(b"confidential transfer");
+        assert_eq!(
+            quil_execution::ExecutionEngineManager::confidential_operation_count(
+                &engine.app_address,
+                &canonical_app_message(&message),
+            ),
+            1,
+            "the transfer keeps its confidential operation through the wire conversion"
+        );
+        engine.add_app_message(&message);
+        engine.add_app_message(&message);
+        assert_eq!(stamped(&engine), 1);
+        assert_eq!(engine.message_collector.total_pending(), 2);
+        engine.message_collector.set_prover_only_mode(true);
+        engine.add_app_message(b"filtered application message");
+        assert_eq!(stamped(&engine), 1, "a filtered message keeps no stamp");
+        engine.publish_sizes();
+        assert_eq!(handle.sizes().routing_seen, 1);
+    }
+
+    /// Consensus blocks are stored only from members of the running host's
+    /// committee; with no host there are none.
+    #[tokio::test]
+    async fn blocks_are_admitted_only_from_committee_members() {
+        let (mut engine, _handle, _events) =
+            test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        assert!(!engine.admits_block_sender(&[5; 897]), "no running host");
+        engine.cw_members = vec![vec![3; 897], vec![5; 897], vec![9; 897]];
+        assert!(engine.admits_block_sender(&[5; 897]));
+        assert!(!engine.admits_block_sender(&[4; 897]), "not a member");
+        assert!(!engine.admits_block_sender(&[]), "no key");
+    }
+
     /// A bundle's wait counts from its arrival at the shard, however late a
     /// collection first holds it; a stamp no collection holds expires.
     #[test]
@@ -23145,6 +23356,61 @@ mod tests {
         assert!(
             !held.contains_key(&hash(&c)),
             "an old stamp no collection holds expires"
+        );
+    }
+
+    /// A turn prunes the routing clock by looking each stamp up among the
+    /// turn's bundles in a set: a full clock of stamps an hour old and a turn
+    /// of as many bundles settle in milliseconds. Looked up in the list, the
+    /// prune compared every stamp with every bundle, 65,536 x 65,536 here.
+    #[test]
+    fn a_full_turn_prunes_a_full_routing_clock_in_bounded_time() {
+        use std::time::Duration;
+        const N: u32 = 65_536;
+        let clock: RoutingClock = Default::default();
+        let t0 = std::time::Instant::now();
+        // Keys alike but for their last bytes: a list scan compares them whole.
+        let key = |n: u32| {
+            let mut key = [0x5a; 32];
+            key[28..].copy_from_slice(&n.to_be_bytes());
+            key
+        };
+        {
+            let mut seen = clock.lock().unwrap();
+            for n in 0..N {
+                seen.insert(
+                    key(n),
+                    RoutingSeen {
+                        arrived: t0,
+                        logged: false,
+                    },
+                );
+            }
+        }
+        // The turn holds the newer half of the stamps and as many new bundles.
+        let hashes: Vec<[u8; 32]> = (N / 2..N + N / 2).map(key).collect();
+        let operations = vec![1; hashes.len()];
+        let now = t0 + ROUTING_CLOCK_TTL + Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let (waits, _) = routing_waits(&clock, &hashes, &operations, now);
+        let took = start.elapsed();
+        assert_eq!(waits.len(), hashes.len());
+        {
+            let seen = clock.lock().unwrap();
+            assert_eq!(
+                seen.len(),
+                N as usize,
+                "expired stamps no bundle of the turn holds go; held and new ones stay"
+            );
+            assert!(!seen.contains_key(&key(N / 2 - 1)));
+            assert!(seen.contains_key(&key(N / 2)));
+            assert!(seen.contains_key(&key(N + N / 2 - 1)));
+        }
+        assert!(
+            took < Duration::from_secs(2),
+            "a turn of {} bundles took {took:?} to prune {N} stamps: each \
+             stamp was compared with every bundle of the turn",
+            hashes.len()
         );
     }
 

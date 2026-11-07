@@ -109,10 +109,13 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 
 /// Shared digest → frame-bytes store. `Automaton::propose` seals the frame it
 /// built; successful `verify` seals the exact peer bytes the application
-/// accepted. Frames arriving from peers remain replaceable candidates until
-/// application validation succeeds — so a re-proposed/unverified block at a
-/// finalized digest can no longer overwrite the finalized frame (the
-/// "preserve finalized app shard frames" fix).
+/// accepted. Frames arriving from peers are candidates until application
+/// validation succeeds. The first body that arrives under a digest stays its
+/// candidate; a different body arriving later is kept beside it as an
+/// alternate, one per sending member ([`BlockStore::put_from`]), never in its
+/// place ([`BlockStore::put`]). Once sealed, no other body is kept for the digest,
+/// so a re-proposed/unverified block at a finalized digest cannot overwrite
+/// the finalized frame (the "preserve finalized app shard frames" fix).
 ///
 /// The store is bounded by [`BlockStoreLimits`]. Each block carries a view:
 /// the latest certificate's view when it arrived, raised when a notarization
@@ -122,9 +125,12 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// (materialization, recovery) time to take them. A reader that takes them
 /// later than that holds the window at the lowest view it still has to take
 /// ([`BlockStore::hold_from`]). Over a cap, the store evicts first the
-/// candidates (blocks no certificate names and this node never verified),
+/// candidates' bodies (of blocks no certificate names and this node never
+/// verified), those of the sender holding the most first, and the other
+/// bodies held beside a certified block's first while none is verified,
 /// then the blocks of the oldest views, but never a verified or certified
-/// block of the latest `protected_views` views or of the held window. A
+/// block of the latest `protected_views` views or of the held window. Each
+/// member's candidate bodies of one view are held to a quota as well. A
 /// body that arrives after a certificate named it is stored as certified.
 #[derive(Clone, Default)]
 pub struct BlockStore {
@@ -159,15 +165,27 @@ pub struct BlockStoreLimits {
     /// Candidates (blocks no certificate names and this node never
     /// verified) held at most.
     pub max_candidate_blocks: usize,
-    /// Candidate bytes held at most.
+    /// Candidate bytes held at most. The bodies held beside a certified
+    /// block's first one are held up to as many bytes again, apart from the
+    /// candidates, so that neither crowds the other out.
     pub max_candidate_bytes: usize,
+    /// Candidate bodies one committee member's deliveries keep at most per
+    /// view (the latest certificate's when each arrived): past it, its own
+    /// oldest of that view go. Over the candidate caps, the bodies of the
+    /// member holding the most go first, so others' bodies, the leader's
+    /// proposal among them, are not crowded out by one member's.
+    pub max_sender_candidate_blocks: usize,
+    /// Candidate bytes one committee member's deliveries keep at most per
+    /// view, as [`Self::max_sender_candidate_blocks`].
+    pub max_sender_candidate_bytes: usize,
 }
 
 impl Default for BlockStoreLimits {
     /// Sized for an application shard, whose finalizer may hold finalized
     /// bodies here until its engine materializes them. The candidate caps
     /// hold eight GLOBAL frames of the 16 MiB maximum, or 1024 smaller
-    /// blocks; honest members deliver about one proposal per view.
+    /// blocks; honest members deliver about one proposal per view, and a
+    /// member's quota per view holds two of the largest frames.
     fn default() -> Self {
         Self {
             keep_views: 1024,
@@ -176,6 +194,8 @@ impl Default for BlockStoreLimits {
             max_bytes: 512 << 20,
             max_candidate_blocks: 1024,
             max_candidate_bytes: 128 << 20,
+            max_sender_candidate_blocks: 256,
+            max_sender_candidate_bytes: 32 << 20,
         }
     }
 }
@@ -199,9 +219,31 @@ pub type BlockHold = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 /// Minimum interval between two eviction log lines of one store.
 const EVICTION_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bodies a [`BlockStore`] holds at most under one digest no body of was
+/// verified, the first included. Attributed bodies are one per sending
+/// member ([`BlockStore::put_from`]), so they number at most the committee
+/// size; this ceiling bounds a digest's bodies at 64 × the largest body
+/// (with the store's byte caps bounding them all) and the checks a
+/// voter runs per proposal. A member then cannot crowd the leader's body
+/// out unless 63 other members deliver bodies under its digest first.
+pub const MAX_BODIES_PER_DIGEST: usize = 64;
+
+/// Alternates under one digest from deliveries that name no sender
+/// ([`BlockStore::put`]).
+pub const MAX_UNATTRIBUTED_ALTERNATES: usize = 3;
+
 #[derive(Clone)]
 struct StoredBlock {
+    /// The first body that arrived, or the one this node verified or built.
     bytes: Vec<u8>,
+    /// Different bodies that arrived later under the same digest, in
+    /// arrival order; none once a body is verified.
+    alternates: Vec<Vec<u8>>,
+    /// Where each held body came from: the first body's, then each
+    /// alternate's, in that order.
+    origins: Vec<Origin>,
+    /// Alternates delivered without a sender.
+    unattributed: usize,
     verified: bool,
     /// A notarization or finalization names this digest.
     certified: bool,
@@ -211,10 +253,102 @@ struct StoredBlock {
     seq: u64,
 }
 
+/// Where one held body came from.
+#[derive(Clone)]
+struct Origin {
+    /// Names the body among every body the store held
+    /// ([`BlockStore::unchecked_candidate`]).
+    body: u64,
+    /// The committee member whose delivery it is, if the delivery named one.
+    sender: Option<Vec<u8>>,
+    /// Other members that delivered the same bytes later, which are not held
+    /// again: a member relaying the leader's body before the leader's own
+    /// delivery arrives must not hide that the leader delivered it, nor
+    /// drop it by filling its own quota ([`Blocks::remove_body`]).
+    relays: Vec<Vec<u8>>,
+    /// The latest certificate's view when the body arrived: the view its
+    /// sender's quota counts it in.
+    view: u64,
+}
+
+impl Origin {
+    /// Whether `sender` delivered this body, first or as a relay.
+    fn delivered_by(&self, sender: &[u8]) -> bool {
+        self.sender.as_deref() == Some(sender) || self.relays.iter().any(|relay| relay == sender)
+    }
+}
+
+/// The candidate bodies one sender's deliveries hold (the deliveries that
+/// name no sender count as one sender).
+#[derive(Default)]
+struct SenderUse {
+    count: usize,
+    bytes: usize,
+    /// By the view each body arrived in ([`Origin::view`]).
+    views: std::collections::BTreeMap<u64, ViewUse>,
+}
+
+/// One sender's candidate bodies of one view.
+#[derive(Default)]
+struct ViewUse {
+    count: usize,
+    bytes: usize,
+    /// By body number (arrival order): its digest and length.
+    bodies: std::collections::BTreeMap<u64, (Digest, usize)>,
+}
+
+impl SenderUse {
+    /// The number and digest of the sender's oldest body: the first to
+    /// arrive of its lowest view.
+    fn oldest(&self) -> Option<(u64, Digest)> {
+        let (_, view) = self.views.first_key_value()?;
+        let (body, (digest, _)) = view.bodies.first_key_value()?;
+        Some((*body, *digest))
+    }
+}
+
 impl StoredBlock {
     /// This node verified or built the block, or a certificate names it.
     fn vouched(&self) -> bool {
         self.verified || self.certified
+    }
+
+    /// Each body held with its origin: the first, then the alternates.
+    fn bodies(&self) -> impl Iterator<Item = (&Vec<u8>, &Origin)> {
+        std::iter::once(&self.bytes)
+            .chain(self.alternates.iter())
+            .zip(self.origins.iter())
+    }
+
+    /// The bytes held for this block, its alternates included.
+    fn size(&self) -> usize {
+        self.bytes.len() + self.alternate_bytes()
+    }
+
+    /// The bytes of the alternates held beside the first body.
+    fn alternate_bytes(&self) -> usize {
+        self.alternates.iter().map(Vec::len).sum::<usize>()
+    }
+
+    /// Bytes counted against the candidate caps: all of a candidate's.
+    fn candidate_bytes(&self) -> usize {
+        if self.vouched() {
+            0
+        } else {
+            self.size()
+        }
+    }
+
+    /// Bytes of the bodies held beside a certified block's first one while
+    /// none of its bodies is verified (a verified block holds none). A
+    /// certificate vouches for one body under its digest, not for the others
+    /// members delivered under it, so these have a cap of their own.
+    fn certified_alternate_bytes(&self) -> usize {
+        if self.vouched() {
+            self.alternate_bytes()
+        } else {
+            0
+        }
     }
 }
 
@@ -226,6 +360,10 @@ struct Blocks {
     bytes: usize,
     candidates: usize,
     candidate_bytes: usize,
+    /// [`StoredBlock::certified_alternate_bytes`] of every block.
+    certified_alternate_bytes: usize,
+    /// Every candidate's bodies, by the sender whose delivery each is.
+    senders: HashMap<Option<Vec<u8>>, SenderUse>,
     /// The highest view a certificate named.
     certified_view: u64,
     /// The highest finalized view.
@@ -238,6 +376,8 @@ struct Blocks {
     held_view: Option<u64>,
     hold: Option<BlockHold>,
     next_seq: u64,
+    /// Names the next body stored ([`Origin::body`]).
+    next_body: u64,
     evicted: Evicted,
 }
 
@@ -308,18 +448,33 @@ impl Blocks {
             bytes: 0,
             candidates: 0,
             candidate_bytes: 0,
+            certified_alternate_bytes: 0,
+            senders: HashMap::new(),
             certified_view: 0,
             finalized_view: 0,
             certified_digests: HashMap::new(),
             held_view: None,
             hold: None,
             next_seq: 0,
+            next_body: 0,
             evicted: Evicted::default(),
         }
     }
 
     /// Store `bytes` under `digest`, replacing what is held there.
-    fn insert(&mut self, digest: Digest, bytes: Vec<u8>, verified: bool) -> Option<EvictionReport> {
+    fn insert(
+        &mut self,
+        digest: Digest,
+        bytes: Vec<u8>,
+        verified: bool,
+        sender: Option<&[u8]>,
+    ) -> Option<EvictionReport> {
+        self.place(digest, bytes, verified, sender);
+        self.enforce_caps()
+    }
+
+    /// [`Self::insert`] without enforcing the caps.
+    fn place(&mut self, digest: Digest, bytes: Vec<u8>, verified: bool, sender: Option<&[u8]>) {
         let (view, seq, certified) = match self.take(&digest) {
             Some(old) => (old.view.max(self.certified_view), old.seq, old.certified),
             None => {
@@ -330,38 +485,283 @@ impl Blocks {
                 }
             }
         };
+        let origin = self.origin(sender);
         self.add(
             digest,
             StoredBlock {
                 bytes,
+                alternates: Vec::new(),
+                origins: vec![origin],
+                unattributed: 0,
                 verified,
                 certified,
                 view,
                 seq,
             },
         );
+    }
+
+    /// Store a peer's `bytes` under `digest` as a candidate: the first body
+    /// stays, and a different later one is kept as an alternate unless its
+    /// `sender` already delivered a body held here, or, with no sender,
+    /// [`MAX_UNATTRIBUTED_ALTERNATES`] such are held; never over
+    /// [`MAX_BODIES_PER_DIGEST`]. A sender's copy of a body already held is
+    /// recorded as its delivery of that body ([`Origin::relays`], at most
+    /// [`MAX_BODIES_PER_DIGEST`] per digest), not held again. Nothing changes
+    /// once a body under `digest` is verified.
+    fn offer(
+        &mut self,
+        digest: Digest,
+        bytes: Vec<u8>,
+        sender: Option<&[u8]>,
+    ) -> Option<EvictionReport> {
+        if !self.map.contains_key(&digest) {
+            self.place(digest, bytes, false, sender);
+            self.hold_quota(sender);
+            return self.enforce_caps();
+        }
+        let certified_view = self.certified_view;
+        let held = self.map.get(&digest)?;
+        if held.verified {
+            return None;
+        }
+        let refused = match sender {
+            Some(sender) => held
+                .origins
+                .iter()
+                .any(|origin| origin.delivered_by(sender)),
+            None => held.unattributed >= MAX_UNATTRIBUTED_ALTERNATES,
+        };
+        if refused {
+            return None;
+        }
+        let same = held.bodies().position(|(held, _)| *held == bytes);
+        let relays: usize = held.origins.iter().map(|origin| origin.relays.len()).sum();
+        let alternates = held.alternates.len();
+        if let Some(index) = same {
+            if let Some(sender) = sender.filter(|_| relays < MAX_BODIES_PER_DIGEST) {
+                let origin = &mut self.map.get_mut(&digest)?.origins[index];
+                origin.relays.push(sender.to_vec());
+            }
+            return None;
+        }
+        if alternates + 1 >= MAX_BODIES_PER_DIGEST {
+            return None;
+        }
+        let origin = self.origin(sender);
+        let mut block = self.take(&digest)?;
+        // A body kept beside a candidate's keeps it as recent as the latest
+        // certificate, as replacing it did. A refused delivery changes
+        // nothing, and only a certificate moves a vouched block's view: a
+        // member that re-sent any body under each certified digest this node
+        // did not verify otherwise kept them all from the window's prune and
+        // from eviction.
+        if !block.vouched() {
+            block.view = block.view.max(certified_view);
+        }
+        block.alternates.push(bytes);
+        block.origins.push(origin);
+        if sender.is_none() {
+            block.unattributed += 1;
+        }
+        self.add(digest, block);
+        self.hold_quota(sender);
         self.enforce_caps()
     }
 
+    /// Hold `sender`'s candidate bodies of the current view to its quota
+    /// ([`BlockStoreLimits::max_sender_candidate_blocks`] and bytes), its own
+    /// oldest of that view going first. Deliveries that name no sender are
+    /// this node's own (recoveries, replays) and have none.
+    fn hold_quota(&mut self, sender: Option<&[u8]>) {
+        let Some(sender) = sender else {
+            return;
+        };
+        let key = Some(sender.to_vec());
+        let view = self.certified_view;
+        loop {
+            let Some(held) = self
+                .senders
+                .get(&key)
+                .and_then(|user| user.views.get(&view))
+            else {
+                return;
+            };
+            if held.count <= self.limits.max_sender_candidate_blocks
+                && held.bytes <= self.limits.max_sender_candidate_bytes
+            {
+                return;
+            }
+            let Some((body, (digest, _))) = held.bodies.first_key_value() else {
+                return;
+            };
+            let (body, digest) = (*body, *digest);
+            if !self.remove_body(&digest, body) {
+                return;
+            }
+        }
+    }
+
+    /// The origin of a body `sender` delivered (`None`: no sender named),
+    /// under a number no other body of this store had.
+    fn origin(&mut self, sender: Option<&[u8]>) -> Origin {
+        self.next_body += 1;
+        Origin {
+            body: self.next_body,
+            sender: sender.map(<[u8]>::to_vec),
+            relays: Vec::new(),
+            view: self.certified_view,
+        }
+    }
+
     fn add(&mut self, digest: Digest, block: StoredBlock) {
-        let len = block.bytes.len();
-        self.bytes += len;
+        self.bytes += block.size();
         if !block.vouched() {
             self.candidates += 1;
-            self.candidate_bytes += len;
+            for (bytes, origin) in block.bodies() {
+                self.charge(digest, origin, bytes.len());
+            }
         }
+        self.candidate_bytes += block.candidate_bytes();
+        self.certified_alternate_bytes += block.certified_alternate_bytes();
         self.map.insert(digest, block);
     }
 
     fn take(&mut self, digest: &Digest) -> Option<StoredBlock> {
         let block = self.map.remove(digest)?;
-        let len = block.bytes.len();
-        self.bytes -= len;
+        self.bytes -= block.size();
         if !block.vouched() {
             self.candidates -= 1;
-            self.candidate_bytes -= len;
+            for (_, origin) in block.bodies() {
+                self.discharge(origin);
+            }
         }
+        self.candidate_bytes -= block.candidate_bytes();
+        self.certified_alternate_bytes -= block.certified_alternate_bytes();
         Some(block)
+    }
+
+    /// Count a candidate's body against its sender.
+    fn charge(&mut self, digest: Digest, origin: &Origin, len: usize) {
+        let user = self.senders.entry(origin.sender.clone()).or_default();
+        user.count += 1;
+        user.bytes += len;
+        let view = user.views.entry(origin.view).or_default();
+        view.count += 1;
+        view.bytes += len;
+        view.bodies.insert(origin.body, (digest, len));
+    }
+
+    /// Undo [`Self::charge`].
+    fn discharge(&mut self, origin: &Origin) {
+        let Some(user) = self.senders.get_mut(&origin.sender) else {
+            return;
+        };
+        if let Some(view) = user.views.get_mut(&origin.view) {
+            if let Some((_, len)) = view.bodies.remove(&origin.body) {
+                view.count -= 1;
+                view.bytes -= len;
+                user.count -= 1;
+                user.bytes -= len;
+            }
+            if view.bodies.is_empty() {
+                user.views.remove(&origin.view);
+            }
+        }
+        if user.views.is_empty() {
+            self.senders.remove(&origin.sender);
+        }
+    }
+
+    /// Drop the body numbered `body` from `digest`'s block: an alternate, or
+    /// the first body, whose place the earliest alternate then takes (with
+    /// none, the block goes). A body other members delivered too
+    /// ([`Origin::relays`]) is not dropped but passes to the earliest of
+    /// them, whose quota then counts it. False if no such body is held.
+    fn remove_body(&mut self, digest: &Digest, body: u64) -> bool {
+        let Some(mut block) = self.take(digest) else {
+            return false;
+        };
+        let Some(index) = block.origins.iter().position(|origin| origin.body == body) else {
+            self.add(*digest, block);
+            return false;
+        };
+        // A member relaying the leader's body before the leader's own copy
+        // arrived holds it under its own quota: filling that quota with
+        // made-up candidates must not drop the leader's body.
+        let origin = &mut block.origins[index];
+        if !origin.relays.is_empty() {
+            if index > 0 && origin.sender.is_none() {
+                block.unattributed -= 1;
+            }
+            origin.sender = Some(origin.relays.remove(0));
+            self.add(*digest, block);
+            return true;
+        }
+        if index == 0 && block.alternates.is_empty() {
+            self.add(*digest, block);
+            self.evict(digest);
+            return true;
+        }
+        let len = if index == 0 {
+            let next = block.alternates.remove(0);
+            std::mem::replace(&mut block.bytes, next).len()
+        } else {
+            block.alternates.remove(index - 1).len()
+        };
+        let origin = block.origins.remove(index);
+        // The body that left the alternates: the one removed, or the one now
+        // first.
+        let left = if index == 0 {
+            &block.origins[0]
+        } else {
+            &origin
+        };
+        if left.sender.is_none() {
+            block.unattributed -= 1;
+        }
+        if block.vouched() {
+            self.evicted.vouched += 1;
+        } else {
+            self.evicted.candidates += 1;
+        }
+        self.evicted.bytes += len as u64;
+        self.add(*digest, block);
+        true
+    }
+
+    /// The number and digest of the candidate body to evict first over a
+    /// candidate cap or the store's caps: the oldest of the sender whose
+    /// candidate bodies are the most `by_bytes` (else by count), ties going
+    /// to the sender whose oldest body arrived first. One member's
+    /// deliveries thus go before a body of any sender holding less, the
+    /// leader's proposal among them.
+    fn crowding_victim(&self, by_bytes: bool) -> Option<(u64, Digest)> {
+        self.senders
+            .values()
+            .filter_map(|user| Some((user, user.oldest()?)))
+            .max_by_key(|(user, (body, _))| {
+                let (first, second) = if by_bytes {
+                    (user.bytes, user.count)
+                } else {
+                    (user.count, user.bytes)
+                };
+                (first, second, std::cmp::Reverse(*body))
+            })
+            .map(|(_, oldest)| oldest)
+    }
+
+    /// Drop the alternates held beside `digest`'s first body.
+    fn drop_alternates(&mut self, digest: &Digest) {
+        let Some(mut block) = self.take(digest) else {
+            return;
+        };
+        self.evicted.candidates += block.alternates.len() as u64;
+        self.evicted.bytes += block.alternate_bytes() as u64;
+        block.alternates.clear();
+        block.origins.truncate(1);
+        block.unattributed = 0;
+        self.add(*digest, block);
     }
 
     fn note_certificate(&mut self, view: u64) {
@@ -377,8 +777,9 @@ impl Blocks {
     }
 
     /// A certificate names `digest`; `view` is its view, when it is one of
-    /// this store's.
-    fn certify(&mut self, digest: &Digest, view: Option<u64>) {
+    /// this store's. A candidate's alternates then count against the cap of
+    /// those beside certified blocks.
+    fn certify(&mut self, digest: &Digest, view: Option<u64>) -> Option<EvictionReport> {
         if let Some(view) = view {
             self.note_certificate(view);
         }
@@ -396,11 +797,11 @@ impl Blocks {
             };
             self.certified_digests.remove(&oldest);
         }
-        if let Some(mut block) = self.take(digest) {
-            block.certified = true;
-            block.view = block.view.max(view);
-            self.add(*digest, block);
-        }
+        let mut block = self.take(digest)?;
+        block.certified = true;
+        block.view = block.view.max(view);
+        self.add(*digest, block);
+        self.enforce_caps()
     }
 
     /// `view` finalized, and a reader still has to take the finalized bodies
@@ -429,21 +830,56 @@ impl Blocks {
 
     fn enforce_caps(&mut self) -> Option<EvictionReport> {
         let limits = self.limits;
+        // A member writes the header the digest hashes, so it can make up
+        // any number of digests: evicted oldest first, a member's tiny made-up
+        // candidates evicted the leader's proposal of the same view. The
+        // bodies of the sender holding the most go first.
         while self.candidates > limits.max_candidate_blocks
             || self.candidate_bytes > limits.max_candidate_bytes
         {
-            let Some(victim) = self.eviction_victim(|block| !block.vouched()) else {
+            let by_bytes = self.candidates <= limits.max_candidate_blocks;
+            let Some((body, victim)) = self.crowding_victim(by_bytes) else {
                 break;
             };
-            self.evict(&victim);
+            if !self.remove_body(&victim, body) {
+                break;
+            }
+        }
+        // A member could otherwise add one body of the largest size under
+        // each certified digest this node did not verify, and no cap would
+        // reach it. Counted with the candidates, these went last and filled
+        // the budget, and each new proposal was then evicted on arrival. They
+        // go oldest view first; the first body stays.
+        while self.certified_alternate_bytes > limits.max_candidate_bytes {
+            let Some(victim) = self.eviction_victim(|block| block.certified_alternate_bytes() > 0)
+            else {
+                break;
+            };
+            self.drop_alternates(&victim);
+        }
+        // Over the byte cap, they go before any block, so that they cannot
+        // push a new proposal's body out either.
+        while self.bytes > limits.max_bytes {
+            let Some(victim) = self.eviction_victim(|block| block.certified_alternate_bytes() > 0)
+            else {
+                break;
+            };
+            self.drop_alternates(&victim);
         }
         let mut floor = self.certified_view.saturating_sub(limits.protected_views);
         if let Some(held) = self.held_view {
             floor = floor.min(held.saturating_sub(limits.keep_views));
         }
         while self.map.len() > limits.max_blocks || self.bytes > limits.max_bytes {
-            let Some(victim) = self.eviction_victim(|block| !block.vouched() || block.view < floor)
-            else {
+            // Candidates first, as above, then vouched blocks of old views.
+            if let Some((body, victim)) = self.crowding_victim(self.map.len() <= limits.max_blocks)
+            {
+                if !self.remove_body(&victim, body) {
+                    break;
+                }
+                continue;
+            }
+            let Some(victim) = self.eviction_victim(|block| block.view < floor) else {
                 break;
             };
             self.evict(&victim);
@@ -453,6 +889,7 @@ impl Blocks {
 
     /// The block to evict first among the `eligible`: candidates before
     /// vouched blocks, then the lowest view, then the earliest arrival.
+    /// Candidate bodies go by [`Self::crowding_victim`] instead.
     fn eviction_victim(&self, eligible: impl Fn(&StoredBlock) -> bool) -> Option<Digest> {
         self.map
             .iter()
@@ -468,7 +905,7 @@ impl Blocks {
             } else {
                 self.evicted.candidates += 1;
             }
-            self.evicted.bytes += block.bytes.len() as u64;
+            self.evicted.bytes += block.size() as u64;
         }
     }
 
@@ -516,23 +953,78 @@ impl BlockStore {
         }
     }
 
-    /// Insert an unverified block candidate. Candidates may be replaced until
-    /// one exact byte sequence passes application validation and is sealed.
-    /// Once sealed, peer ingress cannot substitute different bytes for the
-    /// consensus digest that was actually verified.
+    /// Insert an unverified block candidate that names no sender (a local
+    /// recovery, or ingress that does not attribute its blocks). The first
+    /// body that arrives under `digest` stays its candidate: a digest names
+    /// the frame header's output, which does not cover the body, so a later
+    /// delivery that replaced it let any peer holding a proposal swap its body
+    /// before the voters checked it, and they refused the honest proposal. A
+    /// different later body is kept as an alternate (at most
+    /// [`MAX_UNATTRIBUTED_ALTERNATES`] of these), which a voter checks only
+    /// when the first one fails ([`BlockStore::candidates`]). Once one body
+    /// passes application validation and is sealed, peer ingress cannot
+    /// substitute or add bytes for that digest.
     pub fn put(&self, digest: Digest, bytes: Vec<u8>) {
-        let report = {
-            let mut inner = self.inner.lock();
-            let sealed = inner.map.get(&digest).is_some_and(|stored| stored.verified);
-            if sealed {
-                None
-            } else {
-                inner.insert(digest, bytes, false)
-            }
-        };
+        let report = self.inner.lock().offer(digest, bytes, None);
         if let Some(report) = report {
             report.log();
         }
+    }
+
+    /// [`Self::put`] for a block the committee member `sender` delivered:
+    /// each member's first body under a digest is held, its later ones are
+    /// not, so no one member can crowd another's body out
+    /// ([`MAX_BODIES_PER_DIGEST`]).
+    pub fn put_from(&self, digest: Digest, bytes: Vec<u8>, sender: &[u8]) {
+        let report = self.inner.lock().offer(digest, bytes, Some(sender));
+        if let Some(report) = report {
+            report.log();
+        }
+    }
+
+    /// Every body held under `digest`: the first that arrived (or the one
+    /// sealed), then the alternates in arrival order.
+    pub fn candidates(&self, digest: &Digest) -> Vec<Vec<u8>> {
+        self.candidates_bounded(digest, usize::MAX)
+    }
+
+    /// [`Self::candidates`] of at most `max_bytes` each, refusing oversized
+    /// recovery input before copying peer-controlled bytes.
+    pub fn candidates_bounded(&self, digest: &Digest, max_bytes: usize) -> Vec<Vec<u8>> {
+        let inner = self.inner.lock();
+        let Some(stored) = inner.map.get(digest) else {
+            return Vec::new();
+        };
+        std::iter::once(&stored.bytes)
+            .chain(stored.alternates.iter())
+            .filter(|bytes| bytes.len() <= max_bytes)
+            .cloned()
+            .collect()
+    }
+
+    /// A body held under `digest` whose number is not in `checked`, with its
+    /// number and whether `leader` delivered it: the one `leader` delivered
+    /// ([`Self::put_from`]), else the first in arrival order (the sealed
+    /// body, once one is). A voter takes them one at a time, so a body
+    /// arriving while it checks another is not missed.
+    pub fn unchecked_candidate(
+        &self,
+        digest: &Digest,
+        leader: &[u8],
+        checked: &[u64],
+    ) -> Option<(u64, Vec<u8>, bool)> {
+        let inner = self.inner.lock();
+        let stored = inner.map.get(digest)?;
+        let bodies = std::iter::once(&stored.bytes)
+            .chain(stored.alternates.iter())
+            .zip(stored.origins.iter())
+            .filter(|(_, origin)| !checked.contains(&origin.body));
+        let from_leader = |origin: &Origin| origin.delivered_by(leader);
+        let (bytes, origin) = bodies
+            .clone()
+            .find(|&(_, origin)| from_leader(origin))
+            .or_else(|| bodies.clone().next())?;
+        Some((origin.body, bytes.clone(), from_leader(origin)))
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
         self.inner
@@ -540,6 +1032,17 @@ impl BlockStore {
             .map
             .get(digest)
             .map(|stored| stored.bytes.clone())
+    }
+
+    /// Whether `sender` delivered a body under `digest` whose number is not
+    /// in `checked` ([`Self::unchecked_candidate`]), without copying it.
+    pub fn holds_unchecked_from(&self, digest: &Digest, sender: &[u8], checked: &[u64]) -> bool {
+        self.inner.lock().map.get(digest).is_some_and(|stored| {
+            stored
+                .origins
+                .iter()
+                .any(|origin| origin.delivered_by(sender) && !checked.contains(&origin.body))
+        })
     }
 
     /// Refuse oversized recovery input before copying peer-controlled bytes.
@@ -562,7 +1065,7 @@ impl BlockStore {
             if sealed {
                 None
             } else {
-                inner.insert(digest, bytes, true)
+                inner.insert(digest, bytes, true, None)
             }
         };
         if let Some(report) = report {
@@ -586,14 +1089,20 @@ impl BlockStore {
     /// consensus or its finalizer may still need, at least until `view`
     /// leaves the window.
     pub fn certified(&self, digest: &Digest, view: u64) {
-        self.inner.lock().certify(digest, Some(view));
+        let report = self.inner.lock().certify(digest, Some(view));
+        if let Some(report) = report {
+            report.log();
+        }
     }
 
     /// A finalization this node recorded earlier names `digest`, at a view
     /// that may belong to another consensus instance: keep its block as a
     /// certified one without moving this store's views.
     pub fn recorded_final(&self, digest: &Digest) {
-        self.inner.lock().certify(digest, None);
+        let report = self.inner.lock().certify(digest, None);
+        if let Some(report) = report {
+            report.log();
+        }
     }
 
     /// A certificate of `view` that names no block (a nullification).
@@ -769,6 +1278,16 @@ pub trait FrameFinalizer: Send + Sync + 'static {
     );
     /// A proposer equivocated (double-propose/finalize). Drives a ProverKick.
     fn on_equivocation(&self, _view: u64) {}
+    /// Whether `bytes`, a body held under `digest` that this node never
+    /// verified, can be the block a certificate of `view` names, judged
+    /// without executing it. A digest names the frame header's output, which
+    /// does not cover the rest of the body, so another member can deliver a
+    /// different body under it ahead of the leader's. The reporter hands on
+    /// the first held body that passes, and none if no body does. The default
+    /// accepts any body.
+    fn authenticates(&self, _view: u64, _digest: &Digest, _bytes: &[u8]) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1411,8 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
+        // Peer ingress names a block's sender by its committee key.
+        let leader = AsRef::<[u8]>::as_ref(&context.leader).to_vec();
         let proposal_context = ProposalContext::from(context);
         let proposer = self.proposer.clone();
         let store = self.store.clone();
@@ -902,44 +1423,84 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
             // bounded number of times before giving up, so an ordinary delivery
             // reorder nullifies a view only when the block is genuinely missing
             // (which the resolver/catch-up then backfills).
-            let mut bytes = store.get(&payload);
-            let mut waited = 0u32;
             // Up to ~6s: the block travels over :8340 out-of-band and, under CPU
             // load (co-located localnet, mTLS handshake + decode), can lag the
             // vote-request by seconds. Bounded well under `leader_timeout` (30s).
-            while bytes.is_none() && waited < 60 {
-                ctx.sleep(std::time::Duration::from_millis(100)).await;
-                bytes = store.get(&payload);
-                waited += 1;
-            }
-            let verified_bytes = bytes.clone();
+            //
+            // The body the leader sent is checked first. The digest names the
+            // header's output, not the body, so another member can deliver a
+            // different body under it ahead of the leader's: after each body
+            // that fails, this voter takes the next it has not checked, and
+            // waits within the same bound for the leader's, until one passes
+            // or the leader's own body fails ([`BlockStore::put_from`]).
+            let mut checked: Vec<u64> = Vec::new();
+            let mut waited = 0u32;
             // A voter busy with its own execution (for example publishing the
             // previous frame) answers once it is free, not with a nullify.
             let mut deferred = std::time::Duration::ZERO;
-            let ok = loop {
-                match proposer.verify_or_defer(proposal_context, payload, bytes.clone()) {
-                    Ok(ok) => break ok,
-                    Err(delay) if deferred < VERIFY_PATIENCE && !tx.is_closed() => {
-                        ctx.sleep(delay).await;
-                        deferred += delay;
-                    }
-                    Err(_) => {
-                        if deferred >= VERIFY_PATIENCE {
-                            proposer.verify_patience_ran_out(proposal_context, deferred);
+            let mut ran_out = false;
+            let mut accepted = None;
+            loop {
+                let (candidate, from_leader) =
+                    match store.unchecked_candidate(&payload, &leader, &checked) {
+                        Some((body, bytes, from_leader)) => {
+                            checked.push(body);
+                            (Some(bytes), from_leader)
                         }
-                        break false;
+                        None if waited < 60 && !tx.is_closed() => {
+                            ctx.sleep(std::time::Duration::from_millis(100)).await;
+                            waited += 1;
+                            continue;
+                        }
+                        // No body arrived: the proposer judges the proposal
+                        // without one, as before.
+                        None if checked.is_empty() => (None, false),
+                        None => break,
+                    };
+                let ok = loop {
+                    match proposer.verify_or_defer(proposal_context, payload, candidate.clone()) {
+                        Ok(ok) => break ok,
+                        // A deferral can rest on what an unchecked body
+                        // claims (an app frame's GLOBAL anchor just ahead),
+                        // so another member's body must not keep the
+                        // leader's waiting: once the leader's is here, it is
+                        // checked instead, and decides.
+                        Err(_)
+                            if !from_leader
+                                && store.holds_unchecked_from(&payload, &leader, &checked) =>
+                        {
+                            break false;
+                        }
+                        Err(delay) if deferred < VERIFY_PATIENCE && !tx.is_closed() => {
+                            ctx.sleep(delay).await;
+                            deferred += delay;
+                        }
+                        Err(_) => {
+                            ran_out |= deferred >= VERIFY_PATIENCE;
+                            break false;
+                        }
                     }
+                };
+                if ok {
+                    accepted = Some(candidate);
+                    break;
                 }
-            };
+                if candidate.is_none() || from_leader || ran_out || tx.is_closed() {
+                    break;
+                }
+            }
+            let ok = accepted.is_some();
+            // Once per check, however many of its bodies were still deferred.
+            if ran_out && !ok {
+                proposer.verify_patience_ran_out(proposal_context, deferred);
+            }
             if let Some(liveness) = liveness.as_ref() {
                 liveness.settle(Step::Verify, proposal_context.view, ok);
             }
             // On success, seal the EXACT bytes the application validated, so a
             // racing peer candidate at the same digest can't replace them.
-            if ok {
-                if let Some(bytes) = verified_bytes {
-                    store.seal(payload, bytes);
-                }
+            if let Some(Some(bytes)) = accepted {
+                store.seal(payload, bytes);
             }
             let _ = tx.send(ok);
         });
@@ -986,14 +1547,23 @@ impl<Sk: FrameSink> Relay for FalconRelay<Sk> {
     type Plan = Plan<FalconPublicKey>;
 
     fn broadcast(&mut self, payload: Self::Digest, plan: Self::Plan) -> Feedback {
-        let Some(bytes) = self.store.get(&payload) else {
-            // We don't hold the block (shouldn't happen for our own proposal);
-            // nothing to ship.
-            return Feedback::Closed;
+        // Our own proposal is sealed when built. A forward ships only a body
+        // this node verified: another member can deliver a different body
+        // under the digest ahead of the leader's, and the first one held may
+        // be that body.
+        let (bytes, recipients) = match plan {
+            Plan::Propose { .. } => (self.store.get(&payload), Recipients::All),
+            Plan::Forward { recipients, .. } => (
+                self.store
+                    .get_with_verification(&payload)
+                    .and_then(|(bytes, verified)| verified.then_some(bytes)),
+                recipients,
+            ),
         };
-        let recipients = match plan {
-            Plan::Propose { .. } => Recipients::All,
-            Plan::Forward { recipients, .. } => recipients,
+        let Some(bytes) = bytes else {
+            // We don't hold the block (shouldn't happen for our own proposal),
+            // or no verified body to forward: nothing to ship.
+            return Feedback::Closed;
         };
         self.sink.broadcast(payload, bytes, recipients);
         Feedback::Ok
@@ -1792,6 +2362,25 @@ impl<Fin: FrameFinalizer> FalconReporter<Fin> {
         self.liveness = liveness;
         self
     }
+
+    /// The body a certificate of `view` names, and whether this node verified
+    /// it: the body it verified or built, else the first held body the
+    /// finalizer authenticates ([`FrameFinalizer::authenticates`]). The first
+    /// body that arrived under `digest` may be another member's, sent ahead of
+    /// the leader's.
+    fn certified_body(&self, view: u64, digest: &Digest) -> (Option<Vec<u8>>, bool) {
+        match self.store.get_with_verification(digest) {
+            Some((bytes, true)) => (Some(bytes), true),
+            Some(_) => (
+                self.store
+                    .candidates(digest)
+                    .into_iter()
+                    .find(|bytes| self.finalizer.authenticates(view, digest, bytes)),
+                false,
+            ),
+            None => (None, false),
+        }
+    }
 }
 
 impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
@@ -1806,7 +2395,7 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
                 let digest = n.proposal.payload;
                 let view: u64 = n.proposal.round.view().get();
                 self.store.certified(&digest, view);
-                let bytes = self.store.get(&digest);
+                let (bytes, _) = self.certified_body(view, &digest);
                 self.finalizer.on_notarized(view, digest, bytes);
             }
             Activity::Certification(n) => {
@@ -1824,10 +2413,7 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
                 // "we only learned the finalization cert" (bytes present but
                 // never locally verified) — the finalizer needs it to decide
                 // whether to trust the local bytes or re-fetch.
-                let (bytes, locally_verified) = self
-                    .store
-                    .get_with_verification(&digest)
-                    .map_or((None, false), |(bytes, verified)| (Some(bytes), verified));
+                let (bytes, locally_verified) = self.certified_body(view, &digest);
                 // Serialize the finalization certificate (proposal + Falcon
                 // quorum cert) so the finalizer can carry it into a coverage
                 // bundle for global-level reward verification.
@@ -1857,6 +2443,72 @@ mod block_store_seal_tests {
 
     fn digest(byte: u8) -> Digest {
         digest_from_identity([byte; 32])
+    }
+
+    /// A later different body never replaces the first: it waits beside it,
+    /// up to the alternate cap, until a body is sealed.
+    #[test]
+    fn later_bodies_wait_beside_the_first() {
+        let store = BlockStore::new();
+        let block = digest(4);
+        let bodies: [&[u8]; 4] = [b"first", b"second", b"first", b"second"];
+        for body in bodies {
+            store.put(block, body.to_vec());
+        }
+        assert_eq!(store.get(&block), Some(b"first".to_vec()));
+        assert_eq!(
+            store.get_with_verification(&block),
+            Some((b"first".to_vec(), false))
+        );
+        assert_eq!(
+            store.candidates(&block),
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "a repeated body is held once"
+        );
+        for n in 0..10u8 {
+            store.put(block, vec![n]);
+        }
+        let held = store.candidates(&block);
+        assert_eq!(held.len(), 1 + MAX_UNATTRIBUTED_ALTERNATES);
+        assert_eq!(held[..3], [b"first".to_vec(), b"second".to_vec(), vec![0]]);
+        assert_eq!(store.usage(), (1, held.iter().map(Vec::len).sum::<usize>()));
+        assert_eq!(
+            store.candidates_bounded(&block, 1),
+            held[2..].to_vec(),
+            "oversized bodies are not copied"
+        );
+        store.seal(block, b"second".to_vec());
+        store.put(block, b"first".to_vec());
+        store.put_from(block, b"third".to_vec(), b"member");
+        assert_eq!(store.candidates(&block), vec![b"second".to_vec()]);
+        assert_eq!(store.usage(), (1, 6));
+        assert!(store.candidates(&digest(5)).is_empty());
+    }
+
+    /// Each member's first body under a digest is held and its later ones
+    /// are not, so one member's bodies never crowd out another's; all
+    /// bodies stop at the per-digest ceiling.
+    #[test]
+    fn each_member_holds_one_body_per_digest() {
+        let store = BlockStore::new();
+        let block = digest(6);
+        for n in 0..10u8 {
+            store.put_from(block, vec![n], b"member");
+        }
+        store.put_from(block, b"leader".to_vec(), b"leader");
+        store.put_from(block, b"again".to_vec(), b"leader");
+        store.put_from(block, vec![0], b"other");
+        assert_eq!(
+            store.candidates(&block),
+            vec![vec![0], b"leader".to_vec()],
+            "the first body of each member, a repeated body once"
+        );
+        for n in 0..100u32 {
+            store.put_from(block, n.to_be_bytes().to_vec(), &n.to_be_bytes());
+        }
+        assert_eq!(store.candidates(&block).len(), MAX_BODIES_PER_DIGEST);
+        store.put(block, b"unattributed".to_vec());
+        assert_eq!(store.candidates(&block).len(), MAX_BODIES_PER_DIGEST);
     }
 
     #[test]
@@ -1897,6 +2549,38 @@ mod block_store_seal_tests {
         store.seal(block, validated.clone());
         assert_eq!(store.get_with_verification(&block), Some((validated, true)));
     }
+
+    /// A forward ships only a body this node verified: the first body held
+    /// under a digest may be another member's, sent ahead of the leader's.
+    #[test]
+    fn a_forward_ships_only_a_verified_body() {
+        use commonware_consensus::types::{Epoch, Round, View};
+        #[derive(Default)]
+        struct Shipped(Mutex<Vec<Vec<u8>>>);
+        impl FrameSink for Shipped {
+            fn broadcast(&self, _: Digest, bytes: Vec<u8>, _: Recipients<FalconPublicKey>) {
+                self.0.lock().push(bytes);
+            }
+        }
+        let store = BlockStore::new();
+        let block = digest(9);
+        store.put_from(block, b"other".to_vec(), b"member");
+        store.put_from(block, b"leader".to_vec(), b"leader");
+        let sink = Arc::new(Shipped::default());
+        let mut relay = FalconRelay::new(sink.clone(), store.clone());
+        let forward = || Plan::Forward {
+            round: Round::new(Epoch::new(0), View::new(1)),
+            recipients: Recipients::Some(Vec::new()),
+        };
+        assert!(matches!(
+            relay.broadcast(block, forward()),
+            Feedback::Closed
+        ));
+        assert!(sink.0.lock().is_empty(), "no unverified body is forwarded");
+        store.seal(block, b"leader".to_vec());
+        assert!(matches!(relay.broadcast(block, forward()), Feedback::Ok));
+        assert_eq!(*sink.0.lock(), vec![b"leader".to_vec()]);
+    }
 }
 
 #[cfg(test)]
@@ -1930,6 +2614,130 @@ mod block_store_bound_tests {
         }
         assert_eq!(store.usage(), (16, 64 << 10));
         assert_eq!(held(&store, 85..=100), 16);
+    }
+
+    /// A certificate vouches for one body under its digest, not for the
+    /// others members deliver under it: those have a cap of their own, and
+    /// the oldest views' go first, while every certified digest keeps its
+    /// first body. Candidates do not evict them.
+    #[test]
+    fn bodies_beside_a_certified_one_are_capped() {
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=32u32 {
+            let block = digest_n(n);
+            store.certified(&block, u64::from(n));
+            store.put_from(block, vec![1; 1 << 10], b"leader");
+            store.put_from(block, vec![2; 16 << 10], b"member");
+        }
+        let (blocks, bytes) = store.usage();
+        assert_eq!(blocks, 32, "every certified digest keeps its first body");
+        assert!(
+            bytes <= (32 << 10) + (64 << 10),
+            "bodies beside certified ones escape their cap: {bytes} bytes held"
+        );
+        assert_eq!(store.candidates(&digest_n(32)).len(), 2);
+        assert_eq!(store.candidates(&digest_n(1)), vec![vec![1; 1 << 10]]);
+        store.seal(digest_n(32), vec![2; 16 << 10]);
+        assert_eq!(store.usage(), (32, (31 << 10) + (16 << 10) + (48 << 10)));
+        for n in 100..=200 {
+            store.put(digest_n(n), vec![3; 4 << 10]);
+        }
+        assert_eq!(held(&store, 185..=200), 16);
+        assert_eq!(
+            store.candidates(&digest_n(31)).len(),
+            2,
+            "candidates evicted a body beside a certified one"
+        );
+    }
+
+    /// Bodies members deliver beside certified digests this node never
+    /// verified fill only their own budget: a member that keeps it full
+    /// cannot make the store evict each new proposal's body on arrival, before
+    /// the voter checks it.
+    #[test]
+    fn bodies_beside_certified_ones_never_evict_a_new_proposal() {
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=32u32 {
+            let block = digest_n(n);
+            store.certified(&block, u64::from(n));
+            store.put_from(block, vec![1; 1 << 10], b"leader");
+            store.put_from(block, vec![2; 16 << 10], b"member");
+        }
+        assert_eq!(store.candidates(&digest_n(32)).len(), 2, "rig check");
+        for n in 100..=104u32 {
+            let proposal = digest_n(n);
+            store.put_from(proposal, vec![3; 4 << 10], b"leader");
+            assert_eq!(
+                store.candidates(&proposal),
+                vec![vec![3; 4 << 10]],
+                "the proposal's body was crowded out by bodies beside certified ones"
+            );
+        }
+    }
+
+    /// A certificate naming a candidate moves its alternates under the cap of
+    /// those beside certified blocks at once, not at the next delivery.
+    #[test]
+    fn a_certificate_holds_a_candidates_alternates_to_their_cap() {
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=4u32 {
+            let block = digest_n(n);
+            store.certified(&block, u64::from(n));
+            store.put_from(block, vec![1; 1 << 10], b"leader");
+            store.put_from(block, vec![2; 15 << 10], b"member");
+        }
+        let late = digest_n(5);
+        store.put_from(late, vec![1; 1 << 10], b"leader");
+        store.put_from(late, vec![2; 16 << 10], b"member");
+        assert_eq!(store.usage(), (5, (5 << 10) + (76 << 10)), "rig check");
+        store.certified(&late, 5);
+        assert_eq!(
+            store.candidates(&digest_n(1)).len(),
+            1,
+            "a certificate left the bodies beside certified ones over their cap"
+        );
+        assert_eq!(store.candidates(&late).len(), 2);
+        assert_eq!(store.usage(), (5, (5 << 10) + (61 << 10)));
+    }
+
+    /// Over the byte cap, the bodies beside certified ones go before a new
+    /// proposal's body, oldest view first.
+    #[test]
+    fn over_the_byte_cap_bodies_beside_certified_ones_go_first() {
+        let limits = BlockStoreLimits {
+            max_bytes: 40 << 10,
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=2u32 {
+            let block = digest_n(n);
+            store.certified(&block, u64::from(n));
+            store.put_from(block, vec![1; 1 << 10], b"leader");
+            store.put_from(block, vec![2; 16 << 10], b"member");
+        }
+        assert_eq!(store.usage(), (2, 34 << 10), "rig check");
+        store.put_from(digest_n(3), vec![3; 8 << 10], b"leader");
+        assert_eq!(
+            store.candidates(&digest_n(3)),
+            vec![vec![3; 8 << 10]],
+            "the proposal's body was crowded out by bodies beside certified ones"
+        );
+        assert_eq!(store.candidates(&digest_n(1)).len(), 1);
+        assert_eq!(store.candidates(&digest_n(2)).len(), 2);
+        assert_eq!(store.usage(), (3, 26 << 10));
     }
 
     /// A finalization drops the blocks more than `keep_views` below it and
@@ -2054,6 +2862,213 @@ mod block_store_bound_tests {
             Some((vec![1; 8], false))
         );
         assert_eq!(held(&store, 2..=20), 4);
+    }
+
+    /// A member writes the header its digest hashes, so it can make up
+    /// digests at will. However many or large its made-up candidates of a
+    /// view are, they go before the leader's proposal of that view.
+    #[test]
+    fn one_members_made_up_candidates_never_evict_the_leaders_proposal() {
+        let limits = BlockStoreLimits {
+            max_candidate_blocks: 4,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let proposal = digest_n(1);
+        store.put_from(proposal, b"leader".to_vec(), b"leader");
+        for i in 0..1024u32 {
+            store.put_from(digest_n(1000 + i), vec![i as u8; 1], b"member");
+        }
+        assert_eq!(
+            store.candidates(&proposal),
+            vec![b"leader".to_vec()],
+            "VULNERABLE: the leader's proposal was evicted by one member's made-up candidates"
+        );
+        assert_eq!(store.usage().0, 4);
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.put_from(proposal, vec![1; 16 << 10], b"leader");
+        for i in 0..8u32 {
+            store.put_from(digest_n(2000 + i), vec![2; 16 << 10], b"member");
+        }
+        assert_eq!(
+            store.candidates(&proposal),
+            vec![vec![1; 16 << 10]],
+            "VULNERABLE: the leader's proposal was evicted by one member's made-up candidates of \
+             the largest size"
+        );
+        assert_eq!(store.usage(), (4, 64 << 10));
+    }
+
+    /// A certificate keeps a block it names until its view leaves the
+    /// window. A member re-sending a body under each certified digest this
+    /// node did not verify, which the store refuses, must not keep them
+    /// there: past `max_blocks`, each new candidate was evicted on arrival.
+    #[test]
+    fn a_refused_redelivery_does_not_keep_a_certified_block() {
+        let limits = BlockStoreLimits {
+            keep_views: 4,
+            protected_views: 2,
+            max_blocks: 8,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for view in 1..=20u32 {
+            store.put(digest_n(view), vec![view as u8; 8]);
+            store.certified(&digest_n(view), view.into());
+            for again in 1..=view {
+                store.put(digest_n(again), vec![again as u8; 8]);
+            }
+            store.finalized(view.into());
+        }
+        let proposal = digest_n(100);
+        store.put(proposal, vec![0xaa; 8]);
+        assert_eq!(
+            store.get(&proposal),
+            Some(vec![0xaa; 8]),
+            "VULNERABLE: refused re-deliveries kept {} certified blocks past the window, and the \
+             new proposal was evicted",
+            store.usage().0
+        );
+        assert_eq!(held(&store, 16..=20), 5);
+        // The re-sent bodies of digests the window dropped are candidates
+        // again, under the caps (`max_blocks`): the two newest stay.
+        assert_eq!(held(&store, 1..=15), 2);
+        assert_eq!(store.usage().0, 8);
+    }
+
+    /// A member's candidate bodies of one view are held to its quota, its
+    /// own oldest going first and never another sender's, even when its
+    /// oldest is the first body under the leader's digest; the bodies of
+    /// another view have a quota of their own.
+    #[test]
+    fn a_members_candidates_past_its_quota_evict_only_its_own() {
+        let limits = BlockStoreLimits {
+            max_sender_candidate_blocks: 4,
+            max_sender_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let contested = digest_n(50);
+        store.put_from(contested, b"forged".to_vec(), b"member");
+        store.put_from(contested, b"leader".to_vec(), b"leader");
+        store.put_from(digest_n(1), vec![1; 1 << 10], b"leader");
+        for n in 10..20u32 {
+            store.put_from(digest_n(n), vec![2; 1 << 10], b"member");
+        }
+        assert_eq!(
+            held(&store, 10..20),
+            4,
+            "VULNERABLE: a member's candidates of one view exceed its quota"
+        );
+        assert_eq!(held(&store, 16..20), 4, "its newest stay");
+        assert_eq!(store.candidates(&contested), vec![b"leader".to_vec()]);
+        assert_eq!(held(&store, [1]), 1);
+        // An alternate it adds under the leader's digest counts as well.
+        store.put_from(digest_n(1), vec![3; 1 << 10], b"member");
+        assert_eq!(store.candidates(&digest_n(1)).len(), 2);
+        assert_eq!(held(&store, 10..20), 3);
+        // So do its bytes.
+        store.put_from(digest_n(30), vec![4; 63 << 10], b"member");
+        assert_eq!(
+            held(&store, 10..20),
+            0,
+            "VULNERABLE: a member's candidate bytes of one view exceed its quota"
+        );
+        assert_eq!(
+            store.candidates(&digest_n(1)),
+            vec![vec![1; 1 << 10], vec![3; 1 << 10]]
+        );
+        store.observe_certificate(1);
+        for n in 40..44u32 {
+            store.put_from(digest_n(n), vec![5; 1 << 10], b"member");
+        }
+        assert_eq!(held(&store, 40..44), 4);
+        assert_eq!(held(&store, [1, 30, 50]), 3, "another view's quota");
+    }
+
+    /// A member that relays the leader's body before the leader's own copy
+    /// arrives holds it under its own quota; filling that quota with
+    /// made-up candidates does not drop the leader's body, which stays
+    /// held as the leader's.
+    #[test]
+    fn a_body_relayed_first_outlives_the_relaying_members_quota() {
+        let limits = BlockStoreLimits {
+            max_sender_candidate_blocks: 4,
+            max_sender_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let proposal = digest_n(50);
+        store.put_from(proposal, b"leader".to_vec(), b"member");
+        store.put_from(proposal, b"leader".to_vec(), b"leader");
+        for n in 10..20u32 {
+            store.put_from(digest_n(n), vec![2; 1 << 10], b"member");
+        }
+        assert_eq!(
+            store.candidates(&proposal),
+            vec![b"leader".to_vec()],
+            "VULNERABLE: a member that relayed the leader's body first dropped it by filling \
+             its own quota"
+        );
+        assert!(store.holds_unchecked_from(&proposal, b"leader", &[]));
+        assert_eq!(held(&store, 10..20), 4, "its own quota still holds");
+        // Held as the leader's now, it no longer counts against the member.
+        assert_eq!(held(&store, 16..20), 4);
+    }
+
+    /// Over the candidate caps, the bodies of the sender holding the most
+    /// go first: members that each hold more than the leader do not evict
+    /// its proposal, whether they deliver before or after it, by count or by
+    /// bytes, and neither does this node's own unattributed input.
+    #[test]
+    fn members_together_go_before_a_leader_holding_less() {
+        let limits = BlockStoreLimits {
+            max_candidate_blocks: 16,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let proposal = digest_n(1);
+        for round in 0..2u32 {
+            for member in 0..8u32 {
+                for n in 0..4u32 {
+                    let made_up = digest_n(1000 + round * 100 + member * 10 + n);
+                    store.put_from(made_up, vec![member as u8; 8], &member.to_be_bytes());
+                }
+            }
+            if round == 0 {
+                store.put_from(proposal, vec![0xaa; 8], b"leader");
+            }
+            assert_eq!(
+                store.candidates(&proposal),
+                vec![vec![0xaa; 8]],
+                "VULNERABLE: members together evicted the leader's proposal"
+            );
+            assert_eq!(store.usage().0, 16);
+        }
+        for n in 0..64u32 {
+            store.put(digest_n(3000 + n), vec![9; 8]);
+        }
+        assert_eq!(store.candidates(&proposal), vec![vec![0xaa; 8]]);
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.put_from(proposal, vec![0xaa; 4 << 10], b"leader");
+        for member in 0..4u32 {
+            let made_up = digest_n(2000 + member);
+            store.put_from(made_up, vec![member as u8; 16 << 10], &member.to_be_bytes());
+        }
+        assert_eq!(
+            store.candidates(&proposal),
+            vec![vec![0xaa; 4 << 10]],
+            "VULNERABLE: members' large bodies together evicted the leader's smaller proposal"
+        );
+        assert_eq!(store.usage(), (4, (4 << 10) + (48 << 10)));
     }
 }
 

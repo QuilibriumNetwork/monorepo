@@ -865,15 +865,19 @@ fn an_archive_executes_a_parent_not_finalized_here_at_once() {
 }
 
 /// The bounds of the wait, through the consensus adapter: a vote still
-/// waiting when its verify patience (20 s) runs out is declined, and the views
-/// after it wait the same way; a vote whose parent publishes within the
-/// patience is cast on the published state.
+/// waiting when its verify patience (20 s) runs out is declined, with one
+/// line saying the wait was expected, and the views after it wait the same
+/// way; a vote whose parent publishes within the patience is cast on the
+/// published state.
 #[test]
 fn an_archive_vote_waiting_for_publication_declines_at_its_patience_and_votes_once_published() {
+    use crate::outage::test_logs::CapturedLogs;
     use quil_cw_consensus::_consensus::simplex::types::Context;
     use quil_cw_consensus::_consensus::types::{Epoch, Round, View};
     use quil_cw_consensus::_consensus::Automaton as _;
     use quil_cw_consensus::_runtime::{deterministic, Clock as _, Runner as _, Supervisor as _};
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
     let rig = Rig::new();
     let parent = certified_deploy(&rig);
     rig.put(&parent);
@@ -958,6 +962,25 @@ fn an_archive_vote_waiting_for_publication_declines_at_its_patience_and_votes_on
         "{answered:?}"
     );
     assert_eq!(rig.source.last_materialized_frame(), 1);
+
+    // Each declined view says so once, as an expected wait with the event
+    // ending it; the vote cast within the patience says nothing.
+    let declined = logs.lines_with("GLOBAL vote declined");
+    assert_eq!(
+        declined.len(),
+        2,
+        "one line per declined vote: {declined:?}"
+    );
+    for (line, view) in declined.iter().zip([73, 74]) {
+        assert!(
+            line.contains("INFO")
+                && line.contains(&format!("view={view}"))
+                && line.contains("waited_s=20")
+                && line.contains("action=\"wait\"")
+                && line.contains("finalized frames through 1 wait to publish"),
+            "{line}"
+        );
+    }
 }
 
 /// The application whose committee the shard-reward tests certify a header of.
@@ -1446,6 +1469,37 @@ fn publication_ends_the_wait_for_a_finalized_body_and_only_ingesting_archives_wa
     assert!(
         seam.propose_with_context(rig.context(&parent)).is_some(),
         "without sequenced ingest the parent is executed at once"
+    );
+}
+
+/// A frame's digest does not cover its body, and the block store keeps
+/// the first body that arrives under it: one with its requests cut,
+/// arriving first, does not keep the body that matches its header from
+/// publication.
+#[test]
+fn a_finalized_body_is_queued_to_publish_though_another_came_first() {
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let queue = Arc::new(sequenced_pipeline(&rig, &parent, &ready));
+    let finalizer = finalizer_over(&rig, &queue);
+    let seam = rig.seam(&parent).with_finalizer(finalizer.clone());
+    let context = rig.context(&parent);
+    finalize_without_body(&finalizer, &parent);
+    let mut cut = parent.clone();
+    cut.requests.clear();
+    rig.blocks.put(
+        id(&parent),
+        crate::consensus_wire::encode_global_frame(&cut).unwrap(),
+    );
+    assert!(seam.propose_with_context(context).is_none());
+    assert_eq!(queue.queued(), 0, "a body with its requests cut is refused");
+    rig.put(&parent);
+    assert!(seam.propose_with_context(context).is_none());
+    assert_eq!(
+        queue.queued(),
+        1,
+        "the body that matches its header is queued to publish"
     );
 }
 

@@ -791,9 +791,12 @@ fn only_a_validated_child_of_the_materialized_tip_is_executed() {
     let (frame, digest) = parent(&rig, 0);
     assert!(executor.prepare(digest, RANK).is_err());
     let mut variants = Vec::new();
-    for field in 0..4 {
+    for field in 0..4u8 {
         let mut bad = frame.clone();
         let header = bad.header.as_mut().unwrap();
+        // An identity of its own: a block store keeps the first body that
+        // arrives under one.
+        header.output = vec![20 + field; 32];
         match field {
             0 => header.frame_number = 2,
             1 => header.parent_selector = vec![3; 32],
@@ -825,6 +828,54 @@ fn only_a_validated_child_of_the_materialized_tip_is_executed() {
     rig.materialized.store(0, Ordering::SeqCst);
     assert!(executor.prepare(digest, RANK).is_ok());
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+}
+
+/// Bodies other members delivered first under the selected parent's digest,
+/// which does not cover the body, do not keep this member from executing the
+/// parent's own body: a member's later bodies under a digest are not held, so
+/// they cannot crowd the leader's out, a member's copy of a body already held
+/// adds none, and the walk tries the held bodies in arrival order.
+#[test]
+fn a_validated_child_is_executed_though_other_bodies_came_first_under_its_digest() {
+    let rig = rig();
+    let accept = Arc::new(|_: &AppShardFrame| Ok(())) as AppRequestsRootCheck;
+    let executor = executor(&rig, rig.clock.clone(), true, accept);
+    let (frame, digest) = parent(&rig, 0);
+    // Each member's faults differ from every other member's, so each holds
+    // a body of its own.
+    let bad = |round: u8, field: u8| {
+        let mut bad = frame.clone();
+        let header = bad.header.as_mut().unwrap();
+        match field {
+            0 => header.frame_number = 2 + u64::from(round),
+            1 => header.parent_selector = vec![3 + round; 32],
+            2 => header.rank = u64::from(round),
+            _ => header.address = vec![4 + round; 32],
+        }
+        prost::Message::encode_to_vec(&bad)
+    };
+    for round in 0..3u8 {
+        for field in 0..4 {
+            rig.blocks.put_from(digest, bad(round, field), &[round]);
+            assert!(executor.prepare(digest, RANK).is_err(), "fault {field}");
+        }
+    }
+    assert_eq!(
+        rig.blocks.candidates(&digest).len(),
+        3,
+        "one body per member"
+    );
+    // Another member's copy of a held body is not held again.
+    rig.blocks.put_from(digest, bad(0, 0), b"relay");
+    assert!(executor.prepare(digest, RANK).is_err());
+    assert_eq!(rig.blocks.candidates(&digest).len(), 3);
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&frame), b"leader");
+    assert_eq!(rig.blocks.candidates(&digest).len(), 4);
+    assert!(
+        executor.prepare(digest, RANK).is_ok(),
+        "the leader's body held beside the others was never executed"
+    );
 }
 
 #[test]
@@ -1090,6 +1141,39 @@ fn seal_checkpoint_rejects_terminal_and_malformed_bodies_without_execution() {
     }
 }
 
+/// A seal's checkpoint is prepared from the body that is its data frame,
+/// though another body came first under the checkpoint's digest: the digest
+/// does not cover the body, so a peer can deliver another one first.
+#[test]
+fn seal_checkpoint_uses_its_data_frame_though_another_body_came_first() {
+    let rig = rig();
+    let executor = executor(
+        &rig,
+        rig.clock.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    );
+    let (frame, digest) = parent(&rig, 0);
+    let mut bad = frame.clone();
+    bad.header.as_mut().unwrap().frame_number = 2;
+    rig.blocks.put(digest, prost::Message::encode_to_vec(&bad));
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint {
+        frame: 1,
+        view: RANK + 20,
+        digest: digest.0,
+        state_roots: [[0; 32]; 4],
+        history_root: [0; 32],
+    };
+    assert!(executor.prepare_checkpoint(&checkpoint).is_err());
+    offer(&rig, &frame);
+    assert_eq!(rig.blocks.candidates(&digest).len(), 2);
+    let prepared = executor
+        .prepare_checkpoint(&checkpoint)
+        .expect("the checkpoint's data frame is held after another body");
+    assert_eq!(prepared.view, RANK);
+    assert_eq!(prepared.digest, digest);
+}
+
 /// `count` linked unfinalized frames above the genesis tip, one height and one
 /// view apart, stored but never executed; their digests, lowest first.
 fn linked_frames(rig: &Rig, count: u64) -> Vec<Digest> {
@@ -1162,7 +1246,7 @@ fn a_nullified_parent_needs_room_for_a_child_and_is_judged_without_execution() {
     // Eight frames above the tip are within one private execution's reach...
     assert_eq!(
         executor
-            .unfinalized_chain(&tip, frames[7], RANK + 7)
+            .unfinalized_chain(&tip, frames[7], RANK + 7, &|_, _| Ok(()))
             .unwrap()
             .0
             .len(),
@@ -1177,7 +1261,7 @@ fn a_nullified_parent_needs_room_for_a_child_and_is_judged_without_execution() {
     );
     // The ninth is refused by the chain walk, and so by the leader's check.
     let error = executor
-        .unfinalized_chain(&tip, frames[8], RANK + 8)
+        .unfinalized_chain(&tip, frames[8], RANK + 8, &|_, _| Ok(()))
         .unwrap_err()
         .to_string();
     assert!(
@@ -1396,4 +1480,368 @@ fn a_private_parent_citing_an_unheld_frame_fetches_it_before_executing() {
     assert_eq!(cursor(&rig.manager.crdt(), &rig.filter), None);
     drop(prepared);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A member's body delivered first under a parent's digest, which does not
+/// cover the body, neither takes the parent's wait for the GLOBAL frame its
+/// reward citation names nor keeps it from executing: the walk passes over
+/// the member's body, the leader's waits for its cited frame and, once the
+/// frame is fetched, executes.
+#[test]
+fn a_members_body_first_under_a_citing_parent_does_not_take_its_wait() {
+    use super::super::cited_frame_fetch_tests as cf;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let dir = cf::scratch_dir();
+    let mut rig = rig();
+    let anchors_db = quil_store::RocksDb::open_in_memory().unwrap();
+    let anchors = Arc::new(quil_store::RocksClockStore::new(anchors_db.inner()));
+    let txn = anchors.new_transaction(false).unwrap();
+    anchors
+        .put_global_clock_frame(&cf::global_frame(cf::ANCHOR), txn.as_ref())
+        .unwrap();
+    txn.commit().unwrap();
+    let manager = Arc::try_unwrap(rig.manager).ok().unwrap();
+    rig.manager = Arc::new(cf::with_token_suite(manager, anchors.clone(), &dir));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let master = cf::holding(&[cf::CITED]);
+    let executor = executor(
+        &rig,
+        anchors.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    )
+    .with_cited_frame_source(
+        Some(cf::master_source(&master, &calls)),
+        Some(runtime.handle().clone()),
+    );
+    let (mut frame, digest) = parent(&rig, cf::ANCHOR);
+    frame.requests = vec![cf::mint_claim_bundle(cf::CITED)];
+    let header = frame.header.as_mut().unwrap();
+    header.difficulty = 50_000;
+    header.fee_multiplier_vote = 7;
+    let mut forged = frame.clone();
+    forged.header.as_mut().unwrap().frame_number = 2;
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&forged), b"member");
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&frame), b"leader");
+
+    let refused = executor
+        .prepare(digest, RANK)
+        .err()
+        .expect("VULNERABLE: a parent citing an unheld GLOBAL frame must not execute without it");
+    assert!(
+        refused.to_string().contains(CITED_FRAMES_UNFETCHED),
+        "VULNERABLE: the leader's body behind a member's must wait for its cited frame: {refused}"
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while executor.cited_fetch.lock().unwrap().running {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the background fetch must end");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let prepared = executor
+        .prepare(digest, RANK)
+        .expect("once its cited frame is held the leader's body executes");
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(1));
+    drop(prepared);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A member's body delivered first under a deeper unfinalized frame's
+/// digest, with that frame's header and other requests, passes every check
+/// the walk runs on a frame above the tip's child (the header is the
+/// leader's) and fails only its requests root, at execution. The leader's
+/// body held beside it must then be the one executed, as it is at the tip's
+/// child, where the walk checks the root.
+#[test]
+fn a_members_body_under_a_deeper_frame_does_not_keep_the_leaders_from_executing() {
+    let rig = rig();
+    let executor = executor(
+        &rig,
+        rig.clock.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    );
+    let (first, first_digest) = parent(&rig, 0);
+    offer(&rig, &first);
+    let second = child_of(
+        &rig,
+        &executor.prepare(first_digest, RANK).unwrap(),
+        first_digest,
+    );
+    let second_digest = app_frame_digest(&second).unwrap();
+    let mut forged = second.clone();
+    forged.requests = vec![super::super::cited_frame_fetch_tests::mint_claim_bundle(5)];
+    assert_eq!(app_frame_digest(&forged), Some(second_digest));
+    rig.blocks.put_from(
+        second_digest,
+        prost::Message::encode_to_vec(&forged),
+        b"member",
+    );
+    rig.blocks.put_from(
+        second_digest,
+        prost::Message::encode_to_vec(&second),
+        b"leader",
+    );
+    match executor.prepare(second_digest, RANK + 1) {
+        Ok(prepared) => assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(2)),
+        Err(error) => panic!(
+            "VULNERABLE: the selected parent was refused: the walk took a member's body under \
+             its digest and never the leader's held beside it ({error})"
+        ),
+    }
+}
+
+/// A body taken beside a deeper frame's body whose requests root fails
+/// ([`AppParentExecutor::alternate_body`]) waits, as the walked chain does,
+/// for the GLOBAL frame its reward citation names: fetched from the master,
+/// then executed.
+#[test]
+fn a_body_taken_beside_a_refused_one_waits_for_its_cited_frame() {
+    use super::super::cited_frame_fetch_tests as cf;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let dir = cf::scratch_dir();
+    let mut rig = rig();
+    let anchors_db = quil_store::RocksDb::open_in_memory().unwrap();
+    let anchors = Arc::new(quil_store::RocksClockStore::new(anchors_db.inner()));
+    let txn = anchors.new_transaction(false).unwrap();
+    anchors
+        .put_global_clock_frame(&cf::global_frame(cf::ANCHOR), txn.as_ref())
+        .unwrap();
+    txn.commit().unwrap();
+    let manager = Arc::try_unwrap(rig.manager).ok().unwrap();
+    rig.manager = Arc::new(cf::with_token_suite(manager, anchors.clone(), &dir));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let master = cf::holding(&[cf::CITED]);
+    let executor = executor(
+        &rig,
+        anchors.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    )
+    .with_cited_frame_source(
+        Some(cf::master_source(&master, &calls)),
+        Some(runtime.handle().clone()),
+    );
+    let (first, first_digest) = parent(&rig, cf::ANCHOR);
+    offer(&rig, &first);
+    let below = executor.prepare(first_digest, RANK).unwrap();
+    let mut second = child_of(&rig, &below, first_digest);
+    let bundle = cf::mint_claim_bundle(cf::CITED);
+    let canonical = crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).unwrap();
+    let header = second.header.as_mut().unwrap();
+    header.global_frame_number = cf::ANCHOR;
+    header.difficulty = 50_000;
+    header.fee_multiplier_vote = 7;
+    header.requests_root = compute_requests_root(
+        &[canonical],
+        &rig.filter,
+        2,
+        Some(below.manager.as_ref()),
+        Some(&quil_tries::ShaInclusionProver),
+        below.crdt.has_forest(),
+    )
+    .unwrap();
+    second.requests = vec![bundle];
+    drop(below);
+    let digest = app_frame_digest(&second).unwrap();
+    let mut forged = second.clone();
+    forged.requests.clear();
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&forged), b"member");
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&second), b"leader");
+
+    let refused = executor
+        .prepare(digest, RANK + 1)
+        .err()
+        .expect("VULNERABLE: a body citing an unheld GLOBAL frame must not execute without it");
+    assert!(
+        refused.to_string().contains(CITED_FRAMES_UNFETCHED),
+        "VULNERABLE: the body taken beside the refused one must wait for its cited frame: \
+         {refused}"
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while executor.cited_fetch.lock().unwrap().running {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the background fetch must end");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let prepared = executor
+        .prepare(digest, RANK + 1)
+        .expect("once its cited frame is held the leader's body executes");
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(2));
+    drop(prepared);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A member's body under a deeper frame's digest, with the leader's header
+/// and other requests that cite a GLOBAL frame this node lacks, has its
+/// requests root checked before its citations are held: the leader's body
+/// held beside it executes, and the member's body forces no fetch and no
+/// wait for the frame it cites.
+#[test]
+fn a_members_body_under_a_deeper_frame_forces_no_cited_frame_fetch() {
+    use super::super::cited_frame_fetch_tests as cf;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let dir = cf::scratch_dir();
+    let mut rig = rig();
+    let anchors_db = quil_store::RocksDb::open_in_memory().unwrap();
+    let anchors = Arc::new(quil_store::RocksClockStore::new(anchors_db.inner()));
+    let txn = anchors.new_transaction(false).unwrap();
+    anchors
+        .put_global_clock_frame(&cf::global_frame(cf::ANCHOR), txn.as_ref())
+        .unwrap();
+    txn.commit().unwrap();
+    let manager = Arc::try_unwrap(rig.manager).ok().unwrap();
+    rig.manager = Arc::new(cf::with_token_suite(manager, anchors.clone(), &dir));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let master = cf::holding(&[cf::CITED]);
+    let executor = executor(
+        &rig,
+        anchors.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    )
+    .with_cited_frame_source(
+        Some(cf::master_source(&master, &calls)),
+        Some(runtime.handle().clone()),
+    );
+    let (first, first_digest) = parent(&rig, cf::ANCHOR);
+    offer(&rig, &first);
+    let below = executor.prepare(first_digest, RANK).unwrap();
+    let mut second = child_of(&rig, &below, first_digest);
+    second.header.as_mut().unwrap().global_frame_number = cf::ANCHOR;
+    drop(below);
+    let digest = app_frame_digest(&second).unwrap();
+    let mut forged = second.clone();
+    forged.requests = vec![cf::mint_claim_bundle(cf::CITED)];
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&forged), b"member");
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&second), b"leader");
+
+    let prepared = match executor.prepare(digest, RANK + 1) {
+        Ok(prepared) => prepared,
+        Err(error) => panic!(
+            "VULNERABLE: the selected parent was refused on a member's body whose requests \
+             root fails: its citations were held before its root was checked ({error})"
+        ),
+    };
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(2));
+    assert_eq!(
+        prepared.chain_bodies[1].2,
+        prost::Message::encode_to_vec(&second)
+    );
+    // A fetch spawned on the runtime runs only while it is driven; the
+    // timer is made inside it (made outside, it panics: no reactor).
+    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+    assert!(
+        !executor.cited_fetch.lock().unwrap().running,
+        "VULNERABLE: a member's refused body started a fetch of the frame it cites"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "VULNERABLE: a member's refused body made this node fetch the frame it cites"
+    );
+    drop(prepared);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The body taken beside a deeper frame's body whose requests root fails is
+/// the one a resent chain ships ([`PrivateAppParent::chain_bodies`]), not the
+/// refused one.
+#[test]
+fn the_body_taken_beside_a_refused_one_is_the_one_resent() {
+    let rig = rig();
+    let executor = executor(
+        &rig,
+        rig.clock.clone(),
+        true,
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    );
+    let (first, first_digest) = parent(&rig, 0);
+    offer(&rig, &first);
+    let second = child_of(
+        &rig,
+        &executor.prepare(first_digest, RANK).unwrap(),
+        first_digest,
+    );
+    let second_digest = app_frame_digest(&second).unwrap();
+    let mut forged = second.clone();
+    forged.requests = vec![super::super::cited_frame_fetch_tests::mint_claim_bundle(5)];
+    let (forged, second) = (
+        prost::Message::encode_to_vec(&forged),
+        prost::Message::encode_to_vec(&second),
+    );
+    rig.blocks
+        .put_from(second_digest, forged.clone(), b"member");
+    rig.blocks
+        .put_from(second_digest, second.clone(), b"leader");
+    let prepared = executor.prepare(second_digest, RANK + 1).unwrap();
+    let resent: Vec<&Vec<u8>> = prepared.chain_bodies.iter().map(|(_, _, b)| b).collect();
+    assert_eq!(
+        resent,
+        vec![&prost::Message::encode_to_vec(&first), &second],
+        "VULNERABLE: a resend would ship the refused body ({} bytes) instead of the one \
+         executed",
+        forged.len()
+    );
+}
+
+/// A body under a seal checkpoint's digest with the data frame's number and
+/// another view, held first, does not keep the checkpoint from its data
+/// frame: the digest covers only the output, and only a body passing
+/// proposal validation names the data frame's view.
+#[test]
+fn seal_checkpoint_takes_its_validated_data_frame_though_another_view_came_first() {
+    let rig = rig();
+    let executor = executor_with(
+        &rig,
+        rig.clock.clone(),
+        Arc::new(|frame: &AppShardFrame| Ok(frame.header.as_ref().is_some_and(|h| h.rank == RANK))),
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    );
+    let (frame, digest) = parent(&rig, 0);
+    let mut forged = frame.clone();
+    forged.header.as_mut().unwrap().rank = RANK + 3;
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&forged), b"member");
+    rig.blocks
+        .put_from(digest, prost::Message::encode_to_vec(&frame), b"leader");
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint {
+        frame: 1,
+        view: RANK + 20,
+        digest: digest.0,
+        state_roots: [[0; 32]; 4],
+        history_root: [0; 32],
+    };
+    let prepared = match executor.prepare_checkpoint(&checkpoint) {
+        Ok(prepared) => prepared,
+        Err(error) => panic!(
+            "VULNERABLE: the checkpoint was prepared from a member's body naming another view, \
+             not its data frame held beside it ({error})"
+        ),
+    };
+    assert_eq!(prepared.view, RANK);
+    assert_eq!(prepared.digest, digest);
 }

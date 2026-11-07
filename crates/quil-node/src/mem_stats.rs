@@ -48,6 +48,9 @@ pub struct StructuralSizes {
     /// Messages and bytes held by the shard mempools.
     pub app_engine_mempool_messages: usize,
     pub app_engine_mempool_bytes: usize,
+    /// Submission arrival stamps the shard engines hold for the routing
+    /// fallback.
+    pub app_engine_routing_seen: usize,
     pub app_engine_proposal_cache: usize,
     pub app_engine_pending_certified_parents: usize,
 }
@@ -515,11 +518,12 @@ impl StructuralSources {
         // Aggregate per-shard engine sizes. Quick read-lock on the
         // shard_engines map, then snapshot each handle's atomic
         // sizes slot.
-        let (fs, mm, mb, pc, pcp) = {
+        let (fs, mm, mb, rs, pc, pcp) = {
             let engines = self.shard_engines.read();
             let mut fs = 0usize;
             let mut mm = 0usize;
             let mut mb = 0usize;
+            let mut rs = 0usize;
             let mut pc = 0usize;
             let mut pcp = 0usize;
             for handle in engines.values() {
@@ -527,10 +531,11 @@ impl StructuralSources {
                 fs += s.frame_store;
                 mm += s.mempool_messages;
                 mb += s.mempool_bytes;
+                rs += s.routing_seen;
                 pc += s.proposal_cache;
                 pcp += s.pending_certified_parents;
             }
-            (fs, mm, mb, pc, pcp)
+            (fs, mm, mb, rs, pc, pcp)
         };
         StructuralSizes {
             peer_info_cache: self.peer_info_cache.read().len(),
@@ -546,6 +551,7 @@ impl StructuralSources {
             app_engine_frame_store: fs,
             app_engine_mempool_messages: mm,
             app_engine_mempool_bytes: mb,
+            app_engine_routing_seen: rs,
             app_engine_proposal_cache: pc,
             app_engine_pending_certified_parents: pcp,
         }
