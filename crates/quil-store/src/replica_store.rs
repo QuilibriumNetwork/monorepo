@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use quil_crypto::storage_proof::{MerkleCap, NODE_BYTES};
 use quil_types::error::{QuilError, Result};
@@ -68,7 +69,21 @@ const SNAPSHOT_REUSE: u8 = 0x08;
 /// replica to open one node of it (`MerkleCap::subtree`).
 pub const CHUNK_NODES: u64 = 1 << quil_crypto::storage_proof::CAP_HEIGHT;
 /// Chunks written per batch: bounds what writing a replica copies at once.
+/// The most a batch holds: fewer on a disk slower than [`WalPace`] allows.
 const CHUNKS_PER_BATCH: usize = 512;
+/// The fewest chunks a batch is cut to ([`WalPace::batch_chunks`]), 1 MiB:
+/// below it a sync's own cost outweighs its bytes. A disk slower than this
+/// a [`REPLICA_SYNC_TARGET`] (20 MB/s) is paced by time instead.
+const MIN_CHUNKS_PER_BATCH: usize = 32;
+/// How long a batch of replica nodes may take the disk to sync
+/// ([`WalPace`]): the store's synced commits sync its write-ahead log, and
+/// every write made before them with it, and a frame's votes wait on about
+/// 8 of them in turn within its 10 s. 50 ms keeps a replica's share to
+/// half of the 100 ms a store fsync is warned at.
+const REPLICA_SYNC_TARGET: Duration = Duration::from_millis(50);
+/// Batch syncs a disk's speed is taken from: their median ignores up to
+/// three slow ones, as behind a compaction.
+const PACE_WINDOW: usize = 8;
 /// Chunks read per range scan when a whole replica is loaded.
 const CHUNKS_PER_SCAN: u64 = 256;
 /// A table file at least this large under replica keys holds a whole
@@ -441,6 +456,71 @@ fn hash_writes() -> &'static Mutex<()> {
     &WRITES
 }
 
+/// How a replica's nodes go into the store, which the consensus commits
+/// share: each batch is synced on its own before the next is written, so
+/// a synced commit of the store's waits behind at most one batch, not
+/// behind every node written since the last (an epoch's replicas are
+/// 1-1.7 GB a seat, written at once). Each sync is timed and the next
+/// batch cut to what the disk synced in [`REPLICA_SYNC_TARGET`] at the
+/// median of the latest; a sync past it is followed by as long a wait,
+/// leaving the disk to the store's commits. A fast disk keeps
+/// [`CHUNKS_PER_BATCH`] and never waits.
+struct WalPace {
+    /// Seconds a byte of the latest [`PACE_WINDOW`] syncs, the oldest
+    /// replaced first.
+    recent: [f64; PACE_WINDOW],
+    /// Syncs timed in all.
+    timed: usize,
+}
+
+impl WalPace {
+    const fn new() -> Self {
+        Self {
+            recent: [0.0; PACE_WINDOW],
+            timed: 0,
+        }
+    }
+
+    /// Chunks of the next batch: what the disk synced in
+    /// [`REPLICA_SYNC_TARGET`] at the median of the latest syncs, from
+    /// [`MIN_CHUNKS_PER_BATCH`] to [`CHUNKS_PER_BATCH`], the most until a
+    /// sync is timed.
+    fn batch_chunks(&self) -> usize {
+        let timed = self.timed.min(PACE_WINDOW);
+        let mut recent = self.recent;
+        let recent = &mut recent[..timed];
+        recent.sort_unstable_by(f64::total_cmp);
+        let Some(&per_byte) = recent.get(timed / 2) else {
+            return CHUNKS_PER_BATCH;
+        };
+        let chunk_bytes = (CHUNK_NODES as usize * NODE_BYTES) as f64;
+        let chunks = REPLICA_SYNC_TARGET.as_secs_f64() / per_byte / chunk_bytes;
+        if chunks >= CHUNKS_PER_BATCH as f64 {
+            return CHUNKS_PER_BATCH;
+        }
+        (chunks as usize).clamp(MIN_CHUNKS_PER_BATCH, CHUNKS_PER_BATCH)
+    }
+
+    /// Time a sync of a batch of `bytes` that `took` (a batch of at least
+    /// [`MIN_CHUNKS_PER_BATCH`]: a replica's smaller end costs more than
+    /// its bytes): returns how long to wait before the next batch, what it
+    /// took past [`REPLICA_SYNC_TARGET`].
+    fn synced(&mut self, bytes: u64, took: Duration) -> Duration {
+        let batch = (MIN_CHUNKS_PER_BATCH * CHUNK_NODES as usize * NODE_BYTES) as u64;
+        if bytes >= batch {
+            self.recent[self.timed % PACE_WINDOW] = took.as_secs_f64() / bytes as f64;
+            self.timed += 1;
+        }
+        took.saturating_sub(REPLICA_SYNC_TARGET)
+    }
+}
+
+/// This process's [`WalPace`]: replica writes take turns ([`hash_writes`]).
+fn wal_pace() -> std::sync::MutexGuard<'static, WalPace> {
+    static PACE: Mutex<WalPace> = Mutex::new(WalPace::new());
+    PACE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 type LeafCacheKey = (usize, u64, Vec<u8>);
 
 /// Leaf records read recently, by store, epoch and leaf id: every frame a
@@ -633,13 +713,34 @@ impl ReplicaStore {
             &chunk_key(epoch, leaf_id, u32::MAX),
         )?;
         let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
-        for (batch, nodes) in replica.chunks(chunk_bytes * CHUNKS_PER_BATCH).enumerate() {
+        let (mut rest, mut index) = (replica, 0u32);
+        let (mut batches, mut syncing, mut waited) = (0u64, Duration::ZERO, Duration::ZERO);
+        while !rest.is_empty() {
+            let chunks = wal_pace().batch_chunks();
+            let (nodes, after) = rest.split_at(rest.len().min(chunks * chunk_bytes));
             let txn = self.db.new_batch(false)?;
-            for (i, chunk) in nodes.chunks(chunk_bytes).enumerate() {
-                let index = (batch * CHUNKS_PER_BATCH + i) as u32;
+            for chunk in nodes.chunks(chunk_bytes) {
                 txn.set(&chunk_key(epoch, leaf_id, index), chunk)?;
+                index += 1;
             }
             txn.commit()?;
+            // Synced on its own, so the store's next synced commit does not
+            // take it; past the target, the disk is left to them a while.
+            let started = Instant::now();
+            self.db.sync_wal()?;
+            let took = started.elapsed();
+            let wait = wal_pace().synced(nodes.len() as u64, took);
+            std::thread::sleep(wait);
+            (batches, syncing, waited) = (batches + 1, syncing + took, waited + wait);
+            rest = after;
+        }
+        if !waited.is_zero() {
+            tracing::info!(epoch, leaf = %hex::encode(leaf_id), bytes = replica.len(), batches,
+                sync_seconds = syncing.as_secs_f64(), wait_seconds = waited.as_secs_f64(),
+                target_ms = REPLICA_SYNC_TARGET.as_millis() as u64, scope = "this node",
+                "storage replica written to the store in synced batches slower than \
+                 `target_ms` each, waiting as long after each, so the store's synced commits \
+                 do not wait behind it; check this node's disk write speed if this recurs");
         }
         let n = (replica.len() / NODE_BYTES) as u64;
         self.db.set(
@@ -1759,5 +1860,250 @@ mod tests {
                 (b"leaf-2".to_vec(), b"r2".to_vec()),
             ]
         );
+    }
+
+    /// What a store's write-ahead log holds not yet synced, on a disk
+    /// syncing it at a rate ([`SlowWal`]).
+    #[derive(Default)]
+    struct WalState {
+        /// Replica bytes committed since the last sync.
+        unsynced: u64,
+        /// Batches committed.
+        commits: u64,
+        /// The most bytes not yet synced as a batch after the first was
+        /// committed: what a synced commit of the store's would have
+        /// waited behind.
+        tail: u64,
+        /// When the first sync ended, and how long until the next batch.
+        first_synced: Option<Instant>,
+        idle: Option<Duration>,
+    }
+
+    /// A store whose log a disk writing `rate` bytes a second syncs: a
+    /// sync takes as long as its unsynced bytes take that disk.
+    struct SlowWal {
+        inner: Arc<crate::RocksDb>,
+        rate: f64,
+        state: Arc<Mutex<WalState>>,
+    }
+
+    struct SlowWalBatch {
+        inner: Box<dyn quil_types::store::Transaction>,
+        bytes: AtomicU64,
+        state: Arc<Mutex<WalState>>,
+    }
+
+    impl quil_types::store::Transaction for SlowWalBatch {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.bytes.fetch_add(value.len() as u64, Ordering::SeqCst);
+            self.inner.set(key, value)
+        }
+        fn commit(self: Box<Self>) -> Result<()> {
+            let bytes = self.bytes.load(Ordering::SeqCst);
+            self.inner.commit()?;
+            let mut wal = self.state.lock().unwrap();
+            wal.unsynced += bytes;
+            wal.commits += 1;
+            if wal.commits > 1 {
+                wal.tail = wal.tail.max(wal.unsynced);
+            }
+            if let (Some(synced), None) = (wal.first_synced, wal.idle) {
+                wal.idle = Some(synced.elapsed());
+            }
+            Ok(())
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn abort(self: Box<Self>) -> Result<()> {
+            self.inner.abort()
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
+            self.inner.delete_range(lower, upper)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl KvDb for SlowWal {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            Ok(Box::new(SlowWalBatch {
+                inner: self.inner.new_batch(indexed)?,
+                bytes: AtomicU64::new(0),
+                state: self.state.clone(),
+            }))
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            self.inner.compact(start, end, parallelize)
+        }
+        fn compact_all(&self) -> Result<()> {
+            self.inner.compact_all()
+        }
+        fn sync_wal(&self) -> Result<()> {
+            let unsynced = std::mem::take(&mut self.state.lock().unwrap().unsynced);
+            std::thread::sleep(Duration::from_secs_f64(unsynced as f64 / self.rate));
+            let mut wal = self.state.lock().unwrap();
+            if wal.first_synced.is_none() {
+                wal.first_synced = Some(Instant::now());
+            }
+            Ok(())
+        }
+        fn close(&self) -> Result<()> {
+            self.inner.close()
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            self.inner.delete_range(start, end)
+        }
+    }
+
+    /// An epoch's replicas, 1-1.7 GB a seat, go into the store the
+    /// consensus commits share: written in batches never synced, each
+    /// synced commit of the store's took every byte written since the
+    /// last with it. Each batch is now synced on its own, cut to what the
+    /// disk synced in [`REPLICA_SYNC_TARGET`] once one is timed, and one
+    /// synced past it leaves the disk idle as long (2026-11-07).
+    #[test]
+    fn a_replica_is_synced_a_batch_at_a_time_so_a_store_commit_waits_behind_one() {
+        // 32 MiB/s: the first, whole batch of 16 MiB takes it 500 ms.
+        let rate = (32u64 << 20) as f64;
+        let state = Arc::new(Mutex::new(WalState::default()));
+        let wal = SlowWal {
+            inner: Arc::new(crate::RocksDb::open_in_memory().unwrap()),
+            rate,
+            state: state.clone(),
+        };
+        let s = ReplicaStore::new(Arc::new(wal));
+        let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
+        let chunks = CHUNKS_PER_BATCH + 256;
+        let mut replica = vec![0u8; chunks * chunk_bytes];
+        for (i, chunk) in replica.chunks_mut(chunk_bytes).enumerate() {
+            chunk[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        }
+        // Not a cap that decodes: the leaf record is compared as bytes.
+        let cap = [1u8; 64];
+        s.put_hash(6, b"slow", &replica, &cap, &[7u8; 96]).unwrap();
+        let wal = state.lock().unwrap();
+        let behind = Duration::from_secs_f64(wal.tail as f64 / rate);
+        assert!(
+            behind <= REPLICA_SYNC_TARGET,
+            "PACE-REPLICA-TAIL: after a replica's first batch, a synced commit of the store \
+             would have waited {behind:?} behind {} replica bytes not yet synced, past \
+             {REPLICA_SYNC_TARGET:?}",
+            wal.tail
+        );
+        let idle = wal.idle.unwrap_or_default();
+        assert!(
+            idle >= Duration::from_millis(450),
+            "PACE-REPLICA-IDLE: a batch synced in 500 ms, 450 ms past the target, left the \
+             disk to the store's commits for {idle:?}"
+        );
+        drop(wal);
+        // Batches of every size keep each chunk at its index.
+        for (i, chunk) in replica.chunks(chunk_bytes).enumerate() {
+            let stored = s.db.get(&chunk_key(6, b"slow", i as u32)).unwrap();
+            assert_eq!(stored.as_deref(), Some(chunk), "chunk {i}");
+        }
+        assert_eq!(
+            s.db.get(&chunk_key(6, b"slow", chunks as u32)).unwrap(),
+            None
+        );
+        let n = (replica.len() / NODE_BYTES) as u64;
+        assert_eq!(
+            s.db.get(&leaf_key(6, b"slow")).unwrap(),
+            Some(HashLeaf::encode(n, &cap, &[7u8; 96]))
+        );
+    }
+
+    /// A slow disk gets replica batches it syncs within
+    /// [`REPLICA_SYNC_TARGET`]: a whole batch of 16 MiB took one writing
+    /// 40 MB/s 419 ms.
+    #[test]
+    fn replica_batches_are_cut_to_what_a_slow_disk_syncs_within_the_target() {
+        let chunk = (CHUNK_NODES as usize * NODE_BYTES) as f64;
+        for mb_s in [40.0, 80.0, 400.0] {
+            let rate = mb_s * 1e6;
+            let mut pace = WalPace::new();
+            let mut chunks = pace.batch_chunks();
+            assert_eq!(chunks, CHUNKS_PER_BATCH, "the most until a sync is timed");
+            for _ in 0..2 * PACE_WINDOW {
+                let bytes = chunks as f64 * chunk;
+                pace.synced(bytes as u64, Duration::from_secs_f64(bytes / rate));
+                chunks = pace.batch_chunks();
+            }
+            let took = Duration::from_secs_f64(chunks as f64 * chunk / rate);
+            assert!(
+                took <= REPLICA_SYNC_TARGET && took >= REPLICA_SYNC_TARGET / 2,
+                "PACE-REPLICA-CUT: at {mb_s} MB/s a batch of {chunks} chunks takes {took:?} \
+                 to sync, against {REPLICA_SYNC_TARGET:?}"
+            );
+        }
+    }
+
+    /// A disk too slow even for the smallest batch in
+    /// [`REPLICA_SYNC_TARGET`] waits as long as a sync overran it before
+    /// the next: the store's commits get about half of it.
+    #[test]
+    fn a_replica_batch_synced_past_the_target_is_followed_by_as_long_a_wait() {
+        let mut pace = WalPace::new();
+        let batch = (MIN_CHUNKS_PER_BATCH * CHUNK_NODES as usize * NODE_BYTES) as u64;
+        let over = Duration::from_millis(100);
+        let wait = pace.synced(batch, REPLICA_SYNC_TARGET + over);
+        let chunks = pace.batch_chunks();
+        assert!(
+            wait == over && chunks == MIN_CHUNKS_PER_BATCH,
+            "PACE-REPLICA-OVERRUN: a batch of {batch} bytes synced {over:?} past \
+             {REPLICA_SYNC_TARGET:?}: a wait of {wait:?}, then {chunks} chunks"
+        );
+    }
+
+    /// A disk syncing a whole batch well within [`REPLICA_SYNC_TARGET`]
+    /// keeps whole batches and never waits; a replica's small end, which
+    /// costs more than its bytes, does not count as the disk's speed.
+    #[test]
+    fn a_fast_disk_keeps_whole_replica_batches_and_no_waits() {
+        let chunk = CHUNK_NODES as usize * NODE_BYTES;
+        let mut pace = WalPace::new();
+        for _ in 0..2 * PACE_WINDOW {
+            // 1.7 GB/s.
+            let wait = pace.synced((CHUNKS_PER_BATCH * chunk) as u64, Duration::from_millis(10));
+            assert!(
+                wait.is_zero() && pace.batch_chunks() == CHUNKS_PER_BATCH,
+                "PACE-REPLICA-FAST: a fast disk's batches are cut or waited for"
+            );
+        }
+        for _ in 0..PACE_WINDOW {
+            let wait = pace.synced((4 * chunk) as u64, Duration::from_millis(5));
+            assert!(
+                wait.is_zero() && pace.batch_chunks() == CHUNKS_PER_BATCH,
+                "PACE-REPLICA-FAST: a replica's small ends cut the batches"
+            );
+        }
     }
 }
