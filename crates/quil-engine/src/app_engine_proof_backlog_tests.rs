@@ -579,7 +579,8 @@ fn a_finalized_frames_verification_takes_the_slot_background_work_leaves_free() 
         &voter.filter,
         &warm,
         &voter.filter,
-        1
+        1,
+        None
     ));
     assert!(admission_verify::offer_submission(
         &queue,

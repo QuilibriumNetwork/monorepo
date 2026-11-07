@@ -619,14 +619,14 @@ impl ArchiveAppShardIngest {
             let held = self
                 .buffered
                 .get(address)
-                .and_then(|frames| frames.get(&next))
-                .map(|frame| frame.requests.as_slice());
+                .and_then(|frames| frames.get(&next));
             let body = match held {
-                Some(requests) => {
-                    if !budget.take(PlanBudget::bundle_bytes(requests)) {
+                Some(frame) => {
+                    if !budget.take(PlanBudget::bundle_bytes(&frame.requests)) {
                         break;
                     }
-                    PlannedBody::Held(requests.to_vec())
+                    let anchor = crate::archive_preverify::frame_anchor(frame);
+                    PlannedBody::Held(frame.requests.clone(), anchor)
                 }
                 None if self
                     .stored
@@ -644,7 +644,8 @@ impl ArchiveAppShardIngest {
                         if !budget.take(PlanBudget::bundle_bytes(&frame.requests)) {
                             break;
                         }
-                        PlannedBody::Held(frame.requests)
+                        let anchor = crate::archive_preverify::frame_anchor(&frame);
+                        PlannedBody::Held(frame.requests, anchor)
                     }
                     None => break,
                 },
@@ -1146,9 +1147,10 @@ impl ArchiveAppShardIngest {
             .as_ref()
             .filter(|_| !frame.requests.is_empty())
             .map(|_| frame.requests.clone());
+        let anchor = crate::archive_preverify::frame_anchor(&frame);
         self.admit(&address, frame, certified);
         if let (Some(prewarm), Some(requests)) = (self.prewarm.as_ref(), prewarm) {
-            prewarm.offer(&address, frame_number, &requests);
+            prewarm.offer(&address, frame_number, anchor, &requests);
         }
         if !self.sequenced {
             self.try_materialize(&address);

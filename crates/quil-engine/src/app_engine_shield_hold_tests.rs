@@ -1,6 +1,7 @@
 //! What a submission nobody can decide costs a shard's mempool, and that real
 //! shields outlast a stall. Only interfaces of the release base, so the same
-//! file shows the vulnerable outcome there.
+//! file shows the vulnerable outcome there, but for the proof deferral's
+//! anchor, which the base does not take.
 use super::*;
 use quil_consensus::leader_provider::LeaderProvider as _;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -251,7 +252,6 @@ fn formed_shield(rig: &Rig) -> Vec<u8> {
 /// [`formed_shield`] of the same coin and key, its statement told apart by
 /// `opening` (its output's opening seed) and its proof by `proof_tail`.
 fn formed_shield_with(rig: &Rig, opening: u8, proof_tail: &[u8]) -> Vec<u8> {
-    use quil_execution::token_intrinsic::{legacy_migration, materialize};
     use quil_lattice_ct::confidential::{
         relation::membership::IDENTITY_BYTES,
         shield::{Shield, ShieldStatement},
@@ -260,36 +260,7 @@ fn formed_shield_with(rig: &Rig, opening: u8, proof_tail: &[u8]) -> Vec<u8> {
     };
     use quil_types::crypto::Signer as _;
     let application = quil_execution::domains::QUIL_TOKEN;
-    let private = [23; 57];
-    let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
-    let coin = legacy_migration::TransparentCoin {
-        owner_address: quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap(),
-        amount: 12,
-    };
-    let type_hash = legacy_migration::transparent_type_hash(&application).unwrap();
-    let (source, tree) = (0..=u8::MAX)
-        .map(|salt| {
-            let tree =
-                legacy_migration::create_transparent_coin_tree(&coin, &type_hash, &[salt; 32])
-                    .unwrap();
-            (materialize::coin_content_address(&tree).unwrap(), tree)
-        })
-        .find(|(address, _)| shard_covers(&rig.leader.filter, address))
-        .expect("no legacy coin lies in the rig's shard");
-    let state = quil_execution::hypergraph_state::HypergraphState::new(
-        rig.engine.execution_engine.as_ref().unwrap().crdt(),
-    );
-    state
-        .set(
-            &application,
-            &source,
-            &quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap(),
-            1,
-            quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
-        )
-        .unwrap();
-    state.commit().unwrap();
-    state.abort();
+    let (source, private, public) = legacy_source(rig);
     let context = parameter_context(&network(), &application);
     let key = CommitmentKey::derive(&context);
     let opening = AmountOpening::from_seed(&context, &[opening; 32]);
@@ -322,6 +293,93 @@ fn formed_shield_with(rig: &Rig, opening: u8, proof_tail: &[u8]) -> Vec<u8> {
     }
     .encode()
     .unwrap()
+}
+
+/// A batch shield of the coin and key of [`formed_shield`] that passes
+/// every check before its proof, its one output owned by `owner`.
+fn formed_batch_shield(
+    rig: &Rig,
+    owner: [u8; quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES],
+) -> Vec<u8> {
+    use quil_lattice_ct::confidential::{
+        shield::{BatchShield, BatchShieldStatement, ShieldSource},
+        transfer::{parameter_context, Output, MEMO_BYTES},
+        AmountOpening, CommitmentKey,
+    };
+    use quil_types::crypto::Signer as _;
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let (source, private, public) = legacy_source(rig);
+    let context = parameter_context(&network(), &application);
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let statement = BatchShieldStatement {
+        network: network(),
+        application,
+        owner_public_key: public.clone().try_into().unwrap(),
+        sources: vec![ShieldSource {
+            address: source,
+            amount: 12,
+        }],
+        fee: 2,
+        outputs: vec![Output {
+            commitment: CommitmentKey::derive(&context)
+                .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+            owner,
+            memo: [6; MEMO_BYTES],
+        }],
+    };
+    let signature = quil_crypto::Ed448Signer::from_bytes(&private, &public)
+        .unwrap()
+        .sign(&statement.context_bytes().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    BatchShield {
+        statement,
+        signature,
+        proof,
+    }
+    .encode()
+    .unwrap()
+}
+
+/// The legacy coin the formed shields spend, of the key derived from
+/// `[23; 57]`, written into the rig's store in the rig's shard: its address
+/// and the key's private and public halves.
+fn legacy_source(rig: &Rig) -> ([u8; 32], [u8; 57], Vec<u8>) {
+    use quil_execution::token_intrinsic::{legacy_migration, materialize};
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let private = [23; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+    let coin = legacy_migration::TransparentCoin {
+        owner_address: quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap(),
+        amount: 12,
+    };
+    let type_hash = legacy_migration::transparent_type_hash(&application).unwrap();
+    let (source, tree) = (0..=u8::MAX)
+        .map(|salt| {
+            let tree =
+                legacy_migration::create_transparent_coin_tree(&coin, &type_hash, &[salt; 32])
+                    .unwrap();
+            (materialize::coin_content_address(&tree).unwrap(), tree)
+        })
+        .find(|(address, _)| shard_covers(&rig.leader.filter, address))
+        .expect("no legacy coin lies in the rig's shard");
+    let state = quil_execution::hypergraph_state::HypergraphState::new(
+        rig.engine.execution_engine.as_ref().unwrap().crdt(),
+    );
+    state
+        .set(
+            &application,
+            &source,
+            &quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap(),
+            1,
+            quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+    state.commit().unwrap();
+    state.abort();
+    (source, private, public)
 }
 
 fn bundle(requests: Vec<Vec<u8>>) -> Vec<u8> {
@@ -1030,5 +1088,60 @@ async fn a_transfer_of_another_shard_is_held_only_until_its_routing_fallback() {
         rig.collector.total_pending(),
         0,
         "the fallback ends the hold"
+    );
+}
+
+/// A frame anchored before the canonical owner frame G carries a batch
+/// shield whose output owner is not a canonical identity: execution at that
+/// anchor admits the owner and verifies the shield's proof. A member that
+/// trailed its committee by more than `GLOBAL_ANCHOR_SAFETY_MARGIN` frames
+/// at the crossing materializes the frame after it saw GLOBAL frame G +
+/// `MINT_CLAIM_CITATION_LAG`, from which the read-ahead refuses such an
+/// owner for a frame not known yet. Judged at the frame's own anchor, the
+/// frame still waits for the proof on the background thread instead of
+/// materializing at once and verifying it inline while it holds the engine
+/// (a batch shield held every member for 5-14 min). A frame anchored at G
+/// refuses the owner before the proof and waits for nothing.
+#[tokio::test]
+async fn a_frame_anchored_before_the_owner_gate_waits_for_its_shield_in_the_background() {
+    use quil_execution::token_intrinsic::{constants::MINT_CLAIM_CITATION_LAG, global_commit};
+    use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+    use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+    const G: u64 = 1_000;
+    let rig = rig(half(false), Proofs::Absent);
+    let exec = rig.engine.execution_engine.clone().unwrap();
+    let shield = formed_batch_shield(&rig, [0xff; IDENTITY_BYTES]);
+    let requests = vec![MessageBundle {
+        requests: vec![MessageRequest {
+            timestamp: 0,
+            request: Some(Request::TokenOperation(
+                quil_types::proto::token::TokenOperation {
+                    canonical_bytes: shield,
+                },
+            )),
+        }],
+        timestamp: 1,
+    }];
+    global_commit::set_canonical_owner_frame_for_thread(Some(G));
+    global_commit::set_batch_shield_frame_for_thread(Some(0));
+    quil_types::consensus::note_frame_time_head(G + MINT_CLAIM_CITATION_LAG);
+    let at_gate = rig
+        .engine
+        .defer_for_proof_verification(&exec, &requests, 8, Some(G));
+    let before_gate = rig
+        .engine
+        .defer_for_proof_verification(&exec, &requests, 9, Some(G - 1));
+    global_commit::set_canonical_owner_frame_for_thread(None);
+    global_commit::set_batch_shield_frame_for_thread(None);
+    assert!(
+        at_gate.is_none(),
+        "a frame anchored at G waits for a proof its execution refuses before verifying: \
+         {at_gate:?}"
+    );
+    assert!(
+        before_gate.is_some(),
+        "READ-AHEAD: a frame anchored before G materializes at once and verifies its batch \
+         shield's proof inline, the owner judged at the latest GLOBAL frame seen instead of \
+         the frame's anchor"
     );
 }

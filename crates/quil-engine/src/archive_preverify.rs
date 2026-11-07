@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use quil_execution::manager::{PreverifyCounts, PreverifyPacing};
+use quil_execution::manager::{ExecutingFrame, PreverifyCounts, PreverifyPacing};
 use quil_execution::token_intrinsic::spend_relay::RELAY_WINDOW_FRAMES;
 use quil_lattice_ct::confidential::relation::backend::worker_client::{
     slot_busy_total, take_longest_slot_hold,
@@ -89,6 +89,16 @@ fn canonical_pairs(address: &[u8], requests: &[MessageBundle]) -> Vec<(Vec<u8>, 
 
 fn encoded_len(requests: &[MessageBundle]) -> usize {
     requests.iter().map(prost::Message::encoded_len).sum()
+}
+
+/// The GLOBAL frame `frame` is anchored at, as its materialization takes it
+/// (`None`: without an anchor).
+pub(crate) fn frame_anchor(frame: &quil_types::proto::global::AppShardFrame) -> Option<u64> {
+    frame
+        .header
+        .as_ref()
+        .map(|header| header.global_frame_number)
+        .filter(|anchor| *anchor != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +189,7 @@ struct PrewarmState {
 struct PrewarmItem {
     address: Vec<u8>,
     frame: u64,
+    anchor: Option<u64>,
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
     bytes: usize,
 }
@@ -245,12 +256,20 @@ impl ProofPrewarm {
         self
     }
 
-    /// Queue the bundles of frame `frame` of `address`, admitted above the
-    /// cursor, without waiting. The lanes start with the first frame. A frame
-    /// carrying expensive operations is recorded until GLOBAL executes it
-    /// ([`ProofSettlement`]), also when the queue drops it: GLOBAL then
-    /// verifies it when it materializes it, and the hold limit applies.
-    pub fn offer(&self, address: &[u8], frame: u64, requests: &[MessageBundle]) {
+    /// Queue the bundles of frame `frame` of `address`, anchored at GLOBAL
+    /// frame `anchor` and admitted above the cursor, without waiting: they
+    /// are verified as that frame executes them. The lanes start with the
+    /// first frame. A frame carrying expensive operations is recorded until
+    /// GLOBAL executes it ([`ProofSettlement`]), also when the queue drops
+    /// it: GLOBAL then verifies it when it materializes it, and the hold
+    /// limit applies.
+    pub fn offer(
+        &self,
+        address: &[u8],
+        frame: u64,
+        anchor: Option<u64>,
+        requests: &[MessageBundle],
+    ) {
         if requests.is_empty() {
             return;
         }
@@ -274,6 +293,7 @@ impl ProofPrewarm {
         state.queue.push_back(PrewarmItem {
             address: address.to_vec(),
             frame,
+            anchor,
             pairs,
             bytes,
         });
@@ -371,6 +391,7 @@ impl PrewarmShared {
                     done: None,
                     pause: Some(pause),
                     background: false,
+                    executing: ExecutingFrame::App(item.anchor),
                 },
             );
             let mut state = self.lock();
@@ -899,9 +920,10 @@ pub struct PrepassReport {
     pub counts: PreverifyCounts,
 }
 
-/// A body the pass reads: held in memory, or stored above the cursor.
+/// A body the pass reads: held in memory with its frame's anchor
+/// ([`frame_anchor`]), or stored above the cursor.
 pub(crate) enum PlannedBody {
-    Held(Vec<MessageBundle>),
+    Held(Vec<MessageBundle>, Option<u64>),
     Stored(u64),
 }
 
@@ -981,15 +1003,20 @@ pub fn preverify_through_within(
         (planned, verify, clock)
     };
     let mut pairs = Vec::new();
+    // The lowest anchor of the frames read: each is verified as the frame
+    // anchored lowest executes it, which refuses before the proof only what
+    // every later-anchored frame refuses too.
+    let mut lowest: Option<Option<u64>> = None;
     'shards: for (address, bodies) in planned {
         let mut frames = 0;
         for body in bodies {
-            let requests = match body {
-                PlannedBody::Held(requests) => requests,
+            let (requests, anchor) = match body {
+                PlannedBody::Held(requests, anchor) => (requests, anchor),
                 PlannedBody::Stored(number) => {
                     match clock.get_shard_clock_frame(&address, number, false) {
                         Ok(frame) if budget.take_bytes(encoded_len(&frame.requests)) => {
-                            frame.requests
+                            let anchor = frame_anchor(&frame);
+                            (frame.requests, anchor)
                         }
                         Ok(_) => break 'shards,
                         Err(_) => continue,
@@ -1000,6 +1027,7 @@ pub fn preverify_through_within(
                 continue;
             }
             frames += 1;
+            lowest = Some(lowest.map_or(anchor, |low| low.min(anchor)));
             pairs.extend(canonical_pairs(&address, &requests));
         }
         if frames > 0 {
@@ -1061,6 +1089,7 @@ pub fn preverify_through_within(
                     done: Some(&done),
                     pause: None,
                     background: false,
+                    executing: ExecutingFrame::App(lowest.flatten()),
                 },
             );
             if report.rounds == 1 {
@@ -1177,15 +1206,15 @@ mod tests {
             ProofPrewarm::with_bounds(gated_verifier(gate.clone(), calls.clone()), 4, usize::MAX)
                 .with_classifier(counting(0));
         // The first frame is taken and blocks the verifier.
-        prewarm.offer(b"shard", 0, &[bundle(0)]);
+        prewarm.offer(b"shard", 0, None, &[bundle(0)]);
         wait_for("the first frame to be taken", || prewarm.stats().0 == 0);
         for tag in 1..=7 {
-            prewarm.offer(b"shard", tag as u64, &[bundle(tag)]);
+            prewarm.offer(b"shard", tag as u64, None, &[bundle(tag)]);
         }
         let (pending, stats) = prewarm.stats();
         assert_eq!((pending, stats.queued, stats.dropped), (4, 8, 3));
         // Frames without bundles are not queued.
-        prewarm.offer(b"shard", 8, &[]);
+        prewarm.offer(b"shard", 8, None, &[]);
         assert_eq!(prewarm.stats().1.queued, 8);
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
@@ -1202,9 +1231,9 @@ mod tests {
         let small = encoded_len(&[bundle(1)]);
         let prewarm = ProofPrewarm::with_bounds(gated_verifier(gate, calls.clone()), 16, small)
             .with_classifier(counting(0));
-        prewarm.offer(b"shard", 1, &[bundle(1), bundle(2)]);
+        prewarm.offer(b"shard", 1, None, &[bundle(1), bundle(2)]);
         assert_eq!(prewarm.stats().1.dropped, 1);
-        prewarm.offer(b"shard", 2, &[bundle(3)]);
+        prewarm.offer(b"shard", 2, None, &[bundle(3)]);
         wait_for("the small frame", || calls.load(Ordering::SeqCst) == 1);
         assert_eq!(prewarm.stats().1.frames, 1);
     }
@@ -1229,7 +1258,7 @@ mod tests {
             )
         };
         let prewarm = ProofPrewarm::new(verifier).with_classifier(counting(0));
-        prewarm.offer(b"shard", 1, &[bundle(1)]);
+        prewarm.offer(b"shard", 1, None, &[bundle(1)]);
         wait_for("the second attempt", || prewarm.stats().1.frames == 2);
         let (pending, stats) = prewarm.stats();
         assert_eq!((pending, stats.requeued, stats.counts.verified), (0, 1, 1));
@@ -1249,7 +1278,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(true), Condvar::new()));
         let none = Arc::new(|_: &[(Vec<u8>, Vec<u8>)]| OperationCost::default());
         let prewarm = ProofPrewarm::new(gated_verifier(gate, calls.clone())).with_classifier(none);
-        prewarm.offer(b"shard", 1, &[bundle(1)]);
+        prewarm.offer(b"shard", 1, None, &[bundle(1)]);
         assert_eq!(prewarm.stats(), (0, PrewarmStats::default()));
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1285,7 +1314,7 @@ mod tests {
             .with_classifier(counting(0))
             .with_lanes(Arc::new(|| 3));
         for frame in 1..=4 {
-            prewarm.offer(b"shard", frame, &[bundle(frame as u8)]);
+            prewarm.offer(b"shard", frame, None, &[bundle(frame as u8)]);
         }
         wait_for("three frames verifying at once", || {
             most.load(Ordering::SeqCst) == 3
@@ -1567,11 +1596,11 @@ mod tests {
         let prewarm = ProofPrewarm::new(gated_verifier(gate.clone(), calls.clone()))
             .with_classifier(counting(1));
         let settlement = prewarm.settlement();
-        prewarm.offer(b"shard", 3, &[bundle(1)]);
+        prewarm.offer(b"shard", 3, None, &[bundle(1)]);
         assert!(settlement.check(b"shard", 2, 3).holds());
         let cheap = ProofPrewarm::new(gated_verifier(gate.clone(), calls.clone()))
             .with_classifier(counting(0));
-        cheap.offer(b"shard", 3, &[bundle(1)]);
+        cheap.offer(b"shard", 3, None, &[bundle(1)]);
         assert_eq!(cheap.settlement().check(b"shard", 2, 3), Settlement::Clear);
         std::thread::sleep(Duration::from_millis(20));
         assert!(settlement.check(b"shard", 2, 3).holds(), "not verified yet");

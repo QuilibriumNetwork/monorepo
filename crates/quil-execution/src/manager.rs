@@ -298,23 +298,26 @@ pub struct OperationEstimate {
 
 /// How a pre-verification pass runs: at most `parallelism` operations at once
 /// (default: the worker's slots), each finished one counted into `done`, none
-/// started while `pause` returns true, and as `background` work (no finalized
-/// frame waits on it) leaving the first node-wide worker slot free.
+/// started while `pause` returns true, as `background` work (no finalized
+/// frame waits on it) leaving the first node-wide worker slot free, and
+/// ahead of `executing` (default: a frame not known yet).
 #[derive(Default)]
 pub struct PreverifyPacing<'a> {
     pub parallelism: Option<usize>,
     pub done: Option<&'a std::sync::atomic::AtomicUsize>,
     pub pause: Option<&'a (dyn Fn() -> bool + Sync)>,
     pub background: bool,
+    pub executing: ExecutingFrame,
 }
 
 /// The frame that executes an operation judged ahead of it, as far as the
-/// judging caller knows it.
-// Read only by the native prover's read-ahead.
-#[cfg_attr(not(feature = "native-proof"), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutingFrame {
+/// judging caller knows it. A caller holding the frame's header passes its
+/// anchor: a frame anchored before a gate executes what the gate refuses
+/// there, however far past the gate this node saw GLOBAL since.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutingFrame {
     /// One not known yet: a frame a later proposal carries.
+    #[default]
     Later,
     /// An app-shard frame anchored at this GLOBAL frame (`None`: without an
     /// anchor).
@@ -615,7 +618,7 @@ impl ExecutionEngineManager {
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
     ) -> PreverifyCounts {
-        self.preverify_routed(bundles, pacing, ExecutingFrame::Later)
+        self.preverify_routed(bundles, pacing)
     }
 
     /// [`Self::preverify_bundles`] ahead of the global venue's execution of
@@ -631,8 +634,10 @@ impl ExecutionEngineManager {
     ) -> PreverifyCounts {
         self.preverify_routed(
             bundles,
-            &PreverifyPacing::default(),
-            ExecutingFrame::Global(frame),
+            &PreverifyPacing {
+                executing: ExecutingFrame::Global(frame),
+                ..Default::default()
+            },
         )
     }
 
@@ -648,8 +653,10 @@ impl ExecutionEngineManager {
     ) -> PreverifyCounts {
         self.preverify_routed(
             bundles,
-            &PreverifyPacing::default(),
-            ExecutingFrame::App(anchor),
+            &PreverifyPacing {
+                executing: ExecutingFrame::App(anchor),
+                ..Default::default()
+            },
         )
     }
 
@@ -657,7 +664,6 @@ impl ExecutionEngineManager {
         &self,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
-        frame: ExecutingFrame,
     ) -> PreverifyCounts {
         #[cfg(feature = "native-proof")]
         {
@@ -684,6 +690,7 @@ impl ExecutionEngineManager {
             match verifier {
                 Some((policy, worker)) => {
                     let network = policy.network;
+                    let frame = pacing.executing;
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
                         self.proof_refused(&network, address, bytes, tp, frame)
                     };
@@ -694,18 +701,30 @@ impl ExecutionEngineManager {
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = (bundles, pacing, frame);
+            let _ = (bundles, pacing);
             PreverifyCounts::default()
         }
     }
 
     /// The confidential token operations in `bundles` whose verdicts are not
     /// cached yet, as their verification is estimated: what materializing
-    /// them would still verify (not those execution refuses before their
-    /// proof, which [`Self::preverify_bundles_paced`] leaves unverified).
-    /// Empty when every proof is verified, and without a worker.
+    /// them in a frame not known yet would still verify (not those
+    /// execution refuses before their proof, which
+    /// [`Self::preverify_bundles_paced`] leaves unverified). Empty when
+    /// every proof is verified, and without a worker.
     pub fn unverified_confidential_operations(
         &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<OperationEstimate> {
+        self.unverified_confidential_operations_for(ExecutingFrame::Later, bundles)
+    }
+
+    /// [`Self::unverified_confidential_operations`] of `bundles` executed by
+    /// `frame`: a frame anchored before a gate still verifies what the gate
+    /// refuses.
+    pub fn unverified_confidential_operations_for(
+        &self,
+        frame: ExecutingFrame,
         bundles: &[(Vec<u8>, Vec<u8>)],
     ) -> Vec<OperationEstimate> {
         #[cfg(feature = "native-proof")]
@@ -734,13 +753,7 @@ impl ExecutionEngineManager {
             match policy {
                 Some(policy) => {
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
-                        self.proof_refused(
-                            &policy.network,
-                            address,
-                            bytes,
-                            tp,
-                            ExecutingFrame::Later,
-                        )
+                        self.proof_refused(&policy.network, address, bytes, tp, frame)
                     };
                     TokenExecutionEngine::unverified_operation_estimates(&policy, &routed, &refused)
                 }
@@ -749,7 +762,7 @@ impl ExecutionEngineManager {
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = bundles;
+            let _ = (frame, bundles);
             Vec::new()
         }
     }

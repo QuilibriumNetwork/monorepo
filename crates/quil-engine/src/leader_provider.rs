@@ -3416,6 +3416,7 @@ mod tests {
             prewarm.offer(
                 &address,
                 frame,
+                Some(global),
                 &[MessageBundle {
                     requests: Vec::new(),
                     timestamp: frame as i64,

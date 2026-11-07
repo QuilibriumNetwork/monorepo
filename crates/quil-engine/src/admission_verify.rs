@@ -433,6 +433,27 @@ impl AdmissionQueue {
         self.offer_in(digest, bytes, operations, job, lane, None)
     }
 
+    /// [`Self::offer`] for a finalized frame that waits on it, `job`
+    /// verifying it as that frame executes it: a queued verification of it
+    /// takes `job` in its place, so the frame's wait ends on what the frame
+    /// verifies (an operation a gate refuses only after the frame's
+    /// anchor), not on what a frame not known yet would.
+    pub fn offer_for_frame(
+        self: &Arc<Self>,
+        digest: [u8; 32],
+        bytes: usize,
+        operations: usize,
+        job: AdmissionJob,
+    ) -> bool {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(item) = state.queue.iter_mut().find(|item| item.digest == digest) {
+                item.job = job.clone();
+            }
+        }
+        self.offer(digest, bytes, operations, job, true)
+    }
+
     /// Queue a vote-time warm-up of a proposal for `frame` of `shard`:
     /// behind the submissions frames wait on, ahead of arrivals, at most
     /// [`MAX_WARMUPS`] (the oldest is dropped), dropped once queued for
@@ -836,11 +857,12 @@ pub fn digest(canonical: &[u8]) -> [u8; 32] {
 
 /// A canonical submission's confidential operation count, digest and
 /// verification job on `exec`'s worker, one operation at a time per queue
-/// thread; `None` without confidential operations.
+/// thread, ahead of `executing`; `None` without confidential operations.
 fn submission_job(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     application: &[u8],
     canonical: &[u8],
+    executing: quil_execution::manager::ExecutingFrame,
 ) -> Option<(usize, [u8; 32], AdmissionJob)> {
     let application = application[..application.len().min(32)].to_vec();
     let operations = quil_execution::ExecutionEngineManager::confidential_operation_count(
@@ -859,6 +881,7 @@ fn submission_job(
             &quil_execution::manager::PreverifyPacing {
                 parallelism: Some(1),
                 background: !verifying_for_frame(),
+                executing,
                 ..Default::default()
             },
         )
@@ -878,10 +901,32 @@ pub fn offer_submission(
     canonical: &[u8],
     front: bool,
 ) -> bool {
-    let Some((operations, digest, job)) = submission_job(exec, application, canonical) else {
+    let later = quil_execution::manager::ExecutingFrame::Later;
+    let Some((operations, digest, job)) = submission_job(exec, application, canonical, later)
+    else {
         return false;
     };
     queue.offer(digest, canonical.len(), operations, job, front) || queue.pending(&digest)
+}
+
+/// [`offer_submission`] for a finalized app-shard frame anchored at GLOBAL
+/// frame `anchor` (`None`: without an anchor) that waits on it, verified
+/// as that frame executes it ([`AdmissionQueue::offer_for_frame`]): what
+/// execution there admits is verified, whatever GLOBAL frame this node saw
+/// since, and what it refuses before the proof is not.
+pub fn offer_frame_submission(
+    queue: &Arc<AdmissionQueue>,
+    exec: &Arc<quil_execution::ExecutionEngineManager>,
+    application: &[u8],
+    canonical: &[u8],
+    anchor: Option<u64>,
+) -> bool {
+    let executing = quil_execution::manager::ExecutingFrame::App(anchor);
+    let Some((operations, digest, job)) = submission_job(exec, application, canonical, executing)
+    else {
+        return false;
+    };
+    queue.offer_for_frame(digest, canonical.len(), operations, job) || queue.pending(&digest)
 }
 
 /// What became of a confidential submission when it reached this node, for
@@ -1067,7 +1112,9 @@ pub fn offer_arrival(
 }
 
 /// [`offer_submission`] as a vote-time warm-up of a proposal for `frame` of
-/// `shard` ([`AdmissionQueue::offer_warmup`]).
+/// `shard` anchored at GLOBAL frame `anchor`
+/// ([`AdmissionQueue::offer_warmup`]), verified as that proposal executes
+/// it once finalized.
 pub fn offer_warmup_submission(
     queue: &Arc<AdmissionQueue>,
     exec: &Arc<quil_execution::ExecutionEngineManager>,
@@ -1075,8 +1122,11 @@ pub fn offer_warmup_submission(
     canonical: &[u8],
     shard: &[u8],
     frame: u64,
+    anchor: Option<u64>,
 ) -> bool {
-    let Some((operations, digest, job)) = submission_job(exec, application, canonical) else {
+    let executing = quil_execution::manager::ExecutingFrame::App(anchor);
+    let Some((operations, digest, job)) = submission_job(exec, application, canonical, executing)
+    else {
         return false;
     };
     queue.offer_warmup(digest, canonical.len(), operations, job, shard, frame)

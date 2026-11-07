@@ -1093,24 +1093,35 @@ fn the_owner_read_ahead_refuses_only_where_every_executing_frame_does() {
 }
 
 /// What execution refuses before its proof for an owner that is not a
-/// canonical identity, once that check is active at the executing frame's
-/// anchor (`dispatch_for_commit` and `dispatch_global_mint` call
-/// `spend_entries::check_owners`), the read-ahead refuses too, and only
-/// that: every type naming owners, each owner slot made non-canonical in
-/// turn and none, at anchors before, at and past the gate's frame and
-/// without one.
+/// canonical identity, the read-ahead refuses too, and only that, as each
+/// venue executes it: every type naming owners through
+/// `dispatch_for_commit` in an app-shard frame anchored before, at and past
+/// the gate's frame and without an anchor, and the QUIL reward mint through
+/// `dispatch_global_mint` in the GLOBAL frame after each of those anchors
+/// (anchored at N - 1); each owner slot made non-canonical in turn, and
+/// none. Execution's own decision is the reference, so a check it gains with
+/// another predicate or anchor shows here.
 #[test]
 fn every_owner_execution_refuses_before_its_proof_is_read_ahead() {
     use crate::token_intrinsic::spend_entries::owner_fixtures::{self, cases, encode};
     use global_commit::Standing;
     const G: u64 = 1_000;
     let network = owner_fixtures::NETWORK;
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, _) = counting_worker(directory.path());
+    let policy = policy();
     let store = HypergraphState::new(global_view());
+    let clock = crate::testing::NoopExecutionCrypto::new().clock_store;
     let owner = Some(Standing::Lasting("an owner is not a canonical identity"));
     let read_ahead = ExecutionEngineManager::execution_standing;
     global_commit::set_canonical_owner_frame_for_thread(Some(G));
     let mut gaps = Vec::new();
+    // Per case: whether execution refused it for an owner anywhere, and
+    // admitted it past that check anywhere.
+    let mut decided = vec![(false, false); cases().len()];
     for (case, (tp, application, coins)) in cases().iter().enumerate() {
+        let reward_mint =
+            *tp == crate::token_engine::TYPE_LATTICE_MINT && *application == domains::QUIL_TOKEN;
         for slot in 0..=coins.len() {
             let mut owners = vec![[3; IDENTITY_BYTES]; coins.len()];
             if let Some(named) = owners.get_mut(slot) {
@@ -1118,17 +1129,54 @@ fn every_owner_execution_refuses_before_its_proof_is_read_ahead() {
             }
             let bytes = encode(case, &owners);
             for anchor in [None, Some(G - 1), Some(G), Some(G + 1)] {
-                // What execution decides at that anchor, before the proof.
-                let refuses = global_commit::canonical_owners_active(anchor)
-                    && spend_entries::check_owners(&network, application, *tp, &bytes).is_err();
-                assert_eq!(
-                    refuses,
-                    slot < coins.len() && anchor >= Some(G),
-                    "case {case} slot {slot} at {anchor:?}: the fixture misses the check"
+                // The frame executing it with that anchor, and its outcome.
+                let (frame, executed) = if reward_mint {
+                    let n = anchor.map_or(0, |anchor| anchor + 1);
+                    let executed = policy.dispatch_global_mint(
+                        &store,
+                        n,
+                        clock.as_ref(),
+                        application,
+                        &bytes,
+                        Some(&worker),
+                    );
+                    (ExecutingFrame::Global(n), executed)
+                } else {
+                    let context = quil_types::execution::FrameExecutionContext {
+                        frame_number: 1,
+                        finalized_global_frame: anchor,
+                        shard: quil_types::execution::ShardPath::WHOLE,
+                        venue: None,
+                    };
+                    let executed = policy.dispatch_for_commit(
+                        &store,
+                        context,
+                        clock.as_ref(),
+                        application,
+                        &bytes,
+                        *tp,
+                        Some(&worker),
+                        None,
+                    );
+                    (ExecutingFrame::App(anchor), executed)
+                };
+                let refuses = executed
+                    .is_err_and(|error| error.to_string().contains("not a canonical identity"));
+                if refuses {
+                    decided[case].0 = true;
+                } else if slot < coins.len() {
+                    decided[case].1 = true;
+                }
+                let standing = read_ahead(
+                    &store,
+                    &network,
+                    application,
+                    *tp,
+                    &bytes,
+                    frame.anchor_floor(0),
                 );
-                let standing = read_ahead(&store, &network, application, *tp, &bytes, anchor);
                 if (standing == owner) != refuses {
-                    gaps.push((case, slot, anchor, refuses));
+                    gaps.push((case, slot, frame, refuses));
                 }
             }
         }
@@ -1136,8 +1184,15 @@ fn every_owner_execution_refuses_before_its_proof_is_read_ahead() {
     global_commit::set_canonical_owner_frame_for_thread(None);
     assert!(
         gaps.is_empty(),
-        "READ-AHEAD GAP: (case, slot, anchor, execution refuses) where the read-ahead \
-         decides otherwise: {gaps:?}"
+        "READ-AHEAD GAP: (case, slot, executing frame, execution refuses) where the \
+         read-ahead decides otherwise: {gaps:?}"
+    );
+    assert!(
+        decided
+            .iter()
+            .all(|(refused, admitted)| *refused && *admitted),
+        "a fixture never reaches the owner check, or its gate never opens or never stays \
+         shut: {decided:?}"
     );
 }
 
