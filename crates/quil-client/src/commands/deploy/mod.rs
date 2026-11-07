@@ -51,9 +51,16 @@ pub enum DeployCommand {
         /// 32-byte domain (hex or alias).
         #[arg(short = 'd', long)]
         domain: String,
+        /// Seal to the public file key so anyone can read the file
+        /// (collectible images); same fee. Default: only your read key opens it.
+        #[arg(long)]
+        public: bool,
         file: String,
     },
     /// Retrieve a deployed file (single-vertex or chunked) to a local path.
+    ///
+    /// Opens it with your read key, else with the public file key, and says
+    /// which one opened it.
     Get {
         /// 64-byte full address (hex or alias) of the file/index vertex.
         full_address: String,
@@ -259,7 +266,11 @@ pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> 
     match cmd {
         DeployCommand::Hypergraph { args } => hypergraph::run(&dc, args).await,
         DeployCommand::Token { args } => token::run(&dc, args).await,
-        DeployCommand::File { domain, file } => file::run(&dc, domain, file).await,
+        DeployCommand::File {
+            domain,
+            public,
+            file,
+        } => file::run(&dc, domain, file, *public).await,
         DeployCommand::Get {
             full_address,
             output,
@@ -287,7 +298,7 @@ mod tests {
 
     /// A deploy context with an empty keystore and no node: a command fails
     /// once it reaches for its keys or the network.
-    fn offline_ctx(name: &str) -> DeployCtx {
+    pub(super) fn offline_ctx(name: &str) -> DeployCtx {
         let dir =
             std::env::temp_dir().join(format!("quil-client-deploy-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
