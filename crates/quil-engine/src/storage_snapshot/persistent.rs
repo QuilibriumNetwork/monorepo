@@ -378,12 +378,10 @@ fn initialize_with_progress(
             "regenerated sector differs from committed labels".into(),
         ));
     }
+    // Up to 2 GiB: paced as the labels are, so the stores' synced commits
+    // never wait behind all of it.
     let path = dir.join("last.tmp");
-    let mut file = File::create(&path).map_err(io)?;
-    for chunk in last.chunks(1024) {
-        file.write_all(&hash::digests_to_bytes(chunk)).map_err(io)?;
-    }
-    file.sync_all().map_err(io)?;
+    crate::storage_labels::write_digests_paced(&path, &last).map_err(io)?;
     fs::rename(&path, dir.join("last")).map_err(io)?;
     atomic(&dir.join("cap"), &cap.to_bytes())?;
     let sector = Sector {
@@ -1293,6 +1291,43 @@ mod tests {
             "same-epoch leases cannot count one sector twice"
         );
         assert!(Sector::load(other).unwrap().is_none());
+        gates(false);
+    }
+    /// A sector's last layer, up to 2 GiB, goes to disk as its labels do: a
+    /// chunk at a time through the flush gate, paced, then synced. Written
+    /// whole, then synced, it held the stores' synced commits behind all of
+    /// it (2026-11-07). Its bytes are as before.
+    #[test]
+    fn a_sectors_last_layer_goes_to_disk_a_gated_chunk_at_a_time() {
+        use crate::storage_labels::{set_chunk_bytes_for_test, take_gated_pushes};
+        const CHUNK: u64 = 1024;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [0xD4; 32];
+        let (path, id, n) = reserve(&store, &member, b"paced", 1500, 100).unwrap();
+        set_chunk_bytes_for_test(Some(CHUNK as usize));
+        let first = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let written = fs::read(path.join("last")).unwrap();
+        // Labelled already, as warmup labels ahead: only the last layer is
+        // written now.
+        fs::remove_file(path.join("certificate")).unwrap();
+        fs::remove_file(path.join("last")).unwrap();
+        take_gated_pushes();
+        let again = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let (chunks, bytes) = take_gated_pushes();
+        set_chunk_bytes_for_test(None);
+        let last = n * 32;
+        assert!(
+            bytes == last && chunks == last.div_ceil(CHUNK),
+            "PACE-LABELS-LAST: a sector's last layer of {last} bytes went to disk as {chunks} \
+             gated chunks of {bytes} bytes in all, not a {CHUNK}-byte chunk at a time \
+             through the flush gate"
+        );
+        assert_eq!(fs::read(path.join("last")).unwrap(), written);
+        assert_eq!(again.cert, first.cert);
+        assert_eq!(again.last().unwrap().len(), n as usize);
         gates(false);
     }
     #[test]
