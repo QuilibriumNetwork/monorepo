@@ -20,6 +20,7 @@ pub(crate) mod action_log;
 pub(crate) mod balance;
 mod info;
 pub(crate) mod legacy;
+pub(crate) mod agent;
 pub(crate) mod output;
 #[cfg(feature = "native-proof")]
 pub(crate) mod shield_pacing;
@@ -35,6 +36,8 @@ pub(crate) use wallet::{
 pub(crate) use wallet::{
     scans_begin_ago, serve_left_out, serve_left_out_expiring, serve_left_out_with,
 };
+
+pub use agent::{agent_execute, agent_preview, parse_token_argv, AgentQuote};
 
 /// A scan's page count when `--max-pages` sets none: no cap. A scan reads
 /// every coin or escrow of the application, nearly all of them other
@@ -823,7 +826,7 @@ pub enum TokenCommand {
 
 impl TokenCommand {
     /// Whether the command submits through the node's authenticated Send RPC.
-    fn submits(&self) -> bool {
+    pub fn submits(&self) -> bool {
         match self {
             TokenCommand::Account
             | TokenCommand::Info { .. }

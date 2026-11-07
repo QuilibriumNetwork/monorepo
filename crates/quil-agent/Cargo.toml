@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 quil-client = { path = "../quil-client" }
 quil-config = { path = "../quil-config" }
+quil-p2p = { path = "../quil-p2p" }
+quil-rpc = { path = "../quil-rpc" }
 quil-types = { path = "../quil-types" }
 anyhow = "1"
 axum = "0.7"

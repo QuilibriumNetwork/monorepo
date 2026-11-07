@@ -141,6 +141,7 @@ mod tests {
                     current_epoch: "0".into(),
                     epoch_length_frames: "0".into(),
                     reachable: "true".into(),
+                    health: String::new(),
                 })),
                 previews: std::sync::Mutex::new(vec![Ok(quote.clone())]),
                 execute: std::sync::Mutex::new(Ok("included-text".into())),

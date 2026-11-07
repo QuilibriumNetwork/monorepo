@@ -64,6 +64,9 @@ impl From<KeyAccess> for Access {
 pub struct Principal {
     pub name: String,
     pub access: Access,
+    /// A read-only key, or a full key other than the first one. Those keys
+    /// see the diagnostics health-report view, not this node's peer id.
+    pub external: bool,
 }
 
 /// The first configured key the headers match, otherwise no access.
@@ -75,12 +78,16 @@ pub fn request_access(
     api_key: Option<&str>,
     keys: &[ApiKey],
 ) -> Option<Principal> {
+    let operator = keys.iter().position(|key| {
+        key.access == crate::config::KeyAccess::Full && !key.secret.is_empty()
+    });
     let mut matched = None;
-    for key in keys {
+    for (index, key) in keys.iter().enumerate() {
         if request_authorized(authorization, api_key, &key.secret) && matched.is_none() {
             matched = Some(Principal {
                 name: key.name.clone(),
                 access: key.access.into(),
+                external: Some(index) != operator,
             });
         }
     }
@@ -159,6 +166,15 @@ mod tests {
             Some(Principal {
                 name: "laptop".into(),
                 access: Access::Full,
+                external: true,
+            })
+        );
+        assert_eq!(
+            request_access(Some("Bearer full"), None, &keys),
+            Some(Principal {
+                name: "operator".into(),
+                access: Access::Full,
+                external: false,
             })
         );
         assert_eq!(
@@ -166,6 +182,7 @@ mod tests {
             Some(Principal {
                 name: "dashboard".into(),
                 access: Access::ReadOnly,
+                external: true,
             })
         );
         assert_eq!(request_access(Some("Bearer nope"), None, &keys), None);

@@ -11,6 +11,8 @@ target/
 node/build/
 client/build/
 conntest/build/
+crates/quil-client/build/
+crates/quil-agent/build/
 
 # Local profiling / log artifacts (jemalloc heaps, per-core logs, copied
 # binaries). Tens of GB; never an input to the build.

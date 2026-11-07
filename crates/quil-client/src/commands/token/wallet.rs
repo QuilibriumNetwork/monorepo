@@ -4592,7 +4592,7 @@ pub(super) async fn run_balance(
             super::balance::claimable_rewards(tc, verbose),
         )
         .await;
-        println!("{line}");
+        super::output::line(line);
         if let Some(error) = error {
             failed.push(("claimable rewards", error));
         }
@@ -4620,7 +4620,7 @@ pub(super) async fn run_balance(
         if let Err(error) = &legacy {
             failed.push(("legacy coins", reason(error)));
         }
-        println!("{}", format_legacy_coins(&legacy, verbose));
+        super::output::line(format_legacy_coins(&legacy, verbose));
     }
     let (started, mut report) = (std::time::Instant::now(), ScanReport::default());
     let confidential = match &client {
@@ -4654,10 +4654,7 @@ pub(super) async fn run_balance(
     if let Err(error) = &confidential {
         failed.push(("confidential coins", reason(error)));
     }
-    println!(
-        "{}",
-        format_confidential_coins(&confidential, quil, verbose)
-    );
+    super::output::line(format_confidential_coins(&confidential, quil, verbose));
     anyhow::ensure!(failed.is_empty(), "{}", super::balance::incomplete(&failed));
     Ok(())
 }

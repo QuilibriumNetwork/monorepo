@@ -6230,6 +6230,8 @@ dependencies = [
  "hex 0.4.3",
  "quil-client",
  "quil-config",
+ "quil-p2p",
+ "quil-rpc",
  "quil-types",
  "rand 0.8.5",
  "serde",

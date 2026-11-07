@@ -6,8 +6,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::auth::Access;
+use crate::auth::{Access, Principal};
 use crate::config::Settings;
+use crate::disclosure::{self, Audience};
 use crate::ops::{self, Host, PendingStore, ToolOutput};
 
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -37,7 +38,7 @@ pub async fn dispatch(
     app: &Arc<App>,
     message: &Value,
     now: Instant,
-    access: Access,
+    principal: &Principal,
 ) -> Option<Value> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Some(error(message.get("id").cloned(), -32600, "invalid request"));
@@ -51,8 +52,8 @@ pub async fn dispatch(
     let result = match method {
         "initialize" => Ok(initialize(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools(access) })),
-        "tools/call" => call_tool(app, &params, now, access).await,
+        "tools/list" => Ok(json!({ "tools": tools(principal.access) })),
+        "tools/call" => call_tool(app, &params, now, principal).await,
         _ => Err((-32601, format!("unknown method {method}"))),
     };
     Some(match result {
@@ -78,7 +79,7 @@ fn initialize(params: &Value) -> Value {
             "name": "qagent",
             "version": quil_config::display_version()
         },
-        "instructions": "You can check the node with node_info and the totals with balance. Amounts on quote tools are QUIL: 1 means one QUIL, and 0.5 means half a QUIL. Do not pass 8000000000. A quote is printed on the operator's terminal with its confirmation id. Tell the user to look at that terminal and approve it there. This session cannot submit and is not given the id. Do not invent one. Do not pass a file path or a node config."
+        "instructions": "Call next_step before asking for a quote. It says whether to mint, shield, or wait, and whether a quote is already on the operator's terminal. It does not include an address or a confirmation id. node_info includes worker health in sentences. balance is the totals. Amounts on quote tools are QUIL: 1 means one QUIL, and 0.5 means half a QUIL. Do not pass 8000000000. A quote is printed on the operator's terminal with its confirmation id. Tell the user to look at that terminal and approve it there. This session cannot submit and is not given the id. Do not invent one. Do not pass a file path or a node config. When a call fails, the latest redacted warnings are included. Do not treat them as a reason to invent an id."
     })
 }
 
@@ -86,12 +87,17 @@ fn tools(access: Access) -> Vec<Value> {
     let mut listed = vec![
         tool(
             "node_info",
-            "Read worker counts, the head frame, and whether the node is reachable.",
+            "Read worker counts, the head frame, whether the node is reachable, and short health sentences: which workers are held, why, and whether store reads are slow.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         ),
         tool(
             "balance",
             "Totals and counts for this wallet. No addresses and no arguments.",
+            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        ),
+        tool(
+            "next_step",
+            "What to do next. Names a quote already waiting by its action and QUIL amount, or says to mint or shield. No address and no confirmation id.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         ),
     ];
@@ -230,22 +236,39 @@ async fn call_tool(
     app: &App,
     params: &Value,
     now: Instant,
-    access: Access,
+    principal: &Principal,
 ) -> Result<Value, (i32, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or((-32602, "tools/call requires a name".to_string()))?;
-    if access == Access::ReadOnly && !matches!(name, "node_info" | "balance") {
-        return Ok(tool_result(ToolOutput {
-            text: "This API key is read-only. It can call node_info and balance. It cannot send or ask for a quote.".into(),
+    let access = principal.access;
+    let audience = Audience::of(access, principal.external);
+    let secrets: Vec<String> = app
+        .settings
+        .keys
+        .iter()
+        .map(|key| key.secret.clone())
+        .collect();
+    let finish = |output: ToolOutput| {
+        let client = disclosure::release(audience, &secrets, output.text);
+        let withheld = client == disclosure::WITHHELD;
+        Ok(tool_result(ToolOutput {
+            text: client,
+            is_error: output.is_error || withheld,
+        }))
+    };
+    if access == Access::ReadOnly && !matches!(name, "node_info" | "balance" | "next_step") {
+        return finish(ToolOutput {
+            text: "This API key is read-only. It can call node_info, balance, and next_step. It cannot send or ask for a quote.".into(),
             is_error: true,
-        }));
+        });
     }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let outcome = match name {
-        "node_info" => ops::node_info(&app.host, &app.settings, access).await,
+        "node_info" => ops::node_info(&app.host, &app.settings, audience).await,
         "balance" => ops::balance(&app.host, &app.settings).await,
+        "next_step" => ops::next_step(&app.host, &app.settings, &app.pending, now).await,
         "token_prepare" => {
             let argv = argv_arg(&arguments)?;
             ops::prepare(&app.host, &app.settings, &app.pending, argv, now).await
@@ -255,21 +278,27 @@ async fn call_tool(
             Some(Ok(argv)) => {
                 ops::prepare(&app.host, &app.settings, &app.pending, argv, now).await
             }
-            Some(Err(message)) => return Ok(tool_result(ToolOutput::err(message))),
+            Some(Err(message)) => return finish(ToolOutput::err(message)),
             None => {
                 return Err((
                     -32602,
                     format!(
-                        "unknown tool {name}. Reads are node_info and balance. Quotes are transfer_quote, mint_quote, shield_quote, merge_quote, split_quote, pay_quote, and accept_quote."
+                        "unknown tool {name}. Reads are node_info, balance, and next_step. Quotes are transfer_quote, mint_quote, shield_quote, merge_quote, split_quote, pay_quote, and accept_quote."
                     ),
                 ))
             }
         },
     };
     if !outcome.host.is_empty() {
-        eprintln!("{}", outcome.host);
+        if disclosure::holds_config_secret(&outcome.host) {
+            eprintln!(
+                "Quote withheld. It included the node config's private key or the keystore, so it was not printed."
+            );
+        } else {
+            eprintln!("{}", outcome.host);
+        }
     }
-    Ok(tool_result(outcome.client))
+    finish(outcome.client)
 }
 
 fn quote_argv(name: &str, arguments: &Value) -> Option<Result<Vec<String>, String>> {
@@ -436,10 +465,18 @@ fn error(id: Option<Value>, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Access;
+    use crate::auth::{Access, Principal};
     use crate::config::{ApiKey, KeyAccess, Settings};
     use serde_json::json;
     use std::time::Instant;
+
+    fn who(access: Access) -> Principal {
+        Principal {
+            name: "test".into(),
+            access,
+            external: access == Access::ReadOnly,
+        }
+    }
 
     fn app() -> Arc<App> {
         Arc::new(App::new(Settings {
@@ -464,7 +501,7 @@ mod tests {
             &app,
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .unwrap();
@@ -478,7 +515,7 @@ mod tests {
             &app,
             &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .unwrap();
@@ -493,6 +530,7 @@ mod tests {
             vec![
                 "node_info",
                 "balance",
+                "next_step",
                 "transfer_quote",
                 "mint_quote",
                 "shield_quote",
@@ -508,7 +546,7 @@ mod tests {
             &app,
             &json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
             now,
-            Access::ReadOnly,
+            &who(Access::ReadOnly),
         )
         .await
         .unwrap();
@@ -518,7 +556,10 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(read_only_names, vec!["node_info", "balance"]);
+        assert_eq!(
+            read_only_names,
+            vec!["node_info", "balance", "next_step"]
+        );
 
         let refused = dispatch(
             &app,
@@ -529,7 +570,7 @@ mod tests {
                 "params": { "name": "token_query", "arguments": { "argv": ["coins"] } }
             }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .unwrap();
@@ -548,7 +589,7 @@ mod tests {
                 "params": { "name": "token_prepare", "arguments": { "argv": ["balance"] } }
             }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .unwrap();
@@ -563,7 +604,7 @@ mod tests {
                 "params": { "name": "transfer_quote", "arguments": { "recipient": "0xabc" } }
             }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .unwrap();
@@ -577,7 +618,7 @@ mod tests {
             &app,
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             now,
-            Access::Full,
+            &who(Access::Full),
         )
         .await
         .is_none());

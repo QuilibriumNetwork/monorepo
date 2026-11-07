@@ -39,9 +39,9 @@ Every request must include the API key, either as\n\
   Authorization: Bearer <the key>\n\
 or as the header X-Api-Key.\n\n\
 Put a read-only key in the assistant. Yours: {read_only}\n\
-A read-only key can check the node and the balance totals. It is not shown addresses. It cannot send, and it cannot ask for a quote.\n\n\
-Do not put a full key in the assistant. Yours: {full}\n\
-A full key can ask for a quote. The quote is printed on the qagent screen. You approve it there. The assistant is not given the confirmation id.\n\n\
+A read-only key, and any full key other than the first one, sees the node the way a diagnostics health report does: workers, frames, and whether it is reachable. It is not shown the peer id, addresses, the config, or anything from the keystore. A read-only key cannot send and cannot ask for a quote. It can call next_step, which says whether to mint, shield, or wait, without an address or a confirmation id.\n\n\
+Do not put the first full key in the assistant. Yours: {full}\n\
+That key can ask for a quote, and it is the only key shown this node's peer id. The quote is printed on the qagent screen. You approve it there. The assistant is not given the confirmation id. No key is given peerPrivKey or the keystore.\n\n\
 {quotes}\n\n\
 {node}\n\n\
 Settings file: {config}\n\

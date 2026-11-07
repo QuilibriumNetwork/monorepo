@@ -81,7 +81,7 @@ enum KeyCommand {
     Issue {
         /// Name recorded in the log when this key is used.
         name: String,
-        /// This key may only call node_info and balance.
+        /// This key may only call node_info, balance, and next_step.
         #[arg(long)]
         read_only: bool,
     },

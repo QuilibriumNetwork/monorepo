@@ -98,7 +98,7 @@ pub(crate) fn captured() -> bool {
 }
 
 /// Run `work` with its progress lines sent to `sink`.
-pub(crate) async fn capture<F: std::future::Future>(
+pub async fn capture<F: std::future::Future>(
     sink: UnboundedSender<String>,
     work: F,
 ) -> F::Output {

@@ -11,7 +11,11 @@
 pub mod auth;
 pub mod config;
 pub mod control;
+pub mod disclosure;
 pub mod guide;
+pub mod health;
+pub mod next;
+pub mod warnings;
 pub mod http;
 pub mod mcp;
 pub mod ops;

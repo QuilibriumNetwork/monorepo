@@ -9,9 +9,13 @@ use quil_client::context::{Context, GlobalArgs};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::auth::Access;
 use crate::config::{Settings, CONFIRM_TTL};
+use crate::disclosure::{self, Audience};
+use crate::health::{self, HEALTH_UNAVAILABLE};
+use crate::next::{self, HeldQuote};
 use crate::slippage;
+use crate::warnings;
+use crate::worker::HelperFailure;
 
 /// A quote waiting for its confirmation id.
 #[derive(Clone)]
@@ -74,6 +78,40 @@ impl PendingStore {
             .into_iter()
             .map(|(_, id, quote)| (id, quote))
             .collect()
+    }
+
+    /// Quotes still waiting, oldest first, without their confirmation ids.
+    pub fn held(&mut self, now: Instant) -> Vec<HeldQuote> {
+        self.sweep(now);
+        let mut items: Vec<_> = self
+            .items
+            .iter()
+            .map(|(_, pending)| (pending.created, pending))
+            .collect();
+        items.sort_by_key(|(created, _)| *created);
+        items
+            .into_iter()
+            .map(|(_, pending)| HeldQuote {
+                action: pending
+                    .argv
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "quote".into()),
+                amount_quil: pending
+                    .quote
+                    .variable_amount
+                    .or_else(|| quoted_amount(&pending.argv))
+                    .map(|units| quil_client::util::format_quil(&units.to_be_bytes())),
+            })
+            .collect()
+    }
+}
+
+/// The base-unit amount on a transfer, shield, or pay, never the address.
+fn quoted_amount(argv: &[String]) -> Option<u128> {
+    match argv.first().map(String::as_str) {
+        Some("transfer" | "shield" | "pay") => argv.get(2)?.parse().ok(),
+        _ => None,
     }
 }
 
@@ -203,7 +241,8 @@ pub fn strip_client_paths(argv: Vec<String>) -> Vec<String> {
     kept
 }
 
-/// Node status. The peer id is included only for a full key, and the config path never is.
+/// Node status, in the shape of a diagnostics health report. The peer id is
+/// included only for the operator's own key. The config path never is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeFacts {
     pub version: String,
@@ -216,11 +255,14 @@ pub struct NodeFacts {
     pub current_epoch: String,
     pub epoch_length_frames: String,
     pub reachable: String,
+    /// Diagnostics health sentences. Empty only before a read fills it.
+    #[serde(default)]
+    pub health: String,
 }
 
 impl NodeFacts {
-    /// Text for an MCP client. A read-only key does not receive the peer id.
-    pub fn for_client(&self, access: Access) -> String {
+    /// Text for an MCP client. An external key does not receive the peer id.
+    pub fn for_client(&self, audience: Audience) -> String {
         let mut lines = vec![
             format!("Version: {}", self.version),
             format!(
@@ -235,8 +277,11 @@ impl NodeFacts {
             ),
             format!("Reachable: {}", self.reachable),
         ];
-        if access == Access::Full {
+        if audience == Audience::Operator {
             lines.insert(1, format!("Peer: {}", self.peer_id));
+        }
+        if !self.health.is_empty() {
+            lines.push(self.health.clone());
         }
         lines.join("\n")
     }
@@ -272,19 +317,29 @@ impl Host {
         Self::Script(std::sync::Arc::new(script))
     }
 
-    pub async fn balance(&self, settings: &Settings) -> Result<String, String> {
+    pub async fn balance(&self, settings: &Settings) -> Result<String, HelperFailure> {
         match self {
             Self::Process => crate::worker::balance(settings).await,
             #[cfg(test)]
-            Self::Script(script) => script.balance.lock().expect("balance script").clone(),
+            Self::Script(script) => script
+                .balance
+                .lock()
+                .expect("balance script")
+                .clone()
+                .map_err(HelperFailure::plain),
         }
     }
 
-    pub async fn node_info(&self, settings: &Settings) -> Result<NodeFacts, String> {
+    pub async fn node_info(&self, settings: &Settings) -> Result<NodeFacts, HelperFailure> {
         match self {
             Self::Process => crate::worker::node_info(settings).await,
             #[cfg(test)]
-            Self::Script(script) => script.node.lock().expect("node script").clone(),
+            Self::Script(script) => script
+                .node
+                .lock()
+                .expect("node script")
+                .clone()
+                .map_err(HelperFailure::plain),
         }
     }
 
@@ -292,7 +347,7 @@ impl Host {
         &self,
         settings: &Settings,
         argv: Vec<String>,
-    ) -> Result<AgentQuote, String> {
+    ) -> Result<AgentQuote, HelperFailure> {
         match self {
             Self::Process => crate::worker::preview(settings, argv).await,
             #[cfg(test)]
@@ -301,15 +356,25 @@ impl Host {
                 .lock()
                 .expect("preview script")
                 .pop()
-                .unwrap_or_else(|| Err("no scripted preview".into())),
+                .unwrap_or_else(|| Err("no scripted preview".into()))
+                .map_err(HelperFailure::plain),
         }
     }
 
-    pub async fn execute(&self, settings: &Settings, argv: Vec<String>) -> Result<String, String> {
+    pub async fn execute(
+        &self,
+        settings: &Settings,
+        argv: Vec<String>,
+    ) -> Result<String, HelperFailure> {
         match self {
             Self::Process => crate::worker::execute(settings, argv).await,
             #[cfg(test)]
-            Self::Script(script) => script.execute.lock().expect("execute script").clone(),
+            Self::Script(script) => script
+                .execute
+                .lock()
+                .expect("execute script")
+                .clone()
+                .map_err(HelperFailure::plain),
         }
     }
 }
@@ -320,20 +385,46 @@ pub async fn balance(host: &Host, settings: &Settings) -> Outcome {
         Ok(text) => Outcome::client(ToolOutput::ok(text)),
         Err(err) => {
             tracing::warn!("balance unavailable");
-            tell_host("Balance", &err);
-            Outcome::client(ToolOutput::err(BALANCE_UNAVAILABLE))
+            tell_host("Balance", &err.message);
+            Outcome::client(ToolOutput::err(failed(BALANCE_UNAVAILABLE, &err.warnings)))
         }
     }
 }
 
-/// Worker counts and frames. The peer id is omitted for a read-only key.
-pub async fn node_info(host: &Host, settings: &Settings, access: Access) -> Outcome {
+fn failed(sentence: &str, warnings_found: &[String]) -> String {
+    let mut text = sentence.to_string();
+    warnings::append(&mut text, warnings_found);
+    text
+}
+
+/// What to do next: a quote already waiting, rewards to mint, or coins to
+/// shield. No address and no confirmation id.
+pub async fn next_step(
+    host: &Host,
+    settings: &Settings,
+    pending: &Mutex<PendingStore>,
+    now: Instant,
+) -> Outcome {
+    let held = pending.lock().await.held(now);
+    match host.balance(settings).await {
+        Ok(text) => Outcome::client(ToolOutput::ok(next::advise(Some(&text), &held, &[]))),
+        Err(err) => {
+            tracing::warn!("balance unavailable");
+            tell_host("Next step", &err.message);
+            Outcome::client(ToolOutput::err(next::advise(None, &held, &err.warnings)))
+        }
+    }
+}
+
+/// Worker counts, frames, and the diagnostics health sentences. An external
+/// key does not receive the peer id.
+pub async fn node_info(host: &Host, settings: &Settings, audience: Audience) -> Outcome {
     match host.node_info(settings).await {
-        Ok(facts) => Outcome::client(ToolOutput::ok(facts.for_client(access))),
+        Ok(facts) => Outcome::client(ToolOutput::ok(facts.for_client(audience))),
         Err(err) => {
             tracing::warn!("node info unavailable");
-            tell_host("Node info", &err);
-            Outcome::client(ToolOutput::err(NODE_UNAVAILABLE))
+            tell_host("Node info", &err.message);
+            Outcome::client(ToolOutput::err(failed(NODE_UNAVAILABLE, &err.warnings)))
         }
     }
 }
@@ -365,8 +456,8 @@ pub async fn prepare(
         }
         Err(err) => {
             tracing::warn!("quote unavailable");
-            tell_host("Quote", &err);
-            return Outcome::client(ToolOutput::err(QUOTE_UNAVAILABLE));
+            tell_host("Quote", &err.message);
+            return Outcome::client(ToolOutput::err(failed(QUOTE_UNAVAILABLE, &err.warnings)));
         }
     };
     let id = pending.lock().await.insert(argv, quote.clone(), now);
@@ -397,7 +488,8 @@ pub async fn confirm(
         Err(err) => {
             pending.lock().await.restore(id.to_string(), stored);
             return format!(
-                "{err}\n\nThe confirmation is still valid until it expires.\n{}",
+                "{}\n\nThe confirmation is still valid until it expires.\n{}",
+                err.message,
                 crate::guide::failure_hint()
             );
         }
@@ -425,7 +517,8 @@ pub async fn confirm(
             message
         }
         Err(err) => format!(
-            "{err}\n\nNothing was sent, and nothing was retried. Ask for the quote again before another confirm.\n{}",
+            "{}\n\nNothing was sent, and nothing was retried. Ask for the quote again before another confirm.\n{}",
+            err.message,
             crate::guide::failure_hint()
         ),
     }
@@ -435,9 +528,28 @@ pub async fn confirm(
 pub async fn run_balance(settings: &Settings) -> Result<String, String> {
     let argv = prepare_argv(vec!["balance".into()], settings);
     let args = parse(&argv, settings).map_err(|output| output.text)?;
-    token::agent_execute(global_args(settings), &args)
+    let text = token::agent_execute(global_args(settings), &args)
         .await
-        .map_err(|err| format!("{err:#}"))
+        .map_err(|err| format!("{err:#}"))?;
+    Ok(client_lines(&text))
+}
+
+/// Balance text for an API key: the totals, without the node header, a
+/// config path, or keystore material.
+fn client_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            !line.starts_with("Node ")
+                && !line.contains("(config ")
+                && !disclosure::holds_config_secret(line)
+                && !has_home_path(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn has_home_path(line: &str) -> bool {
+    line.contains("/home/") || line.contains("/Users/") || line.contains("/root/")
 }
 
 /// Node status in the helper.
@@ -485,12 +597,60 @@ async fn read_node_info(settings: &Settings) -> anyhow::Result<NodeFacts> {
         current_epoch: info.current_epoch.to_string(),
         epoch_length_frames: info.epoch_length_frames.to_string(),
         reachable: info.reachable.to_string(),
+        health: health_text(&ctx, &node_config, &_config_dir).await,
     })
 }
 
+async fn health_text(
+    ctx: &Context,
+    node_config: &quil_config::Config,
+    config_dir: &std::path::Path,
+) -> String {
+    let report = match health_report(ctx, node_config, config_dir).await {
+        Ok(report) => report,
+        Err(_) => {
+            tracing::warn!("health report unavailable");
+            return HEALTH_UNAVAILABLE.to_string();
+        }
+    };
+    health::explain(&report)
+}
+
+async fn health_report(
+    ctx: &Context,
+    node_config: &quil_config::Config,
+    config_dir: &std::path::Path,
+) -> anyhow::Result<quil_types::proto::diagnostics::HealthReport> {
+    let keys = ctx.key_manager(node_config, config_dir)?;
+    let signer = keys
+        .get_signer_by_id("q-prover-key")
+        .map_err(|err| anyhow::anyhow!("prover key: {err}"))?;
+    let secret = signer.private_key().to_vec();
+    let identity = quil_p2p::Keypair::falcon_from_bytes(&secret)
+        .map_err(|err| anyhow::anyhow!("prover key is not Falcon: {err}"))?;
+    let peer = identity.public().to_peer_id();
+    let addr = quil_client::rpc::local_stream_addr(node_config)?;
+    let connect = quil_rpc::diagnostics_service::connect_peer(&addr, &secret, peer);
+    let mut client = tokio::time::timeout(std::time::Duration::from_secs(15), connect)
+        .await
+        .map_err(|_| anyhow::anyhow!("health connect timed out"))?
+        .map_err(|err| anyhow::anyhow!("health connect: {err}"))?;
+    let read = client.get_health_report(quil_types::proto::diagnostics::GetHealthReportRequest {});
+    let report = tokio::time::timeout(std::time::Duration::from_secs(15), read)
+        .await
+        .map_err(|_| anyhow::anyhow!("health report timed out"))?
+        .map_err(|err| anyhow::anyhow!("health report: {err}"))?;
+    Ok(report.into_inner())
+}
+
 fn tell_host(what: &str, err: &str) {
+    let detail = if disclosure::holds_config_secret(err) {
+        "The result included the node config's private key or the keystore, so it was not shown."
+    } else {
+        err
+    };
     eprintln!(
-        "{what} failed.\n\n{err}\n\n{}",
+        "{what} failed.\n\n{detail}\n\n{}",
         crate::guide::failure_hint()
     );
 }
@@ -691,7 +851,6 @@ pub fn accept_argv(escrow: &str, fee_quil: Option<&str>) -> Result<Vec<String>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Access;
     use crate::config::{ApiKey, KeyAccess};
     use std::time::Instant;
     use tokio::sync::Mutex;
@@ -709,6 +868,17 @@ mod tests {
             network: None,
             config_path: std::path::PathBuf::from("qagent.yaml"),
         }
+    }
+
+    #[test]
+    fn balance_text_drops_the_node_header_and_a_home_path() {
+        let text = client_lines(
+            "Node 12D3KooWExample (config /home/user1/.quilibrium/configs/XJA)\n\
+             Claimable rewards: 1 QUIL, mint to claim\n\
+             using /home/user1/.quilibrium/configs/XJA/config.yml\n\
+             privateKey: secret",
+        );
+        assert_eq!(text, "Claimable rewards: 1 QUIL, mint to claim");
     }
 
     #[test]
@@ -774,6 +944,7 @@ mod tests {
             current_epoch: "6".into(),
             epoch_length_frames: "7".into(),
             reachable: "true".into(),
+            health: "All reported workers are serving.".into(),
         }
     }
 
@@ -807,11 +978,11 @@ mod tests {
     #[test]
     fn a_read_only_status_omits_the_peer_id() {
         let facts = facts();
-        let read_only = facts.for_client(Access::ReadOnly);
+        let read_only = facts.for_client(Audience::External);
         assert!(!read_only.contains("peer-secret"), "{read_only}");
         assert!(!read_only.contains("Config"), "{read_only}");
         assert!(read_only.contains("Workers: 1 running"));
-        assert!(facts.for_client(Access::Full).contains("Peer: peer-secret"));
+        assert!(facts.for_client(Audience::Operator).contains("Peer: peer-secret"));
     }
 
     #[tokio::test]

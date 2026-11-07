@@ -98,9 +98,10 @@ async fn mcp_post(State(server): State<Arc<Server>>, headers: HeaderMap, body: B
         method,
         key = %principal.name,
         access = principal.access.as_str(),
+        party = if principal.external { "external" } else { "operator" },
         "mcp request"
     );
-    let outcome = mcp::dispatch(&server.app, &message, Instant::now(), principal.access).await;
+    let outcome = mcp::dispatch(&server.app, &message, Instant::now(), &principal).await;
     let Some(body) = outcome else {
         return StatusCode::ACCEPTED.into_response();
     };
