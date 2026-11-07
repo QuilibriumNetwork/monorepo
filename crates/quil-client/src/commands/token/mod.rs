@@ -18,6 +18,7 @@ mod account;
 pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
+mod info;
 pub(crate) mod legacy;
 pub(crate) mod output;
 #[cfg(feature = "native-proof")]
@@ -437,6 +438,12 @@ pub struct TokenArgs {
 pub enum TokenCommand {
     /// Shows the account address of the managing account.
     Account,
+    /// Print a token's name, symbol and configuration, read from its
+    /// metadata vertex: `info <TokenDomain>`.
+    Info {
+        /// Token domain (32-byte hex), as `deploy token` printed it.
+        domain: String,
+    },
     /// Lists the total balance of tokens in the managing account.
     Balance,
     /// Lists all coins under control of the managing account.
@@ -766,6 +773,7 @@ impl TokenCommand {
     fn submits(&self) -> bool {
         match self {
             TokenCommand::Account
+            | TokenCommand::Info { .. }
             | TokenCommand::Balance
             | TokenCommand::Coins
             | TokenCommand::Legacy(_)
@@ -1080,7 +1088,10 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         return legacy::run(global, &args.common, &application(args)?, listing).await;
     }
     let tc = TokenCtx::load(global, &args.common)?;
-    if !matches!(args.command, TokenCommand::Account) {
+    if !matches!(
+        args.command,
+        TokenCommand::Account | TokenCommand::Info { .. }
+    ) {
         tc.require_keys()?;
     }
     run_with_context(&tc, args).await
@@ -1464,6 +1475,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
+        TokenCommand::Info { domain } => info::run(tc, domain).await,
         TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run_loaded(tc, &application, listing).await
@@ -1483,6 +1495,18 @@ mod tests {
     struct TokenCli {
         #[command(flatten)]
         token: TokenArgs,
+    }
+
+    #[test]
+    fn token_info_takes_a_domain() {
+        let domain = hex::encode([7; 32]);
+        let parsed = TokenCli::try_parse_from(["token", "info", &domain]).unwrap();
+        assert!(matches!(
+            parsed.token.command,
+            TokenCommand::Info { domain: ref d } if *d == domain
+        ));
+        assert!(!parsed.token.command.submits());
+        assert!(TokenCli::try_parse_from(["token", "info"]).is_err());
     }
 
     #[test]
