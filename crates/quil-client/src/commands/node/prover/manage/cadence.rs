@@ -1,10 +1,9 @@
 //! Checks for forecasts derived from node-owned cadence snapshots.
 #[cfg(test)]
 mod node_forecast_tests {
-    use super::super::super::{
-        committee_size, format_quil_daily_units, observed_quil_daily, quorum_signers,
-    };
+    use super::super::super::{committee_size, format_quil_daily_units, observed_quil_daily};
     use num_bigint::BigInt;
+    use quil_rpc::health_conditions::quorum_signers;
     use quil_types::proto::node::{FrameCadence, FrameWindow, ShardProverCounts, ShardRewardInfo};
     #[test]
     fn observed_forecasts_distinguish_zero_and_missing_coverage() {

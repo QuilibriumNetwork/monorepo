@@ -427,6 +427,12 @@ pub(crate) fn format_gb(v: &BigInt) -> String {
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
+// One pricing for the client's forecasts and the node's reward condition.
+pub(crate) use quil_rpc::health_conditions::{
+    committee_size, format_quil_daily_units, observed_quil_daily, observed_window, signing_share,
+    SigningShare,
+};
+
 /// `framesPerDay` — frames in 24h at a 10s target frame time.
 const FRAMES_PER_DAY: u64 = 24 * 60 * 60 / 10; // 8640
 
@@ -442,103 +448,6 @@ pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
         return "<0.1".to_string();
     }
     format!("{}.{}", &tenths / 10, &tenths % 10)
-}
-
-pub(crate) fn format_quil_daily_units(v: &BigInt) -> String {
-    let negative = v.sign() == Sign::Minus;
-    let magnitude = if negative { -v } else { v.clone() };
-    let tenths =
-        (&magnitude + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
-    let text = if magnitude > BigInt::from(0) && tenths == BigInt::from(0) {
-        "<0.1".into()
-    } else {
-        format!("{}.{}", &tenths / 10, &tenths % 10)
-    };
-    format!("~{}{text}", if negative { "-" } else { "" })
-}
-/// Signers a shard frame's finalization certificate carries for an
-/// `n`-member committee: simplex stops verifying finalize votes at its
-/// `N3f1` quorum, `n - (n - 1) / 3`, and a frame credits only those signers.
-pub(crate) fn quorum_signers(n: u32) -> u32 {
-    n - n.saturating_sub(1) / 3
-}
-
-/// A shard's frame committee: its active provers and seated leavers
-/// (`get_active_provers`); joining and paused provers do not sign. Servers
-/// without phase counts give only the live count, which includes them.
-pub(crate) fn committee_size(shard: &quil_types::proto::node::ShardRewardInfo) -> u32 {
-    shard
-        .prover_counts
-        .as_ref()
-        .map_or(shard.active_provers, |c| c.active + c.leaving + c.departing)
-}
-
-/// A cadence window with enough coverage to read. The node withholds a cadence
-/// once its latest sample is over 90s old, so freshness on arrival is the node's
-/// call on its own clock; the client's clock takes no part.
-pub(crate) fn observed_window(
-    cadence: &quil_types::proto::node::FrameCadence,
-    day: bool,
-) -> Option<&quil_types::proto::node::FrameWindow> {
-    let w = if day {
-        cadence.day.as_ref()?
-    } else {
-        cadence.hour.as_ref()?
-    };
-    (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
-}
-
-/// The share of a shard's frames that pay a seat: `paid` of `frames`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SigningShare {
-    pub paid: u64,
-    pub frames: u64,
-    /// The seat's own certificate share, as the node counted it; else the
-    /// share a member voting in time signs, quorum of committee.
-    pub measured: bool,
-}
-
-/// [`SigningShare`] of a seat in the 60m or 24h window. GLOBAL credits each
-/// signer of a frame's certificate the same per-signer reward, so a seat
-/// earns the frames it signs: its own share once the node counted a frame
-/// in the window, else [`quorum_signers`] of `committee`. A committee of 0
-/// or 1 pays every frame.
-pub(crate) fn signing_share(
-    share: Option<&quil_types::proto::node::CertificateShare>,
-    day: bool,
-    committee: u32,
-) -> SigningShare {
-    let own = share.and_then(|s| if day { s.day.as_ref() } else { s.hour.as_ref() });
-    if let Some(w) = own.filter(|w| w.frames > 0) {
-        return SigningShare {
-            paid: w.signed_frames.min(w.frames),
-            frames: w.frames,
-            measured: true,
-        };
-    }
-    let n = committee.max(1);
-    SigningShare {
-        paid: u64::from(quorum_signers(n)),
-        frames: u64::from(n),
-        measured: false,
-    }
-}
-
-/// Observed QUIL/day of a seat on a shard: the shard's observed frame rate
-/// times the [`signing_share`] of its frames that pay the seat.
-pub(crate) fn observed_quil_daily(
-    per_frame: &BigInt,
-    cadence: &quil_types::proto::node::FrameCadence,
-    day: bool,
-    committee: u32,
-    share: Option<&quil_types::proto::node::CertificateShare>,
-) -> Option<BigInt> {
-    let w = observed_window(cadence, day)?;
-    let s = signing_share(share, day, committee);
-    Some(
-        per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400) * BigInt::from(s.paid)
-            / (BigInt::from(w.observed_seconds) * BigInt::from(s.frames)),
-    )
 }
 
 /// QUIL/day of a seat that signs every frame of a shard producing one frame
