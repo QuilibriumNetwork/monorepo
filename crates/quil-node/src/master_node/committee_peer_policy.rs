@@ -66,6 +66,11 @@ pub(super) const UNAVAILABLE_REPEAT: Duration = Duration::from_secs(600);
 /// it means both kept failing.
 pub(super) const EXPECTED_WAIT_WARN_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// How long a [`Cause::GlobalSync`] wait stays quiet. Every periodic prover
+/// tree sync holds the committed view for a few seconds while it installs
+/// its chunks; only a hold past this bound logs its start, and then its end.
+pub(super) const GLOBAL_SYNC_QUIET: Duration = Duration::from_secs(60);
+
 /// What an operator does about an expected wait, at info and past its bound.
 const EXPECTED_WAIT_ACTION: &str = "no action needed: this ends when this node \
     materializes its first GLOBAL frame from archive sync, and the line 'committee \
@@ -73,9 +78,16 @@ const EXPECTED_WAIT_ACTION: &str = "no action needed: this ends when this node \
     30 min it warns: then check that 'initial prover tree sync complete' was logged and \
     that no 'archive connection still failing' warning repeats";
 
-/// What peers lose while the policy is unavailable.
-const EFFECT: &str = "members of this node's committees that share an IP address \
-    get no IP-colocation exemption from peer scoring until it ends";
+/// What the peer-scoring exemptions do while the policy is unavailable.
+const EFFECT: &str = "the IP-colocation exemptions last applied stay in force (none \
+    after a fresh start); members joining or leaving this node's committees gain or lose \
+    theirs only once it ends";
+
+/// What an operator does about a GLOBAL state sync that holds the view long.
+const GLOBAL_SYNC_ACTION: &str = "no action needed: this ends when the GLOBAL state sync \
+    from an archive installs its last chunk, or when a later prover tree sync completes \
+    if this one fails; past 30 min it warns: then check that no 'archive connection still \
+    failing' warning repeats";
 
 /// Why the committed session heads cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +135,9 @@ pub(super) enum Transition {
         cause: Cause,
         replaced: Option<(Cause, Duration, u64)>,
     },
-    /// The episode continues inside its reminder interval: nothing logged.
+    /// Nothing logged: the episode continues inside its reminder interval,
+    /// or a quiet GLOBAL state sync wait began, continues inside
+    /// [`GLOBAL_SYNC_QUIET`] or ended without having logged its start.
     Suppressed,
     /// The episode continues and its reminder is due.
     Repeated {
@@ -144,62 +158,93 @@ struct Episode {
     started: Instant,
     logged: Instant,
     failures: u64,
+    /// Whether its start was logged: a [`Cause::GlobalSync`] wait's only once
+    /// it lasts [`GLOBAL_SYNC_QUIET`], so a short hold logs neither end.
+    announced: bool,
 }
 
 /// Turns the refresh's per-tick failures (every 5 s) into one line when an
 /// unavailability starts, a reminder every [`UNAVAILABLE_REPEAT`] with its
 /// duration and failure count, and one info line when it ends. An expected
 /// wait logs at info until [`EXPECTED_WAIT_WARN_AFTER`] ([`Transition::warns`]).
+/// A GLOBAL state sync wait logs its start only once it lasts
+/// [`GLOBAL_SYNC_QUIET`], and its end only after that start.
 #[derive(Default)]
 pub(super) struct Unavailability(Option<Episode>);
 
 impl Unavailability {
     pub(super) fn failed(&mut self, error: &QuilError, now: Instant) -> Transition {
         let cause = Cause::of(error);
-        let transition = match self.0.as_mut().filter(|episode| episode.cause == cause) {
+        let (transition, held) = match self.0.as_mut().filter(|episode| episode.cause == cause) {
             Some(episode) => {
                 episode.failures += 1;
-                if now.saturating_duration_since(episode.logged) < UNAVAILABLE_REPEAT {
+                let held = now.saturating_duration_since(episode.started);
+                if !episode.announced {
+                    if held < GLOBAL_SYNC_QUIET {
+                        return Transition::Suppressed;
+                    }
+                    // Its reminders keep their schedule from its start.
+                    episode.announced = true;
+                    (
+                        Transition::Started {
+                            cause,
+                            replaced: None,
+                        },
+                        held,
+                    )
+                } else if now.saturating_duration_since(episode.logged) < UNAVAILABLE_REPEAT {
                     return Transition::Suppressed;
-                }
-                episode.logged = now;
-                Transition::Repeated {
-                    cause,
-                    duration: now.saturating_duration_since(episode.started),
-                    failures: episode.failures,
+                } else {
+                    episode.logged = now;
+                    (
+                        Transition::Repeated {
+                            cause,
+                            duration: held,
+                            failures: episode.failures,
+                        },
+                        held,
+                    )
                 }
             }
             None => {
-                let replaced = self
-                    .0
-                    .replace(Episode {
-                        cause,
-                        started: now,
-                        logged: now,
-                        failures: 1,
-                    })
-                    .map(|old| {
-                        (
-                            old.cause,
-                            now.saturating_duration_since(old.started),
-                            old.failures,
-                        )
-                    });
-                Transition::Started { cause, replaced }
+                let replaced = self.0.take().map(|old| {
+                    (
+                        old.cause,
+                        now.saturating_duration_since(old.started),
+                        old.failures,
+                    )
+                });
+                // A GLOBAL state sync that ends a logged wait of another cause
+                // logs at once, so that wait's start line gets its successor.
+                let announced = cause != Cause::GlobalSync || replaced.is_some();
+                self.0 = Some(Episode {
+                    cause,
+                    started: now,
+                    logged: now,
+                    failures: 1,
+                    announced,
+                });
+                if !announced {
+                    return Transition::Suppressed;
+                }
+                (Transition::Started { cause, replaced }, Duration::ZERO)
             }
         };
-        transition.log(Some(error));
+        transition.log(Some(error), held);
         transition
     }
 
     pub(super) fn recovered(&mut self, now: Instant) -> Option<Transition> {
         let episode = self.0.take()?;
+        if !episode.announced {
+            return Some(Transition::Suppressed);
+        }
         let transition = Transition::Ended {
             cause: episode.cause,
             duration: now.saturating_duration_since(episode.started),
             failures: episode.failures,
         };
-        transition.log(None);
+        transition.log(None, Duration::ZERO);
         Some(transition)
     }
 }
@@ -217,7 +262,8 @@ impl Transition {
         }
     }
 
-    fn log(&self, error: Option<&QuilError>) {
+    /// `held`: how long the episode had lasted when its start was logged.
+    fn log(&self, error: Option<&QuilError>, held: Duration) {
         let error = error.map_or_else(String::new, ToString::to_string);
         let repeat_every_s = UNAVAILABLE_REPEAT.as_secs();
         let warn_after_s = EXPECTED_WAIT_WARN_AFTER.as_secs();
@@ -250,10 +296,12 @@ impl Transition {
                         scope = "this node",
                         cause = cause.as_str(),
                         replaced = %replaced,
+                        duration_s = held.as_secs(),
+                        quiet_s = GLOBAL_SYNC_QUIET.as_secs(),
                         repeat_every_s,
                         warn_after_s,
                         effect = EFFECT,
-                        action = "no action needed: this ends when the GLOBAL state sync from an archive installs its last chunk, or when a later prover tree sync completes if this one fails; past 30 min it warns: then check that no 'archive connection still failing' warning repeats",
+                        action = GLOBAL_SYNC_ACTION,
                         "waiting for a GLOBAL state sync from an archive to finish; nothing to fix yet"
                     ),
                     Cause::Other => warn!(
@@ -320,7 +368,7 @@ impl Transition {
                 cause = cause.as_str(),
                 duration_s = duration.as_secs(),
                 failures,
-                "committee membership readable again; committee peers get their IP-colocation exemption"
+                "committee membership readable again; IP-colocation exemptions follow it again"
             ),
         }
     }
@@ -561,5 +609,67 @@ mod tests {
         assert!(other.failed(&unreadable, t0).warns());
         assert!(other.failed(&unreadable, at(600)).warns());
         assert!(!other.recovered(at(605)).unwrap().warns());
+    }
+
+    fn global_sync() -> QuilError {
+        QuilError::ExecutionUnavailable(
+            quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+        )
+    }
+
+    /// Every periodic prover tree sync holds the committed view for a few
+    /// seconds; an operator read those start and end lines, every 5 min, as
+    /// a stuck sync.
+    #[test]
+    fn a_short_global_sync_hold_logs_nothing() {
+        let t0 = Instant::now();
+        let mut state = Unavailability::default();
+        assert_eq!(
+            state.failed(&global_sync(), t0),
+            Transition::Suppressed,
+            "a short hold logged its start"
+        );
+        assert_eq!(
+            state.recovered(t0 + Duration::from_secs(5)),
+            Some(Transition::Suppressed),
+            "a short hold logged its end"
+        );
+        assert_eq!(state.recovered(t0 + Duration::from_secs(10)), None);
+        assert_eq!(
+            state.failed(&global_sync(), t0 + Duration::from_secs(300)),
+            Transition::Suppressed,
+            "the next short hold logged its start"
+        );
+    }
+
+    #[test]
+    fn a_global_sync_hold_past_a_minute_logs_its_start_then_its_end() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut state = Unavailability::default();
+        for s in (0..60).step_by(5) {
+            assert_eq!(
+                state.failed(&global_sync(), at(s)),
+                Transition::Suppressed,
+                "a hold logged its start at {s}s"
+            );
+        }
+        assert_eq!(
+            state.failed(&global_sync(), at(60)),
+            Transition::Started {
+                cause: Cause::GlobalSync,
+                replaced: None
+            },
+            "a minute-long hold logged no start"
+        );
+        assert_eq!(
+            state.recovered(at(61)),
+            Some(Transition::Ended {
+                cause: Cause::GlobalSync,
+                duration: Duration::from_secs(61),
+                failures: 13
+            }),
+            "a minute-long hold logged no end"
+        );
     }
 }
