@@ -4,7 +4,7 @@
 //! `launchctl` (macOS) and generates the systemd unit / launchd plist.
 //! These operations require root (invoked via `sudo`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::system;
@@ -14,6 +14,16 @@ const LAUNCHD_LABEL: &str = "com.quilibrium.quilibrium-node";
 
 fn launchd_plist_path() -> String {
     format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist")
+}
+
+/// The node service's file on `os`: the launchd plist on macOS, else the
+/// systemd unit.
+pub fn service_file_path(os: &str) -> PathBuf {
+    if os == "darwin" {
+        PathBuf::from(launchd_plist_path())
+    } else {
+        PathBuf::from(SYSTEMD_UNIT_PATH)
+    }
 }
 
 pub fn run(action: &str) -> anyhow::Result<()> {
