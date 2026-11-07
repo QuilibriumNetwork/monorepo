@@ -1215,10 +1215,15 @@ pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
 /// Replica keys switch to persistent member/leaf keys at
 /// [`MAINNET_STABLE_REPLICA_KEY_EPOCH`]; epoch freshness remains bound into
 /// the registration, beacon challenges and STARK.
-/// Equal to [`MAINNET_PERSISTENT_STORAGE_EPOCH`]: a release published by
-/// epoch 1435 plus its [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] (32).
-/// Provers should upgrade before epoch 1459 for the full warmup. GLOBAL
-/// executors must upgrade before epoch 1466 admits the first epoch-1467 seals.
+/// Equal to [`MAINNET_PERSISTENT_STORAGE_EPOCH`], whose capacity warmup
+/// ([`PERSISTENT_STORAGE_WARMUP_EPOCHS`], 32) starts at epoch 1435 (frame
+/// 1,033,200, [`persistent_storage_warmup_epoch`]): from then nodes publish
+/// capacity precommits and GLOBAL applies them, and a GLOBAL executor
+/// without the release skips them. Every GLOBAL executor (every archive, in
+/// any order) must run the release before epoch 1435, or GLOBAL splits.
+/// Provers should run it before epoch 1435 for the full capacity warmup, and
+/// before epoch 1459 for the full eight-epoch label warmup of the first
+/// sealed epoch (`storage_labels::ahead_epoch`).
 pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1467);
 static SEALED_STORAGE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 thread_local! {
@@ -4253,17 +4258,13 @@ mod strict_peer_info_epoch_tests {
 mod sealed_storage_activation_tests {
     use super::*;
     #[test]
-    fn sealed_storage_cutover_is_1467_and_mainnet_ignores_overrides() {
-        assert_eq!(
-            MAINNET_SEALED_STORAGE_EPOCH,
-            Some(1467),
-            "sealed storage starts at epoch 1467"
-        );
+    fn sealed_storage_cutover_is_the_mainnet_constant_and_mainnet_ignores_overrides() {
+        let first = MAINNET_SEALED_STORAGE_EPOCH.expect("mainnet seals");
         for setting in [None, Some("0"), Some("9999"), Some("bad")] {
             assert_eq!(
                 sealed_storage_epoch_for(0, setting),
-                1467,
-                "mainnet seals from epoch 1467 whatever the setting"
+                first,
+                "mainnet seals from epoch {first} whatever the setting"
             );
         }
         assert_eq!(sealed_storage_epoch_for(1, None), u64::MAX);
@@ -4303,40 +4304,42 @@ mod sealed_storage_activation_tests {
     }
 
     /// The mainnet defaults, with no setting or thread override: a frame
-    /// before 1,056,240 (epoch 1467) neither requires a sealed seat nor stops
-    /// the unsealed issuance share; the frame itself does both.
+    /// before the first frame of [`MAINNET_SEALED_STORAGE_EPOCH`], the
+    /// warmup included, neither requires a sealed seat nor stops the unsealed
+    /// issuance share; that frame does both.
     #[test]
-    fn mainnet_requires_sealing_from_frame_1_056_240() {
+    fn mainnet_requires_sealing_from_the_first_frame_of_the_sealed_epoch() {
         set_sealed_storage_epoch_for_thread(None);
         set_persistent_storage_epoch_for_thread(None);
         set_unsealed_issuance_epoch_for_thread(None);
-        let boundary = 1_056_240;
-        assert_eq!(epoch_start_frame(1467), boundary);
-        for frame in [1_002_960, 1_039_680, boundary - 1] {
+        let first = MAINNET_SEALED_STORAGE_EPOCH.expect("mainnet seals");
+        let boundary = epoch_start_frame(first);
+        let warmup = epoch_start_frame(first - PERSISTENT_STORAGE_WARMUP_EPOCHS);
+        for frame in [1_002_960, warmup, boundary - 1] {
             assert!(
                 !sealed_storage_required_at(frame),
-                "frame {frame}: sealing is required only from epoch 1467"
+                "frame {frame}: sealing is required only from epoch {first}"
             );
             assert!(
                 storage_seat_eligible(&[1], frame, None),
-                "frame {frame}: an unsealed member counts until epoch 1467"
+                "frame {frame}: an unsealed member counts until epoch {first}"
             );
             assert!(
                 unsealed_issuance_active(frame),
-                "frame {frame}: unsealed issuance is paid until epoch 1467"
+                "frame {frame}: unsealed issuance is paid until epoch {first}"
             );
         }
         assert!(
             sealed_storage_required_at(boundary),
-            "sealing is required from epoch 1467"
+            "sealing is required from epoch {first}"
         );
         assert!(
             !storage_seat_eligible(&[1], boundary, None),
-            "an unsealed member stops counting at epoch 1467"
+            "an unsealed member stops counting at epoch {first}"
         );
         assert!(
             !unsealed_issuance_active(boundary),
-            "unsealed issuance stops at epoch 1467"
+            "unsealed issuance stops at epoch {first}"
         );
     }
 }

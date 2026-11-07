@@ -833,9 +833,7 @@ pub(crate) fn poll_sector_certificates(
     use quil_execution::global_intrinsic::persistent_storage as protocol;
     let first = quil_types::consensus::persistent_storage_epoch();
     let current = quil_types::consensus::epoch_for_frame(frame);
-    if first == u64::MAX
-        || current.saturating_add(quil_types::consensus::PERSISTENT_STORAGE_WARMUP_EPOCHS) < first
-    {
+    if !quil_types::consensus::persistent_storage_warmup_at(current) {
         return Ok(());
     }
     let Some(store) = crate::storage_labels::installed() else {

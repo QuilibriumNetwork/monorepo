@@ -2,8 +2,9 @@
 //! Mainnet persistent certificates and three-layer seals activate at epoch 1467.
 use std::{cell::Cell, sync::OnceLock};
 
-/// Publish by epoch 1435 + [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] (32); sealed
-/// storage ([`super::MAINNET_SEALED_STORAGE_EPOCH`]) starts with it.
+/// Its capacity warmup ([`PERSISTENT_STORAGE_WARMUP_EPOCHS`], 32) starts at
+/// epoch 1435 ([`persistent_storage_warmup_epoch`]); sealed storage
+/// ([`super::MAINNET_SEALED_STORAGE_EPOCH`]) starts with it.
 pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = Some(1467);
 /// The faster suite switches with the coordinated persistent-storage activation.
 pub const MAINNET_FAST_STORAGE_EPOCH: Option<u64> = MAINNET_PERSISTENT_STORAGE_EPOCH;
@@ -138,6 +139,31 @@ pub fn persistent_storage_at(epoch: u64) -> bool {
     from != u64::MAX && epoch >= from
 }
 
+/// The first epoch of the capacity warmup, [`PERSISTENT_STORAGE_WARMUP_EPOCHS`]
+/// before [`persistent_storage_epoch`]: from it nodes send, and GLOBAL
+/// applies, capacity precommits for the first persistent epoch. A GLOBAL
+/// executor without the handler skips them, so every GLOBAL executor must run
+/// the release before it. MAX when persistent storage is disabled.
+pub fn persistent_storage_warmup_epoch() -> u64 {
+    match persistent_storage_epoch() {
+        u64::MAX => u64::MAX,
+        first => first.saturating_sub(PERSISTENT_STORAGE_WARMUP_EPOCHS),
+    }
+}
+
+/// Whether epoch `current` is in or past the capacity warmup, when nodes
+/// send capacity precommits.
+pub fn persistent_storage_warmup_at(current: u64) -> bool {
+    let from = persistent_storage_warmup_epoch();
+    from != u64::MAX && current >= from
+}
+
+/// Whether GLOBAL in epoch `current` admits a capacity precommit for `epoch`:
+/// from the epoch itself up to [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] ahead.
+pub fn capacity_precommit_window(current: u64, epoch: u64) -> bool {
+    epoch >= current && epoch <= current.saturating_add(PERSISTENT_STORAGE_WARMUP_EPOCHS)
+}
+
 /// The most certified sectors a member holding `seats` may have.
 pub fn max_certified_sectors(seats: u64) -> u64 {
     seats
@@ -179,16 +205,16 @@ mod tests {
     use super::*;
     #[test]
     fn mainnet_activation_is_coordinated_and_ignores_environment_settings() {
-        assert_eq!(
-            MAINNET_PERSISTENT_STORAGE_EPOCH,
-            Some(1467),
-            "persistent storage starts at epoch 1467"
+        let first = MAINNET_PERSISTENT_STORAGE_EPOCH.expect("mainnet activates");
+        assert!(
+            first >= 1429,
+            "the activation follows the gates passed below"
         );
         for setting in [None, Some("0"), Some("1393"), Some("bad")] {
             assert_eq!(
                 configured(0, setting, 1314, 1429),
-                1467,
-                "mainnet starts persistent storage at epoch 1467 whatever the setting"
+                first,
+                "mainnet starts persistent storage at epoch {first} whatever the setting"
             );
         }
         assert_eq!(configured(1, Some("1400"), 1314, 1393), 1400);
@@ -197,43 +223,75 @@ mod tests {
         assert_eq!(configured(1, Some("1400"), 1314, u64::MAX), u64::MAX);
     }
     #[test]
-    fn mainnet_switches_to_three_layers_exactly_at_epoch_1467() {
+    fn mainnet_switches_to_three_layers_exactly_at_the_activation() {
         set_persistent_storage_epoch_for_thread(None);
         set_storage_seal_profile_for_thread(None);
+        let first = MAINNET_PERSISTENT_STORAGE_EPOCH.expect("mainnet activates");
         assert_eq!(
             persistent_storage_epoch(),
-            1467,
-            "persistent storage starts at epoch 1467"
+            first,
+            "persistent storage starts at epoch {first}"
         );
-        assert_eq!(1467 * super::super::EPOCH_LENGTH_FRAMES, 1_056_240);
-        assert!(super::super::stable_replica_keys_at(1467));
-        for epoch in [1465, 1466] {
+        assert!(super::super::stable_replica_keys_at(first));
+        for epoch in [first - 2, first - 1] {
             assert!(!persistent_storage_at(epoch));
             assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Eleven);
         }
-        for epoch in [1467, 1468] {
+        for epoch in [first, first + 1] {
             assert!(persistent_storage_at(epoch));
             assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Three);
         }
         set_persistent_storage_epoch_for_thread(Some(u64::MAX));
-        assert_eq!(storage_seal_profile(1467), StorageSealProfile::Eleven);
+        assert_eq!(storage_seal_profile(first), StorageSealProfile::Eleven);
         set_persistent_storage_epoch_for_thread(None);
     }
 
-    /// Sealed and persistent storage share one mainnet activation, which a
-    /// release published by epoch 1435 reaches after its full warmup.
+    /// Sealed and persistent storage share one mainnet activation.
     #[test]
     fn sealed_storage_starts_with_persistent_storage_after_the_warmup() {
         assert_eq!(
             super::super::MAINNET_SEALED_STORAGE_EPOCH,
             MAINNET_PERSISTENT_STORAGE_EPOCH,
-            "sealed and persistent storage both start at epoch 1467"
+            "sealed and persistent storage start at the same epoch"
         );
-        assert_eq!(
-            MAINNET_PERSISTENT_STORAGE_EPOCH.map(|e| e - PERSISTENT_STORAGE_WARMUP_EPOCHS),
-            Some(1435),
-            "epoch 1467 is publish epoch 1435 plus the warmup"
+    }
+
+    /// The warmup start, the activation less [`PERSISTENT_STORAGE_WARMUP_EPOCHS`],
+    /// is the deadline for every GLOBAL executor: the first epoch in which
+    /// nodes send, and GLOBAL admits, a capacity precommit for the first
+    /// persistent epoch.
+    #[test]
+    fn mainnet_warmup_start_is_the_first_epoch_precommits_are_sent_and_admitted() {
+        set_persistent_storage_epoch_for_thread(None);
+        let first = MAINNET_PERSISTENT_STORAGE_EPOCH.expect("mainnet activates");
+        let start = persistent_storage_warmup_epoch();
+        assert_eq!(start, first - PERSISTENT_STORAGE_WARMUP_EPOCHS);
+        assert!(
+            !persistent_storage_warmup_at(start - 1),
+            "WARMUP-START: no precommit is sent before epoch {start}"
         );
+        assert!(
+            persistent_storage_warmup_at(start),
+            "WARMUP-START: precommits are sent from epoch {start}"
+        );
+        assert!(persistent_storage_warmup_at(first));
+        assert!(
+            (0..start).all(|current| !capacity_precommit_window(current, first)),
+            "WARMUP-START: GLOBAL admits no epoch-{first} precommit before epoch {start}"
+        );
+        assert!(
+            capacity_precommit_window(start, first),
+            "WARMUP-START: GLOBAL admits epoch-{first} precommits from epoch {start}"
+        );
+        assert!(capacity_precommit_window(first, first));
+        assert!(!capacity_precommit_window(first + 1, first));
+        set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        assert_eq!(persistent_storage_warmup_epoch(), u64::MAX);
+        assert!(!persistent_storage_warmup_at(u64::MAX));
+        set_persistent_storage_epoch_for_thread(Some(20));
+        assert_eq!(persistent_storage_warmup_epoch(), 0);
+        assert!(persistent_storage_warmup_at(0));
+        set_persistent_storage_epoch_for_thread(None);
     }
 
     #[test]

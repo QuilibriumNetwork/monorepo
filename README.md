@@ -217,6 +217,8 @@ attacks and does not establish the security of reduced-layer parameters.
 Mainnet activates the three-layer suite (`MAINNET_FAST_STORAGE_PROFILE`) with
 persistent storage at epoch 1467 (`MAINNET_FAST_STORAGE_EPOCH` =
 `MAINNET_PERSISTENT_STORAGE_EPOCH`), the epoch sealed storage also starts.
+Its 32-epoch capacity warmup starts at epoch 1435 (frame 1,033,200): every
+archive serving GLOBAL must run the release before then.
 Benchmark flags cannot activate a suite on mainnet. Existing eleven-layer
 encodings and proof transcripts are preserved. New registrations use `PS02`/`PS03`; capacity envelopes
 use `PSC3`/`PSC4` with a tagged certificate. Cached labels and resumed sectors
