@@ -1143,6 +1143,18 @@ impl BlsAppFrameValidator {
         quil_types::consensus::required_anchor_active(latest).then_some(latest)
     }
 
+    /// This node's latest GLOBAL frame, when the fee vote bounds apply from
+    /// it and `frame`'s vote lies outside them. A voter refuses such a
+    /// proposal even when its anchor predates the bounds, which validation,
+    /// judged by the anchor, lets pass.
+    pub fn fee_vote_out_of_bounds_now(&self, frame: &AppShardFrame) -> Option<u64> {
+        if crate::fees::fee_vote_in_bounds(frame.header.as_ref()?.fee_multiplier_vote) {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        crate::fees::fee_vote_bounded_at(latest).then_some(latest)
+    }
+
     /// The GLOBAL frame `frame` is anchored to, when this node's clock does
     /// not hold it, with the latest GLOBAL frame it does hold (`None`: none
     /// or no clock). `None` when the anchor is held or the frame has none.
@@ -1377,6 +1389,16 @@ impl BlsAppFrameValidator {
                 )));
             }
         }
+
+        // The frame prices its application writes at its fee vote, which its
+        // leader chose: refuse one outside the bounds every leader computes
+        // (a vote of zero would make those writes free). Judged by the anchor,
+        // so every replica and archive decides alike.
+        crate::fees::check_fee_vote(
+            header.frame_number,
+            header.global_frame_number,
+            header.fee_multiplier_vote,
+        )?;
 
         // 1. Verify the deterministic app output. The global chain supplies
         // the storage beacon; app frames perform no VDF verification.

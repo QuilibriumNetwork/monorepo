@@ -905,6 +905,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions two epochs after their request"
     );
+    let fee_vote_bound_from = quil_engine::fees::init_fee_vote_bound_frame(args.network);
+    info!(
+        fee_vote_bound_frame = %if fee_vote_bound_from == u64::MAX { "never".to_string() } else { fee_vote_bound_from.to_string() },
+        "app shard frames refused when their fee vote is outside the bounds every leader computes"
+    );
     let signed_frame_from = quil_types::consensus::init_signed_frame_activation_frame(args.network);
     info!(
         signed_frame_activation_frame = %if signed_frame_from == u64::MAX { "never".to_string() } else { signed_frame_from.to_string() },

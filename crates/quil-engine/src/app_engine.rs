@@ -2028,12 +2028,18 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .as_ref()
             .map(|h| h.timestamp)
             .unwrap_or(now_ms - 10_000); // assume 10s at genesis
-        let fee_multiplier_vote = crate::fees::compute_fee_multiplier_vote(
-            self.fee_manager.as_ref(),
-            &self.filter,
-            now_ms,
-            previous_timestamp_ms,
-            self.reward_greedy,
+
+        // Kept inside the bounds members enforce once they apply (a no-op
+        // for every vote computed today; see `fees::MIN_FEE_MULTIPLIER_VOTE`).
+        let fee_multiplier_vote = crate::fees::proposer_fee_vote(
+            anchor_gfn,
+            crate::fees::compute_fee_multiplier_vote(
+                self.fee_manager.as_ref(),
+                &self.filter,
+                now_ms,
+                previous_timestamp_ms,
+                self.reward_greedy,
+            ),
         );
 
         // Per-frame shard state roots: 4 × 64-byte phase commitments
@@ -27793,6 +27799,107 @@ mod tests {
                 .unwrap_or(false),
             "vertex-adds root (state_roots[0]) must be non-zero after a real write; got {roots_after:?}"
         );
+    }
+
+    /// A frame prices its application writes at its fee vote: a hypergraph
+    /// write carrying no settlement claim is skipped in a frame voting 100,
+    /// and commits in one voting zero, which is why members bound the vote
+    /// (`fees::check_fee_vote`).
+    #[test]
+    fn a_write_without_a_claim_commits_only_at_a_zero_fee_vote() {
+        use quil_execution::hypergraph_intrinsic::confidential;
+        use quil_execution::hypergraph_intrinsic::vertex_ops::{
+            vertex_add_domain_separator, vertex_add_signing_message,
+        };
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+        use quil_types::proto::hypergraph::VertexAdd;
+        use std::sync::Arc;
+
+        let signer = quil_crypto::FalconSigner::generate();
+        struct KeyResolver(Vec<u8>);
+        impl quil_execution::hypergraph_intrinsic::HypergraphConfigResolver for KeyResolver {
+            fn write_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+                Some(self.0.clone())
+            }
+        }
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let mgr = quil_execution::ExecutionEngineManager::new(
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+            Arc::new(crate::test_support::AcceptAllKeyManager),
+            crdt.clone(),
+            crypto.circuit_compiler.clone(),
+            crypto.clock_store.clone(),
+            Arc::new(KeyResolver(signer.public_key().to_vec())),
+            false, // application mode
+        );
+        let domain = quil_execution::hypergraph_intrinsic::hypergraph_base_domain().to_vec();
+        let field = confidential::ConfidentialField {
+            commitment: [7u8; 32],
+            kem_ct: vec![0u8; confidential::KEM_CT_LEN],
+            nonce: [0u8; confidential::NONCE_LEN],
+            aead_ct: vec![0u8; confidential::SALT_LEN + confidential::TAG_LEN],
+        };
+        let chunks: Vec<Vec<u8>> = vec![confidential::encode(&field)];
+        let data = quil_execution::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks(
+            &chunks,
+        )
+        .unwrap();
+        let data_address = vec![0x22u8; 32];
+        let mut signed = vertex_add_domain_separator(&domain).unwrap();
+        signed.extend_from_slice(
+            &vertex_add_signing_message(&domain, &data_address, &chunks).unwrap(),
+        );
+        let bundle = MessageBundle {
+            requests: vec![MessageRequest {
+                timestamp: 1,
+                request: Some(Request::VertexAdd(VertexAdd {
+                    domain: domain.clone(),
+                    data_address,
+                    data,
+                    signature: signer.sign_with_domain(&signed, &[]).unwrap(),
+                })),
+            }],
+            timestamp: 1,
+        };
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&domain);
+        let location = quil_hypergraph::addressing::Location {
+            app_address: app,
+            data_address: [0x22u8; 32],
+        };
+
+        let priced = materialize_app_shard_requests(
+            &mgr,
+            std::slice::from_ref(&bundle),
+            1,
+            50_000,
+            0,
+            100,
+            &domain,
+            0,
+        )
+        .unwrap();
+        assert_eq!((priced.processed, priced.skipped), (0, 1), "vote 100");
+        assert!(crdt.get_vertex_data(&location).is_none());
+
+        let free = materialize_app_shard_requests(
+            &mgr,
+            std::slice::from_ref(&bundle),
+            2,
+            50_000,
+            0,
+            0,
+            &domain,
+            0,
+        )
+        .unwrap();
+        assert_eq!((free.processed, free.skipped), (1, 0), "vote 0");
+        assert!(crdt.get_vertex_data(&location).is_some());
     }
 
     #[test]
