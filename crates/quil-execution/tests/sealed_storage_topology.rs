@@ -1,5 +1,5 @@
 //! Sealed storage across a split or merge, from the sealed storage epoch
-//! (`MAINNET_SEALED_STORAGE_EPOCH`, 1393).
+//! (`MAINNET_SEALED_STORAGE_EPOCH`, 1467).
 //!
 //! A storage seat is per member and shard. A split or merge moves the
 //! members' allocations onto the shards it creates; no GLOBAL path moves a
@@ -64,7 +64,7 @@ impl quil_types::crypto::KeyManager for AcceptAll {
 }
 
 const EPOCH: u64 = 720;
-/// Past the sealed storage epoch (1393), the unified cutover and every grid
+/// Past the sealed storage epoch (1467), the unified cutover and every grid
 /// reset, as on mainnet.
 const START: u64 = 2000 * EPOCH;
 const APP: [u8; 32] = [0x31; 32];
@@ -554,7 +554,7 @@ fn assert_produces(what: &str, applied: Option<u64>, trace: &Trace) {
     }
     assert!(
         failures.is_empty(),
-        "{what} applied in epoch {applied} (sealed storage from epoch 1393): {}",
+        "{what} applied in epoch {applied} (sealed storage from epoch 1467): {}",
         failures.join(" | ")
     );
 }

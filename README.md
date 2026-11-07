@@ -214,11 +214,11 @@ graph prepared outside the timer, and checks both roots against the certificate.
 Its report covers one CPU lane; it does not assess partial-storage, GPU or ASIC
 attacks and does not establish the security of reduced-layer parameters.
 
-Mainnet fast-profile activation is unset:
-`MAINNET_FAST_STORAGE_EPOCH` and `MAINNET_FAST_STORAGE_PROFILE` are both `None`,
-in addition to the existing unset persistent-storage activation. Benchmark flags
-cannot activate a suite on mainnet. Existing eleven-layer encodings and proof
-transcripts are preserved. New registrations use `PS02`/`PS03`; capacity envelopes
+Mainnet activates the three-layer suite (`MAINNET_FAST_STORAGE_PROFILE`) with
+persistent storage at epoch 1467 (`MAINNET_FAST_STORAGE_EPOCH` =
+`MAINNET_PERSISTENT_STORAGE_EPOCH`), the epoch sealed storage also starts.
+Benchmark flags cannot activate a suite on mainnet. Existing eleven-layer
+encodings and proof transcripts are preserved. New registrations use `PS02`/`PS03`; capacity envelopes
 use `PSC3`/`PSC4` with a tagged certificate. Cached labels and resumed sectors
 carry their suite, while suite views share resource reservations.
 

@@ -1064,8 +1064,9 @@ mod tests {
         );
     }
     #[test]
-    fn scheduled_mainnet_warmup_builds_three_layer_sectors_for_1444() {
+    fn scheduled_mainnet_warmup_builds_three_layer_sectors_for_the_first_epoch() {
         gates(false);
+        let first = quil_types::consensus::MAINNET_PERSISTENT_STORAGE_EPOCH.unwrap();
         quil_types::consensus::set_min_sector_nodes_for_thread(Some(64));
         crate::storage_jobs::set_available_for_test(Some(64 << 30));
         let graph = super::super::tests::test_crdt();
@@ -1083,8 +1084,8 @@ mod tests {
         let captured = capture_at(
             &graph,
             &filter,
-            1444,
-            &[current_source(&graph, &filter, 1444)],
+            first,
+            &[current_source(&graph, &filter, first)],
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1106,10 +1107,10 @@ mod tests {
         assert_eq!(fs::read(sector.dir.join("reservation")).unwrap().len(), 52);
         assert!(store
             .for_profile(sector::Profile::Three)
-            .find(1444, &member, &sector.cert.sector, |n| n == sector.cert.n)
+            .find(first, &member, &sector.cert.sector, |n| n == sector.cert.n)
             .is_some());
         assert!(store
-            .find(1444, &member, &sector.cert.sector, |_| true)
+            .find(first, &member, &sector.cert.sector, |_| true)
             .is_none());
         quil_types::consensus::set_min_sector_nodes_for_thread(None);
         crate::storage_jobs::set_available_for_test(None);

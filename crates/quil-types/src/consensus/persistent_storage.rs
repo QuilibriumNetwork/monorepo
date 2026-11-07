@@ -1,8 +1,10 @@
 //! Coordinated activation of persistent label certificates and sector roots.
-//! Mainnet persistent certificates and three-layer seals activate at epoch 1444.
+//! Mainnet persistent certificates and three-layer seals activate at epoch 1467.
 use std::{cell::Cell, sync::OnceLock};
 
-pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = Some(1444);
+/// Publish by epoch 1435 + [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] (32); sealed
+/// storage ([`super::MAINNET_SEALED_STORAGE_EPOCH`]) starts with it.
+pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = Some(1467);
 /// The faster suite switches with the coordinated persistent-storage activation.
 pub const MAINNET_FAST_STORAGE_EPOCH: Option<u64> = MAINNET_PERSISTENT_STORAGE_EPOCH;
 pub const MAINNET_FAST_STORAGE_PROFILE: Option<StorageSealProfile> =
@@ -177,9 +179,17 @@ mod tests {
     use super::*;
     #[test]
     fn mainnet_activation_is_coordinated_and_ignores_environment_settings() {
-        assert_eq!(MAINNET_PERSISTENT_STORAGE_EPOCH, Some(1444));
+        assert_eq!(
+            MAINNET_PERSISTENT_STORAGE_EPOCH,
+            Some(1467),
+            "persistent storage starts at epoch 1467"
+        );
         for setting in [None, Some("0"), Some("1393"), Some("bad")] {
-            assert_eq!(configured(0, setting, 1314, 1429), 1444);
+            assert_eq!(
+                configured(0, setting, 1314, 1429),
+                1467,
+                "mainnet starts persistent storage at epoch 1467 whatever the setting"
+            );
         }
         assert_eq!(configured(1, Some("1400"), 1314, 1393), 1400);
         assert_eq!(configured(1, Some("12"), 1314, 1393), 1393);
@@ -187,23 +197,43 @@ mod tests {
         assert_eq!(configured(1, Some("1400"), 1314, u64::MAX), u64::MAX);
     }
     #[test]
-    fn mainnet_switches_to_three_layers_exactly_at_epoch_1444() {
+    fn mainnet_switches_to_three_layers_exactly_at_epoch_1467() {
         set_persistent_storage_epoch_for_thread(None);
         set_storage_seal_profile_for_thread(None);
-        assert_eq!(persistent_storage_epoch(), 1444);
-        assert_eq!(1444 * super::super::EPOCH_LENGTH_FRAMES, 1_039_680);
-        assert!(super::super::stable_replica_keys_at(1444));
-        for epoch in [1442, 1443] {
+        assert_eq!(
+            persistent_storage_epoch(),
+            1467,
+            "persistent storage starts at epoch 1467"
+        );
+        assert_eq!(1467 * super::super::EPOCH_LENGTH_FRAMES, 1_056_240);
+        assert!(super::super::stable_replica_keys_at(1467));
+        for epoch in [1465, 1466] {
             assert!(!persistent_storage_at(epoch));
             assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Eleven);
         }
-        for epoch in [1444, 1445] {
+        for epoch in [1467, 1468] {
             assert!(persistent_storage_at(epoch));
             assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Three);
         }
         set_persistent_storage_epoch_for_thread(Some(u64::MAX));
-        assert_eq!(storage_seal_profile(1444), StorageSealProfile::Eleven);
+        assert_eq!(storage_seal_profile(1467), StorageSealProfile::Eleven);
         set_persistent_storage_epoch_for_thread(None);
+    }
+
+    /// Sealed and persistent storage share one mainnet activation, which a
+    /// release published by epoch 1435 reaches after its full warmup.
+    #[test]
+    fn sealed_storage_starts_with_persistent_storage_after_the_warmup() {
+        assert_eq!(
+            super::super::MAINNET_SEALED_STORAGE_EPOCH,
+            MAINNET_PERSISTENT_STORAGE_EPOCH,
+            "sealed and persistent storage both start at epoch 1467"
+        );
+        assert_eq!(
+            MAINNET_PERSISTENT_STORAGE_EPOCH.map(|e| e - PERSISTENT_STORAGE_WARMUP_EPOCHS),
+            Some(1435),
+            "epoch 1467 is publish epoch 1435 plus the warmup"
+        );
     }
 
     #[test]
@@ -240,7 +270,7 @@ mod profile_tests {
     use super::*;
     #[test]
     fn fast_suites_require_both_coordinated_settings_and_persistent_activation() {
-        assert_eq!(MAINNET_FAST_STORAGE_EPOCH, Some(1444));
+        assert_eq!(MAINNET_FAST_STORAGE_EPOCH, MAINNET_PERSISTENT_STORAGE_EPOCH);
         assert_eq!(
             MAINNET_FAST_STORAGE_PROFILE,
             Some(StorageSealProfile::Three)
