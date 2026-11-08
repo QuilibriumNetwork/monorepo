@@ -64,6 +64,17 @@ const HASH_NODES: u8 = 0x06;
 const DATA_CAP: u8 = 0x07;
 /// Latest immutable snapshot fingerprint and its epoch, by logical leaf.
 const SNAPSHOT_REUSE: u8 = 0x08;
+/// A hash-proof epoch's leaf whose chunks lie in runs over several epochs
+/// ([`HASH_LEAF_RUNS`]), by leaf id, in place of its [`HASH_LEAF`] record:
+/// builds before runs read no such record, so to them the leaf is not
+/// stored and is encoded again. (0x09 is taken by another open change.)
+const LEAF_RUNS: u8 = 0x0A;
+/// The chunk index, under an epoch's [`HASH_NODES`] keys of a leaf, of an
+/// empty value showing that a [`LEAF_RUNS`] record of a later epoch reads
+/// that epoch's chunks of the leaf. Past every chunk, but within the range
+/// builds before runs keep for an alias, so their eviction drops it
+/// exactly when it drops the chunks.
+const RUNS_WITNESS: u32 = u32::MAX - 1;
 
 /// Nodes per stored chunk: one subtree below the cap, all a member reads of a
 /// replica to open one node of it (`MerkleCap::subtree`).
@@ -109,8 +120,14 @@ fn meta_key(kind: u8, epoch: u64, id: &[u8]) -> Vec<u8> {
 /// Leads a hash-proof epoch's leaf as builds before the chunked layout stored
 /// it, whole, under its replica key; read only to convert it.
 const LEGACY_HASH_REPLICA_TAG: u8 = 0xA5;
-/// Leads a [`HASH_LEAF`] record.
+/// Leads a [`HASH_LEAF`] record whose chunks are all its own epoch's.
 const HASH_LEAF_VERSION: u8 = 1;
+/// Leads a [`HASH_LEAF`] record whose chunks are all one earlier epoch's
+/// ([`ReplicaStore::alias_hash`]).
+const HASH_LEAF_ALIAS: u8 = 2;
+/// Leads a [`LEAF_RUNS`] record: a leaf whose chunks lie in runs, each its
+/// own epoch's or an earlier one's ([`ReplicaStore::put_hash`]).
+const HASH_LEAF_RUNS: u8 = 3;
 
 /// A hash-proof epoch's stored leaf, nodes and all.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,8 +206,12 @@ pub struct HashLeaf {
     pub cap: MerkleCap,
     pub registration_root: Vec<u8>,
     chunk_nodes: u64,
-    /// Immutable chunks retained for an epoch alias; aliases always point directly to the base.
-    source_epoch: Option<u64>,
+    /// Where the chunks lie when not all under the record's own epoch:
+    /// runs `(first chunk, epoch)` from chunk 0 on, each up to the next,
+    /// under the record's own epoch or an earlier one whose immutable
+    /// chunks it reads. A run names the epoch that wrote its chunks, never
+    /// another reference to them.
+    sources: Vec<(u32, u64)>,
 }
 
 impl HashLeaf {
@@ -206,18 +227,98 @@ impl HashLeaf {
         value
     }
 
+    /// The record of a leaf stored under `epoch` whose chunks lie where
+    /// `runs` (`(first chunk, epoch)` from chunk 0 on) put them, `body`
+    /// what [`Self::encode`] writes after its version. Runs of one epoch
+    /// are merged, so a leaf whose chunks are all its own epoch's, or all
+    /// one earlier epoch's, is recorded as builds before runs recorded it.
+    fn encode_runs(epoch: u64, runs: &[(u32, u64)], body: &[u8]) -> Vec<u8> {
+        let mut merged: Vec<(u32, u64)> = Vec::with_capacity(runs.len());
+        for &(first, source) in runs {
+            if merged.last().is_none_or(|&(_, last)| last != source) {
+                merged.push((first, source));
+            }
+        }
+        let mut value = Vec::with_capacity(5 + merged.len() * 12 + body.len());
+        match merged[..] {
+            [] => value.push(HASH_LEAF_VERSION),
+            [(0, source)] if source == epoch => value.push(HASH_LEAF_VERSION),
+            [(0, source)] => {
+                value.push(HASH_LEAF_ALIAS);
+                value.extend_from_slice(&source.to_be_bytes());
+            }
+            _ => {
+                value.push(HASH_LEAF_RUNS);
+                value.extend_from_slice(&(merged.len() as u32).to_be_bytes());
+                for (first, source) in merged {
+                    value.extend_from_slice(&first.to_be_bytes());
+                    value.extend_from_slice(&source.to_be_bytes());
+                }
+            }
+        }
+        value.extend_from_slice(body);
+        value
+    }
+
+    /// A stored record without its version and runs: what
+    /// [`Self::encode`] writes after its version.
+    fn body(value: &[u8]) -> Option<&[u8]> {
+        match *value.first()? {
+            HASH_LEAF_VERSION => value.get(1..),
+            HASH_LEAF_ALIAS => value.get(9..),
+            HASH_LEAF_RUNS => {
+                let runs = u32::from_be_bytes(value.get(1..5)?.try_into().ok()?) as usize;
+                value.get(runs.checked_mul(12)?.checked_add(5)?..)
+            }
+            _ => None,
+        }
+    }
+
     fn decode(value: &[u8]) -> Result<Self> {
+        let layout = Self::layout(value)?;
+        let cap = MerkleCap::from_bytes(layout.cap).ok_or_else(|| {
+            QuilError::InvalidArgument("a stored replica's cap does not decode".into())
+        })?;
+        Ok(Self {
+            n: layout.n,
+            cap,
+            registration_root: layout.registration_root.to_vec(),
+            chunk_nodes: layout.chunk_nodes,
+            sources: layout.sources,
+        })
+    }
+
+    /// A stored record's fields, its cap not decoded: what finding the
+    /// chunks it reads takes, without checking a cap.
+    fn layout(value: &[u8]) -> Result<LeafLayout<'_>> {
         let corrupt = || QuilError::Store("a stored replica's leaf record does not decode".into());
         let (&version, rest) = value.split_first().ok_or_else(corrupt)?;
-        if ![HASH_LEAF_VERSION, 2].contains(&version) || rest.len() < 12 {
-            return Err(corrupt());
-        }
-        let (source_epoch, rest) = if version == 2 {
-            let epoch = u64::from_be_bytes(rest.get(..8).ok_or_else(corrupt)?.try_into().unwrap());
-            (Some(epoch), &rest[8..])
-        } else {
-            (None, rest)
+        let sources: Vec<(u32, u64)> = match version {
+            HASH_LEAF_VERSION => Vec::new(),
+            HASH_LEAF_ALIAS => {
+                let epoch = rest.get(..8).ok_or_else(corrupt)?;
+                vec![(0, u64::from_be_bytes(epoch.try_into().expect("8 bytes")))]
+            }
+            HASH_LEAF_RUNS => {
+                let count = rest.get(..4).ok_or_else(corrupt)?;
+                let count = u32::from_be_bytes(count.try_into().expect("4 bytes")) as usize;
+                let runs = count
+                    .checked_mul(12)
+                    .and_then(|len| rest.get(4..len.checked_add(4)?))
+                    .ok_or_else(corrupt)?;
+                runs.chunks_exact(12)
+                    .map(|run| {
+                        let first = u32::from_be_bytes(run[..4].try_into().expect("4 bytes"));
+                        (
+                            first,
+                            u64::from_be_bytes(run[4..].try_into().expect("8 bytes")),
+                        )
+                    })
+                    .collect()
+            }
+            _ => return Err(corrupt()),
         };
+        let rest = HashLeaf::body(value).ok_or_else(corrupt)?;
         if rest.len() < 12 {
             return Err(corrupt());
         }
@@ -228,22 +329,55 @@ impl HashLeaf {
         if chunk_nodes == 0 || !rest.is_empty() {
             return Err(corrupt());
         }
-        let cap = MerkleCap::from_bytes(cap).ok_or_else(|| {
-            QuilError::InvalidArgument("a stored replica's cap does not decode".into())
-        })?;
-        Ok(Self {
+        // Runs from chunk 0 on, each past the last and within the leaf.
+        let chunks = n.div_ceil(chunk_nodes);
+        if version == HASH_LEAF_RUNS
+            && (sources.first().map(|&(first, _)| first) != Some(0)
+                || sources.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+                || sources
+                    .last()
+                    .is_some_and(|&(first, _)| u64::from(first) >= chunks))
+        {
+            return Err(corrupt());
+        }
+        Ok(LeafLayout {
             n,
-            cap,
-            registration_root: registration_root.to_vec(),
             chunk_nodes,
-            source_epoch,
+            cap,
+            registration_root,
+            sources,
         })
     }
 
     /// Bytes this record holds in memory.
     fn bytes(&self) -> usize {
         let cap: usize = self.cap.levels.iter().map(Vec::len).sum();
-        cap * NODE_BYTES + self.registration_root.len()
+        cap * NODE_BYTES + self.registration_root.len() + self.sources.len() * 12
+    }
+
+    /// Where the chunks of this record, stored under `epoch`, lie: runs
+    /// `(first chunk, epoch whose keys hold it)` from chunk 0 on.
+    fn runs(&self, epoch: u64) -> Vec<(u32, u64)> {
+        if self.sources.is_empty() {
+            vec![(0, epoch)]
+        } else {
+            self.sources.clone()
+        }
+    }
+
+    /// The epoch whose keys hold chunk `chunk` of this record, stored
+    /// under `epoch`, and the first chunk after it that lies elsewhere
+    /// (`u64::MAX` when none does).
+    fn chunk_source(&self, epoch: u64, chunk: u64) -> (u64, u64) {
+        let at = self
+            .sources
+            .partition_point(|&(first, _)| u64::from(first) <= chunk);
+        let source = at.checked_sub(1).map_or(epoch, |run| self.sources[run].1);
+        let end = self
+            .sources
+            .get(at)
+            .map_or(u64::MAX, |&(first, _)| u64::from(first));
+        (source, end)
     }
 }
 
@@ -410,6 +544,24 @@ fn take(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((field, &bytes[4 + len..]))
 }
 
+/// A stored [`HASH_LEAF`] record's fields ([`HashLeaf::layout`]), its cap
+/// not decoded.
+struct LeafLayout<'a> {
+    n: u64,
+    chunk_nodes: u64,
+    cap: &'a [u8],
+    registration_root: &'a [u8],
+    /// As [`HashLeaf`]'s.
+    sources: Vec<(u32, u64)>,
+}
+
+impl LeafLayout<'_> {
+    /// Chunks the leaf's nodes take.
+    fn chunks(&self) -> u64 {
+        self.n.div_ceil(self.chunk_nodes)
+    }
+}
+
 /// A leaf as builds before the chunked layout stored it, borrowed from the
 /// stored value.
 struct LegacyHashReplica<'a> {
@@ -436,6 +588,31 @@ impl<'a> LegacyHashReplica<'a> {
 
 fn leaf_key(epoch: u64, leaf_id: &[u8]) -> Vec<u8> {
     meta_key(HASH_LEAF, epoch, leaf_id)
+}
+
+fn runs_key(epoch: u64, leaf_id: &[u8]) -> Vec<u8> {
+    meta_key(LEAF_RUNS, epoch, leaf_id)
+}
+
+/// The earlier epochs, below `epoch`, whose chunks a record read.
+fn earlier_sources(sources: &[(u32, u64)], epoch: u64) -> std::collections::BTreeSet<u64> {
+    sources
+        .iter()
+        .map(|&(_, source)| source)
+        .filter(|&source| source < epoch)
+        .collect()
+}
+
+/// Runs records found reading chunks an earlier build evicted, by epoch
+/// and leaf id, warned of once each.
+type StaleRuns = std::collections::HashSet<(u64, Vec<u8>)>;
+
+fn stale_runs() -> std::sync::MutexGuard<'static, StaleRuns> {
+    static STALE: OnceLock<Mutex<StaleRuns>> = OnceLock::new();
+    STALE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Key of chunk `chunk` of a leaf's nodes: the leaf id is length-prefixed so
@@ -522,6 +699,10 @@ fn wal_pace() -> std::sync::MutexGuard<'static, WalPace> {
 }
 
 type LeafCacheKey = (usize, u64, Vec<u8>);
+
+/// Chunks of a leaf stored under an epoch that another epoch's record
+/// reads: `(epoch, leaf id, first chunk, end)`.
+type ChunkRun = (u64, Vec<u8>, u64, u64);
 
 /// Leaf records read recently, by store, epoch and leaf id: every frame a
 /// seat proposes opens the same leaves, whose caps it would otherwise read
@@ -670,7 +851,9 @@ impl ReplicaStore {
     /// with it, opens any node (`quil_crypto::storage_proof::MerkleCap`), and
     /// the registration root it was registered with. The nodes go in chunks
     /// of [`CHUNK_NODES`], written before the leaf record that makes them
-    /// readable, so an interrupted write leaves no leaf.
+    /// readable, so an interrupted write leaves no leaf. A chunk whose bytes
+    /// the leaf's latest earlier epoch ([`Self::note_snapshot`]) stored
+    /// alike is not written again: the record reads it where it lies.
     pub fn put_hash(
         &self,
         epoch: u64,
@@ -692,10 +875,7 @@ impl ReplicaStore {
         cap: &[u8],
         registration_root: &[u8],
     ) -> Result<()> {
-        if self
-            .referenced_sources(0)?
-            .contains(&(epoch, leaf_id.to_vec()))
-        {
+        if self.is_referenced(epoch, leaf_id)? {
             return Err(QuilError::Store(
                 "cannot replace a referenced immutable replica".into(),
             ));
@@ -705,23 +885,40 @@ impl ReplicaStore {
                 "a replica is a whole number of nodes".into(),
             ));
         }
+        let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
+        let n = (replica.len() / NODE_BYTES) as u64;
+        // Per chunk, the earlier epoch holding its bytes, if one does.
+        let base = self.chunk_base(epoch, leaf_id, n)?;
+        let kept = match &base {
+            Some((from, leaf)) => self.unchanged_chunks(*from, leaf_id, leaf, replica, cap),
+            None => vec![None; replica.len().div_ceil(chunk_bytes)],
+        };
         forget_leaves(|e, id| e == epoch && id == leaf_id);
         self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
+        self.db.delete(&runs_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
             &chunk_key(epoch, leaf_id, u32::MAX),
         )?;
-        let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
-        let (mut rest, mut index) = (replica, 0u32);
+        let changed: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter_map(|(chunk, source)| source.is_none().then_some(chunk))
+            .collect();
+        let mut rest = &changed[..];
         let (mut batches, mut syncing, mut waited) = (0u64, Duration::ZERO, Duration::ZERO);
+        let mut written = 0u64;
         while !rest.is_empty() {
             let chunks = wal_pace().batch_chunks();
-            let (nodes, after) = rest.split_at(rest.len().min(chunks * chunk_bytes));
+            let (batch, after) = rest.split_at(rest.len().min(chunks));
             let txn = self.db.new_batch(false)?;
-            for chunk in nodes.chunks(chunk_bytes) {
-                txn.set(&chunk_key(epoch, leaf_id, index), chunk)?;
-                index += 1;
+            let mut bytes = 0u64;
+            for &chunk in batch {
+                let at = chunk * chunk_bytes;
+                let nodes = &replica[at..replica.len().min(at + chunk_bytes)];
+                txn.set(&chunk_key(epoch, leaf_id, chunk as u32), nodes)?;
+                bytes += nodes.len() as u64;
             }
             txn.commit()?;
             // Synced on its own, so the store's next synced commit does not
@@ -729,35 +926,185 @@ impl ReplicaStore {
             let started = Instant::now();
             self.db.sync_wal()?;
             let took = started.elapsed();
-            let wait = wal_pace().synced(nodes.len() as u64, took);
+            let wait = wal_pace().synced(bytes, took);
             std::thread::sleep(wait);
             (batches, syncing, waited) = (batches + 1, syncing + took, waited + wait);
+            written += bytes;
             rest = after;
         }
+        if let Some((from, _)) = &base {
+            tracing::info!(epoch, leaf = %hex::encode(leaf_id), from_epoch = *from,
+                chunks = kept.len(), chunks_written = changed.len(), bytes_written = written,
+                bytes_kept = replica.len() as u64 - written,
+                "storage replica written in its changed chunks only: the others are read \
+                 where `from_epoch` wrote them");
+        }
         if !waited.is_zero() {
-            tracing::info!(epoch, leaf = %hex::encode(leaf_id), bytes = replica.len(), batches,
+            tracing::info!(epoch, leaf = %hex::encode(leaf_id), bytes = written, batches,
                 sync_seconds = syncing.as_secs_f64(), wait_seconds = waited.as_secs_f64(),
                 target_ms = REPLICA_SYNC_TARGET.as_millis() as u64, scope = "this node",
                 "storage replica written to the store in synced batches slower than \
                  `target_ms` each, waiting as long after each, so the store's synced commits \
                  do not wait behind it; check this node's disk write speed if this recurs");
         }
-        let n = (replica.len() / NODE_BYTES) as u64;
-        self.db.set(
-            &leaf_key(epoch, leaf_id),
-            &HashLeaf::encode(n, cap, registration_root),
-        )
+        let runs: Vec<(u32, u64)> = kept
+            .iter()
+            .enumerate()
+            .map(|(chunk, source)| (chunk as u32, source.unwrap_or(epoch)))
+            .collect();
+        let body = HashLeaf::encode(n, cap, registration_root);
+        let record = HashLeaf::encode_runs(epoch, &runs, &body[1..]);
+        let txn = self.db.new_batch(false)?;
+        self.put_record(&*txn, epoch, leaf_id, &record, &runs)?;
+        txn.commit()
+    }
+
+    /// Put `record`, a leaf's at `epoch` whose chunks lie where `runs`
+    /// put them, under its key in `txn`: a [`HASH_LEAF`] record unless
+    /// it is in runs ([`LEAF_RUNS`]), then with a [`RUNS_WITNESS`] beside
+    /// the chunks of each earlier epoch it reads.
+    fn put_record(
+        &self,
+        txn: &dyn quil_types::store::Transaction,
+        epoch: u64,
+        leaf_id: &[u8],
+        record: &[u8],
+        runs: &[(u32, u64)],
+    ) -> Result<()> {
+        if record.first() != Some(&HASH_LEAF_RUNS) {
+            txn.delete(&runs_key(epoch, leaf_id))?;
+            return txn.set(&leaf_key(epoch, leaf_id), record);
+        }
+        for source in earlier_sources(runs, epoch) {
+            txn.set(&chunk_key(source, leaf_id, RUNS_WITNESS), &[])?;
+        }
+        txn.delete(&leaf_key(epoch, leaf_id))?;
+        txn.set(&runs_key(epoch, leaf_id), record)
+    }
+
+    /// A leaf's stored record at `epoch`: its [`HASH_LEAF`] record, else
+    /// its [`LEAF_RUNS`] record while every earlier epoch's chunks that one
+    /// reads are kept. A build before runs evicts those it does not know
+    /// are read, and the [`RUNS_WITNESS`] with them: the leaf is then not
+    /// stored, and encoded again, rather than stored with chunks missing.
+    fn leaf_value(&self, epoch: u64, leaf_id: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self.db.get(&leaf_key(epoch, leaf_id))? {
+            return Ok(Some(value));
+        }
+        let Some(value) = self.db.get(&runs_key(epoch, leaf_id))? else {
+            return Ok(None);
+        };
+        for source in earlier_sources(&HashLeaf::layout(&value)?.sources, epoch) {
+            if self
+                .db
+                .get(&chunk_key(source, leaf_id, RUNS_WITNESS))?
+                .is_none()
+            {
+                if stale_runs().insert((epoch, leaf_id.to_vec())) {
+                    tracing::warn!(epoch, leaf = %hex::encode(leaf_id), source_epoch = source,
+                        scope = "this node",
+                        action = "none: the leaf's next snapshot encodes it again; expected \
+                                  once after running an earlier build",
+                        "storage replica stored in chunk runs reads chunks of `source_epoch` \
+                         that an earlier build of this node evicted: the leaf counts as not \
+                         stored until it is encoded again");
+                }
+                return Ok(None);
+            }
+        }
+        Ok(Some(value))
+    }
+
+    /// The record of this leaf at the latest earlier epoch
+    /// ([`Self::note_snapshot`]) and that epoch, when it holds `n` nodes in
+    /// chunks of [`CHUNK_NODES`]: the chunks a write at `epoch` may keep.
+    fn chunk_base(&self, epoch: u64, leaf_id: &[u8], n: u64) -> Result<Option<(u64, HashLeaf)>> {
+        let Some(noted) = self.db.get(&meta_key(SNAPSHOT_REUSE, 0, leaf_id))? else {
+            return Ok(None);
+        };
+        let from = match noted.get(32..) {
+            Some(from) if from.len() == 8 => u64::from_be_bytes(from.try_into().expect("8 bytes")),
+            _ => return Ok(None),
+        };
+        if from >= epoch {
+            return Ok(None);
+        }
+        let Some(value) = self.leaf_value(from, leaf_id)? else {
+            return Ok(None);
+        };
+        Ok(HashLeaf::decode(&value)
+            .ok()
+            .filter(|leaf| leaf.n == n && leaf.chunk_nodes == CHUNK_NODES)
+            .map(|leaf| (from, leaf)))
+    }
+
+    /// Per chunk of `replica`, the epoch whose keys hold the same bytes for
+    /// `base`, this leaf's record at `from`, or `None` where they differ:
+    /// the chunks a write need not repeat. The bytes are compared, so a
+    /// chunk read back other than written is written again; the caps'
+    /// roots of the chunks, where both have one per chunk, spare reading
+    /// those that changed. A base that cannot be read keeps nothing.
+    fn unchanged_chunks(
+        &self,
+        from: u64,
+        leaf_id: &[u8],
+        base: &HashLeaf,
+        replica: &[u8],
+        cap: &[u8],
+    ) -> Vec<Option<u64>> {
+        use quil_crypto::storage_proof::CAP_HEIGHT;
+        let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
+        let chunks = replica.len().div_ceil(chunk_bytes);
+        let mut kept = vec![None; chunks];
+        let new = MerkleCap::from_bytes(cap);
+        let roots = new
+            .as_ref()
+            .filter(|new| new.n == base.n && new.height == CAP_HEIGHT)
+            .filter(|_| base.cap.height == CAP_HEIGHT)
+            .map(|new| (&new.levels[0], &base.cap.levels[0]));
+        let maybe_same =
+            |chunk: usize| roots.is_none_or(|(new, old)| new.get(chunk) == old.get(chunk));
+        let mut chunk = 0;
+        while chunk < chunks {
+            if !maybe_same(chunk) {
+                chunk += 1;
+                continue;
+            }
+            let mut end = chunk + 1;
+            while end < chunks && end - chunk < CHUNKS_PER_SCAN as usize && maybe_same(end) {
+                end += 1;
+            }
+            let nodes = chunk as u64 * CHUNK_NODES..base.n.min(end as u64 * CHUNK_NODES);
+            let old = match self.read_nodes(from, leaf_id, base, nodes) {
+                Ok(old) => old,
+                Err(error) => {
+                    tracing::warn!(epoch = from, leaf = %hex::encode(leaf_id), %error,
+                        scope = "this node", action = "check this node's disk and store health",
+                        "storage replica of an earlier epoch could not be read to find the \
+                         chunks a new one shares with it: the new one is written whole");
+                    return vec![None; chunks];
+                }
+            };
+            let new = replica[chunk * chunk_bytes..].chunks(chunk_bytes);
+            for (at, (old, new)) in old.chunks(chunk_bytes).zip(new).enumerate() {
+                if old == new {
+                    kept[chunk + at] = Some(base.chunk_source(from, (chunk + at) as u64).0);
+                }
+            }
+            chunk = end;
+        }
+        kept
     }
 
     /// Reuse the same immutable nodes in a later epoch. The source's data cap
     /// and complete registration are retained; no chunk is copied. Eviction
-    /// pins exactly the base ranges still referenced by a live epoch.
+    /// pins exactly the chunk runs still referenced by a live epoch.
     pub fn alias_hash(&self, epoch: u64, leaf_id: &[u8], from: u64) -> Result<bool> {
         if from >= epoch {
             return Ok(false);
         }
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(value) = self.db.get(&leaf_key(from, leaf_id))? else {
+        let Some(value) = self.leaf_value(from, leaf_id)? else {
             return Ok(false);
         };
         let leaf = HashLeaf::decode(&value)?;
@@ -776,27 +1123,51 @@ impl ReplicaStore {
                 "source data cap differs from registration".into(),
             ));
         }
-        if leaf.source_epoch.is_some_and(|base| base >= from) {
+        let runs = leaf.runs(from);
+        if runs.iter().any(|&(_, source)| source > from) {
             return Err(QuilError::Store("forward snapshot reference".into()));
         }
-        let base = leaf.source_epoch.unwrap_or(from);
-        let mut alias = vec![2];
-        alias.extend_from_slice(&base.to_be_bytes());
-        alias.extend_from_slice(&value[if value[0] == 2 { 9 } else { 1 }..]);
+        let body = HashLeaf::body(&value)
+            .ok_or_else(|| QuilError::Store("invalid source leaf record".into()))?;
+        let alias = HashLeaf::encode_runs(epoch, &runs, body);
         let txn = self.db.new_batch(false)?;
-        txn.set(&leaf_key(epoch, leaf_id), &alias)?;
+        self.put_record(&*txn, epoch, leaf_id, &alias, &runs)?;
         txn.set(&meta_key(DATA_CAP, epoch, leaf_id), &cap)?;
         txn.commit()?;
         forget_leaves(|e, id| e == epoch && id == leaf_id);
         Ok(true)
     }
 
-    fn referenced_sources(&self, from: u64) -> Result<std::collections::BTreeSet<(u64, Vec<u8>)>> {
+    /// Whether a leaf record of another epoch reads chunks of `leaf_id`
+    /// stored under `epoch`.
+    fn is_referenced(&self, epoch: u64, leaf_id: &[u8]) -> Result<bool> {
+        Ok(self
+            .referenced_chunks(0)?
+            .iter()
+            .any(|(source, id, ..)| *source == epoch && id == leaf_id))
+    }
+
+    /// The chunk runs stored under an earlier epoch that the leaf records
+    /// of epochs `from` on read.
+    fn referenced_chunks(&self, from: u64) -> Result<std::collections::BTreeSet<ChunkRun>> {
         let mut out = std::collections::BTreeSet::new();
-        let mut iter = self.db.new_iter(
-            &meta_key(HASH_LEAF, from, &[]),
-            &meta_key(HASH_LEAF + 1, 0, &[]),
-        )?;
+        for kind in [HASH_LEAF, LEAF_RUNS] {
+            self.referenced_by(kind, from, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// [`Self::referenced_chunks`] by the records of `kind`, into `out`;
+    /// a runs record's [`RUNS_WITNESS`] keys among them.
+    fn referenced_by(
+        &self,
+        kind: u8,
+        from: u64,
+        out: &mut std::collections::BTreeSet<ChunkRun>,
+    ) -> Result<()> {
+        let mut iter = self
+            .db
+            .new_iter(&meta_key(kind, from, &[]), &meta_key(kind + 1, 0, &[]))?;
         let mut ok = iter.first();
         while ok {
             let key = iter.key();
@@ -805,22 +1176,36 @@ impl ReplicaStore {
             }
             let epoch = u64::from_be_bytes(key[3..11].try_into().unwrap());
             // Legacy metadata may contain an evictable incomplete cache; it
-            // cannot pin chunks. Only v2 records carry references.
-            if iter.value().first() != Some(&2) {
+            // cannot pin chunks. Only alias and run records carry references.
+            if !matches!(
+                iter.value().first(),
+                Some(&(HASH_LEAF_ALIAS | HASH_LEAF_RUNS))
+            ) {
                 ok = iter.next();
                 continue;
             }
-            let leaf = HashLeaf::decode(iter.value())?;
-            if let Some(base) = leaf.source_epoch {
-                if base >= epoch {
+            let leaf = HashLeaf::layout(iter.value())?;
+            for (at, &(first, source)) in leaf.sources.iter().enumerate() {
+                if source > epoch {
                     return Err(QuilError::Store("invalid replica reference".into()));
                 }
-                out.insert((base, key[11..].to_vec()));
+                if source < epoch {
+                    let end = leaf
+                        .sources
+                        .get(at + 1)
+                        .map_or(leaf.chunks(), |&(next, _)| u64::from(next));
+                    out.insert((source, key[11..].to_vec(), u64::from(first), end));
+                }
+            }
+            if kind == LEAF_RUNS {
+                for source in earlier_sources(&leaf.sources, epoch) {
+                    let witness = u64::from(RUNS_WITNESS);
+                    out.insert((source, key[11..].to_vec(), witness, witness + 1));
+                }
             }
             ok = iter.next();
         }
-        iter.close()?;
-        Ok(out)
+        iter.close()
     }
 
     pub fn snapshot_match(&self, leaf_id: &[u8], fingerprint: &[u8; 32]) -> Result<Option<u64>> {
@@ -843,8 +1228,7 @@ impl ReplicaStore {
         use quil_crypto::storage_proof::{parse_registration_root, Tree};
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         let leaf = self
-            .db
-            .get(&leaf_key(epoch, leaf_id))?
+            .leaf_value(epoch, leaf_id)?
             .and_then(|bytes| HashLeaf::decode(&bytes).ok())
             .ok_or_else(|| QuilError::Store("no chunked replica for data cap".into()))?;
         let registered = parse_registration_root(&leaf.registration_root)
@@ -906,7 +1290,7 @@ impl ReplicaStore {
         if let Some(leaf) = leaf_cache().get(&key) {
             return Ok(Some(leaf));
         }
-        let value = match self.db.get(&leaf_key(epoch, leaf_id))? {
+        let value = match self.leaf_value(epoch, leaf_id)? {
             Some(value) => value,
             None => {
                 let converted = if wait {
@@ -918,7 +1302,7 @@ impl ReplicaStore {
                 if !converted {
                     return Ok(None);
                 }
-                let Some(value) = self.db.get(&leaf_key(epoch, leaf_id))? else {
+                let Some(value) = self.leaf_value(epoch, leaf_id)? else {
                     return Ok(None);
                 };
                 value
@@ -1084,10 +1468,9 @@ impl ReplicaStore {
         leaf: &HashLeaf,
         nodes: std::ops::Range<u64>,
     ) -> Result<Vec<u8>> {
-        if leaf.source_epoch.is_some_and(|base| base >= epoch) {
+        if leaf.sources.iter().any(|&(_, source)| source > epoch) {
             return Err(QuilError::Store("forward replica alias".into()));
         }
-        let epoch = leaf.source_epoch.unwrap_or(epoch);
         let missing = || {
             QuilError::Store(format!(
                 "nodes {}..{} of a stored replica of {} nodes are missing",
@@ -1115,24 +1498,27 @@ impl ReplicaStore {
             Ok(())
         };
         if first == last {
+            let (source, _) = leaf.chunk_source(epoch, first);
             let bytes = self
                 .db
-                .get(&chunk_key(epoch, leaf_id, first as u32))?
+                .get(&chunk_key(source, leaf_id, first as u32))?
                 .ok_or_else(missing)?;
             take_chunk(first, &bytes)?;
             return Ok(out);
         }
-        // A range scan holds all it covers, so scan in windows.
+        // A range scan holds all it covers, so scan in windows, each within
+        // one run of chunks.
         let mut chunk = first;
         while chunk <= last {
-            let end = (chunk + CHUNKS_PER_SCAN).min(last + 1);
+            let (source, run_end) = leaf.chunk_source(epoch, chunk);
+            let end = (chunk + CHUNKS_PER_SCAN).min(last + 1).min(run_end);
             let mut iter = self.db.new_iter(
-                &chunk_key(epoch, leaf_id, chunk as u32),
-                &chunk_key(epoch, leaf_id, end as u32),
+                &chunk_key(source, leaf_id, chunk as u32),
+                &chunk_key(source, leaf_id, end as u32),
             )?;
             let mut ok = iter.first();
             while ok {
-                if chunk >= end || iter.key() != chunk_key(epoch, leaf_id, chunk as u32) {
+                if chunk >= end || iter.key() != chunk_key(source, leaf_id, chunk as u32) {
                     return Err(missing());
                 }
                 take_chunk(chunk, iter.value())?;
@@ -1242,10 +1628,8 @@ impl ReplicaStore {
         forget_leaves(|e, id| e == epoch && id == leaf_id);
         self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
-        if !self
-            .referenced_sources(0)?
-            .contains(&(epoch, leaf_id.to_vec()))
-        {
+        self.db.delete(&runs_key(epoch, leaf_id))?;
+        if !self.is_referenced(epoch, leaf_id)? {
             self.db.delete_range(
                 &chunk_key(epoch, leaf_id, 0),
                 &chunk_key(epoch, leaf_id, u32::MAX),
@@ -1286,7 +1670,7 @@ impl ReplicaStore {
 
     fn evict(&self, keep_from: u64, store: &str) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
-        let pinned = self.referenced_sources(keep_from)?;
+        let pinned = self.referenced_chunks(keep_from)?;
         let mut lo = Vec::with_capacity(9);
         lo.push(STORAGE_REPLICA);
         lo.extend_from_slice(&0u64.to_be_bytes());
@@ -1297,16 +1681,31 @@ impl ReplicaStore {
         self.db.delete_range(&lo, &hi)?;
         self.reclaim_in_background(lo, hi, "evicted");
         forget_leaves(|epoch, _| epoch < keep_from);
-        for kind in [PARTITION, SNAPSHOT_SOURCES, LEAF_NODES, HASH_LEAF, DATA_CAP] {
+        for kind in [
+            PARTITION,
+            SNAPSHOT_SOURCES,
+            LEAF_NODES,
+            HASH_LEAF,
+            DATA_CAP,
+            LEAF_RUNS,
+        ] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
         }
         let mut at = meta_key(HASH_NODES, 0, &[]);
         let until = meta_key(HASH_NODES, keep_from, &[]);
+        // Only the chunks a live epoch reads: an earlier epoch's chunks a
+        // later one wrote again go.
+        let index = |chunk: u64| u32::try_from(chunk).unwrap_or(u32::MAX);
         let mut protected: Vec<_> = pinned
             .into_iter()
-            .filter(|(epoch, _)| *epoch < keep_from)
-            .map(|(epoch, id)| (chunk_key(epoch, &id, 0), chunk_key(epoch, &id, u32::MAX)))
+            .filter(|(epoch, ..)| *epoch < keep_from)
+            .map(|(epoch, id, first, end)| {
+                (
+                    chunk_key(epoch, &id, index(first)),
+                    chunk_key(epoch, &id, index(end)),
+                )
+            })
             .collect();
         protected.sort();
         for (lo, hi) in protected {
@@ -1859,6 +2258,430 @@ mod tests {
                 (b"leaf-1".to_vec(), b"r1".to_vec()),
                 (b"leaf-2".to_vec(), b"r2".to_vec()),
             ]
+        );
+    }
+
+    /// A store counting the bytes of replica chunks written to it, which
+    /// can stop taking writes after a number of them as at a crash: what
+    /// it took until then stays.
+    struct Recording {
+        inner: Arc<crate::RocksDb>,
+        chunk_bytes: Arc<AtomicU64>,
+        /// Writes it takes before the crash; `u64::MAX` for no crash.
+        writes_left: Arc<AtomicU64>,
+    }
+
+    struct RecordingBatch {
+        inner: Box<dyn quil_types::store::Transaction>,
+        chunk_bytes: Arc<AtomicU64>,
+        pending: AtomicU64,
+        writes_left: Arc<AtomicU64>,
+    }
+
+    fn is_chunk(key: &[u8]) -> bool {
+        key.starts_with(&[STORAGE_REPLICA, META, HASH_NODES])
+    }
+
+    /// Take one write, or fail as a crashed store does.
+    fn take_write(left: &AtomicU64) -> Result<()> {
+        left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
+            u64::MAX => Some(u64::MAX),
+            0 => None,
+            left => Some(left - 1),
+        })
+        .map(|_| ())
+        .map_err(|_| QuilError::Store("the store crashed".into()))
+    }
+
+    impl quil_types::store::Transaction for RecordingBatch {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            if is_chunk(key) {
+                self.pending.fetch_add(value.len() as u64, Ordering::SeqCst);
+            }
+            self.inner.set(key, value)
+        }
+        fn commit(self: Box<Self>) -> Result<()> {
+            take_write(&self.writes_left)?;
+            let pending = self.pending.load(Ordering::SeqCst);
+            self.inner.commit()?;
+            self.chunk_bytes.fetch_add(pending, Ordering::SeqCst);
+            Ok(())
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn abort(self: Box<Self>) -> Result<()> {
+            self.inner.abort()
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
+            self.inner.delete_range(lower, upper)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl KvDb for Recording {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            take_write(&self.writes_left)?;
+            if is_chunk(key) {
+                self.chunk_bytes
+                    .fetch_add(value.len() as u64, Ordering::SeqCst);
+            }
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            take_write(&self.writes_left)?;
+            self.inner.delete(key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            Ok(Box::new(RecordingBatch {
+                inner: self.inner.new_batch(indexed)?,
+                chunk_bytes: self.chunk_bytes.clone(),
+                pending: AtomicU64::new(0),
+                writes_left: self.writes_left.clone(),
+            }))
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            self.inner.compact(start, end, parallelize)
+        }
+        fn compact_all(&self) -> Result<()> {
+            self.inner.compact_all()
+        }
+        fn sync_wal(&self) -> Result<()> {
+            self.inner.sync_wal()
+        }
+        fn close(&self) -> Result<()> {
+            self.inner.close()
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            take_write(&self.writes_left)?;
+            self.inner.delete_range(start, end)
+        }
+    }
+
+    /// A [`Recording`] store: the replica store over it, the store under
+    /// it (to open again after a crash), the chunk bytes it took and the
+    /// writes it takes before a crash.
+    fn recording() -> (
+        ReplicaStore,
+        Arc<crate::RocksDb>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let inner = Arc::new(crate::RocksDb::open_in_memory().unwrap());
+        let chunk_bytes = Arc::new(AtomicU64::new(0));
+        let writes_left = Arc::new(AtomicU64::new(u64::MAX));
+        let db = Recording {
+            inner: inner.clone(),
+            chunk_bytes: chunk_bytes.clone(),
+            writes_left: writes_left.clone(),
+        };
+        (
+            ReplicaStore::new(Arc::new(db)),
+            inner,
+            chunk_bytes,
+            writes_left,
+        )
+    }
+
+    /// `nodes` with each node of `changed` set to another canonical value,
+    /// and their cap.
+    fn changed(nodes: &[u8], changed: &[usize]) -> (Vec<u8>, Vec<u8>) {
+        let mut nodes = nodes.to_vec();
+        for &node in changed {
+            let at = node * NODE_BYTES;
+            let element = u32::from_le_bytes(nodes[at..at + 4].try_into().unwrap());
+            nodes[at..at + 4].copy_from_slice(&((element + 1) % (1 << 30)).to_le_bytes());
+        }
+        let cap = quil_crypto::storage_proof::MerkleTree::from_nodes(&nodes)
+            .unwrap()
+            .cap(quil_crypto::storage_proof::CAP_HEIGHT)
+            .to_bytes();
+        (nodes, cap)
+    }
+
+    /// The registration root of a leaf whose data cap is `cap`.
+    fn registered(cap: &[u8]) -> Vec<u8> {
+        use quil_crypto::storage_proof::Tree;
+        let cap = MerkleCap::from_bytes(cap).unwrap();
+        quil_crypto::storage_proof::registration_root(
+            &cap.commitment(Tree::Data),
+            &[0; 32],
+            &cap.commitment(Tree::Replica),
+        )
+    }
+
+    /// Bytes of the replica chunks a store holds.
+    fn stored_chunk_bytes(s: &ReplicaStore) -> u64 {
+        let mut iter =
+            s.db.new_iter(
+                &meta_key(HASH_NODES, 0, &[]),
+                &meta_key(HASH_NODES + 1, 0, &[]),
+            )
+            .unwrap();
+        let (mut bytes, mut ok) = (0, iter.first());
+        while ok {
+            bytes += iter.value().len() as u64;
+            ok = iter.next();
+        }
+        iter.close().unwrap();
+        bytes
+    }
+
+    /// An epoch's replica of a leaf whose data changed in one place differs
+    /// from the last epoch's only in that place's chunk, yet every epoch
+    /// wrote all of a leaf's chunks again: 1-1.7 GB a seat for any change
+    /// to its shard (2026-11-08).
+    #[test]
+    fn a_leaf_changed_in_one_chunk_writes_only_that_chunk_again() {
+        let (s, _, chunk_bytes, _) = recording();
+        let n = 8 * CHUNK_NODES as usize;
+        let (first, first_cap) = hash_leaf(n, 3);
+        s.put_hash(3, b"leaf", &first, &first_cap, &[1u8; 96])
+            .unwrap();
+        s.note_snapshot(3, b"leaf", &[3; 32]).unwrap();
+        let (second, second_cap) = changed(&first, &[5 * CHUNK_NODES as usize + 17]);
+        chunk_bytes.store(0, Ordering::SeqCst);
+        s.put_hash(4, b"leaf", &second, &second_cap, &[2u8; 96])
+            .unwrap();
+        let written = chunk_bytes.load(Ordering::SeqCst);
+        let chunk = (CHUNK_NODES as usize * NODE_BYTES) as u64;
+        assert_eq!(
+            written,
+            chunk,
+            "CHUNK-WRITES-BYTES: a replica of {} bytes changed in one chunk wrote {written} \
+             bytes of chunks, against the {chunk} of that chunk",
+            second.len()
+        );
+        assert_eq!(
+            &s.get_hash(4, b"leaf").unwrap().unwrap().replica[..],
+            &second[..]
+        );
+    }
+
+    /// A leaf written in its changed chunks reads, whole and in any range,
+    /// as the same leaf written whole: through runs from several epochs, an
+    /// alias of them, and an earlier chunk read back damaged.
+    #[test]
+    fn a_leaf_written_in_changed_chunks_reads_as_one_written_whole() {
+        let (s, whole) = (store(), store());
+        let c = CHUNK_NODES as usize;
+        // Eight chunks, the last one short.
+        let n = 7 * c + 300;
+        let (e3, cap3) = hash_leaf(n, 11);
+        let (e4, cap4) = changed(&e3, &[c + 1, 6 * c, n - 1]);
+        let (e5, cap5) = changed(&e4, &[0, 6 * c + 5]);
+        let (e7, cap7) = changed(&e5, &[4 * c]);
+        let check = |epoch: u64, nodes: &[u8]| {
+            let read = s.get_hash(epoch, b"leaf").unwrap().unwrap();
+            assert_eq!(
+                read,
+                whole.get_hash(epoch, b"leaf").unwrap().unwrap(),
+                "CHUNK-IDENTITY: epoch {epoch}'s leaf reads other than written whole"
+            );
+            assert!(
+                read.replica[..] == nodes[..],
+                "CHUNK-IDENTITY: epoch {epoch}'s replica differs from its nodes"
+            );
+            let leaf = s.get_hash_leaf(epoch, b"leaf").unwrap().unwrap();
+            for range in [0..1, c - 1..c + 1, c..3 * c + 2, 5 * c + 3..7 * c + 1, 0..n] {
+                let at = range.start * NODE_BYTES..range.end * NODE_BYTES;
+                let range = range.start as u64..range.end as u64;
+                assert!(
+                    s.read_nodes(epoch, b"leaf", &leaf, range.clone()).unwrap() == nodes[at],
+                    "CHUNK-IDENTITY: epoch {epoch}'s nodes {range:?} read other than written"
+                );
+            }
+        };
+        let put = |epoch: u64, nodes: &[u8], cap: &[u8]| {
+            for store in [&s, &whole] {
+                store
+                    .put_hash(epoch, b"leaf", nodes, cap, &registered(cap))
+                    .unwrap();
+                store
+                    .put_data_cap(epoch, b"leaf", &MerkleCap::from_bytes(cap).unwrap())
+                    .unwrap();
+            }
+            // Only this store knows the earlier epochs.
+            s.note_snapshot(epoch, b"leaf", &[epoch as u8; 32]).unwrap();
+        };
+        put(3, &e3, &cap3);
+        put(4, &e4, &cap4);
+        put(5, &e5, &cap5);
+        for store in [&s, &whole] {
+            assert!(store.alias_hash(6, b"leaf", 5).unwrap());
+        }
+        s.note_snapshot(6, b"leaf", &[6; 32]).unwrap();
+        for (epoch, nodes) in [(3, &e3), (4, &e4), (5, &e5), (6, &e5)] {
+            check(epoch, nodes);
+        }
+        // Chunk 2, unchanged since epoch 3, read back damaged wherever it
+        // lies: epoch 7 writes it again rather than keep it.
+        for epoch in 3..=6 {
+            if s.db.get(&chunk_key(epoch, b"leaf", 2)).unwrap().is_some() {
+                s.db.set(&chunk_key(epoch, b"leaf", 2), &vec![0u8; c * NODE_BYTES])
+                    .unwrap();
+            }
+        }
+        put(7, &e7, &cap7);
+        check(7, &e7);
+    }
+
+    /// A write of a leaf in its changed chunks stopped at any point, as by
+    /// a crash, leaves no leaf at its epoch, so its snapshot encodes it
+    /// again, and the earlier epoch whose chunks it keeps reads as before;
+    /// written again, it reads whole, also once that epoch is evicted.
+    #[test]
+    fn a_leaf_write_stopped_at_any_point_leaves_no_leaf_to_read() {
+        let c = CHUNK_NODES as usize;
+        let n = 6 * c;
+        let (first, first_cap) = hash_leaf(n, 21);
+        let (second, second_cap) = changed(&first, &[1, 3 * c + 2, 5 * c]);
+        for writes in 0u64.. {
+            let (s, inner, _, writes_left) = recording();
+            s.put_hash(3, b"leaf", &first, &first_cap, &[1u8; 96])
+                .unwrap();
+            s.note_snapshot(3, b"leaf", &[3; 32]).unwrap();
+            writes_left.store(writes, Ordering::SeqCst);
+            let stopped = s
+                .put_hash(4, b"leaf", &second, &second_cap, &[2u8; 96])
+                .is_err();
+            // The store opened again after the crash.
+            let s = ReplicaStore::new(inner);
+            if stopped {
+                assert!(
+                    s.get_hash_leaf(4, b"leaf").unwrap().is_none(),
+                    "CHUNK-TORN: a write stopped after {writes} writes left a leaf to read"
+                );
+                assert!(
+                    s.get_hash(3, b"leaf").unwrap().unwrap().replica[..] == first[..],
+                    "CHUNK-TORN: a write stopped after {writes} writes changed the epoch before"
+                );
+                s.put_hash(4, b"leaf", &second, &second_cap, &[2u8; 96])
+                    .unwrap();
+            }
+            assert!(
+                s.get_hash(4, b"leaf").unwrap().unwrap().replica[..] == second[..],
+                "CHUNK-TORN: after a write stopped after {writes} writes, the leaf written \
+                 again reads other than written"
+            );
+            s.evict_below_epoch(4).unwrap();
+            assert!(
+                s.get_hash(4, b"leaf").unwrap().unwrap().replica[..] == second[..],
+                "CHUNK-TORN: after a write stopped after {writes} writes and an eviction, the \
+                 leaf reads other than written"
+            );
+            if !stopped {
+                assert!(writes > 0, "a write takes writes");
+                break;
+            }
+        }
+    }
+
+    /// Evicting the epochs below a leaf written in its changed chunks keeps
+    /// the earlier chunks it reads and drops those written again since: one
+    /// copy of each chunk stays, as of a leaf written whole.
+    #[test]
+    fn eviction_keeps_one_copy_of_each_chunk_a_live_leaf_reads() {
+        let s = store();
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(8 * c, 31);
+        let (e4, cap4) = changed(&e3, &[2 * c + 9]);
+        let (e5, cap5) = changed(&e4, &[6 * c]);
+        for (epoch, nodes, cap) in [(3, &e3, &cap3), (4, &e4, &cap4), (5, &e5, &cap5)] {
+            s.put_hash(epoch, b"leaf", nodes, cap, &[epoch as u8; 96])
+                .unwrap();
+            s.note_snapshot(epoch, b"leaf", &[epoch as u8; 32]).unwrap();
+        }
+        s.evict_below_epoch(5).unwrap();
+        let read = s
+            .get_hash(5, b"leaf")
+            .expect("CHUNK-EVICT: the live leaf does not read after eviction")
+            .expect("CHUNK-EVICT: the live leaf is gone after eviction");
+        assert!(
+            read.replica[..] == e5[..],
+            "CHUNK-EVICT: the live leaf reads other than written after eviction"
+        );
+        assert_eq!(
+            stored_chunk_bytes(&s),
+            e5.len() as u64,
+            "CHUNK-EVICT: after eviction the store holds other than one copy of each chunk \
+             of a {}-byte replica",
+            e5.len()
+        );
+    }
+
+    /// A build before chunk runs decodes leaf records of versions 1 and 2
+    /// only, and evicts every chunk below an epoch but those its aliases
+    /// read: a leaf it met in runs would fail every lookup, and its next
+    /// snapshot too while its shard is unchanged (2026-11-08). To it such
+    /// a leaf is not stored, and encoded again; the earlier chunks its
+    /// eviction drops leave the leaf not stored here too, never stored
+    /// with chunks missing.
+    #[test]
+    fn a_leaf_in_runs_is_not_stored_to_an_earlier_build_nor_after_its_eviction() {
+        let s = store();
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(4 * c, 41);
+        let (e4, cap4) = changed(&e3, &[c + 3]);
+        s.put_hash(3, b"leaf", &e3, &cap3, &[3u8; 96]).unwrap();
+        s.note_snapshot(3, b"leaf", &[3; 32]).unwrap();
+        s.put_hash(4, b"leaf", &e4, &cap4, &[4u8; 96]).unwrap();
+        let mut iter =
+            s.db.new_iter(
+                &meta_key(HASH_LEAF, 0, &[]),
+                &meta_key(HASH_LEAF + 1, 0, &[]),
+            )
+            .unwrap();
+        let mut ok = iter.first();
+        while ok {
+            assert!(
+                [1, 2].contains(&iter.value()[0]),
+                "CHUNK-ROLLBACK: a leaf record of version {} that an earlier build fails on",
+                iter.value()[0]
+            );
+            ok = iter.next();
+        }
+        iter.close().unwrap();
+        // An earlier build's eviction below epoch 4, no alias pinning.
+        s.db.delete_range(&meta_key(HASH_NODES, 0, &[]), &meta_key(HASH_NODES, 4, &[]))
+            .unwrap();
+        s.db.delete_range(&meta_key(HASH_LEAF, 0, &[]), &meta_key(HASH_LEAF, 4, &[]))
+            .unwrap();
+        // Opened again by this build.
+        let s = ReplicaStore::new(s.db.clone());
+        if let Some(leaf) = s.get_hash_leaf(4, b"leaf").unwrap() {
+            assert!(
+                s.read_nodes(4, b"leaf", &leaf, 0..leaf.n).is_ok(),
+                "CHUNK-ROLLBACK: a leaf whose chunks an earlier build evicted reads as stored"
+            );
+        } else {
+            s.put_hash(4, b"leaf", &e4, &cap4, &[4u8; 96]).unwrap();
+        }
+        assert!(
+            s.get_hash(4, b"leaf").unwrap().unwrap().replica[..] == e4[..],
+            "CHUNK-ROLLBACK: the leaf reads other than written after an earlier build's eviction"
         );
     }
 
