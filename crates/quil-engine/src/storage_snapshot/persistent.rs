@@ -3232,13 +3232,12 @@ mod tests {
             })
             .count()
     }
+    /// The node's publish callback, as the poll takes it.
+    type Publish = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
     /// A publish that sends each message to the receiver.
-    fn published() -> (
-        Arc<dyn Fn(Vec<u8>) + Send + Sync>,
-        std::sync::mpsc::Receiver<Vec<u8>>,
-    ) {
+    fn published() -> (Publish, std::sync::mpsc::Receiver<Vec<u8>>) {
         let (send, recv) = std::sync::mpsc::channel();
-        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+        let publish: Publish = Arc::new(move |bytes| {
             send.send(bytes).unwrap();
         });
         (publish, recv)
