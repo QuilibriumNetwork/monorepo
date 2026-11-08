@@ -980,7 +980,10 @@ async fn a_transfer_of_another_shard_is_held_only_until_its_routing_fallback() {
     };
     let mut n = 0u64;
     let mut taken = Vec::new();
-    // Bundles one place after their designated shard here, up to the cap.
+    // Bundles one place after their designated shard here, up to the cap. A
+    // bundle the mempool refuses with room left, or a run of bundles none
+    // designated one place away, ends the fill as a failure.
+    let mut skipped = 0u32;
     while CAP - rig.collector.pending_totals().1 >= 4096 {
         let room = CAP - rig.collector.pending_totals().1;
         let mut left = room.min(GOSSIP_MESSAGE) - 2048;
@@ -994,10 +997,23 @@ async fn a_transfer_of_another_shard_is_held_only_until_its_routing_fallback() {
         let data = bundle(requests);
         let hash = hash_of(&data);
         if routing_offset(&filter, &shards, &hash) != Some(1) {
+            skipped += 1;
+            assert!(
+                skipped < 1000,
+                "rig check: {skipped} bundles in a row designated no shard one place before this one"
+            );
             continue;
         }
+        skipped = 0;
         taken.push(hash);
+        let before = rig.collector.pending_totals();
         rig.engine.handle_prover_message(&data);
+        assert_ne!(
+            rig.collector.pending_totals(),
+            before,
+            "rig check: the mempool refused a {}-byte bundle with {room} of {CAP} bytes free",
+            data.len()
+        );
     }
     let full = rig.collector.pending_totals();
     for i in 1..=10u64 {

@@ -82,7 +82,8 @@ impl CapacityMessage {
             proof: bytes,
         }
     }
-    fn decode(outer: &StorageEpochProof) -> std::result::Result<Self, String> {
+    /// Read a capacity message from its envelope ([`Self::envelope`]).
+    pub fn decode(outer: &StorageEpochProof) -> std::result::Result<Self, String> {
         if !capacity_message(outer) {
             return Err("not a capacity certificate".into());
         }

@@ -1281,7 +1281,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // latency-sensitive prove path. Structurally-invalid bundles were
         // already rejected at ingest.
         // ------------------------------------------------------------------
-        let collected = self.message_collector.collect_for_rank(rank);
+        let collected = capacity_last(self.message_collector.collect_for_rank(rank));
         // The VDF must commit exactly the body we can serialize. A permissive
         // engine validator can accept bytes that are not a canonical bundle;
         // hashing those and dropping them during the later decode makes our
@@ -1372,7 +1372,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // a later frame; on a loaded node, 30 prover messages took
                 // 160 s here and no leader could propose.
                 let validation_started = std::time::Instant::now();
-                let mut deferred = 0usize;
+                let (mut deferred, mut deferred_capacity) = (0usize, 0usize);
                 // Op kinds → (messages, total ms, slowest ms), logged when
                 // validation is slow, to tell one costly op from a slow store.
                 let mut validation_ms: std::collections::HashMap<String, (usize, u64, u64)> =
@@ -1443,6 +1443,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     }
                     if validation_started.elapsed() >= MESSAGE_VALIDATION_BUDGET {
                         deferred += 1;
+                        if crate::message_collector::carries_capacity_message(&raw) {
+                            deferred_capacity += 1;
+                        }
                         continue;
                     }
                     let started = std::time::Instant::now();
@@ -1527,9 +1530,10 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     tracing::warn!(
                         frame = frame_number,
                         deferred,
+                        deferred_capacity,
                         validated = valid.len() + invalid.len(),
                         budget_ms = MESSAGE_VALIDATION_BUDGET.as_millis() as u64,
-                        "GLOBAL message validation budget spent; deferring the rest to a later frame",
+                        "GLOBAL message validation budget spent; deferring the rest to a later frame (deferred_capacity of them persistent-sector capacity messages, which are validated last)",
                     );
                 }
                 crate::message_collector::order_copies_by_signers(&mut in_lockstep_shard);
@@ -1941,6 +1945,20 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
 // below cover `get_next_leaders` (leader selection) and the pure
 // helper functions, which need only a `ProverRegistry`.
 
+/// `collected` with persistent-sector capacity messages behind every other
+/// message, each part in its own order, so the validation budget reaches
+/// shard headers, storage epoch proofs and prover messages first: a capacity
+/// certificate costs a STARK verification, and on 2026-11-08 a leader
+/// validated 220 messages and deferred 843 behind them. Leader policy only:
+/// a frame carries its messages in the order its leader gives, and every
+/// archive executes that order.
+pub(crate) fn capacity_last(collected: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let (capacity, rest): (Vec<_>, Vec<_>) = collected
+        .into_iter()
+        .partition(|raw| crate::message_collector::carries_capacity_message(raw));
+    rest.into_iter().chain(capacity).collect()
+}
+
 /// The committee-handoff submissions a bundle carries, when it carries
 /// nothing else (`None` otherwise, or when it does not decode).
 fn handoff_only_submissions(
@@ -2220,6 +2238,53 @@ pub(crate) fn reduce_handoff_bundles(
 
 #[cfg(test)]
 mod tests {
+    /// A leader validates persistent-sector capacity messages after every
+    /// other message, each part in its collection order.
+    #[test]
+    fn capacity_messages_are_validated_after_every_other_message() {
+        use quil_crypto::persistent_storage::{Certificate, Profile};
+        use quil_execution::global_intrinsic::persistent_storage::CapacityMessage;
+        use quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let capacity = |member: u8| {
+            let message = CapacityMessage {
+                member: [member; 32],
+                epoch: 1500,
+                certificate: Certificate {
+                    profile: Profile::Eleven,
+                    sector: [1; 32],
+                    n: 32,
+                    columns: [0; 32],
+                    labels: [0; 32],
+                },
+                signed_at: 9,
+                signature: vec![member; 74],
+                proof: Vec::new(),
+            };
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                    inner_bytes: message.envelope().to_canonical_bytes(),
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let (first, second) = (capacity(1), capacity(2));
+        let collected = vec![
+            first.clone(),
+            b"join".to_vec(),
+            second.clone(),
+            b"proof".to_vec(),
+        ];
+        assert_eq!(
+            super::capacity_last(collected),
+            vec![b"join".to_vec(), b"proof".to_vec(), first, second],
+            "class-share capacity-last: capacity messages are validated before other messages"
+        );
+    }
+
     /// A localnet's shorter frame interval caps the pacing wait at that
     /// interval, and a parent in the past still needs none; the default
     /// keeps the ten-second cap.

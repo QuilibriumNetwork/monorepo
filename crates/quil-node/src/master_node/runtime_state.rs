@@ -16,11 +16,14 @@ pub(crate) struct RuntimeState {
 }
 
 /// The node's GLOBAL message collector. Only a node taking part in GLOBAL
-/// consensus collects from it: elsewhere it refuses every message.
+/// consensus collects from it: elsewhere it refuses every message. Its ranks
+/// keep room for shard frame headers and storage epoch proofs, and cap
+/// persistent-sector capacity messages.
 fn global_message_collector(
     consensus_participant: bool,
 ) -> Arc<quil_engine::message_collector::MessageCollector> {
     let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    collector.set_class_shares();
     if !consensus_participant {
         collector.set_no_proposer();
     }
@@ -332,6 +335,19 @@ mod tests {
             SubmitOutcome::Accepted
         );
         assert_eq!(participant.pending_count(1), 1);
+    }
+
+    /// The GLOBAL collector keeps class shares: shard frame headers and
+    /// storage epoch proofs keep room in each rank, which capacity messages
+    /// filled on 2026-11-08.
+    #[test]
+    fn the_global_collector_keeps_class_shares() {
+        for participant in [true, false] {
+            assert!(
+                global_message_collector(participant).class_shares(),
+                "class-share global-shares: the GLOBAL collector (participant: {participant}) keeps no room for shard headers and storage epoch proofs"
+            );
+        }
     }
 
     #[test]
