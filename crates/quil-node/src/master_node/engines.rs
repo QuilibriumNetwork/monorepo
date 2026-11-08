@@ -12,7 +12,8 @@ pub(crate) struct EngineHandles {
 
 /// `proof_worker` is the node-wide token verifier client (a clone shares
 /// its single admission slot); `None` leaves the manager without the
-/// token suite, which then rejects confidential token operations.
+/// token suite, which then fails every frame carrying a confidential token
+/// operation.
 pub(crate) fn init_engines(
     storage: &StorageHandles,
     network: u8,

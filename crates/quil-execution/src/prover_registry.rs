@@ -3289,9 +3289,7 @@ impl CommittedProverScan {
             l2: [0xffu8; 32],
         };
         let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
-        let mut ring_keys = Vec::new();
-        let mut releases = Vec::new();
+        let mut rows = Vec::new();
         let mut seniority: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut seats = HashMap::new();
 
@@ -3349,13 +3347,15 @@ impl CommittedProverScan {
                 }
                 if type_hash == TYPE_HASH_ALLOCATION {
                     if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
-                        allocations.push((prover_ref, alloc));
-                        ring_keys.push(decode_ring_key(&root));
-                        releases.push(
+                        rows.push((
+                            vk,
+                            prover_ref,
+                            alloc,
+                            decode_ring_key(&root),
                             crate::global_intrinsic::prover_release::Release::from_bytes(
                                 &read_bytes(&root, "allocation:ProverAllocation", "Release"),
                             ),
-                        );
+                        ));
                     }
                     return;
                 }
@@ -3367,6 +3367,18 @@ impl CommittedProverScan {
                 }
             };
         let adds = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+        // Vertex-key order, whatever order the store yields: it walks the
+        // versioned keyspace before the legacy one, and collects versioned
+        // keys of differing lengths through a hash map.
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut allocations = Vec::with_capacity(rows.len());
+        let mut ring_keys = Vec::with_capacity(rows.len());
+        let mut releases = Vec::with_capacity(rows.len());
+        for (_, prover_ref, alloc, ring_key, release) in rows {
+            allocations.push((prover_ref, alloc));
+            ring_keys.push(ring_key);
+            releases.push(release);
+        }
         (
             Self {
                 addr_to_pubkey,
@@ -3428,7 +3440,7 @@ impl CommittedProverScan {
     }
 
     /// Every allocation, with its prover's public key and its ring key
-    /// ([`Self::ring_key`]), in scan order.
+    /// ([`Self::ring_key`]), in vertex-key order.
     pub fn allocations_with_keys(
         &self,
     ) -> impl Iterator<
@@ -5277,6 +5289,82 @@ mod tests {
         assert_eq!(
             scan.all_on_filter(&fa[0]),
             vec![(pk_a.clone(), addr_a.clone())]
+        );
+    }
+
+    /// A/B reproducer for the scan's allocation order: the store yields its
+    /// versioned vertices before its legacy ones, so the scan listed
+    /// allocations in an order that depends on how each node's store was
+    /// written rather than on committed state. A build that sorts the scan
+    /// lists them by vertex key.
+    #[test]
+    fn reproduces_allocations_in_store_order() {
+        use crate::global_intrinsic::materialize::{
+            allocation_address, prover_address_from_pubkey,
+        };
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::NoopInclusionProver;
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        let pk = vec![0xA1u8; 57];
+        let paddr = prover_address_from_pubkey(&pk).unwrap();
+        let mut vertices: Vec<(Vec<u8>, Vec<u8>)> = (0u8..2)
+            .map(|suffix| {
+                let mut filter = crate::domains::QUIL_TOKEN.to_vec();
+                filter.push(suffix);
+                let blob = build_sub_tree(vec![
+                    type_hash_leaf("allocation:ProverAllocation"),
+                    field_leaf("allocation:ProverAllocation", "Prover", paddr.to_vec()),
+                    field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                    field_leaf(
+                        "allocation:ProverAllocation",
+                        "ConfirmationFilter",
+                        filter.clone(),
+                    ),
+                ]);
+                let mut key = vec![0xFFu8; 32];
+                key.extend_from_slice(&allocation_address(&pk, &filter).unwrap());
+                (key, blob)
+            })
+            .collect();
+        vertices.sort();
+        // The higher vertex key in the versioned keyspace, the lower one in
+        // the legacy keyspace a node keeps until it rewrites the vertex.
+        let (low, high) = (&vertices[0], &vertices[1]);
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &low.0, &low.1)
+            .unwrap();
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &high.0,
+                &high.1,
+                1,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let crdt = HypergraphCrdt::new(
+            store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(NoopInclusionProver),
+        );
+        let scan = CommittedProverScan::try_scan(&crdt).unwrap();
+        let listed: Vec<Vec<u8>> = scan
+            .allocations_with_keys()
+            .map(|(_, alloc, _, _)| alloc.vertex_address.clone())
+            .collect();
+        let by_key: Vec<Vec<u8>> = vertices.iter().map(|(key, _)| key[32..].to_vec()).collect();
+        assert_eq!(listed.len(), 2, "both allocations scanned");
+        assert_eq!(
+            listed, by_key,
+            "allocations listed in store order, not by vertex key"
         );
     }
 

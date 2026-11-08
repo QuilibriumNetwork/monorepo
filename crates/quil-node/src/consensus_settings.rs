@@ -265,6 +265,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_KICKED_SENIORITY_RESTORATION_FRAME override active (localnet only)"
         );
     }
+    let citation_window_epoch = quil_types::consensus::init_global_citation_window_epoch(network);
+    if network != 0 && citation_window_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = citation_window_epoch,
+            "QUIL_GLOBAL_CITATION_WINDOW_EPOCH override active (localnet only)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +410,71 @@ mod tests {
             !matches!(replayed, Ok(true)),
             "replayed leave accepted again: a leave signed at frame {} was accepted at frame {at}",
             at - 100
+        );
+    }
+
+    /// A/B reproducer for ancient global citations: a mint claim may cite a
+    /// global frame however far before its anchor, and a replica without
+    /// that frame holds the claim's frame for retry while the others apply
+    /// it. On a test network that sets `QUIL_GLOBAL_CITATION_WINDOW_EPOCH=0`,
+    /// a build with the citation window refuses the claim outright; a build
+    /// without it ignores the setting.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn reproduces_ancient_global_citation_stall() {
+        use quil_execution::token_intrinsic::mint_claim::verify_from_clock;
+        use quil_lattice_ct::confidential::{
+            mint_claim::MintClaim,
+            relation::membership::IDENTITY_BYTES,
+            transfer::{parameter_context, Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        use quil_types::error::QuilError;
+        use quil_types::execution::{FrameExecutionContext, ShardPath};
+
+        std::env::set_var("QUIL_GLOBAL_CITATION_WINDOW_EPOCH", "0");
+        super::initialize(1);
+        let network = [1; 32];
+        let app = quil_execution::domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &app);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let claim = MintClaim {
+            network,
+            application: app,
+            cited_global_frame: 1,
+            global_root: [3; 32],
+            receipt: [4; 32],
+            fee: 0,
+            outputs: vec![Output {
+                commitment: CommitmentKey::derive(&context).commit(5, &opening),
+                owner: [6; IDENTITY_BYTES],
+                memo: [7; MEMO_BYTES],
+            }],
+            forest_proof: vec![1],
+        }
+        .encode()
+        .unwrap();
+        // This replica holds no global frame below the anchor.
+        let clock = quil_store::testing::InMemoryClockStore::new();
+        let anchor = 1_000_000;
+        let outcome = verify_from_clock(
+            &clock,
+            FrameExecutionContext {
+                frame_number: 2,
+                finalized_global_frame: Some(anchor),
+                shard: ShardPath::WHOLE,
+                venue: None,
+            },
+            &network,
+            &app,
+            &claim,
+            2,
+        )
+        .err();
+        assert!(
+            matches!(outcome, Some(QuilError::InvalidArgument(_))),
+            "a claim citing global frame 1 under anchor {anchor} stalls a replica without \
+             that frame: {outcome:?} holds the frame for retry instead of refusing the claim"
         );
     }
 }

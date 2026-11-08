@@ -732,22 +732,93 @@ mod tests {
              the authorization record does not bind"
         );
     }
+
+    /// From the citation window epoch a citation trailing the anchor by more
+    /// than the window is refused even where the frame is held, and one at
+    /// the window's edge still resolves. Before it the old frame resolves.
+    #[test]
+    fn clock_reward_root_refuses_citations_outside_the_window() {
+        use quil_types::consensus::{
+            set_global_citation_window_epoch_for_thread, GLOBAL_CITATION_WINDOW_FRAMES,
+        };
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let clock = quil_store::testing::InMemoryClockStore::new();
+        let anchor = 3 * GLOBAL_CITATION_WINDOW_FRAMES;
+        let edge = anchor - GLOBAL_CITATION_WINDOW_FRAMES;
+        for (frame, root) in [(edge, [1u8; 32]), (edge - 1, [2u8; 32])] {
+            clock.seed_frame(GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: frame,
+                    prover_tree_commitment: root.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        set_global_citation_window_epoch_for_thread(Some(u64::MAX));
+        assert_eq!(
+            clock_reward_root(&clock, edge - 1, anchor).unwrap(),
+            [2; 32]
+        );
+        set_global_citation_window_epoch_for_thread(Some(0));
+        assert_eq!(clock_reward_root(&clock, edge, anchor).unwrap(), [1; 32]);
+        assert!(matches!(
+            clock_reward_root(&clock, edge - 1, anchor),
+            Err(QuilError::InvalidArgument(reason)) if reason.contains("citation window")
+        ));
+        assert!(matches!(
+            clock_reward_root(&clock, 1, anchor),
+            Err(QuilError::InvalidArgument(reason)) if reason.contains("citation window")
+        ));
+        assert!(matches!(
+            clock_reward_root(&clock, edge + 1, anchor),
+            Err(QuilError::ExecutionUnavailable(_))
+        ));
+        assert!(matches!(
+            clock_reward_root(&clock, anchor + 1, anchor),
+            Err(QuilError::InvalidArgument(reason)) if reason.contains("future")
+        ));
+        set_global_citation_window_epoch_for_thread(None);
+    }
+
+    /// Witnesses cite the newest root their node retains, at most the reward
+    /// witness lookback before their cap, and a mint claim's cap trails the
+    /// latest frame by the citation lag. The window holds twice that.
+    #[test]
+    fn the_citation_window_admits_every_honest_witness_citation() {
+        let honest = crate::token_intrinsic::reward_witness::REWARD_WITNESS_LOOKBACK_FRAMES
+            + crate::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+        assert!(quil_types::consensus::GLOBAL_CITATION_WINDOW_FRAMES >= 2 * honest);
+    }
 }
 
 /// The canonical GLOBAL prover-shard root committed by global frame
 /// `cited_frame`, which must not follow the executing frame's finalized global
-/// anchor. Missing local history is an execution failure (the frame is held
-/// for retry), not a deterministic rejection.
+/// anchor and, from the global citation window epoch, must not trail it by
+/// more than [`GLOBAL_CITATION_WINDOW_FRAMES`]. Both bounds are deterministic
+/// rejections. Missing local history within them is an execution failure (the
+/// frame is held for retry).
+///
+/// [`GLOBAL_CITATION_WINDOW_FRAMES`]: quil_types::consensus::GLOBAL_CITATION_WINDOW_FRAMES
 pub(crate) fn clock_reward_root(
     clock: &dyn quil_types::store::ClockStore,
     cited_frame: u64,
     finalized_global_frame: u64,
 ) -> quil_types::error::Result<[u8; 32]> {
+    use quil_types::consensus::{global_citation_window_active, GLOBAL_CITATION_WINDOW_FRAMES};
     use quil_types::error::QuilError;
     let unavailable = |message: String| QuilError::ExecutionUnavailable(format!("mint: {message}"));
     if cited_frame > finalized_global_frame {
         return Err(QuilError::InvalidArgument(format!(
             "mint: future global reward frame (cited {cited_frame}, anchor {finalized_global_frame})"
+        )));
+    }
+    if global_citation_window_active(finalized_global_frame)
+        && finalized_global_frame - cited_frame > GLOBAL_CITATION_WINDOW_FRAMES
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "mint: global reward frame outside the citation window (cited {cited_frame}, \
+             anchor {finalized_global_frame}, window {GLOBAL_CITATION_WINDOW_FRAMES})"
         )));
     }
     let frame = clock
