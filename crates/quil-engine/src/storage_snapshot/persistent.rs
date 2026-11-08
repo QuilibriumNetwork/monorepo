@@ -1326,6 +1326,83 @@ fn target_warn_due(dir: &Path, epoch: u64) -> bool {
     warned.insert(dir.to_owned(), epoch) != Some(epoch)
 }
 
+/// A sector's wait for its GLOBAL precommit slot: the epoch it began, the
+/// epoch of the precommit last found holding the slot, and the epoch its
+/// overrun was last reported.
+struct SlotWait {
+    since: u64,
+    held_for: u64,
+    warned: Option<u64>,
+}
+
+/// The sectors whose precommit waits for its slot, by directory.
+static SLOT_WAITS: Mutex<std::collections::BTreeMap<PathBuf, SlotWait>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// How many epochs a sector's precommit waits for its slot before the wait
+/// is reported as overrun: a precommit holds its slot through the two
+/// epochs after its own, and one a sector waits behind targets the next
+/// epoch at most.
+const SLOT_WAIT_EPOCHS: u64 = 4;
+
+/// Note that a sector's precommit waits for its slot, held by `holder`:
+/// once as the wait begins and as another precommit takes the slot, and a
+/// warn once an epoch while the wait is past [`SLOT_WAIT_EPOCHS`].
+fn slot_wait(
+    sector: &Sector,
+    frame: u64,
+    current: u64,
+    target: u64,
+    holder: &quil_execution::global_intrinsic::persistent_storage::PendingCertificate,
+) {
+    let mut waits = SLOT_WAITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut begun = false;
+    let wait = waits.entry(sector.dir.clone()).or_insert_with(|| {
+        begun = true;
+        SlotWait {
+            since: current,
+            held_for: holder.epoch,
+            warned: None,
+        }
+    });
+    let (id, held_by) = (
+        hex::encode(sector.cert.sector),
+        hex::encode(holder.certificate.sector),
+    );
+    if begun || wait.held_for != holder.epoch {
+        wait.held_for = holder.epoch;
+        info!(frame, sector = %id, target, held_by = %held_by, held_for = holder.epoch,
+            "a sector's precommit waits: another precommit of this member holds its GLOBAL \
+             slot, which refuses this one until that one's epoch has passed by two or its \
+             sector is certified; nothing is sent until then");
+    }
+    let waited = current.saturating_sub(wait.since);
+    if waited > SLOT_WAIT_EPOCHS && wait.warned != Some(current) {
+        wait.warned = Some(current);
+        warn!(frame, sector = %id, target, waited, held_by = %held_by,
+            held_for = holder.epoch, scope = "local",
+            action = "check the certification of this member's sector holding the slot: one \
+                      never certified precommits into it again as each precommit expires",
+            "a sector's precommit has waited for its GLOBAL slot for more than {} epochs",
+            SLOT_WAIT_EPOCHS);
+    }
+}
+
+/// End a sector's wait for its precommit slot, if it waited.
+fn slot_wait_ended(sector: &Sector, frame: u64, current: u64) {
+    let ended = SLOT_WAITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&sector.dir);
+    if let Some(wait) = ended {
+        info!(frame, sector = %hex::encode(sector.cert.sector),
+            waited = current.saturating_sub(wait.since),
+            "a sector's GLOBAL precommit slot is free: its wait ended");
+    }
+}
+
 /// Poll committed GLOBAL records, never execution's speculative overlay.
 /// Proof generation has a separate lane and durable retry files; a restart
 /// neither relabels certified capacity nor changes an accepted precommit.
@@ -1439,7 +1516,28 @@ pub(crate) fn poll_sector_certificates(
             .unwrap_or(next);
         atomic(&target_path, &target.to_be_bytes())?;
         let pending = protocol::committed_pending(snapshot.as_ref(), member, &sector.cert, target)?;
-        let pending = pending.filter(|p| p.epoch == target && p.certificate == sector.cert);
+        let (pending, holder) = match pending {
+            Some(p) if p.epoch == target && p.certificate == sector.cert => (Some(p), None),
+            other => (None, other),
+        };
+        // GLOBAL refuses a precommit while its slot (this member, the
+        // sector id's first byte mod 16 and the target mod 4) holds another
+        // whose epoch has not passed by two and whose sector is not
+        // certified (`persistent_storage::check_capacity`): a sector given
+        // a new certificate, or another sharing its slot, waits rather than
+        // sending one GLOBAL refuses at every frame.
+        if let Some(holder) = holder.filter(|h| h.epoch >= current.saturating_sub(2)) {
+            let certified = protocol::committed_certificate(
+                snapshot.as_ref(),
+                member,
+                &holder.certificate.sector,
+            )?;
+            if certified.is_none() {
+                slot_wait(&sector, frame, current, target, &holder);
+                return Ok(());
+            }
+        }
+        slot_wait_ended(&sector, frame, current);
         let Some(pending) = pending else {
             if let Some(precommit) = precommit_due(&sector, member, target, frame, signer)? {
                 publish(precommit);
@@ -3047,6 +3145,228 @@ mod tests {
             reports, 1,
             "LAST-LAYER-TARGET-WARN: a damaged precommit target was reported {reports} times \
              in an epoch, not once"
+        );
+        gates(false);
+    }
+    /// A GLOBAL where this member is registered at `frame`, in epoch 1499,
+    /// and a sector of the installed store set up for epoch 1500 that has
+    /// not precommitted: the GLOBAL, the member, the sector and `frame`.
+    fn unprecommitted_sector(label: &[u8]) -> (Arc<HypergraphCrdt>, [u8; 32], Sector, u64) {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, label, 1500, 100).unwrap();
+        let sector = initialize(store, &member, 1500, path, id, n, &|| false).unwrap();
+        (global, member, sector, frame)
+    }
+    /// Commit at `frame` this member's precommit of `certificate` for
+    /// `epoch`, as GLOBAL takes it.
+    fn commit_precommit(
+        global: &Arc<HypergraphCrdt>,
+        member: &[u8; 32],
+        certificate: sector::Certificate,
+        epoch: u64,
+        frame: u64,
+    ) {
+        use quil_execution::global_intrinsic::persistent_storage as protocol;
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_types::crypto::Signer;
+        let mut message = protocol::CapacityMessage {
+            member: *member,
+            epoch,
+            certificate,
+            signed_at: frame,
+            signature: Vec::new(),
+            proof: Vec::new(),
+        };
+        message.signature = TestIdentity
+            .sign_with_domain(
+                &message.signing_message(),
+                &protocol::capacity_domain().unwrap(),
+            )
+            .unwrap();
+        let state = HypergraphState::new(global.clone());
+        let records =
+            protocol::check_capacity(frame, &message.envelope(), &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        assert_eq!(records.len(), 1, "GLOBAL takes the precommit");
+        protocol::apply(&state, frame, &records).unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+    }
+    /// How many of the precommits `sent` GLOBAL takes at `frame`.
+    fn precommits_taken(global: &Arc<HypergraphCrdt>, frame: u64, sent: &[Vec<u8>]) -> usize {
+        use quil_execution::global_intrinsic::persistent_storage as protocol;
+        use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+        use quil_execution::hypergraph_state::HypergraphState;
+        let state = HypergraphState::new(global.clone());
+        sent.iter()
+            .filter(|bytes| {
+                let precommit = StorageEpochProof::from_canonical_bytes(bytes).unwrap();
+                protocol::check_capacity(frame, &precommit, &state, &TestIdentity, &|_| {
+                    Err(unavailable("not known".into()))
+                })
+                .is_ok_and(|records| records.len() == 1)
+            })
+            .count()
+    }
+    /// A publish that sends each message to the receiver.
+    fn published() -> (
+        Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        (publish, recv)
+    }
+    /// An uncertified sector given the certificate its labels give, while
+    /// its old certificate's precommit holds its GLOBAL slot, waits and
+    /// sends nothing: GLOBAL refuses another precommit in the slot until
+    /// that one's epoch has passed by two. Then it precommits, and GLOBAL
+    /// takes it. It signed and sent a precommit GLOBAL refused at every
+    /// frame, for two or three epochs.
+    #[test]
+    fn a_sector_given_a_new_certificate_waits_for_its_precommit_slot() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let (global, member, sector, frame) = unprecommitted_sector(b"certified anew");
+        // Its old certificate's precommit, for the next epoch, holds the
+        // slot, as a sector set up from torn kept labels leaves it.
+        let mut old = sector.cert;
+        old.labels = old.columns;
+        commit_precommit(&global, &member, old, 1500, frame + 1);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (publish, recv) = published();
+        for at in [frame + 2, frame + 3] {
+            poll_sector_certificates(
+                at,
+                &member,
+                &global,
+                clock.clone(),
+                &TestIdentity,
+                publish.clone(),
+            )
+            .unwrap();
+        }
+        let sent: Vec<_> = recv.try_iter().collect();
+        assert!(
+            sent.is_empty(),
+            "LAST-LAYER-SLOT-SENT: a sector sent {} precommits while another held its GLOBAL \
+             slot; GLOBAL takes {} of them",
+            sent.len(),
+            precommits_taken(&global, frame + 3, &sent)
+        );
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let notes = logged.matches("a sector's precommit waits").count();
+        assert_eq!(
+            notes, 1,
+            "LAST-LAYER-SLOT-NOTE: a sector's wait for its precommit slot was noted {notes} \
+             times, not once"
+        );
+        let after = 1503 * quil_types::consensus::epoch_length_frames() + 2;
+        poll_sector_certificates(after, &member, &global, clock, &TestIdentity, publish).unwrap();
+        let sent: Vec<_> = recv.try_iter().collect();
+        assert!(
+            sent.len() == 1 && precommits_taken(&global, after, &sent) == 1,
+            "a sector whose precommit slot freed did not precommit, or GLOBAL refused it"
+        );
+        gates(false);
+    }
+    /// A sector whose GLOBAL precommit slot another of this member's
+    /// sectors holds, their ids sharing their first byte mod 16, waits and
+    /// sends nothing until that precommit's epoch has passed by two. A wait
+    /// past four epochs, as the other precommits into the slot again, is
+    /// reported once an epoch.
+    #[test]
+    fn a_sector_waits_for_a_precommit_slot_another_sector_holds() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let (global, member, sector, frame) = unprecommitted_sector(b"shared slot");
+        let mut other = sector.cert;
+        other.sector[31] ^= 1;
+        commit_precommit(&global, &member, other, 1500, frame + 1);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (publish, recv) = published();
+        let poll = |at: u64| {
+            poll_sector_certificates(
+                at,
+                &member,
+                &global,
+                clock.clone(),
+                &TestIdentity,
+                publish.clone(),
+            )
+            .unwrap();
+            recv.try_iter().collect::<Vec<_>>()
+        };
+        let sent = poll(frame + 2);
+        assert!(
+            sent.is_empty(),
+            "LAST-LAYER-SLOT-SHARED: a sector sent {} precommits while another sector held its \
+             GLOBAL slot; GLOBAL takes {} of them",
+            sent.len(),
+            precommits_taken(&global, frame + 2, &sent)
+        );
+        // The other, never certified, precommits into the slot again as
+        // its precommit expires.
+        let length = quil_types::consensus::epoch_length_frames();
+        commit_precommit(&global, &member, other, 1504, 1503 * length + 1);
+        let sent: Vec<_> = [1503 * length + 2, 1504 * length + 2, 1504 * length + 3]
+            .into_iter()
+            .flat_map(&poll)
+            .collect();
+        assert!(
+            sent.is_empty(),
+            "LAST-LAYER-SLOT-SHARED: a sector sent {} precommits while another sector held its \
+             GLOBAL slot again",
+            sent.len()
+        );
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let overruns = logged.matches("has waited for its GLOBAL slot").count();
+        assert_eq!(
+            overruns, 1,
+            "LAST-LAYER-SLOT-OVERRUN: a wait for a precommit slot past four epochs was \
+             reported {overruns} times, not once"
+        );
+        let after = 1507 * length + 2;
+        let sent = poll(after);
+        assert!(
+            sent.len() == 1 && precommits_taken(&global, after, &sent) == 1,
+            "a sector whose precommit slot freed did not precommit, or GLOBAL refused it"
         );
         gates(false);
     }
