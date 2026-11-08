@@ -1326,28 +1326,33 @@ fn target_warn_due(dir: &Path, epoch: u64) -> bool {
     warned.insert(dir.to_owned(), epoch) != Some(epoch)
 }
 
-/// A sector's wait for its GLOBAL precommit slot: the epoch it began, the
-/// epoch of the precommit last found holding the slot, and the epoch its
-/// overrun was last reported.
+/// The precommit holding a sector's GLOBAL slot: its sector id and epoch.
+type SlotHolder = ([u8; 32], u64);
+
+/// A sector's wait for its GLOBAL precommit slot: its sector, the epoch the
+/// wait began, the last epoch of the term of the precommit it waits behind,
+/// the precommit last found holding the slot, the one past the term last
+/// reported, and the poll frame that last found the slot held.
 struct SlotWait {
+    sector: [u8; 32],
     since: u64,
-    held_for: u64,
-    warned: Option<u64>,
+    term: u64,
+    holder: SlotHolder,
+    warned: Option<SlotHolder>,
+    seen: u64,
 }
 
 /// The sectors whose precommit waits for its slot, by directory.
 static SLOT_WAITS: Mutex<std::collections::BTreeMap<PathBuf, SlotWait>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-/// How many epochs a sector's precommit waits for its slot before the wait
-/// is reported as overrun: a precommit holds its slot through the two
-/// epochs after its own, and one a sector waits behind targets the next
-/// epoch at most.
-const SLOT_WAIT_EPOCHS: u64 = 4;
-
-/// Note that a sector's precommit waits for its slot, held by `holder`:
-/// once as the wait begins and as another precommit takes the slot, and a
-/// warn once an epoch while the wait is past [`SLOT_WAIT_EPOCHS`].
+/// Note that a sector's precommit waits for its slot, held by `holder`.
+/// A precommit holds its slot through the two epochs after its own, which
+/// in the capacity warmup is the first persistent epoch, so a wait lasts
+/// that term: it is noted as it begins, with the epoch it ends by, and
+/// again as a precommit that took the slot within the term extends it. A
+/// precommit found holding the slot past the term took it again: warned
+/// once for each.
 fn slot_wait(
     sector: &Sector,
     frame: u64,
@@ -1358,49 +1363,70 @@ fn slot_wait(
     let mut waits = SLOT_WAITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held = (holder.certificate.sector, holder.epoch);
     let mut begun = false;
     let wait = waits.entry(sector.dir.clone()).or_insert_with(|| {
         begun = true;
         SlotWait {
+            sector: sector.cert.sector,
             since: current,
-            held_for: holder.epoch,
+            term: holder.epoch.saturating_add(2),
+            holder: held,
             warned: None,
+            seen: frame,
         }
     });
+    wait.seen = frame;
     let (id, held_by) = (
         hex::encode(sector.cert.sector),
         hex::encode(holder.certificate.sector),
     );
-    if begun || wait.held_for != holder.epoch {
-        wait.held_for = holder.epoch;
+    if current > wait.term {
+        wait.holder = held;
+        if wait.warned != Some(held) {
+            wait.warned = Some(held);
+            warn!(frame, sector = %id, target, waited = current.saturating_sub(wait.since),
+                held_by = %held_by, held_for = holder.epoch, term_ended = wait.term,
+                scope = "local",
+                action = "check the certification of this member's sector holding the slot: \
+                          one never certified precommits into it again as each precommit \
+                          expires",
+                "a sector's precommit has waited for its GLOBAL slot past the term of the \
+                 precommit it waited behind: another precommit took the slot again");
+        }
+        return;
+    }
+    if begun || wait.holder != held {
+        wait.holder = held;
+        wait.term = wait.term.max(holder.epoch.saturating_add(2));
         info!(frame, sector = %id, target, held_by = %held_by, held_for = holder.epoch,
+            ends_by = wait.term.saturating_add(1),
             "a sector's precommit waits: another precommit of this member holds its GLOBAL \
              slot, which refuses this one until that one's epoch has passed by two or its \
-             sector is certified; nothing is sent until then");
-    }
-    let waited = current.saturating_sub(wait.since);
-    if waited > SLOT_WAIT_EPOCHS && wait.warned != Some(current) {
-        wait.warned = Some(current);
-        warn!(frame, sector = %id, target, waited, held_by = %held_by,
-            held_for = holder.epoch, scope = "local",
-            action = "check the certification of this member's sector holding the slot: one \
-                      never certified precommits into it again as each precommit expires",
-            "a sector's precommit has waited for its GLOBAL slot for more than {} epochs",
-            SLOT_WAIT_EPOCHS);
+             sector is certified; nothing is sent before then, and the wait ends by epoch \
+             ends_by");
     }
 }
 
-/// End a sector's wait for its precommit slot, if it waited.
-fn slot_wait_ended(sector: &Sector, frame: u64, current: u64) {
-    let ended = SLOT_WAITS
+/// End the wait of each sector in `root` that the poll at `frame` did not
+/// find waiting for its slot, however its poll ended: the slot freed, the
+/// sector was certified, its member's sector cap held it back, it could
+/// not be polled, or it is gone.
+fn slot_waits_ended(root: &Path, frame: u64, current: u64) {
+    SLOT_WAITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&sector.dir);
-    if let Some(wait) = ended {
-        info!(frame, sector = %hex::encode(sector.cert.sector),
-            waited = current.saturating_sub(wait.since),
-            "a sector's GLOBAL precommit slot is free: its wait ended");
-    }
+        .retain(|dir, wait| {
+            if dir.parent() != Some(root) || wait.seen == frame {
+                return true;
+            }
+            info!(frame, sector = %hex::encode(wait.sector),
+                waited = current.saturating_sub(wait.since),
+                "a sector's precommit no longer waits for its GLOBAL slot: the slot is free, \
+                 or the sector was certified, held back by its member's sector cap, not \
+                 polled or removed");
+            false
+        });
 }
 
 /// Poll committed GLOBAL records, never execution's speculative overlay.
@@ -1537,7 +1563,6 @@ pub(crate) fn poll_sector_certificates(
                 return Ok(());
             }
         }
-        slot_wait_ended(&sector, frame, current);
         let Some(pending) = pending else {
             if let Some(precommit) = precommit_due(&sector, member, target, frame, signer)? {
                 publish(precommit);
@@ -1699,7 +1724,7 @@ pub(crate) fn poll_sector_certificates(
         );
         Ok(())
     };
-    for entry in fs::read_dir(root).map_err(io)?.flatten() {
+    for entry in fs::read_dir(&root).map_err(io)?.flatten() {
         if !sector_directory(&entry.path()) {
             continue;
         }
@@ -1718,6 +1743,7 @@ pub(crate) fn poll_sector_certificates(
             }
         }
     }
+    slot_waits_ended(&root, frame, current);
     Ok(())
 }
 
@@ -3303,8 +3329,8 @@ mod tests {
     /// A sector whose GLOBAL precommit slot another of this member's
     /// sectors holds, their ids sharing their first byte mod 16, waits and
     /// sends nothing until that precommit's epoch has passed by two. A wait
-    /// past four epochs, as the other precommits into the slot again, is
-    /// reported once an epoch.
+    /// past that term, as the other precommits into the slot again, is
+    /// reported once for that precommit.
     #[test]
     fn a_sector_waits_for_a_precommit_slot_another_sector_holds() {
         let logs = super::super::tests::capture_logs();
@@ -3358,7 +3384,7 @@ mod tests {
         let overruns = logged.matches("has waited for its GLOBAL slot").count();
         assert_eq!(
             overruns, 1,
-            "LAST-LAYER-SLOT-OVERRUN: a wait for a precommit slot past four epochs was \
+            "LAST-LAYER-SLOT-OVERRUN: a wait for a precommit slot past its holder's term was \
              reported {overruns} times, not once"
         );
         let after = 1507 * length + 2;
