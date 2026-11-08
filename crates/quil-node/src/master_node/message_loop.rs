@@ -156,9 +156,11 @@ fn unrouted_shard_message(
             if !addr.is_empty()
                 && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
             {
+                let now = std::time::Instant::now();
                 if let Err(reason) = mirror.offer(clock_store, &frame, data) {
-                    MIRROR_REFUSALS.note(&frame, reason, std::time::Instant::now());
+                    MIRROR_REFUSALS.note(&frame, reason, now);
                 }
+                mirror.summarize(now);
             }
         }
     }
@@ -212,8 +214,27 @@ fn mirror_admits(
 /// Frames without a certificate held per shard until a certified child links
 /// to them, as many as the archive ingest holds.
 const MIRROR_HELD_PER_SHARD: usize = 32;
-/// Encoded bytes of every held frame; past it the longest held is dropped.
+/// Frames held per shard at one frame number. Past it the longest held there
+/// goes, so impostors at the real frame's number cannot keep it out for good.
+const MIRROR_HELD_PER_NUMBER: usize = 4;
+/// How far above a shard's stored head a frame without a certificate is
+/// held. One at or below it is mirrored only when its stored child links to
+/// it.
+const MIRROR_HOLD_WINDOW: u64 = MIRROR_HELD_PER_SHARD as u64;
+/// Bytes all held frames take, bookkeeping included; past it the longest
+/// held goes.
 const MIRROR_HELD_BYTES: usize = 64 << 20;
+/// Bookkeeping bytes per held frame besides its encoding and its filter
+/// (counted twice): its key in both maps, its value and a B-tree node share.
+const MIRROR_HELD_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<HeldKey>()
+    + std::mem::size_of::<(u64, Vec<u8>)>()
+    + std::mem::size_of::<u64>()
+    + 64;
+/// Frames a bound evicted that are remembered, so that a certified child
+/// naming one shows a real frame was lost.
+const MIRROR_EVICTED_REMEMBERED: usize = 1024;
+/// How often the frames held for their certified child are summarized.
+const MIRROR_HOLD_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What a node without an archive ingest mirrors of the shard frames
 /// gossiped for shards no local engine runs: a frame that verifies at once
@@ -221,22 +242,51 @@ const MIRROR_HELD_BYTES: usize = 64 << 20;
 /// Simplex finalizes a view's notarized ancestors with the child's
 /// certificate, so such a frame never carries one of its own; the archive
 /// ingest holds it until a certified child links to it, and so does this.
+/// Either way the carried requests must match the header's root.
 struct ShardMirror {
     validator: quil_engine::frame_validator::BlsAppFrameValidator,
+    /// The shards the prover registry names, as the archive ingest tracks
+    /// them: only their frames are held.
+    tracked: quil_engine::archive_ingest::TrackedShards,
+    /// Recomputes a frame's requests root; none in tests, where a frame with
+    /// requests is refused.
+    execution: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    has_forest: bool,
     held: std::sync::Mutex<HeldFrames>,
 }
 
 /// The key of a held frame: its filter, number and output identity. Keyed
-/// by identity, so a well-formed impostor does not displace the real frame.
+/// by identity, so a well-formed impostor does not replace the real frame.
 type HeldKey = (Vec<u8>, u64, [u8; 32]);
 
-/// Frames without a certificate whose header verifies otherwise, each with
-/// its arrival count and encoding.
-#[derive(Default)]
+/// What happened to held frames since the last summary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HoldCounts {
+    /// Frames held.
+    held: u64,
+    /// Held frames mirrored once a certified child linked to them.
+    released: u64,
+    /// Held frames a bound evicted.
+    evicted: u64,
+    /// Held frames dropped as far below a mirrored frame.
+    pruned: u64,
+    /// Evicted frames a certified child later named: real frames lost.
+    lost: u64,
+}
+
+/// Frames without a certificate whose header and requests verify otherwise,
+/// each with its arrival count and encoding; an arrival index finds the
+/// longest held without a scan.
 struct HeldFrames {
     frames: std::collections::BTreeMap<HeldKey, (u64, Vec<u8>)>,
+    by_arrival: std::collections::BTreeMap<u64, HeldKey>,
     bytes: usize,
+    byte_cap: usize,
     arrivals: u64,
+    evicted: std::collections::VecDeque<HeldKey>,
+    evicted_keys: std::collections::HashSet<HeldKey>,
+    counts: HoldCounts,
+    reported: Option<std::time::Instant>,
 }
 
 /// What [`ShardMirror::offer`] did with a frame it did not refuse.
@@ -248,14 +298,28 @@ enum Mirrored {
     Held,
 }
 
-impl ShardMirror {
-    fn new(validator: quil_engine::frame_validator::BlsAppFrameValidator) -> Self {
-        Self {
-            validator,
-            held: std::sync::Mutex::new(HeldFrames::default()),
-        }
+/// The mirror a node without an archive ingest checks gossiped shard frames
+/// with: the validator built as the archive ingest builds its own, and the
+/// shards its prover registry names.
+fn shard_mirror(
+    prover_registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+    clock_store: Arc<dyn quil_types::store::ClockStore>,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    execution: Option<Arc<quil_execution::ExecutionEngineManager>>,
+) -> ShardMirror {
+    ShardMirror {
+        tracked: quil_engine::archive_ingest::TrackedShards::new(
+            prover_registry.clone(),
+            crdt.clone(),
+        ),
+        has_forest: crdt.has_forest(),
+        validator: shard_mirror_validator(prover_registry, clock_store, crdt),
+        execution,
+        held: std::sync::Mutex::new(HeldFrames::new(MIRROR_HELD_BYTES)),
     }
+}
 
+impl ShardMirror {
     /// Mirror gossiped `frame` (encoded as `data`) into `clock_store` once it
     /// verifies, hold it while it waits for its certified child, else say
     /// why not.
@@ -275,8 +339,21 @@ impl ShardMirror {
             Err(reason) if certified => return Err(reason),
             Err(_) => return self.hold(clock_store, frame, data),
         }
+        self.body_matches(frame)?;
         self.store(clock_store, header, data);
         Ok(Mirrored::Stored)
+    }
+
+    /// Whether `frame`'s carried requests match its header's root, as the
+    /// archive ingest checks them: the certificate covers only the header.
+    fn body_matches(&self, frame: &quil_types::proto::global::AppShardFrame) -> Result<(), String> {
+        quil_engine::archive_ingest::requests_match_root(
+            frame,
+            self.execution.as_deref(),
+            None,
+            self.has_forest,
+        )
+        .map_err(|mismatch| mismatch.to_string())
     }
 
     /// Mirror an authenticated frame, then the held ancestors it links to.
@@ -300,24 +377,10 @@ impl ShardMirror {
             child.frame_number.checked_sub(1),
             <[u8; 32]>::try_from(child.parent_selector.as_slice()),
         ) {
-            let key = (header.address.clone(), below, identity);
-            let Some(parent) = held
-                .frames
-                .get(&key)
-                .and_then(|(_, data)| {
-                    <quil_types::proto::global::AppShardFrame as prost::Message>::decode(
-                        data.as_slice(),
-                    )
-                    .ok()
-                })
-                .and_then(|frame| frame.header)
-                .filter(|parent| {
-                    quil_engine::frame_validator::app_frame_links_to_child(parent, &child)
-                })
+            let Some((parent, data)) = held.take_parent(&header.address, below, identity, &child)
             else {
                 break;
             };
-            let (_, data) = held.remove(&key).expect("found above");
             super::worker_manager::mirror_shard_frame_to_clock_store(
                 clock_store,
                 &header.address,
@@ -326,23 +389,16 @@ impl ShardMirror {
             child = parent;
         }
         // A frame this far below a mirrored one is no ancestor still owed.
-        let stale = header
-            .frame_number
-            .saturating_sub(MIRROR_HELD_PER_SHARD as u64);
-        let below: std::ops::Range<HeldKey> =
-            (header.address.clone(), 0, [0; 32])..(header.address.clone(), stale, [0; 32]);
-        let owed: Vec<HeldKey> = held
-            .frames
-            .range(below)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in owed {
-            held.remove(&key);
-        }
+        held.prune_below(
+            &header.address,
+            header.frame_number.saturating_sub(MIRROR_HOLD_WINDOW),
+        );
     }
 
-    /// Hold a frame without a certificate whose header verifies otherwise,
-    /// or mirror it when the child mirrored before it links to it.
+    /// Hold a frame without a certificate of a registered shard, above its
+    /// stored head and within [`MIRROR_HOLD_WINDOW`] of it, whose header and
+    /// requests verify otherwise; or mirror it when its stored child links
+    /// to it.
     fn hold(
         &self,
         clock_store: &dyn quil_types::store::ClockStore,
@@ -350,28 +406,47 @@ impl ShardMirror {
         data: &[u8],
     ) -> Result<Mirrored, String> {
         let header = frame.header.as_ref().ok_or("no header")?;
+        if !self.tracked.registered(&header.address) {
+            return Err("no certificate, and the prover registry names no such shard".into());
+        }
+        let linked = header
+            .frame_number
+            .checked_add(1)
+            .and_then(|number| {
+                clock_store
+                    .get_shard_clock_frame(&header.address, number, false)
+                    .ok()
+            })
+            .and_then(|child| child.header)
+            .is_some_and(|child| {
+                quil_engine::frame_validator::app_frame_links_to_child(header, &child)
+            });
+        if !linked {
+            let head = clock_store
+                .get_latest_shard_clock_frame_number(&header.address)
+                .ok()
+                .flatten();
+            if let Some(head) = head.filter(|&head| {
+                header.frame_number <= head || header.frame_number - head > MIRROR_HOLD_WINDOW
+            }) {
+                return Err(format!(
+                    "no certificate, and not within {MIRROR_HOLD_WINDOW} frames above the \
+                     stored head {head}"
+                ));
+            }
+        }
         match self.validator.validate_linked_without_storage(frame) {
             Ok(true) => {}
             Ok(false) => return Err("no certificate, and the header does not verify".into()),
             Err(error) => return Err(format!("no certificate, and {error}")),
         }
-        let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-            .map_err(|_| "no certificate, and no output identity".to_string())?;
-        let child = header.frame_number.checked_add(1).and_then(|number| {
-            clock_store
-                .get_shard_clock_frame(&header.address, number, false)
-                .ok()
-        });
-        if child
-            .as_ref()
-            .and_then(|child| child.header.as_ref())
-            .is_some_and(|child| {
-                quil_engine::frame_validator::app_frame_links_to_child(header, child)
-            })
-        {
+        self.body_matches(frame)?;
+        if linked {
             self.store(clock_store, header, data);
             return Ok(Mirrored::Stored);
         }
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map_err(|_| "no certificate, and no output identity".to_string())?;
         self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -381,45 +456,196 @@ impl ShardMirror {
             );
         Ok(Mirrored::Held)
     }
+
+    /// Log what happened to held frames since the last line, at most once
+    /// per [`MIRROR_HOLD_SUMMARY`] and only when something did; a warn when
+    /// a real frame was lost to a bound. The counts logged, if a line was.
+    fn summarize(&self, now: std::time::Instant) -> Option<HoldCounts> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let since = held.reported;
+        if since.is_some_and(|last| now.saturating_duration_since(last) < MIRROR_HOLD_SUMMARY)
+            || held.counts == HoldCounts::default()
+        {
+            return None;
+        }
+        held.reported = Some(now);
+        let counts = std::mem::take(&mut held.counts);
+        let (holding, holding_bytes) = (held.frames.len(), held.bytes);
+        drop(held);
+        let interval_s = since.map(|last| now.saturating_duration_since(last).as_secs());
+        if counts.lost > 0 {
+            warn!(
+                lost = counts.lost,
+                held = counts.held,
+                released = counts.released,
+                evicted = counts.evicted,
+                pruned = counts.pruned,
+                holding,
+                holding_bytes,
+                interval_s,
+                scope = "peer",
+                check = "a hold bound evicted real frames before their certified child arrived, \
+                         so this node serves no frame at those numbers; many evictions mean a \
+                         peer floods shard frame topics with well-formed frames",
+                "shard frames held for their certified child were lost to a bound"
+            );
+        } else {
+            info!(
+                held = counts.held,
+                released = counts.released,
+                evicted = counts.evicted,
+                pruned = counts.pruned,
+                holding,
+                holding_bytes,
+                interval_s,
+                scope = "peer",
+                check = "none: a notarized frame is final through its certified child; evictions \
+                         without losses are frames no certified child named",
+                "shard frames without a certificate were held for their certified child before \
+                 mirroring"
+            );
+        }
+        Some(counts)
+    }
 }
 
 impl HeldFrames {
-    fn remove(&mut self, key: &HeldKey) -> Option<(u64, Vec<u8>)> {
-        let removed = self.frames.remove(key)?;
-        self.bytes -= removed.1.len();
-        Some(removed)
+    fn new(byte_cap: usize) -> Self {
+        Self {
+            frames: Default::default(),
+            by_arrival: Default::default(),
+            bytes: 0,
+            byte_cap,
+            arrivals: 0,
+            evicted: Default::default(),
+            evicted_keys: Default::default(),
+            counts: HoldCounts::default(),
+            reported: None,
+        }
     }
 
-    /// Hold `data` under `key`. Past the bounds the shard's farthest frame
-    /// goes first, so an impostor numbered far ahead cannot push out the real
-    /// next frame, then the longest held of any shard.
-    fn insert(&mut self, key: HeldKey, data: Vec<u8>) {
-        if self.frames.contains_key(&key) {
+    /// The bytes a frame of `data` held under `key` takes.
+    fn cost(key: &HeldKey, data: &[u8]) -> usize {
+        data.len() + 2 * key.0.len() + MIRROR_HELD_ENTRY_OVERHEAD
+    }
+
+    fn remove(&mut self, key: &HeldKey) -> Option<Vec<u8>> {
+        let (arrival, data) = self.frames.remove(key)?;
+        self.by_arrival.remove(&arrival);
+        self.bytes -= Self::cost(key, &data);
+        Some(data)
+    }
+
+    /// Evict `key` for a bound, remembering it.
+    fn evict(&mut self, key: &HeldKey) {
+        if self.remove(key).is_none() {
             return;
         }
+        self.counts.evicted += 1;
+        if self.evicted_keys.insert(key.clone()) {
+            self.evicted.push_back(key.clone());
+        }
+        while self.evicted.len() > MIRROR_EVICTED_REMEMBERED {
+            if let Some(oldest) = self.evicted.pop_front() {
+                self.evicted_keys.remove(&oldest);
+            }
+        }
+    }
+
+    /// The held frame `number` of `filter` with output identity `identity`,
+    /// taken when it links to `child`. A frame a bound evicted is counted
+    /// lost.
+    fn take_parent(
+        &mut self,
+        filter: &[u8],
+        number: u64,
+        identity: [u8; 32],
+        child: &quil_types::proto::global::FrameHeader,
+    ) -> Option<(quil_types::proto::global::FrameHeader, Vec<u8>)> {
+        let key = (filter.to_vec(), number, identity);
+        let Some((_, data)) = self.frames.get(&key) else {
+            if self.evicted_keys.remove(&key) {
+                self.evicted.retain(|evicted| evicted != &key);
+                self.counts.lost += 1;
+            }
+            return None;
+        };
+        let parent =
+            <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data.as_slice())
+                .ok()
+                .and_then(|frame| frame.header)
+                .filter(|parent| {
+                    quil_engine::frame_validator::app_frame_links_to_child(parent, child)
+                })?;
+        let data = self.remove(&key)?;
+        self.counts.released += 1;
+        Some((parent, data))
+    }
+
+    /// Drop `filter`'s held frames numbered below `stale`.
+    fn prune_below(&mut self, filter: &[u8], stale: u64) {
+        let below: std::ops::Range<HeldKey> =
+            (filter.to_vec(), 0, [0; 32])..(filter.to_vec(), stale, [0; 32]);
+        let owed: Vec<HeldKey> = self
+            .frames
+            .range(below)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in owed {
+            if self.remove(&key).is_some() {
+                self.counts.pruned += 1;
+            }
+        }
+    }
+
+    /// Hold `data` under `key`, unless held already. Past the bounds go, in
+    /// turn: the longest held at its number; the shard's farthest frame, so
+    /// an impostor numbered ahead cannot push out the real next frame; the
+    /// longest held of any shard. Each step reads a bounded range or the
+    /// arrival index, never the whole map.
+    fn insert(&mut self, key: HeldKey, data: Vec<u8>) -> bool {
+        if self.frames.contains_key(&key) {
+            return false;
+        }
+        let number: std::ops::RangeInclusive<HeldKey> =
+            (key.0.clone(), key.1, [0; 32])..=(key.0.clone(), key.1, [0xff; 32]);
         let shard: std::ops::RangeInclusive<HeldKey> =
             (key.0.clone(), 0, [0; 32])..=(key.0.clone(), u64::MAX, [0xff; 32]);
         self.arrivals += 1;
-        self.bytes += data.len();
+        self.bytes += Self::cost(&key, &data);
+        self.by_arrival.insert(self.arrivals, key.clone());
         self.frames.insert(key, (self.arrivals, data));
-        while self.frames.range(shard.clone()).count() > MIRROR_HELD_PER_SHARD {
-            let Some(farthest) = self.frames.range(shard.clone()).next_back() else {
-                break;
-            };
-            let farthest = farthest.0.clone();
-            self.remove(&farthest);
-        }
-        while self.bytes > MIRROR_HELD_BYTES {
-            let Some(oldest) = self
+        self.counts.held += 1;
+        if self.frames.range(number.clone()).count() > MIRROR_HELD_PER_NUMBER {
+            let oldest = self
                 .frames
-                .iter()
+                .range(number)
                 .min_by_key(|(_, (arrival, _))| *arrival)
-                .map(|(key, _)| key.clone())
-            else {
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.evict(&oldest);
+            }
+        }
+        if self.frames.range(shard.clone()).count() > MIRROR_HELD_PER_SHARD {
+            let farthest = self
+                .frames
+                .range(shard)
+                .next_back()
+                .map(|(key, _)| key.clone());
+            if let Some(farthest) = farthest {
+                self.evict(&farthest);
+            }
+        }
+        while self.bytes > self.byte_cap {
+            let Some(oldest) = self.by_arrival.values().next().cloned() else {
                 break;
             };
-            self.remove(&oldest);
+            self.evict(&oldest);
         }
+        true
     }
 }
 
@@ -473,8 +699,9 @@ impl MirrorRefusals {
             scope = "peer",
             check = "frames that verify later are mirrored as they arrive; many refusals with \
                      a missing anchored GLOBAL frame mean this node's GLOBAL view lags; a \
-                     certificate refused or a missing certificate is a peer's forged or \
-                     unfinished frame",
+                     refused certificate, header or requests is a peer's forged frame (a frame \
+                     without a certificate that verifies otherwise is held for its certified \
+                     child, not refused)",
             "gossiped shard frames were not mirrored for serving: they did not verify (the \
              latest named)"
         );
@@ -698,11 +925,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     });
     // A node without an archive ingest (a cluster master) mirrors the shard
     // frames gossiped for shards no local engine runs, once they verify.
-    let shard_mirror = ShardMirror::new(shard_mirror_validator(
+    let gossip_mirror = shard_mirror(
         pr_for_recv.clone(),
         clock_store_recv.clone(),
         crdt_for_recv.clone(),
-    ));
+        Some(exec_mgr_for_recv.clone()),
+    );
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
     // certificate and VDF verified skips both checks on later copies.
@@ -2520,7 +2748,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             bm,
                                             &received.data,
                                             clock_store_recv.as_ref(),
-                                            &shard_mirror,
+                                            &gossip_mirror,
                                         ),
                                     }
                                 }
@@ -2612,6 +2840,11 @@ mod tests {
 
     impl Shard {
         fn new() -> Self {
+            Self::registered(true)
+        }
+
+        /// The shard, named in the registry's shard summaries or not.
+        fn registered(named: bool) -> Self {
             use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
             use quil_types::crypto::Signer as _;
             quil_crypto::init();
@@ -2663,7 +2896,14 @@ mod tests {
                 Arc::new(quil_hypergraph::testing::MemStore::new()),
                 Arc::new(quil_types::crypto::NoopInclusionProver),
             ));
-            let mirror = ShardMirror::new(shard_mirror_validator(registry, clock.clone(), crdt));
+            if named {
+                registry.set_summaries(vec![quil_types::consensus::ProverShardSummary {
+                    filter: filter.clone(),
+                    status_counts: Default::default(),
+                    total_size: 0,
+                }]);
+            }
+            let mirror = shard_mirror(registry, clock.clone(), crdt, None);
             Self {
                 signer,
                 filter,
@@ -2685,6 +2925,7 @@ mod tests {
                     global_frame_number: self.global_frame,
                     timestamp: 1,
                     state_roots: vec![vec![0; 32]; 4],
+                    requests_root: vec![0; 32],
                     prover: vec![7; 32],
                     output: vec![number as u8; 516],
                     ..Default::default()
@@ -2995,11 +3236,6 @@ mod tests {
                 .ok()
         };
         shard.hear(&topic, &shard.certified(6));
-        let selector = |frame: &quil_types::proto::global::AppShardFrame| {
-            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
-                .unwrap()
-                .to_vec()
-        };
         let parent = shard.notarized(7, selector(&shard.certified(6)));
         let impostor = shard.notarized(7, vec![1; 32]);
         assert!(mirror_admits(&shard.mirror.validator, &parent).is_err());
@@ -3030,6 +3266,235 @@ mod tests {
         shard.hear(&topic, &orphan);
         assert_eq!(stored(11), None, "no certified child links to it");
         assert_eq!(shard.latest(), Some(10));
+    }
+
+    /// The certificate covers the header only: a copy whose carried requests
+    /// do not match the header's root is neither mirrored nor held, and so
+    /// does not keep out the genuine copy that follows.
+    #[test]
+    fn a_copy_whose_requests_do_not_match_its_header_is_not_mirrored() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let stored = |number| {
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, number, false)
+                .ok()
+        };
+        let tampered = |frame: &quil_types::proto::global::AppShardFrame| {
+            let mut frame = frame.clone();
+            frame.requests = vec![Default::default()];
+            frame
+        };
+        let genuine = shard.certified(6);
+        shard.hear(&topic, &tampered(&genuine));
+        assert_eq!(
+            stored(6),
+            None,
+            "BODY-UNBOUND: a certified header carrying requests its root does not commit to \
+             was mirrored"
+        );
+        shard.hear(&topic, &genuine);
+        assert_eq!(stored(6), Some(genuine.clone()));
+
+        let parent = shard.notarized(7, selector(&genuine));
+        assert!(
+            shard
+                .mirror
+                .offer(
+                    shard.clock.as_ref(),
+                    &tampered(&parent),
+                    &prost::Message::encode_to_vec(&tampered(&parent)),
+                )
+                .is_err(),
+            "BODY-UNBOUND: a frame without a certificate whose requests do not match was held"
+        );
+        shard.hear(&topic, &parent);
+        shard.hear(&topic, &shard.certified_child(&parent));
+        assert_eq!(stored(7), Some(parent), "the genuine copy is mirrored");
+    }
+
+    /// A frame without a certificate is held only for a shard the prover
+    /// registry names, and only above the shard's stored head and within
+    /// [`MIRROR_HOLD_WINDOW`] of it; at or below the head it is mirrored only
+    /// when its stored child links to it.
+    #[test]
+    fn a_frame_is_held_only_for_a_registered_shard_near_its_head() {
+        let offer = |shard: &Shard, frame: &quil_types::proto::global::AppShardFrame| {
+            shard.mirror.offer(
+                shard.clock.as_ref(),
+                frame,
+                &prost::Message::encode_to_vec(frame),
+            )
+        };
+        let unnamed = Shard::registered(false);
+        let frame = unnamed.notarized(7, vec![1; 32]);
+        assert!(
+            offer(&unnamed, &frame).is_err(),
+            "HOLD-BOUND: a frame of a shard the registry does not name was held"
+        );
+
+        let shard = Shard::new();
+        let topic = shard.topic();
+        shard.hear(&topic, &shard.certified(6));
+        let far = shard.notarized(6 + MIRROR_HOLD_WINDOW + 1, vec![1; 32]);
+        assert!(
+            offer(&shard, &far).is_err(),
+            "HOLD-BOUND: a frame past the window above the stored head was held"
+        );
+        assert!(
+            offer(&shard, &shard.notarized(6, vec![1; 32])).is_err(),
+            "HOLD-BOUND: a frame at the stored head was held"
+        );
+        assert_eq!(
+            offer(
+                &shard,
+                &shard.notarized(6 + MIRROR_HOLD_WINDOW, vec![1; 32])
+            ),
+            Ok(Mirrored::Held)
+        );
+    }
+
+    /// Two frames without a certificate in a row are mirrored by the
+    /// certified frame after them, whichever of them arrived first.
+    #[test]
+    fn a_certified_frame_mirrors_two_held_ancestors() {
+        use quil_types::store::ClockStore as _;
+        for parent_first in [true, false] {
+            let shard = Shard::new();
+            let topic = shard.topic();
+            let stored = |number| {
+                shard
+                    .clock
+                    .get_shard_clock_frame(&shard.filter, number, false)
+                    .ok()
+            };
+            shard.hear(&topic, &shard.certified(6));
+            let first = shard.notarized(7, selector(&shard.certified(6)));
+            let second = shard.notarized(8, selector(&first));
+            if parent_first {
+                shard.hear(&topic, &first);
+                shard.hear(&topic, &second);
+            } else {
+                shard.hear(&topic, &second);
+                shard.hear(&topic, &first);
+            }
+            assert_eq!((stored(7), stored(8)), (None, None));
+            shard.hear(&topic, &shard.certified_child(&second));
+            assert_eq!(
+                (stored(7), stored(8), shard.latest()),
+                (Some(first), Some(second), Some(9)),
+                "both held ancestors are mirrored (parent first: {parent_first})"
+            );
+        }
+    }
+
+    /// The hold's bounds: a duplicate is held once; past the per-number bound
+    /// the longest held there goes; past the per-shard bound the farthest
+    /// frame; past the byte bound the longest held of any shard; pruning
+    /// drops what lies below; the byte count returns to zero; an evicted frame
+    /// a child names counts as lost.
+    #[test]
+    fn held_frames_evict_in_order_and_keep_their_byte_count() {
+        let key =
+            |filter: u8, number: u64, identity: u8| (vec![filter; 35], number, [identity; 32]);
+        let child = quil_types::proto::global::FrameHeader::default();
+        let mut held = HeldFrames::new(usize::MAX);
+        assert!(held.insert(key(1, 5, 1), vec![0; 10]));
+        let bytes = held.bytes;
+        assert!(
+            !held.insert(key(1, 5, 1), vec![0; 10]),
+            "a duplicate is held once"
+        );
+        assert_eq!(held.bytes, bytes);
+        for identity in 2..=(MIRROR_HELD_PER_NUMBER as u8 + 1) {
+            held.insert(key(1, 5, identity), vec![0; 10]);
+        }
+        assert!(
+            !held.frames.contains_key(&key(1, 5, 1)),
+            "the longest held at its number goes"
+        );
+        assert_eq!(held.counts.evicted, 1);
+
+        let mut held = HeldFrames::new(usize::MAX);
+        for number in 1..=MIRROR_HELD_PER_SHARD as u64 + 1 {
+            held.insert(key(1, number, 0), vec![0; 10]);
+        }
+        assert!(
+            held.frames.contains_key(&key(1, 1, 0))
+                && !held
+                    .frames
+                    .contains_key(&key(1, MIRROR_HELD_PER_SHARD as u64 + 1, 0)),
+            "EVICTION-ORDER: past the per-shard bound the farthest frame goes, not the next"
+        );
+        assert_eq!(
+            held.take_parent(&[1; 35], MIRROR_HELD_PER_SHARD as u64 + 1, [0; 32], &child),
+            None
+        );
+        assert_eq!(
+            held.counts.lost, 1,
+            "an evicted frame a child names is lost"
+        );
+        held.prune_below(&[1; 35], 11);
+        assert_eq!(held.frames.len(), MIRROR_HELD_PER_SHARD - 10);
+        assert_eq!(held.counts.pruned, 10);
+
+        let one = HeldFrames::cost(&key(1, 1, 0), &[0; 1000]);
+        let mut held = HeldFrames::new(3 * one);
+        for filter in 1..=4 {
+            held.insert(key(filter, 1, 0), vec![0; 1000]);
+        }
+        assert!(
+            !held.frames.contains_key(&key(1, 1, 0)) && held.frames.len() == 3,
+            "past the byte bound the longest held of any shard goes"
+        );
+        assert_eq!(held.bytes, 3 * one);
+        for filter in 2..=4 {
+            held.remove(&key(filter, 1, 0));
+        }
+        assert_eq!((held.bytes, held.by_arrival.len()), (0, 0));
+    }
+
+    /// The hold's counts are logged at once, then at most once per interval,
+    /// and only when something happened.
+    #[test]
+    fn held_frames_are_summarized_per_interval() {
+        let shard = Shard::new();
+        let offer = |frame: &quil_types::proto::global::AppShardFrame| {
+            shard.mirror.offer(
+                shard.clock.as_ref(),
+                frame,
+                &prost::Message::encode_to_vec(frame),
+            )
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(shard.mirror.summarize(start), None, "nothing happened");
+        assert_eq!(offer(&shard.certified(6)), Ok(Mirrored::Stored));
+        assert_eq!(
+            offer(&shard.notarized(7, selector(&shard.certified(6)))),
+            Ok(Mirrored::Held)
+        );
+        assert_eq!(
+            shard.mirror.summarize(start).map(|counts| counts.held),
+            Some(1)
+        );
+        assert_eq!(offer(&shard.notarized(8, vec![1; 32])), Ok(Mirrored::Held));
+        assert_eq!(shard.mirror.summarize(start), None);
+        assert_eq!(
+            shard
+                .mirror
+                .summarize(start + MIRROR_HOLD_SUMMARY)
+                .map(|counts| counts.held),
+            Some(1)
+        );
+    }
+
+    /// The output identity a child names its parent by.
+    fn selector(frame: &quil_types::proto::global::AppShardFrame) -> Vec<u8> {
+        quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
+            .unwrap()
+            .to_vec()
     }
 
     /// Refusals log one line at once, then at most one per interval with the
