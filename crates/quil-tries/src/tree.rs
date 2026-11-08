@@ -67,6 +67,21 @@ impl VectorCommitmentTree {
         h.finalize().to_vec()
     }
 
+    /// The first leaf, in tree order, that [`Self::get_leaf`] does not find
+    /// at its own key. Neither a tree's commitment (it leaves out the root's
+    /// prefix) nor its [`Self::content_digest`] (the leaves alone) binds the
+    /// shape a reader navigates by key, so a tree read from untrusted bytes
+    /// holds what they bind only when this is `None`.
+    pub fn unreachable_leaf(&self) -> Option<&LeafNode> {
+        let mut leaves = Vec::new();
+        self.root.as_ref()?.collect_leaves(&mut leaves);
+        leaves.into_iter().find(|leaf| {
+            !self
+                .get_leaf(&leaf.key)
+                .is_some_and(|found| std::ptr::eq(found, *leaf))
+        })
+    }
+
     /// Whether any leaf carries a value its commitment does not bind.
     pub fn has_unbound_values(&self) -> bool {
         self.root

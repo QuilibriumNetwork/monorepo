@@ -346,8 +346,9 @@ const ENCRYPTED_FIELD_KEY_LEN: usize = 8;
 /// to the target the node checks here. Each class that legitimately carries
 /// one has such a relation:
 /// - a sealed sub-tree (a metadata vertex's seals, a token's configuration):
-///   the target is the content digest of the tree the value holds, so
-///   another value would need a SHA-512 second preimage;
+///   the target is the content digest of the tree the value holds, and its
+///   reader finds each of its leaves by key, so another value read as
+///   another configuration would need a SHA-512 second preimage;
 /// - a confidential field at an index key: the value leads with the target as
 ///   its commitment, which its reader checks the opened plaintext against
 ///   (a hash of salt and plaintext). The ciphertext is not bound, as it is not
@@ -365,8 +366,10 @@ fn leaf_value_bound(leaf: &quil_tries::LeafNode) -> bool {
     if target.is_empty() {
         return true;
     }
-    let sealed = quil_tries::deserialize_go_tree(value)
-        .is_ok_and(|root| quil_tries::VectorCommitmentTree { root }.content_digest() == target);
+    let sealed = quil_tries::deserialize_go_tree(value).is_ok_and(|root| {
+        let tree = quil_tries::VectorCommitmentTree { root };
+        tree.content_digest() == target && tree.unreachable_leaf().is_none()
+    });
     if sealed {
         return true;
     }
@@ -384,16 +387,34 @@ fn leaf_value_bound(leaf: &quil_tries::LeafNode) -> bool {
 }
 
 /// The key of the first field of a synced vertex blob whose value the
-/// authenticated leaf does not bind ([`leaf_value_bound`]), if any. A blob
-/// that is not a field tree is committed as raw bytes, so binds them.
+/// authenticated leaf does not bind ([`leaf_value_bound`]), or that a
+/// reader does not find at its key, if any: the commitment over the field
+/// tree leaves out its root's prefix, so a prefix the keys do not share
+/// would hide every field. A blob that is not a field tree is committed as
+/// raw bytes, so binds them.
 pub fn sync_blob_unbound_field(blob: &[u8]) -> Option<Vec<u8>> {
     let root = quil_tries::deserialize_go_tree(blob).ok().flatten()?;
+    let tree = quil_tries::VectorCommitmentTree { root: Some(root) };
+    if let Some(leaf) = tree.unreachable_leaf() {
+        return Some(leaf.key.clone());
+    }
     let mut leaves = Vec::new();
-    root.collect_leaves(&mut leaves);
+    tree.root.as_ref()?.collect_leaves(&mut leaves);
     leaves
         .into_iter()
         .find(|leaf| !leaf_value_bound(leaf))
         .map(|leaf| leaf.key.clone())
+}
+
+/// The field ([`sync_blob_unbound_field`]) for which a sync refuses `blob`
+/// at phase `phase_idx`, once the vertex value binding is scheduled. Only
+/// vertex adds hold field trees their readers read; other phases' blobs
+/// (tombstones, hyperedge atoms) are read as raw bytes.
+pub fn sync_blob_refused_field(phase_idx: usize, blob: &[u8]) -> Option<Vec<u8>> {
+    if phase_idx != 0 || !quil_types::consensus::vertex_value_binding_scheduled() {
+        return None;
+    }
+    sync_blob_unbound_field(blob)
 }
 
 /// Marks an application phase whose confinement commit still needs its
@@ -4070,17 +4091,16 @@ impl HypergraphCrdt {
                 ));
             }
             // On every shard, a field behind a `hash_target` installs only
-            // with the value its target binds: the leaf authenticates the
-            // target, and the node reads the value.
-            if scheduled {
-                if let Some(field) = sync_blob_unbound_field(blob) {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "synced vertex {} carries field {} whose value its commitment does \
-                         not bind",
-                        hex::encode(key),
-                        hex::encode(field)
-                    )));
-                }
+            // with the value its target binds, and every field where its
+            // reader finds it: the leaf authenticates the target and the
+            // tree's slots, and the node reads the value by key.
+            if let Some(field) = sync_blob_refused_field(plan.phase_idx, blob) {
+                return Err(QuilError::InvalidArgument(format!(
+                    "synced vertex {} carries field {} whose value its commitment does not \
+                     bind",
+                    hex::encode(key),
+                    hex::encode(field)
+                )));
             }
         }
         let _forest_guard = self.forest_write_lock.lock().unwrap();
@@ -7635,6 +7655,153 @@ mod sync_value_binding_tests {
                 blob(&[2 << 2], &legacy_verenc(&statement), &statement),
             ),
         ]);
+    }
+
+    /// `serialized` with every stored commitment and size dropped (a reader
+    /// recomputes or ignores them) and a root prefix none of its keys share,
+    /// padded back to its length: the same leaves in the same order, none
+    /// of them where a reader looks for it by key.
+    fn unnavigable(serialized: &[u8]) -> Vec<u8> {
+        fn strip(node: &mut quil_tries::VectorCommitmentNode) {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) => {
+                    leaf.commitment.clear();
+                    leaf.size = BigInt::from(0);
+                }
+                quil_tries::VectorCommitmentNode::Branch(branch) => {
+                    branch.commitment.clear();
+                    branch.size = BigInt::from(0);
+                    for child in branch.children.iter_mut().flatten() {
+                        strip(child);
+                    }
+                }
+            }
+        }
+        let mut root = quil_tries::deserialize_go_tree(serialized)
+            .unwrap()
+            .unwrap();
+        strip(&mut root);
+        let quil_tries::VectorCommitmentNode::Branch(branch) = &mut root else {
+            panic!("precondition: a tree of several fields");
+        };
+        branch.prefix = vec![63];
+        let mut forged = quil_tries::serialize_go_tree(Some(&root)).unwrap();
+        assert!(
+            forged.len() <= serialized.len(),
+            "precondition: room in the dropped fields"
+        );
+        forged.resize(serialized.len(), 0);
+        forged
+    }
+
+    /// Install `honest`, then refuse `forged` served for the same
+    /// authenticated leaf, as `case`, on an application shard.
+    fn refused_for_the_honest_leaf(case: &str, honest: &[u8], forged: Vec<u8>) {
+        assert_eq!(
+            quil_tries::vertex_leaf_value(&forged).unwrap(),
+            quil_tries::vertex_leaf_value(honest).unwrap(),
+            "precondition: {case} keeps the authenticated leaf"
+        );
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        let synced = sync_into([0x2a; 32], [1; 32], honest);
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+        assert!(synced.is_ok(), "the honest blob installs: {synced:?}");
+        refused_on_an_app_shard(vec![(case, forged)]);
+    }
+
+    /// A sealed sub-tree's target: its content digest.
+    fn seal_digest(tree: &quil_tries::VectorCommitmentTree) -> Vec<u8> {
+        tree.content_digest()
+    }
+
+    /// Sealed shape: A sealed sub-tree's content digest binds its
+    /// leaves in tree order, not the shape its reader navigates by key. A
+    /// source keeps a token configuration's leaves and their order under a
+    /// root prefix none of its keys share: the digest and the authenticated
+    /// leaf still match, and the node reads a configuration with no field
+    /// (each one its default). The sync must refuse it.
+    #[test]
+    fn an_app_shard_sync_refuses_a_sealed_sub_tree_its_reader_cannot_navigate() {
+        let mut sub = quil_tries::VectorCommitmentTree::new();
+        for (i, field) in [&b"mint"[..], b"units", b"supply", b"name", b"symbol"]
+            .into_iter()
+            .enumerate()
+        {
+            sub.insert(&[(i as u8) << 2], field, &[], &BigInt::from(field.len()))
+                .unwrap();
+        }
+        let honest = quil_tries::serialize_go_tree(sub.root.as_ref()).unwrap();
+        let forged = unnavigable(&honest);
+        let read = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(&forged).unwrap(),
+        };
+        assert_eq!(seal_digest(&read), seal_digest(&sub));
+        assert_eq!(
+            read.get(&[2 << 2]),
+            None,
+            "precondition: the field is hidden"
+        );
+        let digest = seal_digest(&sub);
+        refused_for_the_honest_leaf(
+            "a sealed sub-tree its reader cannot navigate",
+            &blob(&[16 << 2], &honest, &digest),
+            blob(&[16 << 2], &forged, &digest),
+        );
+    }
+
+    /// Vertex shape: The vertex commitment binds each field's key and
+    /// slot and each inner branch's prefix, but not the root's own prefix. A
+    /// source serves a coin's fields under a root prefix none of its keys
+    /// share: the authenticated leaf still matches, and the node finds no
+    /// field of the coin (it reads no coin there). The sync must refuse it.
+    #[test]
+    fn an_app_shard_sync_refuses_a_vertex_its_reader_cannot_navigate() {
+        let mut coin = quil_tries::VectorCommitmentTree::new();
+        // A coin's frame, owner, commitment and position keys.
+        let fields: [(u8, &[u8]); 4] = [
+            (0, &[1; 8]),
+            (1 << 2, &[2; 32]),
+            (2 << 2, &[3; 56]),
+            (4 << 2, &[4; 8]),
+        ];
+        for (key, value) in fields {
+            coin.insert(&[key], value, &[], &BigInt::from(value.len()))
+                .unwrap();
+        }
+        let honest = quil_tries::serialize_go_tree(coin.root.as_ref()).unwrap();
+        let forged = unnavigable(&honest);
+        let read = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(&forged).unwrap(),
+        };
+        assert_eq!(
+            read.get(&[4 << 2]),
+            None,
+            "precondition: the field is hidden"
+        );
+        refused_for_the_honest_leaf("a vertex its reader cannot navigate", &honest, forged);
+    }
+
+    /// Only vertex adds hold field trees their readers read, so a sync
+    /// checks the fields of those alone, once the binding is scheduled.
+    #[test]
+    fn a_sync_checks_the_fields_of_vertex_adds_only() {
+        let unbound = blob(&[4 << 2], &[9; 8], &[3; 8]);
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(u64::MAX));
+        assert_eq!(
+            sync_blob_refused_field(0, &unbound),
+            None,
+            "inert until scheduled"
+        );
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        assert_eq!(sync_blob_refused_field(0, &unbound), Some(vec![4 << 2]));
+        for phase in 1..4 {
+            assert_eq!(
+                sync_blob_refused_field(phase, &unbound),
+                None,
+                "phase {phase}"
+            );
+        }
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
     }
 }
 
