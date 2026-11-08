@@ -495,6 +495,9 @@ pub fn build_leaf_replica(
 /// alone ([`stable_replica_key`]), and a leaf keeps its labels across epochs.
 /// Each epoch's proofs stay bound to their epoch either way: the seal
 /// challenges, the opening indices and the epoch STARK's transcript hash it.
+/// Consensus-affecting: registrations commit to labels under this key, so
+/// its tags and layout are frozen (`mainnet_replica_keys_are_frozen`); a new
+/// rule needs an activation epoch.
 pub fn replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] {
     if quil_types::consensus::stable_replica_keys_at(epoch) {
         stable_replica_key(member_id, shard_id)
@@ -626,6 +629,42 @@ mod tests {
         assert_ne!(stable, stable_replica_key(b"member0", b"shardB"));
         for epoch in 0..4_000 {
             assert_ne!(stable, epoch_replica_key(b"member0", b"shardA", epoch));
+        }
+        set_stable_replica_key_epoch_for_thread(None);
+    }
+
+    /// Mainnet's replica keys, frozen. A registration's column commitment is
+    /// its leaf's labelling under this key, so a build that derives another
+    /// key cannot seal what an older build registered, and archives on the
+    /// other rule refuse its seals: a tag change merged without an
+    /// activation epoch cost every prover upgrading across it a sealed epoch
+    /// (mainnet, 2026-11-08). Changing a tag, the hashed layout or the
+    /// stable replica key epoch needs a new key rule from a named activation
+    /// epoch, with these vectors kept for the epochs before it.
+    #[test]
+    fn mainnet_replica_keys_are_frozen() {
+        use quil_types::consensus::{
+            set_stable_replica_key_epoch_for_thread, MAINNET_STABLE_REPLICA_KEY_EPOCH,
+        };
+        assert_eq!(
+            MAINNET_STABLE_REPLICA_KEY_EPOCH,
+            Some(1429),
+            "frozen_key_epoch"
+        );
+        set_stable_replica_key_epoch_for_thread(MAINNET_STABLE_REPLICA_KEY_EPOCH);
+        let (member, leaf) = ([0x11u8; 32], [0x22u8; 35]);
+        let key = |epoch| hex::encode(replica_key(&member, &leaf, epoch));
+        assert_eq!(
+            key(1428),
+            "62c3641820ffba3e4e73b51338391cb6255d8ee0262a207dcd121b9b18f17d8a",
+            "frozen_epoch_key"
+        );
+        for epoch in [1429, 1433, 1467, 2000] {
+            assert_eq!(
+                key(epoch),
+                "067335536c3732d68b3188198bc1964704e302ac0026f8dacd34e92bd87c478b",
+                "frozen_stable_key at epoch {epoch}"
+            );
         }
         set_stable_replica_key_epoch_for_thread(None);
     }

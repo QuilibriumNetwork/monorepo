@@ -28,10 +28,12 @@
 //! GLOBAL withholds a member's storage share (before epoch 1342: kicks it)
 //! for roots it committed and never proved by the settlement window's end,
 //! so a settlement waits for no seal and no collection longer than its first
-//! attempt. A worker prepares a
-//! seat's settlement before its seal and keeps it ([`prepare_reusing`]); a
-//! retry sends the settlement alone, prepared apart from the seal, and near
-//! the window's end ([`settle_closing_frames`]) the first attempt does too.
+//! attempt. A worker prepares a seat's settlement and its seal in jobs of
+//! their own on every attempt ([`part_jobs`]): a seal relabelling, or failing
+//! after it, never holds the settlement's job. The node joins the halves it
+//! collected together into one part ([`join_halves`]). A retry sends the
+//! settlement alone, and near the window's end ([`settle_closing_frames`])
+//! the first attempt does too.
 //! The node proves a settlement sent alone at once, beside any collection
 //! waiting for its seat, and sends each seat's settlement to GLOBAL once
 //! ([`claim_settlements`]): GLOBAL refuses a proof whole when one of its
@@ -641,6 +643,122 @@ pub fn forget_prepared(member: &[u8; 32], filter: &[u8], epoch: u64) {
     }
 }
 
+/// One job preparing half of a seat's part ([`part_jobs`]): the half it
+/// prepares, and whether the node's collection waits for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartJob {
+    pub seals: bool,
+    pub settles: bool,
+    /// Announced to the node on the first attempt, so the member's
+    /// collection waits for it (at most [`max_wait_secs`]); a settlement sent
+    /// alone is proved at once instead.
+    pub announced: bool,
+}
+
+/// The jobs preparing a seat's part, settlement first: each half in a job of
+/// its own, on every attempt. A seal relabels its leaves (about an hour per
+/// GiB) and can fail only after that: a leaf labelled under another replica
+/// key fails at its column commitment after a full relabelling (mainnet,
+/// 2026-11-08). A settlement prepared in the seal's job waited for it, past
+/// its window's end, and GLOBAL withheld the member's held storage share.
+/// `settle_alone`: a retry, or near the window's end, sends the settlement
+/// alone, proved at once.
+pub fn part_jobs(seals: bool, settles: bool, settle_alone: bool) -> Vec<PartJob> {
+    let settle = settles.then_some(PartJob {
+        seals: false,
+        settles: true,
+        announced: !settle_alone,
+    });
+    let seal = seals.then_some(PartJob {
+        seals: true,
+        settles: false,
+        announced: true,
+    });
+    settle.into_iter().chain(seal).collect()
+}
+
+/// A registration whose seal this process cannot prove: the member, the
+/// shard, the epoch settled beside it (it seals `epoch + 2`), the frame it
+/// was registered at and its leaves.
+type UnprovableSeal = ([u8; 32], Vec<u8>, u64, u64, Vec<Vec<u32>>);
+
+fn unprovable_seals() -> &'static Mutex<HashSet<UnprovableSeal>> {
+    static UNPROVABLE: OnceLock<Mutex<HashSet<UnprovableSeal>>> = OnceLock::new();
+    UNPROVABLE.get_or_init(Default::default)
+}
+
+/// Whether a seal failed for good: the registered column commitment is not
+/// this build's labelling of the leaf
+/// ([`quil_crypto::storage_proof::COLUMNS_NOT_REGISTERED`]). The columns
+/// depend on the replica key, the leaf's size and the SDR parameters alone,
+/// so every later attempt relabels the leaf to fail the same way.
+pub fn seal_failed_for_good(error: &str) -> bool {
+    error.contains(quil_crypto::storage_proof::COLUMNS_NOT_REGISTERED)
+}
+
+/// Note that `member`'s registration on `filter` for `epoch + 2`, made at
+/// frame `registered_at` with `leaves`, cannot be sealed by this process
+/// ([`seal_failed_for_good`]); true the first time.
+pub fn note_unprovable_seal(
+    member: &[u8; 32],
+    filter: &[u8],
+    epoch: u64,
+    registered_at: u64,
+    leaves: &[Vec<u32>],
+) -> bool {
+    let Ok(mut unprovable) = unprovable_seals().lock() else {
+        return false;
+    };
+    unprovable.retain(|(_, _, e, _, _)| e.saturating_add(2) >= epoch);
+    unprovable.insert((
+        *member,
+        filter.to_vec(),
+        epoch,
+        registered_at,
+        leaves.to_vec(),
+    ))
+}
+
+/// Whether the registration was noted unprovable
+/// ([`note_unprovable_seal`]): its seal is not tried again.
+pub fn seal_unprovable(
+    member: &[u8; 32],
+    filter: &[u8],
+    epoch: u64,
+    registered_at: u64,
+    leaves: &[Vec<u32>],
+) -> bool {
+    unprovable_seals().lock().is_ok_and(|unprovable| {
+        unprovable.contains(&(
+            *member,
+            filter.to_vec(),
+            epoch,
+            registered_at,
+            leaves.to_vec(),
+        ))
+    })
+}
+
+/// What GLOBAL does with a seat's issuance in `seal_epoch` when its
+/// registration for that epoch is not sealed, for the warn naming a failed
+/// seal. From the unsealed issuance epoch (mainnet 1321) and before the
+/// sealed storage epoch (mainnet 1467) an unsealed participant is paid its
+/// share at once, so nothing is withheld; from the sealed storage epoch an
+/// unsealed seat is not eligible for its committees.
+pub fn unsealed_seat_outcome(seal_epoch: u64) -> &'static str {
+    use quil_types::consensus::{sealed_storage_required, unsealed_issuance_epoch};
+    if sealed_storage_required(seal_epoch) {
+        "from the sealed storage epoch a seat without a sealed registration sits out its \
+         committees in that epoch and earns nothing there"
+    } else if seal_epoch >= unsealed_issuance_epoch() {
+        "before the sealed storage epoch GLOBAL pays an unsealed participant its issuance \
+         share at once: nothing is withheld for the missing seal"
+    } else {
+        "before the unsealed issuance epoch GLOBAL issues no share to a participant without \
+         a sealed registration"
+    }
+}
+
 /// A seat's settlement: its member, shard and the epoch it settles.
 type SettlementKey = ([u8; 32], Vec<u8>, u64);
 
@@ -1094,6 +1212,43 @@ pub fn deliver(message: SeatMessage, publish: Publish) {
     }
 }
 
+/// `parts` with each seat's seal and settlement, prepared in jobs of their
+/// own ([`part_jobs`]) and collected together, joined into one part
+/// ([`PreparedSeat::join`]) where the first of them was: a proof lists each
+/// shard once, so apart they would take a proof each. A part sent alone
+/// (`solo`) is never joined.
+fn join_halves(parts: Vec<PreparedSeat>) -> Vec<PreparedSeat> {
+    let mut out: Vec<PreparedSeat> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let partner = (!part.solo && part.part.seals != part.part.settles)
+            .then(|| {
+                out.iter().position(|held| {
+                    !held.solo
+                        && held.member == part.member
+                        && held.part.shard_filter == part.part.shard_filter
+                        && held.part.epoch == part.part.epoch
+                        && held.part.seals == part.part.settles
+                        && held.part.settles == part.part.seals
+                })
+            })
+            .flatten();
+        let Some(at) = partner else {
+            out.push(part);
+            continue;
+        };
+        let held = out.remove(at);
+        let (seal, settle) = if held.part.seals {
+            (held, part)
+        } else {
+            (part, held)
+        };
+        if let Some(joined) = PreparedSeat::join(Some(seal), Some(settle)) {
+            out.insert(at, joined);
+        }
+    }
+    out
+}
+
 /// Wait for `member`'s collection to come due, then prove it.
 fn watch(member: [u8; 32]) {
     let (collect, max_wait) = (
@@ -1133,7 +1288,7 @@ fn watch(member: [u8; 32]) {
         if collection.parts.is_empty() {
             return;
         }
-        for chunk in chunks(collection.parts, chunk_leaves(), chunk_bytes()) {
+        for chunk in chunks(join_halves(collection.parts), chunk_leaves(), chunk_bytes()) {
             prove_and_publish(chunk, collection.publish.clone());
         }
         return;
@@ -2021,5 +2176,167 @@ mod tests {
         assert_eq!(settlements_in(&proof.to_canonical_bytes()), vec![key]);
         assert!(settlements_in(&[0, 0, 3, 0x24, 1]).is_empty());
         assert!(settlements_in(b"a frame header").is_empty());
+    }
+
+    /// A seat's settlement is prepared in a job of its own on every attempt,
+    /// first, never in its seal's: a seal that relabels its leaves for an hour,
+    /// or fails after relabelling (a leaf labelled under another replica key;
+    /// mainnet, 2026-11-08), held the settlement past its window's end, and
+    /// GLOBAL withheld the member's held storage share.
+    #[test]
+    fn a_settlement_is_never_prepared_in_its_seals_job() {
+        let job = |seals, settles, announced| PartJob {
+            seals,
+            settles,
+            announced,
+        };
+        assert_eq!(
+            part_jobs(true, true, false),
+            vec![job(false, true, true), job(true, false, true)],
+            "settlement_in_seal_job on a first attempt"
+        );
+        assert_eq!(
+            part_jobs(true, true, true),
+            vec![job(false, true, false), job(true, false, true)],
+            "settlement_in_seal_job sent alone"
+        );
+        for settle_alone in [false, true] {
+            assert_eq!(
+                part_jobs(false, true, settle_alone),
+                vec![job(false, true, !settle_alone)]
+            );
+            assert_eq!(
+                part_jobs(true, false, settle_alone),
+                vec![job(true, false, true)]
+            );
+            assert!(part_jobs(false, false, settle_alone).is_empty());
+        }
+    }
+
+    /// The halves of a seat prepared apart and collected together are proved
+    /// as one part, as when they were prepared together: a proof lists each
+    /// shard once, so apart they would take a proof each. A half sent alone
+    /// is not joined, and nor are halves of different shards.
+    #[test]
+    fn a_seats_halves_collected_together_are_proved_as_one_part() {
+        let halves = |shard| {
+            let (seal, settle) = sealing_and_settling(shard).halves();
+            (seal.unwrap(), settle.unwrap())
+        };
+        let (seal_a, settle_a) = halves(0x71);
+        let (seal_b, _) = halves(0x72);
+        let (seal_c, mut settle_c) = halves(0x73);
+        settle_c.solo = true;
+        let joined = join_halves(vec![
+            settle_a,
+            seal_b.clone(),
+            settle_c.clone(),
+            seal_a,
+            seal_c.clone(),
+        ]);
+        let keys: Vec<(u8, bool, bool)> = joined
+            .iter()
+            .map(|part| {
+                (
+                    part.part.shard_filter[0],
+                    part.part.seals,
+                    part.part.settles,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (0x71, true, true),
+                (0x72, true, false),
+                (0x73, false, true),
+                (0x73, true, false)
+            ],
+            "halves_not_joined"
+        );
+        assert_eq!(joined[0].to_bytes(), sealing_and_settling(0x71).to_bytes());
+        assert_eq!(joined[1].to_bytes(), seal_b.to_bytes());
+        assert_eq!(joined[2].to_bytes(), settle_c.to_bytes());
+        assert_eq!(joined[3].to_bytes(), seal_c.to_bytes());
+    }
+
+    /// A seal that fails at its column commitment is final for its
+    /// registration: noted once, it is not tried again, while another
+    /// registration, member, shard or epoch is. Any other failure (a missing
+    /// replica, a stopped relabelling) is tried again.
+    #[test]
+    fn a_registration_whose_columns_are_another_labelling_is_not_sealed_again() {
+        let final_error =
+            QuilError::InvalidArgument(quil_crypto::storage_proof::COLUMNS_NOT_REGISTERED.into());
+        assert!(
+            seal_failed_for_good(&final_error.to_string()),
+            "columns_failure_not_final"
+        );
+        for passing in [
+            QuilError::ExecutionUnavailable("no stored replica of leaf 00 for epoch 7".into()),
+            QuilError::InvalidArgument(
+                "the kept column digests are not the registered column commitment".into(),
+            ),
+        ] {
+            assert!(!seal_failed_for_good(&passing.to_string()), "{passing}");
+        }
+        let (member, filter, epoch, at) = ([0x81; 32], vec![0x82; 32], 1431, 1_031_100);
+        let leaves = vec![vec![0, 1], vec![2]];
+        assert!(!seal_unprovable(&member, &filter, epoch, at, &leaves));
+        assert!(note_unprovable_seal(&member, &filter, epoch, at, &leaves));
+        assert!(
+            !note_unprovable_seal(&member, &filter, epoch, at, &leaves),
+            "noted twice"
+        );
+        assert!(
+            seal_unprovable(&member, &filter, epoch, at, &leaves),
+            "unprovable_seal_tried_again"
+        );
+        assert!(!seal_unprovable(&[0x83; 32], &filter, epoch, at, &leaves));
+        assert!(!seal_unprovable(&member, &[0x84; 32], epoch, at, &leaves));
+        assert!(!seal_unprovable(&member, &filter, epoch + 1, at, &leaves));
+        assert!(!seal_unprovable(&member, &filter, epoch, at + 1, &leaves));
+        assert!(!seal_unprovable(&member, &filter, epoch, at, &[vec![2]]));
+    }
+
+    /// The warn for a failed seal says what GLOBAL does with an unsealed
+    /// seat: from the unsealed issuance epoch (mainnet 1321) to the sealed
+    /// storage epoch (mainnet 1467) it pays the share at once, so nothing is
+    /// withheld; from the sealed storage epoch the seat sits out.
+    #[test]
+    fn a_failed_seal_names_what_global_does_with_an_unsealed_seat() {
+        use quil_types::consensus::{
+            set_persistent_storage_epoch_for_thread, set_sealed_storage_epoch_for_thread,
+            set_unsealed_issuance_epoch_for_thread,
+        };
+        set_unsealed_issuance_epoch_for_thread(Some(1321));
+        set_sealed_storage_epoch_for_thread(Some(1467));
+        set_persistent_storage_epoch_for_thread(Some(1467));
+        let outcomes: Vec<&str> = [1320, 1321, 1433, 1466, 1467, 1500]
+            .into_iter()
+            .map(unsealed_seat_outcome)
+            .collect();
+        set_unsealed_issuance_epoch_for_thread(None);
+        set_sealed_storage_epoch_for_thread(None);
+        set_persistent_storage_epoch_for_thread(None);
+        let paid = |outcome: &str| outcome.contains("pays an unsealed participant");
+        let sits_out = |outcome: &str| outcome.contains("sits out");
+        assert!(
+            !paid(outcomes[0]) && !sits_out(outcomes[0]),
+            "{}",
+            outcomes[0]
+        );
+        for outcome in &outcomes[1..4] {
+            assert!(
+                paid(outcome) && !sits_out(outcome),
+                "unsealed_outcome_wrong: {outcome}"
+            );
+        }
+        for outcome in &outcomes[4..] {
+            assert!(
+                sits_out(outcome) && !paid(outcome),
+                "unsealed_outcome_wrong: {outcome}"
+            );
+        }
     }
 }

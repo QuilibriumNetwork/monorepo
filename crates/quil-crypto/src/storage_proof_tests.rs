@@ -1325,3 +1325,40 @@ fn logarithmic_zero_commitment_matches_dense_padding() {
         }
     }
 }
+
+/// A leaf labelled under one replica key and sealed under another (a node
+/// that upgraded across a change of the key rule between its encode and its
+/// seal; mainnet, 2026-11-08) fails at its column commitment with
+/// [`COLUMNS_NOT_REGISTERED`], which a worker reads as final: the columns
+/// depend on the key alone, so relabelling again fails the same way. Kept
+/// columns that disagree fail otherwise: a damaged copy is not final.
+#[test]
+fn a_leaf_labelled_under_another_replica_key_fails_for_good_at_its_columns() {
+    use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
+    let m = member(1);
+    set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
+    let encoded = encode(&m, &data(200 * NODE_BYTES, 2));
+    set_stable_replica_key_epoch_for_thread(Some(EPOCH));
+    let stmt = statement(&m, &encoded, b"beacon");
+    let relabelled = prove_seal(&encoded.replica, &stmt, &params(), 16);
+    let current = encode(&m, &data(200 * NODE_BYTES, 2));
+    let sealed = prove_seal(
+        &current.replica,
+        &statement(&m, &current, b"beacon"),
+        &params(),
+        16,
+    );
+    let (kept, _) = Kept::label(encoded.n, &sdr::replica_key(&m, LEAF, EPOCH));
+    let opened = prove_seal_with_labels(&encoded.replica, &stmt, &params(), 16, &kept);
+    set_stable_replica_key_epoch_for_thread(None);
+    assert_eq!(
+        relabelled,
+        Err(COLUMNS_NOT_REGISTERED.to_string()),
+        "columns_not_final"
+    );
+    assert!(sealed.is_ok(), "the same leaf encoded under the key seals");
+    assert!(
+        opened.is_err_and(|error| error != COLUMNS_NOT_REGISTERED),
+        "kept_columns_final"
+    );
+}
