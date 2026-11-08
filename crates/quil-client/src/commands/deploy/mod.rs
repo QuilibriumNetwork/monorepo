@@ -175,6 +175,39 @@ impl DeployCtx {
         crate::rpc::connect_node_service(&self.connect_opts).await
     }
 
+    /// What an owner's update of `domain` signs over after its separator:
+    /// from the config replay frame, the digest of the application's metadata
+    /// vertex as the node holds it (`vertex` when already read); before it,
+    /// nothing. Within [`SIGNING_BINDING_MARGIN_FRAMES`] of the frame it
+    /// refuses, as nodes may judge the update either way.
+    pub(super) async fn update_binding(
+        &self,
+        client: &mut NodeServiceClient<Channel>,
+        domain: &[u8],
+        vertex: Option<&[u8]>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let from =
+            quil_execution::config_replay::init_config_replay_frame(self.node_config.p2p.network);
+        let head = client
+            .get_node_info(tonic::Request::new(
+                quil_types::proto::node::GetNodeInfoRequest::default(),
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
+            .into_inner()
+            .last_global_head_frame;
+        if !binds_update(head, from)? {
+            return Ok(None);
+        }
+        let vertex = match vertex {
+            Some(vertex) => vertex.to_vec(),
+            None => metadata_vertex(client, domain).await?,
+        };
+        quil_execution::config_replay::metadata_vertex_binding(&vertex)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("could not read the application's metadata: {e}"))
+    }
+
     /// Read+write+owner public keys for a deploy config.
     pub fn deploy_keys(&self) -> anyhow::Result<DeployKeys> {
         let read = self
@@ -293,8 +326,73 @@ pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> 
     }
 }
 
+/// The fastest GLOBAL frame time, in seconds.
+const FASTEST_FRAME_SECS: u64 = 10;
+
+/// Frames on each side of the config replay frame in which an update is not
+/// signed: a paid update executes only once its settlement is certified, up
+/// to [`crate::send::PAID_SUBMISSION_WAIT`] after it was signed, and an
+/// application shard judges a frame by its GLOBAL anchor, which trails the
+/// head. Twice the wait at the fastest frame time covers both (180 frames).
+const SIGNING_BINDING_MARGIN_FRAMES: u64 =
+    2 * crate::send::PAID_SUBMISSION_WAIT.as_secs() / FASTEST_FRAME_SECS;
+
+/// Whether an update signed at GLOBAL head `head` binds the metadata vertex
+/// it replaces, for config replay frame `from`; an error within
+/// [`SIGNING_BINDING_MARGIN_FRAMES`] of the frame.
+fn binds_update(head: u64, from: u64) -> anyhow::Result<bool> {
+    if from == 0 || head >= from.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) {
+        return Ok(true);
+    }
+    if head.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) < from {
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "updates sign the state they replace from GLOBAL frame {from}, and the head is {head}: \
+         an update signed now may be judged either way, so nothing was sent; retry after \
+         frame {}",
+        from.saturating_add(SIGNING_BINDING_MARGIN_FRAMES)
+    )
+}
+
+/// The metadata vertex of the application at `domain`, as the node holds it.
+pub(super) async fn metadata_vertex(
+    client: &mut NodeServiceClient<Channel>,
+    domain: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut address = domain.to_vec();
+    address.extend_from_slice(&quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS);
+    let response = client
+        .get_vertex_data(tonic::Request::new(
+            quil_types::proto::node::GetVertexDataRequest {
+                address,
+                full_data: true,
+            },
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("could not read the application's metadata: {e}"))?
+        .into_inner();
+    if response.present == Some(false) || response.raw_data.is_empty() {
+        anyhow::bail!("no application deployed at {}", hex::encode(domain));
+    }
+    Ok(response.raw_data)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_update_near_the_config_replay_frame_is_not_signed() {
+        use super::{binds_update, SIGNING_BINDING_MARGIN_FRAMES as MARGIN};
+        assert_eq!(MARGIN, 180);
+        let from = 1_000;
+        assert!(!binds_update(from - MARGIN - 1, from).unwrap());
+        assert!(binds_update(from - MARGIN, from).is_err());
+        assert!(binds_update(from + MARGIN - 1, from).is_err());
+        assert!(binds_update(from + MARGIN, from).unwrap());
+        // A network guarded from its first frame binds at once.
+        assert!(binds_update(0, 0).unwrap());
+    }
+
     use quil_execution::token_intrinsic::config_resolver::MintVariant;
 
     use super::*;

@@ -2,8 +2,9 @@
 //!
 //! Port of `client/cmd/deploy/update.go` `UpdateComputeCmd`, on the current PQ
 //! auth: the owner signs the canonical `ComputeUpdate` (signature field cleared)
-//! with the Falcon `q-prover-key` under domain `address ‖ "COMPUTE_UPDATE"`, and
-//! the raw Falcon bytes go in the proto's `signature` field. The node
+//! with the Falcon `q-prover-key` under domain `address ‖ "COMPUTE_UPDATE"`,
+//! followed from the config replay frame by the digest of the metadata vertex
+//! it replaces, and the raw Falcon bytes go in the proto's `signature` field. The node
 //! (`engines.rs` TYPE_COMPUTE_UPDATE branch) re-encodes the update with an empty
 //! signature via `ComputeUpdate::to_canonical_bytes()` and verifies it against
 //! the *prior* config's `owner_public_key` — so the config here carries the
@@ -30,6 +31,7 @@ pub(crate) fn build_compute_update(
     domain: &[u8],
     cfg: ComputeConfiguration,
     rdf_schema: Vec<u8>,
+    binding: Option<&[u8]>,
 ) -> anyhow::Result<ComputeUpdate> {
     // Signed message = canonical ComputeUpdate with the signature field cleared
     // (the node re-encodes the same way, sig empty, before verifying).
@@ -43,9 +45,12 @@ pub(crate) fn build_compute_update(
         .to_canonical_bytes()
         .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
 
-    // Falcon owner signature under `domain ‖ "COMPUTE_UPDATE"`.
-    let mut domain_sep = domain.to_vec();
-    domain_sep.extend_from_slice(b"COMPUTE_UPDATE");
+    // Falcon owner signature under `domain ‖ "COMPUTE_UPDATE" [‖ binding]`.
+    let domain_sep = quil_execution::config_replay::update_signing_domain(
+        domain,
+        quil_execution::config_replay::COMPUTE_UPDATE_TAG,
+        binding,
+    );
     let signer: Box<dyn Signer> = key_manager
         .get_signer_by_id("q-prover-key")
         .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
@@ -91,9 +96,16 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         owner_public_key: keys.owner,
     };
 
-    let signed = build_compute_update(&dc.key_manager, &domain, cfg, rdf_schema)?;
-
     let mut client = dc.connect().await?;
+    let binding = dc.update_binding(&mut client, &domain, None).await?;
+    let signed = build_compute_update(
+        &dc.key_manager,
+        &domain,
+        cfg,
+        rdf_schema,
+        binding.as_deref(),
+    )?;
+
     let request = MessageRequest {
         request: Some(Request::ComputeUpdate(signed)),
         timestamp: 0,

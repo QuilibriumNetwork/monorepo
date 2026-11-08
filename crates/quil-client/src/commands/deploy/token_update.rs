@@ -2,9 +2,10 @@
 //!
 //! Port of `client/cmd/deploy/update.go` `UpdateTokenCmd`, on the current PQ
 //! auth: the owner signs the canonical `TokenUpdate` (signature field cleared)
-//! with the Falcon `q-prover-key` under domain `address ‖ "TOKEN_UPDATE"`, and
-//! the raw Falcon bytes go in the proto's `signature` field
-//! (`token_update_from_proto` carries the raw sig, matching the node's
+//! with the Falcon `q-prover-key` under domain `address ‖ "TOKEN_UPDATE"`,
+//! followed from the config replay frame by the digest of the configuration
+//! the update replaces, and the raw Falcon bytes go in the proto's `signature`
+//! field (`token_update_from_proto` carries the raw sig, matching the node's
 //! `engines.rs` verify).
 //!
 //! The node replaces the token's whole configuration with the update's, so the
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use num_bigint::{BigInt, BigUint, Sign};
 use tonic::transport::Channel;
 
+use quil_execution::config_replay::{update_signing_domain, TOKEN_UPDATE_TAG};
 use quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
 use quil_execution::token_intrinsic::conversions::{
     token_config_to_proto, token_update_from_proto,
@@ -38,11 +40,14 @@ use super::{check_key_args, DeployCtx};
 /// Build a signed `TokenUpdate` for `domain`. The signed message is the
 /// canonical `TokenUpdate` with the signature field cleared (the node re-encodes
 /// it the same way before verifying against the prior config's owner key); the
-/// Falcon `q-prover-key` signs it under `domain ‖ "TOKEN_UPDATE"`.
+/// Falcon `q-prover-key` signs it under `domain ‖ "TOKEN_UPDATE"`, followed by
+/// `binding`, the digest of the metadata vertex the update replaces, when given
+/// ([`DeployCtx::update_binding`]).
 pub(crate) fn build_token_update(
     key_manager: &FileKeyManager,
     domain: &[u8],
     cfg: TokenConfiguration,
+    binding: Option<&[u8]>,
 ) -> anyhow::Result<TokenUpdate> {
     // Signed message = canonical TokenUpdate with an empty signature field.
     let unsigned = TokenUpdate {
@@ -55,9 +60,8 @@ pub(crate) fn build_token_update(
         .to_canonical_bytes()
         .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
 
-    // Falcon owner signature under `domain ‖ "TOKEN_UPDATE"`.
-    let mut domain_sep = domain.to_vec();
-    domain_sep.extend_from_slice(b"TOKEN_UPDATE");
+    // Falcon owner signature under `domain ‖ "TOKEN_UPDATE" [‖ binding]`.
+    let domain_sep = update_signing_domain(domain, TOKEN_UPDATE_TAG, binding);
     let signer: Box<dyn Signer> = key_manager
         .get_signer_by_id("q-prover-key")
         .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
@@ -122,8 +126,11 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     let domain = dc.resolve_address(domain_arg, 32)?;
 
     let mut client = dc.connect().await?;
-    let current = read_config(&mut client, &domain).await?;
+    let (current, vertex) = read_config(&mut client, &domain).await?;
     let cfg = update_config(dc, &current, args)?;
+    let binding = dc
+        .update_binding(&mut client, &domain, Some(&vertex))
+        .await?;
 
     println!("Domain: {}", hex::encode(&domain));
     let changes = changed_fields(&current, &cfg);
@@ -134,7 +141,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         println!("  {change}");
     }
 
-    let signed = build_token_update(&dc.key_manager, &domain, cfg)?;
+    let signed = build_token_update(&dc.key_manager, &domain, cfg, binding.as_deref())?;
     let request = MessageRequest {
         request: Some(Request::TokenUpdate(signed)),
         timestamp: 0,
@@ -145,12 +152,13 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     Ok(())
 }
 
-/// The token's configuration as the chain holds it. Any failure refuses the
-/// update: one built without it would erase every field it does not set.
+/// The token's configuration as the chain holds it, with its metadata vertex.
+/// Any failure refuses the update: one built without it would erase every
+/// field it does not set.
 async fn read_config(
     client: &mut NodeServiceClient<Channel>,
     domain: &[u8],
-) -> anyhow::Result<TokenConfiguration> {
+) -> anyhow::Result<(TokenConfiguration, Vec<u8>)> {
     let refused = "an update replaces the whole configuration, so nothing was sent";
     let mut address = domain.to_vec();
     address.extend_from_slice(&HYPERGRAPH_METADATA_ADDRESS);
@@ -168,14 +176,16 @@ async fn read_config(
             hex::encode(domain)
         );
     }
-    config_from_metadata_vertex(&response.raw_data)
-        .map_err(|e| anyhow::anyhow!("could not decode the token's configuration: {e}; {refused}"))
+    let cfg = config_from_metadata_vertex(&response.raw_data).map_err(|e| {
+        anyhow::anyhow!("could not decode the token's configuration: {e}; {refused}")
+    })?;
+    Ok((cfg, response.raw_data))
 }
 
 /// Decode a token's configuration from its metadata vertex (the serialized
 /// tree at `domain ‖ HYPERGRAPH_METADATA_ADDRESS`), as the node reads it
 /// before an update.
-fn config_from_metadata_vertex(blob: &[u8]) -> anyhow::Result<TokenConfiguration> {
+pub(crate) fn config_from_metadata_vertex(blob: &[u8]) -> anyhow::Result<TokenConfiguration> {
     let outer = quil_tries::VectorCommitmentTree {
         root: quil_tries::deserialize_go_tree(blob)
             .map_err(|e| anyhow::anyhow!("metadata vertex: {e}"))?,

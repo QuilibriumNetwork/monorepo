@@ -852,6 +852,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
         "application shard relay records"
     );
+    let config_replay_from = quil_execution::config_replay::init_config_replay_frame(args.network);
+    info!(
+        config_replay_frame = config_replay_from,
+        "deploys onto deployed applications refused and updates signed over the metadata they replace"
+    );
     let seal_drain_from =
         quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
     info!(
