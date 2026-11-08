@@ -3412,6 +3412,42 @@ mod tests {
         );
         gates(false);
     }
+    /// A registered replica seals again once its sector's cap and last
+    /// layer, both damaged on disk, are made again: the cap cannot be
+    /// rewritten from the layer, so the sector is labelled again, else its
+    /// seals fail for good.
+    #[test]
+    fn a_registered_sector_seals_again_past_a_damaged_cap_and_last_layer() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([93; 32], [95; 32]);
+        let (snap, slot, replicas, path, n) = registered_leaf(store, &member, app);
+        let output = vec![9; 516];
+        let cap = fs::read(path.join("cap")).unwrap();
+        let whole = tear_last(&path, n);
+        fs::write(path.join("cap"), b"torn").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let prepared = loop {
+            let prepared = prepare(&replicas, &member, &app, 1500, &slot, &output, &snap);
+            if prepared.is_ok() || std::time::Instant::now() > deadline {
+                break prepared;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            prepared.is_ok()
+                && fs::read(path.join("cap")).unwrap() == cap
+                && fs::read(path.join("last")).unwrap() == whole,
+            "LAST-LAYER-CAP-FALLBACK: a registered sector whose cap and last layer are both \
+             damaged was not labelled again"
+        );
+        gates(false);
+    }
     /// A certified sector whose last layer is gone from disk is labelled
     /// again, as one torn is, and the leaf it refused is then encoded.
     #[test]
