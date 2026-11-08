@@ -695,8 +695,8 @@ impl HealthRegistry {
     /// The conditions of this node's allocations and their workers. Each
     /// needs fresh observations of what it compares: without them it tracks
     /// nothing. States that pass at a restart or a rebind (no worker yet, a
-    /// blocked start, nothing materialized yet) count once they held for
-    /// the base window.
+    /// blocked start, nothing materialized yet, a worker bound before its
+    /// allocation shows) count once they held for the base window.
     fn judge_seats(&mut self, now_ms: u64) -> Vec<Judged> {
         let workers_seen = fresh_at(self.workers_seen_ms, now_ms);
         let allocations_seen = fresh_at(self.allocations_seen_ms, now_ms);
@@ -867,10 +867,19 @@ impl HealthRegistry {
             .filter(|a| a.shown())
             .map(|a| a.filter.as_slice())
             .collect();
+        // A restart or a rebind reports its workers' filters before their
+        // allocations show, so a bound worker counts after the base window.
         let bound = workers_and_allocations
             .iter()
             .filter(|w| !w.filter.is_empty() && !live.contains(&w.filter.as_slice()))
-            .map(worker)
+            .filter_map(|w| {
+                over_window(
+                    ConditionKind::WorkersBoundWithoutAllocation,
+                    w.core_id,
+                    &w.filter,
+                    w.materialized_frame.unwrap_or(0),
+                )
+            })
             .collect();
 
         let base_secs = BASE_WINDOW_MS / 1000;
@@ -950,7 +959,7 @@ impl HealthRegistry {
                 shards: bound,
                 tracked: workers_and_allocations.len() as u32,
                 observed_unix_ms: both_seen,
-                threshold: 0,
+                threshold: base_secs,
                 wait: None,
                 global: None,
                 log_evidence: None,
@@ -3230,8 +3239,9 @@ mod tests {
         assert_eq!(listed(&c), [(1, 0)]);
     }
 
-    /// A worker bound to a shard where this prover holds no live allocation
-    /// is listed, of the bound workers; an informational wait.
+    /// A worker bound for the base window to a shard where this prover
+    /// holds no live allocation is listed, of the bound workers; an
+    /// informational wait.
     #[test]
     fn workers_bound_without_a_live_allocation_are_listed() {
         let seats = [
@@ -3239,22 +3249,61 @@ mod tests {
             seat(2, EffectiveStatus::ExpiredLeaving),
             seat(3, EffectiveStatus::Rejected),
         ];
-        let workers = [
-            worker(1, 1, T0, T0),
-            worker(2, 2, T0, T0),
-            worker(3, 3, T0, T0),
-            worker(4, 9, T0, T0),
-        ];
+        let at = |now: u64| {
+            vec![
+                worker(1, 1, now, T0),
+                worker(2, 2, now, T0),
+                worker(3, 3, now, T0),
+                worker(4, 9, now, T0),
+            ]
+        };
         let mut reg = HealthRegistry::default();
-        judge_seats_at(&mut reg, &workers, &seats, T0);
+        judge_seats_at(&mut reg, &at(T0), &seats, T0);
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &at(now), &seats, now);
         let c = condition(&reg, ConditionKind::WorkersBoundWithoutAllocation).expect("bound");
         assert_eq!(listed(&c), [(2, 2), (3, 3), (9, 4)]);
         assert_eq!((c.affected, c.tracked), (3, 4));
         assert_eq!(c.severity, ConditionSeverity::Info as i32);
         assert_eq!(
+            (c.threshold, c.shards[0].window_secs),
+            (60, 60),
+            "bound rows carry the base-window threshold"
+        );
+        assert_eq!(
             notice_text(&c),
             "Workers bound without an allocation: 3/4 workers."
         );
+    }
+
+    /// After a restart the workers report their filters before the
+    /// allocations show: a worker bound without a live allocation counts
+    /// only once that held for the base window, so allocations shown
+    /// within it start nothing, and a worker that stays unallocated is
+    /// listed at the window.
+    #[test]
+    fn workers_bound_without_a_live_allocation_count_after_the_base_window() {
+        let kind = ConditionKind::WorkersBoundWithoutAllocation;
+        let at = |now: u64| vec![worker(1, 1, now, T0), worker(2, 2, now, T0)];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &at(T0), &[], T0);
+        assert!(
+            condition(&reg, kind).is_none(),
+            "bound workers stay unlisted before the base window"
+        );
+        let shown = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::ExpiredLeaving),
+        ];
+        let later = T0 + 15_000;
+        judge_seats_at(&mut reg, &at(later), &shown, later);
+        assert!(condition(&reg, kind).is_none(), "not yet for the window");
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &at(now), &shown, now);
+        let c = condition(&reg, kind).expect("still bound after the window");
+        assert_eq!(listed(&c), [(2, 2)]);
+        assert_eq!(c.shards[0].unchanged_since_unix_ms, T0);
+        assert_eq!((c.affected, c.tracked), (1, 2));
     }
 
     /// A running or serving worker that has materialized no frame counts
