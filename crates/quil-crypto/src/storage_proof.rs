@@ -1196,7 +1196,16 @@ pub fn prove_seal_with_labels(
         .last_layer()
         .filter(|last| last.len() == n)
         .ok_or("no kept last layer for the leaf")?;
-    seal.finish(statement, columns, last)
+    // Kept columns that are not the registration's may be a damaged copy, so
+    // their failure is not [`COLUMNS_NOT_REGISTERED`]: relabelling the leaf
+    // ([`prove_seal`]) decides.
+    seal.finish(statement, columns, last).map_err(|error| {
+        if error == COLUMNS_NOT_REGISTERED {
+            "the kept column digests are not the registered column commitment".into()
+        } else {
+            error
+        }
+    })
 }
 
 /// Open only challenged subtrees; every cached cap and opening is checked
@@ -1268,6 +1277,15 @@ fn prove_seal_from_caps(
     Ok(proof)
 }
 
+/// Why a seal fails when the registered column commitment is not this
+/// build's labelling of the leaf ([`prove_seal`]). The labels, and so the
+/// column tree, depend on the replica key, the leaf's size and the SDR
+/// parameters alone, never on the data: the same registration fails the same
+/// way on every attempt. Its leaf was labelled under another replica key, as
+/// by a build with another key rule before an upgrade (mainnet, 2026-11-08).
+pub const COLUMNS_NOT_REGISTERED: &str =
+    "the registered column commitment is not this replica's labelling";
+
 /// A seal proof being made: the replica, the challenges and their parents,
 /// and the labels kept for each node they name.
 struct Seal {
@@ -1328,7 +1346,7 @@ impl Seal {
         } = self;
         let column_tree = MerkleTree::from_digests(columns);
         if column_tree.commitment(Tree::Column) != statement.registered.comm_c {
-            return Err("the registered column commitment is not this replica's labelling".into());
+            return Err(COLUMNS_NOT_REGISTERED.into());
         }
         let column = |v: u64| ColumnOpening {
             labels: kept[&v].clone(),

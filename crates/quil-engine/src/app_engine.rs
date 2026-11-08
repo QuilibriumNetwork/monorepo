@@ -3811,10 +3811,20 @@ impl AppConsensusEngine {
                 .ok()
                 .flatten()
         };
+        // A registration this process found it cannot seal (its column
+        // commitment is another labelling's) is not tried again: the
+        // settlement waits for no seal, and no worker relabels its leaves.
         let next = slot(seal_epoch).filter(|slot| {
             hash_storage_proofs_at(seal_epoch)
                 && slot.sealed_at.is_none()
                 && !slot.leaves.is_empty()
+                && !crate::storage_epoch_batch::seal_unprovable(
+                    &member,
+                    shard,
+                    epoch,
+                    slot.registered_at,
+                    &slot.leaves,
+                )
         });
         let seal = next
             .clone()
@@ -3960,13 +3970,12 @@ impl AppConsensusEngine {
             }
         };
         // A settlement is prepared in a lane of its own, apart from its seal,
-        // unless it shares a first part with the seal: it never waits behind
-        // the seal's relabelling (about an hour per GiB) or the seat's
-        // encodes. Sent again, or near the window's end, it goes alone and the
-        // node proves it at once.
+        // on every attempt (`storage_epoch_batch::part_jobs`): it never waits
+        // behind the seal's relabelling (about an hour per GiB), a seal that
+        // fails after it, or the seat's encodes. Sent again, or near the
+        // window's end, it goes alone and the node proves it at once.
         let has_seal = seal.is_some();
         let settle_inputs_present = settle.is_some();
-        let split = settle_inputs_present && (attempt > 1 || closing || !has_seal);
         let settle_alone = attempt > 1 || closing;
         if closing && settle_inputs_present {
             warn!(epoch, attempt, global_frame = global_frame_number, window_end = until,
@@ -3977,9 +3986,10 @@ impl AppConsensusEngine {
         }
         // The node's collection waits only for what goes in it: not for a
         // settlement sent alone.
-        let batched_settle = settle.is_some() && !settle_alone;
-        if has_seal || batched_settle {
-            announce(has_seal, batched_settle);
+        let jobs =
+            crate::storage_epoch_batch::part_jobs(has_seal, settle_inputs_present, settle_alone);
+        for part in jobs.iter().filter(|part| part.announced) {
+            announce(part.seals, part.settles);
         }
         // What each half of the part is prepared from: a retry reuses a half
         // prepared from the same inputs.
@@ -4024,6 +4034,26 @@ impl AppConsensusEngine {
                         )),
                     ));
                 }
+                // A retry queued before the seal failed for good does not
+                // relabel the leaves again.
+                if seals
+                    && seal.as_ref().is_some_and(|slot| {
+                        crate::storage_epoch_batch::seal_unprovable(
+                            &member,
+                            &filter,
+                            epoch,
+                            slot.registered_at,
+                            &slot.leaves,
+                        )
+                    })
+                {
+                    drop(withdraw(
+                        quil_types::error::QuilError::ExecutionUnavailable(
+                            "the registration cannot be sealed".into(),
+                        ),
+                    ));
+                    return Ok(());
+                }
                 let started = std::time::Instant::now();
                 let (mut seat, reused) = unwound(|| {
                     crate::storage_epoch_batch::prepare_reusing(
@@ -4067,16 +4097,28 @@ impl AppConsensusEngine {
                     )
                 })
                 .map_err(|error| {
-                    if seals {
-                        let next = if settles {
-                            "its settlement is prepared alone now"
-                        } else {
-                            "the seal is tried again at its next attempt"
-                        };
-                        warn!(epoch, attempt, global_frame = crate::storage_snapshot::global_frame().unwrap_or(0),
-                            filter = %hex::encode(&filter), %error, next,
-                            "storage seal part not prepared: withdrawn from the node's batch, so the member's other seats are proved without it; \
-                             GLOBAL withholds this seat's storage share unless a seal lands in its window. A missing forest node in the error is a store defect to report");
+                    if let Some(slot) = seal.as_ref().filter(|_| seals) {
+                        let seal_epoch = epoch + 2;
+                        let unsealed = crate::storage_epoch_batch::unsealed_seat_outcome(seal_epoch);
+                        let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
+                        if !crate::storage_epoch_batch::seal_failed_for_good(&error.to_string()) {
+                            warn!(epoch, seal_epoch, attempt, global_frame, filter = %hex::encode(&filter), %error, unsealed,
+                                "storage seal part not prepared: withdrawn from the node's batch, so the member's other seats are proved \
+                                 without it; the seal is tried again at its next attempt. A missing forest node in the error is a store \
+                                 defect to report");
+                        } else if crate::storage_epoch_batch::note_unprovable_seal(
+                            &member,
+                            &filter,
+                            epoch,
+                            slot.registered_at,
+                            &slot.leaves,
+                        ) {
+                            warn!(epoch, seal_epoch, attempt, global_frame, filter = %hex::encode(&filter), %error, unsealed,
+                                "storage seal cannot be proved: the registered column commitment is not this build's labelling of the \
+                                 leaf (it was encoded under another replica key, as by a build running before an upgrade), so every \
+                                 attempt would fail the same way; not tried again. The seat's settlement is unaffected, and its next \
+                                 registration, encoded by this build, seals");
+                        }
                     }
                     withdraw(error)
                 })?;
@@ -4110,30 +4152,18 @@ impl AppConsensusEngine {
                 result => result,
             };
             match (seals_here, settles_here) {
-                // A seal that fails here must not keep the settlement out:
-                // the held rewards and the seat ride on it.
-                (true, true) => prove(true, true).or_else(|error| {
-                    if crate::storage_snapshot::settlement_closed(epoch, 0) {
-                        return closed(Err(error)).and_then(|()| prove(true, false));
-                    }
-                    // `prove` logged the seal's failure and withdrew it.
-                    prove(false, true)
-                }),
                 (false, true) => closed(prove(false, true)),
                 (seals, settles) => prove(seals, settles),
             }
         };
-        if split {
-            let settling = job.clone();
-            crate::storage_jobs::spawn(&settlement_lane, "settlement part", move || {
-                settling(false, true)
-            });
-            if has_seal {
-                crate::storage_jobs::spawn(&lane, "epoch proof part", move || job(true, false));
-            }
-        } else {
-            let settles = settle_inputs_present;
-            crate::storage_jobs::spawn(&lane, "epoch proof part", move || job(has_seal, settles));
+        for part in jobs {
+            let job = job.clone();
+            let (lane, label) = if part.seals {
+                (&lane, "epoch proof part")
+            } else {
+                (&settlement_lane, "settlement part")
+            };
+            crate::storage_jobs::spawn(lane, label, move || job(part.seals, part.settles));
         }
     }
 
