@@ -281,8 +281,12 @@ pub(crate) enum SeatLog {
     /// A seat's epoch, as this node counted it and committed state records it.
     Reward {
         filter: Vec<u8>,
+        epoch: u64,
         stage: &'static str,
-        slot: SlotRead,
+        /// How GLOBAL pays the seat's issuance share ([`kind`]).
+        kind: &'static str,
+        /// `None` for a seat GLOBAL holds no slot for in the epoch.
+        slot: Option<SlotRead>,
         counts: EpochCount,
         /// Whether this process observed GLOBAL from before the epoch began.
         complete: bool,
@@ -329,6 +333,24 @@ impl SlotRead {
             release_at_most: slot.release(slot.frames),
             outcome: slot.outcome,
         }
+    }
+}
+
+/// How GLOBAL pays a seat's issuance share of a frame anchored in `epoch`
+/// (`prover_shard_update::materialize_prover_shard_update_with_fees`):
+/// `held` in a sealed seat until its settlement; `at_once` with the frame
+/// before the hash-proof epochs, and to an unsealed seat from the unsealed
+/// issuance epoch; else `fees_only`. Fees are paid at once to every kind.
+/// GLOBAL gates the unsealed payment on its executing frame's epoch, which
+/// trails the anchor's by under a lockstep window.
+fn kind(epoch: u64, sealed: bool) -> &'static str {
+    use quil_types::consensus::{hash_storage_proofs_at, unsealed_issuance_epoch};
+    if sealed {
+        "held"
+    } else if !hash_storage_proofs_at(epoch) || epoch >= unsealed_issuance_epoch() {
+        "at_once"
+    } else {
+        "fees_only"
     }
 }
 
@@ -736,9 +758,10 @@ impl SeatCertificates {
         }
     }
 
-    /// The current seats whose slots are due a read from committed state:
-    /// one of the last two epochs still lacks a reward line, and
-    /// [`READ_EVERY`] has passed since the last read.
+    /// The seats whose slots are due a read from committed state: one of
+    /// the last two epochs still lacks a reward line, and [`READ_EVERY`] has
+    /// passed since the last read. A former seat counts too, until its
+    /// epochs are done or it is dropped: it was held in them.
     pub fn rewards_due(&mut self, now: u64) -> Vec<Vec<u8>> {
         let current = self.current_epoch();
         if self.global_frame == 0 {
@@ -749,7 +772,7 @@ impl SeatCertificates {
             let pending = (current.saturating_sub(2)..current).any(|epoch| {
                 seat.rewards_logged.get(&epoch).copied().unwrap_or(0) != (ENDED | CLOSED)
             });
-            if seat.current && pending && now.saturating_sub(seat.read_at) >= READ_EVERY {
+            if pending && now.saturating_sub(seat.read_at) >= READ_EVERY {
                 seat.read_at = now;
                 due.push(filter.clone());
             }
@@ -760,7 +783,10 @@ impl SeatCertificates {
     /// The reward lines `filter`'s `slots`, as committed state holds them,
     /// make due: for each of the last two epochs, a line when it ended and
     /// one when its settlement closed (settled or expired), each once. An
-    /// epoch the seat holds no slot for is done once it is two epochs old.
+    /// epoch the seat holds no slot for is paid at once or not at all
+    /// ([`kind`]): once it is two epochs old, when no slot can still sync
+    /// in, it gets one line if the seat was held in it (tips counted, or
+    /// counted since before the epoch began and still a seat), and is done.
     pub fn rewards(&mut self, filter: &[u8], slots: &[SlotRead], now: u64) -> Vec<SeatLog> {
         let current = self.current_epoch();
         let length = quil_types::consensus::epoch_length_frames();
@@ -775,33 +801,35 @@ impl SeatCertificates {
             if logged == (ENDED | CLOSED) {
                 continue;
             }
-            let Some(slot) = slots.iter().find(|slot| slot.epoch == epoch) else {
-                if epoch + 2 <= current {
-                    seat.rewards_logged.insert(epoch, ENDED | CLOSED);
-                }
-                continue;
-            };
             let counts = seat.epochs.get(&epoch).copied().unwrap_or_default();
-            if !slot.sealed && slot.frames == 0 && counts.frames == 0 {
-                seat.rewards_logged.insert(epoch, ENDED | CLOSED);
-                continue;
-            }
-            let stage = match slot.outcome {
-                Outcome::Open if logged & ENDED == 0 => Some((ENDED, "ended")),
-                Outcome::Open => None,
-                _ if logged & CLOSED == 0 => Some((ENDED | CLOSED, "closed")),
-                _ => None,
+            let complete = seat.first_global > 0 && seat.first_global <= epoch * length;
+            let held = counts.frames > 0 || (seat.current && complete);
+            let slot = slots.iter().find(|slot| slot.epoch == epoch);
+            let stage = match slot {
+                None if epoch + 2 > current => continue,
+                None if held && logged == 0 => Some((ENDED | CLOSED, "ended")),
+                None => None,
+                Some(slot) if !slot.sealed && slot.frames == 0 && counts.frames == 0 => None,
+                Some(slot) => match slot.outcome {
+                    Outcome::Open if logged & ENDED == 0 => Some((ENDED, "ended")),
+                    Outcome::Open => continue,
+                    _ if logged & CLOSED == 0 => Some((ENDED | CLOSED, "closed")),
+                    _ => continue,
+                },
             };
             let Some((bits, stage)) = stage else {
+                seat.rewards_logged.insert(epoch, ENDED | CLOSED);
                 continue;
             };
             seat.rewards_logged.insert(epoch, logged | bits);
             logs.push(SeatLog::Reward {
                 filter: filter.to_vec(),
+                epoch,
                 stage,
-                slot: slot.clone(),
+                kind: kind(epoch, slot.is_some_and(|slot| slot.sealed)),
+                slot: slot.cloned(),
                 counts,
-                complete: seat.first_global > 0 && seat.first_global <= epoch * length,
+                complete,
                 committee,
             });
         }
@@ -1065,30 +1093,45 @@ fn log(line: &SeatLog) {
         }
         SeatLog::Reward {
             filter,
+            epoch,
             stage,
+            kind,
             slot,
             counts,
             complete,
             committee,
         } => {
-            let (outcome, closed_at) = match slot.outcome {
-                Outcome::Open => ("open", 0),
-                Outcome::Settled(frame) => ("settled", frame),
-                Outcome::Expired(frame) => ("expired", frame),
+            let none = SlotRead {
+                epoch: *epoch,
+                sealed: false,
+                frames: 0,
+                expected: 0,
+                held: 0.into(),
+                release_at_most: 0.into(),
+                outcome: Outcome::Open,
+            };
+            let read = slot.as_ref().unwrap_or(&none);
+            let (outcome, closed_at) = match (slot, read.outcome) {
+                (None, _) => ("no_slot", 0),
+                (_, Outcome::Open) => ("open", 0),
+                (_, Outcome::Settled(frame)) => ("settled", frame),
+                (_, Outcome::Expired(frame)) => ("expired", frame),
             };
             let proposals = |units: u64| units as f64 / storage_seat::PROPOSAL as f64;
-            tracing::info!(filter = %hex::encode(filter), epoch = slot.epoch, stage,
-                sealed = slot.sealed, committee,
+            tracing::info!(filter = %hex::encode(filter), epoch = *epoch, stage, kind,
+                sealed = read.sealed, committee,
                 tips_seen = counts.frames, tips_signed = counts.signed,
                 expected_by_tips = proposals(counts.weight), counts_complete = complete,
-                expected_proposals = proposals(slot.expected), chained_roots = slot.frames,
-                held = %slot.held, release_at_most = %slot.release_at_most,
+                expected_proposals = proposals(read.expected), chained_roots = read.frames,
+                held = %read.held, release_at_most = %read.release_at_most,
                 outcome, closed_at_global_frame = closed_at,
                 scope = "shard headers in the GLOBAL frames this node received, and committed GLOBAL state",
-                "this seat's epoch rewards: a sealed seat is entitled to `held` and credited up to \
+                "this seat's epoch rewards: kind=held is entitled to `held` and credited up to \
                  `release_at_most` once settled (nothing if expired), so completeness is the balance \
-                 gained over `held`; an unsealed seat is paid at once for each of `tips_signed` \
-                 (`expected_by_tips` against `expected_proposals` shows how many tips GLOBAL counted)");
+                 gained over `held`; kind=at_once is paid one issuance share at once for each of \
+                 `tips_signed` GLOBAL executed (`expected_by_tips` against `expected_proposals` shows \
+                 how many GLOBAL counted; outcome=no_slot when GLOBAL holds no slot for the seat), \
+                 credited in the hourly reward balance line; kind=fees_only earns fees only");
         }
         SeatLog::Credits {
             window_secs,
@@ -1536,11 +1579,11 @@ mod tests {
         logs.iter()
             .map(|log| match log {
                 SeatLog::Reward {
-                    slot,
+                    epoch,
                     stage,
                     counts,
                     ..
-                } => (slot.epoch, *stage, *counts),
+                } => (*epoch, *stage, *counts),
                 other => panic!("not a reward line: {other:?}"),
             })
             .collect()
@@ -1661,6 +1704,116 @@ mod tests {
         let logs = rewards(&fresh.rewards(FILTER, &bare, T0));
         assert_eq!(logs.len(), 1);
         assert_eq!((logs[0].0, logs[0].2.signed), (6, 1));
+    }
+
+    #[test]
+    fn a_seat_without_a_slot_gets_one_line_once_no_slot_can_sync_in() {
+        let l = epoch_length();
+        let mut t = seated(T0);
+        // Counted since before epoch 5 began.
+        t.observe_global(5 * l - 1);
+        assert!(t.count(FILTER, 1, ms(T0), member(5, 4, true), 5 * l + 1, T0));
+        assert!(t.count(FILTER, 2, ms(T0 + 1), member(5, 4, false), 5 * l + 2, T0));
+        t.observe_global(6 * l);
+        assert!(
+            t.rewards(FILTER, &[], T0).is_empty(),
+            "epoch 5 just ended: a slot may still sync in"
+        );
+        t.observe_global(7 * l);
+        let tips = EpochCount {
+            frames: 2,
+            signed: 1,
+            weight: storage_seat::PROPOSAL / 4,
+        };
+        assert_eq!(
+            rewards(&t.rewards(FILTER, &[], T0)),
+            [(5, "ended", tips)],
+            "a seat paid at once gets its epoch line"
+        );
+        assert!(t.rewards(FILTER, &[], T0).is_empty(), "once");
+        // Held through epoch 6 with no tip seen: a line with nothing counted.
+        t.observe_global(8 * l);
+        assert_eq!(
+            rewards(&t.rewards(FILTER, &[], T0)),
+            [(6, "ended", EpochCount::default())],
+            "a seat held through an epoch gets its line without tips"
+        );
+    }
+
+    #[test]
+    fn a_former_seat_still_gets_the_lines_of_epochs_it_was_held_in() {
+        let l = epoch_length();
+        let mut t = seated(T0);
+        t.observe_global(5 * l - 1);
+        assert!(t.count(FILTER, 1, ms(T0), member(5, 4, true), 5 * l + 1, T0));
+        t.observe_global(7 * l);
+        // The seat leaves; its buckets keep it tracked for a day.
+        assert!(t.seats(&[], T0).is_empty());
+        assert!(!t.seats[FILTER].current);
+        assert_eq!(
+            t.rewards_due(T0),
+            vec![FILTER.to_vec()],
+            "a former seat held in epoch 5"
+        );
+        assert_eq!(
+            rewards(&t.rewards(FILTER, &[], T0))
+                .iter()
+                .map(|r| (r.0, r.2.signed))
+                .collect::<Vec<_>>(),
+            [(5, 1)]
+        );
+        // Epoch 6: no tips and no longer a seat: not held, done bare.
+        t.observe_global(8 * l);
+        assert!(t.rewards(FILTER, &[], T0).is_empty());
+        assert_eq!(
+            t.seats[FILTER].rewards_logged.get(&6),
+            Some(&(ENDED | CLOSED))
+        );
+    }
+
+    #[test]
+    fn the_reward_line_names_how_global_pays_the_seat() {
+        use quil_types::consensus::{
+            set_hash_storage_proof_epoch_for_thread, set_unsealed_issuance_epoch_for_thread,
+        };
+        set_hash_storage_proof_epoch_for_thread(Some(4));
+        set_unsealed_issuance_epoch_for_thread(Some(6));
+        assert_eq!(kind(3, false), "at_once", "before the hash-proof epochs");
+        assert_eq!(
+            kind(5, false),
+            "fees_only",
+            "unsealed before unsealed issuance"
+        );
+        assert_eq!(kind(6, false), "at_once", "unsealed from unsealed issuance");
+        assert_eq!(kind(6, true), "held");
+        let l = epoch_length();
+        let mut t = seated(T0);
+        t.observe_global(5 * l - 1);
+        assert!(t.count(FILTER, 1, ms(T0), member(5, 4, true), 5 * l + 1, T0));
+        assert!(t.count(FILTER, 2, ms(T0), member(5, 4, true), 6 * l + 1, T0));
+        let sealed = [slot(7, true, 1, 9, Outcome::Open)];
+        let mut lines = Vec::new();
+        for global in [7 * l, 8 * l] {
+            t.observe_global(global);
+            for log in t.rewards(FILTER, &sealed, T0) {
+                match log {
+                    SeatLog::Reward {
+                        epoch, kind, slot, ..
+                    } => lines.push((epoch, kind, slot.is_some())),
+                    other => panic!("not a reward line: {other:?}"),
+                }
+            }
+        }
+        set_hash_storage_proof_epoch_for_thread(None);
+        set_unsealed_issuance_epoch_for_thread(None);
+        assert_eq!(
+            lines,
+            [
+                (5, "fees_only", false),
+                (6, "at_once", false),
+                (7, "held", true)
+            ]
+        );
     }
 
     #[test]
