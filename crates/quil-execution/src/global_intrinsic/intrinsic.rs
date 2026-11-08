@@ -4002,6 +4002,7 @@ impl GlobalIntrinsic {
             super::prover_shard_update::HeaderIssuance::claimed(op)
         };
         let participants = participant_indices.len();
+        let rewards_timing = crate::step_timing::section("shard header: rewards");
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
             frame_number,
@@ -4018,6 +4019,7 @@ impl GlobalIntrinsic {
             storage.as_mut(),
             issuance,
         )?;
+        drop(rewards_timing);
         timing.mark("rewards/activity");
 
         // PoRep: the ρ_N-sampled possession audit runs LAST — AFTER the
@@ -4359,15 +4361,28 @@ impl GlobalIntrinsic {
         {
             return Ok(());
         }
+        // Run once per frame, by its first shard header: these sections name
+        // the pass a slow frame spent its time in.
+        let section = crate::step_timing::section;
+        let timing = section("due changes: pending repair");
         self.restore_missing_pending_changes_or_warn(frame_number, state);
+        drop(timing);
+        let timing = section("due changes: topology");
         let flipped = self.apply_due_shard_changes_inner(frame_number, state)?;
         #[cfg(feature = "confidential-tokens")]
         self.reconcile_orphaned_blocks(frame_number, state, &flipped)?;
         #[cfg(not(feature = "confidential-tokens"))]
         let _ = flipped;
+        drop(timing);
+        let timing = section("due changes: expiry sweep");
         self.sweep_storage_expiries(frame_number, state)?;
+        drop(timing);
+        let timing = section("due changes: seniority restoration");
         super::seniority_restoration::restore_kicked_seniority(state, frame_number)?;
+        drop(timing);
+        let timing = section("due changes: committee sessions");
         self.reconcile_committee_sessions(frame_number, state)?;
+        drop(timing);
         self.log_local_shard_grid_once_per_epoch(frame_number, state);
         // Logging only: the stale seal-drain copy summary is written once its
         // interval ends, also when no further copy arrives.
