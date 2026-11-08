@@ -98,6 +98,8 @@ impl Sector {
         Ok(cap)
     }
     fn last(&self) -> Result<Vec<hash::Digest>> {
+        #[cfg(test)]
+        tests::count_last_read(&self.dir);
         let mut file = File::open(self.dir.join("last")).map_err(io)?;
         if file.metadata().map_err(io)?.len() != self.cert.n * 32 {
             return Err(unavailable("sector last layer is short".into()));
@@ -560,12 +562,22 @@ fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
 /// registered replica's damaged last layer shows only in its seal. The mark
 /// is checked before the layer, which each failing leaf would read again.
 fn repair_if_torn(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
-    let marker = sector.dir.join(format!("repair-{epoch}"));
-    if sector.given_up()
-        || marker.exists()
-        || sector.last_matches()
-        || atomic(&marker, &[]).is_err()
-    {
+    if repair_due(sector, epoch) && !sector.last_matches() {
+        start_repair(store, member, epoch, sector);
+    }
+}
+
+/// Whether a failing seal may start a repair of the sector this epoch: it
+/// is not given up, and no repair is marked this epoch.
+fn repair_due(sector: &Sector, epoch: u64) -> bool {
+    !sector.given_up() && !sector.dir.join(format!("repair-{epoch}")).exists()
+}
+
+/// Mark the sector's repair this epoch and start it, warning once: a
+/// failing seal found its last layer missing or differing from its
+/// certificate.
+fn start_repair(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
+    if atomic(&sector.dir.join(format!("repair-{epoch}")), &[]).is_err() {
         return;
     }
     warn!(epoch, sector = %hex::encode(sector.cert.sector), nodes = sector.cert.n,
@@ -579,7 +591,10 @@ fn repair_if_torn(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector
 /// A registered sector's cap, rewritten from its last layer when the file is
 /// damaged or missing and the layer matches the certificate, as the cap is
 /// made from it; otherwise the layer is repaired as after a failed seal. A
-/// cap that cannot be read fails every seal before one is made.
+/// cap that cannot be read fails every seal before one is made. The layer,
+/// up to 2 GiB, is read once an epoch at most, under a reservation of its
+/// size, and never for a sector given up: each failing leaf would read it
+/// again.
 fn cap_or_repair(
     store: &LabelStore,
     member: &[u8],
@@ -590,8 +605,17 @@ fn cap_or_repair(
         Ok(cap) => return Ok(cap),
         Err(error) => error,
     };
-    if let Ok(last) = sector.last() {
-        let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(sector.cert.n));
+    if !repair_due(sector, epoch) {
+        return Err(error);
+    }
+    let whole = {
+        let _memory = crate::storage_jobs::reserve(sector.cert.n.saturating_mul(32));
+        sector
+            .last()
+            .ok()
+            .map(|last| MerkleCap::from_digests(&last, proof::seal_cap_height(sector.cert.n)))
+    };
+    if let Some(cap) = whole {
         if cap.commitment(Tree::Replica) == sector.cert.labels {
             atomic(&sector.dir.join("cap"), &cap.to_bytes())?;
             warn!(epoch, sector = %hex::encode(sector.cert.sector), nodes = sector.cert.n,
@@ -602,7 +626,7 @@ fn cap_or_repair(
             return Ok(cap);
         }
     }
-    repair_if_torn(store, member, epoch, sector);
+    start_repair(store, member, epoch, sector);
     Err(error)
 }
 
@@ -2731,6 +2755,26 @@ mod tests {
     fn last_checks(dir: &Path) -> usize {
         LAST_CHECKS.lock().unwrap().get(dir).copied().unwrap_or(0)
     }
+    /// Each read of a sector's last layer (`Sector::last`), by directory:
+    /// the bytes this process held reserved as it began.
+    static LAST_READS: Mutex<std::collections::BTreeMap<PathBuf, Vec<u64>>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_last_read(dir: &Path) {
+        LAST_READS
+            .lock()
+            .unwrap()
+            .entry(dir.to_owned())
+            .or_default()
+            .push(crate::storage_jobs::held_bytes());
+    }
+    fn last_reads(dir: &Path) -> Vec<u64> {
+        LAST_READS
+            .lock()
+            .unwrap()
+            .get(dir)
+            .cloned()
+            .unwrap_or_default()
+    }
     /// A certified sector set up at epoch 1502, the one leaf of `app`'s data
     /// encoded into it, and the seat slot that seals the leaf: the
     /// snapshot, the slot, the replicas, and the sector's directory and
@@ -2830,6 +2874,78 @@ mod tests {
             0,
             "LAST-LAYER-MARKED-READ: a failing seal read its sector's last layer though its \
              repair was marked this epoch"
+        );
+        gates(false);
+    }
+    /// A failing seal reads no last layer to rewrite its sector's damaged
+    /// cap from once a repair is marked this epoch, nor for a sector given
+    /// up: each failing leaf would read the layer again, up to 2 GiB.
+    #[test]
+    fn a_damaged_cap_reads_no_last_layer_once_a_repair_is_marked_or_given_up() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([83; 32], [85; 32]);
+        let (snap, slot, replicas, path, n) = registered_leaf(store, &member, app);
+        tear_last(&path, n);
+        fs::write(path.join("cap"), b"torn").unwrap();
+        let before = last_reads(&path).len();
+        // A repair marked this epoch, as an earlier failing seal leaves it.
+        fs::write(path.join("repair-1502"), b"").unwrap();
+        let marked = prepare(&replicas, &member, &app, 1500, &slot, &[9u8; 516], &snap);
+        let read_marked = last_reads(&path).len() - before;
+        // Given up, as a repair whose labels differ from the certificate
+        // leaves it.
+        fs::remove_file(path.join("repair-1502")).unwrap();
+        let sector = Sector::load(path.clone()).unwrap().unwrap();
+        fs::write(path.join("repair-failed"), sector.cert.to_bytes()).unwrap();
+        let given_up = prepare(&replicas, &member, &app, 1500, &slot, &[9u8; 516], &snap);
+        let read_given_up = last_reads(&path).len() - before - read_marked;
+        assert_eq!(
+            (read_marked, read_given_up),
+            (0, 0),
+            "LAST-LAYER-CAP-READ: a failing seal read its sector's last layer for a damaged cap \
+             though its repair was marked, or the sector given up"
+        );
+        assert!(
+            marked.is_err() && given_up.is_err(),
+            "a damaged cap over a torn last layer fails the seal"
+        );
+        gates(false);
+    }
+    /// A damaged cap is rewritten from a last layer read under a
+    /// reservation of its size: up to 2 GiB, read outside any, it would
+    /// take memory every other storage job waits for.
+    #[test]
+    fn a_damaged_cap_reads_its_last_layer_under_a_reservation() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app) = ([87; 32], [89; 32]);
+        let (_, _, _, path, n) = registered_leaf(store, &member, app);
+        let cap = fs::read(path.join("cap")).unwrap();
+        fs::write(path.join("cap"), b"torn").unwrap();
+        let sector = Sector::load(path.clone()).unwrap().unwrap();
+        let (before, held) = (last_reads(&path).len(), crate::storage_jobs::held_bytes());
+        let rewritten = cap_or_repair(store, &member, 1502, &sector);
+        let reads = last_reads(&path)[before..].to_vec();
+        assert!(
+            reads.len() == 1 && reads[0] >= held + n * 32,
+            "LAST-LAYER-CAP-RESERVED: a damaged cap's last layer was read holding {reads:?} \
+             bytes reserved, not {held} and its {} bytes",
+            n * 32
+        );
+        assert!(
+            rewritten.is_ok() && fs::read(path.join("cap")).unwrap() == cap,
+            "a whole last layer rewrites a damaged cap"
         );
         gates(false);
     }
