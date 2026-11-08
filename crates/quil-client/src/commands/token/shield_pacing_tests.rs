@@ -462,7 +462,7 @@ fn shield_pacing_still_paused_names_the_nodes_current_state() {
         })
     };
     let head = "Global head unchanged >120s";
-    let slow = "Global frames slow: 300 in 60 min (~300/h, below 330/h)";
+    let slow = "Global frames slow: 300 in the last hour, below 330";
     let mut health = Health::default();
     assert_eq!(health.observe(0, read(None)), None);
     assert_eq!(
