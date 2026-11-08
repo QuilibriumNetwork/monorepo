@@ -827,6 +827,60 @@ fn data_holders<'a>(
     (chosen, passed_over)
 }
 
+/// For each of `candidates`, the proposal frame of the reservation that
+/// claims it as this node's own join, if any. A join the node plans reserves
+/// its auto worker only by its proposal frame (`ProverPipeline::submit_join`),
+/// not by the shard, so each frame in `reserved` claims one Joining
+/// candidate joined at a frame that can include a join proposed then
+/// (`p..=last_join_inclusion_frame(p)`). Candidates are claimed in join-frame
+/// order, each by the earliest reservation whose window holds it, which
+/// claims the most when windows overlap.
+fn planned_join_claims(
+    candidates: &[&quil_types::consensus::ProverAllocationInfo],
+    reserved: &[u64],
+) -> Vec<Option<u64>> {
+    let mut open: Vec<u64> = reserved.iter().copied().filter(|p| *p > 0).collect();
+    open.sort_unstable();
+    let mut order: Vec<usize> = (0..candidates.len())
+        .filter(|i| candidates[*i].status == ProverStatus::Joining)
+        .collect();
+    order.sort_by_key(|i| candidates[*i].join_frame_number);
+    let mut claims = vec![None; candidates.len()];
+    for i in order {
+        let join = candidates[i].join_frame_number;
+        if let Some(at) = open
+            .iter()
+            .position(|p| *p <= join && join <= last_join_inclusion_frame(*p))
+        {
+            claims[i] = Some(open.remove(at));
+        }
+    }
+    claims
+}
+
+/// Which pool serves each bind candidate, in order, given `manual` idle
+/// manual workers and `auto` idle auto workers: `Some(true)` the auto pool,
+/// `Some(false)` the manual pool, `None` neither (an orphan). A claimed join
+/// (`claimed`, [`planned_join_claims`]) takes the auto pool first, any other
+/// candidate the manual pool first; each falls back to the other.
+fn bind_pools(claimed: &[bool], mut manual: usize, mut auto: usize) -> Vec<Option<bool>> {
+    claimed
+        .iter()
+        .map(|&claimed| {
+            let from_auto = auto > 0 && (claimed || manual == 0);
+            if from_auto {
+                auto -= 1;
+                Some(true)
+            } else if manual > 0 {
+                manual -= 1;
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Log, once for a binding pass that had any, the idle workers holding the
 /// data of a shard that was bound to a worker without it, which installs
 /// the shard from an archive, and why each was passed over: one line with
@@ -3245,12 +3299,30 @@ impl WorkerAllocator {
         // installs another. Which candidates get a worker, and the manual
         // pool's precedence, stay as they were; a worker held back or whose
         // store stopped keeps its place at the end.
-        let served = bind_candidates
-            .len()
-            .min(manual_pending.len() + idle_workers.len());
-        let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served]
+        //
+        // A join this node planned for an auto worker is served by the auto
+        // pool, never by an idle manual worker the operator keeps for a seat
+        // of their own: each idle auto worker's reservation claims the join
+        // landing in its window. Every other candidate keeps the manual
+        // pool's precedence.
+        let reserved: Vec<u64> = self
+            .worker_manager
+            .range_workers()?
             .iter()
-            .map(|a| a.confirmation_filter.clone())
+            .filter(|w| idle_workers.contains(&w.core_id))
+            .map(|w| w.pending_filter_frame)
+            .collect();
+        let claims = planned_join_claims(&bind_candidates, &reserved);
+        let pools = bind_pools(
+            &claims.iter().map(Option::is_some).collect::<Vec<_>>(),
+            manual_pending.len(),
+            idle_workers.len(),
+        );
+        let from_idle: Vec<Vec<u8>> = bind_candidates
+            .iter()
+            .zip(&pools)
+            .filter(|(_, pool)| **pool == Some(true))
+            .map(|(a, _)| a.confirmation_filter.clone())
             .collect();
         let holders = self.worker_manager.shard_data();
         let tips = if holders.values().any(|held| !held.is_empty()) {
@@ -3284,15 +3356,23 @@ impl WorkerAllocator {
         // due in: (count, first join frame, last join frame).
         let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> =
             Default::default();
-        for alloc in bind_candidates {
+        for (alloc, claim) in bind_candidates.into_iter().zip(claims) {
             // Prefer a manually-pending (user-picked) worker before
-            // falling back to the auto-managed idle pool.
-            let holds_data =
-                manual_pending.is_empty() && on_data.contains_key(&alloc.confirmation_filter);
-            let pick = manual_pending
-                .pop()
-                .or_else(|| on_data.remove(&alloc.confirmation_filter))
-                .or_else(|| idle_workers.pop());
+            // falling back to the auto-managed idle pool, except for a join
+            // this node planned for an auto worker (`claim`).
+            let holds_data = (claim.is_some() || manual_pending.is_empty())
+                && on_data.contains_key(&alloc.confirmation_filter);
+            let pick = if claim.is_some() {
+                on_data
+                    .remove(&alloc.confirmation_filter)
+                    .or_else(|| idle_workers.pop())
+                    .or_else(|| manual_pending.pop())
+            } else {
+                manual_pending
+                    .pop()
+                    .or_else(|| on_data.remove(&alloc.confirmation_filter))
+                    .or_else(|| idle_workers.pop())
+            };
             if let Some(core_id) = pick {
                 if holds_data {
                     bound_on_data.push(format!(
@@ -3322,13 +3402,23 @@ impl WorkerAllocator {
                         .and_then(|ws| ws.into_iter().find(|w| w.core_id == core_id))
                         .map(|w| w.manually_managed)
                         .unwrap_or(false);
+                let why = match (claim.is_some(), manual) {
+                    (true, false) => "this node's own join, bound from the auto pool",
+                    (true, true) => "this node's own join; no idle auto worker was left",
+                    (false, true) => "an idle manual worker takes the next seat not planned here",
+                    (false, false) if holds_data => "the idle worker whose store holds the data",
+                    (false, false) => "the next idle auto worker",
+                };
                 info!(
                     core_id,
                     filter = hex::encode(&alloc.confirmation_filter),
                     status = ?alloc.status,
+                    join_frame = alloc.join_frame_number,
+                    planned_at = claim,
                     start_consensus,
                     manual,
                     holds_data,
+                    why,
                     "assigning shard to worker"
                 );
                 timed(&mut times.bind, || {
@@ -4571,6 +4661,101 @@ mod tests {
         assert!(logged.contains("registry_awaits_sync="), "{logged}");
         let workers = wm.range_workers().unwrap();
         assert_eq!(workers[0].pending_filter_frame, 0);
+    }
+
+    fn manual_idle_worker(core_id: u32) -> crate::worker::WorkerInfo {
+        crate::worker::WorkerInfo {
+            manually_managed: true,
+            ..idle_worker(core_id, 0)
+        }
+    }
+
+    fn filter_on(wm: &MockWorkerManager, core_id: u32) -> Vec<u8> {
+        let workers = wm.range_workers().unwrap();
+        let worker = workers.into_iter().find(|w| w.core_id == core_id);
+        worker.unwrap().filter
+    }
+
+    /// A join this node planned onto an auto worker binds to the auto pool,
+    /// never to an idle manual worker the operator keeps, and the reserved
+    /// worker is not released as having lost its join (devnet: five of five
+    /// planned joins bound to the idle manual worker).
+    #[test]
+    fn a_planned_auto_join_never_binds_an_idle_manual_worker() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(idle_worker(1, 100)); // auto, reserved by the join planned at 100
+        wm.add(manual_idle_worker(2));
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                joining_alloc(filter.clone(), 102),
+            ]))),
+            vec![0xAAu8; 32],
+        );
+        let logged = reconcile_logged(&alloc, 100 + PROPOSAL_TIMEOUT_FRAMES + 2);
+        let on = |c: u32| filter_on(&wm, c);
+        assert!(
+            on(1) == filter,
+            "planned_join_left_its_auto_worker: {logged}"
+        );
+        assert!(
+            on(2).is_empty(),
+            "the manual worker waits for the operator's join: {logged}"
+        );
+        assert!(!logged.contains("not on this worker"), "{logged}");
+        assert!(
+            logged.contains("planned_at=100"),
+            "the binding names the plan: {logged}"
+        );
+    }
+
+    /// A landed join no idle auto worker's reservation accounts for still
+    /// goes to an idle manual worker first: with no reservation, with one
+    /// proposed after the join, with one whose inclusion window ended before
+    /// it, and beside a planned join bound in the same pass.
+    #[test]
+    fn an_unreserved_landed_join_binds_an_idle_manual_worker_first() {
+        let filter = vec![0x01; 32];
+        let window_ended = 101 - quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW;
+        for pending in [0, 103, window_ended] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.add(idle_worker(1, pending));
+            wm.add(manual_idle_worker(2));
+            let alloc = WorkerAllocator::new(
+                wm.clone(),
+                Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                    joining_alloc(filter.clone(), 102),
+                ]))),
+                vec![0xAAu8; 32],
+            );
+            let logged = reconcile_logged(&alloc, 105);
+            let on = |c: u32| filter_on(&wm, c);
+            assert!(
+                on(2) == filter && on(1).is_empty(),
+                "unreserved_join_skipped_the_manual_worker (reserved at {pending}): {logged}"
+            );
+        }
+
+        let planned = vec![0x02; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(idle_worker(1, 100));
+        wm.add(manual_idle_worker(2));
+        wm.add(idle_worker(3, 0));
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                joining_alloc(filter.clone(), 95),
+                joining_alloc(planned.clone(), 102),
+            ]))),
+            vec![0xAAu8; 32],
+        );
+        let logged = reconcile_logged(&alloc, 105);
+        let on = |c: u32| filter_on(&wm, c);
+        assert!(
+            (on(1), on(2), on(3)) == (planned, filter, Vec::new()),
+            "unreserved_join_skipped_the_manual_worker beside a planned one: {logged}"
+        );
     }
 
     #[test]
