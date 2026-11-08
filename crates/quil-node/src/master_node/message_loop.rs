@@ -222,8 +222,12 @@ const MIRROR_HELD_PER_NUMBER: usize = 4;
 /// stored frame, so a gap behind a later certified frame still fills.
 const MIRROR_HOLD_WINDOW: u64 = MIRROR_HELD_PER_SHARD as u64;
 /// Bytes all held frames take, bookkeeping included; past it the shard
-/// holding the most bytes loses its farthest frame, so a flood of large
-/// frames on some shards cannot push out another shard's next frame.
+/// holding the most bytes loses its largest frame (of equal sizes, the
+/// farthest). A held frame of `n` bytes goes only while its shard holds
+/// nothing larger and no shard holds more bytes, so only while frames are
+/// held for more than about `MIRROR_HELD_BYTES / (MIRROR_HELD_PER_SHARD *
+/// n)` shards: frames padded toward [`MIRROR_HELD_FRAME_BYTES`] go before a
+/// small one. A held frame near that size has no such margin.
 const MIRROR_HELD_BYTES: usize = 64 << 20;
 /// Largest encoding of a frame held for its certified child. The genuine
 /// frames held on a mainnet master store copy carried no requests; this
@@ -347,17 +351,17 @@ impl ShardMirror {
         frame: &quil_types::proto::global::AppShardFrame,
         data: &[u8],
     ) -> Result<Mirrored, String> {
-        let header = frame.header.as_ref().ok_or("no header")?;
-        let certified = header
-            .public_key_signature_bls48581
-            .as_ref()
-            .is_some_and(|signature| !signature.signature.is_empty());
-        if frame.requests.len() > MIRROR_MAX_REQUESTS {
+        if over_request_bound(frame) {
             return Err(format!(
                 "carries {} request bundles, more than the {MIRROR_MAX_REQUESTS} checked",
                 frame.requests.len()
             ));
         }
+        let header = frame.header.as_ref().ok_or("no header")?;
+        let certified = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .is_some_and(|signature| !signature.signature.is_empty());
         match mirror_admits(&self.validator, frame) {
             Ok(()) => {}
             Err(reason) if certified => return Err(reason),
@@ -659,11 +663,12 @@ impl HeldFrames {
     }
 
     /// Hold `data` under `key`, unless held already. Past the bounds go, in
-    /// turn: the longest held at its number; the shard's farthest frame, so
-    /// an impostor numbered ahead cannot push out the real next frame; the
-    /// farthest frame of the shard holding the most bytes, so frames sent to
-    /// other shards cannot push it out either. Each step reads a bounded
-    /// range or the size index, never the whole map.
+    /// turn: the longest held at its number; the shard's farthest frame
+    /// (frames held below the stored head can make that the next one); the
+    /// largest frame of the shard holding the most bytes, of equal sizes the
+    /// farthest ([`MIRROR_HELD_BYTES`]). Each step reads one number's
+    /// frames, one shard's (at most [`MIRROR_HELD_PER_SHARD`]) or the size
+    /// index, never the whole map.
     fn insert(&mut self, key: HeldKey, data: Vec<u8>) -> bool {
         if self.frames.contains_key(&key) {
             return false;
@@ -699,68 +704,97 @@ impl HeldFrames {
             }
         }
         while self.bytes > self.byte_cap {
-            let Some((_, largest)) = self.by_size.last() else {
+            let Some((_, heaviest)) = self.by_size.last() else {
                 break;
             };
-            let largest: std::ops::RangeInclusive<HeldKey> =
-                (largest.clone(), 0, [0; 32])..=(largest.clone(), u64::MAX, [0xff; 32]);
-            let Some(farthest) = self
+            let heaviest: std::ops::RangeInclusive<HeldKey> =
+                (heaviest.clone(), 0, [0; 32])..=(heaviest.clone(), u64::MAX, [0xff; 32]);
+            let Some(largest) = self
                 .frames
-                .range(largest)
-                .next_back()
+                .range(heaviest)
+                .max_by(|(key, (_, data)), (other, (_, other_data))| {
+                    data.len()
+                        .cmp(&other_data.len())
+                        .then_with(|| key.cmp(other))
+                })
                 .map(|(key, _)| key.clone())
             else {
                 break;
             };
-            self.evict(&farthest);
+            self.evict(&largest);
         }
         true
     }
+}
+
+/// Whether `frame` carries more request bundles than the mirror checks:
+/// [`ShardMirror::offer`] refuses it first, before its certificate is.
+fn over_request_bound(frame: &quil_types::proto::global::AppShardFrame) -> bool {
+    frame.requests.len() > MIRROR_MAX_REQUESTS
 }
 
 /// How often the gossiped shard frames refused for the mirror are summarized.
 const MIRROR_REFUSAL_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Gossiped shard frames this node refused to mirror: one line at the first,
-/// then at most one per [`MIRROR_REFUSAL_SUMMARY`] with the count since.
+/// then at most one per [`MIRROR_REFUSAL_SUMMARY`] with the counts since.
 static MIRROR_REFUSALS: MirrorRefusals = MirrorRefusals::new();
 
+/// Refusals since the last line, and when it was logged.
+struct RefusalState {
+    /// Frames refused.
+    refused: u64,
+    /// Of those, frames over the request bundle bound ([`over_request_bound`]),
+    /// refused before their certificate was checked.
+    over_bound: u64,
+    last: Option<std::time::Instant>,
+}
+
 struct MirrorRefusals {
-    state: std::sync::Mutex<(u64, Option<std::time::Instant>)>,
+    state: std::sync::Mutex<RefusalState>,
 }
 
 impl MirrorRefusals {
     const fn new() -> Self {
         Self {
-            state: std::sync::Mutex::new((0, None)),
+            state: std::sync::Mutex::new(RefusalState {
+                refused: 0,
+                over_bound: 0,
+                last: None,
+            }),
         }
     }
 
-    /// `frame` was refused for `reason` at `now`; the count logged, if a
-    /// line is due.
+    /// `frame` was refused for `reason` at `now`; the counts logged
+    /// (refused, and of those over the bundle bound), if a line is due.
     fn note(
         &self,
         frame: &quil_types::proto::global::AppShardFrame,
         reason: String,
         now: std::time::Instant,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.0 += 1;
+        state.refused += 1;
+        if over_request_bound(frame) {
+            state.over_bound += 1;
+        }
         if state
-            .1
+            .last
             .is_some_and(|last| now.saturating_duration_since(last) < MIRROR_REFUSAL_SUMMARY)
         {
             return None;
         }
-        let refused = std::mem::take(&mut state.0);
-        let since = state.1.replace(now);
+        let refused = std::mem::take(&mut state.refused);
+        let over_bound = std::mem::take(&mut state.over_bound);
+        let since = state.last.replace(now);
         drop(state);
         let header = frame.header.as_ref();
         info!(
             refused,
+            over_bound,
             interval_s = since.map(|last| now.saturating_duration_since(last).as_secs()),
             filter = %hex::encode(header.map(|h| h.address.as_slice()).unwrap_or_default()),
             frame = header.map(|h| h.frame_number),
@@ -770,11 +804,13 @@ impl MirrorRefusals {
                      a missing anchored GLOBAL frame mean this node's GLOBAL view lags; a \
                      refused certificate, header or requests is a peer's forged frame (a frame \
                      without a certificate that verifies otherwise is held for its certified \
-                     child, not refused)",
-            "gossiped shard frames were not mirrored for serving: they did not verify (the \
-             latest named)"
+                     child, not refused); over_bound frames carried more request bundles than \
+                     the mirror checks and were refused unchecked, forged or genuine: this \
+                     node serves no frame at a genuine one's number",
+            "gossiped shard frames were not mirrored for serving: they did not verify, or \
+             carried more request bundles than are checked (the latest named)"
         );
-        Some(refused)
+        Some((refused, over_bound))
     }
 }
 
@@ -3523,8 +3559,8 @@ mod tests {
     }
 
     /// Past the byte bound the shard holding the most bytes loses its
-    /// farthest frame, so frames sent to other shards do not push out a
-    /// shard's next frame, however long it was held.
+    /// largest frame, of equal sizes the farthest, so frames sent to other
+    /// shards do not push out a lighter shard's frames, however long held.
     #[test]
     fn held_bytes_evict_from_the_shard_holding_the_most() {
         let key =
@@ -3545,8 +3581,8 @@ mod tests {
             !held.frames.contains_key(&key(2, 3, 0))
                 && held.frames.contains_key(&key(2, 1, 0))
                 && held.frames.len() == 4,
-            "BYTE-EVICTION: past the byte bound the farthest frame of the shard holding the \
-             most bytes goes"
+            "BYTE-EVICTION: past the byte bound the farthest of the equal frames of the shard \
+             holding the most bytes goes"
         );
         assert_eq!(
             (
@@ -3555,6 +3591,74 @@ mod tests {
             ),
             (4 * one, Some(2 * one))
         );
+    }
+
+    /// Past the byte bound a real frame does not go ahead of impostors padded
+    /// at its number. The attack: three frames padded toward the size bound
+    /// at the real next frame's number, their identities ground to sort
+    /// below it so it is its shard's farthest frame; frames on other shards,
+    /// each lighter than its shard, filling the bound until the real frame's
+    /// arrival crosses it. The heaviest shard's largest frame goes, an
+    /// impostor.
+    #[test]
+    fn held_bytes_evict_padded_impostors_before_the_real_frame() {
+        let key =
+            |filter: u8, number: u64, identity: u8| (vec![filter; 35], number, [identity; 32]);
+        let real = key(1, 9, 0x80);
+        let real_data = vec![0; 2000];
+        let real_cost = HeldFrames::cost(&real, &real_data);
+        let padded = MIRROR_HELD_FRAME_BYTES;
+        let mut held = HeldFrames::new(MIRROR_HELD_BYTES);
+        let impostors: Vec<HeldKey> = (1..MIRROR_HELD_PER_NUMBER as u8)
+            .map(|identity| key(1, 9, identity))
+            .collect();
+        for impostor in &impostors {
+            held.insert(impostor.clone(), vec![0; padded]);
+        }
+        let victim = held.bytes + real_cost;
+        // Two frames per other shard, each at most padded, to within half the
+        // real frame's cost of the bound.
+        let (mut filter, mut number) = (2u8, 1);
+        loop {
+            let empty = HeldFrames::cost(&key(filter, number, 0), &[]);
+            let wanted = (MIRROR_HELD_BYTES - held.bytes).saturating_sub(real_cost / 2);
+            if wanted <= empty {
+                break;
+            }
+            held.insert(
+                key(filter, number, 0),
+                vec![0; (wanted - empty).min(padded)],
+            );
+            if number == 2 {
+                (filter, number) = (filter + 1, 1);
+            } else {
+                number += 1;
+            }
+        }
+        assert!(held.shard_bytes.values().all(|&bytes| bytes < victim));
+        assert!(held.bytes <= MIRROR_HELD_BYTES && held.bytes + real_cost > MIRROR_HELD_BYTES);
+        assert_eq!(held.counts.evicted, 0);
+        assert!(
+            held.shard_bytes.len() > 30,
+            "frames on about 31 other shards"
+        );
+
+        held.insert(real.clone(), real_data);
+        assert!(
+            held.frames.contains_key(&real),
+            "BYTE-STEERING: past the byte bound the real frame, the smallest of the heaviest \
+             shard, was evicted ahead of the impostors padded at its number"
+        );
+        assert_eq!(held.counts.evicted, 1);
+        assert_eq!(
+            impostors
+                .iter()
+                .filter(|impostor| held.frames.contains_key(*impostor))
+                .count(),
+            impostors.len() - 1,
+            "one padded impostor goes"
+        );
+        assert!(held.bytes <= MIRROR_HELD_BYTES);
     }
 
     /// A frame over the check's bounds is refused before any check: one
@@ -3704,19 +3808,26 @@ mod tests {
     }
 
     /// Refusals log one line at once, then at most one per interval with the
-    /// count since the last.
+    /// counts since the last; frames over the bundle bound are counted
+    /// apart.
     #[test]
     fn mirror_refusals_are_summarized_per_interval() {
         let refusals = MirrorRefusals::new();
         let frame = quil_types::proto::global::AppShardFrame::default();
+        let over = quil_types::proto::global::AppShardFrame {
+            requests: vec![Default::default(); MIRROR_MAX_REQUESTS + 1],
+            ..Default::default()
+        };
         let start = std::time::Instant::now();
-        assert_eq!(refusals.note(&frame, "first".into(), start), Some(1));
-        for _ in 0..3 {
+        assert_eq!(refusals.note(&frame, "first".into(), start), Some((1, 0)));
+        for _ in 0..2 {
             assert_eq!(refusals.note(&frame, "again".into(), start), None);
         }
+        assert_eq!(refusals.note(&over, "bound".into(), start), None);
         assert_eq!(
             refusals.note(&frame, "later".into(), start + MIRROR_REFUSAL_SUMMARY),
-            Some(4)
+            Some((4, 1)),
+            "OVER-BOUND: refusals over the bundle bound were not counted apart"
         );
     }
 }
