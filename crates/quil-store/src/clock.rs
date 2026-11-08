@@ -906,7 +906,7 @@ mod retention;
 pub use retention::{CandidatePrune, StagedFrameCleanup};
 #[path = "shard_frame_retention.rs"]
 mod shard_retention;
-pub use shard_retention::{PrunedShard, UnservedFramePrune};
+pub use shard_retention::{KeptShard, PrunedShard, UnservedFramePrune};
 
 #[cfg(test)]
 mod writer_hold_tests {
