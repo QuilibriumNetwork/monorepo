@@ -164,7 +164,12 @@ fn unrouted_shard_message(
     let Some(address) = outline.header.map(|header| header.address) else {
         return false;
     };
+    // A peer can grind an address of any length onto a subscribed topic
+    // (3 of 256 bits, hashed from the whole address): a longer address
+    // than any shard's would make every key the worker builds from it as
+    // long as the peer likes.
     if address.is_empty()
+        || address.len() > quil_cw_consensus::handoff::MAX_FILTER_BYTES
         || bitmask != quil_engine::bitmasks::shard_frame_bitmask(&address).as_slice()
     {
         return false;
@@ -196,11 +201,19 @@ fn mirror_sender(received: &quil_p2p::node::ReceivedMessage) -> MirrorSender<'_>
 
 /// The frame's shard (its header's address), read without its bundles.
 fn frame_filter(data: &[u8]) -> Option<Vec<u8>> {
-    <FrameOutline as prost::Message>::decode(data)
+    <FrameHeaderOnly as prost::Message>::decode(data)
         .ok()?
         .header
         .map(|header| header.address)
         .filter(|address| !address.is_empty())
+}
+
+/// A shard frame read for its header only: its bundles are skipped, not
+/// counted.
+#[derive(Clone, PartialEq, prost::Message)]
+struct FrameHeaderOnly {
+    #[prost(message, optional, tag = "1")]
+    header: Option<quil_types::proto::global::FrameHeader>,
 }
 
 /// What the loop reads of a gossiped shard frame before it queues it: the
@@ -939,7 +952,8 @@ impl MirrorFeed {
     /// Start the worker thread: it hands each queued frame to `check`,
     /// reads a shard's committee members (peer IDs) with `members` before
     /// it checks the shard's frame, at most once per
-    /// [`MIRROR_MEMBERS_REFRESH`], and is listed for [`stop_shard_mirrors`].
+    /// [`MIRROR_MEMBERS_REFRESH`] (`None`: no registered shard, nothing is
+    /// kept), and is listed for [`stop_shard_mirrors`].
     fn spawn(
         check: impl FnMut(&[u8]) + Send + 'static,
         members: impl FnMut(&[u8]) -> Option<Vec<Vec<u8>>> + Send + 'static,
@@ -1077,18 +1091,31 @@ fn run_mirror(
         if let Some(data) = state.queue.pop() {
             let now = std::time::Instant::now();
             state.checking = Some(now);
-            let stale = frame_filter(&data).filter(|filter| !state.members_fresh(filter, now));
             drop(state);
+            // The frame is decoded off the queue lock, which the loop takes;
+            // under it only the (bounded) address is looked up.
+            let stale =
+                frame_filter(&data).filter(|filter| !shared.lock().members_fresh(filter, now));
             if let Some(filter) = stale {
-                // A shard with no committed session has no members: its
-                // frames queue under their connection.
-                let peers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_members(&filter)
-                }))
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-                shared.lock().keep_members(filter, peers, now);
+                })) {
+                    // A shard with no committed session has no members: its
+                    // frames queue under their connection.
+                    Ok(Some(peers)) => shared.lock().keep_members(filter, peers, now),
+                    // No registered shard: nothing is kept for it.
+                    Ok(None) => {}
+                    Err(panic) => {
+                        let panic = format!(
+                            "reading a shard's committee members: {}",
+                            panic_text(panic.as_ref())
+                        );
+                        let line = shared.lock().panics.note(now, panic, data.len());
+                        if let Some(line) = line {
+                            line.log();
+                        }
+                    }
+                }
             }
             // The default panic hook still prints each panic: quieting it
             // takes a process-wide hook (`std::panic::set_hook`), which this
@@ -1897,6 +1924,19 @@ pub(crate) async fn add_archive_record_endpoints(
     first
 }
 
+/// The members `read` gives of shard `filter`, none when no session names
+/// them, only if the prover registry names the shard: a peer names any
+/// filter it likes, and only registered shards are read and kept.
+fn registered_shard_members(
+    tracked: &quil_engine::archive_ingest::TrackedShards,
+    filter: &[u8],
+    read: impl FnOnce() -> Option<Vec<Vec<u8>>>,
+) -> Option<Vec<Vec<u8>>> {
+    tracked
+        .registered(filter)
+        .then(|| read().unwrap_or_default())
+}
+
 /// The peer IDs of shard `filter`'s committee members in the committed
 /// GLOBAL session, if it has one: the mirror queues a frame its member
 /// signed under the member ([`MirrorState::sender_key`]).
@@ -2075,9 +2115,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         );
         let clock = clock_store_recv.clone();
         let global = crdt_for_recv.clone();
+        let tracked = mirror.tracked.clone();
         MirrorFeed::spawn(
             move |data| mirror_queued(clock.as_ref(), &mirror, data),
-            move |filter| shard_member_peers(&global, filter),
+            move |filter| {
+                registered_shard_members(&tracked, filter, || shard_member_peers(&global, filter))
+            },
         )
     });
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
@@ -5167,6 +5210,94 @@ mod tests {
             .shared
             .lock()
             .members_fresh(&shard.filter, std::time::Instant::now()));
+    }
+
+    /// The worker reads and keeps committee members only for shards the
+    /// prover registry names, and the loop refuses an address longer than
+    /// any shard's: frames naming made-up shards, or an address of any
+    /// length ground onto a subscribed topic, cost no read and no key. A
+    /// member read that panics is counted with the checks that panic.
+    #[test]
+    fn members_are_read_and_kept_only_for_registered_shards() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let frame_at = |address: Vec<u8>| {
+            let mut frame = shard.frame(7);
+            frame.header.as_mut().unwrap().address = address;
+            prost::Message::encode_to_vec(&frame)
+        };
+        let peer = MirrorSender {
+            signer: b"peer",
+            via: b"peer",
+        };
+
+        let feed = MirrorFeed::new();
+        // The whole address picks the topic: the long address is offered on
+        // its own topic, as one ground onto a subscribed topic would be.
+        let long = [shard.filter.as_slice(), &[7; 64]].concat();
+        let long_topic = quil_engine::bitmasks::shard_frame_bitmask(&long);
+        assert!(
+            !unrouted_shard_message(&long_topic, peer, frame_at(long), &feed)
+                && feed.take().is_none(),
+            "LONG-ADDRESS: an address longer than any shard filter was queued"
+        );
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::new(AtomicUsize::new(0));
+        let feed = {
+            let (reads, checked) = (reads.clone(), checked.clone());
+            let tracked = shard.mirror.tracked.clone();
+            MirrorFeed::spawn(
+                move |_| {
+                    checked.fetch_add(1, SeqCst);
+                },
+                move |filter| {
+                    registered_shard_members(&tracked, filter, || {
+                        reads.fetch_add(1, SeqCst);
+                        Some(vec![b"member".to_vec()])
+                    })
+                },
+            )
+        };
+        feed.offer(&topic, b"peer", frame_at(shard.filter.clone()), 0);
+        for suffix in 0..8u8 {
+            let made_up = [shard.filter.as_slice(), &[suffix; 32]].concat();
+            feed.offer(&topic, b"peer", frame_at(made_up), 0);
+        }
+        wait_for("the worker did not check the queued frames", || {
+            checked.load(SeqCst) == 9
+        });
+        let kept: Vec<Vec<u8>> = feed.shared.lock().members.keys().cloned().collect();
+        assert_eq!(
+            (kept, reads.load(SeqCst)),
+            (vec![shard.filter.clone()], 1),
+            "MEMBERS-ANY-SHARD: members were read or kept for a shard the registry does not name"
+        );
+
+        let capture = Capture::default();
+        let _logs = capture.install();
+        let checked = Arc::new(AtomicUsize::new(0));
+        let feed = {
+            let checked = checked.clone();
+            MirrorFeed::spawn(
+                move |_| {
+                    checked.fetch_add(1, SeqCst);
+                },
+                |_| panic!("a planted members panic"),
+            )
+        };
+        feed.offer(&topic, b"peer", frame_at(shard.filter.clone()), 0);
+        wait_for("a members read that panics stopped the worker", || {
+            checked.load(SeqCst) == 1
+        });
+        assert_eq!(
+            capture
+                .lines_with("reading a shard's committee members: a planted members panic")
+                .len(),
+            1,
+            "MEMBERS-PANIC: a members read that panicked was not counted"
+        );
     }
 
     /// Past its bounds the queue drops a sender's costliest frame (past the
