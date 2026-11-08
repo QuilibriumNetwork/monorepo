@@ -696,7 +696,8 @@ impl HealthRegistry {
     /// needs fresh observations of what it compares: without them it tracks
     /// nothing. States that pass at a restart or a rebind (no worker yet, a
     /// blocked start, nothing materialized yet, a worker bound before its
-    /// allocation shows) count once they held for the base window.
+    /// allocation shows, a stale epoch or a missed join read ahead of the
+    /// prover registry) count once they held for the base window.
     fn judge_seats(&mut self, now_ms: u64) -> Vec<Judged> {
         let workers_seen = fresh_at(self.workers_seen_ms, now_ms);
         let allocations_seen = fresh_at(self.allocations_seen_ms, now_ms);
@@ -838,6 +839,15 @@ impl HealthRegistry {
             })
             .collect();
 
+        // A stale epoch and a missed join are read at this node's freshest
+        // frame, which runs ahead of its prover registry while it catches
+        // up, as after a restart: they count after the base window. A
+        // rejection or a kick is recorded in the registry and counts at once.
+        let epoch_stale = allocations
+            .iter()
+            .filter(|a| a.status == EffectiveStatus::ExpiredEpoch)
+            .filter_map(|a| over_window(ConditionKind::AllocationEpochStale, 0, &a.filter, 0))
+            .collect();
         let epoch = self.epoch;
         let rejected = allocations
             .iter()
@@ -853,7 +863,12 @@ impl HealthRegistry {
                 a.lost_epoch
                     .is_some_and(|lost| lost.saturating_add(1) >= epoch)
             })
-            .map(allocation)
+            .filter_map(|a| {
+                if a.status != EffectiveStatus::ExpiredJoining {
+                    return Some(allocation(a));
+                }
+                over_window(ConditionKind::AllocationsRejected, 0, &a.filter, 0)
+            })
             .collect();
         let with_status = |status: EffectiveStatus| {
             allocations
@@ -906,10 +921,10 @@ impl HealthRegistry {
             },
             Judged {
                 kind: ConditionKind::AllocationEpochStale,
-                shards: with_status(EffectiveStatus::ExpiredEpoch),
+                shards: epoch_stale,
                 tracked: shown(allocations),
                 observed_unix_ms: allocations_seen,
-                threshold: 0,
+                threshold: base_secs,
                 wait: None,
                 global: None,
                 log_evidence: None,
@@ -3125,6 +3140,7 @@ mod tests {
         ];
         let mut reg = HealthRegistry::default();
         judge_seats_at(&mut reg, &[], &seats, T0);
+        judge_seats_at(&mut reg, &[], &seats, T0 + BASE_WINDOW_MS);
         let c = condition(&reg, ConditionKind::AllocationEpochStale).expect("stale epoch");
         assert_eq!(listed(&c), [(2, 0)]);
         assert_eq!((c.affected, c.tracked), (1, 4));
@@ -3132,6 +3148,64 @@ mod tests {
         assert_eq!(
             notice_text(&c),
             "Allocation epoch stale (re-confirm!): 1/4 allocations."
+        );
+    }
+
+    /// A stale epoch and a missed join are read at the node's freshest
+    /// frame, ahead of its prover registry while it catches up, as after a
+    /// restart: they count once they held for the base window, and a
+    /// registry that catches up within it starts nothing. A rejection
+    /// counts at once.
+    #[test]
+    fn stale_epochs_and_missed_joins_count_after_the_base_window() {
+        let missed = AllocationObservation {
+            lost_epoch: Some(10),
+            ..seat(3, EffectiveStatus::ExpiredJoining)
+        };
+        let rejected = AllocationObservation {
+            lost_epoch: Some(10),
+            ..seat(4, EffectiveStatus::Rejected)
+        };
+        let behind = [
+            seat(1, EffectiveStatus::ExpiredEpoch),
+            seat(2, EffectiveStatus::ExpiredEpoch),
+            missed.clone(),
+            rejected.clone(),
+        ];
+        let mut reg = HealthRegistry::default();
+        judge_seats_at(&mut reg, &[], &behind, T0);
+        assert!(
+            condition(&reg, ConditionKind::AllocationEpochStale).is_none(),
+            "a stale epoch read ahead stays unlisted before the base window"
+        );
+        let lost = condition(&reg, ConditionKind::AllocationsRejected).expect("rejected");
+        assert_eq!(
+            listed(&lost),
+            [(4, 0)],
+            "a missed join read ahead stays unlisted before the base window"
+        );
+        let caught_up = [
+            seat(1, EffectiveStatus::Active),
+            seat(2, EffectiveStatus::ExpiredEpoch),
+            seat(3, EffectiveStatus::Active),
+            rejected,
+        ];
+        judge_seats_at(&mut reg, &[], &caught_up, T0 + 15_000);
+        let now = T0 + BASE_WINDOW_MS;
+        judge_seats_at(&mut reg, &[], &caught_up, now);
+        let c = condition(&reg, ConditionKind::AllocationEpochStale).expect("still stale");
+        assert_eq!(listed(&c), [(2, 0)]);
+        assert_eq!(c.shards[0].unchanged_since_unix_ms, T0);
+        assert_eq!(
+            listed(&condition(&reg, ConditionKind::AllocationsRejected).expect("rejected")),
+            [(4, 0)]
+        );
+        let still_missed = [missed, seat(4, EffectiveStatus::Active)];
+        judge_seats_at(&mut reg, &[], &still_missed, now);
+        judge_seats_at(&mut reg, &[], &still_missed, now + BASE_WINDOW_MS);
+        assert_eq!(
+            listed(&condition(&reg, ConditionKind::AllocationsRejected).expect("missed")),
+            [(3, 0)]
         );
     }
 
