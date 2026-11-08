@@ -328,6 +328,74 @@ pub fn sync_blob_has_unbound_values(blob: &[u8]) -> bool {
         .is_some_and(|root| root.has_unbound_value())
 }
 
+/// A confidential field (`hypergraph_intrinsic::confidential`): `[commitment
+/// 32][kem_ct 1039][nonce 12][u32 LE aead_len][aead_ct]`, its commitment the
+/// leaf's `hash_target`.
+const CONFIDENTIAL_HEADER_LEN: usize = 32 + 1039 + 12 + 4;
+/// A pre-2.1 verifiable encryption (Go `MPCitHVerEnc.ToBytes`): 621 bytes
+/// ending in its 57-byte statement, the leaf's `hash_target`.
+const LEGACY_VERENC_LEN: usize = 621;
+const LEGACY_VERENC_STATEMENT_AT: usize = 564;
+/// Both encrypted field kinds sit at big-endian `u64` index keys
+/// (`encrypted_to_vertex_tree`, Go `EncryptedToVertexTree`).
+const ENCRYPTED_FIELD_KEY_LEN: usize = 8;
+
+/// Whether the commitment over a vertex's field tree binds `leaf`'s value. A
+/// leaf with a `hash_target` commits the target in place of its value (with
+/// no mark telling the two apart), so its value is bound only by a relation
+/// to the target the node checks here. Each class that legitimately carries
+/// one has such a relation:
+/// - a sealed sub-tree (a metadata vertex's seals, a token's configuration):
+///   the target is the content digest of the tree the value holds, so
+///   another value would need a SHA-512 second preimage;
+/// - a confidential field at an index key: the value leads with the target as
+///   its commitment, which its reader checks the opened plaintext against
+///   (a hash of salt and plaintext). The ciphertext is not bound, as it is not
+///   for the writer either: a source can make it unreadable, never read as
+///   another plaintext;
+/// - a pre-2.1 verifiable encryption at an index key: the value ends in the
+///   target as its statement.
+///
+/// The encrypted kinds hold only at index keys: elsewhere an honest 32- or
+/// 57-byte field could be moved into the target and served behind a
+/// fabricated ciphertext. Records keyed by schema order (coins, registry
+/// records, settlement and delivery records) never carry a target.
+fn leaf_value_bound(leaf: &quil_tries::LeafNode) -> bool {
+    let (value, target) = (leaf.value.as_slice(), leaf.hash_target.as_slice());
+    if target.is_empty() {
+        return true;
+    }
+    let sealed = quil_tries::deserialize_go_tree(value)
+        .is_ok_and(|root| quil_tries::VectorCommitmentTree { root }.content_digest() == target);
+    if sealed {
+        return true;
+    }
+    if leaf.key.len() != ENCRYPTED_FIELD_KEY_LEN {
+        return false;
+    }
+    let confidential = value.len() >= CONFIDENTIAL_HEADER_LEN
+        && value[..32] == *target
+        && <[u8; 4]>::try_from(&value[CONFIDENTIAL_HEADER_LEN - 4..CONFIDENTIAL_HEADER_LEN])
+            .is_ok_and(|len| {
+                u32::from_le_bytes(len) as usize == value.len() - CONFIDENTIAL_HEADER_LEN
+            });
+    let legacy = value.len() == LEGACY_VERENC_LEN && value[LEGACY_VERENC_STATEMENT_AT..] == *target;
+    confidential || legacy
+}
+
+/// The key of the first field of a synced vertex blob whose value the
+/// authenticated leaf does not bind ([`leaf_value_bound`]), if any. A blob
+/// that is not a field tree is committed as raw bytes, so binds them.
+pub fn sync_blob_unbound_field(blob: &[u8]) -> Option<Vec<u8>> {
+    let root = quil_tries::deserialize_go_tree(blob).ok().flatten()?;
+    let mut leaves = Vec::new();
+    root.collect_leaves(&mut leaves);
+    leaves
+        .into_iter()
+        .find(|leaf| !leaf_value_bound(leaf))
+        .map(|leaf| leaf.key.clone())
+}
+
 /// Marks an application phase whose confinement commit still needs its
 /// records outside the kept shards swept (see `confine_forest`).
 fn confinement_sweep_key(app: &[u8; 32], phase_idx: usize) -> Vec<u8> {
@@ -3983,9 +4051,9 @@ impl HypergraphCrdt {
             ));
         }
         let leaves = &plan.remaining()[..blobs.len()];
-        let bind_values = plan.phase_idx == 0
-            && plan.shard_id.starts_with(&[0xff; 32])
-            && quil_types::consensus::vertex_value_binding_scheduled();
+        let scheduled = quil_types::consensus::vertex_value_binding_scheduled();
+        let bind_values =
+            scheduled && plan.phase_idx == 0 && plan.shard_id.starts_with(&[0xff; 32]);
         for ((key, leaf), blob) in leaves.iter().zip(blobs) {
             let matches = match leaf {
                 Some(leaf) => sync_blob_matches(plan.phase_idx, leaf, blob)?,
@@ -4000,6 +4068,19 @@ impl HypergraphCrdt {
                 return Err(QuilError::InvalidArgument(
                     "synced GLOBAL vertex carries a field its commitment does not bind".into(),
                 ));
+            }
+            // On every shard, a field behind a `hash_target` installs only
+            // with the value its target binds: the leaf authenticates the
+            // target, and the node reads the value.
+            if scheduled {
+                if let Some(field) = sync_blob_unbound_field(blob) {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "synced vertex {} carries field {} whose value its commitment does \
+                         not bind",
+                        hex::encode(key),
+                        hex::encode(field)
+                    )));
+                }
             }
         }
         let _forest_guard = self.forest_write_lock.lock().unwrap();
@@ -7335,7 +7416,11 @@ mod sync_value_binding_tests {
     /// Install `blob` as the one GLOBAL vertex at `data_address` on a fresh
     /// node, by a sync from a node that holds it.
     fn sync_one(data_address: [u8; 32], blob: &[u8]) -> Result<()> {
-        let address = [0xff; 32];
+        sync_into([0xff; 32], data_address, blob)
+    }
+
+    /// [`sync_one`] into the shard of `address`.
+    fn sync_into(address: [u8; 32], data_address: [u8; 32], blob: &[u8]) -> Result<()> {
         let archive = crdt();
         let location = Location {
             app_address: address,
@@ -7365,18 +7450,127 @@ mod sync_value_binding_tests {
 
     /// GLOBAL records carry no `hash_target` leaf. Once the binding is
     /// scheduled, a synced GLOBAL vertex whose field the authenticated leaf
-    /// does not bind is refused; the metadata vertex may seal sub-trees.
+    /// does not bind is refused; the metadata vertex may seal sub-trees,
+    /// bound by their content digest.
     #[test]
     fn a_scheduled_binding_refuses_a_global_vertex_with_an_unbound_field() {
         let bound = blob(&[4], &[0xaa; 8], &[]);
         let unbound = blob(&[4], &[0xaa; 8], &[0xbb; 8]);
+        let mut sub = quil_tries::VectorCommitmentTree::new();
+        sub.insert(&[0], b"configuration", &[], &BigInt::from(13))
+            .unwrap();
+        let sealed = blob(
+            &[16 << 2],
+            &quil_tries::serialize_go_tree(sub.root.as_ref()).unwrap(),
+            &sub.content_digest(),
+        );
         quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(u64::MAX));
         assert!(sync_one([1; 32], &unbound).is_ok(), "inert until scheduled");
         quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(10));
         assert!(sync_one([1; 32], &bound).is_ok());
         assert!(sync_one([1; 32], &unbound).is_err());
-        assert!(sync_one([0xff; 32], &unbound).is_ok());
+        assert!(sync_one([0xff; 32], &sealed).is_ok());
+        assert!(sync_one([0xff; 32], &unbound).is_err());
         quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+    }
+
+    /// A confidential field's canonical bytes: `commitment`, a KEM ciphertext,
+    /// a nonce and `aead_len` AEAD bytes, whose contents a sync never reads.
+    fn confidential(commitment: &[u8; 32], aead_len: usize) -> Vec<u8> {
+        let mut field = commitment.to_vec();
+        field.extend_from_slice(&[0x5a; 1039 + 12]);
+        field.extend_from_slice(&(aead_len as u32).to_le_bytes());
+        field.resize(field.len() + aead_len, 0xa5);
+        field
+    }
+
+    /// A pre-2.1 verifiable encryption's 621 bytes, ending in `statement`.
+    fn legacy_verenc(statement: &[u8; 57]) -> Vec<u8> {
+        let mut field = vec![0x6b; 564];
+        field.extend_from_slice(statement);
+        field
+    }
+
+    /// Sync each of `cases` alone into an application shard; each must be
+    /// refused.
+    fn refused_on_an_app_shard(cases: Vec<(&str, Vec<u8>)>) {
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        for (case, blob) in cases {
+            if sync_into([0x2a; 32], [1; 32], &blob).is_ok() {
+                quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+                panic!("UNBOUND-FIELD: an application-shard sync installed {case}");
+            }
+        }
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+    }
+
+    /// A leaf with a `hash_target` commits the target, not its value. On
+    /// an application shard a source serves a field whose value that target
+    /// does not bind: a coin position moved into the target beside a forged
+    /// one, an arbitrary target, a sealed sub-tree under another digest, and
+    /// encrypted fields under another commitment or statement. Each is
+    /// refused, as on GLOBAL.
+    #[test]
+    fn an_app_shard_sync_refuses_a_field_its_hash_target_does_not_bind() {
+        let mut sub = quil_tries::VectorCommitmentTree::new();
+        sub.insert(&[0], b"forged configuration", &[], &BigInt::from(20))
+            .unwrap();
+        let sub = quil_tries::serialize_go_tree(sub.root.as_ref()).unwrap();
+        // Coin position key `[4 << 2]`; a token's configuration `[16 << 2]`.
+        refused_on_an_app_shard(vec![
+            (
+                "a forged coin position",
+                blob(&[4 << 2], &900_001u64.to_be_bytes(), &3u64.to_be_bytes()),
+            ),
+            (
+                "a field under an arbitrary target",
+                blob(&[0; 8], &[0xcc; 64], &[0xee; 32]),
+            ),
+            (
+                "a sealed sub-tree under another digest",
+                blob(&[16 << 2], &sub, &[0xdd; 64]),
+            ),
+            (
+                "a confidential field under another commitment",
+                blob(&[0; 8], &confidential(&[0x11; 32], 48), &[0x22; 32]),
+            ),
+            (
+                "a verifiable encryption under another statement",
+                blob(&[0; 8], &legacy_verenc(&[0x33; 57]), &[0x44; 57]),
+            ),
+        ]);
+    }
+
+    /// Encrypted fields bind their value through the commitment or statement
+    /// inside it, so they install at the index keys they live at and nowhere
+    /// else: elsewhere an honest 32- or 57-byte field, moved into the target,
+    /// would be served behind a fabricated ciphertext.
+    #[test]
+    fn an_app_shard_sync_binds_encrypted_fields_only_at_index_keys() {
+        let (commitment, statement) = ([0x11; 32], [0x33; 57]);
+        let at_index = [
+            blob(&[0; 8], &confidential(&commitment, 48), &commitment),
+            blob(&1u64.to_be_bytes(), &legacy_verenc(&statement), &statement),
+        ];
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        for field in at_index {
+            let synced = sync_into([0x2a; 32], [1; 32], &field);
+            assert!(
+                synced.is_ok(),
+                "an encrypted field at its index installs: {synced:?}"
+            );
+        }
+        // A coin's owner `[1 << 2]` and commitment `[2 << 2]` keys.
+        refused_on_an_app_shard(vec![
+            (
+                "a 32-byte field behind a confidential field",
+                blob(&[1 << 2], &confidential(&commitment, 48), &commitment),
+            ),
+            (
+                "a 57-byte field behind a verifiable encryption",
+                blob(&[2 << 2], &legacy_verenc(&statement), &statement),
+            ),
+        ]);
     }
 }
 

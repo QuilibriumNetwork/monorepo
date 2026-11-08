@@ -704,4 +704,177 @@ mod tests {
         )
         .is_err());
     }
+
+    /// Install `served` as the vertex at `address` of `application` on a
+    /// fresh node, by a sync from a node holding `held`: the source's leaf
+    /// authenticates the served blob, as a remote sync source's does.
+    fn sync_app_vertex(
+        application: [u8; 32],
+        address: [u8; 32],
+        held: &[u8],
+        served: &[u8],
+    ) -> (std::sync::Arc<quil_hypergraph::HypergraphCrdt>, Result<()>) {
+        use quil_hypergraph::testing::{CrdtTreeReader, MemStore, StubProver};
+        use std::sync::Arc;
+        let node = || {
+            Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(MemStore::new()),
+                Arc::new(StubProver),
+            ))
+        };
+        let source = node();
+        let location = quil_hypergraph::Location {
+            app_address: application,
+            data_address: address,
+        };
+        source.add_vertex(&location, held).unwrap();
+        source.commit(1).unwrap();
+        let (version, root) = source.serve_forest_head(&application, 0).unwrap();
+        let reader = CrdtTreeReader {
+            source,
+            shard_id: application.to_vec(),
+            phase: 0,
+        };
+        let target = node();
+        let anchor = quil_forest::SubtreeSyncAnchor::AppRoot(root);
+        let mut plan = target
+            .prepare_phase_sync(&reader, version, &application, 0, &[], Some(anchor))
+            .unwrap();
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        let synced = target.apply_sync_chunk(&mut plan, &[served.to_vec()]);
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+        (target, synced)
+    }
+
+    /// A sync checks each served blob against its authenticated leaf.
+    /// On an application shard a source serves a coin whose position leaf
+    /// carries a forged value with the committed one as its `hash_target`; it
+    /// drops the ignored size fields and pads past the root node, so the leaf
+    /// and the root still match. The position is outside the coin's content
+    /// address, so a node that installs the blob reads the forged position
+    /// as committed state. The sync must refuse it.
+    #[test]
+    fn an_app_shard_sync_refuses_a_forged_coin_position() {
+        use quil_tries::VectorCommitmentNode;
+        let (network, application) = ([1u8; 32], [0x2a; 32]);
+        let context = parameter_context(&network, &application);
+        let (address, tree) = create_coin(&context, 42, &output(), 3).unwrap();
+        let honest = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        fn forge(node: &mut VectorCommitmentNode, key: &[u8], value: &[u8]) {
+            match node {
+                VectorCommitmentNode::Leaf(leaf) => {
+                    if leaf.key == key {
+                        leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    }
+                    leaf.commitment.clear();
+                    leaf.size = BigInt::from(0);
+                }
+                VectorCommitmentNode::Branch(branch) => {
+                    branch.commitment.clear();
+                    branch.size = BigInt::from(0);
+                    for child in branch.children.iter_mut().flatten() {
+                        forge(child, key, value);
+                    }
+                }
+            }
+        }
+        let mut root = quil_tries::deserialize_go_tree(&honest).unwrap().unwrap();
+        let key = super::super::materialize::COIN_POSITION_KEY;
+        forge(&mut root, &key, &900_001u64.to_be_bytes());
+        let mut forged = quil_tries::serialize_go_tree(Some(&root)).unwrap();
+        assert!(
+            forged.len() <= honest.len(),
+            "precondition: room in ignored fields"
+        );
+        forged.resize(honest.len(), 0);
+        assert_ne!(forged, honest);
+        assert_eq!(
+            quil_tries::vertex_leaf_value(&forged).unwrap(),
+            quil_tries::vertex_leaf_value(&honest).unwrap(),
+            "precondition: the forged blob keeps the authenticated leaf"
+        );
+
+        let vertex_key = [application.as_slice(), address.as_slice()].concat();
+        let read = |node: std::sync::Arc<quil_hypergraph::HypergraphCrdt>| {
+            let state = HypergraphState::new(node);
+            let disc = vertex_adds_discriminator().unwrap();
+            let blob = state.get(&application, &address, &disc).unwrap().unwrap();
+            decode_stored_snapshot_coin(&context, &application, &vertex_key, &blob)
+        };
+        let (node, synced) = sync_app_vertex(application, address, &honest, &honest);
+        synced.expect("the honest coin syncs");
+        assert_eq!(read(node).unwrap().unwrap().position, 3);
+
+        let (node, synced) = sync_app_vertex(application, address, &honest, &forged);
+        if synced.is_ok() {
+            let read = read(node);
+            panic!(
+                "UNBOUND-FIELD: an application-shard sync installed coin {} while its \
+                 authenticated leaf commits position 3 as hash_target; the node reads {:?}",
+                hex::encode(&address[..8]),
+                read.map(|coin| coin.map(|coin| coin.position))
+            );
+        }
+    }
+
+    /// The fields that legitimately carry a `hash_target` still install by an
+    /// application-shard sync: a hypergraph vertex's confidential fields, and
+    /// a metadata vertex's sealed sub-trees, empty or not (a token's
+    /// configuration is sealed the same way).
+    #[test]
+    fn every_hash_target_producer_installs_by_an_app_shard_sync() {
+        use crate::hypergraph_intrinsic::{confidential, vertex_ops};
+        let reader = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let fields: Vec<Vec<u8>> = [&b"first field"[..], &[0u8; 300][..]]
+            .iter()
+            .enumerate()
+            .map(|(i, plaintext)| {
+                let field = confidential::seal(plaintext, &reader.public, &[i as u8; 32], &[7; 12])
+                    .unwrap();
+                confidential::encode(&field)
+            })
+            .collect();
+        let vertex = vertex_ops::encrypted_to_vertex_tree(&fields).unwrap();
+        let mut metadata = VectorCommitmentTree::new();
+        let mut empty = VectorCommitmentTree::new();
+        let mut configuration = VectorCommitmentTree::new();
+        configuration
+            .insert(&[0], b"configuration", &[], &BigInt::from(13))
+            .unwrap();
+        configuration
+            .insert(&[1 << 2], &[0x5a; 74], &[], &BigInt::from(74))
+            .unwrap();
+        let prover = quil_hypergraph::testing::StubProver;
+        crate::hypergraph_state::seal_metadata_state_at_index(
+            &mut metadata,
+            &mut empty,
+            0,
+            &prover,
+        )
+        .unwrap();
+        crate::hypergraph_state::seal_metadata_state_at_index(
+            &mut metadata,
+            &mut configuration,
+            16,
+            &prover,
+        )
+        .unwrap();
+        metadata
+            .insert(&[0xff; 32], &[0x11; 32], &[], &BigInt::from(32))
+            .unwrap();
+        for (what, tree, address) in [
+            ("confidential fields", vertex, [3; 32]),
+            ("sealed metadata", metadata, [0xff; 32]),
+        ] {
+            assert!(
+                tree.has_unbound_values(),
+                "precondition: {what} carry hash_target"
+            );
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            let (_, synced) = sync_app_vertex([0x2a; 32], address, &blob, &blob);
+            if let Err(error) = synced {
+                panic!("LEGIT-REFUSED: an application-shard sync refused {what}: {error}");
+            }
+        }
+    }
 }

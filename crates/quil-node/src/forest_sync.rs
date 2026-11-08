@@ -232,7 +232,7 @@ async fn fetch_sync_blobs(
     source_version: u64,
     leaves: &[([u8; 32], Option<Vec<u8>>)],
 ) -> Result<Vec<Vec<u8>>> {
-    use quil_hypergraph::crdt::sync_blob_matches;
+    use quil_hypergraph::crdt::{sync_blob_matches, sync_blob_unbound_field};
     let shard = app_shard_key(shard_id)
         .ok_or_else(|| QuilError::InvalidArgument("invalid sync shard".into()))?;
     let mut blobs: Vec<Option<Vec<u8>>> = Vec::with_capacity(leaves.len());
@@ -250,8 +250,15 @@ async fn fetch_sync_blobs(
         }
         let mut vertex_id = shard.l2.to_vec();
         vertex_id.extend_from_slice(key);
+        // A held blob whose field its leaf does not bind (installed from a
+        // source before the sync checked) is fetched again, not reused.
         match crdt.peek_synced_blob(&shard, phase as usize, &vertex_id) {
-            Some(blob) if sync_blob_matches(phase as usize, leaf, &blob)? => blobs.push(Some(blob)),
+            Some(blob)
+                if sync_blob_matches(phase as usize, leaf, &blob)?
+                    && sync_blob_unbound_field(&blob).is_none() =>
+            {
+                blobs.push(Some(blob))
+            }
             _ => {
                 blobs.push(None);
                 wanted.push((i, vertex_id));

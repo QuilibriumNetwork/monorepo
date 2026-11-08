@@ -51,6 +51,22 @@ impl VectorCommitmentTree {
         get_recursive(self.root.as_ref(), key, 0)
     }
 
+    /// SHA-512 over the leaves in tree order, each as `(u32 BE key length,
+    /// key, u32 BE value length, value)`. A sealed sub-tree's leaf carries
+    /// this content digest as its `hash_target`, so the digest of the tree
+    /// read back from the leaf's value binds that value.
+    pub fn content_digest(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        for (k, v) in self.leaves() {
+            h.update((k.len() as u32).to_be_bytes());
+            h.update(&k);
+            h.update((v.len() as u32).to_be_bytes());
+            h.update(&v);
+        }
+        h.finalize().to_vec()
+    }
+
     /// Whether any leaf carries a value its commitment does not bind.
     pub fn has_unbound_values(&self) -> bool {
         self.root

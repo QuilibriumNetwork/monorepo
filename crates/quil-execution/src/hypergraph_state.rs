@@ -25,17 +25,10 @@ use quil_hypergraph::HypergraphCrdt;
 /// A PQ-safe content digest of a vector-commitment tree: `SHA-512` over its flat
 /// `(field_key, value)` leaves. Replaces the KZG/BLS48-581 `commit()` for the
 /// vestigial metadata `hash_target` and the compute-deploy domain — hashes tree
-/// CONTENT, not a curve commitment. Deterministic ⇒ consensus-safe.
+/// CONTENT, not a curve commitment. Deterministic ⇒ consensus-safe. The one
+/// definition sits beside the tree, where a sync checks a sealed leaf.
 pub(crate) fn tree_content_digest(tree: &VectorCommitmentTree) -> Vec<u8> {
-    use sha2::{Digest, Sha512};
-    let mut h = Sha512::new();
-    for (k, v) in tree.leaves() {
-        h.update((k.len() as u32).to_be_bytes());
-        h.update(&k);
-        h.update((v.len() as u32).to_be_bytes());
-        h.update(&v);
-    }
-    h.finalize().to_vec()
+    tree.content_digest()
 }
 
 /// `poseidon("vertex:adds")` — 32 bytes.
