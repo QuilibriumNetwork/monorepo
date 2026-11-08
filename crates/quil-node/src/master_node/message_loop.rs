@@ -217,15 +217,30 @@ const MIRROR_HELD_PER_SHARD: usize = 32;
 /// Frames held per shard at one frame number. Past it the longest held there
 /// goes, so impostors at the real frame's number cannot keep it out for good.
 const MIRROR_HELD_PER_NUMBER: usize = 4;
-/// How far above a shard's stored head a frame without a certificate is
-/// held. One at or below it is mirrored only when its stored child links to
-/// it.
+/// How far from a shard's stored head, above or below, a frame without a
+/// certificate is held; at or below the head only at a number with no
+/// stored frame, so a gap behind a later certified frame still fills.
 const MIRROR_HOLD_WINDOW: u64 = MIRROR_HELD_PER_SHARD as u64;
-/// Bytes all held frames take, bookkeeping included; past it the longest
-/// held goes.
+/// Bytes all held frames take, bookkeeping included; past it the shard
+/// holding the most bytes loses its farthest frame, so a flood of large
+/// frames on some shards cannot push out another shard's next frame.
 const MIRROR_HELD_BYTES: usize = 64 << 20;
+/// Largest encoding of a frame held for its certified child. The genuine
+/// frames held on a mainnet master store copy carried no requests; this
+/// leaves room for a notarized frame that carries some, while a peer's
+/// 16 MiB frame is refused before any check and never held.
+const MIRROR_HELD_FRAME_BYTES: usize = 1 << 20;
+/// Most request bundles a frame may carry for the mirror to check them. The
+/// check converts each bundle, locks its addresses and commits it to a
+/// tree on the message loop, so without a bound one 16 MiB frame of tiny
+/// bundles buys hundreds of thousands of commits there. Shard frames are
+/// paced to one per GLOBAL frame, and mainnet ones carry far fewer (most
+/// none); a frame over the bound is refused before any check, and the next
+/// frame that verifies is mirrored.
+const MIRROR_MAX_REQUESTS: usize = 1024;
 /// Bookkeeping bytes per held frame besides its encoding and its filter
-/// (counted twice): its key in both maps, its value and a B-tree node share.
+/// (counted twice): its key, its value, its shard's share of the size index
+/// and a B-tree node share.
 const MIRROR_HELD_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<HeldKey>()
     + std::mem::size_of::<(u64, Vec<u8>)>()
     + std::mem::size_of::<u64>()
@@ -275,11 +290,14 @@ struct HoldCounts {
 }
 
 /// Frames without a certificate whose header and requests verify otherwise,
-/// each with its arrival count and encoding; an arrival index finds the
-/// longest held without a scan.
+/// each with its arrival count and encoding; a size index finds the shard
+/// holding the most bytes without a scan.
 struct HeldFrames {
     frames: std::collections::BTreeMap<HeldKey, (u64, Vec<u8>)>,
-    by_arrival: std::collections::BTreeMap<u64, HeldKey>,
+    /// Bytes each shard's held frames take.
+    shard_bytes: std::collections::HashMap<Vec<u8>, usize>,
+    /// The same, ordered by bytes.
+    by_size: std::collections::BTreeSet<(usize, Vec<u8>)>,
     bytes: usize,
     byte_cap: usize,
     arrivals: u64,
@@ -334,6 +352,12 @@ impl ShardMirror {
             .public_key_signature_bls48581
             .as_ref()
             .is_some_and(|signature| !signature.signature.is_empty());
+        if frame.requests.len() > MIRROR_MAX_REQUESTS {
+            return Err(format!(
+                "carries {} request bundles, more than the {MIRROR_MAX_REQUESTS} checked",
+                frame.requests.len()
+            ));
+        }
         match mirror_admits(&self.validator, frame) {
             Ok(()) => {}
             Err(reason) if certified => return Err(reason),
@@ -395,8 +419,9 @@ impl ShardMirror {
         );
     }
 
-    /// Hold a frame without a certificate of a registered shard, above its
-    /// stored head and within [`MIRROR_HOLD_WINDOW`] of it, whose header and
+    /// Hold a frame without a certificate of a registered shard, within
+    /// [`MIRROR_HOLD_WINDOW`] of its stored head at a number with no stored
+    /// frame and at most [`MIRROR_HELD_FRAME_BYTES`], whose header and
     /// requests verify otherwise; or mirror it when its stored child links
     /// to it.
     fn hold(
@@ -426,12 +451,27 @@ impl ShardMirror {
                 .get_latest_shard_clock_frame_number(&header.address)
                 .ok()
                 .flatten();
-            if let Some(head) = head.filter(|&head| {
-                header.frame_number <= head || header.frame_number - head > MIRROR_HOLD_WINDOW
-            }) {
+            if let Some(head) = head {
+                if header.frame_number.abs_diff(head) > MIRROR_HOLD_WINDOW {
+                    return Err(format!(
+                        "no certificate, and more than {MIRROR_HOLD_WINDOW} frames from the \
+                         stored head {head}"
+                    ));
+                }
+                let stored = header.frame_number <= head
+                    && clock_store
+                        .get_shard_clock_frame(&header.address, header.frame_number, false)
+                        .ok()
+                        .and_then(|stored| stored.header)
+                        .is_some();
+                if stored {
+                    return Err("no certificate, and a frame is stored at its number".into());
+                }
+            }
+            if data.len() > MIRROR_HELD_FRAME_BYTES {
                 return Err(format!(
-                    "no certificate, and not within {MIRROR_HOLD_WINDOW} frames above the \
-                     stored head {head}"
+                    "no certificate, and {} bytes, more than the {MIRROR_HELD_FRAME_BYTES} held",
+                    data.len()
                 ));
             }
         }
@@ -516,7 +556,8 @@ impl HeldFrames {
     fn new(byte_cap: usize) -> Self {
         Self {
             frames: Default::default(),
-            by_arrival: Default::default(),
+            shard_bytes: Default::default(),
+            by_size: Default::default(),
             bytes: 0,
             byte_cap,
             arrivals: 0,
@@ -533,10 +574,26 @@ impl HeldFrames {
     }
 
     fn remove(&mut self, key: &HeldKey) -> Option<Vec<u8>> {
-        let (arrival, data) = self.frames.remove(key)?;
-        self.by_arrival.remove(&arrival);
-        self.bytes -= Self::cost(key, &data);
+        let (_, data) = self.frames.remove(key)?;
+        let cost = Self::cost(key, &data);
+        self.bytes -= cost;
+        self.account(&key.0, |bytes| bytes - cost);
         Some(data)
+    }
+
+    /// Set `filter`'s held bytes to `change` of them, in both indexes.
+    fn account(&mut self, filter: &[u8], change: impl FnOnce(usize) -> usize) {
+        let before = self.shard_bytes.get(filter).copied().unwrap_or(0);
+        let after = change(before);
+        if before > 0 {
+            self.by_size.remove(&(before, filter.to_vec()));
+        }
+        if after > 0 {
+            self.shard_bytes.insert(filter.to_vec(), after);
+            self.by_size.insert((after, filter.to_vec()));
+        } else {
+            self.shard_bytes.remove(filter);
+        }
     }
 
     /// Evict `key` for a bound, remembering it.
@@ -604,8 +661,9 @@ impl HeldFrames {
     /// Hold `data` under `key`, unless held already. Past the bounds go, in
     /// turn: the longest held at its number; the shard's farthest frame, so
     /// an impostor numbered ahead cannot push out the real next frame; the
-    /// longest held of any shard. Each step reads a bounded range or the
-    /// arrival index, never the whole map.
+    /// farthest frame of the shard holding the most bytes, so frames sent to
+    /// other shards cannot push it out either. Each step reads a bounded
+    /// range or the size index, never the whole map.
     fn insert(&mut self, key: HeldKey, data: Vec<u8>) -> bool {
         if self.frames.contains_key(&key) {
             return false;
@@ -615,8 +673,9 @@ impl HeldFrames {
         let shard: std::ops::RangeInclusive<HeldKey> =
             (key.0.clone(), 0, [0; 32])..=(key.0.clone(), u64::MAX, [0xff; 32]);
         self.arrivals += 1;
-        self.bytes += Self::cost(&key, &data);
-        self.by_arrival.insert(self.arrivals, key.clone());
+        let cost = Self::cost(&key, &data);
+        self.bytes += cost;
+        self.account(&key.0, |bytes| bytes + cost);
         self.frames.insert(key, (self.arrivals, data));
         self.counts.held += 1;
         if self.frames.range(number.clone()).count() > MIRROR_HELD_PER_NUMBER {
@@ -640,10 +699,20 @@ impl HeldFrames {
             }
         }
         while self.bytes > self.byte_cap {
-            let Some(oldest) = self.by_arrival.values().next().cloned() else {
+            let Some((_, largest)) = self.by_size.last() else {
                 break;
             };
-            self.evict(&oldest);
+            let largest: std::ops::RangeInclusive<HeldKey> =
+                (largest.clone(), 0, [0; 32])..=(largest.clone(), u64::MAX, [0xff; 32]);
+            let Some(farthest) = self
+                .frames
+                .range(largest)
+                .next_back()
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.evict(&farthest);
         }
         true
     }
@@ -3316,9 +3385,8 @@ mod tests {
     }
 
     /// A frame without a certificate is held only for a shard the prover
-    /// registry names, and only above the shard's stored head and within
-    /// [`MIRROR_HOLD_WINDOW`] of it; at or below the head it is mirrored only
-    /// when its stored child links to it.
+    /// registry names, and only within [`MIRROR_HOLD_WINDOW`] of the shard's
+    /// stored head at a number with no stored frame.
     #[test]
     fn a_frame_is_held_only_for_a_registered_shard_near_its_head() {
         let offer = |shard: &Shard, frame: &quil_types::proto::global::AppShardFrame| {
@@ -3345,7 +3413,7 @@ mod tests {
         );
         assert!(
             offer(&shard, &shard.notarized(6, vec![1; 32])).is_err(),
-            "HOLD-BOUND: a frame at the stored head was held"
+            "HOLD-BOUND: a frame at the stored head's number was held"
         );
         assert_eq!(
             offer(
@@ -3392,9 +3460,8 @@ mod tests {
 
     /// The hold's bounds: a duplicate is held once; past the per-number bound
     /// the longest held there goes; past the per-shard bound the farthest
-    /// frame; past the byte bound the longest held of any shard; pruning
-    /// drops what lies below; the byte count returns to zero; an evicted frame
-    /// a child names counts as lost.
+    /// frame; pruning drops what lies below; an evicted frame a child names
+    /// counts as lost; the byte count returns to zero in both indexes.
     #[test]
     fn held_frames_evict_in_order_and_keep_their_byte_count() {
         let key =
@@ -3441,19 +3508,158 @@ mod tests {
         assert_eq!(held.counts.pruned, 10);
 
         let one = HeldFrames::cost(&key(1, 1, 0), &[0; 1000]);
-        let mut held = HeldFrames::new(3 * one);
-        for filter in 1..=4 {
+        let mut held = HeldFrames::new(usize::MAX);
+        for filter in 1..=3 {
             held.insert(key(filter, 1, 0), vec![0; 1000]);
         }
-        assert!(
-            !held.frames.contains_key(&key(1, 1, 0)) && held.frames.len() == 3,
-            "past the byte bound the longest held of any shard goes"
-        );
         assert_eq!(held.bytes, 3 * one);
-        for filter in 2..=4 {
+        for filter in 1..=3 {
             held.remove(&key(filter, 1, 0));
         }
-        assert_eq!((held.bytes, held.by_arrival.len()), (0, 0));
+        assert_eq!(
+            (held.bytes, held.shard_bytes.len(), held.by_size.len()),
+            (0, 0, 0)
+        );
+    }
+
+    /// Past the byte bound the shard holding the most bytes loses its
+    /// farthest frame, so frames sent to other shards do not push out a
+    /// shard's next frame, however long it was held.
+    #[test]
+    fn held_bytes_evict_from_the_shard_holding_the_most() {
+        let key =
+            |filter: u8, number: u64, identity: u8| (vec![filter; 35], number, [identity; 32]);
+        let one = HeldFrames::cost(&key(1, 1, 0), &[0; 1000]);
+        let mut held = HeldFrames::new(4 * one);
+        held.insert(key(1, 7, 0), vec![0; 1000]);
+        for number in 1..=3 {
+            held.insert(key(2, number, 0), vec![0; 1000]);
+        }
+        held.insert(key(3, 1, 0), vec![0; 1000]);
+        assert!(
+            held.frames.contains_key(&key(1, 7, 0)),
+            "BYTE-EVICTION: past the byte bound a frame of the shard holding the fewest \
+             bytes was evicted"
+        );
+        assert!(
+            !held.frames.contains_key(&key(2, 3, 0))
+                && held.frames.contains_key(&key(2, 1, 0))
+                && held.frames.len() == 4,
+            "BYTE-EVICTION: past the byte bound the farthest frame of the shard holding the \
+             most bytes goes"
+        );
+        assert_eq!(
+            (
+                held.bytes,
+                held.shard_bytes.get([2u8; 35].as_slice()).copied()
+            ),
+            (4 * one, Some(2 * one))
+        );
+    }
+
+    /// A frame over the check's bounds is refused before any check: one
+    /// carrying more request bundles than [`MIRROR_MAX_REQUESTS`], and one
+    /// without a certificate larger than [`MIRROR_HELD_FRAME_BYTES`], which
+    /// is never held.
+    #[test]
+    fn a_frame_over_the_check_bounds_is_refused_before_its_check() {
+        let shard = Shard::new();
+        let topic = shard.topic();
+        shard.hear(&topic, &shard.certified(6));
+        let offer = |frame: &quil_types::proto::global::AppShardFrame, data: &[u8]| {
+            shard.mirror.offer(shard.clock.as_ref(), frame, data)
+        };
+        let carrying = |count: usize| {
+            let mut frame = shard.certified(7);
+            frame.requests = vec![Default::default(); count];
+            frame
+        };
+        let within = carrying(MIRROR_MAX_REQUESTS);
+        let over = carrying(MIRROR_MAX_REQUESTS + 1);
+        let reason = |frame: &quil_types::proto::global::AppShardFrame| {
+            offer(frame, &prost::Message::encode_to_vec(frame)).unwrap_err()
+        };
+        assert!(
+            !reason(&within).contains("request bundles, more than"),
+            "a frame within the bound reaches the body check"
+        );
+        assert!(
+            reason(&over).contains("request bundles, more than"),
+            "BODY-BOUND: a frame carrying more request bundles than the bound reached the \
+             body check: {}",
+            reason(&over)
+        );
+
+        let notarized = shard.notarized(7, selector(&shard.certified(6)));
+        let mut large = prost::Message::encode_to_vec(&notarized);
+        // An unknown field: the frame decodes the same.
+        prost::encoding::encode_key(15, prost::encoding::WireType::LengthDelimited, &mut large);
+        prost::encoding::encode_varint(MIRROR_HELD_FRAME_BYTES as u64, &mut large);
+        large.resize(large.len() + MIRROR_HELD_FRAME_BYTES, 0);
+        assert_eq!(
+            <quil_types::proto::global::AppShardFrame as prost::Message>::decode(large.as_slice())
+                .ok(),
+            Some(notarized.clone())
+        );
+        assert!(
+            offer(&notarized, &large).is_err(),
+            "HOLD-SIZE: a frame without a certificate larger than the bound was held"
+        );
+        assert_eq!(
+            offer(&notarized, &prost::Message::encode_to_vec(&notarized)),
+            Ok(Mirrored::Held)
+        );
+    }
+
+    /// A frame without a certificate below the stored head, at a number with
+    /// no stored frame, is held: a certified frame stored ahead of a gap does
+    /// not keep the gap's frames out. One at a stored number, or further than
+    /// [`MIRROR_HOLD_WINDOW`] below the head, is not.
+    #[test]
+    fn a_frame_below_the_stored_head_fills_its_gap() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let stored = |number| {
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, number, false)
+                .ok()
+        };
+        let base = MIRROR_HOLD_WINDOW + 8;
+        shard.hear(&topic, &shard.certified(base));
+        let gap = shard.notarized(base + 1, selector(&shard.certified(base)));
+        let child = shard.certified_child(&gap);
+        let ahead = shard.certified_child(&child);
+        shard.hear(&topic, &ahead);
+        assert_eq!(shard.latest(), Some(base + 3));
+        shard.hear(&topic, &gap);
+        shard.hear(&topic, &child);
+        assert_eq!(
+            stored(base + 1),
+            Some(gap),
+            "GAP-BELOW-HEAD: a frame without a certificate below the stored head was not \
+             mirrored once its certified child arrived"
+        );
+        let offer = |frame: &quil_types::proto::global::AppShardFrame| {
+            shard.mirror.offer(
+                shard.clock.as_ref(),
+                frame,
+                &prost::Message::encode_to_vec(frame),
+            )
+        };
+        assert!(
+            offer(&shard.notarized(base, vec![1; 32])).is_err(),
+            "a frame at a stored number is not held"
+        );
+        assert!(
+            offer(&shard.notarized(base + 3 - MIRROR_HOLD_WINDOW - 1, vec![1; 32])).is_err(),
+            "a frame past the window below the stored head is not held"
+        );
+        assert_eq!(
+            offer(&shard.notarized(base + 3 - MIRROR_HOLD_WINDOW, vec![1; 32])),
+            Ok(Mirrored::Held)
+        );
     }
 
     /// The hold's counts are logged at once, then at most once per interval,
