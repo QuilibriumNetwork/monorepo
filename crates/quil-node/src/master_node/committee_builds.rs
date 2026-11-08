@@ -105,33 +105,81 @@ pub(super) fn groups(builds: &[Build]) -> String {
     )
 }
 
+fn release_name(release: &Release) -> String {
+    match release {
+        Release::Known(release) => release.clone(),
+        Release::NoPeerInfo => "no peer info".to_string(),
+        Release::ThisNode => "this node".to_string(),
+    }
+}
+
 /// Member indices grouped by release, like [`groups`], e.g.
 /// `2.1.0.25.92: 0,1,3; 2.1.0.25: 2; no peer info: 4; this node: 5`.
 pub(super) fn release_groups(releases: &[Release]) -> String {
     grouped(
         releases,
         |release| matches!(release, Release::Known(_)),
-        |release| match release {
-            Release::Known(release) => release.clone(),
-            Release::NoPeerInfo => "no peer info".to_string(),
-            Release::ThisNode => "this node".to_string(),
-        },
+        release_name,
     )
 }
 
-/// Members whose reported GLOBAL head trails `global_head` by more than
-/// [`BEHIND_FRAMES`], as `index@head`, e.g. `9@907919,12@907919`; members
-/// that reported no head (`None` or 0) are left out.
-pub(super) fn behind_global(heads: &[Option<u64>], global_head: u64) -> Vec<String> {
+/// The indices of members whose reported GLOBAL head trails `global_head`
+/// by more than [`BEHIND_FRAMES`], with that head; members that reported no
+/// head (`None` or 0) are left out.
+fn behind(heads: &[Option<u64>], global_head: u64) -> Vec<(usize, u64)> {
     heads
         .iter()
         .enumerate()
         .filter_map(|(index, head)| {
             let head = head.filter(|head| *head > 0)?;
-            (head.saturating_add(BEHIND_FRAMES) < global_head).then(|| format!("{index}@{head}"))
+            (head.saturating_add(BEHIND_FRAMES) < global_head).then_some((index, head))
         })
         .collect()
 }
+
+/// Members behind GLOBAL ([`behind`]) as `index@head`, e.g.
+/// `9@907919,12@907919`.
+pub(super) fn behind_global(heads: &[Option<u64>], global_head: u64) -> Vec<String> {
+    behind(heads, global_head)
+        .into_iter()
+        .map(|(index, head)| format!("{index}@{head}"))
+        .collect()
+}
+
+/// The releases of the members behind GLOBAL ([`behind`]), their indices
+/// grouped like [`release_groups`], e.g. `2.1.0.25.116: 9,12`: whether they
+/// run this node's release tells an operator whose problem it is
+/// ([`BEHIND_ACTION`]).
+pub(super) fn behind_releases(
+    heads: &[Option<u64>],
+    releases: &[Release],
+    global_head: u64,
+) -> String {
+    let mut by_release: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (index, _) in behind(heads, global_head) {
+        let release = releases
+            .get(index)
+            .map_or_else(|| "unknown".to_string(), release_name);
+        by_release
+            .entry(release)
+            .or_default()
+            .push(index.to_string());
+    }
+    by_release
+        .into_iter()
+        .map(|(release, members)| format!("{release}: {}", members.join(",")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What an operator checks when members are behind GLOBAL: their release,
+/// not an assumed one (2026-11-08: the members behind ran the current
+/// release, and the action said they most likely ran an outdated one).
+pub(super) const BEHIND_ACTION: &str = "nothing to fix on this node: these members report a \
+    GLOBAL head over 360 frames behind this node's. Compare behind_releases with this node's \
+    release: a member on the same release lags on its own host (its GLOBAL sync, CPU, disk or \
+    network) and this ends when it catches up; one on an older release catches up once its \
+    operator upgrades";
 
 /// Per committee, the session last seen and when its builds were logged.
 #[derive(Default)]
@@ -231,6 +279,38 @@ mod tests {
         assert!(
             behind_global(&heads, 0).is_empty(),
             "no local head, nobody is behind"
+        );
+    }
+
+    /// The members behind GLOBAL are listed with their releases, so the
+    /// action can leave the cause to what they run rather than assume an
+    /// outdated release (2026-11-08: the members behind ran the current
+    /// release).
+    #[test]
+    fn members_behind_global_are_named_with_their_releases() {
+        let releases = [
+            Release::of(Some("2.1.0.25.116".into())),
+            Release::of(Some("2.1.0.25.116".into())),
+            Release::ThisNode,
+            Release::of(Some("2.1.0.25.92".into())),
+            Release::of(Some("2.1.0.25.116".into())),
+        ];
+        let heads = [
+            Some(908_000),
+            Some(908_800),
+            None,
+            Some(907_919),
+            Some(908_100),
+        ];
+        assert_eq!(
+            behind_releases(&heads, &releases, 908_800),
+            "2.1.0.25.116: 0,4; 2.1.0.25.92: 3",
+            "behind-releases: only the members behind, by release"
+        );
+        assert_eq!(behind_releases(&heads, &releases, 0), "");
+        assert!(
+            BEHIND_ACTION.contains("behind_releases") && !BEHIND_ACTION.contains("most likely"),
+            "behind-action: the action names what to check, not an assumed cause"
         );
     }
 

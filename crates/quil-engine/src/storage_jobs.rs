@@ -325,6 +325,19 @@ impl Jobs {
                 Err(error) if self.stopping() => {
                     info!(label, lane = %shown, %error, "storage snapshot job stopped with the node")
                 }
+                // Work ahead that gave its memory back to more urgent work
+                // ([`Reservation::named_stop`]): an expected wait, not a
+                // failure (2026-11-08: logged as one at each renewal's
+                // snapshot during sector warmup).
+                Err(QuilError::StorageWorkStopped(stopped)) => info!(
+                    label,
+                    lane = %shown,
+                    %stopped,
+                    seconds = started.elapsed().as_secs_f64(),
+                    scope = "local",
+                    "storage job ahead stopped to give its memory back to more urgent work; it \
+                     goes on from what it kept when next asked: an expected wait"
+                ),
                 Err(error) => {
                     warn!(label, lane = %shown, %error, "storage snapshot job failed; it is tried again when next needed")
                 }
@@ -613,6 +626,30 @@ pub enum Urgency {
     Ahead,
 }
 
+/// What work ahead was asked to give its memory back to
+/// ([`Reservation::yielded_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YieldedTo {
+    /// Work due now in this process, such as a renewal's snapshot.
+    DueNow,
+    /// Work ahead more urgent than it: leaves that cannot otherwise be
+    /// labelled within their renewal's grace.
+    MoreUrgentAhead,
+    /// Work due now in another process of the node on this host
+    /// ([`install_host_ledger`]).
+    OtherProcess,
+}
+
+impl YieldedTo {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DueNow => "work due now, such as a renewal's snapshot",
+            Self::MoreUrgentAhead => "more urgent work ahead",
+            Self::OtherProcess => "work due now in another process of the node on this host",
+        }
+    }
+}
+
 /// Jobs that may hold memory at once: one per core the process may use,
 /// less the master's. Counted once, on a thread of the process's CPUs: the
 /// thread asking is often a data worker's, pinned to one core, and counting
@@ -874,6 +911,27 @@ impl Reservation {
             .is_some_and(|yielding| yielding.asked)
     }
 
+    /// What this reservation was asked to give its memory back to
+    /// ([`Self::yield_requested`]); `None` until asked.
+    pub fn yielded_to(&self) -> Option<YieldedTo> {
+        self.admission
+            .state()
+            .yielding
+            .get(&self.ticket)
+            .and_then(|yielding| yielding.to)
+    }
+
+    /// `error` of the work holding this reservation: work that stopped when
+    /// told to ([`QuilError::StorageWorkStopped`]) after it was asked to give
+    /// its memory back names what to ([`Self::yielded_to`]) for its job's
+    /// line; any other error is returned as it is.
+    pub fn named_stop(&self, error: QuilError) -> QuilError {
+        let (QuilError::StorageWorkStopped(work), Some(to)) = (&error, self.yielded_to()) else {
+            return error;
+        };
+        QuilError::StorageWorkStopped(format!("{work}; its memory went to {}", to.name()))
+    }
+
     /// Mark this reservation, for work due now, as labelling a leaf now (a
     /// renewal's snapshot without labels kept ahead for it): while it is
     /// held, labelling ahead beyond [`ahead_beside_due`] pauses and
@@ -1099,6 +1157,8 @@ struct Yielding {
     millionths: u32,
     /// Whether it was asked to give its memory back.
     asked: bool,
+    /// What it was asked to give its memory back to, once asked.
+    to: Option<YieldedTo>,
     /// Whether it is work ahead in parallel ([`ahead_in_parallel`]).
     parallel: bool,
 }
@@ -1276,6 +1336,7 @@ impl Admission {
             for yielding in state.yielding.values_mut() {
                 if !yielding.asked {
                     yielding.asked = true;
+                    yielding.to = Some(YieldedTo::OtherProcess);
                     asked += 1;
                 }
             }
@@ -1600,6 +1661,7 @@ impl Admission {
                             bytes: waiting.bytes,
                             millionths: 0,
                             asked: false,
+                            to: None,
                             parallel: waiting.parallel,
                         },
                     );
@@ -1826,9 +1888,15 @@ impl Admission {
             return;
         }
         let mut bytes = 0u64;
+        let to = if head == 0 {
+            YieldedTo::DueNow
+        } else {
+            YieldedTo::MoreUrgentAhead
+        };
         for ticket in &newly {
             if let Some(yielding) = state.yielding.get_mut(ticket) {
                 yielding.asked = true;
+                yielding.to = Some(to);
                 bytes = bytes.saturating_add(yielding.bytes);
             }
         }
@@ -4006,6 +4074,82 @@ mod tests {
         shrink.send(()).unwrap();
         assert!(granted(&next));
         drop(done);
+    }
+
+    /// Work ahead asked to give its memory back names what to: work due
+    /// now waiting for it here, more urgent work ahead, or another process's
+    /// work due now; its stop then names it, and other errors stay as they
+    /// are.
+    #[test]
+    fn work_ahead_names_what_it_gave_its_memory_back_to() {
+        let (admission, _) = admission(8, 8 * GIB);
+        let ahead = admission.reserve_with(4 * GIB, Urgency::Ahead);
+        let stopped = || QuilError::StorageWorkStopped("labelling a sector".into());
+        assert_eq!(ahead.yielded_to(), None, "not asked yet");
+        assert!(
+            matches!(ahead.named_stop(stopped()), QuilError::StorageWorkStopped(text)
+                if text == "labelling a sector"),
+            "a stop before any ask names nothing"
+        );
+        let small = hold(admission, GIB);
+        assert!(granted(&small));
+        let due = hold(admission, 4 * GIB);
+        until_waiting(admission, 1);
+        assert!(ahead.yield_requested());
+        assert_eq!(ahead.yielded_to(), Some(YieldedTo::DueNow), "named-yield");
+        let named = ahead.named_stop(stopped());
+        assert!(
+            matches!(&named, QuilError::StorageWorkStopped(text)
+                if text.starts_with("labelling a sector; its memory went to work due now")),
+            "named-yield: {named}"
+        );
+        assert!(
+            matches!(
+                ahead.named_stop(QuilError::ExecutionUnavailable("broken".into())),
+                QuilError::ExecutionUnavailable(text) if text == "broken"
+            ),
+            "a failure is not a stop"
+        );
+        drop(ahead);
+        assert!(granted(&due));
+        drop(small.release);
+        drop(due.release);
+    }
+
+    /// A job that stopped to give its memory back is an expected wait,
+    /// logged at info naming what it gave it to; a job that failed is still
+    /// a warning (2026-11-08: each yield of sector warmup to a renewal's
+    /// snapshot was logged as a failed job).
+    #[test]
+    fn a_job_that_gave_its_memory_back_is_logged_as_a_wait_not_a_failure() {
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        spawn(b"test lane: gave back", "test", || {
+            Err(QuilError::StorageWorkStopped(
+                "labelling a sector; its memory went to work due now".into(),
+            ))
+        });
+        spawn(b"test lane: failed", "test", || {
+            Err(QuilError::ExecutionUnavailable("a broken job".into()))
+        });
+        assert!(wait_lane_idle(b"test lane: gave back", SOON));
+        assert!(wait_lane_idle(b"test lane: failed", SOON));
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let gave = text
+            .lines()
+            .find(|line| line.contains("its memory went to work due now"))
+            .expect("the stop is logged");
+        assert!(
+            gave.contains("INFO") && gave.contains("stopped to give its memory back"),
+            "yield-info: a stop to give memory back is an expected wait: {gave}"
+        );
+        let failed = text
+            .lines()
+            .find(|line| line.contains("a broken job"))
+            .expect("the failure is logged");
+        assert!(
+            failed.contains("WARN") && failed.contains("storage snapshot job failed"),
+            "a failure still warns: {failed}"
+        );
     }
 
     #[test]

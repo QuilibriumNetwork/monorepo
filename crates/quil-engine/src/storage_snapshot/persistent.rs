@@ -391,9 +391,20 @@ fn initialize_with_progress(
                 .ok_or_else(|| unavailable("no disk space to certify a new sector".into()))?;
             match admitted.label_kept(params, stop, layers)? {
                 Labelling::Labelled(labelled) if labelled.kept => (labelled.last, labelled.comm_c),
+                // Told to stop: it gave its memory back to more urgent work,
+                // or its caller stops. Not a failure: the next attempt goes
+                // on from the whole layers kept.
+                Labelling::Stopped { layers: kept } => {
+                    return Err(QuilError::StorageWorkStopped(format!(
+                        "initial labelling of sector {}, {kept} of {} whole layers kept to go \
+                         on from",
+                        hex::encode(id),
+                        params.layers
+                    )))
+                }
                 _ => {
                     return Err(unavailable(
-                        "initial sector labelling stopped or could not be retained".into(),
+                        "initial sector labelling could not be retained".into(),
                     ))
                 }
             }
@@ -1064,7 +1075,8 @@ pub(crate) fn prewarm_sectors(
         initialize(store, member, captured.epoch, dir.clone(), *id, *n, &|| {
             memory.wait_while_paused(&gone);
             gone() || memory.yield_requested()
-        })?;
+        })
+        .map_err(|error| memory.named_stop(error))?;
         Ok(())
     })?;
     Ok(())
@@ -1307,7 +1319,8 @@ fn resume_reserved_sector(
             initialize(store, &member, epoch, dir, id, n, &|| {
                 memory.wait_while_paused(&crate::storage_jobs::stopping);
                 crate::storage_jobs::stopping() || memory.yield_requested()
-            })?;
+            })
+            .map_err(|error| memory.named_stop(error))?;
             Ok(())
         },
     );
@@ -1758,6 +1771,39 @@ mod tests {
             on.then_some(quil_types::consensus::StorageSealProfile::Eleven),
         );
     }
+    /// A sector's initial labelling told to stop, as when it gives its
+    /// memory back to more urgent work, is a stop, not a failure: it keeps
+    /// its whole layers and the next attempt goes on from them to the
+    /// sector (2026-11-08: each stop was logged as a failed job).
+    #[test]
+    fn a_sector_labelling_told_to_stop_is_a_stop_and_goes_on_after() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [0xC7; 32];
+        let (path, id, n) = reserve(&store, &member, b"stopped leaf", 1500, 100).unwrap();
+        let labelled = std::sync::atomic::AtomicBool::new(false);
+        let stopped = initialize_with_progress(
+            &store,
+            &member,
+            1500,
+            path.clone(),
+            id,
+            n,
+            &|| labelled.load(std::sync::atomic::Ordering::Relaxed),
+            &|_| labelled.store(true, std::sync::atomic::Ordering::Relaxed),
+        )
+        .err();
+        let Some(QuilError::StorageWorkStopped(text)) = &stopped else {
+            panic!("typed-stop: a sector labelling told to stop failed instead: {stopped:?}");
+        };
+        assert!(text.contains("whole layers kept"), "{text}");
+        let sector = initialize(&store, &member, 1500, path, id, n, &|| false)
+            .unwrap_or_else(|error| panic!("the next attempt goes on: {error}"));
+        assert_eq!(sector.cert.n, n);
+    }
+
     #[test]
     fn scheduled_mainnet_warmup_builds_three_layer_sectors_for_the_first_epoch() {
         gates(false);
