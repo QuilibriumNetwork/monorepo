@@ -1764,6 +1764,7 @@ async fn deliver_shard_submission<H>(
         bitmask,
         data: payload,
         from: Vec::new(),
+        via: Vec::new(),
         direct: false,
     }) {
         Ok(()) if no_peer => {
@@ -6550,6 +6551,7 @@ mod shard_submission_tests {
                 bitmask: Vec::new(),
                 data: Vec::new(),
                 from: Vec::new(),
+                via: Vec::new(),
                 direct: false,
             })
             .unwrap();

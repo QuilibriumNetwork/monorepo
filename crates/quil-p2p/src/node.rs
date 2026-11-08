@@ -27,7 +27,13 @@ const AUTONAT_SERVER_SUMMARY_EVERY: Duration = Duration::from_secs(60 * 60);
 pub struct ReceivedMessage {
     pub bitmask: Vec<u8>,
     pub data: Vec<u8>,
+    /// Who sent it: the gossip message's signer (any key its publisher
+    /// chose), or the direct sender.
     pub from: Vec<u8>,
+    /// The connected peer it arrived from: gossip's propagation source, or
+    /// the direct sender. Unlike a signer, a peer cannot mint these freely:
+    /// each takes a connection. Empty when it came from this node.
+    pub via: Vec<u8>,
     /// Delivered point-to-point ([`crate::direct`]) rather than by gossip.
     pub direct: bool,
 }
@@ -1181,6 +1187,7 @@ impl P2PNode {
                                                     bitmask: request.bitmask,
                                                     data: request.data,
                                                     from: peer.to_bytes(),
+                                                    via: peer.to_bytes(),
                                                     direct: true,
                                                 }).is_ok();
                                             let counter = if accepted { &direct_stats.received } else { &direct_stats.received_refused };
@@ -1219,13 +1226,14 @@ impl P2PNode {
                                 }
                                 NodeBehaviourEvent::Blossomsub(bss_event) => match bss_event {
                                     BlossomSubEvent::Message {
-                                        message, ..
+                                        propagation_source, message, ..
                                     } => {
                                         // Moved, not copied: the event owns the message.
                                         let result = msg_tx.try_send(ReceivedMessage {
                                             bitmask: message.bitmask,
                                             data: message.data,
                                             from: message.from,
+                                            via: propagation_source.to_bytes(),
                                             direct: false,
                                         });
                                         direct_stats.note_gossip_receive(&result);
