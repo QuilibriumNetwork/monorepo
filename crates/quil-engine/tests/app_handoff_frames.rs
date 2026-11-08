@@ -1804,6 +1804,172 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
     handoff::set_presence_report_frame_for_thread(None);
 }
 
+/// Sign `header`, anchored at its GLOBAL frame whose output is
+/// `anchor_output`, by `keys` under `session`, extending a frame certified
+/// at `parent_view`.
+fn certify_anchored(
+    header: &mut FrameHeader,
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    parent_view: u64,
+    anchor_output: &[u8],
+) {
+    header.output = quil_crypto::porep::deterministic_app_frame_output(
+        &header.parent_selector,
+        &header.requests_root,
+        &header.state_roots,
+        &quil_crypto::porep::derive_storage_beacon(header.global_frame_number, anchor_output),
+        header.frame_number,
+        header.rank,
+        &header.prover,
+        header.difficulty,
+        header.fee_multiplier_vote,
+        header.timestamp,
+        &header.storage_attestation_root,
+        0,
+        &header.settlements,
+        &header.accumulator,
+        &header.spends,
+    );
+    let certificate = sign(
+        session,
+        keys,
+        header.rank,
+        parent_view,
+        quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
+    );
+    header.public_key_signature_bls48581 = Some(Bls48581AggregateSignature {
+        signature: wrap_cert_for_header(&certificate),
+        ..Default::default()
+    });
+}
+
+/// Sealed storage applies by a header's anchor epoch. A closing session's
+/// last headers, anchored in the epoch before the sealed storage epoch,
+/// missed their window, and the seal draining them reaches GLOBAL in the
+/// sealed epoch's first frame. Their signers never sealed for the anchor
+/// epoch, which did not require it: the drain and the seal are accepted and
+/// the successor authorized. Judged by the executing frame, every copy was
+/// refused and the shard halted for good (a release-candidate devnet,
+/// 2026-11-08).
+#[test]
+fn a_seal_drains_headers_anchored_before_the_sealed_storage_epoch() {
+    const SEALED: u64 = 1;
+    let crossing = quil_types::consensus::epoch_start_frame(SEALED);
+    let anchor = crossing - 1;
+    let anchor_output = [0x48u8; 32];
+    let keys = keys();
+    let source = session(&keys, vec![0x64; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    handoff::set_presence_report_frame_for_thread(Some(0));
+    handoff::set_seal_drain_frame_for_thread(Some(6));
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+    store_global_frame(&fixture, anchor, &anchor_output);
+
+    // GLOBAL executed frame 1 at frame 3. Frames 2 and 3, proposed by a
+    // member and anchored in the last frame before the crossing, missed
+    // their window.
+    let prover = quil_crypto::poseidon::hash_bytes_to_32(&source.members[0])
+        .unwrap()
+        .to_vec();
+    let mut frames = vec![first_frame(&source, &keys)];
+    for (number, view, parent_view) in [(2u64, 7u64, 5u64), (3, 9, 7)] {
+        let previous = frames.last().unwrap().header.as_ref().unwrap();
+        let mut header = FrameHeader {
+            address: source.filter.clone(),
+            frame_number: number,
+            rank: view,
+            difficulty: 1,
+            global_frame_number: anchor,
+            prover: prover.clone(),
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+                .unwrap()
+                .to_vec(),
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify_anchored(&mut header, &source, &keys, parent_view, &anchor_output);
+        frames.push(AppShardFrame {
+            header: Some(header),
+            ..Default::default()
+        });
+    }
+    let wire = |frame: &AppShardFrame| {
+        let mut op = canonical(frame);
+        op.global_frame_number = frame.header.as_ref().unwrap().global_frame_number;
+        op.to_canonical_bytes().unwrap()
+    };
+    intrinsic
+        .invoke_step(3, &wire(&frames[0]), &fixture.state)
+        .unwrap();
+    commit(&fixture.state, 3);
+    let request = handoff::schedule(
+        &fixture.state,
+        4,
+        vec![source.filter.clone()],
+        vec![DesiredCommittee {
+            filter: source.filter.clone(),
+            members: session(&self::keys(), source.filter.clone()).members,
+        }],
+    )
+    .unwrap();
+    commit(&fixture.state, 4);
+    let last = canonical(&frames[2]);
+    let seal = Seal {
+        request: request.id().unwrap(),
+        session: source.id().unwrap(),
+        view: 11,
+        checkpoint: Checkpoint {
+            frame: 3,
+            view: 9,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&last.output).unwrap(),
+            state_roots: [[0; 32]; 4],
+            history_root: [0x66; 32],
+        },
+    };
+    let submission = CertificateSubmission {
+        certificate: sign(&source, &keys, 11, 9, seal.digest()),
+        seal,
+    };
+    let drain = handoff::SealSubmission {
+        submission,
+        drain: vec![wire(&frames[1]), wire(&frames[2])],
+    }
+    .to_canonical_bytes()
+    .unwrap();
+
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(SEALED));
+    assert!(intrinsic
+        .validate(crossing, &drain, None, None)
+        .expect("old_anchor_refused"));
+    intrinsic
+        .invoke_step(crossing, &drain, &fixture.state)
+        .expect("old_anchor_refused");
+    commit(&fixture.state, crossing);
+    assert_eq!(
+        handoff::session_tip(&fixture.state, &source.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .frame,
+        3,
+        "the drain executed through the checkpoint"
+    );
+    assert_eq!(
+        handoff::head(&fixture.state, &source.filter)
+            .unwrap()
+            .unwrap()
+            .generation,
+        2,
+        "the seal authorized the successor"
+    );
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    handoff::set_seal_drain_frame_for_thread(None);
+    handoff::set_presence_report_frame_for_thread(None);
+}
+
 /// A closing session whose frame 1 GLOBAL executed (at frame 3) and whose
 /// frames 2 to `last` are only notarized, frame n at view 2n + 3, sealed at
 /// frame `last` by its members under a request GLOBAL made at frame 4.

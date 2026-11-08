@@ -52,6 +52,13 @@ pub const EXPIRY_CLASS: &str = "storage:StorageExpiry";
 
 /// Canonical application participation gate. Missing storage is never an
 /// affirmative result; this reads the committed seat, not an async registry.
+///
+/// `epoch` is the header's anchor epoch, `frame` the GLOBAL frame executing
+/// it. Sealing applies by the anchor epoch: a header anchored before the
+/// sealed storage epoch was signed under that epoch's rules, and GLOBAL can
+/// execute it after the boundary (a late header, a closing seal's drain).
+/// Judged by the executing frame, its unsealed signers refused it and the
+/// seal draining it, so the session never closed and its shard halted.
 pub fn require_sealed_participant(
     state: &HypergraphState,
     member: &[u8],
@@ -59,7 +66,10 @@ pub fn require_sealed_participant(
     frame: u64,
     epoch: u64,
 ) -> Result<()> {
-    if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
+    if filter.is_empty()
+        || !quil_types::consensus::sealed_storage_required_at(frame)
+        || !quil_types::consensus::sealed_storage_required(epoch)
+    {
         return Ok(());
     }
     let member = <&[u8; 32]>::try_from(member)
@@ -69,7 +79,6 @@ pub fn require_sealed_participant(
         .as_ref()
         .and_then(|seat| seat.slot(epoch))
         .map(SeatSlot::view);
-    // Gate by the executing GLOBAL frame, but check the header's anchor epoch.
     if slot.as_ref().is_none_or(|slot| {
         slot.leaves.is_empty()
             || slot
