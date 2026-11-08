@@ -512,7 +512,8 @@ impl GlobalIntrinsic {
     /// the frame's epoch at most 10 frames before it
     /// (`verify::validate_prover_op_frame`). ProverConfirm must be signed in
     /// the frame's epoch (`validate_confirm_epoch`). ShardSplit/Merge have
-    /// no per-op replay window. ProverConfirm/Reject's epoch window is a
+    /// the same window from the shard op binding epoch
+    /// (`verify::verify_shard_split`), none before it. ProverConfirm/Reject's epoch window is a
     /// timing constraint relative to JoinFrameNumber, not a freshness gate
     /// (enforced by `validate_confirm_timing`).
     ///
@@ -870,7 +871,12 @@ impl GlobalIntrinsic {
                         "ShardSplit: prover tree unavailable — cannot verify signature".into(),
                     )
                 })?;
-                let sig_ok = match verify::verify_shard_split(&op, pt, self.key_manager.as_ref()) {
+                let sig_ok = match verify::verify_shard_split(
+                    &op,
+                    pt,
+                    self.key_manager.as_ref(),
+                    frame_number,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(frame = frame_number, error = %e, "validate_message: ShardSplit verify ERRORED → rejected");
@@ -908,7 +914,8 @@ impl GlobalIntrinsic {
                         "ShardMerge: prover tree unavailable — cannot verify signature".into(),
                     )
                 })?;
-                let sig_ok = verify::verify_shard_merge(&op, pt, self.key_manager.as_ref())?;
+                let sig_ok =
+                    verify::verify_shard_merge(&op, pt, self.key_manager.as_ref(), frame_number)?;
                 if !sig_ok {
                     return Ok(false);
                 }
@@ -4182,7 +4189,7 @@ impl GlobalIntrinsic {
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_shard_split(op, &prover_tree, self.key_manager.as_ref())? {
+        if !verify::verify_shard_split(op, &prover_tree, self.key_manager.as_ref(), frame_number)? {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_split: signature verification failed".into(),
             ));
@@ -4286,7 +4293,7 @@ impl GlobalIntrinsic {
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_shard_merge(op, &prover_tree, self.key_manager.as_ref())? {
+        if !verify::verify_shard_merge(op, &prover_tree, self.key_manager.as_ref(), frame_number)? {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_merge: signature verification failed".into(),
             ));
@@ -4918,7 +4925,8 @@ impl GlobalIntrinsic {
             quil_forest::shard_bit_path_from_prefix(prefix)
                 .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
         };
-        let mut live: std::collections::HashSet<(Vec<u8>, Vec<bool>)> = store
+        type Grid = std::collections::HashSet<(Vec<u8>, Vec<bool>)>;
+        let mut live: Grid = store
             .range_app_shards()?
             .into_iter()
             .map(|r| (r.shard_key, canon_bits(&r.prefix)))
@@ -4928,7 +4936,7 @@ impl GlobalIntrinsic {
         // the gate would hold it forever) nor reassign anything (the parent's
         // retired slots would be moved onto the live children, overwriting
         // their allocations); the grid step below only consumes its record.
-        let stale_split = |change: &PendingShardChange| -> Result<bool> {
+        let stale_split = |change: &PendingShardChange, live: &Grid| -> Result<bool> {
             if change.kind != ShardChangeKind::Split {
                 return Ok(false);
             }
@@ -4943,56 +4951,219 @@ impl GlobalIntrinsic {
             Ok(removed
                 .is_some_and(|(l2, path)| !live.contains(&(grid_key(&l2), canon_bits(&path)))))
         };
+        // From the shard op binding epoch a due merge must collapse exactly the
+        // live children of its parent: each child in the grid, and no other live
+        // shard inside or above the parent's range. A merge whose children were
+        // split or merged away since, or that a forged or replayed op named,
+        // would otherwise delete live shards and add a parent overlapping the
+        // rest, leaving the grid with overlaps or gaps. Like a stale split it is
+        // consumed without changing the grid. Before the epoch nothing changes.
+        let binding = quil_types::consensus::shard_op_binding_active(frame_number);
+        let stale_merge = |change: &PendingShardChange, live: &Grid| -> bool {
+            if change.kind != ShardChangeKind::Merge || !binding {
+                return false;
+            }
+            let bit_path_mode =
+                change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+            let Ok(output) = materialize::materialize_shard_merge(
+                &change.children,
+                &change.parent,
+                bit_path_mode,
+            ) else {
+                return true;
+            };
+            let Some((app, parent_path)) = output.added_parent else {
+                return true;
+            };
+            let key = grid_key(&app);
+            let parent_bits = canon_bits(&parent_path);
+            let mut children = Vec::with_capacity(output.removed_shards.len());
+            for (l2, path) in &output.removed_shards {
+                let child = (grid_key(l2), canon_bits(path));
+                if !live.contains(&child) {
+                    return true;
+                }
+                children.push(child);
+            }
+            live.iter().any(|entry| {
+                entry.0 == key
+                    && !children.contains(entry)
+                    && (entry.1.starts_with(&parent_bits) || parent_bits.starts_with(&entry.1))
+            })
+        };
+        // From the same epoch a due split must name the two bit-path siblings
+        // of one branch below its parent, as validate requires of a split
+        // included from the epoch on. A split included before the epoch was
+        // validated without that rule, so a re-wrapped one could name any
+        // filters extending its parent (overlapping, gapped, more than two, a
+        // descent past the limit). Like a stale split it is consumed without
+        // changing the grid; honest proposers emit only such siblings, so their
+        // in-flight splits apply. Its signature never covered the children, so
+        // a re-wrap onto other siblings within the limit still applies.
+        let unbound_split = |change: &PendingShardChange| -> bool {
+            change.kind == ShardChangeKind::Split
+                && binding
+                && verify::require_sibling_children(
+                    "due shard split",
+                    &change.parent,
+                    &change.children,
+                    false,
+                )
+                .is_err()
+        };
+        // Each due change's fate is decided once, in order, before the handoff
+        // gate, and the reassignment and the grid step below keep it, so a
+        // change is gated and reassigned exactly when it applies. From the
+        // binding epoch a change is judged against the grid as the changes
+        // admitted before it this frame leave it, so a duplicate of one of
+        // them is consumed. A change that needs a shard one of them adds waits
+        // a frame: the gate and the reassignment read the committed grid and
+        // allocations, which do not hold that shard yet. Before the epoch the
+        // gate and the reassignment judge splits against the grid the frame
+        // started with, and the grid step against the updated one, as before.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Verdict {
+            Apply,
+            StaleSplit,
+            UnboundSplit,
+            StaleMerge,
+            Defer,
+        }
+        let judge = |change: &PendingShardChange, view: &Grid| -> Result<Verdict> {
+            if !binding {
+                return Ok(if stale_split(change, &live)? {
+                    Verdict::StaleSplit
+                } else {
+                    Verdict::Apply
+                });
+            }
+            Ok(if unbound_split(change) {
+                Verdict::UnboundSplit
+            } else if stale_split(change, view)? {
+                Verdict::StaleSplit
+            } else if stale_merge(change, view) {
+                Verdict::StaleMerge
+            } else if stale_split(change, &live)? || stale_merge(change, &live) {
+                Verdict::Defer
+            } else {
+                Verdict::Apply
+            })
+        };
+        // The grid step's effect of an admitted change on the view.
+        let admit = |change: &PendingShardChange, view: &mut Grid| -> Result<()> {
+            let bit_path_mode =
+                change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+            let (removed, added) = match change.kind {
+                ShardChangeKind::Split => {
+                    let output = materialize::materialize_shard_split(
+                        &change.parent,
+                        &change.children,
+                        bit_path_mode,
+                    )?;
+                    (
+                        output.removed_parent.into_iter().collect::<Vec<_>>(),
+                        output.new_shards,
+                    )
+                }
+                ShardChangeKind::Merge => {
+                    let output = materialize::materialize_shard_merge(
+                        &change.children,
+                        &change.parent,
+                        bit_path_mode,
+                    )?;
+                    (
+                        output.removed_shards,
+                        output.added_parent.into_iter().collect(),
+                    )
+                }
+            };
+            for (l2, path) in &removed {
+                view.remove(&(grid_key(l2), canon_bits(path)));
+            }
+            for (l2, path) in &added {
+                view.insert((grid_key(l2), canon_bits(path)));
+            }
+            Ok(())
+        };
         // Sources governed by an authorized committee session must seal their
         // final checkpoint first; such a change stays pending until its
         // successors are authorized (see `handoff::schedule`).
+        let policy = quil_types::consensus::committee_handoff_policy();
+        let even = frame_number >= super::materialize::unified_tree_cutover_frame();
+        let mut view = live.clone();
         let mut dropped: Vec<PendingShardChange> = Vec::new();
-        let due: Vec<PendingShardChange> = match quil_types::consensus::committee_handoff_policy() {
-            Some(policy) => {
-                let even = frame_number >= super::materialize::unified_tree_cutover_frame();
-                let mut ready = Vec::with_capacity(due.len());
-                for change in due {
-                    if stale_split(&change)? {
-                        ready.push(change);
+        let mut ready: Vec<(PendingShardChange, Verdict)> = Vec::with_capacity(due.len());
+        for change in due {
+            // Before the epoch a network without a handoff policy judged
+            // nothing here.
+            let verdict = if binding || policy.is_some() {
+                judge(&change, &view)?
+            } else {
+                Verdict::Apply
+            };
+            match verdict {
+                Verdict::Apply => {}
+                Verdict::Defer => {
+                    tracing::warn!(
+                        parent = hex::encode(&change.parent),
+                        children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                        kind = ?change.kind,
+                        effective_epoch = change.effective_epoch,
+                        proposed_frame = change.proposed_frame,
+                        frame = frame_number,
+                        "apply_due: DEFERRING change that needs a shard another change due this frame adds; it stays pending and is judged again next frame"
+                    );
+                    continue;
+                }
+                _ => {
+                    ready.push((change, verdict));
+                    continue;
+                }
+            }
+            if let Some(policy) = &policy {
+                // A change the scheduler cannot express must not take the
+                // chain down with it: a failed frame here stops the
+                // materializer, and the same change is due again on every
+                // later frame. Undo the attempt, keep the change pending.
+                let checkpoint = state.changeset_len();
+                let size = |filter: &[u8]| self.split_child_size(filter);
+                match super::handoff::schedule::gate_topology_change_sized(
+                    state,
+                    frame_number,
+                    policy,
+                    &change,
+                    scan.as_ref().map(|f| f as _),
+                    even,
+                    &size,
+                ) {
+                    Ok(super::handoff::schedule::TopologyGate::Apply) => {}
+                    Ok(super::handoff::schedule::TopologyGate::Wait) => continue,
+                    Ok(super::handoff::schedule::TopologyGate::Drop) => {
+                        dropped.push(change);
                         continue;
                     }
-                    // A change the scheduler cannot express must not take the
-                    // chain down with it: a failed frame here stops the
-                    // materializer, and the same change is due again on every
-                    // later frame. Undo the attempt, keep the change pending.
-                    let checkpoint = state.changeset_len();
-                    let size = |filter: &[u8]| self.split_child_size(filter);
-                    match super::handoff::schedule::gate_topology_change_sized(
-                        state,
-                        frame_number,
-                        &policy,
-                        &change,
-                        scan.as_ref().map(|f| f as _),
-                        even,
-                        &size,
-                    ) {
-                        Ok(super::handoff::schedule::TopologyGate::Apply) => ready.push(change),
-                        Ok(super::handoff::schedule::TopologyGate::Wait) => {}
-                        Ok(super::handoff::schedule::TopologyGate::Drop) => dropped.push(change),
-                        // Only a DETERMINISTIC refusal is skipped: every
-                        // materializing node computes it identically. A local
-                        // store fault still fails the frame, or one archive would
-                        // skip what the others scheduled.
-                        Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => {
-                            return Err(error)
-                        }
-                        Err(error) => {
-                            state.rollback_to(checkpoint);
-                            tracing::error!(frame = frame_number, parent = hex::encode(&change.parent),
-                                kind = ?change.kind, %error,
-                                "committee handoff: due topology change could not be scheduled; it stays pending");
-                        }
+                    // Only a DETERMINISTIC refusal is skipped: every
+                    // materializing node computes it identically. A local
+                    // store fault still fails the frame, or one archive would
+                    // skip what the others scheduled.
+                    Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        state.rollback_to(checkpoint);
+                        tracing::error!(frame = frame_number, parent = hex::encode(&change.parent),
+                            kind = ?change.kind, %error,
+                            "committee handoff: due topology change could not be scheduled; it stays pending");
+                        continue;
                     }
                 }
-                ready
             }
-            None => due,
-        };
+            if binding {
+                admit(&change, &mut view)?;
+            }
+            ready.push((change, Verdict::Apply));
+        }
+        let due = ready;
         if !dropped.is_empty() {
             for change in &dropped {
                 store.delete_pending_shard_change(txn, &change.parent, change.effective_epoch)?;
@@ -5006,8 +5177,13 @@ impl GlobalIntrinsic {
             return Ok(Vec::new());
         }
         let mut flipped: Vec<([u8; 32], Vec<bool>)> = Vec::new();
-        for change in &due {
-            if stale_split(change)? {
+        for (change, verdict) in &due {
+            let skip = if binding {
+                *verdict != Verdict::Apply
+            } else {
+                stale_split(change, &live)?
+            };
+            if skip {
                 continue;
             }
             let reassigned = scan
@@ -5030,9 +5206,25 @@ impl GlobalIntrinsic {
             }
         }
 
-        for change in &due {
+        for (change, verdict) in &due {
             match change.kind {
                 ShardChangeKind::Split => {
+                    if *verdict == Verdict::UnboundSplit {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING split whose children are not the bit-path siblings of one branch below its parent; consuming the pending record without changing the grid"
+                        );
+                        store.delete_pending_shard_change(
+                            txn,
+                            &change.parent,
+                            change.effective_epoch,
+                        )?;
+                        continue;
+                    }
                     // Decode in the format the children were PROPOSED in (a split
                     // that straddles the cutover keeps its original encoding).
                     let bit_path_mode =
@@ -5047,10 +5239,13 @@ impl GlobalIntrinsic {
                     // DIFFERENT partition on top of the real children (overlapping
                     // shards → provers on "both sides"). Still consume the pending
                     // record below so it stops re-firing.
-                    let parent_in_grid =
-                        output.removed_parent.as_ref().map_or(true, |(l2, path)| {
+                    let parent_in_grid = if binding {
+                        *verdict != Verdict::StaleSplit
+                    } else {
+                        output.removed_parent.as_ref().is_none_or(|(l2, path)| {
                             live.contains(&(grid_key(l2), canon_bits(path)))
-                        });
+                        })
+                    };
                     if !parent_in_grid {
                         tracing::warn!(
                             parent = hex::encode(&change.parent),
@@ -5143,6 +5338,22 @@ impl GlobalIntrinsic {
                     }
                 }
                 ShardChangeKind::Merge => {
+                    if *verdict == Verdict::StaleMerge {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING stale merge — its children are not exactly the live shards of its parent; consuming the pending record without changing the grid"
+                        );
+                        store.delete_pending_shard_change(
+                            txn,
+                            &change.parent,
+                            change.effective_epoch,
+                        )?;
+                        continue;
+                    }
                     // Decode in the format the children were PROPOSED in (mirrors
                     // the Split branch's straddle-safe gate).
                     let bit_path_mode =

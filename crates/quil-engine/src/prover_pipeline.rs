@@ -2460,21 +2460,25 @@ impl ProverPipeline {
         self.publish_prover_message(bytes, frame_number).await
     }
 
-    /// Submit a `ShardSplit` proposal for the given shard → child set.
-    /// Go signs `u64_be(frame) || shard_address` under the
-    /// `SHARD_SPLIT` domain. See `global_shard_split.go:205-230`.
+    /// Submit a `ShardSplit` proposal for the given shard → child set,
+    /// signed over what its verifier checks
+    /// (`verify::shard_op_signing_payload`): from the shard op binding epoch
+    /// the frame, the parent and every child; before it, as Go
+    /// (`global_shard_split.go:205-230`), the frame and parent only.
     pub async fn submit_shard_split(
         &self,
         shard_address: Vec<u8>,
         proposed_shards: Vec<Vec<u8>>,
         frame_number: u64,
     ) -> Result<()> {
-        let mut msg = Vec::with_capacity(8 + shard_address.len());
-        msg.extend_from_slice(&frame_number.to_be_bytes());
-        msg.extend_from_slice(&shard_address);
-
+        let (msg, domain) = quil_execution::global_intrinsic::verify::shard_op_signing_payload(
+            quil_execution::global_intrinsic::verify::ShardOpKind::Split,
+            frame_number,
+            frame_number,
+            &shard_address,
+            &proposed_shards,
+        )?;
         let signer = self.bls_signer()?;
-        let domain = Self::domain(b"SHARD_SPLIT")?;
         let signature = signer.sign_with_domain(&msg, &domain)?;
 
         let split = ShardSplit {
@@ -2497,21 +2501,23 @@ impl ProverPipeline {
             .await
     }
 
-    /// Submit a `ShardMerge` proposal for the given shard list →
-    /// parent. Go signs `u64_be(frame) || parent_address` under the
-    /// `SHARD_MERGE` domain. See `global_shard_merge.go:203-230`.
+    /// Submit a `ShardMerge` proposal for the given shard list → parent,
+    /// signed like [`Self::submit_shard_split`] (before the shard op binding
+    /// epoch as Go, `global_shard_merge.go:203-230`: frame and parent only).
     pub async fn submit_shard_merge(
         &self,
         shard_addresses: Vec<Vec<u8>>,
         parent_address: Vec<u8>,
         frame_number: u64,
     ) -> Result<()> {
-        let mut msg = Vec::with_capacity(8 + parent_address.len());
-        msg.extend_from_slice(&frame_number.to_be_bytes());
-        msg.extend_from_slice(&parent_address);
-
+        let (msg, domain) = quil_execution::global_intrinsic::verify::shard_op_signing_payload(
+            quil_execution::global_intrinsic::verify::ShardOpKind::Merge,
+            frame_number,
+            frame_number,
+            &parent_address,
+            &shard_addresses,
+        )?;
         let signer = self.bls_signer()?;
-        let domain = Self::domain(b"SHARD_MERGE")?;
         let signature = signer.sign_with_domain(&msg, &domain)?;
 
         let merge = ShardMerge {

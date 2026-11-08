@@ -60,6 +60,9 @@ pub mod storage_seat;
 pub mod storage_snapshot;
 pub mod verify;
 
+#[cfg(test)]
+mod shard_op_binding_tests;
+
 pub use addressed_signature::{
     AddressedSignature, MAX_ADDRESSED_SIG_LEN, TYPE_BLS48581_ADDRESSED_SIGNATURE,
 };

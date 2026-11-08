@@ -617,7 +617,7 @@ pub(crate) async fn start(
                     "adds",
                     &app,
                     &parent_bits,
-                    16,
+                    quil_execution::global_intrinsic::verify::SPLIT_MAX_EXTRA_BITS,
                     &quil_forest::bit_path_reaches_outputs,
                 )
             },

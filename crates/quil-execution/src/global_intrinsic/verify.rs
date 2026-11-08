@@ -1086,17 +1086,156 @@ pub(crate) fn verify_addressed_bls(
     key_manager.validate_signature(KeyType::Falcon512, &pubkey, message, signature, domain)
 }
 
-/// Verify a `ShardSplit` op. Mirrors Go's `ShardSplitOp.Verify` at
-/// `global_shard_split.go:53-133`:
+/// How far past its parent a split may descend to its branch: the proposer
+/// (`propose_split_children`) looks this many bits past a uniform run.
+pub const SPLIT_MAX_EXTRA_BITS: usize = 16;
+
+/// Which shard topology op [`shard_op_signing_payload`] signs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardOpKind {
+    Split,
+    Merge,
+}
+
+/// The bytes a `ShardSplit` or `ShardMerge` signed at frame `op_frame` and
+/// included at GLOBAL frame `frame_number` signs, and their domain. Before
+/// the shard op binding epoch
+/// ([`quil_types::consensus::shard_op_binding_active`]) that is
+/// `frame_be ‖ parent` under `poseidon(GLOBAL ‖ "SHARD_SPLIT")` (or
+/// `"SHARD_MERGE"`), which leaves the children unsigned. From it the frame,
+/// the parent and every child in order are signed, each length-prefixed,
+/// under `"SHARD_SPLIT_BOUND"` (or `"SHARD_MERGE_BOUND"`), so a signature
+/// over the old bytes never verifies. The proposer passes the frame it signs
+/// at as both frames; the freshness rule puts them in one epoch.
+pub fn shard_op_signing_payload(
+    kind: ShardOpKind,
+    frame_number: u64,
+    op_frame: u64,
+    parent: &[u8],
+    children: &[Vec<u8>],
+) -> Result<(Vec<u8>, [u8; 32])> {
+    let (legacy, bound, tag) = match kind {
+        ShardOpKind::Split => (
+            &b"SHARD_SPLIT"[..],
+            &b"SHARD_SPLIT_BOUND"[..],
+            &b"split"[..],
+        ),
+        ShardOpKind::Merge => (
+            &b"SHARD_MERGE"[..],
+            &b"SHARD_MERGE_BOUND"[..],
+            &b"merge"[..],
+        ),
+    };
+    if !quil_types::consensus::shard_op_binding_active(frame_number) {
+        let mut message = Vec::with_capacity(8 + parent.len());
+        message.extend_from_slice(&op_frame.to_be_bytes());
+        message.extend_from_slice(parent);
+        return Ok((message, intrinsic_domain(legacy)?));
+    }
+    let length = |bytes: &[u8]| -> Result<[u8; 2]> {
+        u16::try_from(bytes.len())
+            .map(u16::to_be_bytes)
+            .map_err(|_| QuilError::InvalidArgument("shard op: filter too long to sign".into()))
+    };
+    let count = u8::try_from(children.len())
+        .map_err(|_| QuilError::InvalidArgument("shard op: too many children to sign".into()))?;
+    let mut message =
+        Vec::with_capacity(32 + parent.len() + children.iter().map(|c| c.len() + 2).sum::<usize>());
+    message.extend_from_slice(b"quil/shard-");
+    message.extend_from_slice(tag);
+    message.extend_from_slice(b"/v2");
+    message.extend_from_slice(&op_frame.to_be_bytes());
+    message.extend_from_slice(&length(parent)?);
+    message.extend_from_slice(parent);
+    message.push(count);
+    for child in children {
+        message.extend_from_slice(&length(child)?);
+        message.extend_from_slice(child);
+    }
+    Ok((message, intrinsic_domain(bound)?))
+}
+
+/// From the shard op binding epoch, a split's or merge's children must be
+/// the two bit-path children `B‖0`, `B‖1` (in that order, canonically
+/// encoded) of one branch `B`: for a merge `B` is the parent, for a split `B`
+/// extends the parent by at most [`SPLIT_MAX_EXTRA_BITS`]. That is all the
+/// proposers emit, and it keeps the grid a complete prefix-free partition.
+/// Apply checks a due split the same way, whenever it was included.
+pub(crate) fn require_sibling_children(
+    op: &str,
+    parent: &[u8],
+    children: &[Vec<u8>],
+    merge: bool,
+) -> Result<()> {
+    let refuse = |what: &str| Err(QuilError::InvalidArgument(format!("{op}: {what}")));
+    let Some((app, parent_bits)) = quil_forest::decode_shard_filter_or_root(parent, 32) else {
+        return refuse("malformed parent filter");
+    };
+    let [lo, hi] = children else {
+        return refuse("children must be exactly two bit-path siblings");
+    };
+    let decoded = |child: &[u8]| {
+        quil_forest::decode_shard_bit_path(child, 32)
+            .filter(|(child_app, bits)| {
+                *child_app == app && quil_forest::encode_shard_bit_path(&app, bits) == child
+            })
+            .map(|(_, bits)| bits)
+    };
+    let (Some(lo_bits), Some(hi_bits)) = (decoded(lo), decoded(hi)) else {
+        return refuse("children must be canonical bit-path filters of the parent's app");
+    };
+    let Some((last, branch)) = lo_bits.split_last() else {
+        return refuse("children must extend a branch");
+    };
+    let mut sibling = branch.to_vec();
+    sibling.push(true);
+    if *last || hi_bits != sibling {
+        return refuse("children must be the siblings B‖0, B‖1 in that order");
+    }
+    if merge && branch != parent_bits.as_slice() {
+        return refuse("children must be the two children of the parent");
+    }
+    if !branch.starts_with(&parent_bits) || branch.len() - parent_bits.len() > SPLIT_MAX_EXTRA_BITS
+    {
+        return refuse("children must branch within the split descent limit below the parent");
+    }
+    Ok(())
+}
+
+/// From the shard op binding epoch a split or merge, like the other signed
+/// prover ops, must be signed at most [`PROVER_OP_FRESHNESS_WINDOW`] frames
+/// before, and in the epoch of, the frame including it: a signed op cannot be
+/// replayed once the grid it was meant for has changed.
+fn validate_shard_op_frame(op: &str, signed_frame: u64, inclusion_frame: u64) -> Result<()> {
+    if signed_frame > inclusion_frame
+        || inclusion_frame - signed_frame > PROVER_OP_FRESHNESS_WINDOW
+        || quil_types::consensus::epoch_for_frame(signed_frame)
+            != quil_types::consensus::epoch_for_frame(inclusion_frame)
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: signed frame {signed_frame} is not within {PROVER_OP_FRESHNESS_WINDOW} frames \
+             before frame {inclusion_frame} in its epoch"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify a `ShardSplit` op included at GLOBAL frame `frame_number`. Mirrors
+/// Go's `ShardSplitOp.Verify` at `global_shard_split.go:53-133`:
 /// - shard_address 32–63 bytes
 /// - proposed_shards has 2–8 entries, each of parent_len+1 or
 /// parent_len+2 and prefixed by shard_address
-/// - BLS sig over `frame_be_u64 || shard_address` with domain
-/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
+/// - the signature over [`shard_op_signing_payload`]
+///
+/// From the shard op binding epoch also: signed at most
+/// [`PROVER_OP_FRESHNESS_WINDOW`] frames before `frame_number` in its epoch,
+/// after the unified tree cutover, with two sibling children
+/// ([`require_sibling_children`]).
 pub fn verify_shard_split(
     op: &super::prover_ops::ShardSplit,
     prover_tree: &quil_tries::VectorCommitmentTree,
     key_manager: &dyn KeyManager,
+    frame_number: u64,
 ) -> Result<bool> {
     if op.shard_address.len() < 32 || op.shard_address.len() > 63 {
         return Err(QuilError::InvalidArgument(format!(
@@ -1110,12 +1249,21 @@ pub fn verify_shard_split(
             op.proposed_shards.len()
         )));
     }
+    let bound = quil_types::consensus::shard_op_binding_active(frame_number);
+    if bound {
+        validate_shard_op_frame("shard split", op.frame_number, frame_number)?;
+    }
     // Deep-bifurcation: post-cutover proposals encode children as bit-path
     // FILTERS (`app ‖ bit_len ‖ packed`, variable length), validated as
     // bit-prefix extensions of the parent — NOT the legacy byte-suffix children
     // (exactly parent_len+1/+2, a byte prefix). The proposal frame decides the
     // format, matching `materialize_shard_split`'s gate at the same frame.
     let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
+    if bound && !bit_path_mode {
+        return Err(QuilError::InvalidArgument(
+            "shard split: signed before the unified tree cutover".into(),
+        ));
+    }
     let parent_len = op.shard_address.len();
     for shard in &op.proposed_shards {
         if bit_path_mode {
@@ -1144,17 +1292,22 @@ pub fn verify_shard_split(
             }
         }
     }
+    if bound {
+        require_sibling_children("shard split", &op.shard_address, &op.proposed_shards, false)?;
+    }
 
     let sig = op
         .public_key_signature_bls48581
         .as_ref()
         .ok_or_else(|| QuilError::InvalidArgument("shard split: missing signature".into()))?;
 
-    let mut message = Vec::with_capacity(8 + op.shard_address.len());
-    message.extend_from_slice(&op.frame_number.to_be_bytes());
-    message.extend_from_slice(&op.shard_address);
-
-    let domain = intrinsic_domain(b"SHARD_SPLIT")?;
+    let (message, domain) = shard_op_signing_payload(
+        ShardOpKind::Split,
+        frame_number,
+        op.frame_number,
+        &op.shard_address,
+        &op.proposed_shards,
+    )?;
 
     verify_addressed_bls(
         &sig.address,
@@ -1167,17 +1320,21 @@ pub fn verify_shard_split(
     )
 }
 
-/// Verify a `ShardMerge` op. Mirrors Go's `ShardMergeOp.Verify` at
-/// `global_shard_merge.go:51-125`:
+/// Verify a `ShardMerge` op included at GLOBAL frame `frame_number`. Mirrors
+/// Go's `ShardMergeOp.Verify` at `global_shard_merge.go:51-125`:
 /// - parent_address 32 bytes
 /// - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
 /// and each prefixed by parent_address
-/// - BLS sig over `frame_be_u64 || parent_address` with domain
-/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
+/// - the signature over [`shard_op_signing_payload`]
+///
+/// From the shard op binding epoch also: freshness and the cutover as for a
+/// split, and the children are the parent's two bit-path children
+/// ([`require_sibling_children`]).
 pub fn verify_shard_merge(
     op: &super::prover_ops::ShardMerge,
     prover_tree: &quil_tries::VectorCommitmentTree,
     key_manager: &dyn KeyManager,
+    frame_number: u64,
 ) -> Result<bool> {
     if op.parent_address.len() < 32 || op.parent_address.len() > 63 {
         return Err(QuilError::InvalidArgument(format!(
@@ -1191,12 +1348,21 @@ pub fn verify_shard_merge(
             op.shard_addresses.len()
         )));
     }
+    let bound = quil_types::consensus::shard_op_binding_active(frame_number);
+    if bound {
+        validate_shard_op_frame("shard merge", op.frame_number, frame_number)?;
+    }
     // Deep-bifurcation (parity with `verify_shard_split`): post-cutover the
     // merged children are variable-length bit-path FILTERS validated as bit-prefix
     // extensions of the parent — NOT the legacy parent_len+1/+2 byte suffixes. The
     // proposal frame decides the format. The parent may be the bare app root or a
     // bit-path filter; `shard_filter_extends` handles both.
     let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
+    if bound && !bit_path_mode {
+        return Err(QuilError::InvalidArgument(
+            "shard merge: signed before the unified tree cutover".into(),
+        ));
+    }
     let parent_len = op.parent_address.len();
     for shard in &op.shard_addresses {
         if bit_path_mode {
@@ -1225,17 +1391,22 @@ pub fn verify_shard_merge(
             }
         }
     }
+    if bound {
+        require_sibling_children("shard merge", &op.parent_address, &op.shard_addresses, true)?;
+    }
 
     let sig = op
         .public_key_signature_bls48581
         .as_ref()
         .ok_or_else(|| QuilError::InvalidArgument("shard merge: missing signature".into()))?;
 
-    let mut message = Vec::with_capacity(8 + op.parent_address.len());
-    message.extend_from_slice(&op.frame_number.to_be_bytes());
-    message.extend_from_slice(&op.parent_address);
-
-    let domain = intrinsic_domain(b"SHARD_MERGE")?;
+    let (message, domain) = shard_op_signing_payload(
+        ShardOpKind::Merge,
+        frame_number,
+        op.frame_number,
+        &op.parent_address,
+        &op.shard_addresses,
+    )?;
 
     verify_addressed_bls(
         &sig.address,
@@ -2323,7 +2494,7 @@ mod tests {
     #[test]
     fn shard_split_accepts_valid() {
         let prover_tree = make_prover_tree();
-        assert!(verify_shard_split(&sample_split(), &prover_tree, &AcceptKeyManager).unwrap());
+        assert!(verify_shard_split(&sample_split(), &prover_tree, &AcceptKeyManager, 0).unwrap());
     }
 
     #[test]
@@ -2331,7 +2502,7 @@ mod tests {
         let prover_tree = make_prover_tree();
         let mut op = sample_split();
         op.shard_address = vec![0x01u8; 31]; // < 32
-        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     #[test]
@@ -2339,7 +2510,7 @@ mod tests {
         let prover_tree = make_prover_tree();
         let mut op = sample_split();
         op.proposed_shards = vec![vec![0x01u8; 33]]; // only 1
-        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     #[test]
@@ -2348,13 +2519,13 @@ mod tests {
         let mut op = sample_split();
         // Right length (parent+1) but wrong prefix.
         op.proposed_shards = vec![vec![0x09u8; 33], vec![0x01u8; 33]];
-        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     #[test]
     fn shard_split_rejects_bad_signature() {
         let prover_tree = make_prover_tree();
-        assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager).unwrap());
+        assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager, 0).unwrap());
     }
 
     /// Deep-bifurcation: post-cutover (`frame_number >= cutover`) the children are
@@ -2376,7 +2547,7 @@ mod tests {
         op.shard_address = app.to_vec(); // bare app root (empty bit-path parent)
         op.proposed_shards = vec![c0, c1];
         assert!(
-            verify_shard_split(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            verify_shard_split(&op, &prover_tree, &AcceptKeyManager, 0).unwrap(),
             "deep bit-path children under the bare-app root must pass validation"
         );
 
@@ -2386,7 +2557,7 @@ mod tests {
             encode_shard_bit_path(&app, &[true]),
             encode_shard_bit_path(&[0x09u8; 32], &[false]),
         ];
-        assert!(verify_shard_split(&bad, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_split(&bad, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     fn sample_merge() -> ShardMerge {
@@ -2404,7 +2575,7 @@ mod tests {
     #[test]
     fn shard_merge_accepts_valid() {
         let prover_tree = make_prover_tree();
-        assert!(verify_shard_merge(&sample_merge(), &prover_tree, &AcceptKeyManager).unwrap());
+        assert!(verify_shard_merge(&sample_merge(), &prover_tree, &AcceptKeyManager, 0).unwrap());
     }
 
     #[test]
@@ -2412,7 +2583,7 @@ mod tests {
         let prover_tree = make_prover_tree();
         let mut op = sample_merge();
         op.shard_addresses = vec![vec![0x09u8; 33], vec![0x01u8; 33]];
-        assert!(verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_merge(&op, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     #[test]
@@ -2421,7 +2592,7 @@ mod tests {
         let mut op = sample_merge();
         op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x77u8; 32];
         // poseidon(pubkey) != sig.address → Ok(false).
-        assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap());
+        assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager, 0).unwrap());
     }
 
     /// Deep-bifurcation (parity with the split): post-cutover the merged children
@@ -2441,7 +2612,7 @@ mod tests {
             encode_shard_bit_path(&app, &[false, false, false, true]),
         ];
         assert!(
-            verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            verify_shard_merge(&op, &prover_tree, &AcceptKeyManager, 0).unwrap(),
             "deep bit-path children merging into their parent branch must validate"
         );
 
@@ -2451,7 +2622,7 @@ mod tests {
             encode_shard_bit_path(&app, &[false, false, false, false]),
             encode_shard_bit_path(&app, &[true, false, false, false]), // wrong branch
         ];
-        assert!(verify_shard_merge(&bad, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_shard_merge(&bad, &prover_tree, &AcceptKeyManager, 0).is_err());
     }
 
     fn sample_seniority_merge() -> ProverSeniorityMerge {
