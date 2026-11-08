@@ -142,29 +142,22 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
 /// frames are mirrored by the worker drain). The filter is the frame header's
 /// `address`; the bitmask check confirms this really is a shard-frame message
 /// for it (and that non-frame mesh traffic is skipped). Only a frame that
-/// verifies is mirrored ([`mirror_admits`]): any peer can publish on the
+/// verifies is mirrored ([`ShardMirror::offer`]): any peer can publish on the
 /// topic, and one unverified far-future frame pinned the head this node
 /// serves, as it did an archive's.
 fn unrouted_shard_message(
     bitmask: &[u8],
     data: &[u8],
     clock_store: &dyn quil_types::store::ClockStore,
-    validator: &quil_engine::frame_validator::BlsAppFrameValidator,
+    mirror: &ShardMirror,
 ) {
     if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
         if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
             if !addr.is_empty()
                 && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
             {
-                match mirror_admits(validator, &frame) {
-                    Ok(()) => super::worker_manager::mirror_shard_frame_to_clock_store(
-                        clock_store,
-                        &addr,
-                        data,
-                    ),
-                    Err(reason) => {
-                        MIRROR_REFUSALS.note(&frame, reason, std::time::Instant::now());
-                    }
+                if let Err(reason) = mirror.offer(clock_store, &frame, data) {
+                    MIRROR_REFUSALS.note(&frame, reason, std::time::Instant::now());
                 }
             }
         }
@@ -213,6 +206,220 @@ fn mirror_admits(
         Ok(true) => Ok(()),
         Ok(false) => Err("certificate refused".into()),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Frames without a certificate held per shard until a certified child links
+/// to them, as many as the archive ingest holds.
+const MIRROR_HELD_PER_SHARD: usize = 32;
+/// Encoded bytes of every held frame; past it the longest held is dropped.
+const MIRROR_HELD_BYTES: usize = 64 << 20;
+
+/// What a node without an archive ingest mirrors of the shard frames
+/// gossiped for shards no local engine runs: a frame that verifies at once
+/// ([`mirror_admits`]), and one final only through its certified child.
+/// Simplex finalizes a view's notarized ancestors with the child's
+/// certificate, so such a frame never carries one of its own; the archive
+/// ingest holds it until a certified child links to it, and so does this.
+struct ShardMirror {
+    validator: quil_engine::frame_validator::BlsAppFrameValidator,
+    held: std::sync::Mutex<HeldFrames>,
+}
+
+/// The key of a held frame: its filter, number and output identity. Keyed
+/// by identity, so a well-formed impostor does not displace the real frame.
+type HeldKey = (Vec<u8>, u64, [u8; 32]);
+
+/// Frames without a certificate whose header verifies otherwise, each with
+/// its arrival count and encoding.
+#[derive(Default)]
+struct HeldFrames {
+    frames: std::collections::BTreeMap<HeldKey, (u64, Vec<u8>)>,
+    bytes: usize,
+    arrivals: u64,
+}
+
+/// What [`ShardMirror::offer`] did with a frame it did not refuse.
+#[derive(Debug, PartialEq, Eq)]
+enum Mirrored {
+    /// Mirrored, with the held ancestors it links to.
+    Stored,
+    /// Held until a certified child links to it.
+    Held,
+}
+
+impl ShardMirror {
+    fn new(validator: quil_engine::frame_validator::BlsAppFrameValidator) -> Self {
+        Self {
+            validator,
+            held: std::sync::Mutex::new(HeldFrames::default()),
+        }
+    }
+
+    /// Mirror gossiped `frame` (encoded as `data`) into `clock_store` once it
+    /// verifies, hold it while it waits for its certified child, else say
+    /// why not.
+    fn offer(
+        &self,
+        clock_store: &dyn quil_types::store::ClockStore,
+        frame: &quil_types::proto::global::AppShardFrame,
+        data: &[u8],
+    ) -> Result<Mirrored, String> {
+        let header = frame.header.as_ref().ok_or("no header")?;
+        let certified = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .is_some_and(|signature| !signature.signature.is_empty());
+        match mirror_admits(&self.validator, frame) {
+            Ok(()) => {}
+            Err(reason) if certified => return Err(reason),
+            Err(_) => return self.hold(clock_store, frame, data),
+        }
+        self.store(clock_store, header, data);
+        Ok(Mirrored::Stored)
+    }
+
+    /// Mirror an authenticated frame, then the held ancestors it links to.
+    fn store(
+        &self,
+        clock_store: &dyn quil_types::store::ClockStore,
+        header: &quil_types::proto::global::FrameHeader,
+        data: &[u8],
+    ) {
+        super::worker_manager::mirror_shard_frame_to_clock_store(
+            clock_store,
+            &header.address,
+            data,
+        );
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut child = header.clone();
+        while let (Some(below), Ok(identity)) = (
+            child.frame_number.checked_sub(1),
+            <[u8; 32]>::try_from(child.parent_selector.as_slice()),
+        ) {
+            let key = (header.address.clone(), below, identity);
+            let Some(parent) = held
+                .frames
+                .get(&key)
+                .and_then(|(_, data)| {
+                    <quil_types::proto::global::AppShardFrame as prost::Message>::decode(
+                        data.as_slice(),
+                    )
+                    .ok()
+                })
+                .and_then(|frame| frame.header)
+                .filter(|parent| {
+                    quil_engine::frame_validator::app_frame_links_to_child(parent, &child)
+                })
+            else {
+                break;
+            };
+            let (_, data) = held.remove(&key).expect("found above");
+            super::worker_manager::mirror_shard_frame_to_clock_store(
+                clock_store,
+                &header.address,
+                &data,
+            );
+            child = parent;
+        }
+        // A frame this far below a mirrored one is no ancestor still owed.
+        let stale = header
+            .frame_number
+            .saturating_sub(MIRROR_HELD_PER_SHARD as u64);
+        let below: std::ops::Range<HeldKey> =
+            (header.address.clone(), 0, [0; 32])..(header.address.clone(), stale, [0; 32]);
+        let owed: Vec<HeldKey> = held
+            .frames
+            .range(below)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in owed {
+            held.remove(&key);
+        }
+    }
+
+    /// Hold a frame without a certificate whose header verifies otherwise,
+    /// or mirror it when the child mirrored before it links to it.
+    fn hold(
+        &self,
+        clock_store: &dyn quil_types::store::ClockStore,
+        frame: &quil_types::proto::global::AppShardFrame,
+        data: &[u8],
+    ) -> Result<Mirrored, String> {
+        let header = frame.header.as_ref().ok_or("no header")?;
+        match self.validator.validate_linked_without_storage(frame) {
+            Ok(true) => {}
+            Ok(false) => return Err("no certificate, and the header does not verify".into()),
+            Err(error) => return Err(format!("no certificate, and {error}")),
+        }
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map_err(|_| "no certificate, and no output identity".to_string())?;
+        let child = header.frame_number.checked_add(1).and_then(|number| {
+            clock_store
+                .get_shard_clock_frame(&header.address, number, false)
+                .ok()
+        });
+        if child
+            .as_ref()
+            .and_then(|child| child.header.as_ref())
+            .is_some_and(|child| {
+                quil_engine::frame_validator::app_frame_links_to_child(header, child)
+            })
+        {
+            self.store(clock_store, header, data);
+            return Ok(Mirrored::Stored);
+        }
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (header.address.clone(), header.frame_number, identity),
+                data.to_vec(),
+            );
+        Ok(Mirrored::Held)
+    }
+}
+
+impl HeldFrames {
+    fn remove(&mut self, key: &HeldKey) -> Option<(u64, Vec<u8>)> {
+        let removed = self.frames.remove(key)?;
+        self.bytes -= removed.1.len();
+        Some(removed)
+    }
+
+    /// Hold `data` under `key`. Past the bounds the shard's farthest frame
+    /// goes first, so an impostor numbered far ahead cannot push out the real
+    /// next frame, then the longest held of any shard.
+    fn insert(&mut self, key: HeldKey, data: Vec<u8>) {
+        if self.frames.contains_key(&key) {
+            return;
+        }
+        let shard: std::ops::RangeInclusive<HeldKey> =
+            (key.0.clone(), 0, [0; 32])..=(key.0.clone(), u64::MAX, [0xff; 32]);
+        self.arrivals += 1;
+        self.bytes += data.len();
+        self.frames.insert(key, (self.arrivals, data));
+        while self.frames.range(shard.clone()).count() > MIRROR_HELD_PER_SHARD {
+            let Some(farthest) = self.frames.range(shard.clone()).next_back() else {
+                break;
+            };
+            let farthest = farthest.0.clone();
+            self.remove(&farthest);
+        }
+        while self.bytes > MIRROR_HELD_BYTES {
+            let Some(oldest) = self
+                .frames
+                .iter()
+                .min_by_key(|(_, (arrival, _))| *arrival)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
     }
 }
 
@@ -491,11 +698,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     });
     // A node without an archive ingest (a cluster master) mirrors the shard
     // frames gossiped for shards no local engine runs, once they verify.
-    let mirror_validator = shard_mirror_validator(
+    let shard_mirror = ShardMirror::new(shard_mirror_validator(
         pr_for_recv.clone(),
         clock_store_recv.clone(),
         crdt_for_recv.clone(),
-    );
+    ));
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
     // certificate and VDF verified skips both checks on later copies.
@@ -2313,7 +2520,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             bm,
                                             &received.data,
                                             clock_store_recv.as_ref(),
-                                            &mirror_validator,
+                                            &shard_mirror,
                                         ),
                                     }
                                 }
@@ -2400,7 +2607,7 @@ mod tests {
         global_frame: u64,
         global_output: Vec<u8>,
         clock: Arc<quil_store::testing::InMemoryClockStore>,
-        validator: quil_engine::frame_validator::BlsAppFrameValidator,
+        mirror: ShardMirror,
     }
 
     impl Shard {
@@ -2456,14 +2663,14 @@ mod tests {
                 Arc::new(quil_hypergraph::testing::MemStore::new()),
                 Arc::new(quil_types::crypto::NoopInclusionProver),
             ));
-            let validator = shard_mirror_validator(registry, clock.clone(), crdt);
+            let mirror = ShardMirror::new(shard_mirror_validator(registry, clock.clone(), crdt));
             Self {
                 signer,
                 filter,
                 global_frame,
                 global_output,
                 clock,
-                validator,
+                mirror,
             }
         }
 
@@ -2489,6 +2696,42 @@ mod tests {
         /// Frame `number` with its deterministic output and the member's
         /// finalization certificate.
         fn certified(&self, number: u64) -> quil_types::proto::global::AppShardFrame {
+            self.certified_after(number, vec![])
+        }
+
+        /// Frame `number` built on the frame whose output identity is
+        /// `parent_selector`, notarized: its deterministic output, no
+        /// certificate of its own.
+        fn notarized(
+            &self,
+            number: u64,
+            parent_selector: Vec<u8>,
+        ) -> quil_types::proto::global::AppShardFrame {
+            let mut frame = self.certified_after(number, parent_selector);
+            frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+            frame
+        }
+
+        /// The certified frame after `parent`, linking to it.
+        fn certified_child(
+            &self,
+            parent: &quil_types::proto::global::AppShardFrame,
+        ) -> quil_types::proto::global::AppShardFrame {
+            let parent = parent.header.as_ref().unwrap();
+            self.certified_after(
+                parent.frame_number + 1,
+                quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+                    .unwrap()
+                    .to_vec(),
+            )
+        }
+
+        /// [`Self::certified`], built on `parent_selector`.
+        fn certified_after(
+            &self,
+            number: u64,
+            parent_selector: Vec<u8>,
+        ) -> quil_types::proto::global::AppShardFrame {
             use quil_cw_consensus::{
                 _consensus::{
                     simplex::{
@@ -2507,6 +2750,7 @@ mod tests {
             use quil_types::crypto::Signer as _;
             let mut frame = self.frame(number);
             let h = frame.header.as_mut().unwrap();
+            h.parent_selector = parent_selector;
             let rho = quil_crypto::porep::derive_storage_beacon(
                 h.global_frame_number,
                 &self.global_output,
@@ -2565,7 +2809,7 @@ mod tests {
                 bitmask,
                 &prost::Message::encode_to_vec(frame),
                 self.clock.as_ref(),
-                &self.validator,
+                &self.mirror,
             );
         }
 
@@ -2593,7 +2837,7 @@ mod tests {
         let shard = Shard::new();
         let topic = shard.topic();
         let frame = shard.certified(7);
-        assert_eq!(mirror_admits(&shard.validator, &frame), Ok(()));
+        assert_eq!(mirror_admits(&shard.mirror.validator, &frame), Ok(()));
         shard.hear(&topic, &frame);
         assert_eq!(
             shard
@@ -2726,12 +2970,66 @@ mod tests {
                 ..Default::default()
             });
         for forged in [&unsigned, &altered, &garbage] {
-            assert!(mirror_admits(&shard.validator, forged).is_err());
+            assert!(mirror_admits(&shard.mirror.validator, forged).is_err());
             shard.hear(&topic, forged);
             assert_eq!(shard.latest(), Some(7), "the forged frame is not mirrored");
         }
         shard.hear(&topic, &shard.certified(8));
         assert_eq!(shard.latest(), Some(8), "the honest chain still advances");
+    }
+
+    /// Simplex finalizes a notarized frame through its certified child, so a
+    /// genuine frame can come without a certificate of its own (mainnet
+    /// shards make several a day). It is held and mirrored once a certified
+    /// child links to it, whichever arrives first; a frame without a
+    /// certificate that no certified child links to is not.
+    #[test]
+    fn a_frame_final_only_through_its_certified_child_is_mirrored() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let stored = |number| {
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, number, false)
+                .ok()
+        };
+        shard.hear(&topic, &shard.certified(6));
+        let selector = |frame: &quil_types::proto::global::AppShardFrame| {
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
+                .unwrap()
+                .to_vec()
+        };
+        let parent = shard.notarized(7, selector(&shard.certified(6)));
+        let impostor = shard.notarized(7, vec![1; 32]);
+        assert!(mirror_admits(&shard.mirror.validator, &parent).is_err());
+        shard.hear(&topic, &impostor);
+        shard.hear(&topic, &parent);
+        assert_eq!(stored(7), None, "no certified child links to it yet");
+        assert_eq!(shard.latest(), Some(6));
+        shard.hear(&topic, &shard.certified_child(&parent));
+        assert_eq!(
+            (stored(7), shard.latest()),
+            (Some(parent.clone()), Some(8)),
+            "FINAL-THROUGH-CHILD: a frame final only through its certified child was not \
+             mirrored once the child arrived"
+        );
+
+        let late = shard.notarized(9, selector(&shard.certified_child(&parent)));
+        shard.hear(&topic, &shard.certified_child(&late));
+        assert_eq!(shard.latest(), Some(10));
+        shard.hear(&topic, &late);
+        assert_eq!(
+            stored(9),
+            Some(late),
+            "FINAL-THROUGH-CHILD: a frame final only through its certified child was not \
+             mirrored when the child came first"
+        );
+
+        let orphan = shard.notarized(11, vec![0; 32]);
+        shard.hear(&topic, &orphan);
+        assert_eq!(stored(11), None, "no certified child links to it");
+        assert_eq!(shard.latest(), Some(10));
     }
 
     /// Refusals log one line at once, then at most one per interval with the
