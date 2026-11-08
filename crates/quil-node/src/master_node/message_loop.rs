@@ -148,10 +148,10 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
 ///
 /// The check runs on the mirror's own thread ([`MirrorFeed`]); this loop
 /// reads only the frame's header, counts its request bundles unread and
-/// queues it. Checked here, a peer's frame of many bundles held the loop
-/// for seconds, and the check reads the execution engines that GLOBAL
-/// execution locks. True when the frame was queued.
-fn unrouted_shard_message(bitmask: &[u8], data: Vec<u8>, feed: &MirrorFeed) -> bool {
+/// queues it under its signer `from`. Checked here, a peer's frame of many
+/// bundles held the loop for seconds, and the check reads the execution
+/// engines that GLOBAL execution locks. True when the frame was queued.
+fn unrouted_shard_message(bitmask: &[u8], from: &[u8], data: Vec<u8>, feed: &MirrorFeed) -> bool {
     let Ok(outline) = <FrameOutline as prost::Message>::decode(data.as_slice()) else {
         return false;
     };
@@ -163,7 +163,7 @@ fn unrouted_shard_message(bitmask: &[u8], data: Vec<u8>, feed: &MirrorFeed) -> b
     {
         return false;
     }
-    feed.offer(bitmask, data, outline.requests.len());
+    feed.offer(bitmask, from, data, outline.requests.len());
     true
 }
 
@@ -189,11 +189,19 @@ fn mirror_queued(
     mirror: &ShardMirror,
     data: &[u8],
 ) {
-    let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data)
-    else {
-        return;
-    };
     let now = std::time::Instant::now();
+    let frame = match <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
+        Ok(frame) => frame,
+        Err(error) => {
+            // Its outline decoded on the loop: a request bundle does not.
+            MIRROR_REFUSALS.note(
+                &Default::default(),
+                format!("does not decode: {error}"),
+                now,
+            );
+            return;
+        }
+    };
     if let Err(reason) = mirror.offer(clock_store, &frame, data) {
         MIRROR_REFUSALS.note(&frame, reason, now);
     }
@@ -204,22 +212,27 @@ fn mirror_queued(
 /// arrive about one per 11 s (a mainnet master store copy: 0.06 to 0.09 a
 /// second per shard), so this is minutes of one shard's frames while the
 /// check waits, and a peer that floods a topic fills only that topic's
-/// room.
+/// room. A topic lists only senders with frames queued, so it also bounds
+/// the senders a topic tracks.
 const MIRROR_QUEUED_PER_TOPIC: usize = 16;
 /// Bytes the frames queued for the mirror's check take, bookkeeping
-/// included; past it the topic queuing the most bytes loses its costliest
-/// frame. Genuine frames on a mainnet master store copy took at most
-/// 198 KB, most far less: this queues hundreds of them, or four of a
-/// peer's 16 MiB gossip messages.
+/// included; past it the sender queuing the most bytes on the topic
+/// queuing the most loses its largest frame. Genuine frames on a mainnet
+/// master store copy took at most 198 KB, most far less: this queues
+/// hundreds of them, or four of a peer's 16 MiB gossip messages.
 const MIRROR_QUEUED_BYTES: usize = 64 << 20;
 /// What checking one carried request bundle costs, in bytes of encoding
 /// that cost as much: on a mainnet master store copy the check took about
 /// 1.9 ms per bundle and 12 ms per MB.
 const MIRROR_BUNDLE_COST_BYTES: usize = 160 << 10;
-/// Bookkeeping bytes per queued frame besides its encoding and its topic.
+/// Bookkeeping bytes per queued frame besides its encoding, its topic and
+/// its sender.
 const MIRROR_QUEUED_ENTRY_OVERHEAD: usize = std::mem::size_of::<QueuedFrame>() + 64;
-/// How often the frames the mirror's queue dropped are summarized.
+/// How often the frames the mirror's queue dropped, and the checks that
+/// panicked, are summarized.
 const MIRROR_QUEUE_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
+/// The most of a caught panic's text a line quotes.
+const MIRROR_PANIC_TEXT: usize = 200;
 
 /// A gossiped shard frame queued for the mirror's check.
 struct QueuedFrame {
@@ -229,11 +242,30 @@ struct QueuedFrame {
     arrival: u64,
 }
 
-/// The frames queued on one gossip topic, and the bytes they take.
-#[derive(Default)]
-struct TopicFrames {
+/// The frames one sender queued on a gossip topic, and the bytes they take.
+struct SenderFrames {
+    /// The peer that signed the gossip message (its `from`).
+    from: Vec<u8>,
     frames: Vec<QueuedFrame>,
     bytes: usize,
+}
+
+/// The frames queued on one gossip topic: per sender, in turn order, and
+/// in all. A sender is listed only while it has frames queued.
+#[derive(Default)]
+struct TopicFrames {
+    senders: std::collections::VecDeque<SenderFrames>,
+    frames: usize,
+    bytes: usize,
+}
+
+/// Which of a sender's frames a bound drops.
+#[derive(Clone, Copy)]
+enum Evict {
+    /// The costliest to check: past the topic's bound.
+    Costliest,
+    /// The largest: past the byte bound.
+    Largest,
 }
 
 /// Frames the mirror's queue dropped, and their encoded bytes.
@@ -243,14 +275,25 @@ struct QueueDrops {
     bytes: u64,
 }
 
-/// The shard frames queued for the mirror's check, per gossip topic. The
-/// worker takes the topics in turn and a topic's cheapest frame first, so a
-/// peer that floods one topic delays another's frame by at most the frame
-/// in check, and its own topic's genuine frame, smaller than a flood's, by
-/// none of those queued. Past the bounds the costliest frame goes: of its
-/// topic ([`MIRROR_QUEUED_PER_TOPIC`]), else of the topic queuing the most
-/// bytes ([`MIRROR_QUEUED_BYTES`]). Topics, not filters: a peer names any
-/// filter it likes, but only the topics this node subscribes reach it.
+/// The shard frames queued for the mirror's check, per gossip topic and,
+/// within a topic, per sender (the peer that signed the gossip message).
+/// The worker takes the topics in turn, a topic's senders in turn, and a
+/// sender's cheapest frame first. So a peer that floods one topic delays
+/// another topic's frame by at most one check per other topic with frames
+/// queued, and another sender's frame on its own topic by at most one of
+/// its frames per turn of that topic, however small and many its frames.
+///
+/// Past a topic's bound ([`MIRROR_QUEUED_PER_TOPIC`]) the sender queuing
+/// the most frames there loses its costliest; of equal counts the sender
+/// whose frame arrived. So an arrival drops another sender's frame only
+/// when that sender queues more frames there than the arriving one. Past
+/// the byte bound ([`MIRROR_QUEUED_BYTES`]) the sender queuing the most
+/// bytes on the topic queuing the most loses its largest frame.
+///
+/// Topics, not filters: a peer names any filter it likes, but only the
+/// topics this node subscribes reach it. Senders are the gossip messages'
+/// signers: a peer that signs with many keys counts as many senders, and
+/// they then share a topic's room and turns with the genuine one.
 struct MirrorQueue {
     topics: std::collections::HashMap<Vec<u8>, TopicFrames>,
     /// Topics with queued frames, in turn order.
@@ -290,20 +333,22 @@ impl MirrorQueue {
         }
     }
 
-    /// The bytes `frame` queued on `topic` takes.
-    fn size(topic: &[u8], frame: &QueuedFrame) -> usize {
-        frame.data.len() + topic.len() + MIRROR_QUEUED_ENTRY_OVERHEAD
+    /// The bytes `frame`, queued on `topic` by `from`, takes.
+    fn size(topic: &[u8], from: &[u8], frame: &QueuedFrame) -> usize {
+        frame.data.len() + topic.len() + from.len() + MIRROR_QUEUED_ENTRY_OVERHEAD
     }
 
     /// Frames queued.
     fn len(&self) -> usize {
-        self.topics.values().map(|queued| queued.frames.len()).sum()
+        self.topics.values().map(|queued| queued.frames).sum()
     }
 
-    /// Queue `data`, a frame on `topic` carrying `bundles` request bundles,
-    /// then drop what the bounds ask. Finding the topic queuing the most
+    /// Queue `data`, a frame on `topic` signed by `from` carrying `bundles`
+    /// request bundles, then drop what the bounds ask. Finding the sender
+    /// reads one entry per sender the topic lists (at most
+    /// [`MIRROR_QUEUED_PER_TOPIC`]); finding the topic queuing the most
     /// bytes reads one entry per queued topic, only past the byte bound.
-    fn push(&mut self, topic: &[u8], data: Vec<u8>, bundles: usize) {
+    fn push(&mut self, topic: &[u8], from: &[u8], data: Vec<u8>, bundles: usize) {
         self.arrivals += 1;
         let frame = QueuedFrame {
             cost: data
@@ -312,17 +357,36 @@ impl MirrorQueue {
             arrival: self.arrivals,
             data,
         };
-        let size = Self::size(topic, &frame);
+        let size = Self::size(topic, from, &frame);
         let queued = self.topics.entry(topic.to_vec()).or_default();
-        if queued.frames.is_empty() {
+        if queued.frames == 0 {
             self.turns.push_back(topic.to_vec());
         }
-        queued.frames.push(frame);
+        let index = match queued.senders.iter().position(|sender| sender.from == from) {
+            Some(index) => index,
+            None => {
+                queued.senders.push_back(SenderFrames {
+                    from: from.to_vec(),
+                    frames: Vec::new(),
+                    bytes: 0,
+                });
+                queued.senders.len() - 1
+            }
+        };
+        let sender = &mut queued.senders[index];
+        sender.frames.push(frame);
+        sender.bytes += size;
+        queued.frames += 1;
         queued.bytes += size;
-        let over = queued.frames.len() > MIRROR_QUEUED_PER_TOPIC;
         self.bytes += size;
-        if over {
-            self.drop_costliest(topic);
+        if queued.frames > MIRROR_QUEUED_PER_TOPIC {
+            let most = (0..queued.senders.len()).max_by_key(|&index| {
+                let sender = &queued.senders[index];
+                (sender.frames.len(), sender.from == from, sender.bytes)
+            });
+            if let Some(most) = most {
+                self.drop_frame(topic, most, Evict::Costliest);
+            }
         }
         while self.bytes > self.byte_cap {
             let Some(heaviest) = self
@@ -338,25 +402,47 @@ impl MirrorQueue {
             else {
                 break;
             };
-            self.drop_costliest(&heaviest);
+            let most = self.topics.get(&heaviest).and_then(|queued| {
+                (0..queued.senders.len()).max_by_key(|&index| {
+                    let sender = &queued.senders[index];
+                    (sender.bytes, sender.frames.len())
+                })
+            });
+            if !most.is_some_and(|most| self.drop_frame(&heaviest, most, Evict::Largest)) {
+                break;
+            }
         }
     }
 
-    /// Drop `topic`'s costliest frame, of equal costs the latest, and count
-    /// it.
-    fn drop_costliest(&mut self, topic: &[u8]) {
+    /// Drop the costliest or the largest frame, of equal ones the latest,
+    /// of the sender at `index` in `topic`'s turn order, and count it.
+    /// False when there was none.
+    fn drop_frame(&mut self, topic: &[u8], index: usize, evict: Evict) -> bool {
         let Some(queued) = self.topics.get_mut(topic) else {
-            return;
+            return false;
         };
-        let Some(index) = (0..queued.frames.len())
-            .max_by_key(|&index| (queued.frames[index].cost, queued.frames[index].arrival))
-        else {
-            return;
+        let Some(sender) = queued.senders.get_mut(index) else {
+            return false;
         };
-        let frame = queued.frames.swap_remove(index);
-        let size = Self::size(topic, &frame);
+        let Some(victim) = (0..sender.frames.len()).max_by_key(|&at| {
+            let frame = &sender.frames[at];
+            let weight = match evict {
+                Evict::Costliest => frame.cost,
+                Evict::Largest => frame.data.len(),
+            };
+            (weight, frame.arrival)
+        }) else {
+            return false;
+        };
+        let frame = sender.frames.swap_remove(victim);
+        let size = Self::size(topic, &sender.from, &frame);
+        sender.bytes -= size;
+        if sender.frames.is_empty() {
+            queued.senders.remove(index);
+        }
+        queued.frames -= 1;
         queued.bytes -= size;
-        let emptied = queued.frames.is_empty();
+        let emptied = queued.frames == 0;
         self.bytes -= size;
         self.dropped.frames += 1;
         self.dropped.bytes += frame.data.len() as u64;
@@ -364,25 +450,36 @@ impl MirrorQueue {
             self.topics.remove(topic);
             self.turns.retain(|turn| turn.as_slice() != topic);
         }
+        true
     }
 
-    /// The next frame to check: the cheapest of the topic whose turn it is,
-    /// of equal costs the earliest.
+    /// The next frame to check: of the topic whose turn it is, of its
+    /// sender whose turn it is, the cheapest, of equal costs the earliest.
     fn pop(&mut self) -> Option<Vec<u8>> {
         while let Some(topic) = self.turns.pop_front() {
             let Some(queued) = self.topics.get_mut(&topic) else {
                 continue;
             };
-            let Some(index) = (0..queued.frames.len())
-                .min_by_key(|&index| (queued.frames[index].cost, queued.frames[index].arrival))
-            else {
+            let Some(mut sender) = queued.senders.pop_front() else {
                 self.topics.remove(&topic);
                 continue;
             };
-            let frame = queued.frames.swap_remove(index);
-            let size = Self::size(&topic, &frame);
+            let Some(index) = (0..sender.frames.len())
+                .min_by_key(|&index| (sender.frames[index].cost, sender.frames[index].arrival))
+            else {
+                // No sender is listed without frames; the topic keeps its turn.
+                self.turns.push_front(topic);
+                continue;
+            };
+            let frame = sender.frames.swap_remove(index);
+            let size = Self::size(&topic, &sender.from, &frame);
+            sender.bytes -= size;
+            if !sender.frames.is_empty() {
+                queued.senders.push_back(sender);
+            }
+            queued.frames -= 1;
             queued.bytes -= size;
-            let emptied = queued.frames.is_empty();
+            let emptied = queued.frames == 0;
             self.bytes -= size;
             if emptied {
                 self.topics.remove(&topic);
@@ -392,6 +489,22 @@ impl MirrorQueue {
             return Some(frame.data);
         }
         None
+    }
+
+    /// Drop every queued frame, counted: no worker will check them.
+    fn clear(&mut self) {
+        for frame in self
+            .topics
+            .values()
+            .flat_map(|queued| queued.senders.iter())
+            .flat_map(|sender| sender.frames.iter())
+        {
+            self.dropped.frames += 1;
+            self.dropped.bytes += frame.data.len() as u64;
+        }
+        self.topics.clear();
+        self.turns.clear();
+        self.bytes = 0;
     }
 
     /// The line due at `now` about dropped frames, if one is: at most one
@@ -463,6 +576,91 @@ impl QueueLine {
     }
 }
 
+/// Checks by the mirror's worker that panicked: logged at once, then at
+/// most once per [`MIRROR_QUEUE_SUMMARY`] with the count since. A peer's
+/// frame can make the check panic (the class group VDF code panics on some
+/// malformed outputs), so a line per panic would let it flood the log.
+#[derive(Default)]
+struct MirrorPanics {
+    /// Since the last line.
+    panics: u64,
+    /// The first of those: its text, and its frame's encoded bytes.
+    first: Option<(String, usize)>,
+    /// When a line was last logged.
+    reported: Option<std::time::Instant>,
+}
+
+/// A line about the checks that panicked.
+#[derive(Debug, PartialEq, Eq)]
+struct PanicLine {
+    panics: u64,
+    panic: String,
+    frame_bytes: usize,
+    interval_s: Option<u64>,
+}
+
+impl MirrorPanics {
+    /// The check of a frame of `frame_bytes` panicked at `now` with
+    /// `panic`; the line due, if one is.
+    fn note(
+        &mut self,
+        now: std::time::Instant,
+        panic: String,
+        frame_bytes: usize,
+    ) -> Option<PanicLine> {
+        self.panics += 1;
+        self.first.get_or_insert((panic, frame_bytes));
+        self.due(now)
+    }
+
+    /// The line due at `now`, if one is: panics not logged yet, and no line
+    /// within [`MIRROR_QUEUE_SUMMARY`].
+    fn due(&mut self, now: std::time::Instant) -> Option<PanicLine> {
+        if self.panics == 0
+            || self
+                .reported
+                .is_some_and(|last| now.saturating_duration_since(last) < MIRROR_QUEUE_SUMMARY)
+        {
+            return None;
+        }
+        let (panic, frame_bytes) = self.first.take().unwrap_or_default();
+        let since = self.reported.replace(now);
+        Some(PanicLine {
+            panics: std::mem::take(&mut self.panics),
+            panic,
+            frame_bytes,
+            interval_s: since.map(|last| now.saturating_duration_since(last).as_secs()),
+        })
+    }
+}
+
+impl PanicLine {
+    fn log(&self) {
+        warn!(
+            panics = self.panics,
+            panic = %self.panic,
+            frame_bytes = self.frame_bytes,
+            interval_s = self.interval_s,
+            scope = "this node",
+            action = "report this line: the check should refuse a malformed frame, not panic",
+            "the shard mirror's check of gossiped frames panicked: those frames were not \
+             mirrored; the worker continues"
+        );
+    }
+}
+
+/// The text of a caught panic, cut to [`MIRROR_PANIC_TEXT`] characters.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic without text")
+        .chars()
+        .take(MIRROR_PANIC_TEXT)
+        .collect()
+}
+
 /// The loop's end of the queue the mirror checks gossiped shard frames
 /// from, on its own thread ([`MirrorQueue`]): the loop never waits for the
 /// check, nor for the locks it takes.
@@ -473,16 +671,23 @@ struct MirrorFeed {
 struct MirrorShared {
     state: std::sync::Mutex<MirrorState>,
     queued: std::sync::Condvar,
+    /// Notified when the worker ends.
+    ended: std::sync::Condvar,
+    /// The worker's thread, joined once it ended
+    /// ([`MirrorShared::wait_ended`]).
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct MirrorState {
     queue: MirrorQueue,
     /// Since when the worker checks a frame.
     checking: Option<std::time::Instant>,
-    /// False once the worker failed to start or stopped.
+    /// False once the worker failed to start or ended.
     running: bool,
-    /// The loop's end is gone: the worker stops.
+    /// The worker is to stop: the loop's end is gone, or the node stops
+    /// ([`stop_shard_mirrors`]).
     closed: bool,
+    panics: MirrorPanics,
 }
 
 impl MirrorShared {
@@ -491,14 +696,54 @@ impl MirrorShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Ask the worker to stop: it checks no queued frame after the one in
+    /// check, if any.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.queued.notify_all();
+    }
+
+    /// Wait up to `grace` for the worker to end, then join its thread.
+    /// Whether it ended.
+    fn wait_ended(&self, grace: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + grace;
+        let mut state = self.lock();
+        while state.running {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            state = match self.ended.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        drop(state);
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            // It ended: this waits only for its return.
+            let _ = thread.join();
+        }
+        true
+    }
 }
 
-/// Clears the running flag when the mirror's worker ends, however it ends.
+/// Marks the mirror's worker ended, however it ends, and drops (counted)
+/// the frames still queued: no worker will check them.
 struct MirrorRunning(Arc<MirrorShared>);
 
 impl Drop for MirrorRunning {
     fn drop(&mut self) {
-        self.0.lock().running = false;
+        let mut state = self.0.lock();
+        state.running = false;
+        state.queue.clear();
+        drop(state);
+        self.0.ended.notify_all();
         if std::thread::panicking() {
             error!(
                 scope = "this node",
@@ -507,6 +752,45 @@ impl Drop for MirrorRunning {
             );
         }
     }
+}
+
+/// The mirror workers this process started ([`MirrorFeed::spawn`]), for
+/// [`stop_shard_mirrors`].
+static MIRROR_WORKERS: std::sync::Mutex<Vec<std::sync::Weak<MirrorShared>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The mirror workers whose state still exists.
+fn live_mirror_workers() -> Vec<Arc<MirrorShared>> {
+    MIRROR_WORKERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect()
+}
+
+/// Ask the shard mirror workers to stop before the process exits: each
+/// ends after the frame in check, without checking the frames queued, and
+/// drops the store handles its check holds. Does not wait: see
+/// [`wait_for_shard_mirrors`]. Returns how many were running.
+pub(crate) fn stop_shard_mirrors() -> usize {
+    live_mirror_workers()
+        .iter()
+        .filter(|worker| {
+            worker.close();
+            worker.lock().running
+        })
+        .count()
+}
+
+/// Wait up to `grace` for the shard mirror workers to end after
+/// [`stop_shard_mirrors`], joining each. Returns how many still run.
+pub(crate) fn wait_for_shard_mirrors(grace: std::time::Duration) -> usize {
+    let started = std::time::Instant::now();
+    live_mirror_workers()
+        .iter()
+        .filter(|worker| !worker.wait_ended(grace.saturating_sub(started.elapsed())))
+        .count()
 }
 
 impl MirrorFeed {
@@ -519,13 +803,17 @@ impl MirrorFeed {
                     checking: None,
                     running: true,
                     closed: false,
+                    panics: MirrorPanics::default(),
                 }),
                 queued: std::sync::Condvar::new(),
+                ended: std::sync::Condvar::new(),
+                thread: std::sync::Mutex::new(None),
             }),
         }
     }
 
-    /// Start the worker thread: it hands each queued frame to `check`.
+    /// Start the worker thread: it hands each queued frame to `check`, and
+    /// is listed for [`stop_shard_mirrors`].
     fn spawn(check: impl FnMut(&[u8]) + Send + 'static) -> Self {
         let feed = Self::new();
         let shared = feed.shared.clone();
@@ -536,28 +824,46 @@ impl MirrorFeed {
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || run_mirror(shared, check))
             });
-        if let Err(error) = started {
-            feed.shared.lock().running = false;
-            error!(
-                %error,
-                scope = "this node",
-                action = "restart the node; if it repeats, check the host's thread and memory \
-                          limits and report this line",
-                "shard mirror worker did not start: gossiped shard frames are not mirrored for \
-                 serving"
-            );
+        match started {
+            Ok(thread) => {
+                *feed
+                    .shared
+                    .thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread);
+                let mut workers = MIRROR_WORKERS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                workers.retain(|worker| worker.strong_count() > 0);
+                workers.push(Arc::downgrade(&feed.shared));
+            }
+            Err(error) => {
+                feed.shared.lock().running = false;
+                error!(
+                    %error,
+                    scope = "this node",
+                    action = "restart the node; if it repeats, check the host's thread and \
+                              memory limits and report this line",
+                    "shard mirror worker did not start: gossiped shard frames are not mirrored \
+                     for serving"
+                );
+            }
         }
         feed
     }
 
-    /// Queue `data`, a frame on `topic` carrying `bundles` request bundles,
-    /// without waiting for its check; dropped and counted when its worker is
-    /// not running.
-    fn offer(&self, topic: &[u8], data: Vec<u8>, bundles: usize) {
+    /// Queue `data`, a frame on `topic` signed by `from` carrying `bundles`
+    /// request bundles, without waiting for its check; dropped and counted
+    /// when its worker is not running, dropped when it was stopped.
+    fn offer(&self, topic: &[u8], from: &[u8], data: Vec<u8>, bundles: usize) {
         let now = std::time::Instant::now();
         let mut state = self.shared.lock();
+        if state.closed {
+            // The node stops: nothing is checked any more.
+            return;
+        }
         if state.running {
-            state.queue.push(topic, data, bundles);
+            state.queue.push(topic, from, data, bundles);
         } else {
             state.queue.dropped.frames += 1;
             state.queue.dropped.bytes += data.len() as u64;
@@ -583,38 +889,58 @@ impl MirrorFeed {
 
 impl Drop for MirrorFeed {
     fn drop(&mut self) {
-        self.shared.lock().closed = true;
-        self.shared.queued.notify_all();
+        self.shared.close();
     }
 }
 
-/// The mirror's worker: check each queued frame, and say when drops ended.
-fn run_mirror(shared: Arc<MirrorShared>, mut check: impl FnMut(&[u8])) {
+/// The mirror's worker: check each queued frame until it is stopped, and
+/// say when drops ended and when checks panicked.
+fn run_mirror(shared: Arc<MirrorShared>, check: impl FnMut(&[u8])) {
     let _running = MirrorRunning(shared.clone());
+    // Dropped before `_running`: the store handles the check holds are
+    // released before the worker is marked ended.
+    let mut check_frame = check;
     let mut state = shared.lock();
     loop {
-        if let Some(data) = state.queue.pop() {
-            state.checking = Some(std::time::Instant::now());
-            drop(state);
-            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&data)));
-            if checked.is_err() {
-                error!(
-                    scope = "this node",
-                    "the shard mirror's check of a gossiped frame panicked; the worker continues"
-                );
-            }
-            drop(data);
-            state = shared.lock();
-            state.checking = None;
-            continue;
-        }
         if state.closed {
             return;
         }
-        if let Some(line) = state.queue.summarize(std::time::Instant::now()) {
+        if let Some(data) = state.queue.pop() {
+            state.checking = Some(std::time::Instant::now());
+            drop(state);
+            // The default panic hook still prints each panic: quieting it
+            // takes a process-wide hook (`std::panic::set_hook`), which this
+            // worker leaves alone for every other thread's sake. The line
+            // below is the bounded record.
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_frame(&data)))
+                    .err()
+                    .map(|panic| panic_text(panic.as_ref()));
+            let frame_bytes = data.len();
+            drop(data);
+            let now = std::time::Instant::now();
+            state = shared.lock();
+            state.checking = None;
+            let line = panicked.and_then(|panic| state.panics.note(now, panic, frame_bytes));
+            if let Some(line) = line {
+                drop(state);
+                line.log();
+                state = shared.lock();
+            }
+            continue;
+        }
+        let now = std::time::Instant::now();
+        let dropped = state.queue.summarize(now);
+        let panicked = state.panics.due(now);
+        if dropped.is_some() || panicked.is_some() {
             let running = state.running;
             drop(state);
-            line.log(None, running);
+            if let Some(line) = dropped {
+                line.log(None, running);
+            }
+            if let Some(line) = panicked {
+                line.log();
+            }
             state = shared.lock();
             continue;
         }
@@ -821,6 +1147,9 @@ impl ShardMirror {
         }
         let header = frame.header.as_ref().ok_or("no header")?;
         if stored_already(clock_store, header) {
+            // Another writer (the worker drain) may have stored it: release
+            // the parents held for it, as storing it here would have.
+            self.release_held(clock_store, header);
             return Ok(Mirrored::Known);
         }
         let certified = header
@@ -861,6 +1190,17 @@ impl ShardMirror {
             &header.address,
             data,
         );
+        self.release_held(clock_store, header);
+    }
+
+    /// Mirror the held frames the stored frame of `header` links down to,
+    /// each through its child, and forget held frames too far below it to
+    /// be owed.
+    fn release_held(
+        &self,
+        clock_store: &dyn quil_types::store::ClockStore,
+        header: &quil_types::proto::global::FrameHeader,
+    ) {
         let mut held = self
             .held
             .lock()
@@ -908,10 +1248,9 @@ impl ShardMirror {
             .checked_add(1)
             .and_then(|number| {
                 clock_store
-                    .get_shard_clock_frame(&header.address, number, false)
+                    .get_shard_clock_frame_header(&header.address, number)
                     .ok()
             })
-            .and_then(|child| child.header)
             .is_some_and(|child| {
                 quil_engine::frame_validator::app_frame_links_to_child(header, &child)
             });
@@ -929,10 +1268,8 @@ impl ShardMirror {
                 }
                 let stored = header.frame_number <= head
                     && clock_store
-                        .get_shard_clock_frame(&header.address, header.frame_number, false)
-                        .ok()
-                        .and_then(|stored| stored.header)
-                        .is_some();
+                        .get_shard_clock_frame_header(&header.address, header.frame_number)
+                        .is_ok();
                 if stored {
                     return Err("no certificate, and a frame is stored at its number".into());
                 }
@@ -1195,16 +1532,15 @@ impl HeldFrames {
 /// Whether the frame stored at `header`'s number has this header, its
 /// storage attestation aside. The stored copy's requests matched it, so a
 /// copy carrying other requests is no frame to mirror, and its check, which
-/// a peer's frame of many bundles makes cost seconds, is skipped.
+/// a peer's frame of many bundles makes cost seconds, is skipped. Reads
+/// only the stored header, not the stored requests.
 fn stored_already(
     clock_store: &dyn quil_types::store::ClockStore,
     header: &quil_types::proto::global::FrameHeader,
 ) -> bool {
     clock_store
-        .get_shard_clock_frame(&header.address, header.frame_number, false)
-        .ok()
-        .and_then(|stored| stored.header)
-        .is_some_and(|mut stored| {
+        .get_shard_clock_frame_header(&header.address, header.frame_number)
+        .is_ok_and(|mut stored| {
             stored
                 .storage_attestation
                 .clone_from(&header.storage_attestation);
@@ -3343,6 +3679,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             if let Some(feed) = mirror_feed.as_ref() {
                                                 unrouted_shard_message(
                                                     bm,
+                                                    &received.from,
                                                     std::mem::take(&mut received.data),
                                                     feed,
                                                 );
@@ -3648,7 +3985,12 @@ mod tests {
         /// `frame` heard on `bitmask`: queued as the loop queues it, then
         /// checked as the mirror's worker checks it.
         fn hear(&self, bitmask: &[u8], frame: &quil_types::proto::global::AppShardFrame) {
-            unrouted_shard_message(bitmask, prost::Message::encode_to_vec(frame), &self.feed);
+            unrouted_shard_message(
+                bitmask,
+                b"peer",
+                prost::Message::encode_to_vec(frame),
+                &self.feed,
+            );
             while let Some(data) = self.feed.take() {
                 mirror_queued(self.clock.as_ref(), &self.mirror, &data);
             }
@@ -4295,12 +4637,68 @@ mod tests {
         );
     }
 
-    /// The output identity a child names its parent by.
+    /// Wait for `done`, failing with `what` once 30 s pass without it.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "{what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The lines logged while installed, on this thread and on the threads
+    /// it starts with its dispatcher (the mirror's worker).
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Capture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(self.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+
+        fn lines_with(&self, text: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains(text))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
     /// The loop queues a gossiped shard frame and goes on while the mirror's
     /// check waits, as it waits for the execution engines GLOBAL execution
-    /// holds; the worker checks every queued frame once it can.
+    /// holds, also past the frames a topic queues: those past its bound are
+    /// dropped, never waited for. The worker checks the frames queued once
+    /// it can.
     #[test]
     fn the_loop_queues_frames_for_the_mirror_without_waiting() {
+        let offered = 2 * 3 * MIRROR_QUEUED_PER_TOPIC;
+        let kept = 2 * MIRROR_QUEUED_PER_TOPIC;
         let engines = Arc::new(std::sync::Mutex::new(()));
         let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let held = engines.lock().unwrap();
@@ -4314,8 +4712,13 @@ mod tests {
             })
         };
         let started = std::time::Instant::now();
-        for frame in 0..32u8 {
-            feed.offer(&[frame % 2; 32], vec![frame; 100], 0);
+        for frame in 0..offered {
+            feed.offer(
+                &[(frame % 2) as u8; 32],
+                b"peer",
+                (frame as u16).to_be_bytes().repeat(50),
+                0,
+            );
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(1),
                 "LOOP-WAITS: queuing frame {frame} waited for the mirror's check"
@@ -4323,68 +4726,101 @@ mod tests {
         }
         drop(held);
         // Progress, with a generous overall cap.
-        let mut last = (0, std::time::Instant::now());
+        let mut last = (usize::MAX, std::time::Instant::now());
         loop {
-            let done = checked.lock().unwrap().len();
-            if done == 32 {
+            let (left, checking) = {
+                let state = feed.shared.lock();
+                (state.queue.len(), state.checking.is_some())
+            };
+            if left == 0 && !checking {
                 break;
             }
-            if done > last.0 {
-                last = (done, std::time::Instant::now());
+            if left != last.0 {
+                last = (left, std::time::Instant::now());
             }
             assert!(
                 last.1.elapsed() < std::time::Duration::from_secs(30),
-                "the worker stopped at {done} of 32 queued frames"
+                "the worker stopped with {left} frames queued"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let mut checked = checked.lock().unwrap().clone();
-        checked.sort();
-        assert_eq!(
-            checked,
-            (0..32u8).map(|frame| vec![frame; 100]).collect::<Vec<_>>()
+        let count = checked.len();
+        // Each topic kept its bound; the worker may have taken one more into
+        // its check before the rest arrived.
+        assert!(
+            (kept..=kept + 1).contains(&count),
+            "{count} of {offered} offered frames checked"
         );
-        assert_eq!(feed.shared.lock().queue.dropped, QueueDrops::default());
+        checked.sort();
+        checked.dedup();
+        assert_eq!(checked.len(), count, "a frame was checked twice");
     }
 
-    /// A peer that floods one topic with costly frames delays neither another
-    /// topic's frame nor its own topic's cheaper genuine frame by more than
-    /// one turn.
+    /// A peer that floods one topic with costly frames delays another
+    /// topic's frame by one check (one other topic queues frames here), and
+    /// another sender's frame on its own topic by one of its frames.
     #[test]
-    fn a_flooded_topic_does_not_starve_another_in_the_mirror_queue() {
+    fn a_flood_delays_other_topics_and_senders_by_one_turn() {
         let (flooded, other) = ([1u8; 32], [2u8; 32]);
         let mut queue = MirrorQueue::new(MIRROR_QUEUED_BYTES);
-        for _ in 0..MIRROR_QUEUED_PER_TOPIC - 1 {
-            queue.push(&flooded, vec![0xee; 1 << 20], MIRROR_MAX_REQUESTS);
+        for _ in 0..MIRROR_QUEUED_PER_TOPIC - 2 {
+            queue.push(&flooded, b"flood", vec![0xee; 1 << 20], MIRROR_MAX_REQUESTS);
         }
-        queue.push(&other, vec![2; 2000], 1);
-        queue.push(&flooded, vec![1; 2000], 1);
-        let first: Vec<Vec<u8>> = std::iter::from_fn(|| queue.pop()).take(2).collect();
+        queue.push(&other, b"genuine", vec![2; 2000], 1);
+        queue.push(&flooded, b"genuine", vec![1; 2000], 1);
+        let first: Vec<Vec<u8>> = std::iter::from_fn(|| queue.pop()).take(3).collect();
         assert!(
             first.contains(&vec![2; 2000]) && first.contains(&vec![1; 2000]),
             "QUEUE-FAIRNESS: a flood's frames were checked before the genuine ones"
         );
         assert_eq!(
             std::iter::from_fn(|| queue.pop()).count(),
-            MIRROR_QUEUED_PER_TOPIC - 1
+            MIRROR_QUEUED_PER_TOPIC - 3
         );
         assert_eq!(queue.dropped, QueueDrops::default());
         assert_eq!(queue.bytes, 0);
         assert!(queue.topics.is_empty() && queue.turns.is_empty());
     }
 
-    /// Past its bounds the queue drops the costliest frame (of its topic, or
-    /// of the topic queuing the most bytes), not a genuine frame that came
-    /// last, and its byte count returns to zero.
+    /// A peer that floods a topic, faster than the worker checks, with
+    /// frames smaller (so cheaper) than a genuine one neither evicts another
+    /// sender's frame on that topic nor keeps it from its turn: the topic's
+    /// bound drops the flood's own frames.
+    #[test]
+    fn a_small_frame_flood_from_one_sender_leaves_another_senders_frame_checked() {
+        let topic = [1u8; 32];
+        let genuine = vec![2; 2000];
+        let mut queue = MirrorQueue::new(MIRROR_QUEUED_BYTES);
+        for flood in 0..MIRROR_QUEUED_PER_TOPIC {
+            queue.push(&topic, b"flood", vec![flood as u8; 100], 0);
+        }
+        queue.push(&topic, b"genuine", genuine.clone(), 1);
+        for flood in 0..2 * MIRROR_QUEUED_PER_TOPIC {
+            queue.push(&topic, b"flood", vec![flood as u8; 100], 0);
+        }
+        assert_eq!(queue.dropped.frames, 2 * MIRROR_QUEUED_PER_TOPIC as u64 + 1);
+        let first: Vec<Vec<u8>> = std::iter::from_fn(|| queue.pop()).take(2).collect();
+        assert!(
+            first.contains(&genuine),
+            "QUEUE-SENDERS: a small-frame flood from one sender evicted or delayed another \
+             sender's frame"
+        );
+    }
+
+    /// Past its bounds the queue drops a sender's costliest frame (past the
+    /// topic's bound) or the largest frame of the sender queuing the most
+    /// bytes (past the byte bound), not a genuine frame that came last, and
+    /// its byte count returns to zero.
     #[test]
     fn the_mirror_queue_drops_the_costliest_frame_past_its_bounds() {
         let topic = [1u8; 32];
         let mut queue = MirrorQueue::new(1 << 20);
         for _ in 0..3 {
-            queue.push(&topic, vec![0xee; 300 << 10], MIRROR_MAX_REQUESTS);
+            queue.push(&topic, b"flood", vec![0xee; 300 << 10], MIRROR_MAX_REQUESTS);
         }
-        queue.push(&[2; 32], vec![2; 1000], 1);
-        queue.push(&topic, vec![1; 200 << 10], 1);
+        queue.push(&[2; 32], b"genuine", vec![2; 1000], 1);
+        queue.push(&topic, b"genuine", vec![1; 200 << 10], 1);
         assert!(queue.bytes <= 1 << 20);
         assert_eq!(
             queue.dropped,
@@ -4400,9 +4836,9 @@ mod tests {
         assert_eq!(queue.bytes, 0);
 
         let mut queue = MirrorQueue::new(MIRROR_QUEUED_BYTES);
-        queue.push(&topic, vec![0xee; 4000], MIRROR_MAX_REQUESTS);
+        queue.push(&topic, b"peer", vec![0xee; 4000], MIRROR_MAX_REQUESTS);
         for frame in 0..MIRROR_QUEUED_PER_TOPIC {
-            queue.push(&topic, vec![frame as u8; 1000], 1);
+            queue.push(&topic, b"peer", vec![frame as u8; 1000], 1);
         }
         assert_eq!(queue.dropped.frames, 1);
         assert!(
@@ -4418,7 +4854,7 @@ mod tests {
         let mut queue = MirrorQueue::new(1000);
         let start = std::time::Instant::now();
         assert_eq!(queue.summarize(start), None, "nothing dropped");
-        queue.push(&[1; 32], vec![0; 2000], 0);
+        queue.push(&[1; 32], b"peer", vec![0; 2000], 0);
         let first = queue
             .summarize(start)
             .expect("QUEUE-DROPS: a dropped frame logged no line");
@@ -4430,8 +4866,8 @@ mod tests {
             }
         );
         first.log(Some(1), true);
-        queue.push(&[1; 32], vec![0; 2000], 0);
-        queue.push(&[2; 32], vec![0; 3000], 0);
+        queue.push(&[1; 32], b"peer", vec![0; 2000], 0);
+        queue.push(&[2; 32], b"peer", vec![0; 3000], 0);
         assert_eq!(queue.summarize(start + MIRROR_QUEUE_SUMMARY / 2), None);
         let next = queue.summarize(start + MIRROR_QUEUE_SUMMARY).unwrap();
         assert_eq!(
@@ -4452,10 +4888,145 @@ mod tests {
         assert_eq!(queue.summarize(start + 3 * MIRROR_QUEUE_SUMMARY), None);
     }
 
+    /// A check that panics is caught: the worker goes on with the next
+    /// frame, and one line, with the first panic's text, covers the panics
+    /// of an interval. A worker that ends anyway is marked so: the frames
+    /// still queued and those offered later are dropped and counted, and
+    /// the loop logs that the worker is not running.
+    #[test]
+    fn a_panicking_or_stopped_mirror_worker_is_detected_and_logged() {
+        let capture = Capture::default();
+        let _logs = capture.install();
+        let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let feed = {
+            let checked = checked.clone();
+            MirrorFeed::spawn(move |data| {
+                if data == b"panic" {
+                    panic!("a planted panic");
+                }
+                checked.lock().unwrap().push(data.to_vec());
+            })
+        };
+        for data in [&b"panic"[..], b"panic", b"panic", b"after"] {
+            feed.offer(&[1; 32], b"peer", data.to_vec(), 0);
+        }
+        wait_for("WORKER-PANIC: a panicking check stopped the worker", || {
+            checked.lock().unwrap().as_slice() == [b"after".to_vec()]
+        });
+        let lines = capture.lines_with("the shard mirror's check of gossiped frames panicked");
+        assert_eq!(lines.len(), 1, "PANIC-LINES: {lines:?}");
+        assert!(
+            lines[0].contains("a planted panic") && lines[0].contains("panics=1"),
+            "{lines:?}"
+        );
+        let mut panics = std::mem::take(&mut feed.shared.lock().panics);
+        assert_eq!(
+            panics.panics, 2,
+            "the panics after the line were not counted"
+        );
+        let later = std::time::Instant::now() + MIRROR_QUEUE_SUMMARY;
+        assert_eq!(
+            panics.due(std::time::Instant::now()),
+            None,
+            "PANIC-LINES: a second line within the interval"
+        );
+        assert_eq!(panics.due(later).map(|line| line.panics), Some(2));
+        assert_eq!(panics.due(later + MIRROR_QUEUE_SUMMARY), None);
+
+        let stopped = MirrorFeed::new();
+        stopped.offer(&[1; 32], b"peer", b"queued".to_vec(), 0);
+        let shared = stopped.shared.clone();
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        let ended = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _running = MirrorRunning(shared);
+                panic!("a planted stop");
+            })
+        })
+        .join();
+        assert!(ended.is_err());
+        assert_eq!(capture.lines_with("shard mirror worker stopped").len(), 1);
+        stopped.offer(&[1; 32], b"peer", b"late".to_vec(), 0);
+        let state = stopped.shared.lock();
+        assert!(
+            !state.running && state.queue.len() == 0,
+            "WORKER-DEAD: a worker that ended was taken for running"
+        );
+        drop(state);
+        assert_eq!(
+            capture
+                .lines_with("the shard mirror worker is not running")
+                .len(),
+            1,
+            "WORKER-DEAD: no line said the worker is not running"
+        );
+    }
+
+    /// At shutdown the worker checks no queued frame after the one in check,
+    /// drops its check with the store handles that holds, and is joined;
+    /// the wait for it is bounded while a check runs. The node's stop
+    /// ([`stop_shard_mirrors`]) lists it.
+    #[test]
+    fn the_mirror_worker_stops_without_checking_queued_frames() {
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stores = Arc::new(());
+        let held = gate.lock().unwrap();
+        let feed = {
+            let (gate, checked, stores) = (gate.clone(), checked.clone(), stores.clone());
+            MirrorFeed::spawn(move |data| {
+                let _stores = &stores;
+                let _gate = gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                checked.lock().unwrap().push(data.to_vec());
+            })
+        };
+        let shared = feed.shared.clone();
+        assert!(
+            live_mirror_workers()
+                .iter()
+                .any(|worker| Arc::ptr_eq(worker, &shared)),
+            "the worker is not listed for the node's stop"
+        );
+        for frame in 0..3u8 {
+            feed.offer(&[1; 32], b"peer", vec![frame; 10], 0);
+        }
+        wait_for("the worker took no frame into its check", || {
+            shared.lock().checking.is_some()
+        });
+        drop(feed);
+        assert!(
+            !shared.wait_ended(std::time::Duration::from_millis(100)),
+            "the worker ended while its check waited"
+        );
+        drop(held);
+        assert!(
+            shared.wait_ended(std::time::Duration::from_secs(30)),
+            "the worker did not end"
+        );
+        assert_eq!(
+            checked.lock().unwrap().len(),
+            1,
+            "CLOSE-DRAINS: the worker checked queued frames after it was stopped"
+        );
+        assert_eq!(
+            Arc::strong_count(&stores),
+            1,
+            "the check outlived the worker"
+        );
+        assert!(
+            shared.thread.lock().unwrap().is_none(),
+            "the worker was not joined"
+        );
+        assert_eq!(shared.lock().queue.len(), 0);
+    }
+
     /// A copy of a mirrored frame is not checked again: the stored copy's
     /// requests matched the header, so a copy carrying others is no frame to
     /// mirror, and a peer cannot make the mirror check a stored frame's
-    /// header against costly requests of its own.
+    /// header against costly requests of its own. A copy whose header
+    /// differs anywhere but its storage attestation is checked.
     #[test]
     fn a_copy_of_a_mirrored_frame_is_not_checked_again() {
         use quil_types::store::ClockStore as _;
@@ -4484,11 +5055,59 @@ mod tests {
                 .unwrap(),
             genuine
         );
+        let altered: [fn(&mut quil_types::proto::global::FrameHeader); 2] = [
+            |header| header.timestamp += 1,
+            |header| header.parent_selector = vec![1; 32],
+        ];
+        for alter in altered {
+            let mut other = genuine.clone();
+            alter(other.header.as_mut().unwrap());
+            assert_ne!(
+                offer(&other),
+                Ok(Mirrored::Known),
+                "KNOWN-LOOSE: a copy whose header differs from the stored frame's was taken \
+                 as known"
+            );
+        }
         let mut next = shard.certified(8);
         next.requests = vec![Default::default()];
         assert!(offer(&next).is_err(), "a frame not stored is checked");
     }
 
+    /// A copy of a frame another writer stored (the worker drain, for a
+    /// shard a local engine ran) releases the parent the mirror holds for
+    /// it, as mirroring that frame itself would have.
+    #[test]
+    fn a_copy_of_a_frame_stored_elsewhere_releases_its_held_parent() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let stored = |number| {
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, number, false)
+                .ok()
+        };
+        shard.hear(&topic, &shard.certified(6));
+        let parent = shard.notarized(7, selector(&shard.certified(6)));
+        shard.hear(&topic, &parent);
+        let child = shard.certified_child(&parent);
+        super::super::worker_manager::mirror_shard_frame_to_clock_store(
+            shard.clock.as_ref(),
+            &shard.filter,
+            &prost::Message::encode_to_vec(&child),
+        );
+        assert_eq!((stored(7), shard.latest()), (None, Some(8)));
+        shard.hear(&topic, &child);
+        assert_eq!(
+            stored(7),
+            Some(parent),
+            "KNOWN-KEEPS-HELD: a copy of a frame stored elsewhere left its held parent \
+             unmirrored"
+        );
+    }
+
+    /// The output identity a child names its parent by.
     fn selector(frame: &quil_types::proto::global::AppShardFrame) -> Vec<u8> {
         quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
             .unwrap()

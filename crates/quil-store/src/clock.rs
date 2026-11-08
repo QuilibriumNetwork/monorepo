@@ -1127,6 +1127,42 @@ mod tests {
         RocksClockStore::new(quil_forest::CoordinatedDb::new(db))
     }
 
+    /// A shard frame's header is read without decoding its requests: one
+    /// whose requests do not decode still gives its header.
+    #[test]
+    fn a_shard_frame_header_reads_without_its_requests() {
+        use store::ClockStore;
+        let s = test_db();
+        let header = global::FrameHeader {
+            address: vec![3; 32],
+            frame_number: 9,
+            output: vec![1; 516],
+            ..Default::default()
+        };
+        let mut data = global::AppShardFrame {
+            header: Some(header.clone()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // A request bundle (tag 2) whose bytes end inside a varint.
+        data.extend_from_slice(&[0x12, 2, 0xff, 0xff]);
+        s.db.put(encoding::clock_shard_frame_key(&header.address, 9), &data)
+            .unwrap();
+        assert!(
+            s.get_shard_clock_frame(&header.address, 9, false).is_err(),
+            "the planted requests do not decode"
+        );
+        assert_eq!(
+            s.get_shard_clock_frame_header(&header.address, 9).ok(),
+            Some(header.clone()),
+            "HEADER-DECODES-ALL: reading a shard frame's header decoded its requests"
+        );
+        assert!(matches!(
+            s.get_shard_clock_frame_header(&header.address, 10),
+            Err(QuilError::NotFound(_))
+        ));
+    }
+
     fn cached_frame(n: u64) -> global::GlobalFrame {
         global::GlobalFrame {
             header: Some(global::GlobalFrameHeader {
@@ -2132,6 +2168,14 @@ where
     }
 }
 
+/// A stored `AppShardFrame` read for its header only: the requests (tag 2)
+/// and the storage attestation are skipped undecoded.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StoredShardFrameHeader {
+    #[prost(message, optional, tag = "1")]
+    header: Option<global::FrameHeader>,
+}
+
 impl store::ClockStore for RocksClockStore {
     fn backing_store_identity(&self) -> Option<store::BackingStoreIdentity> {
         Some(self.db.backing_store_identity())
@@ -2878,6 +2922,22 @@ impl store::ClockStore for RocksClockStore {
             .ok_or_else(|| QuilError::NotFound("shard frame not found".into()))?;
         proto::global::AppShardFrame::decode(data.as_slice())
             .map_err(|e| QuilError::Serialization(e.to_string()))
+    }
+    fn get_shard_clock_frame_header(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<global::FrameHeader> {
+        let key = encoding::clock_shard_frame_key(filter, frame_number);
+        let data = self
+            .db
+            .get_pinned(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound("shard frame not found".into()))?;
+        StoredShardFrameHeader::decode(&*data)
+            .map_err(|e| QuilError::Serialization(e.to_string()))?
+            .header
+            .ok_or_else(|| QuilError::NotFound("shard frame header".into()))
     }
     fn commit_shard_clock_frame(
         &self,

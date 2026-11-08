@@ -486,6 +486,19 @@ pub trait ClockStore: Send + Sync {
         frame_number: u64,
         truncate: bool,
     ) -> Result<proto::global::AppShardFrame>;
+    /// The header of shard `filter`'s frame `frame_number`, without decoding
+    /// its requests: an application frame can be megabytes, and a header
+    /// comparison needs none of them. `NotFound` when no frame (or no
+    /// header) is stored there.
+    fn get_shard_clock_frame_header(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<proto::global::FrameHeader> {
+        self.get_shard_clock_frame(filter, frame_number, true)?
+            .header
+            .ok_or_else(|| QuilError::NotFound("shard frame header".into()))
+    }
     fn commit_shard_clock_frame(
         &self,
         filter: &[u8],
