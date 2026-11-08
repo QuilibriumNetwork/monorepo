@@ -3722,9 +3722,11 @@ impl AppConsensusEngine {
     /// It seals the registration for the epoch after next once GLOBAL has
     /// recorded it and the frame after it exists, and proves the roots
     /// committed the epoch before once their settlement window is open. Both
-    /// go in one proof; settling alone waits until a registration can no
-    /// longer land. Proving runs in the background, and a proof GLOBAL does
-    /// not record is proven and sent again later.
+    /// go in one proof; settling waits for the seal at most a retry interval
+    /// into its window, then goes alone, and again every few GLOBAL frames
+    /// until GLOBAL records it (`storage_epoch_batch::settlement_due`).
+    /// Proving runs in the background, and a proof GLOBAL does not record is
+    /// proven and sent again later.
     fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
         let _probe = probe::section(probe::Section::StorageEpochProofCheck);
         if let (Some(global), Some(publish), Ok(member)) = (
@@ -3840,26 +3842,55 @@ impl AppConsensusEngine {
             >= storage_snapshot_frame(seal_epoch)
                 + crate::app_shard_metadata::storage_snapshot_grace()
                 + crate::storage_snapshot::seal_retry_frames();
-        // Settling shares a proof with the seal when one can still come: a
-        // registration GLOBAL recorded whose beacon frame is not here yet, or
-        // one that may still land.
-        let awaiting_seal = !closing
-            && seal.is_none()
+        // The next registration's seal may still come: one GLOBAL recorded
+        // whose beacon frame is not here yet, or one that may still land.
+        // Settling waits for it a while, to share its proof
+        // (`storage_epoch_batch::settlement_due`).
+        let seal_pending = seal.is_none()
             && hash_storage_proofs_at(seal_epoch)
             && (next.is_some() || (slot(seal_epoch).is_none() && !registration_closed));
         // The frame this runs from and the slot may trail GLOBAL; past the
         // window's end as this process saw GLOBAL, the settlement cannot land
         // and its replicas are evicted.
-        let settle = slot(epoch).filter(|slot| {
+        let owed = slot(epoch).filter(|slot| {
             own_seat
                 && hash_storage_proofs_at(epoch)
                 && slot.sealed_at.is_some()
-                && slot.open
                 && slot.frames > 0
-                && (from..until).contains(&global_frame_number)
                 && !crate::storage_snapshot::settlement_closed(epoch, global_frame_number)
-                && !awaiting_seal
         });
+        // How each settlement this worker sent ended, logged once.
+        if own_seat {
+            crate::storage_epoch_batch::settlement_outcomes(
+                &member,
+                shard,
+                global_frame_number,
+                |e| slot(e).map(|slot| slot.open),
+            );
+        }
+        let due = crate::storage_epoch_batch::settlement_due(
+            epoch,
+            global_frame_number,
+            crate::storage_epoch_batch::SettlementView {
+                owed: owed.as_ref().is_some_and(|slot| slot.open),
+                seal_pending,
+                sent_alone_at: crate::storage_epoch_batch::settlement_sent_alone_at(
+                    &member, shard, epoch,
+                ),
+            },
+        );
+        let settle = owed.filter(|_| due.is_some());
+        // A settlement sent alone goes again apart from the seat's attempts,
+        // without its seal, until its slot shows it settled: an archive drops
+        // a submission no GLOBAL frame carried after ten frames.
+        let (attempt_due, attempts) = crate::storage_snapshot::epoch_proof_attempt_due(
+            &member,
+            shard,
+            epoch,
+            global_frame_number,
+        );
+        let resend = !attempt_due && settle.is_some() && due.is_some_and(|due| due.resend);
+        let seal = seal.filter(|_| !resend);
         if seal.is_none() && settle.is_none() {
             crate::storage_epoch_batch::forget_prepared(&member, shard, epoch);
             return;
@@ -3888,10 +3919,14 @@ impl AppConsensusEngine {
                 .get_global_clock_frame(number)
                 .is_err()
         };
-        // Near the window's end a seal whose beacon frame is not here yet
-        // does not hold the settlement up; it follows once the frame is.
+        // Near the window's end, or a retry interval into it, a seal whose
+        // beacon frame is not here yet does not hold the settlement up; it
+        // follows once the frame is.
+        let waited = closing
+            || global_frame_number
+                >= from.saturating_add(crate::storage_snapshot::seal_retry_frames());
         let seal = match seal {
-            Some(slot) if closing && settle.is_some() && missing(slot.registered_at + 1) => {
+            Some(slot) if waited && settle.is_some() && missing(slot.registered_at + 1) => {
                 recover(vec![slot.registered_at + 1]);
                 None
             }
@@ -3937,17 +3972,27 @@ impl AppConsensusEngine {
         // trail GLOBAL by a registry pull (minutes): ask for an early one, so
         // the view learns the seal (proposals commit roots only for a seal
         // they see) and a part GLOBAL applied is not sent again.
-        if let Some(sent) = crate::storage_snapshot::epoch_proof_sent_at(&member, shard, epoch) {
+        if let Some(sent) = crate::storage_snapshot::epoch_proof_sent_at(&member, shard, epoch).max(
+            crate::storage_epoch_batch::settlement_sent_alone_at(&member, shard, epoch),
+        ) {
             crate::global_view_refresh::shared().request(
                 crate::global_view_refresh::Reason::StorageRecordAwaited,
                 sent + 4,
                 std::time::Instant::now(),
             );
         }
-        let Some(attempt) =
-            crate::storage_snapshot::claim_epoch_proof(&member, shard, epoch, global_frame_number)
-        else {
-            return;
+        let attempt = if resend {
+            attempts.max(1)
+        } else {
+            let Some(attempt) = crate::storage_snapshot::claim_epoch_proof(
+                &member,
+                shard,
+                epoch,
+                global_frame_number,
+            ) else {
+                return;
+            };
+            attempt
         };
         let (filter, replicas) = (
             shard.to_vec(),
@@ -3976,8 +4021,8 @@ impl AppConsensusEngine {
         // window's end, it goes alone and the node proves it at once.
         let has_seal = seal.is_some();
         let settle_inputs_present = settle.is_some();
-        let settle_alone = attempt > 1 || closing;
-        if closing && settle_inputs_present {
+        let settle_alone = attempt > 1 || closing || resend || due.is_some_and(|due| due.alone);
+        if closing && settle_inputs_present && !resend {
             warn!(epoch, attempt, global_frame = global_frame_number, window_end = until,
                 frames_left = until.saturating_sub(global_frame_number), filter = %hex::encode(shard),
                 "storage settlement not recorded near its window's end: sending it alone, apart from its seal. This node's storage \
@@ -3990,6 +4035,15 @@ impl AppConsensusEngine {
             crate::storage_epoch_batch::part_jobs(has_seal, settle_inputs_present, settle_alone);
         for part in jobs.iter().filter(|part| part.announced) {
             announce(part.seals, part.settles);
+        }
+        if settle_inputs_present {
+            crate::storage_epoch_batch::note_settlement_sent(
+                &member,
+                shard,
+                epoch,
+                global_frame_number,
+                settle_alone,
+            );
         }
         // What each half of the part is prepared from: a retry reuses a half
         // prepared from the same inputs.
@@ -4128,8 +4182,12 @@ impl AppConsensusEngine {
                     bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
                     "storage epoch proof part prepared for the node");
                 publish(bytes);
-                // GLOBAL needs a retry interval from now, not from the claim.
-                crate::storage_snapshot::note_epoch_proof_published(&member, &filter, epoch);
+                // GLOBAL needs a retry interval from now, not from the claim;
+                // a settlement sent again apart from the attempts moves no
+                // attempt's clock.
+                if !resend {
+                    crate::storage_snapshot::note_epoch_proof_published(&member, &filter, epoch);
+                }
                 Ok(())
             };
             // A settlement not prepared before its window closed is moot:
@@ -4140,7 +4198,7 @@ impl AppConsensusEngine {
             let closed = |result: quil_types::error::Result<()>| match result {
                 Err(error) if crate::storage_snapshot::settlement_closed(epoch, 0) => {
                     let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
-                    if attempt == 1 {
+                    if attempt == 1 && !resend {
                         warn!(epoch, frames, global_frame, %error, filter = %hex::encode(&filter),
                             "storage settlement window closed before this node sent its part; unless an earlier run's part landed, GLOBAL withholds the member's storage share for the unproven roots (before epoch 1342: kicks it): check this shard's storage job backlog");
                     } else {
@@ -21518,6 +21576,126 @@ mod tests {
             sent.iter().any(|message| matches!(message,
                 SeatMessage::Part(part) if part.part.settles && !part.part.seals)),
             "the settlement is sent without the seal"
+        );
+    }
+
+    /// Wait for the seat's storage jobs: its lane and its settlement lane.
+    fn seat_lanes_idle(engine: &AppConsensusEngine) {
+        for lane in [
+            engine.filter.clone(),
+            [b"settlement ".as_slice(), &engine.filter].concat(),
+        ] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                &lane,
+                Duration::from_secs(30)
+            ));
+        }
+    }
+
+    /// Run the seat's epoch proof job at each GLOBAL frame of `frames`, in
+    /// turn, and wait for its storage jobs.
+    fn settle_at(engine: &AppConsensusEngine, frames: &[u64]) {
+        for &frame in frames {
+            engine.prove_storage_epoch_if_due(frame);
+            seat_lanes_idle(engine);
+        }
+    }
+
+    /// The view GLOBAL's record of the settlement of `epoch` gives the
+    /// engine: its slot no longer owed, the other slots as they were.
+    fn settled_in_view(engine: &mut AppConsensusEngine, epoch: u64) {
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        for e in [epoch, epoch + 2] {
+            if let Some(mut slot) = engine
+                .prover_registry
+                .get_storage_seat_slot(&[1; 32], &engine.filter, e)
+                .unwrap()
+            {
+                if e == epoch {
+                    slot.open = false;
+                }
+                registry.set_storage_seat_slot(&[1; 32], &engine.filter, slot);
+            }
+        }
+        engine.prover_registry = registry;
+    }
+
+    /// A settlement sent alone goes again every ten GLOBAL frames while its
+    /// slot shows it owed, and not sooner: an archive drops a submission no
+    /// frame carried after ten frames. Sent once a retry interval (48
+    /// frames), a settlement was in archives' mempools for about 50 of its
+    /// window's last 400 frames, and its seat expired (mainnet, 2026-11-08).
+    #[tokio::test]
+    async fn a_settlement_sent_alone_goes_again_every_ten_global_frames_and_not_sooner() {
+        let (engine, published, (from, _)) = engine_owing_a_settlement(5, true, true);
+        let alone_at = from + 1 + crate::storage_snapshot::seal_retry_frames();
+        settle_at(&engine, &[from + 1, alone_at]);
+        let first = settlements_sent_alone(&published);
+        settle_at(&engine, &[alone_at + 9]);
+        let early = settlements_sent_alone(&published);
+        settle_at(&engine, &[alone_at + 10]);
+        let again = settlements_sent_alone(&published);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(first, 1, "the retry sends the settlement alone");
+        assert_eq!(
+            early, 1,
+            "a settlement sent alone went again sooner than ten GLOBAL frames: early"
+        );
+        assert_eq!(
+            again, 2,
+            "a settlement sent alone was not sent again ten GLOBAL frames later, while an archive dropped it: unsent"
+        );
+    }
+
+    /// The settlement waits for the next registration's seal, to share its
+    /// proof, at most a retry interval (48 GLOBAL frames) into its window,
+    /// then goes alone: held for a registration that landed 67 minutes into
+    /// the window, a settlement first went out among the window's capacity
+    /// traffic, and its seat expired (mainnet, 2026-11-08).
+    #[tokio::test]
+    async fn a_settlement_waits_for_its_next_seal_at_most_a_retry_interval_into_its_window() {
+        let (engine, published, (from, _)) = engine_owing_a_settlement(5, false, false);
+        settle_at(&engine, &[from]);
+        let at_opening = published.lock().unwrap().len();
+        settle_at(
+            &engine,
+            &[from + crate::storage_snapshot::seal_retry_frames()],
+        );
+        let sent = settlements_sent_alone(&published);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            at_opening, 0,
+            "at its window's opening the settlement waits for the next registration"
+        );
+        assert_eq!(
+            sent, 1,
+            "a retry interval into its window the settlement still waited for a registration that had not landed: unsent"
+        );
+    }
+
+    /// Once its slot shows the settlement recorded, it is not sent again:
+    /// the resends last only while GLOBAL has not recorded it.
+    #[tokio::test]
+    async fn a_settlement_is_not_sent_again_once_its_slot_shows_it_settled() {
+        let (mut engine, published, (from, _)) = engine_owing_a_settlement(5, true, true);
+        let retry = crate::storage_snapshot::seal_retry_frames();
+        let alone_at = from + 1 + retry;
+        settle_at(&engine, &[from + 1, alone_at, alone_at + 10]);
+        let resent = settlements_sent_alone(&published);
+        settled_in_view(&mut engine, 5);
+        settle_at(
+            &engine,
+            &[alone_at + 20, alone_at + 30, from + 1 + 2 * retry],
+        );
+        let after = settlements_sent_alone(&published);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            resent, 2,
+            "the settlement sent alone was not sent again before GLOBAL recorded it: unsent"
+        );
+        assert_eq!(
+            after, resent,
+            "the settlement went out again after its slot showed it settled: overrun"
         );
     }
 

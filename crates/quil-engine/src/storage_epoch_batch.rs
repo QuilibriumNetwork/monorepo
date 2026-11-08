@@ -28,14 +28,20 @@
 //! GLOBAL withholds a member's storage share (before epoch 1342: kicks it)
 //! for roots it committed and never proved by the settlement window's end,
 //! so a settlement waits for no seal and no collection longer than its first
-//! attempt. A worker prepares a seat's settlement and its seal in jobs of
-//! their own on every attempt ([`part_jobs`]): a seal relabelling, or failing
-//! after it, never holds the settlement's job. The node joins the halves it
-//! collected together into one part ([`join_halves`]). A retry sends the
-//! settlement alone, and near the window's end ([`settle_closing_frames`])
-//! the first attempt does too.
+//! attempt, and for the next registration's seal at most a retry interval
+//! into its window ([`settlement_due`]). A worker prepares a seat's
+//! settlement and its seal in jobs of their own on every attempt
+//! ([`part_jobs`]): a seal relabelling, or failing after it, never holds the
+//! settlement's job. The node joins the halves it collected together into
+//! one part ([`join_halves`]). A retry sends the settlement alone, and near
+//! the window's end ([`settle_closing_frames`]), or past that wait, the
+//! first attempt does too. A settlement sent alone goes again every
+//! [`SETTLEMENT_RESEND_FRAMES`] GLOBAL frames until its slot shows it
+//! settled: an archive drops a submission no frame carried after that many.
 //! The node proves a settlement sent alone at once, beside any collection
-//! waiting for its seat, and sends each seat's settlement to GLOBAL once
+//! waiting for its seat, and sends it again as the proof it made of it
+//! before ([`reuse_settlement_proof`]), so archives hold one copy. A proof
+//! carrying seals carries no settlement that already went out
 //! ([`claim_settlements`]): GLOBAL refuses a proof whole when one of its
 //! seats settles an epoch already settled.
 
@@ -677,6 +683,172 @@ pub fn part_jobs(seals: bool, settles: bool, settle_alone: bool) -> Vec<PartJob>
     settle.into_iter().chain(seal).collect()
 }
 
+/// GLOBAL frames between sends of a settlement sent alone while its slot
+/// shows it owed ([`settlement_due`]): an archive drops a submission no
+/// GLOBAL frame carried after this many finalized frames
+/// (`message_collector::RETENTION_WINDOW`). Sent once a retry interval (48
+/// frames), every other send dropped by this node, a settlement was in
+/// archives' mempools for about 50 of its window's last 400 frames, and its
+/// seat expired (mainnet, 2026-11-08).
+pub const SETTLEMENT_RESEND_FRAMES: u64 = 10;
+
+/// A seat's settlement as its worker sees it at a GLOBAL frame
+/// ([`settlement_due`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettlementView {
+    /// Its slot shows it owed: no epoch proof settled the epoch yet.
+    pub owed: bool,
+    /// The next registration's seal may still come and is not ready to
+    /// prove: a registration whose beacon frame is not here yet, or one that
+    /// may still land.
+    pub seal_pending: bool,
+    /// The GLOBAL frame this worker last sent it alone at
+    /// ([`settlement_sent_alone_at`]).
+    pub sent_alone_at: Option<u64>,
+}
+
+/// How a seat's settlement goes ([`settlement_due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleSend {
+    /// Alone: the node proves it at once, not in the member's collection.
+    pub alone: bool,
+    /// Sent again now, apart from the seat's attempts
+    /// (`crate::storage_snapshot::claim_epoch_proof`), without its seal.
+    pub resend: bool,
+}
+
+/// Whether the settlement of `epoch` goes at GLOBAL frame `frame`, and how:
+/// `None` outside its window, once its slot shows it settled, and while it
+/// waits for the next registration's seal. It waits so the two share one
+/// proof, from its window's opening for at most
+/// [`crate::storage_snapshot::seal_retry_frames`], then goes alone: held for
+/// a registration that landed 67 minutes into its window, a settlement first
+/// went out among the window's capacity traffic, and its seat expired
+/// (mainnet, 2026-11-08). Near the window's end ([`settle_closing_frames`])
+/// it waits for nothing. Once sent alone, it goes again every
+/// [`SETTLEMENT_RESEND_FRAMES`] while its slot shows it owed.
+pub fn settlement_due(epoch: u64, frame: u64, view: SettlementView) -> Option<SettleSend> {
+    let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+    if !view.owed || !(from..until).contains(&frame) {
+        return None;
+    }
+    let closing = frame >= until.saturating_sub(settle_closing_frames());
+    let waited = frame >= from.saturating_add(crate::storage_snapshot::seal_retry_frames());
+    if view.seal_pending && !closing && !waited && view.sent_alone_at.is_none() {
+        return None;
+    }
+    Some(SettleSend {
+        alone: closing || view.seal_pending || view.sent_alone_at.is_some(),
+        resend: view
+            .sent_alone_at
+            .is_some_and(|at| frame >= at.saturating_add(SETTLEMENT_RESEND_FRAMES)),
+    })
+}
+
+/// What a worker sent of a seat's settlement: the GLOBAL frames of its first
+/// and last sends, how many, and the last sent alone.
+#[derive(Debug, Clone, Copy)]
+struct SettlementSends {
+    first: u64,
+    last: u64,
+    sends: u32,
+    alone_at: Option<u64>,
+}
+
+fn settlement_sends() -> &'static Mutex<HashMap<SettlementKey, SettlementSends>> {
+    static SENDS: OnceLock<Mutex<HashMap<SettlementKey, SettlementSends>>> = OnceLock::new();
+    SENDS.get_or_init(Default::default)
+}
+
+/// Note that this worker sent `member`'s settlement of `epoch` on `filter`
+/// at GLOBAL frame `frame`, `alone` or in the member's collection.
+pub fn note_settlement_sent(member: &[u8; 32], filter: &[u8], epoch: u64, frame: u64, alone: bool) {
+    let Ok(mut sends) = settlement_sends().lock() else {
+        return;
+    };
+    sends.retain(|(_, _, e), _| e.saturating_add(2) >= epoch);
+    let sent = sends
+        .entry((*member, filter.to_vec(), epoch))
+        .or_insert(SettlementSends {
+            first: frame,
+            last: frame,
+            sends: 0,
+            alone_at: None,
+        });
+    sent.last = sent.last.max(frame);
+    sent.sends = sent.sends.saturating_add(1);
+    if alone {
+        sent.alone_at = Some(sent.alone_at.map_or(frame, |at| at.max(frame)));
+    }
+}
+
+/// The GLOBAL frame this worker last sent `member`'s settlement of `epoch`
+/// on `filter` alone at ([`note_settlement_sent`]).
+pub fn settlement_sent_alone_at(member: &[u8; 32], filter: &[u8], epoch: u64) -> Option<u64> {
+    settlement_sends()
+        .lock()
+        .ok()?
+        .get(&(*member, filter.to_vec(), epoch))
+        .and_then(|sent| sent.alone_at)
+}
+
+/// How a settlement a worker sent ended ([`settlement_outcomes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementOutcome {
+    /// Its slot showed it settled within its window.
+    Settled,
+    /// Its window ended while its slot showed it owed in this worker's view.
+    Unsettled,
+}
+
+/// Log once how each settlement this worker sent of `member`'s seat on
+/// `filter` ended, as seen at GLOBAL frame `frame`: one line each, with its
+/// sends; `open(epoch)` is what its slot shows (`None`: no slot in view).
+/// Returns them by epoch, with the times each went again.
+pub fn settlement_outcomes(
+    member: &[u8; 32],
+    filter: &[u8],
+    frame: u64,
+    open: impl Fn(u64) -> Option<bool>,
+) -> Vec<(u64, SettlementOutcome, u32)> {
+    let Ok(mut sends) = settlement_sends().lock() else {
+        return Vec::new();
+    };
+    let mut ended = Vec::new();
+    sends.retain(|(sent_member, sent_filter, epoch), sent| {
+        if sent_member != member || sent_filter.as_slice() != filter {
+            return true;
+        }
+        let epoch = *epoch;
+        let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let outcome = if frame >= until {
+            SettlementOutcome::Unsettled
+        } else if open(epoch) == Some(false) {
+            SettlementOutcome::Settled
+        } else {
+            return true;
+        };
+        let resent = sent.sends.saturating_sub(1);
+        match outcome {
+            SettlementOutcome::Settled => {
+                info!(epoch, filter = %hex::encode(filter), first_sent_frame = sent.first, last_sent_frame = sent.last,
+                    resent, global_frame = frame, window_end = until,
+                    "storage settlement recorded: its slot shows GLOBAL settled it");
+            }
+            SettlementOutcome::Unsettled => {
+                warn!(epoch, filter = %hex::encode(filter), first_sent_frame = sent.first, last_sent_frame = sent.last,
+                    resent, global_frame = frame, window_end = until,
+                    "storage settlement not seen recorded by its window's end: no GLOBAL frame carried any of its sends in \
+                     this node's view (which may trail GLOBAL by a registry pull); GLOBAL withholds the member's storage share for the \
+                     unproven roots. Check this node's `storage epoch proof not delivered` lines and the GLOBAL frame rate");
+            }
+        }
+        ended.push((epoch, outcome, resent));
+        false
+    });
+    ended
+}
+
 /// A registration whose seal this process cannot prove: the member, the
 /// shard, the epoch settled beside it (it seals `epoch + 2`), the frame it
 /// was registered at and its leaves.
@@ -768,33 +940,19 @@ fn settlements_sent() -> &'static Mutex<HashMap<SettlementKey, Instant>> {
     SENT.get_or_init(Default::default)
 }
 
-/// How long after a seat's settlement went out the same settlement sent
-/// alone is not sent again: one and a half of its worker's retry intervals
-/// ([`crate::storage_snapshot::seal_retry_frames`]). The first retry comes
-/// before the worker's view shows what GLOBAL applied (on a devnet, a
-/// joint proof applied 30 s earlier: GLOBAL refused the retry as settling
-/// again), and is dropped; one GLOBAL lost goes again at the second. Frames
-/// count at mainnet's pace at least: a node whose workers run apart notes
-/// no GLOBAL frame, so it knows no faster schedule's current pace.
-fn resettle_after() -> Duration {
-    let frame_ms = quil_types::consensus::ideal_frame_time_ms()
-        .max(quil_types::consensus::IDEAL_FRAME_TIME_MS);
-    Duration::from_millis(
-        crate::storage_snapshot::seal_retry_frames()
-            .saturating_mul(frame_ms)
-            .saturating_mul(3)
-            / 2,
-    )
-}
-
-/// `seats` without the settlements this node already sent, and the
-/// settlements they now send, claimed until their proof goes out or fails
-/// ([`release_settlements`]): GLOBAL refuses a proof whole when one of its
-/// seats settles an epoch already settled, losing the seals in it. A part
-/// proved with the member's others gives up its settlement once one went
-/// out, and proves its seal alone; a settlement sent alone is not sent again
-/// within [`resettle_after`] of the last. None is sent once its window has
-/// closed (`crate::storage_snapshot::settlement_closed`): GLOBAL refuses it.
+/// `seats` without the settlements this node already sent in parts that
+/// seal, and the settlements they now send, claimed until their proof goes
+/// out or fails ([`release_settlements`]): GLOBAL refuses a proof whole when
+/// one of its seats settles an epoch already settled, losing the seals in
+/// it. A part proved with the member's others gives up its settlement once
+/// one went out, and proves its seal alone. A settlement sent alone goes
+/// each time: its worker spaces the sends by GLOBAL frames until its slot
+/// shows it settled ([`settlement_due`]), and a refused copy loses nothing
+/// else. A node's own view of GLOBAL frames may stand still (one whose
+/// workers run apart notes an epoch's start only), and a guard of 720 s of
+/// wall time dropped every other one of its worker's sends at mainnet's
+/// incident pace (2026-11-08). None is sent once its window has closed
+/// (`crate::storage_snapshot::settlement_closed`): GLOBAL refuses it.
 fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<SettlementKey>) {
     let Ok(mut sent) = settlements_sent().lock() else {
         return (seats, Vec::new());
@@ -819,7 +977,7 @@ fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<Settle
         let key = (seat.member, seat.part.shard_filter.clone(), seat.part.epoch);
         let alone = seat.solo && !seat.part.seals;
         match sent.get(&key) {
-            Some(at) if !alone || at.elapsed() < resettle_after() => {
+            Some(at) if !alone => {
                 info!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
                     epoch = seat.part.epoch, sent_secs_ago = at.elapsed().as_secs(), seals = seat.part.seals,
                     "storage epoch proof: this seat's settlement already went out; the part is not sent again with it");
@@ -835,6 +993,82 @@ fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<Settle
         }
     }
     (out, claimed)
+}
+
+/// The proof this node made of a settlement sent alone: the digest of the
+/// part it proves, the proof, and the times it went again.
+struct SettlementProof {
+    part: [u8; 32],
+    bytes: Arc<Vec<u8>>,
+    resends: u32,
+}
+
+fn settlement_proofs() -> &'static Mutex<HashMap<SettlementKey, SettlementProof>> {
+    static PROOFS: OnceLock<Mutex<HashMap<SettlementKey, SettlementProof>>> = OnceLock::new();
+    PROOFS.get_or_init(Default::default)
+}
+
+fn part_digest(seat: &PreparedSeat) -> [u8; 32] {
+    use sha3::Digest;
+    sha3::Sha3_256::digest(seat.to_bytes()).into()
+}
+
+/// Keep `bytes`, the proof of `seat`, a settlement sent alone, to send again
+/// unchanged ([`reuse_settlement_proof`]).
+fn keep_settlement_proof(seat: &PreparedSeat, bytes: &[u8]) {
+    let Ok(mut proofs) = settlement_proofs().lock() else {
+        return;
+    };
+    let epoch = seat.part.epoch;
+    proofs.retain(|(_, _, e), _| e.saturating_add(1) >= epoch);
+    proofs.insert(
+        (seat.member, seat.part.shard_filter.clone(), epoch),
+        SettlementProof {
+            part: part_digest(seat),
+            bytes: Arc::new(bytes.to_vec()),
+            resends: 0,
+        },
+    );
+}
+
+/// The proof this node made of `seat`, a settlement sent alone again from
+/// the same part, and the times it has now gone again: the same bytes, so
+/// archives and GLOBAL's leader hold one copy, and nothing is proved again.
+/// `None` when none was made of this part.
+fn reuse_settlement_proof(seat: &PreparedSeat) -> Option<(Arc<Vec<u8>>, u32)> {
+    let mut proofs = settlement_proofs().lock().ok()?;
+    let proof = proofs.get_mut(&(seat.member, seat.part.shard_filter.clone(), seat.part.epoch))?;
+    if proof.part != part_digest(seat) {
+        return None;
+    }
+    proof.resends = proof.resends.saturating_add(1);
+    Some((proof.bytes.clone(), proof.resends))
+}
+
+/// Send `seats`, one settlement sent alone again from the same part, as the
+/// proof made of it before ([`reuse_settlement_proof`]). False when there is
+/// none, or its window has closed (the proving path drops it and logs why).
+fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
+    let [seat] = seats else {
+        return false;
+    };
+    if crate::storage_snapshot::settlement_closed(seat.part.epoch, 0) {
+        return false;
+    }
+    let Some((bytes, resends)) = reuse_settlement_proof(seat) else {
+        return false;
+    };
+    if let Ok(mut sent) = settlements_sent().lock() {
+        sent.insert(
+            (seat.member, seat.part.shard_filter.clone(), seat.part.epoch),
+            Instant::now(),
+        );
+    }
+    tracing::debug!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
+        epoch = seat.part.epoch, resends, bytes = bytes.len(),
+        "storage settlement sent again alone, as the proof made before");
+    publish(bytes.to_vec());
+    true
 }
 
 /// Give back the settlements a proof that failed claimed.
@@ -1424,6 +1658,11 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
     let persistent = persistent_schedule(&seats);
     let lane = proof_lane(&seats, alone, persistent);
     crate::storage_jobs::spawn(&lane, "member epoch proof", move || {
+        // Sent again from the same part, a settlement alone goes as the
+        // proof made of it before: nothing is proved again.
+        if alone && resend_settlement(&seats, &publish) {
+            return Ok(());
+        }
         let bytes = proof_reservation(&seats, persistent)?;
         let _memory = if alone && !persistent {
             crate::storage_jobs::reserve_settlement(bytes)
@@ -1434,6 +1673,11 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
         if seats.is_empty() {
             return Ok(());
         }
+        let kept = if alone && seats.len() == 1 {
+            seats.clone()
+        } else {
+            Vec::new()
+        };
         let started = Instant::now();
         let member = seats
             .first()
@@ -1469,6 +1713,9 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
             Ok(bytes) => {
                 info!(member, seats = count, sealed_leaves = sealed, bytes = bytes.len(),
                     seconds = started.elapsed().as_secs_f64(), shards = ?shards, "submitting storage epoch proof");
+                if let [seat] = kept.as_slice() {
+                    keep_settlement_proof(seat, &bytes);
+                }
                 publish(bytes);
                 // Its workers' retry clocks run from now (in this process:
                 // thread workers), not from their parts' claims.
@@ -2050,9 +2297,10 @@ mod tests {
         assert!(!recently_proved(&other), "a seal retry waits, as before");
     }
 
-    /// Exactly one proof carries each seat's settlement, in any order: GLOBAL
-    /// refuses a proof whole when it settles an epoch already settled,
-    /// losing the seals in it.
+    /// No proof that seals carries a settlement that already went out, in
+    /// any order: GLOBAL refuses a proof whole when it settles an epoch
+    /// already settled, losing the seals in it. A settlement alone goes each
+    /// time its worker sends it.
     #[test]
     fn each_settlement_goes_to_global_once_whatever_the_order() {
         let mut joint = sealing_and_settling(0x81);
@@ -2069,49 +2317,92 @@ mod tests {
         assert_eq!(out.len(), 2, "the joint part's seal and the other seat");
         assert_eq!(settles(&out), 0, "no second settlement");
         assert!(out[0].part.seals && out[0].part.frames.is_empty() && claimed.is_empty());
-        // A retry one interval later is dropped (the worker's view may not
-        // show GLOBAL's record yet); the next goes.
-        let interval = Duration::from_millis(
-            crate::storage_snapshot::seal_retry_frames()
-                * quil_types::consensus::IDEAL_FRAME_TIME_MS,
-        );
-        assert!(resettle_after() > interval && resettle_after() < 2 * interval);
-        // A process that noted no GLOBAL frame of a faster schedule (a
-        // node whose workers run apart) still counts mainnet's pace.
-        quil_types::consensus::set_frame_time_schedule(vec![(0, 2_500)]);
-        let paced = resettle_after();
-        quil_types::consensus::set_frame_time_schedule(Vec::new());
-        assert!(paced > interval, "a faster schedule shrank the window");
-        // Sent alone again at once: not again.
-        let (out, _) = claim_settlements(vec![alone.clone()]);
-        assert!(
-            out.is_empty(),
-            "a settlement sent alone again at once is not sent"
-        );
-        // After half a retry interval it goes again (GLOBAL may have lost it).
-        let key = (
-            alone.member,
-            alone.part.shard_filter.clone(),
-            alone.part.epoch,
-        );
-        *settlements_sent().lock().unwrap().get_mut(&key).unwrap() -= resettle_after();
+        // Sent alone again, it goes: its worker spaces the sends by GLOBAL
+        // frames (`settlement_due`).
         let (out, claimed) = claim_settlements(vec![alone.clone()]);
         assert_eq!((settles(&out), claimed.len()), (1, 1));
         // A proof that failed gives its settlement back.
         release_settlements(&claimed);
-        let (out, _) = claim_settlements(vec![alone.clone()]);
+        let (out, _) = claim_settlements(vec![joint.clone()]);
         assert_eq!(settles(&out), 1, "released by the failed proof");
 
-        // Joint first: the settlement alone after it is not sent.
+        // Joint first: the settlement alone after it goes when its worker
+        // sends it (GLOBAL lost the joint proof, or refuses the copy whole,
+        // losing nothing else); a joint part after that seals only.
         let mut later = sealing_and_settling(0x83);
         later.member = [0x83; 32];
         let (out, _) = claim_settlements(vec![later.clone()]);
         assert_eq!(settles(&out), 1);
-        let (_, settling) = later.halves();
+        let (_, settling) = later.clone().halves();
         let mut settling = settling.unwrap();
         settling.solo = true;
         let (out, claimed) = claim_settlements(vec![settling]);
-        assert!(out.is_empty() && claimed.is_empty());
+        assert_eq!((settles(&out), claimed.len()), (1, 1));
+        let (out, claimed) = claim_settlements(vec![later]);
+        assert_eq!((settles(&out), claimed.len()), (0, 0));
+    }
+
+    /// A settlement sent alone again from the same part goes as the proof
+    /// made of it before: archives and GLOBAL's leader hold one copy while
+    /// one waits (on mainnet each send was proved anew, 2026-11-08), and
+    /// nothing is proved again. A part from other inputs is proved anew.
+    #[test]
+    fn a_settlement_sent_alone_again_carries_the_proof_made_before() {
+        let mut joint = sealing_and_settling(0x92);
+        joint.member = [0x92; 32];
+        let (_, alone) = joint.halves();
+        let mut alone = alone.unwrap();
+        alone.solo = true;
+        assert!(
+            reuse_settlement_proof(&alone).is_none(),
+            "nothing proved yet"
+        );
+        keep_settlement_proof(&alone, b"the first proof");
+        let (bytes, resends) = reuse_settlement_proof(&alone).expect(
+            "the settlement sent alone again was reproved: new bytes archives cannot deduplicate",
+        );
+        assert_eq!((bytes.as_slice(), resends), (&b"the first proof"[..], 1));
+        assert_eq!(reuse_settlement_proof(&alone).map(|(_, n)| n), Some(2));
+        let mut other = alone.clone();
+        other.part.frames.clear();
+        other.claim.frames.clear();
+        assert!(
+            reuse_settlement_proof(&other).is_none(),
+            "a part from other inputs went as another part's proof"
+        );
+    }
+
+    /// How each settlement a worker sent ended is logged once: settled when
+    /// its slot shows it within its window, unsettled when the window ended
+    /// first, each with the times it went again.
+    #[test]
+    fn a_settlements_outcome_is_logged_once() {
+        let (member, filter, epoch) = ([0x93; 32], vec![0x93], 5);
+        let (from, until) =
+            quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        note_settlement_sent(&member, &filter, epoch, from + 48, true);
+        note_settlement_sent(&member, &filter, epoch, from + 58, true);
+        assert_eq!(
+            settlement_sent_alone_at(&member, &filter, epoch),
+            Some(from + 58)
+        );
+        assert!(settlement_outcomes(&member, &filter, from + 60, |_| Some(true)).is_empty());
+        assert_eq!(
+            settlement_outcomes(&member, &filter, from + 61, |_| Some(false)),
+            vec![(epoch, SettlementOutcome::Settled, 1)]
+        );
+        assert!(
+            settlement_outcomes(&member, &filter, from + 62, |_| Some(false)).is_empty(),
+            "a settlement's outcome was logged again: repeated"
+        );
+        assert_eq!(settlement_sent_alone_at(&member, &filter, epoch), None);
+        let other = vec![0x94];
+        note_settlement_sent(&member, &other, epoch, until - 30, true);
+        assert!(settlement_outcomes(&member, &other, until - 1, |_| Some(true)).is_empty());
+        assert_eq!(
+            settlement_outcomes(&member, &other, until, |_| Some(true)),
+            vec![(epoch, SettlementOutcome::Unsettled, 0)]
+        );
     }
 
     /// No proof carries a settlement once this node saw GLOBAL past its
@@ -2137,6 +2428,32 @@ mod tests {
         let mut alone = alone.unwrap();
         alone.solo = true;
         assert!(claim_settlements(vec![alone]).0.is_empty());
+    }
+
+    /// A settlement sent alone goes out each time its worker sends it again,
+    /// ten GLOBAL frames later: an archive drops a submission no frame
+    /// carried after ten frames, and a node that dropped a copy sent within
+    /// 720 s of the last (46 to 57 frames at mainnet's pace on 2026-11-08)
+    /// left every other one of its worker's sends unsent; the seat expired.
+    #[test]
+    fn a_settlement_sent_alone_again_goes_out_each_time_its_worker_sends_it() {
+        let mut joint = sealing_and_settling(0x91);
+        joint.member = [0x91; 32];
+        let (_, alone) = joint.halves();
+        let mut alone = alone.unwrap();
+        alone.solo = true;
+        let (_, until) =
+            quil_execution::global_intrinsic::storage_seat::settlement_window(alone.part.epoch);
+        crate::storage_snapshot::note_global_frame(until - 100);
+        let (out, claimed) = claim_settlements(vec![alone.clone()]);
+        assert_eq!((out.len(), claimed.len()), (1, 1), "the first send goes");
+        crate::storage_snapshot::note_global_frame(until - 90);
+        let (out, claimed) = claim_settlements(vec![alone]);
+        assert_eq!(
+            (out.len(), claimed.len()),
+            (1, 1),
+            "a settlement its worker sent alone again ten GLOBAL frames later was dropped: unsent"
+        );
     }
 
     /// The settlements a withheld submission carries are found, in a
