@@ -148,11 +148,16 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
 ///
 /// The check runs on the mirror's own thread ([`MirrorFeed`]); this loop
 /// reads only the frame's header, counts its request bundles unread and
-/// queues it under `peer`, the connected peer it arrived from
-/// ([`mirror_sender`]). Checked here, a peer's frame of many bundles held
-/// the loop for seconds, and the check reads the execution engines that
-/// GLOBAL execution locks. True when the frame was queued.
-fn unrouted_shard_message(bitmask: &[u8], peer: &[u8], data: Vec<u8>, feed: &MirrorFeed) -> bool {
+/// queues it under its sender's key ([`MirrorState::sender_key`]). Checked
+/// here, a peer's frame of many bundles held the loop for seconds, and the
+/// check reads the execution engines that GLOBAL execution locks. True when
+/// the frame was queued.
+fn unrouted_shard_message(
+    bitmask: &[u8],
+    sender: MirrorSender<'_>,
+    data: Vec<u8>,
+    feed: &MirrorFeed,
+) -> bool {
     let Ok(outline) = <FrameOutline as prost::Message>::decode(data.as_slice()) else {
         return false;
     };
@@ -164,17 +169,38 @@ fn unrouted_shard_message(bitmask: &[u8], peer: &[u8], data: Vec<u8>, feed: &Mir
     {
         return false;
     }
-    feed.offer(bitmask, peer, data, outline.requests.len());
+    feed.offer_sent(bitmask, &address, sender, data, outline.requests.len());
     true
 }
 
-/// The sender the mirror's queue shares a topic's room and checks between:
-/// the connected peer a message arrived from (gossip's propagation source),
-/// not its signer. A publisher signs each message with any key it likes,
-/// so signers cost nothing to multiply; each connected peer takes one of
-/// the node's bounded connections.
-fn mirror_sender(received: &quil_p2p::node::ReceivedMessage) -> &[u8] {
-    &received.via
+/// Who sent a gossiped shard frame, as the mirror's queue keys it
+/// ([`MirrorState::sender_key`]).
+#[derive(Clone, Copy)]
+struct MirrorSender<'a> {
+    /// The gossip message's signer: any key its publisher chose.
+    signer: &'a [u8],
+    /// The connected peer it arrived from (gossip's propagation source).
+    via: &'a [u8],
+}
+
+/// The sender of `received` for the mirror's queue. A publisher signs each
+/// message with any key it likes, so signers cost nothing to multiply; each
+/// connected peer takes one of the node's bounded connections, and a
+/// committee member's key is not the publisher's to choose.
+fn mirror_sender(received: &quil_p2p::node::ReceivedMessage) -> MirrorSender<'_> {
+    MirrorSender {
+        signer: &received.from,
+        via: &received.via,
+    }
+}
+
+/// The frame's shard (its header's address), read without its bundles.
+fn frame_filter(data: &[u8]) -> Option<Vec<u8>> {
+    <FrameOutline as prost::Message>::decode(data)
+        .ok()?
+        .header
+        .map(|header| header.address)
+        .filter(|address| !address.is_empty())
 }
 
 /// What the loop reads of a gossiped shard frame before it queues it: the
@@ -223,7 +249,7 @@ fn mirror_queued(
 /// second per shard), so this is minutes of one shard's frames while the
 /// check waits, and a peer that floods a topic fills only that topic's
 /// room. A topic lists only senders with frames queued, so it also bounds
-/// the senders (connected peers, [`mirror_sender`]) a topic tracks.
+/// the senders ([`MirrorState::sender_key`]) a topic tracks.
 const MIRROR_QUEUED_PER_TOPIC: usize = 16;
 /// Bytes the frames queued for the mirror's check take, bookkeeping
 /// included; past it the sender queuing the most bytes on the topic
@@ -243,6 +269,13 @@ const MIRROR_QUEUED_ENTRY_OVERHEAD: usize = std::mem::size_of::<QueuedFrame>() +
 const MIRROR_QUEUE_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
 /// The most of a caught panic's text a line quotes.
 const MIRROR_PANIC_TEXT: usize = 200;
+/// How long the mirror's worker uses a shard's committee members it read
+/// ([`ShardMembers`]) before it reads them again.
+const MIRROR_MEMBERS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+/// Shards whose committee members the mirror's worker keeps. A peer names
+/// any filter it likes, so past it the longest-read shard with no members
+/// goes first, then the longest-read of all.
+const MIRROR_MEMBER_SHARDS: usize = 1024;
 
 /// A gossiped shard frame queued for the mirror's check.
 struct QueuedFrame {
@@ -254,7 +287,7 @@ struct QueuedFrame {
 
 /// The frames one sender queued on a gossip topic, and the bytes they take.
 struct SenderFrames {
-    /// The connected peer they arrived from ([`mirror_sender`]).
+    /// The sender's key ([`MirrorState::sender_key`]).
     peer: Vec<u8>,
     frames: Vec<QueuedFrame>,
     bytes: usize,
@@ -286,8 +319,9 @@ struct QueueDrops {
 }
 
 /// The shard frames queued for the mirror's check, per gossip topic and,
-/// within a topic, per sender: the connected peer a frame arrived from
-/// ([`mirror_sender`]), never its signer, which a publisher mints freely.
+/// within a topic, per sender ([`MirrorState::sender_key`]): the committee
+/// member that signed it, else the connected peer it arrived from, never a
+/// signer the node does not know, which a publisher mints freely.
 /// The worker takes the topics in turn. Within a topic it takes the sender
 /// queuing the fewest frames, of equal counts the one whose cheapest frame
 /// is cheapest, then the earliest, and that sender's cheapest frame. So a
@@ -719,6 +753,64 @@ struct MirrorState {
     /// ([`stop_shard_mirrors`]).
     closed: bool,
     panics: MirrorPanics,
+    /// Per shard, its committee members as the worker last read them.
+    members: std::collections::HashMap<Vec<u8>, ShardMembers>,
+}
+
+/// A shard's committee members in the committed GLOBAL session, as peer
+/// IDs, and when the mirror's worker read them.
+struct ShardMembers {
+    peers: std::collections::HashSet<Vec<u8>>,
+    read: std::time::Instant,
+}
+
+impl MirrorState {
+    /// The key a frame of shard `filter` from `sender` queues under: its
+    /// signer when that is a member of the shard's committee as the worker
+    /// last read it, so a relay that delivers a member's frame first does
+    /// not own it; else the connected peer it arrived from. A frame of a
+    /// shard the worker has not read yet queues under its connection.
+    fn sender_key<'a>(&self, filter: &[u8], sender: MirrorSender<'a>) -> &'a [u8] {
+        if self
+            .members
+            .get(filter)
+            .is_some_and(|members| members.peers.contains(sender.signer))
+        {
+            sender.signer
+        } else {
+            sender.via
+        }
+    }
+
+    /// Whether shard `filter`'s members were read within
+    /// [`MIRROR_MEMBERS_REFRESH`] of `now`.
+    fn members_fresh(&self, filter: &[u8], now: std::time::Instant) -> bool {
+        self.members.get(filter).is_some_and(|members| {
+            now.saturating_duration_since(members.read) < MIRROR_MEMBERS_REFRESH
+        })
+    }
+
+    /// Keep shard `filter`'s members `peers`, read at `now`, within
+    /// [`MIRROR_MEMBER_SHARDS`].
+    fn keep_members(&mut self, filter: Vec<u8>, peers: Vec<Vec<u8>>, now: std::time::Instant) {
+        if !self.members.contains_key(&filter) && self.members.len() >= MIRROR_MEMBER_SHARDS {
+            let gone = self
+                .members
+                .iter()
+                .min_by_key(|(_, members)| (!members.peers.is_empty(), members.read))
+                .map(|(filter, _)| filter.clone());
+            if let Some(gone) = gone {
+                self.members.remove(&gone);
+            }
+        }
+        self.members.insert(
+            filter,
+            ShardMembers {
+                peers: peers.into_iter().collect(),
+                read: now,
+            },
+        );
+    }
 }
 
 impl MirrorShared {
@@ -835,6 +927,7 @@ impl MirrorFeed {
                     running: true,
                     closed: false,
                     panics: MirrorPanics::default(),
+                    members: Default::default(),
                 }),
                 queued: std::sync::Condvar::new(),
                 ended: std::sync::Condvar::new(),
@@ -843,9 +936,14 @@ impl MirrorFeed {
         }
     }
 
-    /// Start the worker thread: it hands each queued frame to `check`, and
-    /// is listed for [`stop_shard_mirrors`].
-    fn spawn(check: impl FnMut(&[u8]) + Send + 'static) -> Self {
+    /// Start the worker thread: it hands each queued frame to `check`,
+    /// reads a shard's committee members (peer IDs) with `members` before
+    /// it checks the shard's frame, at most once per
+    /// [`MIRROR_MEMBERS_REFRESH`], and is listed for [`stop_shard_mirrors`].
+    fn spawn(
+        check: impl FnMut(&[u8]) + Send + 'static,
+        members: impl FnMut(&[u8]) -> Option<Vec<Vec<u8>>> + Send + 'static,
+    ) -> Self {
         let feed = Self::new();
         let shared = feed.shared.clone();
         // The worker logs where its spawner does.
@@ -853,7 +951,7 @@ impl MirrorFeed {
         let started = std::thread::Builder::new()
             .name("shard-mirror".into())
             .spawn(move || {
-                tracing::dispatcher::with_default(&dispatch, || run_mirror(shared, check))
+                tracing::dispatcher::with_default(&dispatch, || run_mirror(shared, check, members))
             });
         match started {
             Ok(thread) => {
@@ -883,10 +981,43 @@ impl MirrorFeed {
         feed
     }
 
+    /// Queue `data`, a frame of shard `filter` on `topic` from `sender`
+    /// carrying `bundles` request bundles, under its sender's key
+    /// ([`MirrorState::sender_key`]).
+    fn offer_sent(
+        &self,
+        topic: &[u8],
+        filter: &[u8],
+        sender: MirrorSender<'_>,
+        data: Vec<u8>,
+        bundles: usize,
+    ) {
+        self.queue_under(
+            topic,
+            |state| state.sender_key(filter, sender),
+            data,
+            bundles,
+        );
+    }
+
     /// Queue `data`, a frame on `topic` from `peer` carrying `bundles`
-    /// request bundles, without waiting for its check; dropped and counted
-    /// when its worker is not running, dropped when it was stopped.
+    /// request bundles.
+    #[cfg(test)]
     fn offer(&self, topic: &[u8], peer: &[u8], data: Vec<u8>, bundles: usize) {
+        self.queue_under(topic, |_| peer, data, bundles);
+    }
+
+    /// Queue `data`, a frame on `topic` carrying `bundles` request bundles,
+    /// under the sender key `key` gives, without waiting for its check;
+    /// dropped and counted when its worker is not running, dropped when it
+    /// was stopped.
+    fn queue_under<'a>(
+        &self,
+        topic: &[u8],
+        key: impl FnOnce(&MirrorState) -> &'a [u8],
+        data: Vec<u8>,
+        bundles: usize,
+    ) {
         let now = std::time::Instant::now();
         let mut state = self.shared.lock();
         if state.closed {
@@ -894,6 +1025,7 @@ impl MirrorFeed {
             return;
         }
         if state.running {
+            let peer = key(&state);
             state.queue.push(topic, peer, data, bundles);
         } else {
             state.queue.dropped.frames += 1;
@@ -924,21 +1056,40 @@ impl Drop for MirrorFeed {
     }
 }
 
-/// The mirror's worker: check each queued frame until it is stopped, and
-/// say when drops ended and when checks panicked.
-fn run_mirror(shared: Arc<MirrorShared>, check: impl FnMut(&[u8])) {
+/// The mirror's worker: check each queued frame until it is stopped, read
+/// the committee members of the shards it checks, and say when drops ended
+/// and when checks panicked.
+fn run_mirror(
+    shared: Arc<MirrorShared>,
+    check: impl FnMut(&[u8]),
+    members: impl FnMut(&[u8]) -> Option<Vec<Vec<u8>>>,
+) {
     let _running = MirrorRunning(shared.clone());
-    // Dropped before `_running`: the store handles the check holds are
-    // released before the worker is marked ended.
+    // Dropped before `_running`: the store handles the check and the
+    // members reader hold are released before the worker is marked ended.
     let mut check_frame = check;
+    let mut read_members = members;
     let mut state = shared.lock();
     loop {
         if state.closed {
             return;
         }
         if let Some(data) = state.queue.pop() {
-            state.checking = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            state.checking = Some(now);
+            let stale = frame_filter(&data).filter(|filter| !state.members_fresh(filter, now));
             drop(state);
+            if let Some(filter) = stale {
+                // A shard with no committed session has no members: its
+                // frames queue under their connection.
+                let peers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    read_members(&filter)
+                }))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+                shared.lock().keep_members(filter, peers, now);
+            }
             // The default panic hook still prints each panic: quieting it
             // takes a process-wide hook (`std::panic::set_hook`), which this
             // worker leaves alone for every other thread's sake. The line
@@ -1250,18 +1401,19 @@ impl ShardMirror {
                 break;
             };
             // A frame another writer (the worker drain) stored at that
-            // number stays; the held copy goes.
-            if clock_store
-                .get_shard_clock_frame_header(&header.address, below)
-                .is_err()
-            {
-                super::worker_manager::mirror_shard_frame_to_clock_store(
-                    clock_store,
-                    &header.address,
-                    &data,
-                );
+            // number stays, the held copy goes, and the walk goes on from
+            // the stored frame: a held frame below links to it or stays.
+            match clock_store.get_shard_clock_frame_header(&header.address, below) {
+                Ok(stored) => child = stored,
+                Err(_) => {
+                    super::worker_manager::mirror_shard_frame_to_clock_store(
+                        clock_store,
+                        &header.address,
+                        &data,
+                    );
+                    child = parent;
+                }
             }
-            child = parent;
         }
         // A frame this far below a mirrored one is no ancestor still owed.
         held.prune_below(
@@ -1745,6 +1897,25 @@ pub(crate) async fn add_archive_record_endpoints(
     first
 }
 
+/// The peer IDs of shard `filter`'s committee members in the committed
+/// GLOBAL session, if it has one: the mirror queues a frame its member
+/// signed under the member ([`MirrorState::sender_key`]).
+fn shard_member_peers(
+    global: &Arc<quil_hypergraph::HypergraphCrdt>,
+    filter: &[u8],
+) -> Option<Vec<Vec<u8>>> {
+    use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+    let view = CommittedView::capture(global).ok()?;
+    let session = handoff::head(&view, filter).ok()??;
+    Some(
+        session
+            .members
+            .iter()
+            .map(|key| quil_p2p::peer_id_from_falcon_pubkey(key))
+            .collect(),
+    )
+}
+
 fn shard_sender_key(
     keys: &mut super::shard_sender::ShardSenderKeys,
     peer: &[u8],
@@ -1903,7 +2074,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             Some(exec_mgr_for_recv.clone()),
         );
         let clock = clock_store_recv.clone();
-        MirrorFeed::spawn(move |data| mirror_queued(clock.as_ref(), &mirror, data))
+        let global = crdt_for_recv.clone();
+        MirrorFeed::spawn(
+            move |data| mirror_queued(clock.as_ref(), &mirror, data),
+            move |filter| shard_member_peers(&global, filter),
+        )
     });
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
@@ -4031,7 +4206,10 @@ mod tests {
         fn hear(&self, bitmask: &[u8], frame: &quil_types::proto::global::AppShardFrame) {
             unrouted_shard_message(
                 bitmask,
-                b"peer",
+                MirrorSender {
+                    signer: b"peer",
+                    via: b"peer",
+                },
                 prost::Message::encode_to_vec(frame),
                 &self.feed,
             );
@@ -4748,12 +4926,15 @@ mod tests {
         let held = engines.lock().unwrap();
         let feed = {
             let (engines, checked) = (engines.clone(), checked.clone());
-            MirrorFeed::spawn(move |data| {
-                let _engines = engines
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                checked.lock().unwrap().push(data.to_vec());
-            })
+            MirrorFeed::spawn(
+                move |data| {
+                    let _engines = engines
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    checked.lock().unwrap().push(data.to_vec());
+                },
+                |_| None,
+            )
         };
         let started = std::time::Instant::now();
         for frame in 0..offered {
@@ -4912,6 +5093,82 @@ mod tests {
         );
     }
 
+    /// A relay that delivers a committee member's frame first does not own
+    /// it: once the worker read the shard's members, a frame a member signed
+    /// queues under the member, so the relay's own cheaper frames on that
+    /// connection neither evict it nor go first. The worker reads a shard's
+    /// members once per interval.
+    #[test]
+    fn a_member_frame_relayed_first_is_kept_from_the_relays_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let genuine = prost::Message::encode_to_vec(&shard.certified(7));
+        let cheap = prost::Message::encode_to_vec(&shard.frame(7));
+        let member = b"member".to_vec();
+        let offer = |feed: &MirrorFeed, from: &[u8], data: &[u8]| {
+            let received = quil_p2p::node::ReceivedMessage {
+                bitmask: topic.clone(),
+                data: Vec::new(),
+                from: from.to_vec(),
+                via: b"relay".to_vec(),
+                direct: false,
+            };
+            assert!(unrouted_shard_message(
+                &topic,
+                mirror_sender(&received),
+                data.to_vec(),
+                feed
+            ));
+        };
+
+        let feed = MirrorFeed::new();
+        feed.shared.lock().keep_members(
+            shard.filter.clone(),
+            vec![member.clone()],
+            std::time::Instant::now(),
+        );
+        offer(&feed, &member, &genuine);
+        for signer in 0..MIRROR_QUEUED_PER_TOPIC as u8 {
+            offer(&feed, &[signer; 8], &cheap);
+        }
+        assert_eq!(
+            feed.take(),
+            Some(genuine.clone()),
+            "FIRST-RELAY: a relay's own frames evicted or delayed a member's frame it relayed first"
+        );
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::new(AtomicUsize::new(0));
+        let feed = {
+            let (reads, checked, member) = (reads.clone(), checked.clone(), member.clone());
+            MirrorFeed::spawn(
+                move |_| {
+                    checked.fetch_add(1, SeqCst);
+                },
+                move |_| {
+                    reads.fetch_add(1, SeqCst);
+                    Some(vec![member.clone()])
+                },
+            )
+        };
+        for _ in 0..3 {
+            offer(&feed, &member, &genuine);
+        }
+        wait_for("the worker did not check the queued frames", || {
+            checked.load(SeqCst) == 3
+        });
+        assert_eq!(
+            reads.load(SeqCst),
+            1,
+            "MEMBERS-UNCACHED: the worker read a shard's members for each of its frames"
+        );
+        assert!(feed
+            .shared
+            .lock()
+            .members_fresh(&shard.filter, std::time::Instant::now()));
+    }
+
     /// Past its bounds the queue drops a sender's costliest frame (past the
     /// topic's bound) or the largest frame of the sender queuing the most
     /// bytes (past the byte bound), not a genuine frame that came last, and
@@ -5004,12 +5261,15 @@ mod tests {
         let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let feed = {
             let checked = checked.clone();
-            MirrorFeed::spawn(move |data| {
-                if data == b"panic" {
-                    panic!("a planted panic");
-                }
-                checked.lock().unwrap().push(data.to_vec());
-            })
+            MirrorFeed::spawn(
+                move |data| {
+                    if data == b"panic" {
+                        panic!("a planted panic");
+                    }
+                    checked.lock().unwrap().push(data.to_vec());
+                },
+                |_| None,
+            )
         };
         for data in [&b"panic"[..], b"panic", b"panic", b"after"] {
             feed.offer(&[1; 32], b"peer", data.to_vec(), 0);
@@ -5078,13 +5338,16 @@ mod tests {
         let held = gate.lock().unwrap();
         let feed = {
             let (gate, checked, stores) = (gate.clone(), checked.clone(), stores.clone());
-            MirrorFeed::spawn(move |data| {
-                let _stores = &stores;
-                let _gate = gate
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                checked.lock().unwrap().push(data.to_vec());
-            })
+            MirrorFeed::spawn(
+                move |data| {
+                    let _stores = &stores;
+                    let _gate = gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    checked.lock().unwrap().push(data.to_vec());
+                },
+                |_| None,
+            )
         };
         let shared = feed.shared.clone();
         assert!(
@@ -5246,6 +5509,49 @@ mod tests {
             stored(7),
             Some(drained),
             "RELEASE-OVERWRITES: a held parent replaced the frame stored at its number"
+        );
+    }
+
+    /// When a frame another writer stored stays in place of a held one, the
+    /// walk down the held frames goes on from the stored frame: a held frame
+    /// that links only to the held copy stays held.
+    #[test]
+    fn the_held_walk_goes_on_from_a_frame_stored_in_place_of_a_held_one() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let stored = |number| {
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, number, false)
+                .ok()
+        };
+        shard.hear(&topic, &shard.certified(5));
+        let grandparent = shard.notarized(6, selector(&shard.certified(5)));
+        shard.hear(&topic, &grandparent);
+        let parent = shard.notarized(7, selector(&grandparent));
+        shard.hear(&topic, &parent);
+        // Stored by the worker drain: the parent's output, another parent.
+        let mut drained = parent.clone();
+        drained.header.as_mut().unwrap().parent_selector = vec![9; 32];
+        let child = shard.certified_child(&parent);
+        for frame in [&drained, &child] {
+            super::super::worker_manager::mirror_shard_frame_to_clock_store(
+                shard.clock.as_ref(),
+                &shard.filter,
+                &prost::Message::encode_to_vec(frame),
+            );
+        }
+        assert_eq!(
+            (stored(6), stored(7), shard.latest()),
+            (None, Some(drained.clone()), Some(8))
+        );
+        shard.hear(&topic, &child);
+        assert_eq!(stored(7), Some(drained));
+        assert_eq!(
+            stored(6),
+            None,
+            "WALK-FROM-HELD: a held frame was mirrored below a stored frame it does not link to"
         );
     }
 
