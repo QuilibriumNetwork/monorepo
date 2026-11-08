@@ -2220,6 +2220,51 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
 mod tests {
     use super::*;
 
+    /// Any peer can publish on a shard's frame topic. A node without an
+    /// archive ingest (a cluster master) must not make a gossiped frame with
+    /// no certificate, numbered `u64::MAX`, the head it serves.
+    #[test]
+    fn reproduces_a_forged_far_future_shard_frame_becoming_the_mirrored_head() {
+        use quil_types::store::ClockStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner().clone());
+        let filter = vec![0x33u8; 32];
+        let frame = |number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: number,
+                output: vec![number as u8; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let latest = || {
+            clock
+                .get_latest_shard_clock_frame(&filter)
+                .ok()
+                .and_then(|frame| frame.header)
+                .map(|header| header.frame_number)
+        };
+        let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        unrouted_shard_message(
+            &topic,
+            &prost::Message::encode_to_vec(&frame(u64::MAX)),
+            &clock,
+        );
+        let forged = latest();
+        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(8)), &clock);
+        let after_next = latest();
+        assert_ne!(
+            forged,
+            Some(u64::MAX),
+            "VULNERABLE: a gossiped shard frame with no certificate, numbered {}, was \
+             mirrored unverified and became the head this node serves; after the next \
+             frame (8) the head is {after_next:?}",
+            u64::MAX
+        );
+    }
+
     /// A submission reaches every engine of its application on this node, and
     /// no engine of another application or topic.
     #[test]
