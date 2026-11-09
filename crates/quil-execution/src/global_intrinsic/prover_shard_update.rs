@@ -101,7 +101,9 @@ pub struct HeaderIssuance {
     pub difficulty: u64,
     /// Whether the header earns issuance, fees and activity. From the
     /// anchored issuance epoch a header at or below its session's executed
-    /// tip does not: GLOBAL already credited that frame.
+    /// tip does not: GLOBAL already credited that frame. From the late
+    /// header credit epoch one below the tip that GLOBAL never executed does,
+    /// once (`handoff::credit_header`).
     pub credit: bool,
 }
 

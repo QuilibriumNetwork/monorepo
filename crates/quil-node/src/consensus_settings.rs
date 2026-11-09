@@ -184,6 +184,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_ANCHORED_ISSUANCE_EPOCH override active (localnet only)"
         );
     }
+    let late_credit_epoch = quil_types::consensus::init_late_header_credit_epoch(network);
+    if network != 0 && late_credit_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = late_credit_epoch,
+            "QUIL_LATE_HEADER_CREDIT_EPOCH override active (localnet only)"
+        );
+    }
     let sync_authentication = quil_types::consensus::init_global_sync_authentication_frame(network);
     if network != 0 && sync_authentication != u64::MAX {
         tracing::warn!(

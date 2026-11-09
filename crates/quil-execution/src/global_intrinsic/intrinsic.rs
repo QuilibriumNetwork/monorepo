@@ -3704,7 +3704,8 @@ impl GlobalIntrinsic {
         // From the anchored issuance epoch GLOBAL credits each frame of an
         // authorized session once: a header at or below the session's
         // executed tip, read before this header advances it, was credited when
-        // GLOBAL first executed that frame.
+        // GLOBAL first executed that frame, unless GLOBAL executed the frame's
+        // successor first (the late header credit epoch, below).
         let anchored_issuance = quil_types::consensus::anchored_issuance_active(frame_number);
         let executed_tip = match session {
             Some(session) if anchored_issuance => super::handoff::session_tip(state, &session)?,
@@ -3722,7 +3723,9 @@ impl GlobalIntrinsic {
                 op.frame_number,
             );
         }
-        let credit = !executed_tip.is_some_and(|tip| tip.frame >= op.frame_number);
+        let credit = executed_tip
+            .as_ref()
+            .is_none_or(|tip| tip.frame < op.frame_number);
 
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
@@ -3973,6 +3976,24 @@ impl GlobalIntrinsic {
             })
         } else {
             None
+        };
+        // From the late header credit epoch a frame GLOBAL executes after its
+        // successor is credited too, once (`handoff::credit_header`). Credit
+        // is archive state: only archives record which frames they executed.
+        let credit = match session {
+            Some(session)
+                if anchored_issuance
+                    && quil_types::consensus::late_header_credit_active(frame_number) =>
+            {
+                super::handoff::credit_header(
+                    state,
+                    frame_number,
+                    &session,
+                    executed_tip.as_ref().map(|tip| tip.frame),
+                    op.frame_number,
+                )?
+            }
+            _ => credit,
         };
         // The leader's difficulty is bound into the certified output but no
         // voter compares it with GLOBAL's: from the anchored issuance epoch
