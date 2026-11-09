@@ -933,3 +933,353 @@ fn what_execution_refuses_before_its_proof_is_neither_verified_ahead_nor_awaited
         .unverified_confidential_operations(&owned)
         .is_empty());
 }
+
+/// [`transfer`] creating a coin whose owner is not a canonical identity.
+fn noncanonical_transfer(root: u8, image: u8, seed: u8) -> Vec<u8> {
+    use quil_lattice_ct::confidential::transfer::{Transfer, TransferStatement};
+    Transfer {
+        statement: TransferStatement {
+            network: NETWORK,
+            application: APPLICATION,
+            depth: 1,
+            root: Node::from_bytes(&[root; NODE_BYTES]).unwrap(),
+            images: vec![[image; IDENTITY_BYTES]],
+            outputs: vec![Output {
+                owner: [0xff; IDENTITY_BYTES],
+                ..output(seed)
+            }],
+            fee: 2,
+        },
+        proof: proof(),
+    }
+    .encode()
+    .unwrap()
+}
+
+/// A transfer creating a coin whose owner is not a canonical identity is
+/// refused by execution before its proof once canonical owners are required
+/// (`dispatch_for_commit`). On the base it passes arrival and is verified
+/// ahead, as it is by every member and archive, and only then refused, for
+/// free. The gate's frame is set for this thread only, and the latest GLOBAL
+/// frame this process saw only grows: no other test can undo either.
+#[test]
+fn a_noncanonical_owner_execution_refuses_before_its_proof_is_not_verified_ahead() {
+    global_commit::set_canonical_owner_frame_for_thread(Some(0));
+    quil_types::consensus::note_frame_time_head(1_000);
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runs) = counting_worker(directory.path());
+    let manager = token_manager_with(worker);
+    let global = global_view();
+    publish_root(&global, 3);
+    let pairs = |bytes: Vec<u8>| vec![(APPLICATION.to_vec(), bundle(bytes))];
+    let honest = transfer(3, 0x51, 1);
+    assert!(manager
+        .arrival_operations(&global, &APPLICATION, &bundle(honest.clone()))
+        .is_ok_and(|sizes| !sizes.is_empty()));
+    manager.preverify_bundles(&pairs(honest));
+    assert_eq!(worker_runs(&runs), 1, "the counting worker never ran");
+    let forged = noncanonical_transfer(3, 0x52, 2);
+    let tp = crate::token_engine::TYPE_LATTICE_TRANSACTION;
+    assert!(
+        spend_entries::check_owners(&NETWORK, &APPLICATION, tp, &forged).is_err(),
+        "execution refuses its owner before its proof"
+    );
+    let arrival = manager.arrival_operations(&global, &APPLICATION, &bundle(forged.clone()));
+    manager.preverify_bundles(&pairs(forged));
+    let verified = worker_runs(&runs) - 1;
+    global_commit::set_canonical_owner_frame_for_thread(None);
+    assert!(
+        arrival.is_err() && verified == 0,
+        "READ-AHEAD GAP: a transfer creating a coin whose owner is not a canonical identity \
+         passed arrival ({arrival:?}) and was verified ahead ({verified} runs), though \
+         execution refuses it before its proof"
+    );
+}
+
+/// Near the canonical owner frame G, the read-ahead refuses an owner that
+/// is not a canonical identity only where execution refuses it before its
+/// proof at every frame that can still carry it: from GLOBAL frame G + 1 in
+/// the global venue (anchored at G), from an app-shard frame anchored at G,
+/// never in one without an anchor, and for a frame not known yet only once
+/// the latest GLOBAL frame seen is far enough past G that no such frame is
+/// anchored before G. A frame's own pre-verification judges it at that
+/// frame's anchor, whatever GLOBAL frame this node saw since.
+#[test]
+fn the_owner_read_ahead_refuses_only_where_every_executing_frame_does() {
+    use global_commit::Standing;
+    const G: u64 = 1_000;
+    let lag = LATER_ANCHOR_LAG;
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runs) = counting_worker(directory.path());
+    let manager = token_manager_with(worker.clone());
+    let store = HypergraphState::new(manager.crdt());
+    let clock = crate::testing::NoopExecutionCrypto::new().clock_store;
+    let tp = crate::token_engine::TYPE_LATTICE_TRANSACTION;
+    let forged = noncanonical_transfer(3, 0x75, 0x20);
+    global_commit::set_canonical_owner_frame_for_thread(Some(G));
+    // Whether execution refuses it for its owner, before its proof, in a
+    // frame anchored at `anchor`.
+    let refuses = |anchor: Option<u64>| {
+        policy()
+            .dispatch_for_commit(
+                &store,
+                quil_types::execution::FrameExecutionContext {
+                    frame_number: 1,
+                    finalized_global_frame: anchor,
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                    venue: None,
+                },
+                clock.as_ref(),
+                &APPLICATION,
+                &forged,
+                tp,
+                Some(&worker),
+                None,
+            )
+            .is_err_and(|error| error.to_string().contains("not a canonical identity"))
+    };
+    let owner = Some(Standing::Lasting("an owner is not a canonical identity"));
+    let read_ahead = ExecutionEngineManager::execution_standing;
+    let ahead = |frame: ExecutingFrame, head: u64| {
+        let anchor = frame.anchor_floor(head);
+        read_ahead(&store, &NETWORK, &APPLICATION, tp, &forged, anchor) == owner
+    };
+    let (global, app) = (ExecutingFrame::Global, ExecutingFrame::App);
+    let later = ExecutingFrame::Later;
+    // (executing frame, latest GLOBAL frame seen, the anchors a frame
+    // executing it can have, whether execution refuses it at all of them)
+    let rows: [(ExecutingFrame, u64, &[Option<u64>], bool); 9] = [
+        (global(G), G, &[Some(G - 1)], false),
+        (global(G + 1), G, &[Some(G)], true),
+        (app(Some(G - 1)), G + lag, &[Some(G - 1)], false),
+        (app(Some(G)), G, &[Some(G)], true),
+        (app(None), G + lag, &[None], false),
+        (later, 0, &[Some(0)], false),
+        (later, G, &[Some(G - lag), Some(G)], false),
+        (later, G + lag - 1, &[Some(G - 1), Some(G + lag - 1)], false),
+        (later, G + lag, &[Some(G), Some(G + lag)], true),
+    ];
+    for (frame, head, anchors, refused) in rows {
+        assert_eq!(
+            anchors.iter().all(|anchor| refuses(*anchor)),
+            refused,
+            "{frame:?} seen at {head}: execution"
+        );
+        assert_eq!(
+            ahead(frame, head),
+            refused,
+            "READ-AHEAD: {frame:?} seen at {head}: the read-ahead and execution differ"
+        );
+    }
+    // Through the pre-verifications: a frame's own at its anchor, however
+    // far past G this process saw GLOBAL; the global venue's at its frame;
+    // one for a frame not known yet at the latest GLOBAL frame seen.
+    quil_types::consensus::note_frame_time_head(G + lag);
+    let pairs = |bytes: Vec<u8>| vec![(APPLICATION.to_vec(), bundle(bytes))];
+    let before = worker_runs(&runs);
+    manager.preverify_app_frame_bundles(Some(G - 1), &pairs(noncanonical_transfer(3, 0x61, 0x21)));
+    let admitted = worker_runs(&runs) - before;
+    manager.preverify_app_frame_bundles(Some(G), &pairs(noncanonical_transfer(3, 0x64, 0x22)));
+    manager.preverify_global_bundles(G + 1, &pairs(noncanonical_transfer(3, 0x66, 0x23)));
+    manager.preverify_bundles(&pairs(noncanonical_transfer(3, 0x71, 0x24)));
+    let refused = worker_runs(&runs) - before - admitted;
+    global_commit::set_canonical_owner_frame_for_thread(None);
+    assert_eq!(
+        (admitted, refused),
+        (1, 0),
+        "READ-AHEAD: a frame anchored before G must verify ahead what it admits, and none \
+         of the others what they refuse"
+    );
+}
+
+/// What execution refuses before its proof for an owner that is not a
+/// canonical identity, the read-ahead refuses too, and only that, as each
+/// venue executes it: every type naming owners through
+/// `dispatch_for_commit` in an app-shard frame anchored before, at and past
+/// the gate's frame and without an anchor, and the QUIL reward mint through
+/// `dispatch_global_mint` in the GLOBAL frame after each of those anchors
+/// (anchored at N - 1); each owner slot made non-canonical in turn, and
+/// none. Execution's own decision is the reference, so a check it gains with
+/// another predicate or anchor shows here.
+#[test]
+fn every_owner_execution_refuses_before_its_proof_is_read_ahead() {
+    use crate::token_intrinsic::spend_entries::owner_fixtures::{self, cases, encode};
+    use global_commit::Standing;
+    const G: u64 = 1_000;
+    let network = owner_fixtures::NETWORK;
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, _) = counting_worker(directory.path());
+    let policy = policy();
+    let store = HypergraphState::new(global_view());
+    let clock = crate::testing::NoopExecutionCrypto::new().clock_store;
+    let owner = Some(Standing::Lasting("an owner is not a canonical identity"));
+    let read_ahead = ExecutionEngineManager::execution_standing;
+    global_commit::set_canonical_owner_frame_for_thread(Some(G));
+    let mut gaps = Vec::new();
+    // Per case: whether execution refused it for an owner anywhere, and
+    // admitted it past that check anywhere.
+    let mut decided = vec![(false, false); cases().len()];
+    for (case, (tp, application, coins)) in cases().iter().enumerate() {
+        let reward_mint =
+            *tp == crate::token_engine::TYPE_LATTICE_MINT && *application == domains::QUIL_TOKEN;
+        for slot in 0..=coins.len() {
+            let mut owners = vec![[3; IDENTITY_BYTES]; coins.len()];
+            if let Some(named) = owners.get_mut(slot) {
+                *named = [0xff; IDENTITY_BYTES];
+            }
+            let bytes = encode(case, &owners);
+            for anchor in [None, Some(G - 1), Some(G), Some(G + 1)] {
+                // The frame executing it with that anchor, and its outcome.
+                let (frame, executed) = if reward_mint {
+                    let n = anchor.map_or(0, |anchor| anchor + 1);
+                    let executed = policy.dispatch_global_mint(
+                        &store,
+                        n,
+                        clock.as_ref(),
+                        application,
+                        &bytes,
+                        Some(&worker),
+                    );
+                    (ExecutingFrame::Global(n), executed)
+                } else {
+                    let context = quil_types::execution::FrameExecutionContext {
+                        frame_number: 1,
+                        finalized_global_frame: anchor,
+                        shard: quil_types::execution::ShardPath::WHOLE,
+                        venue: None,
+                    };
+                    let executed = policy.dispatch_for_commit(
+                        &store,
+                        context,
+                        clock.as_ref(),
+                        application,
+                        &bytes,
+                        *tp,
+                        Some(&worker),
+                        None,
+                    );
+                    (ExecutingFrame::App(anchor), executed)
+                };
+                let refuses = executed
+                    .is_err_and(|error| error.to_string().contains("not a canonical identity"));
+                if refuses {
+                    decided[case].0 = true;
+                } else if slot < coins.len() {
+                    decided[case].1 = true;
+                }
+                let standing = read_ahead(
+                    &store,
+                    &network,
+                    application,
+                    *tp,
+                    &bytes,
+                    frame.anchor_floor(0),
+                );
+                if (standing == owner) != refuses {
+                    gaps.push((case, slot, frame, refuses));
+                }
+            }
+        }
+    }
+    global_commit::set_canonical_owner_frame_for_thread(None);
+    assert!(
+        gaps.is_empty(),
+        "READ-AHEAD GAP: (case, slot, executing frame, execution refuses) where the \
+         read-ahead decides otherwise: {gaps:?}"
+    );
+    assert!(
+        decided
+            .iter()
+            .all(|(refused, admitted)| *refused && *admitted),
+        "a fixture never reaches the owner check, or its gate never opens or never stays \
+         shut: {decided:?}"
+    );
+}
+
+/// What execution refuses for a spend's key images before its proof (none,
+/// more than a spend may carry, one twice: `commit_verify::funding_shape`)
+/// no transfer, pending create or settlement that decodes carries: decoding
+/// refuses it, so arrival refuses such bytes as malformed and no
+/// pre-verification sends them to the worker. The read-ahead needs no copy
+/// of that check.
+#[test]
+fn a_spend_naming_a_key_image_twice_never_reaches_proof_work() {
+    use quil_lattice_ct::confidential::transfer::{Transfer, TransferStatement};
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runs) = counting_worker(directory.path());
+    let manager = token_manager_with(worker.clone());
+    let global = global_view();
+    publish_root(&global, 3);
+    let tp = crate::token_engine::TYPE_LATTICE_TRANSACTION;
+    let images = [[0x71; IDENTITY_BYTES], [0x73; IDENTITY_BYTES]];
+    let distinct = Transfer {
+        statement: TransferStatement {
+            network: NETWORK,
+            application: APPLICATION,
+            depth: 1,
+            root: Node::from_bytes(&[3; NODE_BYTES]).unwrap(),
+            images: images.to_vec(),
+            outputs: vec![output(9)],
+            fee: 2,
+        },
+        proof: proof(),
+    }
+    .encode()
+    .unwrap();
+    // The same bytes naming the first image twice.
+    let first = distinct
+        .windows(IDENTITY_BYTES)
+        .position(|window| window == images[0].as_slice())
+        .unwrap();
+    let second = first + IDENTITY_BYTES;
+    assert_eq!(
+        &distinct[second..second + IDENTITY_BYTES],
+        images[1].as_slice()
+    );
+    let mut twice = distinct.clone();
+    twice.copy_within(first..second, second);
+    assert!(
+        Transfer::decode(&twice, &NETWORK, &APPLICATION).is_err(),
+        "READ-AHEAD GAP: a transfer naming a key image twice decodes; execution refuses it \
+         before its proof, the read-ahead does not"
+    );
+    let state = HypergraphState::new(global.clone());
+    let clock = crate::testing::NoopExecutionCrypto::new().clock_store;
+    let executed = policy().dispatch_for_commit(
+        &state,
+        quil_types::execution::FrameExecutionContext {
+            frame_number: 102,
+            finalized_global_frame: Some(101),
+            shard: quil_types::execution::ShardPath::WHOLE,
+            venue: None,
+        },
+        clock.as_ref(),
+        &APPLICATION,
+        &twice,
+        tp,
+        Some(&worker),
+        None,
+    );
+    assert!(
+        executed.is_err() && worker_runs(&runs) == 0,
+        "execution verified its proof: {executed:?}"
+    );
+    let pairs = |bytes: Vec<u8>| vec![(APPLICATION.to_vec(), bundle(bytes))];
+    assert_eq!(
+        manager.arrival_operations(&global, &APPLICATION, &bundle(twice.clone())),
+        Err(ArrivalRefusal::Malformed),
+        "READ-AHEAD GAP: arrival took a transfer naming a key image twice"
+    );
+    manager.preverify_bundles(&pairs(twice));
+    assert_eq!(
+        worker_runs(&runs),
+        0,
+        "READ-AHEAD GAP: a transfer naming a key image twice was verified ahead"
+    );
+    // The same spend of two images reaches the worker: it counts.
+    assert!(manager
+        .arrival_operations(&global, &APPLICATION, &bundle(distinct.clone()))
+        .is_ok_and(|sizes| !sizes.is_empty()));
+    manager.preverify_bundles(&pairs(distinct));
+    assert_eq!(worker_runs(&runs), 1, "the counting worker never ran");
+}

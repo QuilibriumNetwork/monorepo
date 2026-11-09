@@ -2059,6 +2059,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 &canonical_requests,
                 &self.filter,
                 frame_number,
+                (anchor_gfn != 0).then_some(anchor_gfn),
             );
         }
         // Deliveries of globally committed outputs this shard owns, each its
@@ -4243,15 +4244,20 @@ impl AppConsensusEngine {
     /// (inline, as before), or the background verification cannot finish
     /// them (not queued, released after failing in the worker, or ended
     /// without a verdict [`MAX_DEFERRAL_RESTARTS`] times), in which case
-    /// materialization verifies inline as before.
+    /// materialization verifies inline as before. The frame's operations
+    /// are judged as it executes them, at its GLOBAL `anchor`: one anchored
+    /// before a gate verifies what the gate refuses, however far past the
+    /// gate this node saw GLOBAL since.
     fn defer_for_proof_verification(
         &self,
         exec: &Arc<quil_execution::ExecutionEngineManager>,
         requests: &[quil_types::proto::global::MessageBundle],
         frame_number: u64,
+        anchor: Option<u64>,
     ) -> Option<QuilError> {
         let application = &self.app_address[..self.app_address.len().min(32)];
         let queue = crate::admission_verify::global();
+        let executing = quil_execution::manager::ExecutingFrame::App(anchor);
         let budget_secs = exec.token_verification_budget();
         // Operations not known to verify within the budget; the others verify
         // when the frame executes, as before.
@@ -4266,8 +4272,8 @@ impl AppConsensusEngine {
             let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
                 continue;
             };
-            let sizes =
-                exec.unverified_confidential_operations(&[(application.to_vec(), canon.clone())]);
+            let pair = [(application.to_vec(), canon.clone())];
+            let sizes = exec.unverified_confidential_operations_for(executing, &pair);
             if !verifies_in_background(&sizes, budget_secs) {
                 continue;
             }
@@ -4275,9 +4281,13 @@ impl AppConsensusEngine {
             let digest = crate::admission_verify::digest(&canon);
             waiting.push(digest);
             restarted |= !(queue.pending(&digest) || proof_prewarm_running(&canon));
-            verifying &=
-                crate::admission_verify::offer_submission(queue, exec, application, &canon, true)
-                    || proof_prewarm_running(&canon);
+            verifying &= crate::admission_verify::offer_frame_submission(
+                queue,
+                exec,
+                application,
+                &canon,
+                anchor,
+            ) || proof_prewarm_running(&canon);
             queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
         // This frame finalized and asked for its own submissions above
@@ -4671,7 +4681,10 @@ impl AppConsensusEngine {
         if let Some(held) = held_for_proofs(&self.filter, frame_number) {
             return Err(held);
         }
-        if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
+        let anchor = (global_frame_number != 0).then_some(global_frame_number);
+        if let Some(pending) =
+            self.defer_for_proof_verification(&exec, &requests, frame_number, anchor)
+        {
             return Err(pending);
         }
         // Every GLOBAL frame the reward citations name is held before any
@@ -6290,7 +6303,10 @@ impl AppConsensusEngine {
                     })
                     .map(|canon| (application.clone(), canon))
                     .collect();
-                exec.unverified_confidential_operations(&bundles).len()
+                let anchor = crate::archive_preverify::frame_anchor(frame);
+                let executing = quil_execution::manager::ExecutingFrame::App(anchor);
+                exec.unverified_confidential_operations_for(executing, &bundles)
+                    .len()
             }
             _ => 0,
         };
@@ -13808,6 +13824,7 @@ pub(crate) fn build_requests_root_check(
                 &canonical,
                 &filter_for_verify,
                 header.frame_number,
+                (header.global_frame_number != 0).then_some(header.global_frame_number),
             );
             Ok(())
         },
@@ -13867,15 +13884,18 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// behind the submissions finalized frames wait on, bounded, and dropped
 /// once its time passed or `shard` materialized `frame`, since the proposal
 /// may never finalize (a leader could otherwise queue unbounded work ahead
-/// of every honest frame).
+/// of every honest frame). The proposal's operations are judged as it
+/// executes them once finalized, at its GLOBAL `anchor`.
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
     canonical: &[Vec<u8>],
     shard: &[u8],
     frame: u64,
+    anchor: Option<u64>,
 ) {
     let addr = app_address[..app_address.len().min(32)].to_vec();
+    let executing = quil_execution::manager::ExecutingFrame::App(anchor);
     let bundles: Vec<Vec<u8>> = canonical
         .iter()
         .filter(|bundle| {
@@ -13890,7 +13910,10 @@ pub(crate) fn prewarm_proof_verdicts(
     let budget = exec.token_verification_budget();
     let (long, bundles): (Vec<Vec<u8>>, Vec<Vec<u8>>) = bundles.into_iter().partition(|bundle| {
         verifies_in_background(
-            &exec.unverified_confidential_operations(&[(addr.clone(), bundle.clone())]),
+            &exec.unverified_confidential_operations_for(
+                executing,
+                &[(addr.clone(), bundle.clone())],
+            ),
             budget,
         )
     });
@@ -13902,6 +13925,7 @@ pub(crate) fn prewarm_proof_verdicts(
             bundle,
             shard,
             frame,
+            anchor,
         );
     }
     if bundles.is_empty() {
@@ -13930,7 +13954,13 @@ pub(crate) fn prewarm_proof_verdicts(
                 .into_iter()
                 .map(|bundle| (addr.clone(), bundle))
                 .collect();
-            exec.preverify_bundles(&pairs);
+            exec.preverify_bundles_paced(
+                &pairs,
+                &quil_execution::manager::PreverifyPacing {
+                    executing,
+                    ..Default::default()
+                },
+            );
             release_proof_prewarm(&claimed);
             PROOF_PREWARM_THREADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
@@ -15831,8 +15861,12 @@ pub(crate) fn materialize_app_shard_requests(
         frame_number,
     };
 
+    // The GLOBAL frame this frame is anchored at; none without an anchor.
+    let anchor = (global_frame_number != 0).then_some(global_frame_number);
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
+    // What execution refuses before the proof at the frame's anchor is not
+    // verified.
     let canonical: Vec<(Vec<u8>, Vec<u8>)> = requests
         .iter()
         .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
@@ -15842,7 +15876,7 @@ pub(crate) fn materialize_app_shard_requests(
     let preverify_start = std::time::Instant::now();
     {
         let _step = StepTimer::start(&mut steps.preverify, probe::Section::AppFramePreverify);
-        execution_manager.preverify_bundles(&canonical);
+        execution_manager.preverify_app_frame_bundles(anchor, &canonical);
     }
     if preverify_start.elapsed() > std::time::Duration::from_secs(1) {
         info!(
@@ -15971,7 +16005,7 @@ pub(crate) fn materialize_app_shard_requests(
         let outcome = execution_manager.process_message_with_context(
             quil_types::execution::FrameExecutionContext {
                 frame_number,
-                finalized_global_frame: (global_frame_number != 0).then_some(global_frame_number),
+                finalized_global_frame: anchor,
                 shard,
                 // Workers and archives replay app-shard frames alike: always
                 // in the application venue, never committing inline.

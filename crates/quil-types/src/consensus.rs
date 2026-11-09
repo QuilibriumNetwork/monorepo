@@ -303,7 +303,13 @@ pub fn note_frame_time_head(frame: u64) {
 /// with it takes the interval at its start throughout, even when a schedule
 /// changes pace inside it.
 pub fn ideal_frame_time_ms() -> u64 {
-    ideal_frame_time_ms_at(FRAME_TIME_HEAD.load(std::sync::atomic::Ordering::Relaxed))
+    ideal_frame_time_ms_at(frame_time_head())
+}
+
+/// The latest GLOBAL frame this process noted ([`note_frame_time_head`]); 0
+/// before it noted one.
+pub fn frame_time_head() -> u64 {
+    FRAME_TIME_HEAD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Epoch length for testnet/devnet (`network != 0`): a short epoch so the

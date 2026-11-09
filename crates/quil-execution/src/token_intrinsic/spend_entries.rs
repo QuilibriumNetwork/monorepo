@@ -241,6 +241,20 @@ pub fn check_owners(
     refuse_noncanonical(&operation_owners(network, application, tp, bytes)?)
 }
 
+/// Whether operation `bytes` (type `tp`) names an owner that is not a
+/// canonical identity, the refusal of [`check_owners`], read from its bytes
+/// alone; false when they do not decode (execution refuses those for their
+/// encoding, not their owners) and for a type that names no owner.
+pub fn names_noncanonical_owner(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    tp: u32,
+    bytes: &[u8],
+) -> bool {
+    operation_owners(network, application, tp, bytes)
+        .is_ok_and(|owners| owners.iter().any(is_burned_owner))
+}
+
 /// Refuse an operation creating a coin whose owner is not a canonical
 /// identity: exactly the coins a globally executed application's fold took
 /// and failed on, so that venue keeps refusing them (at every frame, with no
@@ -443,6 +457,186 @@ pub fn commit_needs(application: &[u8; 32], tp: u32, bytes: &[u8]) -> Option<Com
     Some(needs)
 }
 
+/// Operations naming owners, one per type that creates or authorizes coins,
+/// with the owners a test sets (tests).
+#[cfg(test)]
+pub(crate) mod owner_fixtures {
+    use super::*;
+    use quil_lattice_ct::confidential::{
+        custom_mint::CustomMintStatement,
+        memo::EscrowRecoveryMemo,
+        mint::{MintStatement, RewardClaim, FALCON_PUBLIC_BYTES, FALCON_SIGNATURE_BYTES},
+        pending_claim::EscrowPolicy,
+        pending_create::PendingCreateStatement,
+        relation::membership::{Node, NODE_BYTES},
+        settlement::SettlementStatement,
+        shield::{Shield, ShieldStatement},
+        transfer::MEMO_BYTES,
+        AmountOpening, CommitmentKey,
+    };
+
+    /// The network every fixture names.
+    pub(crate) const NETWORK: [u8; 32] = [1; 32];
+    /// The custom token the custom mint fixture issues.
+    pub(crate) const CUSTOM: [u8; 32] = [8; 32];
+
+    /// Each fixture's (type, application, whether each owner slot is a
+    /// coin's): a pending create's escrowed output and refund recovery are
+    /// not coins, and a QUIL reward mint only authorizes its outputs.
+    pub(crate) fn cases() -> [(u32, [u8; 32], &'static [bool]); 8] {
+        let quil = domains::QUIL_TOKEN;
+        [
+            (TYPE_LATTICE_TRANSACTION, quil, &[true, true]),
+            (TYPE_LATTICE_PENDING, quil, &[false, true, false]),
+            (TYPE_LATTICE_PENDING_CLAIM, quil, &[true]),
+            (TYPE_LATTICE_SHIELD, quil, &[true]),
+            (TYPE_LATTICE_MINT_CLAIM, quil, &[true]),
+            (TYPE_LATTICE_MINT, CUSTOM, &[true]),
+            (TYPE_LATTICE_SETTLEMENT, quil, &[true]),
+            (TYPE_LATTICE_MINT, quil, &[false]),
+        ]
+    }
+
+    /// A coin of `application` owned by `owner`.
+    fn coin(application: &[u8; 32], owner: [u8; IDENTITY_BYTES]) -> Output {
+        let context = parameter_context(&NETWORK, application);
+        Output {
+            owner,
+            commitment: CommitmentKey::derive(&context)
+                .commit(6, &AmountOpening::from_seed(&context, &[6; 32])),
+            memo: [6; MEMO_BYTES],
+        }
+    }
+
+    /// Fixture `case` of [`cases`], its owner slots holding `o`.
+    pub(crate) fn encode(case: usize, o: &[[u8; IDENTITY_BYTES]]) -> Vec<u8> {
+        let quil = domains::QUIL_TOKEN;
+        let mut proof = vec![0; 40];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let funding = |outputs: Vec<Output>, fee: u128| TransferStatement {
+            network: NETWORK,
+            application: quil,
+            depth: 1,
+            root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+            images: vec![[5; IDENTITY_BYTES]],
+            outputs,
+            fee,
+        };
+        let policy = EscrowPolicy {
+            recipient: [7; FALCON_PUBLIC_BYTES],
+            refund: [8; FALCON_PUBLIC_BYTES],
+            refund_after_global_frame: 100,
+        };
+        match case {
+            0 => Transfer {
+                statement: funding(vec![coin(&quil, o[0]), coin(&quil, o[1])], 2),
+                proof: proof.clone(),
+            }
+            .encode(),
+            1 => PendingCreate {
+                statement: PendingCreateStatement {
+                    funding: funding(vec![coin(&quil, o[0]), coin(&quil, o[1])], 2),
+                    policy: policy.clone(),
+                    refund_recovery: EscrowRecoveryMemo {
+                        owner: o[2],
+                        ciphertext: [10; MEMO_BYTES],
+                    },
+                },
+                proof: proof.clone(),
+            }
+            .encode(),
+            2 => PendingClaim {
+                statement: PendingClaimStatement {
+                    network: NETWORK,
+                    application: quil,
+                    escrow_address: [15; 32],
+                    source: coin(&quil, o[0]).commitment,
+                    policy: policy.clone(),
+                    branch: ClaimBranch::Recipient,
+                    fee: 2,
+                    outputs: vec![coin(&quil, o[0])],
+                },
+                signature: [0; FALCON_SIGNATURE_BYTES],
+                proof: proof.clone(),
+            }
+            .encode(),
+            3 => Shield {
+                statement: ShieldStatement {
+                    network: NETWORK,
+                    application: quil,
+                    transparent_address: [6; 32],
+                    owner_public_key: [7; 57],
+                    amount: 12,
+                    fee: 2,
+                    outputs: vec![coin(&quil, o[0])],
+                },
+                signature: [0; 114],
+                proof: proof.clone(),
+            }
+            .encode(),
+            4 => MintClaim {
+                network: NETWORK,
+                application: quil,
+                cited_global_frame: 1,
+                global_root: [3; 32],
+                receipt: [9; 32],
+                fee: 0,
+                outputs: vec![coin(&quil, o[0])],
+                forest_proof: vec![4; 8],
+            }
+            .encode(),
+            5 => CustomMint {
+                statement: CustomMintStatement {
+                    network: NETWORK,
+                    application: CUSTOM,
+                    authority_key_type: 0,
+                    authority_public_key: Vec::new(),
+                    entitlement_proof: Vec::new(),
+                    nonce: [9; 32],
+                    amount: 10,
+                    outputs: vec![coin(&CUSTOM, o[0])],
+                },
+                signature: Vec::new(),
+                proof: proof.clone(),
+            }
+            .encode(),
+            6 => Settlement {
+                statement: SettlementStatement {
+                    funding: funding(vec![coin(&quil, o[0])], 7 + 1_000),
+                    fee: 7,
+                    settlement: 1_000,
+                    destination: [137; 32],
+                    context: [138; 32],
+                    payment: None,
+                    claimant: None,
+                },
+                proof: proof.clone(),
+            }
+            .encode(),
+            _ => Mint {
+                statement: MintStatement {
+                    network: NETWORK,
+                    application: quil,
+                    cited_frame: 1,
+                    reward_root: [8; 32],
+                    fee: 2,
+                    claims: vec![RewardClaim {
+                        owner: [8; 32],
+                        value: 18,
+                        public_key: [0; FALCON_PUBLIC_BYTES],
+                        forest_proof: vec![1],
+                    }],
+                    outputs: vec![coin(&quil, o[0])],
+                },
+                signatures: vec![[0; FALCON_SIGNATURE_BYTES]],
+                proof: proof.clone(),
+            }
+            .encode(),
+        }
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,161 +733,10 @@ mod tests {
     /// non-canonical in turn.
     #[test]
     fn every_owner_an_operation_names_reaches_the_canonical_check() {
-        use quil_lattice_ct::confidential::{
-            custom_mint::CustomMintStatement,
-            memo::EscrowRecoveryMemo,
-            mint::{MintStatement, RewardClaim, FALCON_PUBLIC_BYTES, FALCON_SIGNATURE_BYTES},
-            pending_claim::{EscrowPolicy, PendingClaimStatement},
-            pending_create::PendingCreateStatement,
-            settlement::SettlementStatement,
-            shield::{Shield, ShieldStatement},
-        };
-        let network = [1u8; 32];
+        use super::owner_fixtures::{cases, encode, NETWORK};
+        let network = NETWORK;
         let quil = domains::QUIL_TOKEN;
-        let custom = [8u8; 32];
-        let mut proof = vec![0; 40];
-        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        let coin = |application: &[u8; 32], owner: [u8; IDENTITY_BYTES]| Output {
-            owner,
-            ..output(&parameter_context(&network, application), 6)
-        };
-        let funding = |outputs: Vec<Output>, fee: u128| TransferStatement {
-            network,
-            application: quil,
-            depth: 1,
-            root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
-            images: vec![[5; IDENTITY_BYTES]],
-            outputs,
-            fee,
-        };
-        let policy = EscrowPolicy {
-            recipient: [7; FALCON_PUBLIC_BYTES],
-            refund: [8; FALCON_PUBLIC_BYTES],
-            refund_after_global_frame: 100,
-        };
-        let encode = |case: usize, o: &[[u8; IDENTITY_BYTES]]| -> Vec<u8> {
-            match case {
-                0 => Transfer {
-                    statement: funding(vec![coin(&quil, o[0]), coin(&quil, o[1])], 2),
-                    proof: proof.clone(),
-                }
-                .encode(),
-                1 => PendingCreate {
-                    statement: PendingCreateStatement {
-                        funding: funding(vec![coin(&quil, o[0]), coin(&quil, o[1])], 2),
-                        policy: policy.clone(),
-                        refund_recovery: EscrowRecoveryMemo {
-                            owner: o[2],
-                            ciphertext: [10; MEMO_BYTES],
-                        },
-                    },
-                    proof: proof.clone(),
-                }
-                .encode(),
-                2 => PendingClaim {
-                    statement: PendingClaimStatement {
-                        network,
-                        application: quil,
-                        escrow_address: [15; 32],
-                        source: coin(&quil, o[0]).commitment,
-                        policy: policy.clone(),
-                        branch: ClaimBranch::Recipient,
-                        fee: 2,
-                        outputs: vec![coin(&quil, o[0])],
-                    },
-                    signature: [0; FALCON_SIGNATURE_BYTES],
-                    proof: proof.clone(),
-                }
-                .encode(),
-                3 => Shield {
-                    statement: ShieldStatement {
-                        network,
-                        application: quil,
-                        transparent_address: [6; 32],
-                        owner_public_key: [7; 57],
-                        amount: 12,
-                        fee: 2,
-                        outputs: vec![coin(&quil, o[0])],
-                    },
-                    signature: [0; 114],
-                    proof: proof.clone(),
-                }
-                .encode(),
-                4 => MintClaim {
-                    network,
-                    application: quil,
-                    cited_global_frame: 1,
-                    global_root: [3; 32],
-                    receipt: [9; 32],
-                    fee: 0,
-                    outputs: vec![coin(&quil, o[0])],
-                    forest_proof: vec![4; 8],
-                }
-                .encode(),
-                5 => CustomMint {
-                    statement: CustomMintStatement {
-                        network,
-                        application: custom,
-                        authority_key_type: 0,
-                        authority_public_key: Vec::new(),
-                        entitlement_proof: Vec::new(),
-                        nonce: [9; 32],
-                        amount: 10,
-                        outputs: vec![coin(&custom, o[0])],
-                    },
-                    signature: Vec::new(),
-                    proof: proof.clone(),
-                }
-                .encode(),
-                6 => Settlement {
-                    statement: SettlementStatement {
-                        funding: funding(vec![coin(&quil, o[0])], 7 + 1_000),
-                        fee: 7,
-                        settlement: 1_000,
-                        destination: [137; 32],
-                        context: [138; 32],
-                        payment: None,
-                        claimant: None,
-                    },
-                    proof: proof.clone(),
-                }
-                .encode(),
-                _ => Mint {
-                    statement: MintStatement {
-                        network,
-                        application: quil,
-                        cited_frame: 1,
-                        reward_root: [8; 32],
-                        fee: 2,
-                        claims: vec![RewardClaim {
-                            owner: [8; 32],
-                            value: 18,
-                            public_key: [0; FALCON_PUBLIC_BYTES],
-                            forest_proof: vec![1],
-                        }],
-                        outputs: vec![coin(&quil, o[0])],
-                    },
-                    signatures: vec![[0; FALCON_SIGNATURE_BYTES]],
-                    proof: proof.clone(),
-                }
-                .encode(),
-            }
-            .unwrap()
-        };
-        // (type, application, whether each owner slot is a coin's): a pending
-        // create's escrowed output and refund recovery are not coins, and a
-        // QUIL reward mint only authorizes its outputs.
-        let cases: [(u32, [u8; 32], &[bool]); 8] = [
-            (TYPE_LATTICE_TRANSACTION, quil, &[true, true]),
-            (TYPE_LATTICE_PENDING, quil, &[false, true, false]),
-            (TYPE_LATTICE_PENDING_CLAIM, quil, &[true]),
-            (TYPE_LATTICE_SHIELD, quil, &[true]),
-            (TYPE_LATTICE_MINT_CLAIM, quil, &[true]),
-            (TYPE_LATTICE_MINT, custom, &[true]),
-            (TYPE_LATTICE_SETTLEMENT, quil, &[true]),
-            (TYPE_LATTICE_MINT, quil, &[false]),
-        ];
-        for (case, (tp, application, coins)) in cases.iter().enumerate() {
+        for (case, (tp, application, coins)) in cases().iter().enumerate() {
             let good = vec![[3; IDENTITY_BYTES]; coins.len()];
             let bytes = encode(case, &good);
             assert_eq!(
@@ -702,6 +745,8 @@ mod tests {
                 "case {case}"
             );
             check_owners(&network, application, *tp, &bytes).unwrap();
+            let named = |bytes: &[u8]| names_noncanonical_owner(&network, application, *tp, bytes);
+            assert!(!named(&bytes) && !named(&bytes[1..]), "case {case}");
             let relayed = is_relayed(*tp) || application != &quil;
             if relayed {
                 check_coin_owners(&network, application, *tp, &bytes).unwrap();
@@ -711,6 +756,11 @@ mod tests {
                 owners[slot] = [0xff; IDENTITY_BYTES];
                 let bytes = encode(case, &owners);
                 let refused = check_owners(&network, application, *tp, &bytes).unwrap_err();
+                assert!(
+                    names_noncanonical_owner(&network, application, *tp, &bytes),
+                    "READ-AHEAD GAP: case {case} slot {slot}: check_owners refuses an owner the \
+                     read-ahead misses"
+                );
                 assert!(
                     refused.to_string().contains("not a canonical identity"),
                     "case {case} slot {slot}: {refused}"
