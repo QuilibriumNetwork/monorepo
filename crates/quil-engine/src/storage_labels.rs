@@ -582,6 +582,13 @@ struct Candidate {
     /// Before the epoch of the last sweep ([`LabelStore::sweep`]): no seal
     /// needs them.
     stale: bool,
+    /// Needed for an epoch where persistent storage holds: a sector's
+    /// labels, kept until GLOBAL certifies it. Released, they are labelled
+    /// again, needing twice their size free again, while the labels of
+    /// seats before that epoch serve one seat's registrations each and that
+    /// epoch's sweep removes them: those go first (2026-11-08: a release
+    /// took sectors' labels first, as the latest needed).
+    sector: bool,
     bytes: u64,
 }
 
@@ -886,6 +893,9 @@ impl LabelStore {
     /// process or one before it, stay for this one to resume from
     /// ([`Admitted::resumes_from`]) as far as each matches its digest
     /// ([`verify_kept_with_params`]); whatever else an attempt left is removed first.
+    /// A sector's labels (an epoch where persistent storage holds) short of
+    /// that room take it first from the labels kept for seats before that
+    /// epoch ([`Self::make_sector_room`]).
     /// `None` when refused, leaving none of its files, logged once a leaf,
     /// epoch and stage: the leaf is then labelled where it is needed, as by
     /// a process that keeps no labels. `None` too while that count is being
@@ -973,6 +983,9 @@ impl LabelStore {
         let bytes = self
             .label_bytes(n)
             .saturating_sub(kept as u64 * layer_bytes(n));
+        if quil_types::consensus::persistent_storage_at(epoch) {
+            self.make_sector_room(epoch, leaf_id, &dir, n, bytes.saturating_mul(DISK_MARGIN));
+        }
         // Held until this store's record counts the leaf; taken first, so
         // this process's labels being written need not wait for it.
         let turn = self.labels_turn();
@@ -1348,9 +1361,11 @@ impl LabelStore {
     /// the floor ([`disk_floor`]): they are a cache, and the node's stores
     /// and logs beside them must not fail for them. Every count no
     /// labelling or seal of this process or another holds ([`hold_layers`])
-    /// may go, until free space is [`release_band`] above the floor: those
-    /// of epochs already swept first, then the latest needed, the smallest
-    /// first within an epoch. A seal opens its labels within the hour after
+    /// may go, until free space is [`release_band`] above the floor: the
+    /// labels of seats before persistent storage first, sectors' last
+    /// ([`Candidate::sector`]); within each, those of epochs already swept
+    /// first, then the latest needed, the smallest first within an epoch.
+    /// A seal opens its labels within the hour after
     /// its snapshot, too soon to label a large leaf again, while labels for
     /// a later epoch may be labelled ahead again before their snapshot; and
     /// small leaves are labelled again at their snapshot within the
@@ -1384,7 +1399,7 @@ impl LabelStore {
             return None;
         }
         let target = floor.saturating_add(release_band(floor));
-        let released = self.release(usage.free_bytes, target);
+        let released = self.release(usage.free_bytes, target, |_| true);
         let now = unix_now();
         let marked = self.shortage();
         let first = marked.is_none();
@@ -1461,14 +1476,69 @@ impl LabelStore {
         );
     }
 
-    /// Release the counts [`Self::keep_floor`] may take, in its order, until
-    /// `free` and what they held reach `target`.
-    fn release(&self, free: u64, target: u64) -> Released {
+    /// Make room for the labels of `member`'s sector `leaf_id` of `n` nodes
+    /// for `epoch`, where persistent storage holds, in its directory `own`:
+    /// when `bytes` do not fit above the floor, release the labels kept for
+    /// seats before persistent storage ([`Candidate::sector`]), in the order
+    /// [`Self::keep_floor`] takes them, until they fit or none is left, and
+    /// log what went. Those labels are a cache that the persistent storage
+    /// epoch's sweep removes, while a sector not certified by then leaves
+    /// its seat without storage reward; [`Self::keep_floor`] releases
+    /// nothing above the floor, so a node whose free space sits less than
+    /// twice a sector's labels above it, beside hundreds of GiB of seats'
+    /// labels, started no sector again (2026-11-08: 3.5 GiB above a floor of
+    /// 91.5 GiB). Nothing while another process releases labels.
+    fn make_sector_room(&self, epoch: u64, leaf_id: &[u8], own: &Path, n: u64, bytes: u64) {
+        let pending = *self.pending();
+        let Err(Shortfall {
+            needed,
+            free: Some(free),
+        }) = self.room(pending, bytes)
+        else {
+            return;
+        };
+        let Ok(dir) = File::open(&self.dir) else {
+            return;
+        };
+        if dir.try_lock().is_err() {
+            return;
+        }
+        let released = self.release(free, needed, |candidate| {
+            !candidate.sector && candidate.dir != own
+        });
+        drop(dir);
+        if released.counts == 0 {
+            return;
+        }
+        let free_after = self.usage().map_or(free, |usage| usage.free_bytes);
+        let epochs = released
+            .epochs
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(epoch, leaf = %hex::encode(leaf_id), nodes = n, needed_bytes = needed,
+            free_bytes = free, free_after_bytes = free_after, released_bytes = released.bytes,
+            released_counts = released.counts, in_use_counts = released.in_use,
+            epochs = %epochs, fits = free_after >= needed, scope = "local",
+            "storage labels kept for seats released for a sector: the sector's labels needed \
+             needed_bytes free on the labels' filesystem (twice their size, above the floor and \
+             the labels being written) and it had free_bytes; the released labels serve only \
+             registrations before the persistent storage epoch, whose sweep removes them, and \
+             their seats' snapshots label them again at need (about an hour per GiB on a core)");
+    }
+
+    /// Release the counts [`Self::keep_floor`] may take that `take` takes,
+    /// in its order, until `free` and what they held reach `target`.
+    fn release(&self, free: u64, target: u64, take: impl Fn(&Candidate) -> bool) -> Released {
         let mut released = Released::default();
         let mut free = free;
         for candidate in self.candidates() {
             if free >= target {
                 break;
+            }
+            if !take(&candidate) {
+                continue;
             }
             let lock = leaf_lock(&candidate.dir);
             let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1552,14 +1622,16 @@ impl LabelStore {
                         n,
                         epoch,
                         stale: epoch < swept,
+                        sector: quil_types::consensus::persistent_storage_at(epoch),
                         bytes,
                     });
                 }
             }
         }
         candidates.sort_by(|a, b| {
-            b.stale
-                .cmp(&a.stale)
+            a.sector
+                .cmp(&b.sector)
+                .then(b.stale.cmp(&a.stale))
                 .then(b.epoch.cmp(&a.epoch))
                 .then(a.bytes.cmp(&b.bytes))
                 .then(a.dir.cmp(&b.dir))
@@ -5094,7 +5166,7 @@ mod tests {
         let dir = store.leaf_dir(epoch, member, leaf);
         fs::create_dir_all(&dir).unwrap();
         let [layers, columns, ready] = paths(&dir, n);
-        let depth = SdrParams::default().layers as u64;
+        let depth = store.params().layers as u64;
         File::create(layers)
             .unwrap()
             .set_len(n * depth * NODE_BYTES as u64)
@@ -5188,6 +5260,133 @@ mod tests {
                 .admit(11, &member, b"next", n, Stage::Ahead)
                 .expect("labelling ahead resumes"),
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A release takes the labels kept for seats before persistent storage
+    /// first and sectors' labels last: released, a sector's labels are
+    /// labelled again, needing twice their size free again, while the
+    /// seats' go at the persistent storage epoch's sweep anyway. Taken as
+    /// the latest needed, sectors' labels went first, and a node near the
+    /// floor labelled them over and over (2026-11-08).
+    #[test]
+    fn a_release_takes_seats_labels_before_a_sectors() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(20));
+        let dir = temp_dir("seats-first");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let three = store.for_profile(quil_types::consensus::StorageSealProfile::Three);
+        let floor = disk_floor(TOTAL);
+        let member = [9u8; 32];
+        // 1.5 GiB each: the two cover the release band (2.5 GiB).
+        let seats = [b"seat-a", b"seat-b"]
+            .map(|leaf| kept_sparse(&store, 10, &member, leaf, 4 * EIGHTH_NODES));
+        // A sector's labels, 1 GiB, needed latest.
+        let sector = kept_sparse(&three, 20, &member, b"sector", 8 * EIGHTH_NODES);
+        assert_eq!(bytes_under(&sector), GIB + 32 + 8);
+
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!(
+            files_under(&sector).len(),
+            4,
+            "sectorroom: a sector's labels went before seats': {released:?}"
+        );
+        assert!(
+            three.find(20, &member, b"sector", |_| true).is_some(),
+            "sectorroom: the sector's labels are kept"
+        );
+        assert_eq!(
+            (released.counts, released.epochs.clone()),
+            (2, vec![10]),
+            "sectorroom: the seats' labels went: {released:?}"
+        );
+        for seat in &seats {
+            assert_eq!(
+                files_under(seat),
+                Vec::<PathBuf>::new(),
+                "sectorroom: {seat:?}"
+            );
+        }
+
+        // With no seats' labels left, a sector's go too: the stores come
+        // first.
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!(released.counts, 1, "sectorroom: {released:?}");
+        assert_eq!(files_under(&sector), Vec::<PathBuf>::new(), "sectorroom");
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sector refused room above the floor takes it from the labels kept
+    /// for seats before persistent storage, until it fits and no further,
+    /// and never from another sector's labels; with no seats' labels it is
+    /// refused as before. The floor's own release starts below the floor
+    /// only, so a node 3.5 GiB above it, its labels' filesystem mostly
+    /// seats' labels, started no sector again (2026-11-08).
+    #[test]
+    fn a_sector_short_of_room_above_the_floor_takes_it_from_seats_labels() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(20));
+        let dir = temp_dir("sector-room");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let three = store.for_profile(quil_types::consensus::StorageSealProfile::Three);
+        let floor = disk_floor(TOTAL);
+        let member = [10u8; 32];
+        // A sector of 1 GiB of labels needs 2 GiB free above the floor.
+        let n = 8 * EIGHTH_NODES;
+        assert_eq!(three.label_bytes(n) * DISK_MARGIN, 2 * GIB);
+        // Another sector's labels, not certified yet.
+        let other = kept_sparse(&three, 20, &member, b"other", n);
+
+        // Half a GiB above the floor, with no seats' labels: refused, and
+        // the other sector's labels stay.
+        base.store(floor + GIB / 2 + bytes_under(&dir), Ordering::SeqCst);
+        assert!(
+            three
+                .admit(20, &member, b"sector", n, Stage::Snapshot)
+                .is_none(),
+            "sectorroom: no room"
+        );
+        assert_eq!(
+            files_under(&other).len(),
+            4,
+            "sectorroom: another sector's labels went for a sector"
+        );
+
+        // Seats' labels of 3/4 GiB each: two of them make the room.
+        let seats: Vec<PathBuf> = [b"seat-a", b"seat-b", b"seat-c", b"seat-d"]
+            .iter()
+            .map(|leaf| kept_sparse(&store, 10, &member, *leaf, 2 * EIGHTH_NODES))
+            .collect();
+        base.store(floor + GIB / 2 + bytes_under(&dir), Ordering::SeqCst);
+        let admitted = three
+            .admit(20, &member, b"sector", n, Stage::Snapshot)
+            .expect("sectorroom: a sector short of room above the floor stays refused");
+        let left = seats
+            .iter()
+            .filter(|seat| !files_under(seat).is_empty())
+            .count();
+        assert_eq!(
+            left, 2,
+            "sectorroom: released until the sector fits, no further"
+        );
+        assert_eq!(
+            files_under(&other).len(),
+            4,
+            "sectorroom: another sector's labels went for a sector"
+        );
+        assert!(
+            store.shortage().is_none(),
+            "sectorroom: above the floor, no shortage"
+        );
+        drop(admitted);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
         let _ = fs::remove_dir_all(&dir);
     }
 
