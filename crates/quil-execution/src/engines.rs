@@ -963,6 +963,14 @@ impl InclusionProver for NoopInclusionProver {
     }
 }
 
+/// A confidential token operation reached an engine without a proof policy
+/// (`proofWorker.disabled`, or a build without the native verifier). This
+/// node cannot tell whether the operation is valid, so it must not skip it as
+/// invalid while verifying replicas apply it: the frame fails here instead.
+fn token_proofs_unconfigured() -> QuilError {
+    QuilError::ExecutionUnavailable("token proof verification is not configured".into())
+}
+
 impl ShardExecutionEngine for TokenExecutionEngine {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
@@ -1032,10 +1040,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 | crate::token_engine::TYPE_LATTICE_PENDING_CLAIM
                 | crate::token_engine::TYPE_LATTICE_SHIELD
                 | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
-                | crate::token_engine::TYPE_LATTICE_SETTLEMENT => {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY => {
+                    return Err(token_proofs_unconfigured());
                 }
                 _ => {
                     crate::token_engine::peek_token_message_kind(inner_bytes)?;
@@ -1133,11 +1140,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         | crate::token_engine::TYPE_LATTICE_SHIELD
                         | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
                         | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                        | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY
                 ) =>
                 {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                    return Err(token_proofs_unconfigured());
                 }
                 None => return Ok(()), // other stateless operations skip materialization
             };
@@ -1256,10 +1262,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 | crate::token_engine::TYPE_LATTICE_PENDING_CLAIM
                 | crate::token_engine::TYPE_LATTICE_SHIELD
                 | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
-                | crate::token_engine::TYPE_LATTICE_SETTLEMENT => {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY => {
+                    return Err(token_proofs_unconfigured());
                 }
                 crate::token_engine::TYPE_MINT_TRANSACTION => {
                     // Retired (decaf448): the confidential-value path is now
@@ -3702,9 +3707,9 @@ mod tests {
         )));
         let mut engine = token_engine_test(ExecutionMode::Application);
         engine.state = Some(state.clone());
-        let mut unsupported = crate::token_engine::TYPE_LATTICE_TRANSACTION
-            .to_be_bytes()
-            .to_vec();
+        // A retired type is a deterministic rejection with or without a
+        // proof policy; an unverifiable confidential type fails the frame.
+        let mut unsupported = Vec::from(crate::token_engine::TYPE_TRANSACTION.to_be_bytes());
         unsupported.extend_from_slice(b"QCT3");
         let request = CanonicalMessageRequest::wrap(unsupported.clone())
             .unwrap()
@@ -3720,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_token_engine_rejects_all_confidential_types_before_decoding() {
+    fn unconfigured_token_engine_fails_on_all_confidential_types_before_decoding() {
         use crate::token_engine::*;
         for (mode, stateful) in [
             (ExecutionMode::Application, false),
@@ -3745,6 +3750,8 @@ mod tests {
                 TYPE_LATTICE_PENDING_CLAIM,
                 TYPE_LATTICE_SHIELD,
                 TYPE_LATTICE_MINT_CLAIM,
+                TYPE_LATTICE_SETTLEMENT,
+                crate::token_intrinsic::constants::TYPE_COIN_DELIVERY,
             ] {
                 for body in [b"QLCT".as_slice(), b"QCT3".as_slice(), b"".as_slice()] {
                     let mut inner = tp.to_be_bytes().to_vec();
@@ -3765,11 +3772,102 @@ mod tests {
                                 )
                                 .map(|_| ()),
                         ] {
-                            assert!(matches!(result, Err(QuilError::InvalidArgument(ref reason))
-                                if reason == "token proof verification is not configured"));
+                            assert!(
+                                matches!(result, Err(QuilError::ExecutionUnavailable(ref reason))
+                                if reason == "token proof verification is not configured")
+                            );
                         }
                         assert_eq!(state.changeset_len(), 0);
                     }
+                }
+            }
+        }
+    }
+
+    /// A/B reproducer for unverifiable confidential operations: a node
+    /// without a token proof policy (`proofWorker.disabled`) rejected them as
+    /// invalid, so its materialization skipped what verifying replicas apply
+    /// and its state forked silently. A build that fails the frame instead
+    /// returns an execution failure.
+    #[test]
+    fn reproduces_unverifiable_confidential_operation_skipped() {
+        let state = Arc::new(crate::hypergraph_state::HypergraphState::new(Arc::new(
+            quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            ),
+        )));
+        let mut engine = token_engine_test(ExecutionMode::Application);
+        engine.state = Some(state);
+        let mut inner = crate::token_engine::TYPE_LATTICE_TRANSACTION
+            .to_be_bytes()
+            .to_vec();
+        inner.extend_from_slice(b"QCT3");
+        let message = CanonicalMessageRequest::wrap(inner)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        for result in [
+            engine.validate_message(1, &domains::QUIL_TOKEN, &message),
+            engine
+                .process_message(1, &BigInt::from(1), &domains::QUIL_TOKEN, &message)
+                .map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(QuilError::is_execution_unavailable),
+                "a confidential operation this node cannot verify was skipped as invalid \
+                 ({result:?}) while verifying replicas apply it"
+            );
+        }
+    }
+
+    /// Class guard for unverifiable operations: every token type a proof
+    /// policy verifies (the types `validate_message` hands to the policy)
+    /// fails the frame on an engine without one, in every mode, instead of
+    /// being rejected or skipped. A newly verified type fails here until the
+    /// unconfigured arms list it.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn unconfigured_token_engine_fails_on_every_policy_verified_type() {
+        let verified: Vec<u32> = (0x0500u32..=0x05ff)
+            .filter(|tp| {
+                crate::token_intrinsic::dispatch::is_confidential_type(*tp)
+                    || *tp == crate::token_intrinsic::constants::TYPE_COIN_DELIVERY
+            })
+            .collect();
+        assert!(!verified.is_empty());
+        for (mode, stateful) in [
+            (ExecutionMode::Application, false),
+            (ExecutionMode::Application, true),
+            (ExecutionMode::Global, false),
+            (ExecutionMode::Global, true),
+        ] {
+            let mut engine = token_engine_test(mode);
+            if stateful {
+                engine.state = Some(Arc::new(crate::hypergraph_state::HypergraphState::new(
+                    Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                        Arc::new(quil_hypergraph::testing::MemStore::new()),
+                        Arc::new(quil_types::crypto::NoopInclusionProver),
+                    )),
+                )));
+            }
+            for &tp in &verified {
+                let message = make_bundle(vec![tp.to_be_bytes().to_vec()]);
+                for result in [
+                    engine.validate_message(1, &domains::QUIL_TOKEN, &message),
+                    engine
+                        .process_message(1, &BigInt::from(1), &domains::QUIL_TOKEN, &message)
+                        .map(|_| ()),
+                ] {
+                    assert!(
+                        result
+                            .as_ref()
+                            .is_err_and(QuilError::is_execution_unavailable),
+                        "token type {tp:#06x} is verified by a proof policy, but an engine \
+                         without one returned {result:?} instead of failing the frame"
+                    );
                 }
             }
         }

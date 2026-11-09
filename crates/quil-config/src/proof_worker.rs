@@ -86,9 +86,10 @@ pub struct ProofWorkerConfig {
     /// killed and the verification reported unavailable.
     #[serde(default = "default_max_resident_bytes")]
     pub max_resident_bytes: u64,
-    /// Explicitly disable the token suite. The node then rejects every
-    /// confidential token operation ("token suite is not
-    /// configured") instead of falling back to any older proof system.
+    /// Explicitly disable the token suite. The node then cannot verify a
+    /// confidential token operation ("token proof verification is not
+    /// configured") and stops at the first frame that carries one, instead
+    /// of skipping it or falling back to any older proof system.
     #[serde(default)]
     pub disabled: bool,
 }

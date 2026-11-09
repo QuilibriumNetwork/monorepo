@@ -2130,6 +2130,109 @@ mod exact_state_size_epoch_tests {
     }
 }
 
+/// How many GLOBAL frames a cited global frame may trail the finalized
+/// global anchor of the frame that executes the citation, from
+/// [`MAINNET_GLOBAL_CITATION_WINDOW_EPOCH`]: eight epochs, about 16 hours at
+/// the roughly 350 GLOBAL frames per hour (about 10.3 s per frame) mainnet
+/// produced in November 2026.
+/// It covers reward mints, mint and settlement claims and coin deliveries.
+/// Honest witnesses cite the newest root their node retains, at most 1,440
+/// frames before the anchor or the latest frame they see (the reward witness
+/// lookback); the remaining 4,320 frames, about 12 hours at that rate, cover
+/// inclusion delay. A claim that waits longer is refused and is rebuilt with
+/// a fresh witness; the record it cites is not consumed.
+pub const GLOBAL_CITATION_WINDOW_FRAMES: u64 = 5_760;
+
+/// The epoch from which a citation of a global frame more than
+/// [`GLOBAL_CITATION_WINDOW_FRAMES`] before the executing frame's anchor is
+/// refused deterministically. Before it a node resolved a citation of any
+/// earlier frame from its clock store, and a node without that frame (one
+/// that started from a later snapshot) held the executing frame for retry
+/// while the others applied it. Consensus-affecting: nodes on either side
+/// disagree on an old citation they both hold, so every archive and prover
+/// must run a build with it before then. Mainnet epoch 1488 (frame
+/// 1,071,360), which GLOBAL cannot reach before 2026-11-12 13:00 UTC even at
+/// ten seconds a frame: more than two days after a release published by
+/// 2026-11-10 12:00 UTC. `QUIL_GLOBAL_CITATION_WINDOW_EPOCH` elsewhere, never
+/// by default.
+pub const MAINNET_GLOBAL_CITATION_WINDOW_EPOCH: Option<u64> = Some(1488);
+
+static GLOBAL_CITATION_WINDOW_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static GLOBAL_CITATION_WINDOW_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn global_citation_window_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_GLOBAL_CITATION_WINDOW_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's global citation window epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_global_citation_window_epoch(network: u8) -> u64 {
+    *GLOBAL_CITATION_WINDOW_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_GLOBAL_CITATION_WINDOW_EPOCH").ok();
+        global_citation_window_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_global_citation_window_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX`: never.
+pub fn global_citation_window_epoch() -> u64 {
+    if let Some(epoch) = GLOBAL_CITATION_WINDOW_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *GLOBAL_CITATION_WINDOW_EPOCH.get_or_init(|| global_citation_window_epoch_for(0, None))
+}
+
+/// Whether a citation executing under finalized global anchor `anchor` must
+/// lie within [`GLOBAL_CITATION_WINDOW_FRAMES`] of it.
+pub fn global_citation_window_active(anchor: u64) -> bool {
+    epoch_for_frame(anchor) >= global_citation_window_epoch()
+}
+
+/// Set the global citation window epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_global_citation_window_epoch_for_thread(epoch: Option<u64>) {
+    GLOBAL_CITATION_WINDOW_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod global_citation_window_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_global_citation_window_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::global_citation_window_epoch_for(0, setting), 1488);
+        }
+        assert_eq!(super::global_citation_window_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::global_citation_window_epoch_for(1, Some("x")),
+            u64::MAX
+        );
+        assert_eq!(super::global_citation_window_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet epoch 1488; a thread override moves or disables it.
+    #[test]
+    fn the_global_citation_window_starts_at_the_first_frame_of_its_epoch() {
+        assert_eq!(super::MAINNET_GLOBAL_CITATION_WINDOW_EPOCH, Some(1488));
+        super::set_global_citation_window_epoch_for_thread(Some(3));
+        let first = 3 * super::epoch_length_frames();
+        assert!(!super::global_citation_window_active(first - 1));
+        assert!(super::global_citation_window_active(first));
+        super::set_global_citation_window_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::global_citation_window_active(u64::MAX));
+        super::set_global_citation_window_epoch_for_thread(None);
+    }
+}
+
 /// The effective state of an allocation at a given frame, with the
 /// 720-frame grace window applied. Prefer this over reading
 /// `alloc.status` directly anywhere the protocol's implicit

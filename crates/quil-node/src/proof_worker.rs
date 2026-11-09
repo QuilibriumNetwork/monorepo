@@ -152,7 +152,8 @@ pub(crate) fn resolve_worker_path(config: &ProofWorkerConfig) -> anyhow::Result<
     let path = std::fs::canonicalize(&candidate).map_err(|e| {
         anyhow::anyhow!(
             "token proof worker not found at {}: {e}. Fix or unset proofWorker.path and {WORKER_PATH_ENV} \
-             (the node runs itself as the worker by default), or set proofWorker.disabled: true",
+             (the node runs itself as the worker by default), or set proofWorker.disabled: true \
+             (the node then stops at the first frame carrying a confidential token operation)",
             candidate.display()
         )
     })?;
@@ -172,7 +173,7 @@ fn build_worker(
     slots: VerifierSlots,
 ) -> anyhow::Result<Option<WorkerVerifier>> {
     if config.disabled {
-        tracing::warn!("token suite disabled by proofWorker.disabled; confidential token operations will be rejected");
+        tracing::warn!("token suite disabled by proofWorker.disabled; this node cannot verify confidential token operations and stops at the first frame that carries one");
         return Ok(None);
     }
     config.validate().map_err(anyhow::Error::msg)?;
@@ -306,7 +307,8 @@ pub(crate) fn build_node_worker_as(
 
 /// Install the network policy and a clone of the shared worker on a manager.
 /// Without a worker (suite disabled) the manager is returned unchanged and
-/// rejects confidential token operations.
+/// fails, rather than skips, every frame carrying a confidential token
+/// operation: it cannot tell whether the operation is valid.
 pub(crate) fn install_token_worker(
     manager: ExecutionEngineManager,
     network: u8,
