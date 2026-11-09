@@ -235,29 +235,7 @@ async fn fetch_sync_blobs(
     use quil_hypergraph::crdt::sync_blob_matches;
     let shard = app_shard_key(shard_id)
         .ok_or_else(|| QuilError::InvalidArgument("invalid sync shard".into()))?;
-    let mut blobs: Vec<Option<Vec<u8>>> = Vec::with_capacity(leaves.len());
-    let mut wanted: Vec<(usize, Vec<u8>)> = Vec::new();
-    for (i, (key, leaf)) in leaves.iter().enumerate() {
-        let Some(leaf) = leaf else {
-            // The prepared, root-checked GLOBAL diff proves absence. No
-            // readable blob is fetched for a removed local-only record.
-            blobs.push(Some(Vec::new()));
-            continue;
-        };
-        if sync_blob_matches(phase as usize, leaf, &[])? {
-            blobs.push(Some(Vec::new()));
-            continue;
-        }
-        let mut vertex_id = shard.l2.to_vec();
-        vertex_id.extend_from_slice(key);
-        match crdt.peek_synced_blob(&shard, phase as usize, &vertex_id) {
-            Some(blob) if sync_blob_matches(phase as usize, leaf, &blob)? => blobs.push(Some(blob)),
-            _ => {
-                blobs.push(None);
-                wanted.push((i, vertex_id));
-            }
-        }
-    }
+    let (mut blobs, wanted) = held_sync_blobs(crdt, &shard, phase, leaves)?;
     if !wanted.is_empty() {
         let shard_bytes: Vec<u8> = shard.l1.iter().copied().chain(shard.l2).collect();
         let fetched =
@@ -285,6 +263,52 @@ async fn fetch_sync_blobs(
         .into_iter()
         .map(|blob| blob.expect("every blob resolved"))
         .collect())
+}
+
+/// The blob of each leaf, `None` where it must be fetched, and the index and
+/// vertex id of each blob to fetch.
+type HeldBlobs = (Vec<Option<Vec<u8>>>, Vec<(usize, Vec<u8>)>);
+
+/// The blobs of `leaves` a sync needs no fetch for ([`fetch_sync_blobs`]),
+/// and the index and vertex id of each it must fetch. A held blob is reused
+/// only when it matches its leaf and a sync would install it: one installed
+/// from a source before the sync checked its fields is fetched again.
+fn held_sync_blobs(
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    shard: &ShardKey,
+    phase: u32,
+    leaves: &[([u8; 32], Option<Vec<u8>>)],
+) -> Result<HeldBlobs> {
+    use quil_hypergraph::crdt::{sync_blob_matches, sync_blob_refused_field};
+    let mut blobs: Vec<Option<Vec<u8>>> = Vec::with_capacity(leaves.len());
+    let mut wanted: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (i, (key, leaf)) in leaves.iter().enumerate() {
+        let Some(leaf) = leaf else {
+            // The prepared, root-checked GLOBAL diff proves absence. No
+            // readable blob is fetched for a removed local-only record.
+            blobs.push(Some(Vec::new()));
+            continue;
+        };
+        if sync_blob_matches(phase as usize, leaf, &[])? {
+            blobs.push(Some(Vec::new()));
+            continue;
+        }
+        let mut vertex_id = shard.l2.to_vec();
+        vertex_id.extend_from_slice(key);
+        match crdt.peek_synced_blob(shard, phase as usize, &vertex_id) {
+            Some(blob)
+                if sync_blob_matches(phase as usize, leaf, &blob)?
+                    && sync_blob_refused_field(phase as usize, &blob).is_none() =>
+            {
+                blobs.push(Some(blob))
+            }
+            _ => {
+                blobs.push(None);
+                wanted.push((i, vertex_id));
+            }
+        }
+    }
+    Ok((blobs, wanted))
 }
 
 async fn fetch_remote_blobs(
@@ -1365,5 +1389,51 @@ mod tests {
         let mut forged = EMPTY_PHASE_ROOT;
         forged[31] ^= 1;
         assert!(!is_empty_phase_root(&forged));
+    }
+
+    /// A vertex field tree holding `value` at `key`, behind `hash_target`.
+    fn field_blob(key: &[u8], value: &[u8], hash_target: &[u8]) -> Vec<u8> {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        let size = num_bigint::BigInt::from(value.len());
+        tree.insert(key, value, hash_target, &size).unwrap();
+        quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()
+    }
+
+    /// A node may hold a blob a source installed before the sync checked
+    /// fields: one whose position its leaf does not bind. A later sync that
+    /// plans its leaf fetches it again rather than reuse it, while a held
+    /// blob a sync would install is reused.
+    #[test]
+    fn a_held_blob_a_sync_would_refuse_is_fetched_again() {
+        let app = [0x2a; 32];
+        let forged = field_blob(&[4 << 2], &900_001u64.to_be_bytes(), &3u64.to_be_bytes());
+        let honest = field_blob(&[4 << 2], &3u64.to_be_bytes(), &[]);
+        let node = memory_crdt();
+        let mut leaves = Vec::new();
+        for (address, blob) in [([1; 32], &forged), ([2; 32], &honest)] {
+            let location = quil_hypergraph::Location {
+                app_address: app,
+                data_address: address,
+            };
+            node.add_vertex(&location, blob).unwrap();
+            leaves.push((address, Some(quil_tries::vertex_leaf_value(blob).unwrap())));
+        }
+        node.commit(1).unwrap();
+        let shard = app_shard_key(&app).unwrap();
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(0));
+        let held = held_sync_blobs(&node, &shard, 0, &leaves);
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+        let (blobs, wanted) = held.unwrap();
+        assert_eq!(
+            blobs[1].as_deref(),
+            Some(honest.as_slice()),
+            "a held blob a sync installs is reused"
+        );
+        let fetched: Vec<usize> = wanted.iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            fetched,
+            vec![0],
+            "a held blob a sync would refuse must be fetched again"
+        );
     }
 }

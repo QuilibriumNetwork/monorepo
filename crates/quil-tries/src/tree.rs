@@ -51,6 +51,37 @@ impl VectorCommitmentTree {
         get_recursive(self.root.as_ref(), key, 0)
     }
 
+    /// SHA-512 over the leaves in tree order, each as `(u32 BE key length,
+    /// key, u32 BE value length, value)`. A sealed sub-tree's leaf carries
+    /// this content digest as its `hash_target`, so the digest of the tree
+    /// read back from the leaf's value binds that value.
+    pub fn content_digest(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        for (k, v) in self.leaves() {
+            h.update((k.len() as u32).to_be_bytes());
+            h.update(&k);
+            h.update((v.len() as u32).to_be_bytes());
+            h.update(&v);
+        }
+        h.finalize().to_vec()
+    }
+
+    /// The first leaf, in tree order, that [`Self::get_leaf`] does not find
+    /// at its own key. Neither a tree's commitment (it leaves out the root's
+    /// prefix) nor its [`Self::content_digest`] (the leaves alone) binds the
+    /// shape a reader navigates by key, so a tree read from untrusted bytes
+    /// holds what they bind only when this is `None`.
+    pub fn unreachable_leaf(&self) -> Option<&LeafNode> {
+        let mut leaves = Vec::new();
+        self.root.as_ref()?.collect_leaves(&mut leaves);
+        leaves.into_iter().find(|leaf| {
+            !self
+                .get_leaf(&leaf.key)
+                .is_some_and(|found| std::ptr::eq(found, *leaf))
+        })
+    }
+
     /// Whether any leaf carries a value its commitment does not bind.
     pub fn has_unbound_values(&self) -> bool {
         self.root
