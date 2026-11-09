@@ -204,9 +204,7 @@ jobs:
           # The partitions build the same artifacts; one saves them.
           save-if: ${{ github.event_name == 'push' && matrix.partition == 1 }}
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
+      - uses: ./.github/actions/install-nextest
 
       # A merge queue merges the commit its group tested, so the push of
       # that commit only builds the tests in the first partition, which
@@ -305,9 +303,7 @@ jobs:
           shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           save-if: false
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
+      - uses: ./.github/actions/install-nextest
 
       # The workspace build gives the lattice crates the features the
       # node and qclient enable (native-proof); the filter picks the

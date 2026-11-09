@@ -46,26 +46,125 @@ runs:
           unzip \
           curl
 
-    # protoc from apt is too old for prost-build; pull the official
-    # release binary directly. Pinned version — bump as needed.
-    - name: Install protoc (linux)
+    # protoc from apt (3.21) is older than the pinned release; install
+    # the official 28.3 binary and its well-known .proto files. A GitHub
+    # release-download outage must not fail every job in setup, so the
+    # verified download is cached, and on a miss Maven Central's copy of
+    # the same release (protoc 28.3 is published there as 4.28.3, signed
+    # by the protobuf release key) is the fallback. Every artifact is
+    # checked against the hash pinned below before it is installed or
+    # cached. Bump the version and every pin together.
+    - name: Resolve protoc (linux)
+      id: protoc
       if: runner.os == 'Linux'
       shell: bash
       env:
         PROTOC_VERSION: "28.3"
       run: |
         case "$RUNNER_ARCH" in
-          X64)   PROTOC_ARCH=linux-x86_64 ;;
-          ARM64) PROTOC_ARCH=linux-aarch_64 ;;
+          X64)
+            PROTOC_ARCH=linux-x86_64
+            # sha384 of protoc-28.3-linux-x86_64.zip (GitHub release)
+            ZIP_SHA384=eb2c6810df71e595c2df60e0bacd6d2e33d4ba001b553376edcf0021e289688ad85aabf48ed728b72776a9128722b27a
+            # sha256 of protoc-4.28.3-linux-x86_64.exe (Maven Central)
+            EXE_SHA256=0e8c86f9b69b2b0fff91d56d8906a846ad89ce56dfeb1b673287b61c959bd633
+            ;;
+          ARM64)
+            PROTOC_ARCH=linux-aarch_64
+            ZIP_SHA384=39b543c02cdfa093640e67652a86b09d89056249de6de120ade77046f78c2965a4f9b1414ef07c4f59d2f21302baaad0
+            EXE_SHA256=fac5818bce92cfd652264514c0663173643752f6ab6dc83a44b268da880a5cec
+            ;;
           *) echo "unsupported runner arch: $RUNNER_ARCH" >&2; exit 1 ;;
         esac
+        # sha256 of protobuf-java-4.28.3.jar (Maven Central): the
+        # well-known .proto files for the Maven fallback.
+        JAR_SHA256=ba02977c0fef8b40af9f85fe69af362d8e13f2685b49a9752750b18da726157e
+        PINS="$(printf '%s %s %s' "$ZIP_SHA384" "$EXE_SHA256" "$JAR_SHA256" | sha256sum | cut -c1-16)"
+        {
+          echo "version=$PROTOC_VERSION"
+          echo "arch=$PROTOC_ARCH"
+          echo "zip-sha384=$ZIP_SHA384"
+          echo "exe-sha256=$EXE_SHA256"
+          echo "jar-sha256=$JAR_SHA256"
+          echo "dir=$HOME/.cache/protoc-$PROTOC_VERSION-$PROTOC_ARCH"
+          echo "key=protoc-$PROTOC_VERSION-$PROTOC_ARCH-$PINS"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache protoc download (linux)
+      if: runner.os == 'Linux'
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.protoc.outputs.dir }}
+        key: ${{ steps.protoc.outputs.key }}
+
+    - name: Install protoc (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        PROTOC_VERSION: ${{ steps.protoc.outputs.version }}
+        PROTOC_ARCH: ${{ steps.protoc.outputs.arch }}
+        ZIP_SHA384: ${{ steps.protoc.outputs.zip-sha384 }}
+        EXE_SHA256: ${{ steps.protoc.outputs.exe-sha256 }}
+        JAR_SHA256: ${{ steps.protoc.outputs.jar-sha256 }}
+        PROTOC_DIR: ${{ steps.protoc.outputs.dir }}
+        PROTOC_PREFIX: /usr/local
+        PROTOBUF_RELEASES: https://github.com/protocolbuffers/protobuf/releases/download
+        MAVEN_PROTOBUF: https://repo1.maven.org/maven2/com/google/protobuf
+      run: |
+        set -euo pipefail
+        ZIP="protoc-$PROTOC_VERSION-$PROTOC_ARCH.zip"
+        EXE="protoc-4.$PROTOC_VERSION-$PROTOC_ARCH.exe"
+        JAR="protobuf-java-4.$PROTOC_VERSION.jar"
+        mkdir -p "$PROTOC_DIR"
         TMP="$(mktemp -d)"
-        curl -fsSL --retry 5 --retry-all-errors -o "$TMP/protoc.zip" \
-          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
-        sudo unzip -o "$TMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
-        sudo chmod +x /usr/local/bin/protoc
-        rm -rf "$TMP"
-        protoc --version
+        trap 'rm -rf "$TMP"' EXIT
+
+        # Succeeds only when the file exists and matches its pin.
+        verified() { # <dir> <file> <algo> <hash>
+          [[ -f "$1/$2" ]] && (cd "$1" && echo "$4  $2" | "$3sum" -c --quiet -)
+        }
+        # Downloads into TMP, keeps the file only if it matches its pin.
+        fetch() { # <url> <file> <algo> <hash>
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 \
+            --max-time 300 -o "$TMP/$2" "$1" || return 1
+          if ! verified "$TMP" "$2" "$3" "$4"; then
+            echo "::warning::$2 from $1 does not match its pinned $3"
+            return 1
+          fi
+          mv "$TMP/$2" "$PROTOC_DIR/$2"
+        }
+        have_zip() { verified "$PROTOC_DIR" "$ZIP" sha384 "$ZIP_SHA384"; }
+        have_maven() {
+          verified "$PROTOC_DIR" "$EXE" sha256 "$EXE_SHA256" &&
+            verified "$PROTOC_DIR" "$JAR" sha256 "$JAR_SHA256"
+        }
+
+        if have_zip; then
+          echo "protoc $PROTOC_VERSION: cached GitHub release zip"
+        elif have_maven; then
+          echo "protoc $PROTOC_VERSION: cached Maven Central artifacts"
+        elif fetch "$PROTOBUF_RELEASES/v$PROTOC_VERSION/$ZIP" "$ZIP" sha384 "$ZIP_SHA384"; then
+          echo "protoc $PROTOC_VERSION: GitHub release zip"
+        else
+          echo "::warning::protoc $PROTOC_VERSION GitHub release download failed; using Maven Central"
+          fetch "$MAVEN_PROTOBUF/protoc/4.$PROTOC_VERSION/$EXE" "$EXE" sha256 "$EXE_SHA256"
+          fetch "$MAVEN_PROTOBUF/protobuf-java/4.$PROTOC_VERSION/$JAR" "$JAR" sha256 "$JAR_SHA256"
+        fi
+
+        # Install whichever verified source is now in the cache dir.
+        if have_zip; then
+          sudo unzip -o -q "$PROTOC_DIR/$ZIP" -d "$PROTOC_PREFIX" bin/protoc 'include/*'
+          sudo chmod 0755 "$PROTOC_PREFIX/bin/protoc"
+        else
+          sudo install -D -m 0755 "$PROTOC_DIR/$EXE" "$PROTOC_PREFIX/bin/protoc"
+          sudo unzip -o -q "$PROTOC_DIR/$JAR" 'google/protobuf/*.proto' -d "$PROTOC_PREFIX/include"
+        fi
+        PROTOC_REPORTED="$("$PROTOC_PREFIX/bin/protoc" --version)"
+        echo "$PROTOC_REPORTED"
+        if [[ "$PROTOC_REPORTED" != "libprotoc $PROTOC_VERSION" ]]; then
+          echo "::error::installed protoc reports '$PROTOC_REPORTED', expected $PROTOC_VERSION"
+          exit 1
+        fi
 
     - name: brew install (macos)
       if: runner.os == 'macOS'
