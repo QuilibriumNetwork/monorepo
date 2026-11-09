@@ -521,17 +521,33 @@ impl Seat {
 
 /// The seat of `member` on `filter` in committed `state`.
 pub fn read(state: &HypergraphState, member: &[u8; 32], filter: &[u8]) -> Result<Option<Seat>> {
-    read_address(state, &seat_address(member, filter)?)
+    Ok(read_sized(state, member, filter)?.map(|(seat, _)| seat))
+}
+
+/// [`read`], with the size in bytes of the seat's stored record.
+pub fn read_sized(
+    state: &HypergraphState,
+    member: &[u8; 32],
+    filter: &[u8],
+) -> Result<Option<(Seat, usize)>> {
+    read_address_sized(state, &seat_address(member, filter)?)
 }
 
 /// The seat at `address` in committed `state`.
 pub fn read_address(state: &HypergraphState, address: &[u8; 32]) -> Result<Option<Seat>> {
+    Ok(read_address_sized(state, address)?.map(|(seat, _)| seat))
+}
+
+fn read_address_sized(
+    state: &HypergraphState,
+    address: &[u8; 32],
+) -> Result<Option<(Seat, usize)>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)? {
         Some(blob) if !blob.is_empty() => Seat::from_tree(
             &crate::prover_registry::rebuild_vertex_tree_from_blob(&blob),
         )
-        .map(Some),
+        .map(|seat| Some((seat, blob.len()))),
         _ => Ok(None),
     }
 }

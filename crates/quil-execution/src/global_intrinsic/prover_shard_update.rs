@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use num_bigint::BigInt;
 
@@ -1013,6 +1014,8 @@ pub fn materialize_prover_shard_update(
 ///
 /// `issuance` prices the frame's issuance and says whether it is credited at
 /// all ([`HeaderIssuance`]); a frame not credited only resolves its rings.
+///
+/// Where the time went is logged when it ran slow ([`ShardUpdateTiming`]).
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_prover_shard_update_with_fees(
     frame_header: &FrameHeader,
@@ -1022,6 +1025,45 @@ pub fn materialize_prover_shard_update_with_fees(
     _frame_prover: &Arc<dyn FrameProver>,
     reward_issuance: &Arc<dyn RewardIssuance>,
     world_state_size: u64,
+    active_provers: Vec<ProverInfo>,
+    participant_bitmask: &[usize],
+    shard_metadata: ShardMetadata,
+    committed_fees: u128,
+    session: Option<[u8; 32]>,
+    storage: Option<&mut StorageFrame>,
+    issuance: HeaderIssuance,
+) -> Result<()> {
+    let mut timing = ShardUpdateTiming::start();
+    let result = materialize_shard_update_timed(
+        frame_header,
+        current_frame_number,
+        state,
+        reward_issuance,
+        world_state_size,
+        active_provers,
+        participant_bitmask,
+        shard_metadata,
+        committed_fees,
+        session,
+        storage,
+        issuance,
+        &mut timing,
+    );
+    timing.finish(frame_header, current_frame_number);
+    result
+}
+
+/// [`materialize_prover_shard_update_with_fees`], marking its steps in
+/// `timing`.
+// The public entry point's arguments, less the two it ignores, plus the
+// timing it logs.
+#[allow(clippy::too_many_arguments)]
+fn materialize_shard_update_timed(
+    frame_header: &FrameHeader,
+    current_frame_number: u64,
+    state: &HypergraphState,
+    reward_issuance: &Arc<dyn RewardIssuance>,
+    world_state_size: u64,
     mut active_provers: Vec<ProverInfo>,
     participant_bitmask: &[usize],
     shard_metadata: ShardMetadata,
@@ -1029,6 +1071,7 @@ pub fn materialize_prover_shard_update_with_fees(
     session: Option<[u8; 32]>,
     storage: Option<&mut StorageFrame>,
     issuance: HeaderIssuance,
+    timing: &mut ShardUpdateTiming,
 ) -> Result<()> {
     let storage_epoch = quil_types::consensus::epoch_for_frame(frame_header.global_frame_number);
     if !frame_header.address.is_empty()
@@ -1060,6 +1103,7 @@ pub fn materialize_prover_shard_update_with_fees(
             storage_epoch,
         )?;
     }
+    timing.mark("sealed gate");
     let session_rings = match &session {
         Some(session) => Some(session_member_rings(
             state,
@@ -1098,6 +1142,10 @@ pub fn materialize_prover_shard_update_with_fees(
         shard_metadata,
         session_rings.as_deref(),
     )?;
+    timing.counts.rings = ctx.participants_by_ring.len();
+    timing.counts.participants = ctx.participants_by_ring.values().map(Vec::len).sum();
+    timing.counts.committee = ctx.active_provers.len();
+    timing.mark("rings");
     if !issuance.credit {
         tracing::info!(
             shard = %hex::encode(&frame_header.address),
@@ -1185,6 +1233,7 @@ pub fn materialize_prover_shard_update_with_fees(
         || (quil_types::consensus::epoch_for_frame(current_frame_number)
             >= quil_types::consensus::unsealed_issuance_epoch()
             && !quil_types::consensus::sealed_storage_required(storage_epoch));
+    timing.mark("issuance");
     let held = match storage {
         Some(storage) => Some(hold_storage_shares(
             frame_header,
@@ -1193,6 +1242,7 @@ pub fn materialize_prover_shard_update_with_fees(
             &ctx,
             &rewards_per_ring,
             storage,
+            timing,
         )?),
         None => None,
     };
@@ -1201,6 +1251,7 @@ pub fn materialize_prover_shard_update_with_fees(
     let mut credited_provers = 0usize;
     let mut total_reward = BigInt::from(0);
     let mut unsealed_paid = 0usize;
+    let (mut rewarding, mut activity) = (Duration::ZERO, Duration::ZERO);
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring);
         for &idx in participants {
@@ -1218,6 +1269,7 @@ pub fn materialize_prover_shard_update_with_fees(
             if remainder_receiver == Some(idx) {
                 amount += &fee_remainder;
             }
+            let started = Instant::now();
             if amount.sign() != num_bigint::Sign::NoSign
                 && apply_reward(
                     state,
@@ -1233,10 +1285,14 @@ pub fn materialize_prover_shard_update_with_fees(
                     unsealed_paid += 1;
                 }
             }
+            let rewarded = Instant::now();
+            rewarding += rewarded - started;
 
             update_allocation_activity(state, current_frame_number, prover, &frame_header.address)?;
+            activity += rewarded.elapsed();
         }
     }
+    timing.add([("rewards", rewarding), ("activity", activity)]);
     let present: std::collections::HashSet<usize> =
         ctx.participant_indices.iter().copied().collect();
     record_committee_absence(
@@ -1246,6 +1302,7 @@ pub fn materialize_prover_shard_update_with_fees(
         &ctx.active_provers,
         &present,
     )?;
+    timing.mark("absence");
 
     // Per-shard-frame reward-accrual signal. Unlike the worker-side "reward
     // balance updated by sync" (which only fires on an occasional prover-tree
@@ -1298,27 +1355,43 @@ fn hold_storage_shares(
     ctx: &ShardUpdateContext,
     rewards_per_ring: &HashMap<u8, BigInt>,
     storage: &mut StorageFrame,
+    timing: &mut ShardUpdateTiming,
 ) -> Result<HeldShares> {
     use super::storage_seat;
     let filter = &frame_header.address;
     let epoch = storage.epoch;
     let touch = |address: &[u8],
                  storage: &mut StorageFrame,
+                 work: &mut SeatWork,
+                 counts: &mut ShardUpdateCounts,
                  f: &mut dyn FnMut(&mut storage_seat::Seat) -> bool|
      -> Result<bool> {
         let Ok(member) = <[u8; 32]>::try_from(address) else {
             return Ok(false);
         };
-        let Some(mut seat) = storage_seat::read(state, &member, filter)? else {
+        let started = Instant::now();
+        let read = storage_seat::read_sized(state, &member, filter)?;
+        let read_at = Instant::now();
+        work.read += read_at - started;
+        let Some((mut seat, bytes)) = read else {
             return Ok(false);
         };
+        counts.seats_read += 1;
+        counts.seat_bytes += bytes;
         let before = seat.clone();
         if seat.expire(current_frame_number) && !storage.kicks.iter().any(|k| k == address) {
             storage.kicks.push(address.to_vec());
         }
+        if seat != before {
+            counts.seats_closed += 1;
+        }
         let changed = f(&mut seat);
+        let updated_at = Instant::now();
+        work.update += updated_at - read_at;
         if seat != before {
             storage_seat::write(state, current_frame_number, &seat)?;
+            counts.seats_written += 1;
+            work.write += updated_at.elapsed();
         }
         Ok(changed)
     };
@@ -1328,40 +1401,56 @@ fn hold_storage_shares(
     // executing it; settlement counts those within the response window of
     // their beacons (`storage_seat::SeatSlot::response_times`).
     if let Some(commitment) = storage.commitment.clone() {
-        let first = touch(&frame_header.prover, storage, &mut |seat| {
-            seat.commit(
-                epoch,
-                frame_header.frame_number,
-                commitment.beacon,
-                current_frame_number,
-                &commitment.rho_n,
-                &commitment.root,
-            ) && seat.first_commitment(epoch)
-        })?;
+        let mut work = SeatWork::default();
+        let first = touch(
+            &frame_header.prover,
+            storage,
+            &mut work,
+            &mut timing.counts,
+            &mut |seat| {
+                seat.commit(
+                    epoch,
+                    frame_header.frame_number,
+                    commitment.beacon,
+                    current_frame_number,
+                    &commitment.rho_n,
+                    &commitment.root,
+                ) && seat.first_commitment(epoch)
+            },
+        )?;
+        timing.mark("commitment");
         if first {
             let seat = storage_seat::seat_address(&frame_header.prover, filter)?;
             storage_seat::enqueue_expiry(state, current_frame_number, epoch, &seat)?;
+            timing.mark("expiry queue");
         }
     }
 
     let committee = ctx.active_provers.len();
     let mut held = HeldShares::default();
     let none = BigInt::from(0);
+    let mut work = SeatWork::default();
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring).unwrap_or(&none);
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
             let mut sealed = false;
-            if touch(&prover.address, storage, &mut |seat| {
-                sealed = seat.sealed_for(epoch);
-                seat.hold(
-                    epoch,
-                    current_frame_number,
-                    frame_header.frame_number,
-                    share,
-                    committee,
-                )
-            })? {
+            if touch(
+                &prover.address,
+                storage,
+                &mut work,
+                &mut timing.counts,
+                &mut |seat| {
+                    sealed = seat.sealed_for(epoch);
+                    seat.hold(
+                        epoch,
+                        current_frame_number,
+                        frame_header.frame_number,
+                        share,
+                        committee,
+                    )
+                },
+            )? {
                 held.provers += 1;
                 held.total += share;
             }
@@ -1370,7 +1459,171 @@ fn hold_storage_shares(
             }
         }
     }
+    timing.add([
+        ("seat reads", work.read),
+        ("seat expire/hold", work.update),
+        ("seat writes", work.write),
+    ]);
+    timing.counts.kicks = storage.kicks.len();
     Ok(held)
+}
+
+/// Time a participant loop spends on storage seats, by step.
+#[derive(Debug, Default)]
+struct SeatWork {
+    /// Reading and decoding seats.
+    read: Duration,
+    /// Closing ended epochs and holding the share, in memory.
+    update: Duration,
+    /// Encoding and writing the seats that changed.
+    write: Duration,
+}
+
+/// Seat and committee counts of one shard header's reward materialization.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ShardUpdateCounts {
+    rings: usize,
+    participants: usize,
+    committee: usize,
+    seats_read: usize,
+    /// Stored size of the seats read.
+    seat_bytes: usize,
+    /// Seats whose read closed an epoch whose settlement window ended.
+    seats_closed: usize,
+    seats_written: usize,
+    kicks: usize,
+}
+
+/// Step durations of one shard header's reward materialization
+/// ([`materialize_prover_shard_update_with_fees`]): its sealed gate, rings,
+/// issuance, the proposer's seat commitment and expiry queue, the
+/// participants' seat reads, expiry/hold and writes, rewards, activity and
+/// absence. Logged when it took [`Self::SLOW`] or more and in each epoch's
+/// first GLOBAL frame, where the seats it reads close the epoch two before;
+/// warned when it took a GLOBAL frame interval ([`Self::OVERRUN`]).
+#[derive(Debug)]
+struct ShardUpdateTiming {
+    started: Instant,
+    last: Instant,
+    /// Step name and microseconds, in order.
+    steps: Vec<(&'static str, u64)>,
+    counts: ShardUpdateCounts,
+}
+
+/// What [`ShardUpdateTiming`] logs for one header.
+#[derive(Debug, PartialEq, Eq)]
+struct ShardUpdateLine {
+    overran: bool,
+    epoch_start: bool,
+    /// The steps, then `other` for the time no step names.
+    steps_us: Vec<(&'static str, u64)>,
+}
+
+impl ShardUpdateTiming {
+    /// A GLOBAL frame executes about a hundred headers in its interval.
+    const SLOW: Duration = Duration::from_secs(1);
+    /// A whole GLOBAL frame interval: the next frame's votes are late.
+    const OVERRUN: Duration = Duration::from_secs(10);
+
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            steps: Vec::new(),
+            counts: ShardUpdateCounts::default(),
+        }
+    }
+
+    /// Close the step that ends now.
+    fn mark(&mut self, step: &'static str) {
+        let now = Instant::now();
+        self.steps
+            .push((step, (now - self.last).as_micros() as u64));
+        self.last = now;
+    }
+
+    /// Record steps timed apart, which end now.
+    fn add<const N: usize>(&mut self, steps: [(&'static str, Duration); N]) {
+        self.steps.extend(
+            steps
+                .into_iter()
+                .map(|(step, took)| (step, took.as_micros() as u64)),
+        );
+        self.last = Instant::now();
+    }
+
+    /// The line for work that took `total` in GLOBAL frame `frame`; `None`
+    /// when it is not logged.
+    fn line(&self, total: Duration, frame: u64) -> Option<ShardUpdateLine> {
+        use quil_types::consensus::{epoch_for_frame, epoch_start_frame};
+        let epoch_start = epoch_start_frame(epoch_for_frame(frame)) == frame;
+        if total < Self::SLOW && !epoch_start {
+            return None;
+        }
+        let named: u64 = self.steps.iter().map(|(_, us)| us).sum();
+        let mut steps_us = self.steps.clone();
+        steps_us.push(("other", (total.as_micros() as u64).saturating_sub(named)));
+        Some(ShardUpdateLine {
+            overran: total >= Self::OVERRUN,
+            epoch_start,
+            steps_us,
+        })
+    }
+
+    fn finish(self, header: &FrameHeader, frame: u64) {
+        let total = self.started.elapsed();
+        let Some(line) = self.line(total, frame) else {
+            return;
+        };
+        let ShardUpdateCounts {
+            rings,
+            participants,
+            committee,
+            seats_read,
+            seat_bytes,
+            seats_closed,
+            seats_written,
+            kicks,
+        } = self.counts;
+        macro_rules! emit {
+            ($level:ident, $message:literal) => {
+                tracing::$level!(
+                    frame,
+                    shard = %hex::encode(&header.address),
+                    shard_frame = header.frame_number,
+                    anchor = header.global_frame_number,
+                    epoch_start = line.epoch_start,
+                    total_ms = total.as_millis() as u64,
+                    steps_us = ?line.steps_us,
+                    rings,
+                    participants,
+                    committee,
+                    seats_read,
+                    seat_bytes,
+                    seats_closed,
+                    seats_written,
+                    kicks,
+                    $message
+                )
+            };
+        }
+        if line.overran {
+            emit!(
+                warn,
+                "shard header reward step overran a GLOBAL frame interval, so this node's \
+                 votes and proposals were late: the largest of steps_us names the cost \
+                 (seat reads and writes are storage seat store work, one per participant)"
+            );
+        } else {
+            emit!(
+                info,
+                "shard header reward step timing, logged when it takes a second or more and \
+                 at each epoch's first frame: the largest of steps_us names the cost (seat \
+                 reads and writes are storage seat store work, one per participant)"
+            );
+        }
+    }
 }
 
 /// What [`hold_storage_shares`] held of a hash-proof frame's issuance.
@@ -3476,6 +3729,143 @@ mod tests {
             assert_eq!(slot.pending_amount(), BigInt::from(1_000), "withheld");
         }
         suspend_storage_kicks(None);
+    }
+
+    /// A shard header's reward step is logged with its step split when it
+    /// ran a second or more, warned at a GLOBAL frame interval, logged at
+    /// each epoch's first frame however fast, and not logged otherwise.
+    #[test]
+    fn shard_update_timing_logs_a_slow_header_with_its_steps_and_not_a_fast_one() {
+        let length = quil_types::consensus::epoch_length_frames();
+        let frame = 5 * length + length / 2;
+        let ms = Duration::from_millis;
+        let mut timing = ShardUpdateTiming::start();
+        timing.add([
+            ("seat reads", ms(900)),
+            ("seat expire/hold", ms(50)),
+            ("seat writes", ms(400)),
+        ]);
+        assert_eq!(
+            timing.line(ms(1_500), frame),
+            Some(ShardUpdateLine {
+                overran: false,
+                epoch_start: false,
+                steps_us: vec![
+                    ("seat reads", 900_000),
+                    ("seat expire/hold", 50_000),
+                    ("seat writes", 400_000),
+                    ("other", 150_000),
+                ],
+            }),
+            "a slow header is logged with its steps"
+        );
+        assert_eq!(
+            timing.line(ms(999), frame),
+            None,
+            "a fast header logs nothing"
+        );
+        assert!(
+            timing
+                .line(ms(10_000), frame)
+                .is_some_and(|line| line.overran),
+            "a GLOBAL frame interval or more is warned"
+        );
+        assert!(
+            timing
+                .line(ms(5), 6 * length)
+                .is_some_and(|line| line.epoch_start && !line.overran),
+            "an epoch's first frame logs every header"
+        );
+    }
+
+    /// The counts and steps the line names come from the header's real seat
+    /// work: in the frame that ends an epoch's settlement window, the seat
+    /// read closes that epoch and is written back.
+    #[test]
+    fn shard_update_timing_counts_the_seats_a_header_reads_closes_and_writes() {
+        use super::super::storage_seat::{self, Seat};
+        let length = quil_types::consensus::epoch_length_frames();
+        let epoch = 5;
+        let frame = storage_seat::settlement_window(epoch).1;
+        assert_eq!(
+            frame % length,
+            0,
+            "the window ends at an epoch's first frame"
+        );
+        let state = make_state();
+        let filter = vec![0xA7u8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=2)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let member = <[u8; 32]>::try_from(provers[0].address.as_slice()).unwrap();
+        let mut seat = Seat::new(member, filter.clone());
+        seat.register(epoch, &[vec![]], 10);
+        assert!(seat.seal(epoch, 11));
+        assert!(seat.hold(epoch, 12, 40, &BigInt::from(1_000), 2));
+        storage_seat::write(&state, 12, &seat).unwrap();
+
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let mut storage = StorageFrame {
+            epoch: quil_types::consensus::epoch_for_frame(frame),
+            commitment: None,
+            kicks: Vec::new(),
+        };
+        let header = fake_header(filter.clone(), 60);
+        let mut timing = ShardUpdateTiming::start();
+        materialize_shard_update_timed(
+            &header,
+            frame,
+            &state,
+            &reward_issuance,
+            4096,
+            provers.clone(),
+            &[0, 1],
+            ShardMetadata {
+                state_size: 1024,
+                shard_count: 1,
+            },
+            0,
+            None,
+            Some(&mut storage),
+            HeaderIssuance::claimed(&header),
+            &mut timing,
+        )
+        .unwrap();
+        let counts = timing.counts;
+        assert!(counts.seat_bytes > 0, "the seat's stored size is counted");
+        assert_eq!(
+            (
+                counts.participants,
+                counts.committee,
+                counts.seats_read,
+                counts.seats_closed,
+                counts.seats_written
+            ),
+            (2, 2, 1, 1, 1),
+            "one of two participants holds a seat; reading it closes its epoch"
+        );
+        let line = timing
+            .line(Duration::ZERO, frame)
+            .expect("an epoch's first frame is logged");
+        let steps: Vec<&str> = line.steps_us.iter().map(|(step, _)| *step).collect();
+        assert_eq!(
+            steps,
+            [
+                "sealed gate",
+                "rings",
+                "issuance",
+                "seat reads",
+                "seat expire/hold",
+                "seat writes",
+                "rewards",
+                "activity",
+                "absence",
+                "other"
+            ]
+        );
     }
 
     /// Distribute `header` to all of `provers` as an app frame anchored in
