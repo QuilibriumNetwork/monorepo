@@ -317,6 +317,7 @@ impl RankBuffer {
                 &mut self.verified,
                 &mut self.by_shard,
                 &mut self.bytes,
+                &mut self.shares,
                 &old,
             );
         }
@@ -331,6 +332,7 @@ impl RankBuffer {
                 .insert(message.hash);
         }
         self.bytes += message.data.len();
+        self.shares.add(&message);
         self.messages.insert(arrival, message);
         true
     }
