@@ -1081,19 +1081,30 @@ pub fn notice_text(c: &HealthCondition) -> String {
                 None => format!("Global head unchanged >{threshold}s."),
             }
         }
+        // Each number once: over the full hour (to within a sample) the
+        // count is the hourly rate, and a rate equal to the count adds none.
         ConditionKind::GlobalFramesSlow => {
             let g = c.global.unwrap_or_default();
-            let rate = (g.advanced_frames * 3_600)
-                .checked_div(g.span_secs)
-                .unwrap_or(0);
-            format!(
-                "Global frames slow: {} in {} min (~{rate}/h, below {threshold}/h).",
-                g.advanced_frames,
-                g.span_secs / 60
-            )
+            let frames = g.advanced_frames;
+            if g.span_secs + 60 >= GLOBAL_RATE_WINDOW_MS / 1000 {
+                format!("Global frames slow: {frames} in the last hour, below {threshold}.")
+            } else {
+                let minutes = g.span_secs / 60;
+                match (frames * 3_600).checked_div(g.span_secs) {
+                    Some(rate) if rate != frames => format!(
+                        "Global frames slow: {frames} in {minutes} min (~{rate}/h, below \
+                         {threshold}/h)."
+                    ),
+                    _ => format!(
+                        "Global frames slow: {frames} in {minutes} min, below {threshold}/h."
+                    ),
+                }
+            }
         }
+        // A kind added after this build: the node is newer than this client.
         ConditionKind::Unspecified => format!(
-            "Health condition {} ({}, {}): {affected}/{tracked}; see this node's log.",
+            "Health condition {} ({}, {}) unknown to this qclient, older than the node: update \
+             or restart qclient (the node's log names it).",
             c.kind,
             severity_label(c.severity),
             scope_label(c.scope)
@@ -1154,7 +1165,9 @@ pub fn action_text(action: i32) -> &'static str {
              late or skip leader turns (their logs count skipped turns), normal there means \
              this node receives GLOBAL frames late: check its peers"
         }
-        ConditionAction::Unspecified => "see this node's log",
+        ConditionAction::Unspecified => {
+            "update or restart qclient, which does not know this action"
+        }
     }
 }
 
@@ -2413,5 +2426,113 @@ mod tests {
             .find(|s| s.kind == ConditionKind::GlobalHeadUnchanged as i32)
             .unwrap();
         assert_eq!((source.observed_unix_ms, source.tracked), (0, 0));
+    }
+
+    /// A newer node serves kinds and actions this client lacks: the text
+    /// says this client is older and how to fix that, not to read the log.
+    #[test]
+    fn an_unknown_kind_names_an_older_qclient() {
+        let c = HealthCondition {
+            kind: 999,
+            severity: ConditionSeverity::Warning as i32,
+            scope: ConditionScope::Network as i32,
+            action: 999,
+            affected: 1,
+            tracked: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            notice_text(&c),
+            "Health condition 999 (warning, the network) unknown to this qclient, older than the \
+             node: update or restart qclient (the node's log names it).",
+            "the notice of a kind this client lacks"
+        );
+        assert_eq!(
+            action_text(c.action),
+            "update or restart qclient, which does not know this action"
+        );
+    }
+
+    /// Every notice states each number once: a figure restated, or a
+    /// derived value equal to a shown one, is noise in a one-row notice.
+    #[test]
+    fn every_notice_states_each_number_once() {
+        let numbers = |text: &str| -> Vec<String> {
+            text.split(|ch: char| !ch.is_ascii_digit())
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let global = |advanced_frames, span_secs, reachable| GlobalProgress {
+            head: 9_000,
+            advanced_frames,
+            span_secs,
+            provers: 7,
+            reachable,
+            quorum: 5,
+        };
+        let wait = |batch_from_frame| ExpectedWait {
+            head_frame: 1_000,
+            until_frame: 1_250,
+            batch_from_frame,
+            expected_secs: 600,
+        };
+        let kinds: Vec<i32> = (0..64)
+            .filter(|kind| ConditionKind::try_from(*kind).is_ok())
+            .chain([999])
+            .collect();
+        let mut rendered = Vec::new();
+        for kind in kinds {
+            let threshold = match ConditionKind::try_from(kind) {
+                Ok(ConditionKind::GlobalFramesSlow) => GLOBAL_MIN_FRAMES_PER_HOUR,
+                Ok(ConditionKind::GlobalAppFramesBehind) => 100,
+                _ => 120,
+            };
+            let globals = [
+                None,
+                // The usual span: the full hour, one sample short of it.
+                Some(global(217, 3_600, 3)),
+                Some(global(217, 3_585, 3)),
+                Some(global(160, 1_800, 6)),
+                // A rate that rounds down to the count.
+                Some(global(3, 3_480, 3)),
+            ];
+            for severity in [ConditionSeverity::Info, ConditionSeverity::Warning] {
+                for global in &globals {
+                    // A slow condition always carries its progress.
+                    if global.is_none() && kind == ConditionKind::GlobalFramesSlow as i32 {
+                        continue;
+                    }
+                    for wait in [wait(1_250), wait(1_300)] {
+                        rendered.push(notice_text(&HealthCondition {
+                            kind,
+                            severity: severity as i32,
+                            scope: ConditionScope::Network as i32,
+                            affected: 3,
+                            tracked: 7,
+                            threshold,
+                            global: *global,
+                            wait: Some(wait),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+        }
+        let offenders: Vec<&String> = rendered
+            .iter()
+            .filter(|text| {
+                let tokens = numbers(text);
+                let unique: std::collections::HashSet<&String> = tokens.iter().collect();
+                unique.len() != tokens.len()
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a notice states a number twice: {offenders:?}"
+        );
+        assert!(rendered
+            .iter()
+            .any(|text| text.contains("in the last hour")));
     }
 }
