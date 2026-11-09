@@ -760,6 +760,187 @@ pub(crate) fn prewarm_sectors(
     Ok(())
 }
 
+/// GLOBAL refuses a precommit signed more than 10 frames before the frame
+/// that takes it: a signed precommit is resent unchanged for this many
+/// frames from its signing, which leaves its last copy time to land.
+const PRECOMMIT_REUSE_FRAMES: u64 = 6;
+/// Frames between two sends of the same precommit.
+const PRECOMMIT_RESEND_FRAMES: u64 = 3;
+/// Frames before a certificate GLOBAL has not taken is sent again: archives
+/// keep a message for 10 finalized frames, so an earlier copy is only a
+/// duplicate. The wait doubles at each resend, up to
+/// [`CERTIFICATE_RESEND_MAX_FRAMES`].
+const CERTIFICATE_RESEND_FRAMES: u64 = 15;
+const CERTIFICATE_RESEND_MAX_FRAMES: u64 = 120;
+/// How far the frame the sector pool was last polled at may lie ahead of a
+/// poll's frame: an hour at 10 s frames, far more than application engines'
+/// GLOBAL frames differ by. One further ahead is not a poll of this node's.
+const POLL_AHEAD_FRAMES: u64 = 360;
+/// Frames between two capacity traffic summary lines.
+const POLL_SUMMARY_FRAMES: u64 = 60;
+
+/// Capacity traffic since the last summary line.
+struct Pacing {
+    polls: std::sync::atomic::AtomicU64,
+    precommits_signed: std::sync::atomic::AtomicU64,
+    precommits_resent: std::sync::atomic::AtomicU64,
+    precommits_held: std::sync::atomic::AtomicU64,
+    certificates_sent: std::sync::atomic::AtomicU64,
+    certificates_held: std::sync::atomic::AtomicU64,
+    summary_at: Mutex<Option<u64>>,
+}
+static PACING: Pacing = Pacing {
+    polls: std::sync::atomic::AtomicU64::new(0),
+    precommits_signed: std::sync::atomic::AtomicU64::new(0),
+    precommits_resent: std::sync::atomic::AtomicU64::new(0),
+    precommits_held: std::sync::atomic::AtomicU64::new(0),
+    certificates_sent: std::sync::atomic::AtomicU64::new(0),
+    certificates_held: std::sync::atomic::AtomicU64::new(0),
+    summary_at: Mutex::new(None),
+};
+fn tally(counter: &std::sync::atomic::AtomicU64) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count a poll at `frame`, and log one summary line of capacity traffic
+/// every [`POLL_SUMMARY_FRAMES`] frames that sent any.
+fn poll_summary(frame: u64) {
+    tally(&PACING.polls);
+    let mut at = PACING
+        .summary_at
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let since = *at.get_or_insert(frame);
+    if since <= frame && frame < since.saturating_add(POLL_SUMMARY_FRAMES) {
+        return;
+    }
+    *at = Some(frame);
+    let take = |c: &std::sync::atomic::AtomicU64| c.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let polls = take(&PACING.polls);
+    let (signed, resent, held) = (
+        take(&PACING.precommits_signed),
+        take(&PACING.precommits_resent),
+        take(&PACING.precommits_held),
+    );
+    let (sent, backed_off) = (
+        take(&PACING.certificates_sent),
+        take(&PACING.certificates_held),
+    );
+    if signed + resent + sent > 0 {
+        info!(
+            frame,
+            frames = frame.saturating_sub(since),
+            polls,
+            precommits_signed = signed,
+            precommits_resent = resent,
+            precommits_held = held,
+            certificates_sent = sent,
+            certificates_backed_off = backed_off,
+            "sector capacity traffic: the pool is polled once per new GLOBAL frame, a \
+             precommit is resent unchanged while GLOBAL takes it, and a certificate \
+             GLOBAL has not taken is resent at a widening interval"
+        );
+    }
+}
+
+/// Whether the sector pool polls at `frame`, recorded in `path`: once per
+/// new GLOBAL frame. Each application engine polls with the GLOBAL frame it
+/// has seen, and those differ: a poll from a frame at or below the last one
+/// polled would sign and send its sectors' messages again.
+fn poll_due(path: &Path, frame: u64) -> Result<bool> {
+    let last = fs::read(path)
+        .ok()
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(u64::from_be_bytes);
+    if last.is_some_and(|last| frame <= last && last <= frame.saturating_add(POLL_AHEAD_FRAMES)) {
+        return Ok(false);
+    }
+    atomic(path, &frame.to_be_bytes())?;
+    Ok(true)
+}
+
+/// The precommit `sector` sends for `target` at `frame`, if one is due. It
+/// is signed once and resent unchanged every [`PRECOMMIT_RESEND_FRAMES`],
+/// so archives and the GLOBAL leader hold and check one copy; it is signed
+/// again for a new target, or [`PRECOMMIT_REUSE_FRAMES`] after its signing,
+/// before GLOBAL would find it stale.
+fn precommit_due(
+    sector: &Sector,
+    member: &[u8; 32],
+    target: u64,
+    frame: u64,
+    signer: &dyn quil_types::crypto::Signer,
+) -> Result<Option<Vec<u8>>> {
+    use quil_execution::global_intrinsic::persistent_storage as protocol;
+    let path = sector.dir.join("precommit");
+    let key = digest(&[target.to_be_bytes().as_slice(), &sector.cert.to_bytes()].concat());
+    let held = fs::read(&path)
+        .ok()
+        .filter(|b| b.len() > 48 && b[..32] == key);
+    if let Some(mut held) = held {
+        let signed_at = u64::from_be_bytes(held[32..40].try_into().unwrap());
+        let sent_at = u64::from_be_bytes(held[40..48].try_into().unwrap());
+        if signed_at <= sent_at && sent_at <= frame && frame - signed_at < PRECOMMIT_REUSE_FRAMES {
+            if frame - sent_at < PRECOMMIT_RESEND_FRAMES {
+                tally(&PACING.precommits_held);
+                return Ok(None);
+            }
+            held[40..48].copy_from_slice(&frame.to_be_bytes());
+            atomic(&path, &held)?;
+            tally(&PACING.precommits_resent);
+            return Ok(Some(held.split_off(48)));
+        }
+    }
+    let mut message = protocol::CapacityMessage {
+        member: *member,
+        epoch: target,
+        certificate: sector.cert,
+        signed_at: frame,
+        signature: Vec::new(),
+        proof: Vec::new(),
+    };
+    message.signature =
+        signer.sign_with_domain(&message.signing_message(), &protocol::capacity_domain()?)?;
+    let bytes = message.envelope().to_canonical_bytes();
+    let at = frame.to_be_bytes();
+    atomic(&path, &[key.as_slice(), &at, &at, &bytes].concat())?;
+    tally(&PACING.precommits_signed);
+    Ok(Some(bytes))
+}
+
+/// When a sector's certificate for `target` and `beacon_frame` was last
+/// sent, and how many times.
+fn certificate_sends(dir: &Path, target: u64, beacon_frame: u64) -> Option<(u64, u64)> {
+    let bytes = <[u8; 32]>::try_from(fs::read(dir.join("certificate-sent")).ok()?).ok()?;
+    let at = |i: usize| u64::from_be_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    (at(0) == target && at(1) == beacon_frame).then_some((at(2), at(3)))
+}
+
+/// Whether a sector's certificate is sent at `frame`: at once the first
+/// time, then, while GLOBAL has not taken it, again after
+/// [`CERTIFICATE_RESEND_FRAMES`], doubled at each resend.
+fn certificate_due(dir: &Path, target: u64, beacon_frame: u64, frame: u64) -> bool {
+    let Some((sent_at, sends)) = certificate_sends(dir, target, beacon_frame) else {
+        return true;
+    };
+    let wait = CERTIFICATE_RESEND_FRAMES
+        .saturating_mul(1 << sends.saturating_sub(1).min(8))
+        .min(CERTIFICATE_RESEND_MAX_FRAMES);
+    frame < sent_at || frame >= sent_at.saturating_add(wait)
+}
+
+/// Record that a sector's certificate was sent at `frame`.
+fn certificate_sent(dir: &Path, target: u64, beacon_frame: u64, frame: u64) -> Result<()> {
+    let sends = certificate_sends(dir, target, beacon_frame).map_or(0, |(_, sends)| sends);
+    tally(&PACING.certificates_sent);
+    atomic(
+        &dir.join("certificate-sent"),
+        &[target, beacon_frame, frame, sends.saturating_add(1)]
+            .map(u64::to_be_bytes)
+            .concat(),
+    )
+}
+
 // A lost shard or a restart must not strand the pool behind an unfinished
 // reservation. Capacity is independent of that shard's data; finish it here.
 fn resume_reserved_sector(
@@ -849,10 +1030,10 @@ pub(crate) fn poll_sector_certificates(
     }
     // All application engines share this pool. Poll it once per GLOBAL frame.
     let poll = root.join("last-poll");
-    if fs::read(&poll).ok().as_deref() == Some(frame.to_be_bytes().as_slice()) {
+    if !poll_due(&poll, frame)? {
         return Ok(());
     }
-    atomic(&poll, &frame.to_be_bytes())?;
+    poll_summary(frame);
     let snapshot = global.capture_committed_snapshot()?;
     for entry in fs::read_dir(root).map_err(io)?.flatten() {
         if !sector_directory(&entry.path()) {
@@ -918,17 +1099,9 @@ pub(crate) fn poll_sector_certificates(
         let pending = protocol::committed_pending(snapshot.as_ref(), member, &sector.cert, target)?;
         let pending = pending.filter(|p| p.epoch == target && p.certificate == sector.cert);
         let Some(pending) = pending else {
-            let mut message = protocol::CapacityMessage {
-                member: *member,
-                epoch: target,
-                certificate: sector.cert,
-                signed_at: frame,
-                signature: Vec::new(),
-                proof: Vec::new(),
-            };
-            message.signature = signer
-                .sign_with_domain(&message.signing_message(), &protocol::capacity_domain()?)?;
-            publish(message.envelope().to_canonical_bytes());
+            if let Some(precommit) = precommit_due(&sector, member, target, frame, signer)? {
+                publish(precommit);
+            }
             continue;
         };
         let beacon_frame = pending.committed_at.saturating_add(1);
@@ -960,6 +1133,10 @@ pub(crate) fn poll_sector_certificates(
         );
         if kept.is_none() && !cache.is_file() {
             resume_reserved_sector(store, member, sector.dir.clone())?;
+            continue;
+        }
+        if !certificate_due(&sector.dir, target, beacon_frame, frame) {
+            tally(&PACING.certificates_held);
             continue;
         }
         let member = *member;
@@ -1029,6 +1206,7 @@ pub(crate) fn poll_sector_certificates(
                     }
                     Err(e) => return Err(io(e)),
                 };
+                certificate_sent(&sector.dir, target, beacon_frame, frame)?;
                 publish(
                     protocol::CapacityMessage {
                         member,
@@ -1750,8 +1928,10 @@ mod tests {
             }
             assert!(idle);
             drop(proving);
+            // A certificate GLOBAL has not taken is sent again once the
+            // archives have let the last copy go.
             poll_sector_certificates(
-                frame + 4,
+                frame + 3 + 15,
                 &member,
                 &global,
                 clock.clone(),
@@ -1777,7 +1957,7 @@ mod tests {
         global.commit(frame + 4).unwrap();
         for i in 0..20 {
             poll_sector_certificates(
-                frame + 5 + i,
+                frame + 19 + i,
                 &member,
                 &global,
                 clock.clone(),
@@ -1856,6 +2036,212 @@ mod tests {
             eprintln!("sector_nodes={n} replica_mib={} cold_labels_seconds={:.3} certified_seconds={:.3} round={round} changed_encode_seconds={:.3} fresh_proof_seconds={:.3} fresh_proof_bytes={}",
                 n*32>>20,labelled.as_secs_f64(),certified.as_secs_f64(),encoded_time.as_secs_f64(),begin.elapsed().saturating_sub(encoded_time).as_secs_f64(),fresh.to_bytes().len());
         }
+        gates(false);
+    }
+    /// A registered member with one labelled, uncertified sector, and the
+    /// messages its polls send.
+    struct Pool {
+        _dir: tempfile::TempDir,
+        member: [u8; 32],
+        global: Arc<HypergraphCrdt>,
+        clock: Arc<quil_store::testing::InMemoryClockStore>,
+        frame: u64,
+        path: PathBuf,
+        recv: std::sync::mpsc::Receiver<Vec<u8>>,
+        publish: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    }
+    impl Pool {
+        fn new() -> Self {
+            use quil_execution::global_intrinsic::materialize;
+            use quil_execution::{
+                global_schema::GLOBAL_INTRINSIC_ADDRESS,
+                hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+            };
+            use quil_types::crypto::Signer;
+            gates(true);
+            let dir = tempfile::tempdir().unwrap();
+            crate::storage_labels::install_with_space(
+                dir.path().to_owned(),
+                crate::storage_labels::ample_space(),
+            );
+            let store = crate::storage_labels::installed().unwrap();
+            let key = TestIdentity.public_key();
+            let member = materialize::prover_address_from_pubkey(key).unwrap();
+            let global = super::super::tests::test_crdt();
+            let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+            let state = HypergraphState::new(global.clone());
+            let prover = materialize::create_prover_vertex_tree(key, 1).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS,
+                    &member,
+                    &vertex_adds_discriminator().unwrap(),
+                    frame,
+                    quil_execution::prover_registry::vertex_tree_to_blob(&prover),
+                )
+                .unwrap();
+            state.commit().unwrap();
+            global.commit(frame).unwrap();
+            let (path, id, n) = reserve(store, &member, b"paced leaf", 1500, 100).unwrap();
+            initialize(store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+            let (send, recv) = std::sync::mpsc::channel::<Vec<u8>>();
+            Self {
+                _dir: dir,
+                member,
+                global,
+                clock: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+                frame,
+                path,
+                recv,
+                publish: Arc::new(move |bytes: Vec<u8>| send.send(bytes).unwrap()),
+            }
+        }
+        /// Poll at `frame`, wait for the sector's proof job to end, and
+        /// return what was sent.
+        fn poll(&self, frame: u64) -> Vec<Vec<u8>> {
+            poll_sector_certificates(
+                frame,
+                &self.member,
+                &self.global,
+                self.clock.clone(),
+                &TestIdentity,
+                self.publish.clone(),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            while File::open(self.path.join("proving")).is_ok_and(|f| f.try_lock().is_err()) {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(600),
+                    "the sector's proof job never ended"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.recv.try_iter().collect()
+        }
+    }
+    fn decoded(
+        bytes: &[u8],
+    ) -> quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof {
+        quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(
+            bytes,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn engines_at_different_frames_poll_the_sector_pool_once_per_new_frame() {
+        let pool = Pool::new();
+        let f = pool.frame;
+        // Application engines poll with the GLOBAL frame each has seen,
+        // which lie a frame or more apart and arrive in any order. Only the
+        // first poll of a new frame sends; a precommit sent at f + 1 is not
+        // due again at f + 2.
+        let sent: usize = [f + 1, f, f + 1, f, f + 2, f + 1, f + 2]
+            .into_iter()
+            .map(|frame| pool.poll(frame).len())
+            .sum();
+        assert_eq!(
+            sent, 1,
+            "flood: {sent} precommits from polls of two new frames, one wanted (polled-again)"
+        );
+        gates(false);
+    }
+    #[test]
+    fn a_sectors_precommit_is_signed_once_and_resent_unchanged_while_global_takes_it() {
+        use quil_execution::global_intrinsic::persistent_storage as protocol;
+        use quil_execution::hypergraph_state::HypergraphState;
+        let pool = Pool::new();
+        let mut sends = Vec::new();
+        for frame in pool.frame + 1..=pool.frame + 13 {
+            sends.extend(pool.poll(frame).into_iter().map(|bytes| (frame, bytes)));
+        }
+        let state = HypergraphState::new(pool.global.clone());
+        for (frame, bytes) in &sends {
+            // Each copy still lands if GLOBAL takes it four frames later.
+            protocol::check_capacity(frame + 4, &decoded(bytes), &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap_or_else(|e| {
+                panic!("stale: GLOBAL refuses the precommit sent at frame {frame}: {e}")
+            });
+        }
+        for pair in sends.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0 + 3,
+                "flood: precommits went out at frames {} and {} (resent-sooner)",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        let distinct: std::collections::BTreeSet<&Vec<u8>> =
+            sends.iter().map(|(_, bytes)| bytes).collect();
+        assert!(
+            distinct.len() <= 3,
+            "flood: {} distinct precommits signed in 13 frames (re-signed)",
+            distinct.len()
+        );
+        assert!(
+            sends.len() >= 4,
+            "a precommit GLOBAL has not taken is still resent: {} sends",
+            sends.len()
+        );
+        gates(false);
+    }
+    #[test]
+    fn a_certificate_global_has_not_taken_is_resent_at_a_widening_interval() {
+        use quil_execution::global_intrinsic::persistent_storage as protocol;
+        use quil_execution::hypergraph_state::HypergraphState;
+        let pool = Pool::new();
+        let f = pool.frame;
+        let precommit = pool.poll(f + 1).pop().expect("a precommit");
+        let state = HypergraphState::new(pool.global.clone());
+        let records =
+            protocol::check_capacity(f + 1, &decoded(&precommit), &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        protocol::apply(&state, f + 1, &records).unwrap();
+        state.commit().unwrap();
+        pool.global.commit(f + 1).unwrap();
+        let txn = pool.clock.new_transaction(false).unwrap();
+        pool.clock
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: f + 2,
+                        output: vec![9; 516],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let mut sends = Vec::new();
+        for frame in f + 3..f + 64 {
+            for bytes in pool.poll(frame) {
+                let magic = decoded(&bytes).proof[..4].to_vec();
+                assert!(magic == b"PSC2" || magic == b"PSC4", "only certificates");
+                sends.push(frame);
+            }
+        }
+        assert_eq!(
+            sends.first(),
+            Some(&(f + 3)),
+            "the first certificate goes at once"
+        );
+        for pair in sends.windows(2) {
+            assert!(
+                pair[1] >= pair[0] + 15,
+                "flood: certificates went out at frames {} and {} (resent-sooner)",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(
+            sends.len() >= 3,
+            "a certificate GLOBAL has not taken is still resent: {sends:?}"
+        );
         gates(false);
     }
 }
