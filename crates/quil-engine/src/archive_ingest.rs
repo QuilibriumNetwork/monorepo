@@ -3073,8 +3073,7 @@ impl ArchiveFrameVerifier {
         else {
             return FrameCheck::Refused;
         };
-        let (address, frame_number, requests_root) =
-            (&header.address, header.frame_number, &header.requests_root);
+        let (address, frame_number) = (&header.address, header.frame_number);
         // 1. Quorum BLS cert + VDF against the shard committee. A frame with
         // no certificate of its own is one a certified descendant finalized
         // (see `admit`): it gets every check but the quorum here, and is only
@@ -3140,51 +3139,107 @@ impl ArchiveFrameVerifier {
         }
 
         // 2. Verify the carried requests recompute to the signed root.
-        let canonical: Vec<Vec<u8>> = frame
-            .requests
-            .iter()
-            // As the application committee judges it: an application frame
-            // never carries a claim or a nullify report.
-            .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
-            .collect();
-        if canonical.len() != frame.requests.len() {
-            warn!(
-                frame = frame_number,
-                address = %hex::encode(address),
-                converted = canonical.len(),
-                total = frame.requests.len(),
-                "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
-                frame.requests.len().saturating_sub(canonical.len()),
-                frame.requests.len(),
-            );
-            return FrameCheck::Refused;
-        }
-        let recomputed = match compute_requests_root(
-            &canonical,
-            address,
-            frame_number,
+        match requests_match_root(
+            frame,
             Some(self.execution_manager.as_ref()),
             Some(self.inclusion_prover.as_ref()),
             self.has_forest,
         ) {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(()) => FrameCheck::Admit { certified },
+            Err(RequestsMismatch::Unconvertible { converted, total }) => {
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(address),
+                    converted,
+                    total,
+                    "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
+                    total.saturating_sub(converted),
+                    total,
+                );
+                FrameCheck::Refused
+            }
+            Err(RequestsMismatch::Recompute(e)) => {
                 warn!(
                     frame = frame_number,
                     address = %hex::encode(address),
                     error = %e,
                     "archive ingest: requests_root recompute errored — rejecting frame"
                 );
-                return FrameCheck::Refused;
+                FrameCheck::Refused
             }
-        };
-        if recomputed != *requests_root {
-            warn!(frame = frame_number, address = %hex::encode(address), "archive ingest: requests_root mismatch — rejecting");
-            return FrameCheck::Refused;
+            Err(RequestsMismatch::Root) => {
+                warn!(frame = frame_number, address = %hex::encode(address), "archive ingest: requests_root mismatch — rejecting");
+                FrameCheck::Refused
+            }
         }
-
-        FrameCheck::Admit { certified }
     }
+}
+
+/// Why a frame's carried requests do not match its header's `requests_root`.
+#[derive(Debug)]
+pub enum RequestsMismatch {
+    /// `total - converted` request bundles have no canonical encoding.
+    Unconvertible { converted: usize, total: usize },
+    /// The root could not be recomputed.
+    Recompute(quil_types::error::QuilError),
+    /// The recomputed root differs from the header's.
+    Root,
+}
+
+impl std::fmt::Display for RequestsMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unconvertible { converted, total } => write!(
+                f,
+                "{} of {total} request bundles have no canonical encoding",
+                total.saturating_sub(*converted)
+            ),
+            Self::Recompute(error) => write!(f, "requests_root recompute errored: {error}"),
+            Self::Root => {
+                f.write_str("the carried requests do not match the header's requests_root")
+            }
+        }
+    }
+}
+
+/// Whether `frame`'s carried requests recompute to its header's signed
+/// `requests_root`, as the application committee judges them: the certificate
+/// covers the header only, so this defends against a relay swapping requests
+/// under an otherwise valid header.
+pub fn requests_match_root(
+    frame: &AppShardFrame,
+    execution_manager: Option<&quil_execution::ExecutionEngineManager>,
+    inclusion_prover: Option<&dyn InclusionProver>,
+    has_forest: bool,
+) -> Result<(), RequestsMismatch> {
+    let Some(header) = frame.header.as_ref() else {
+        return Err(RequestsMismatch::Root);
+    };
+    let canonical: Vec<Vec<u8>> = frame
+        .requests
+        .iter()
+        // An application frame never carries a claim or a nullify report.
+        .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
+        .collect();
+    if canonical.len() != frame.requests.len() {
+        return Err(RequestsMismatch::Unconvertible {
+            converted: canonical.len(),
+            total: frame.requests.len(),
+        });
+    }
+    let recomputed = compute_requests_root(
+        &canonical,
+        &header.address,
+        header.frame_number,
+        execution_manager,
+        inclusion_prover,
+        has_forest,
+    )
+    .map_err(RequestsMismatch::Recompute)?;
+    if recomputed != header.requests_root {
+        return Err(RequestsMismatch::Root);
+    }
+    Ok(())
 }
 
 /// The digest of a frame's encoding as it is stored, with its header's
@@ -3380,7 +3435,7 @@ struct KnownShards {
 }
 
 impl TrackedShards {
-    fn new(
+    pub fn new(
         registry: Arc<dyn ProverRegistryTrait>,
         hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> Self {
@@ -3403,9 +3458,13 @@ impl TrackedShards {
     /// when it was last read [`TRACKED_SHARDS_REFRESH`] ago or more and
     /// `address` is neither held nor known.
     fn tracks(&self, address: &[u8], held: &HeldBodies) -> bool {
-        if held.cursor(address).is_some() {
-            return true;
-        }
+        held.cursor(address).is_some() || self.registered(address)
+    }
+
+    /// Whether the prover registry, last read, names `address` as a shard
+    /// with provers. Reads it again when it was last read
+    /// [`TRACKED_SHARDS_REFRESH`] ago or more and `address` is not known.
+    pub fn registered(&self, address: &[u8]) -> bool {
         let mut known = self.known();
         if known.filters.contains(address) {
             return true;

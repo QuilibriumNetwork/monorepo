@@ -1469,9 +1469,10 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// Stop the work that runs on threads of its own and holds store handles:
-/// the storage jobs (`quil_engine::storage_jobs`) and the consensus hosts
+/// the storage jobs (`quil_engine::storage_jobs`), the consensus hosts
 /// (`quil_cw_consensus::engine_host`, GLOBAL on a committee member and app
-/// shards on a worker). The node's runtime ending does not stop them, and
+/// shards on a worker) and a cluster master's shard mirror worker
+/// (`master_node::message_loop`). The node's runtime ending does not stop them, and
 /// one that drops the last handle of a store while the process exits runs
 /// RocksDB's close under its static teardown: an abort ("pthread lock:
 /// Invalid argument"). Whatever outlives [`STOP_GRACE`] is cut short by
@@ -1479,6 +1480,7 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 fn stop_detached_work() {
     let started = Instant::now();
     let hosts = quil_cw_consensus::engine_host::stop_hosts();
+    let mirrors = master_node::message_loop::stop_shard_mirrors();
     let jobs = quil_engine::storage_jobs::shut_down(STOP_GRACE);
     // Storage replica conversions and compactions (`quil_store::replica_store`).
     let replica_work = quil_store::replica_store::wait_for_background_work(
@@ -1508,6 +1510,17 @@ fn stop_detached_work() {
             grace_secs = STOP_GRACE.as_secs(),
             action = "no action needed: their journals and stores recover at the next start",
             "exiting without waiting for consensus hosts still running"
+        );
+    }
+    let mirrors_left = master_node::message_loop::wait_for_shard_mirrors(
+        STOP_GRACE.saturating_sub(started.elapsed()),
+    );
+    if mirrors > 0 && mirrors_left > 0 {
+        info!(
+            threads = mirrors_left,
+            grace_secs = STOP_GRACE.as_secs(),
+            action = "no action needed: the stores replay their write-ahead log at the next start",
+            "exiting without waiting for the shard mirror worker still checking a frame"
         );
     }
     if !jobs.is_empty() {

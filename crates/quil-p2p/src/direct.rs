@@ -369,6 +369,7 @@ mod tests {
             bitmask: vec![1, 2],
             data: vec![payload],
             from: vec![3, 4],
+            via: vec![3, 4],
             direct: false,
         };
         stats.note_gossip_receive(&tx.try_send(message(10)));

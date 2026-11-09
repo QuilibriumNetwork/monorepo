@@ -324,6 +324,7 @@ impl DirectGlobalConsensusPublisher {
                             bitmask: bm,
                             data: d,
                             from: self_id,
+                            via: Vec::new(),
                             direct: false,
                         })
                         .await;

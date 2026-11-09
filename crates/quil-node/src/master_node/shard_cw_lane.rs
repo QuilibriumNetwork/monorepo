@@ -75,6 +75,7 @@ mod tests {
             bitmask: vec![bitmask],
             data: vec![bitmask],
             from: Vec::new(),
+            via: Vec::new(),
             direct: false,
         }
     }

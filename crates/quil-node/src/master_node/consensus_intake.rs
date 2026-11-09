@@ -369,6 +369,7 @@ impl ConsensusIntake {
             message: ReceivedMessage {
                 bitmask,
                 data,
+                via: from.clone(),
                 from,
                 direct: false,
             },
