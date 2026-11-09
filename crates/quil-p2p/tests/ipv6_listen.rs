@@ -3,6 +3,8 @@
 //! IPv6 inbound, IPv4 only through its carrier's NAT), and an IPv4 config stays
 //! on IPv4. A host without an IPv6 loopback skips with the reason.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use quil_p2p::{P2PHandle, P2PNode, ReceivedMessage};
@@ -21,12 +23,46 @@ fn ipv6_loopback(test: &str) -> bool {
     }
 }
 
+/// Ports handed out in this process by `free_port`.
+static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// A port free on the IPv4 loopback a moment ago and not handed out before in
+/// this process. Each probe listener closes on return, so the kernel can give
+/// two calls the same port (nor does an IPv6 or UDP listener hold its port
+/// against an IPv4 TCP probe); a test's ports must differ.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    distinct_port(&HANDED_OUT, || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
+}
+
+/// The first port from `probe` not in `handed_out`, recorded there.
+fn distinct_port(handed_out: &Mutex<BTreeSet<u16>>, mut probe: impl FnMut() -> u16) -> u16 {
+    for _ in 0..1000 {
+        let port = probe();
+        if handed_out.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+    panic!("1000 probes returned only ports handed out before");
+}
+
+/// A port the kernel gives two probes in a row is handed out once.
+#[test]
+fn a_port_probed_twice_is_handed_out_once() {
+    let handed_out = Mutex::new(BTreeSet::new());
+    let mut probes = [40603, 40603, 40611].into_iter();
+    let mut probe = || probes.next().unwrap();
+    assert_eq!(distinct_port(&handed_out, &mut probe), 40603);
+    assert_eq!(
+        distinct_port(&handed_out, &mut probe),
+        40611,
+        "a port handed out twice"
+    );
 }
 
 fn base_config() -> quil_config::P2PConfig {
