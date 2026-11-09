@@ -2977,6 +2977,38 @@ impl Kept {
         (MerkleTree::from_digests(columns).commitment(Tree::Column) == self.comm_c).then_some(last)
     }
 
+    /// [`Self::verified_last_layer`] at every node, not a sample: for a
+    /// sector set up once from these labels, whose certificate would commit
+    /// to any damaged node a sample missed. Reads each layer once, a chunk
+    /// of nodes at a time.
+    pub fn wholly_verified_last_layer(&self) -> Option<Vec<Digest>> {
+        use quil_crypto::storage_proof::{column_digest, MerkleTree, Tree};
+        let n = self.n;
+        let columns = self.columns()?;
+        let last = self.last_layer().filter(|last| last.len() as u64 == n)?;
+        let size = n * NODE_BYTES as u64;
+        for at in (0..n).step_by(1024) {
+            let count = (n - at).min(1024) as usize;
+            let mut layers = Vec::with_capacity(self.depth - 1);
+            for layer in 0..(self.depth - 1) as u64 {
+                let offset = layer * size + at * NODE_BYTES as u64;
+                layers.push(self.read(offset, count * NODE_BYTES)?);
+            }
+            for i in 0..count {
+                let (v, from) = (at as usize + i, i * NODE_BYTES);
+                let mut labels = Vec::with_capacity(self.depth);
+                for layer in &layers {
+                    labels.push(Node::try_from(&layer[from..from + NODE_BYTES]).ok()?);
+                }
+                labels.push(hash::to_bytes(&last[v]));
+                if column_digest(&labels)? != hash::to_bytes(&columns[v]) {
+                    return None;
+                }
+            }
+        }
+        (MerkleTree::from_digests(columns).commitment(Tree::Column) == self.comm_c).then_some(last)
+    }
+
     fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
         let mut file = self.layers.lock().ok()?;
         file.seek(SeekFrom::Start(offset)).ok()?;

@@ -4565,7 +4565,7 @@ pub(crate) mod tests {
     /// The lines logged at info or above from now on, by any thread: storage
     /// jobs log on their own. Installs this process's subscriber (nextest
     /// runs each test in its own process).
-    fn capture_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    pub(super) fn capture_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {

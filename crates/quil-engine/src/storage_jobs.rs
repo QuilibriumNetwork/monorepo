@@ -443,6 +443,13 @@ pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
     true
 }
 
+/// The jobs queued in `lane` behind the one running there: a test counts
+/// what a lane holds while its running job waits.
+#[cfg(test)]
+pub(crate) fn queued_in_lane(lane: &[u8]) -> usize {
+    jobs().lanes().get(lane).map_or(0, |lane| lane.queued.len())
+}
+
 /// Bytes the storage jobs hold now through their reservations: the labelling
 /// buffers of the leaves labelled now and ahead, and the replicas of seals
 /// and settlements. A job holds its reservation, as a peak, from its grant.
