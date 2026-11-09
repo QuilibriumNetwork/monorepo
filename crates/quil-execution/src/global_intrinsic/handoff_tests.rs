@@ -3398,3 +3398,66 @@ fn the_repair_rebuilds_a_sealed_split_and_reports_what_it_cannot_rebuild() {
         Recovery::Unresolved("the request record is absent")
     );
 }
+
+/// Mainnet's drain anchors start at the 2.1 genesis, which the environment
+/// cannot move; another network's at frame 1 unless it sets another.
+#[test]
+fn mainnet_drain_anchors_start_at_the_2_1_genesis() {
+    assert_eq!(
+        MAINNET_DRAIN_ANCHOR_FLOOR,
+        crate::token_intrinsic::constants::FRAME_2_1_CUTOVER
+    );
+    assert_eq!(drain_anchor_floor_for(0, None), 244_200);
+    assert_eq!(drain_anchor_floor_for(0, Some("7")), 244_200);
+    // The raise on mainnet comes from its constants, never the environment,
+    // and starts where committee sessions begin.
+    assert_eq!(
+        drain_anchor_raise_for(0, Some("1"), Some("2")),
+        (1_072_080, 861_840)
+    );
+    assert_eq!(
+        MAINNET_DRAIN_ANCHOR_RAISE_FRAME,
+        Some(1489 * quil_types::consensus::EPOCH_LENGTH_FRAMES)
+    );
+    assert_eq!(drain_anchor_raise_for(1, None, None), (u64::MAX, 0));
+    assert_eq!(drain_anchor_raise_for(1, Some("6"), Some("9")), (6, 9));
+    assert_eq!(drain_anchor_floor_for(1, None), 1);
+    assert_eq!(drain_anchor_floor_for(1, Some("0")), 1, "0 names no frame");
+    assert_eq!(drain_anchor_floor_for(1, Some("not a frame")), 1);
+    assert_eq!(drain_anchor_floor_for(1, Some("7")), 7);
+}
+
+/// A mistyped setting off mainnet is refused rather than read as unset, the
+/// raise's two settings come together, and mainnet ignores all of them.
+#[test]
+fn drain_anchor_settings_off_mainnet_must_parse_and_come_together() {
+    let problem = drain_anchor_settings_problem;
+    assert_eq!(problem(0, Some("x"), Some("y"), None), None);
+    assert_eq!(problem(1, None, None, None), None);
+    assert_eq!(problem(1, Some("7"), Some("6"), Some("9")), None);
+    assert!(problem(1, Some("7x"), None, None)
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_FLOOR "));
+    assert!(problem(1, None, Some("six"), Some("9"))
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME "));
+    assert!(problem(1, None, Some("6"), Some("nine"))
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME "));
+    assert!(problem(1, None, Some("6"), None)
+        .unwrap()
+        .contains("set together"));
+    assert!(problem(1, None, None, Some("9"))
+        .unwrap()
+        .contains("set together"));
+}
+
+/// The raise applies from its frame, not before, and never lowers the floor.
+#[test]
+fn drain_anchor_raise_applies_from_its_frame_and_never_lowers_the_floor() {
+    assert_eq!(drain_anchor_floor_at_for(5, (6, 9), 2), 2);
+    assert_eq!(drain_anchor_floor_at_for(6, (6, 9), 2), 9);
+    assert_eq!(drain_anchor_floor_at_for(7, (6, 9), 2), 9);
+    assert_eq!(drain_anchor_floor_at_for(6, (6, 1), 2), 2);
+    assert_eq!(drain_anchor_floor_at_for(u64::MAX - 1, (u64::MAX, 9), 2), 2);
+}

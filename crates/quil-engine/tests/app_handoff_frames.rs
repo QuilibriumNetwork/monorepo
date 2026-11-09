@@ -2570,3 +2570,670 @@ fn a_refused_stored_copy_does_not_end_the_gap_fetch_before_the_valid_one() {
     assert_eq!(fixture.cursor(&source.filter), 3);
     assert_eq!(output(&stored(&fixture)), output(&frames[2]));
 }
+
+// Seal-drain anchors. A seal submission's drain headers are frames that
+// missed their GLOBAL window, so no window bounds the GLOBAL frame each names
+// as its anchor, and each header's output check reads that frame from the
+// clock store. The session certificate (or, for a notarized checkpoint, the
+// seal's) signs the header's output digest, which commits to the anchor only
+// through the anchor frame's output: a genuine header with its anchor
+// rewritten to a frame no node holds still passes the certificate, and the
+// read reports it unavailable. The materializer fails the whole GLOBAL frame
+// on an unavailable error and retries it for ever (`frame_materializer.rs`).
+// Validation checks the drain before the seal's own closing certificate.
+
+/// The GLOBAL frame that checks the rigs' seals.
+const DRAIN_FRAME: u64 = 10;
+/// The GLOBAL frame the rigs' drain header is anchored to.
+const DRAIN_ANCHOR: u64 = 3;
+/// The oldest GLOBAL frame the rigs hold, as a network's first frame: they
+/// hold frames 2 to 9 (`QUIL_SEAL_DRAIN_ANCHOR_FLOOR`, which a build without
+/// a floor ignores).
+const DRAIN_HISTORY_START: u64 = 2;
+/// Anchors no store in the rigs holds at [`DRAIN_FRAME`]: the frame itself,
+/// the next, far ahead, the largest number, and one below the held history.
+const DRAIN_UNHELD_ANCHORS: [u64; 5] = [DRAIN_FRAME, DRAIN_FRAME + 1, 1_000_000, u64::MAX, 1];
+/// Validations and executions of each submission, as the materializer
+/// retries a failed frame.
+const DRAIN_RETRIES: usize = 3;
+
+/// The output GLOBAL frame `number` has in the rigs' clock stores.
+fn drain_global_output(number: u64) -> Vec<u8> {
+    vec![0x40 ^ (number as u8); 32]
+}
+
+/// `frame` as GLOBAL carries it, its anchor included.
+fn canonical_anchored(frame: &AppShardFrame) -> CanonicalHeader {
+    let mut header = canonical(frame);
+    header.global_frame_number = frame.header.as_ref().unwrap().global_frame_number;
+    header
+}
+
+/// One submission as the GLOBAL message bundle a leader packs.
+fn handoff_bundle(sealed: &[u8]) -> Vec<u8> {
+    quil_execution::message_envelope::CanonicalMessageBundle {
+        requests: vec![Some(
+            quil_execution::message_envelope::CanonicalMessageRequest {
+                inner_type_prefix: handoff::TYPE_COMMITTEE_HANDOFF,
+                inner_bytes: sealed.to_vec(),
+            },
+        )],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A session whose frame 1 GLOBAL executed and whose frame 2, anchored to
+/// GLOBAL frame `anchor`, missed its window; a successor scheduled and the
+/// session's seal at frame 2. GLOBAL runs it as an archive does: the clock
+/// store holds GLOBAL frames 2 to 9, the engine manager has the frame-header
+/// dependencies, and seal drains are active from GLOBAL frame 6.
+struct DrainRig {
+    keys: Vec<FalconPrivateKey>,
+    source: Session,
+    fixture: Fixture,
+    intrinsic: GlobalIntrinsic,
+    manager: quil_execution::ExecutionEngineManager,
+    /// Frame 1, which GLOBAL executed.
+    first: CanonicalHeader,
+    /// Frame 2: certified by the session, or only notarized, which the seal
+    /// certifies from the checkpoint drain frame.
+    header: CanonicalHeader,
+    submission: CertificateSubmission,
+}
+
+impl DrainRig {
+    fn new(anchor: u64, certified: bool) -> Self {
+        Self::with_hole(anchor, certified, None)
+    }
+
+    /// [`Self::new`] on a store that lacks GLOBAL frame `hole`.
+    fn with_hole(anchor: u64, certified: bool, hole: Option<u64>) -> Self {
+        std::env::set_var(
+            "QUIL_SEAL_DRAIN_ANCHOR_FLOOR",
+            DRAIN_HISTORY_START.to_string(),
+        );
+        let keys = keys();
+        let source = session(&keys, vec![0x66; 32]);
+        let fixture = Fixture::new(&source);
+        for number in DRAIN_HISTORY_START..DRAIN_FRAME {
+            if Some(number) != hole {
+                store_global_frame(&fixture, number, &drain_global_output(number));
+            }
+        }
+        let intrinsic = fixture.intrinsic();
+        handoff::initialize(&fixture.state, 2, &source).unwrap();
+        commit(&fixture.state, 2);
+        let first = first_frame(&source, &keys);
+        let first_wire = canonical(&first);
+        intrinsic
+            .invoke_step(3, &first_wire.to_canonical_bytes().unwrap(), &fixture.state)
+            .unwrap();
+        commit(&fixture.state, 3);
+        let parent = first.header.as_ref().unwrap();
+        let mut frame = anchored_frame(
+            &source,
+            &keys,
+            2,
+            7,
+            5,
+            quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+                .unwrap()
+                .to_vec(),
+            anchor,
+            &if anchor == 0 {
+                Vec::new()
+            } else {
+                drain_global_output(anchor)
+            },
+        );
+        if !certified {
+            frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+        }
+        let header = canonical_anchored(&frame);
+        let request = handoff::schedule(
+            &fixture.state,
+            4,
+            vec![source.filter.clone()],
+            vec![DesiredCommittee {
+                filter: source.filter.clone(),
+                members: session(&self::keys(), source.filter.clone()).members,
+            }],
+        )
+        .unwrap();
+        commit(&fixture.state, 4);
+        let seal = Seal {
+            request: request.id().unwrap(),
+            session: source.id().unwrap(),
+            view: 11,
+            checkpoint: Checkpoint {
+                frame: 2,
+                view: 7,
+                digest: quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
+                state_roots: [[0; 32]; 4],
+                history_root: [0x66; 32],
+            },
+        };
+        let submission = CertificateSubmission {
+            certificate: sign(&source, &keys, 11, 7, seal.digest()),
+            seal,
+        };
+        handoff::set_seal_drain_frame_for_thread(Some(6));
+        handoff::set_seal_checkpoint_drain_frame_for_thread(if certified { None } else { Some(6) });
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let manager = quil_execution::ExecutionEngineManager::new(
+            fixture.inclusion.clone(),
+            crypto.key_manager,
+            fixture.state.crdt().clone(),
+            crypto.circuit_compiler,
+            fixture.clock.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
+        );
+        manager
+            .install_global_frame_header_deps(
+                fixture.registry.clone(),
+                Arc::new(ZeroRewards),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                fixture.inclusion.clone(),
+                fixture.prover.clone(),
+            )
+            .unwrap();
+        Self {
+            keys,
+            source,
+            fixture,
+            intrinsic,
+            manager,
+            first: first_wire,
+            header,
+            submission,
+        }
+    }
+
+    /// The rig's frame 2 with its anchor rewritten, nothing else changed.
+    fn rewritten(&self, anchor: u64) -> CanonicalHeader {
+        let mut header = self.header.clone();
+        header.global_frame_number = anchor;
+        header
+    }
+
+    fn sealed(&self, submission: &CertificateSubmission, drain: &[&CanonicalHeader]) -> Vec<u8> {
+        handoff::SealSubmission {
+            submission: submission.clone(),
+            drain: drain
+                .iter()
+                .map(|header| header.to_canonical_bytes().unwrap())
+                .collect(),
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// The rig's seal with a closing certificate the session never signed.
+    fn forged(&self) -> CertificateSubmission {
+        let mut forged = self.submission.clone();
+        forged.certificate = sign(&self.source, &self.keys, 11, 6, forged.seal.digest());
+        forged
+    }
+
+    /// What GLOBAL frame [`DRAIN_FRAME`] makes of `sealed` on each retry:
+    /// the engine's validation (the leader's filter and the materializer's
+    /// first step), then the intrinsic's execution (rolled back on error).
+    fn outcomes(&self, sealed: &[u8]) -> Vec<Result<()>> {
+        let global = quil_execution::domains::GLOBAL;
+        let bundle = handoff_bundle(sealed);
+        let mut outcomes = Vec::new();
+        for _ in 0..DRAIN_RETRIES {
+            outcomes.push(self.manager.validate_message(DRAIN_FRAME, &global, &bundle));
+            outcomes.push(
+                self.intrinsic
+                    .invoke_step(DRAIN_FRAME, sealed, &self.fixture.state),
+            );
+        }
+        outcomes
+    }
+
+    /// The genuine seal and header pass validation where the rig checks
+    /// them, so a refusal below is the anchor's doing.
+    fn check_setup(&self) {
+        let honest = self.sealed(&self.submission, &[&self.header]);
+        let global = quil_execution::domains::GLOBAL;
+        let engine = self
+            .manager
+            .validate_message(DRAIN_FRAME, &global, &handoff_bundle(&honest));
+        let intrinsic = self.intrinsic.validate(DRAIN_FRAME, &honest, None, None);
+        assert!(
+            engine.is_ok() && matches!(intrinsic, Ok(true)),
+            "SD SETUP: GLOBAL frame {DRAIN_FRAME} must admit the genuine seal and drain \
+             header (engine {engine:?}, intrinsic {intrinsic:?})"
+        );
+    }
+}
+
+/// Which of `anchors` fail GLOBAL frame [`DRAIN_FRAME`] as unavailable on
+/// every retry when `rig`'s drain header names them, under `submission`.
+fn drain_halts(
+    rig: &DrainRig,
+    submission: &CertificateSubmission,
+    anchors: &[u64],
+) -> Vec<(u64, String)> {
+    let mut halts = Vec::new();
+    for &anchor in anchors {
+        let outcomes = rig.outcomes(&rig.sealed(submission, &[&rig.rewritten(anchor)]));
+        if let Some(admitted) = outcomes.iter().position(|outcome| outcome.is_ok()) {
+            panic!(
+                "SD UNEXPECTED: GLOBAL frame {DRAIN_FRAME} admitted the drain header with its \
+                 anchor rewritten to {anchor} (outcome {admitted})"
+            );
+        }
+        let unavailable = outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .as_ref()
+                    .is_err_and(|error| error.is_execution_unavailable())
+            })
+            .count();
+        if unavailable == outcomes.len() {
+            halts.push((anchor, outcomes[0].as_ref().unwrap_err().to_string()));
+        } else if unavailable > 0 {
+            panic!(
+                "SD UNEXPECTED: anchor {anchor} is unavailable on {unavailable} of {} \
+                 retries only: {outcomes:?}",
+                outcomes.len()
+            );
+        }
+    }
+    halts
+}
+
+fn assert_no_drain_halt(halts: &[(u64, String)], what: &str) {
+    assert!(
+        halts.is_empty(),
+        "SD HALT: GLOBAL frame {DRAIN_FRAME} fails as unavailable on every retry ({DRAIN_RETRIES} \
+         engine validations and executions each) for {what}, for {} of {} anchors no node \
+         holds; the materializer fails the whole frame on such an error, so every archive \
+         stops there: {:?}",
+        halts.len(),
+        DRAIN_UNHELD_ANCHORS.len(),
+        halts
+            .iter()
+            .map(|(anchor, error)| format!("{anchor}: {error}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A genuine session-certified drain header, its anchor rewritten to a frame
+/// no node holds: the certificate does not cover the anchor, and the output
+/// check reads it first.
+#[test]
+fn seal_drain_halt_a_certified_header_with_its_anchor_rewritten_fails_every_retry() {
+    let rig = DrainRig::new(DRAIN_ANCHOR, true);
+    rig.check_setup();
+    let halts = drain_halts(&rig, &rig.submission, &DRAIN_UNHELD_ANCHORS);
+    assert_no_drain_halt(
+        &halts,
+        "a genuine certified drain header with its anchor rewritten",
+    );
+}
+
+/// The same header under a closing certificate the session never signed: the
+/// drain is checked before the seal, so no valid seal is needed. The genuine
+/// header under that certificate is refused deterministically.
+#[test]
+fn seal_drain_halt_the_drain_is_read_before_the_closing_certificate() {
+    let rig = DrainRig::new(DRAIN_ANCHOR, true);
+    rig.check_setup();
+    let forged = rig.forged();
+    for outcome in rig.outcomes(&rig.sealed(&forged, &[&rig.header])) {
+        match outcome {
+            Err(error) if !error.is_execution_unavailable() => {}
+            other => panic!(
+                "SD SETUP: the genuine header under a forged closing certificate must be \
+                 refused deterministically, got {other:?}"
+            ),
+        }
+    }
+    let halts = drain_halts(&rig, &forged, &DRAIN_UNHELD_ANCHORS);
+    assert_no_drain_halt(
+        &halts,
+        "a genuine certified drain header with its anchor rewritten, under a forged closing \
+         certificate",
+    );
+}
+
+/// A notarized checkpoint header the seal certifies by its output digest,
+/// its anchor rewritten.
+#[test]
+fn seal_drain_halt_a_seal_certified_checkpoint_header_with_its_anchor_rewritten_fails() {
+    let rig = DrainRig::new(DRAIN_ANCHOR, false);
+    rig.check_setup();
+    let halts = drain_halts(&rig, &rig.submission, &DRAIN_UNHELD_ANCHORS);
+    assert_no_drain_halt(
+        &halts,
+        "a notarized checkpoint header the seal certifies, with its anchor rewritten",
+    );
+}
+
+/// A frame the hole rigs' stores lack, above the network's first frame.
+const DRAIN_HOLE: u64 = 8;
+/// The oldest anchor once drain anchors are raised past [`DRAIN_HOLE`].
+const DRAIN_RAISED_FLOOR: u64 = 9;
+
+/// Every archive's history has holes above its first frame, so a floor at
+/// that first frame leaves them: a genuine header, its anchor rewritten into
+/// one, fails the frame as unavailable on every retry. Raising the floor
+/// past the hole from a frame before [`DRAIN_FRAME`] refuses it. The
+/// settings are environment variables, which a build without the raise
+/// ignores, so this runs on that build too and halts there.
+#[test]
+fn seal_drain_halt_an_anchor_in_a_hole_of_the_history_fails_every_retry() {
+    std::env::set_var("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME", "6");
+    std::env::set_var(
+        "QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME",
+        DRAIN_RAISED_FLOOR.to_string(),
+    );
+    for certified in [true, false] {
+        let rig = DrainRig::with_hole(DRAIN_RAISED_FLOOR, certified, Some(DRAIN_HOLE));
+        rig.check_setup();
+        let halts = drain_halts(&rig, &rig.submission, &[DRAIN_HOLE]);
+        assert_no_drain_halt(
+            &halts,
+            "a genuine drain header with its anchor rewritten into a hole of the history",
+        );
+    }
+    eprintln!("SD HOLE: an anchor in a hole of the history is refused");
+}
+
+/// From the raise's frame a genuine header anchored to a held frame under the
+/// raised floor is refused, deterministically; one at the floor still executes.
+#[test]
+fn seal_drain_raise_refuses_a_held_anchor_below_it_and_admits_its_edge() {
+    for certified in [true, false] {
+        let below = DrainRig::new(DRAIN_ANCHOR, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let genuine = below.sealed(&below.submission, &[&below.header]);
+        for outcome in below.outcomes(&genuine) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("older than any committee session") => {}
+                other => panic!(
+                    "SD RAISE: anchor {DRAIN_ANCHOR} (certified {certified}) must be refused \
+                     as older than any session, got {other:?}"
+                ),
+            }
+        }
+        let edge = DrainRig::new(DRAIN_RAISED_FLOOR, certified);
+        edge.check_setup();
+        edge.intrinsic
+            .invoke_step(
+                DRAIN_FRAME,
+                &edge.sealed(&edge.submission, &[&edge.header]),
+                &edge.fixture.state,
+            )
+            .unwrap_or_else(|error| {
+                panic!("SD RAISE: a drain anchored at the raised floor must execute: {error}")
+            });
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+}
+
+/// Before the raise's frame every build agrees as before: a genuine header
+/// under the raised floor executes, and an anchor in a hole stays unavailable.
+#[test]
+fn seal_drain_raise_changes_nothing_before_its_frame() {
+    for certified in [true, false] {
+        let rig = DrainRig::with_hole(DRAIN_ANCHOR, certified, Some(DRAIN_HOLE));
+        handoff::set_drain_anchor_raise_for_thread(Some((DRAIN_FRAME + 1, DRAIN_RAISED_FLOOR)));
+        rig.check_setup();
+        let halts = drain_halts(&rig, &rig.submission, &[DRAIN_HOLE]);
+        assert_eq!(
+            halts.len(),
+            1,
+            "SD RAISE: a hole stays unavailable before the raise's frame"
+        );
+        rig.intrinsic
+            .invoke_step(
+                DRAIN_FRAME,
+                &rig.sealed(&rig.submission, &[&rig.header]),
+                &rig.fixture.state,
+            )
+            .unwrap_or_else(|error| {
+                panic!("SD RAISE: a genuine drain under the floor must execute before: {error}")
+            });
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+}
+
+/// From the raise's frame a drain header must name an anchor, as voters have
+/// required of every frame since the required-anchor epoch; a quorum's header
+/// naming none is refused deterministically, and before the frame it is
+/// admitted as before. A build without the rule executes it.
+#[test]
+fn seal_drain_raise_refuses_a_header_naming_no_anchor() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(0, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((DRAIN_FRAME + 1, DRAIN_RAISED_FLOOR)));
+        rig.check_setup();
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let sealed = rig.sealed(&rig.submission, &[&rig.header]);
+        for outcome in rig.outcomes(&sealed) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("anchor 0, which names no frame") => {}
+                other => panic!(
+                    "SD ZERO: GLOBAL frame {DRAIN_FRAME}, past the raise's frame, must refuse \
+                     a drain header naming no anchor (certified {certified}), got {other:?}"
+                ),
+            }
+        }
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+    eprintln!("SD ZERO: a drain header naming no anchor is refused from the raise's frame");
+}
+
+/// The raise reads only what a drain would execute: a passed-over header
+/// naming no anchor stays unread, and the drain after it executes.
+#[test]
+fn seal_drain_raise_leaves_passed_over_headers_unread() {
+    let rig = DrainRig::new(DRAIN_RAISED_FLOOR, true);
+    handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+    assert_eq!(rig.first.global_frame_number, 0);
+    let sealed = rig.sealed(&rig.submission, &[&rig.first, &rig.header]);
+    rig.intrinsic
+        .invoke_step(DRAIN_FRAME, &sealed, &rig.fixture.state)
+        .unwrap_or_else(|error| {
+            panic!("SD RAISE: a passed-over header naming no anchor stays unread: {error}")
+        });
+    handoff::set_drain_anchor_raise_for_thread(None);
+}
+
+/// A seal refused over its drain anchors costs its shard the close, not the
+/// shard. The refusal changes nothing the fence reads: the session stays
+/// closing, every retry is refused, and from its due frame, not before, GLOBAL
+/// fences it at its executed tip and authorizes the successor. The refused
+/// copy stays refused after that.
+#[test]
+fn seal_drain_refused_seal_recovers_through_the_fence() {
+    use handoff::schedule::{activated, fence_due_frame, fence_stalled_sources};
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let state = &rig.fixture.state;
+        let id = rig.source.id().unwrap();
+        let filters = [rig.source.filter.clone()];
+        let sealed = rig.sealed(&rig.submission, &[&rig.header]);
+        for outcome in rig.outcomes(&sealed) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("older than any committee session") => {}
+                other => panic!("SD FENCE: every retry must be refused, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(
+                handoff::status(state, &id).unwrap(),
+                handoff::Status::Sealing(_)
+            ),
+            "SD FENCE: a refused seal leaves the session closing (certified {certified})"
+        );
+        assert_eq!(handoff::session_tip(state, &id).unwrap().unwrap().frame, 1);
+        let due = fence_due_frame(4);
+        assert_eq!(
+            fence_stalled_sources(state, due - 1, &filters, None).unwrap(),
+            0,
+            "SD FENCE: not before the due frame"
+        );
+        assert_eq!(
+            fence_stalled_sources(state, due, &filters, None).unwrap(),
+            1,
+            "SD FENCE: the due frame fences the session a refused seal left closing \
+             (certified {certified})"
+        );
+        commit(state, due);
+        assert!(handoff::is_fenced(state, &id).unwrap());
+        assert!(matches!(
+            handoff::status(state, &id).unwrap(),
+            handoff::Status::Closed(_)
+        ));
+        assert_eq!(
+            handoff::closed_checkpoint(state, &id)
+                .unwrap()
+                .unwrap()
+                .frame,
+            1,
+            "SD FENCE: fenced at the executed tip; the refused frame stays undrained"
+        );
+        let successor = handoff::head(state, &rig.source.filter).unwrap().unwrap();
+        assert_eq!(
+            (successor.generation, successor.base_frame),
+            (rig.source.generation + 1, 1),
+            "SD FENCE: the shard gets its successor"
+        );
+        assert!(activated(state, &rig.submission.seal.request).unwrap());
+        let late = rig.intrinsic.invoke_step(due + 1, &sealed, state);
+        assert!(
+            late.as_ref()
+                .is_err_and(|error| !error.is_execution_unavailable()),
+            "SD FENCE: the seal must stay refused after the fence, got {late:?}"
+        );
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+    eprintln!("SD FENCE: a refused seal's shard recovers through the fence");
+}
+
+/// A genuine drain, certified by the session or by the seal, is admitted
+/// and executed: the session's tip moves to the checkpoint.
+#[test]
+fn seal_drain_control_a_genuine_drain_header_is_admitted_and_executed() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        rig.check_setup();
+        let honest = rig.sealed(&rig.submission, &[&rig.header]);
+        rig.intrinsic
+            .invoke_step(DRAIN_FRAME, &honest, &rig.fixture.state)
+            .unwrap_or_else(|error| {
+                panic!("control: the genuine drain (certified {certified}) must execute: {error}")
+            });
+        let tip = handoff::session_tip(&rig.fixture.state, &rig.source.id().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(tip.frame, 2, "control: the drain reached the checkpoint");
+    }
+    eprintln!("SD CONTROL: genuine drains are admitted and executed");
+}
+
+/// A rewritten anchor that the node holds is refused deterministically: the
+/// output no longer matches its frame's.
+#[test]
+fn seal_drain_control_a_held_wrong_anchor_is_refused_deterministically() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        rig.check_setup();
+        for anchor in [DRAIN_HISTORY_START, 7, DRAIN_FRAME - 1] {
+            let sealed = rig.sealed(&rig.submission, &[&rig.rewritten(anchor)]);
+            for outcome in rig.outcomes(&sealed) {
+                match outcome {
+                    Err(error) if !error.is_execution_unavailable() => {}
+                    other => panic!(
+                        "control: a held wrong anchor {anchor} (certified {certified}) must be \
+                         refused deterministically, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+    eprintln!("SD CONTROL: held wrong anchors are refused deterministically");
+}
+
+/// A drain header GLOBAL already executed is passed over unread, its anchor
+/// included: the submission is admitted whatever that anchor names.
+#[test]
+fn seal_drain_control_a_passed_over_header_is_never_read() {
+    let rig = DrainRig::new(DRAIN_ANCHOR, true);
+    rig.check_setup();
+    let global = quil_execution::domains::GLOBAL;
+    for anchor in DRAIN_UNHELD_ANCHORS {
+        let mut first = rig.first.clone();
+        first.global_frame_number = anchor;
+        let sealed = rig.sealed(&rig.submission, &[&first, &rig.header]);
+        let engine = rig
+            .manager
+            .validate_message(DRAIN_FRAME, &global, &handoff_bundle(&sealed));
+        assert!(
+            engine.is_ok(),
+            "control: an executed header anchored to {anchor} is passed over: {engine:?}"
+        );
+    }
+    eprintln!("SD CONTROL: passed-over drain headers are never read");
+}
+
+/// Every anchor no node holds is refused before it is read, by a
+/// deterministic error naming it, whichever certificate covers the header.
+#[test]
+fn seal_drain_fix_refuses_anchors_no_node_holds_before_reading_them() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        rig.check_setup();
+        for anchor in DRAIN_UNHELD_ANCHORS {
+            let sealed = rig.sealed(&rig.submission, &[&rig.rewritten(anchor)]);
+            for outcome in rig.outcomes(&sealed) {
+                match outcome {
+                    Err(quil_types::error::QuilError::InvalidArgument(reason))
+                        if reason.contains("a frame no node holds")
+                            && reason.contains(&format!("anchor {anchor},")) => {}
+                    other => panic!(
+                        "SD FIX: anchor {anchor} (certified {certified}) must be refused as one \
+                         no node holds, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+    eprintln!("SD FIX: anchors no node holds are refused before the read");
+}
+
+/// Genuine drain headers anchored at both edges of what GLOBAL frame
+/// [`DRAIN_FRAME`] admits, the network's first frame and the frame before
+/// it, are admitted and executed.
+#[test]
+fn seal_drain_fix_admits_genuine_anchors_at_both_edges() {
+    for anchor in [DRAIN_HISTORY_START, DRAIN_FRAME - 1] {
+        for certified in [true, false] {
+            let rig = DrainRig::new(anchor, certified);
+            rig.check_setup();
+            let honest = rig.sealed(&rig.submission, &[&rig.header]);
+            rig.intrinsic
+                .invoke_step(DRAIN_FRAME, &honest, &rig.fixture.state)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "SD FIX: a genuine drain anchored to {anchor} (certified {certified}) \
+                         must execute: {error}"
+                    )
+                });
+        }
+    }
+    eprintln!("SD FIX: genuine anchors at both edges are admitted and executed");
+}

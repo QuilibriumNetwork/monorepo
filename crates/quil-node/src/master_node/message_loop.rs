@@ -445,6 +445,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             super::peer_info_bounds::preferred(info, &genesis_archive_peer_ids_for_recv, &*pr_for_recv)
         });
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut drain_raise_watch = super::drain_raise_watch::RaiseWatch::default();
         // When the loop started: archives announce themselves about every
         // thirty minutes, so the first one is verified up to that long after it.
         let loop_started = std::time::Instant::now();
@@ -1308,6 +1309,24 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     secs_since_start = loop_started.elapsed().as_secs(),
                                                     "verified genesis archive peer"
                                                 );
+                                            }
+                                            if archive_mode_for_recv {
+                                                let (raise_frame, _) = quil_execution::global_intrinsic::handoff::drain_anchor_raise();
+                                                let head = lhf_for_recv.load(std::sync::atomic::Ordering::Relaxed);
+                                                if super::drain_raise_watch::behind_raise(raise_frame, head, quil_config::SUBPATCH_NUMBER, info.release_subpatch())
+                                                    && drain_raise_watch.due(&info.peer_id, std::time::Instant::now())
+                                                {
+                                                    warn!(
+                                                        scope = "peer",
+                                                        peer = peer_hex,
+                                                        peer_release = %info.release(),
+                                                        release = %quil_config::display_version(),
+                                                        head_frame = head,
+                                                        raise_frame,
+                                                        action = "upgrade that archive before the raise frame",
+                                                        "an archive runs an older release than this node as the drain anchor raise nears: a build without the raise executes drain headers this one refuses, and their state differs once one is packed"
+                                                    );
+                                                }
                                             }
                                             // Authenticated network-head hint for the poller's
                                             // reconcile: this PeerInfo is signed and genesis-archive

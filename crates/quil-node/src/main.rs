@@ -863,6 +863,16 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         seal_drain_frame = %if seal_drain_from == u64::MAX { "never".to_string() } else { seal_drain_from.to_string() },
         "committee handoff seals carrying their drain headers"
     );
+    quil_execution::global_intrinsic::handoff::check_drain_anchor_settings(args.network)
+        .map_err(|error| anyhow::anyhow!("invalid seal drain anchor setting: {error}"))?;
+    let (drain_anchor_raise_frame, drain_anchor_raised_floor) =
+        quil_execution::global_intrinsic::handoff::drain_anchor_raise();
+    info!(
+        drain_anchor_floor = quil_execution::global_intrinsic::handoff::drain_anchor_floor(),
+        drain_anchor_raise_frame = %if drain_anchor_raise_frame == u64::MAX { "never".to_string() } else { drain_anchor_raise_frame.to_string() },
+        drain_anchor_raised_floor,
+        "seal drain headers' oldest GLOBAL anchor, and from which frame it is raised and an anchor required"
+    );
     let seal_recovery_from =
         quil_execution::global_intrinsic::handoff::init_seal_recovery_frame(args.network);
     info!(

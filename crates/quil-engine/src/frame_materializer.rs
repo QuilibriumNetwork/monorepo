@@ -1129,6 +1129,11 @@ impl FrameMaterializer {
                             error = %e,
                             "skipping message that failed signature validation"
                         );
+                        quil_execution::global_intrinsic::intrinsic::note_packed_drain_anchor_refusal(
+                            frame_number,
+                            &header.prover,
+                            &e,
+                        );
                         Some(format!("{e}"))
                     }
                 },

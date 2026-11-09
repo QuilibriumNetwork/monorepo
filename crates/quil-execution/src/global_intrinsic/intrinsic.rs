@@ -3324,6 +3324,7 @@ impl GlobalIntrinsic {
             if op.frame_number < next {
                 continue;
             }
+            refuse_drain_anchor(frame_number, &op)?;
             if by_seal {
                 self.check_seal_certified_header(frame_number, &op)?;
             } else {
@@ -7084,12 +7085,173 @@ fn storage_reward_withheld(global_frame_number: u64, state_size: u64, attested: 
         && !quil_types::consensus::storage_attestation_paused(epoch)
 }
 
+/// A seal's drain header missed its window, so no window bounds the GLOBAL
+/// frame it names as its anchor, and its output check reads that frame. The
+/// certificate signs the output, which commits to the anchor only through
+/// that frame's output, so nothing else binds the number. Refuse, before
+/// any read, an anchor no node can hold for GLOBAL frame `frame_number`:
+/// that frame or a later one, or one below the network's history
+/// (`handoff::drain_anchor_floor`), or, from the raise's frame, older than
+/// any committee session (`handoff::drain_anchor_floor_at`), which takes in
+/// the holes of the history. Anchor 0 names no frame and reads none; from the
+/// raise's frame it is refused too (`handoff::drain_anchor_required_at`). A
+/// frame between them that this node lacks stays unavailable: a local gap.
+fn refuse_drain_anchor(frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
+    let anchor = op.global_frame_number;
+    let floor = super::handoff::drain_anchor_floor_at(frame_number);
+    let unanchored = anchor == 0 && !super::handoff::drain_anchor_required_at(frame_number);
+    if unanchored || (floor..frame_number).contains(&anchor) {
+        return Ok(());
+    }
+    note_drain_anchor_refusal(frame_number, op, floor);
+    let why = if anchor == 0 {
+        "which names no frame"
+    } else if (super::handoff::drain_anchor_floor()..frame_number).contains(&anchor) {
+        "older than any committee session"
+    } else {
+        "a frame no node holds"
+    };
+    Err(QuilError::InvalidArgument(format!(
+        "seal drain: shard {} frame {} names GLOBAL anchor {anchor}, {why}: GLOBAL frame \
+         {frame_number} admits anchors {floor} to {}",
+        hex::encode(&op.address),
+        op.frame_number,
+        frame_number.saturating_sub(1),
+    )))
+}
+
+/// At most one line per interval for refused drain anchors, of each kind.
+const DRAIN_ANCHOR_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+static DRAIN_ANCHOR_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+static DRAIN_ANCHOR_PACKED_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a refusal at `now` warns, with the refusals quieted since the
+/// last warning; inside the interval it only counts.
+fn drain_anchor_warn_due(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    if let Some((at, quieted)) = last.as_mut() {
+        if now.saturating_duration_since(*at) < DRAIN_ANCHOR_WARN_EVERY {
+            *quieted += 1;
+            return None;
+        }
+    }
+    let quieted = last.as_ref().map_or(0, |(_, quieted)| *quieted);
+    *last = Some((now, 0));
+    Some(quieted)
+}
+
+fn note_drain_anchor_refusal(frame_number: u64, op: &super::frame_header::FrameHeader, floor: u64) {
+    let due = drain_anchor_warn_due(
+        &mut DRAIN_ANCHOR_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        tracing::info!(
+            frame = frame_number,
+            shard = %hex::encode(&op.address),
+            shard_frame = op.frame_number,
+            anchor = op.global_frame_number,
+            floor,
+            quieted,
+            "seal drain: refused a drain header anchored outside the GLOBAL frames a drain may \
+             name; any peer can send a copy, so this alone names no one; a GLOBAL frame carrying \
+             one warns",
+        );
+    }
+}
+
+/// Whether `error` is [`refuse_drain_anchor`]'s refusal.
+fn is_drain_anchor_refusal(error: &QuilError) -> bool {
+    matches!(
+        error,
+        QuilError::InvalidArgument(reason)
+            if reason.starts_with("seal drain: shard ") && reason.contains(" names GLOBAL anchor ")
+    )
+}
+
+/// `error` came from executing a GLOBAL frame `leader` proposed: when it is a
+/// refused drain anchor, that leader validated what this node refuses, so it
+/// runs a build without the rule or other code. Warn, at most once per
+/// interval and apart from gossiped copies, which cannot quiet it.
+pub fn note_packed_drain_anchor_refusal(frame_number: u64, leader: &[u8], error: &QuilError) {
+    if !is_drain_anchor_refusal(error) {
+        return;
+    }
+    let due = drain_anchor_warn_due(
+        &mut DRAIN_ANCHOR_PACKED_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        tracing::warn!(
+            frame = frame_number,
+            leader = %hex::encode(leader),
+            quieted,
+            %error,
+            "seal drain: a GLOBAL frame carries a drain header anchored outside the GLOBAL frames \
+             a drain may name, skipped here; its leader runs a build without this rule or other \
+             code: an archive on an older release now holds different state, so upgrade it; \
+             otherwise report this line",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_schema::{write_field, write_type};
     use quil_types::crypto::KeyType;
+
+    /// Only the drain anchor refusal itself counts as a packed one.
+    #[test]
+    fn a_packed_drain_anchor_refusal_is_told_from_other_refusals() {
+        let refused = |anchor| {
+            refuse_drain_anchor(
+                10,
+                &super::super::frame_header::FrameHeader {
+                    frame_number: 2,
+                    global_frame_number: anchor,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(refused(0).is_ok(), "no raise here: anchor 0 is admitted");
+        assert!(is_drain_anchor_refusal(&refused(1_000_000).unwrap_err()));
+        for other in [
+            QuilError::InvalidArgument("seal drain: shard 00 frame 2 has no output".into()),
+            QuilError::InvalidArgument("other names GLOBAL anchor 7".into()),
+            QuilError::ExecutionUnavailable(
+                "seal drain: shard 00 frame 2 names GLOBAL anchor 7".into(),
+            ),
+        ] {
+            assert!(!is_drain_anchor_refusal(&other), "{other}");
+        }
+    }
+
+    /// A refused drain anchor warns at once, then once per interval, the
+    /// next warning counting the refusals quieted in between.
+    #[test]
+    fn drain_anchor_refusal_warning_is_bounded_and_counts_the_quieted() {
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert_eq!(drain_anchor_warn_due(&mut last, start), Some(0));
+        let inside = start + DRAIN_ANCHOR_WARN_EVERY - std::time::Duration::from_secs(1);
+        assert_eq!(drain_anchor_warn_due(&mut last, inside), None);
+        assert_eq!(drain_anchor_warn_due(&mut last, inside), None);
+        let after = start + DRAIN_ANCHOR_WARN_EVERY;
+        assert_eq!(drain_anchor_warn_due(&mut last, after), Some(2));
+        assert_eq!(drain_anchor_warn_due(&mut last, after), None);
+    }
 
     /// The expected epoch-boundary scan (3.7 s for 25,600 allocations) logs
     /// at info; a slow remainder, a slow scan-free pass or a scan past its
