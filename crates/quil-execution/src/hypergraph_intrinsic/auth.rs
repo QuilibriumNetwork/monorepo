@@ -255,20 +255,26 @@ pub fn verify_op_signature(
 /// `update_bytes_without_sig` must be the canonical-bytes encoding of
 /// the `HypergraphUpdate` with its `public_key_signature_bls48581`
 /// field cleared. Callers produce this via
-/// `HypergraphUpdate.to_canonical_bytes_without_signature()`.
+/// `HypergraphUpdate.to_canonical_bytes_without_signature()`. From the
+/// config replay frame the separator ends with `binding`, the digest of the
+/// metadata vertex the update replaces
+/// ([`crate::config_replay::update_signing_domain`]).
 pub fn verify_update_signature(
     resolver: &Arc<dyn HypergraphConfigResolver>,
     domain: &[u8],
     update_bytes_without_sig: &[u8],
     signature: &[u8],
     key_manager: &dyn quil_types::crypto::KeyManager,
+    binding: Option<&[u8]>,
 ) -> Result<AuthCheck> {
     let Some(owner_key) = resolver.owner_public_key(domain) else {
         return Ok(AuthCheck::UnknownDomain);
     };
-    let mut domain_sep = Vec::with_capacity(domain.len() + b"HYPERGRAPH_UPDATE".len());
-    domain_sep.extend_from_slice(domain);
-    domain_sep.extend_from_slice(b"HYPERGRAPH_UPDATE");
+    let domain_sep = crate::config_replay::update_signing_domain(
+        domain,
+        crate::config_replay::HYPERGRAPH_UPDATE_TAG,
+        binding,
+    );
     let ok = key_manager.validate_signature(
         quil_types::crypto::KeyType::Falcon512,
         &owner_key,

@@ -93,6 +93,22 @@ pub fn build_compute_configuration_metadata_tree(
     Ok(tree)
 }
 
+/// The domain a ComputeDeploy of `config` creates: poseidon(COMPUTE ‖
+/// SHA-512(config content)). Retired from the KZG commit (poseidon(COMPUTE ‖
+/// config_tree.commit)) to a hash of the config's flat leaves — PQ-safe, no
+/// BLS48-581. Mirrors the coin-address content-hash decision; changes the
+/// derived domain for NEW compute deploys (fork, aligned with the
+/// forest/Falcon flag day).
+pub fn compute_deploy_domain(config: &super::config::ComputeConfiguration) -> Result<[u8; 32]> {
+    let config_tree = build_compute_configuration_metadata_tree(config)?;
+    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
+    let base = crate::domains::COMPUTE;
+    let mut preimage = Vec::with_capacity(base.len() + config_commit.len());
+    preimage.extend_from_slice(&base);
+    preimage.extend_from_slice(&config_commit);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
 /// Materialize a **new** ComputeDeploy — Go `ComputeIntrinsic.Deploy`
 /// deploy branch (compute_intrinsic.go:523-565, `domain ==
 /// COMPUTE_INTRINSIC_DOMAIN`). Derives the new compute app's domain from
@@ -109,18 +125,8 @@ pub fn materialize_compute_deploy_init(
     inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<[u8; 32]> {
     let config_tree = build_compute_configuration_metadata_tree(config)?;
-    // Compute-app domain = poseidon(COMPUTE ‖ SHA-512(config content)). Retired
-    // from the KZG commit (poseidon(COMPUTE ‖ config_tree.commit)) to a hash of the
-    // config's flat leaves — PQ-safe, no BLS48-581. Mirrors the coin-address
-    // content-hash decision; changes the derived domain for NEW compute deploys
-    // (fork, aligned with the forest/Falcon flag day).
-    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
-
     let base = crate::domains::COMPUTE;
-    let mut preimage = Vec::with_capacity(base.len() + config_commit.len());
-    preimage.extend_from_slice(&base);
-    preimage.extend_from_slice(&config_commit);
-    let domain = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+    let domain = compute_deploy_domain(config)?;
 
     // Validate the supplied RDF schema (reject empty/malformed), mirroring
     // Go's newComputeRDFHypergraphSchema gate. Same structural validator

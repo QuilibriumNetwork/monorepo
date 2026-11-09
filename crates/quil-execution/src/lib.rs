@@ -1,6 +1,7 @@
 pub mod canonical_cursor;
 pub mod compute_engine;
 pub mod compute_intrinsic;
+pub mod config_replay;
 #[cfg(all(test, feature = "confidential-tokens"))]
 mod decoder_fuzz_tests;
 pub mod engines;

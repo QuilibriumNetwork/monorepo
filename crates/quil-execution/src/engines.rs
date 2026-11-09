@@ -1300,6 +1300,13 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             &deploy.config,
                         )?;
                         check_post_quantum_token_config(&cfg)?;
+                        if crate::config_replay::config_replay_guarded(context) {
+                            crate::config_replay::refuse_redeploy(
+                                state,
+                                &crate::token_intrinsic::materialize::token_deploy_domain(&cfg)?,
+                                "token",
+                            )?;
+                        }
                         let derived =
                             crate::token_intrinsic::materialize::materialize_token_deploy_init(
                                 state,
@@ -1355,7 +1362,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             // The signed message is the canonical-bytes
                             // encoding of the TokenUpdate with its
                             // signature field cleared, domain
-                            // `address || "TOKEN_UPDATE"`.
+                            // `address || "TOKEN_UPDATE"`, followed from
+                            // the config replay frame by the digest of the
+                            // metadata vertex it replaces, so an update
+                            // applies once.
                             let prior = prior_cfg.as_ref().ok_or_else(|| {
                                 QuilError::InvalidArgument(
                                     "token update: prior config not found — \
@@ -1382,9 +1392,17 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                     "token update: missing signature".into(),
                                 ));
                             }
-                            let mut domain = Vec::with_capacity(32 + b"TOKEN_UPDATE".len());
-                            domain.extend_from_slice(_address);
-                            domain.extend_from_slice(b"TOKEN_UPDATE");
+                            let guarded = crate::config_replay::config_replay_guarded(context);
+                            let binding = if guarded {
+                                crate::config_replay::stored_binding(state, _address)?
+                            } else {
+                                None
+                            };
+                            let domain = crate::config_replay::update_signing_domain(
+                                _address,
+                                crate::config_replay::TOKEN_UPDATE_TAG,
+                                binding.as_deref(),
+                            );
                             let ok = self.key_manager.validate_signature(
                                 quil_types::crypto::KeyType::Falcon512,
                                 &prior.owner_public_key,
@@ -1424,6 +1442,13 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _frame_number,
                                 self.inclusion_prover.as_ref(),
                             )?;
+                            if guarded {
+                                crate::config_replay::advance_update_sequence(
+                                    state,
+                                    _address,
+                                    _frame_number,
+                                )?;
+                            }
                         }
                         self.config_resolver.invalidate(_address);
                     }
@@ -2192,7 +2217,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
             )?;
             #[cfg(not(feature = "confidential-tokens"))]
             let _ = fee_multiplier;
-            self.process_unpaid(context.frame_number, address, message)
+            self.process_unpaid(context, address, message)
         })();
         match (self.state.as_ref(), result) {
             (Some(state), Ok(outcome)) => {
@@ -2273,10 +2298,11 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
 impl ComputeExecutionEngine {
     fn process_unpaid(
         &self,
-        frame_number: u64,
+        context: quil_types::execution::FrameExecutionContext,
         address: &[u8],
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
+        let frame_number = context.frame_number;
         if message.len() < 4 {
             return Ok(ProcessMessageResult {
                 messages: Vec::new(),
@@ -2403,6 +2429,15 @@ impl ComputeExecutionEngine {
                                 "compute deploy: hypergraph state not installed".into(),
                             )
                         })?;
+                        if crate::config_replay::config_replay_guarded(context) {
+                            crate::config_replay::refuse_redeploy(
+                                s,
+                                &crate::compute_intrinsic::materialize::compute_deploy_domain(
+                                    &cfg,
+                                )?,
+                                "compute",
+                            )?;
+                        }
                         // The compute engine has no inclusion_prover field
                         // of its own; commit metadata sub-trees with the
                         // CRDT's prover (same one the frame commit uses).
@@ -2464,9 +2499,15 @@ impl ComputeExecutionEngine {
                         ));
                     }
                     // Post-quantum owner auth: a single FALCON signature.
-                    let mut domain_bytes = Vec::with_capacity(32 + b"COMPUTE_UPDATE".len());
-                    domain_bytes.extend_from_slice(address);
-                    domain_bytes.extend_from_slice(b"COMPUTE_UPDATE");
+                    // From the config replay frame the owner signs the
+                    // digest of the metadata vertex the update replaces.
+                    let guarded = crate::config_replay::config_replay_guarded(context);
+                    let domain_bytes = crate::config_replay::update_separator(
+                        s,
+                        address,
+                        crate::config_replay::COMPUTE_UPDATE_TAG,
+                        context,
+                    )?;
                     let ok = km.validate_signature(
                         quil_types::crypto::KeyType::Falcon512,
                         &prior_owner_key,
@@ -2497,6 +2538,9 @@ impl ComputeExecutionEngine {
                         frame_number,
                         prover.as_ref(),
                     )?;
+                    if guarded {
+                        crate::config_replay::advance_update_sequence(s, address, frame_number)?;
+                    }
                 }
                 _ => {
                     crate::compute_engine::peek_compute_message_kind(inner_bytes)?;
@@ -2820,11 +2864,12 @@ impl HypergraphExecutionEngine {
     /// silently no-op past their verify gate.
     fn process_inner_op(
         &self,
-        frame_number: u64,
+        context: quil_types::execution::FrameExecutionContext,
         address: &[u8],
         inner_type_prefix: u32,
         inner_bytes: &[u8],
     ) -> Result<()> {
+        let frame_number = context.frame_number;
         use crate::hypergraph_intrinsic::canonical::{
             TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
         };
@@ -2834,7 +2879,7 @@ impl HypergraphExecutionEngine {
         // Defense-in-depth: re-verify before materializing. The
         // frame boundary wires validate_message before process_message,
         // but engines should not assume the caller has done that check.
-        self.validate_inner_op(address, inner_type_prefix, inner_bytes)?;
+        self.validate_inner_op(address, inner_type_prefix, inner_bytes, Some(context))?;
         match inner_type_prefix {
             TYPE_HYPERGRAPH_DEPLOYMENT => {
                 // Derive the new hypergraph app's domain and write the
@@ -2847,6 +2892,13 @@ impl HypergraphExecutionEngine {
                 if let (Some(cfg), Some(state)) =
                     (dispatched.deploy.config.as_ref(), self.state.as_ref())
                 {
+                    if crate::config_replay::config_replay_guarded(context) {
+                        crate::config_replay::refuse_redeploy(
+                            state,
+                            &crate::hypergraph_intrinsic::hypergraph_deploy_domain(cfg)?,
+                            "hypergraph",
+                        )?;
+                    }
                     let _derived = crate::hypergraph_intrinsic::materialize_hypergraph_deploy_init(
                         state,
                         cfg,
@@ -2873,6 +2925,13 @@ impl HypergraphExecutionEngine {
                         frame_number,
                         self.inclusion_prover.as_ref(),
                     )?;
+                    if crate::config_replay::config_replay_guarded(context) {
+                        crate::config_replay::advance_update_sequence(
+                            state,
+                            address,
+                            frame_number,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -2895,6 +2954,7 @@ impl HypergraphExecutionEngine {
         address: &[u8],
         inner_type_prefix: u32,
         inner_bytes: &[u8],
+        context: Option<quil_types::execution::FrameExecutionContext>,
     ) -> Result<()> {
         use crate::hypergraph_intrinsic::canonical::{
             TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
@@ -2923,7 +2983,9 @@ impl HypergraphExecutionEngine {
                 }
                 Ok(())
             }
-            TYPE_HYPERGRAPH_UPDATE => self.validate_hypergraph_update(address, inner_bytes),
+            TYPE_HYPERGRAPH_UPDATE => {
+                self.validate_hypergraph_update(address, inner_bytes, context)
+            }
             _ => {
                 // Vertex add/remove, hyperedge add/remove — existing
                 // dispatch path (structural decode + per-op validate).
@@ -2953,8 +3015,17 @@ impl HypergraphExecutionEngine {
     /// `domain || "HYPERGRAPH_UPDATE"` as the BLS domain separator.
     /// `domain` is the routing address — the hypergraph being updated.
     /// The resolver looks up the existing owner key for that domain.
-    fn validate_hypergraph_update(&self, domain: &[u8], inner_bytes: &[u8]) -> Result<()> {
-        use crate::hypergraph_intrinsic::auth::verify_update_signature;
+    /// Verify a hypergraph update. In a frame (`context`) the owner's
+    /// signature must bind exactly as the frame requires: from the config
+    /// replay frame, to the digest of the metadata vertex the update
+    /// replaces. Admission, which knows no frame, accepts either form.
+    fn validate_hypergraph_update(
+        &self,
+        domain: &[u8],
+        inner_bytes: &[u8],
+        context: Option<quil_types::execution::FrameExecutionContext>,
+    ) -> Result<()> {
+        use crate::hypergraph_intrinsic::auth::{verify_update_signature, AuthCheck};
         let dispatched = crate::hypergraph_intrinsic::decode_and_validate_update(inner_bytes)?;
         let update = &dispatched.update;
         // Re-assert config key lengths after dispatch's structural
@@ -2976,13 +3047,31 @@ impl HypergraphExecutionEngine {
             )
         })?;
         let bytes_without_sig = update.to_canonical_bytes_without_signature()?;
-        let check = verify_update_signature(
-            &self.config_resolver,
-            domain,
-            &bytes_without_sig,
-            &sig.signature,
-            key_manager.as_ref(),
-        )?;
+        let stored = || match self.state.as_ref() {
+            Some(state) => crate::config_replay::stored_binding(state, domain),
+            None => Ok(None),
+        };
+        let bindings = match context.map(crate::config_replay::config_replay_guarded) {
+            Some(true) => vec![Some(stored()?.ok_or_else(|| {
+                QuilError::InvalidArgument("hypergraph update: no metadata vertex to bind".into())
+            })?)],
+            Some(false) => vec![None],
+            None => vec![None, stored()?],
+        };
+        let mut check = AuthCheck::Invalid;
+        for binding in &bindings {
+            check = verify_update_signature(
+                &self.config_resolver,
+                domain,
+                &bytes_without_sig,
+                &sig.signature,
+                key_manager.as_ref(),
+                binding.as_deref(),
+            )?;
+            if check == AuthCheck::Verified {
+                break;
+            }
+        }
         Self::auth_check_to_result(check, "hypergraph_update")?;
         // Schema-evolution check. The new schema must be a strict
         // superset of the prior schema (no removed classes or fields,
@@ -3042,14 +3131,14 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 for req in &bundle.requests {
                     if let Some(r) = req {
-                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes)?;
+                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
                     }
                 }
                 Ok(())
             }
             crate::hypergraph_engine::MessageKindTopLevel::Request => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                self.validate_inner_op(address, req.inner_type_prefix, &req.inner_bytes)?;
+                self.validate_inner_op(address, req.inner_type_prefix, &req.inner_bytes, None)?;
                 Ok(())
             }
         }
@@ -3119,7 +3208,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                     for req in &bundle.requests {
                         if let Some(r) = req {
                             self.process_inner_op(
-                                frame_number,
+                                context,
                                 address,
                                 r.inner_type_prefix,
                                 &r.inner_bytes,
@@ -3130,7 +3219,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 crate::hypergraph_engine::MessageKindTopLevel::Request => {
                     let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
                     self.process_inner_op(
-                        frame_number,
+                        context,
                         address,
                         req.inner_type_prefix,
                         &req.inner_bytes,
@@ -4651,3 +4740,11 @@ mod tests {
 #[cfg(all(test, feature = "native-proof"))]
 #[path = "token_settlement_parity_tests.rs"]
 mod token_settlement_parity_tests;
+
+#[cfg(test)]
+#[path = "token_deploy_replay_tests.rs"]
+mod token_deploy_replay_tests;
+
+#[cfg(test)]
+#[path = "update_replay_tests.rs"]
+mod update_replay_tests;
