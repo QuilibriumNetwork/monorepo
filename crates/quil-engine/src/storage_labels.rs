@@ -637,6 +637,120 @@ pub struct LabelStore {
     /// The release of labels for free space this process last saw
     /// ([`Self::keep_floor`]).
     seen: Arc<Mutex<Option<Shortage>>>,
+    /// Leaves this process found complete labels for or labelled, by
+    /// directory, and what of this process removed them since: labelling
+    /// ahead names why it labels a leaf again ([`Self::ahead_reason`]).
+    held: Arc<Mutex<HashMap<PathBuf, Held>>>,
+    /// The leaves of each member's shard at its last labelling ahead in
+    /// this process, by member and shard ([`Self::note_pass`]).
+    passes: Arc<Mutex<Passes>>,
+}
+
+/// The leaves of each member's shard at its last labelling ahead, by
+/// member and shard ([`LabelStore::note_pass`]).
+type Passes = HashMap<(Vec<u8>, Vec<u8>), HashSet<Vec<u8>>>;
+
+/// Complete labels this process found or made for a leaf
+/// ([`LabelStore::note_held`]).
+#[derive(Debug, Clone)]
+struct Held {
+    member: Vec<u8>,
+    leaf_id: Vec<u8>,
+    /// Their node count.
+    n: u64,
+    /// What of this process removed them since, if anything did.
+    removed_by: Option<&'static str>,
+}
+
+/// Why labelling ahead labels a leaf ([`precompute`]): what this process
+/// can tell of the labels kept for it before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AheadReason {
+    /// Labels bind the epoch (before the stable replica key epoch): every
+    /// epoch's are labelled anew.
+    Epoch,
+    /// Whole layers are kept at a count the leaf's data allows: labelling
+    /// goes on from them.
+    Partial,
+    /// Labels are kept at a count the data allows but could not be opened
+    /// whole.
+    Unreadable,
+    /// Labels are kept only at counts the data outgrew, the largest `was`.
+    Grown { was: u64 },
+    /// Labels are kept only at counts too large for the data, the largest
+    /// `was`.
+    Shrunk { was: u64 },
+    /// None are kept, while this process found or made them at `was`
+    /// nodes; `by` names what of this process removed them (the sweep of
+    /// unused counts, a release for free space, a failed check), none when
+    /// another process or something else did.
+    Dropped { was: u64, by: Option<&'static str> },
+    /// None are kept, and the shard's last pass in this process had the
+    /// leaf without labels kept (refused room, given up).
+    Retry,
+    /// None are kept, and the shard's last pass in this process had no
+    /// such leaf: a new leaf, or the shard's leaves cut anew (their ids
+    /// changed).
+    New,
+    /// None are kept, and this process has had no pass of the shard since
+    /// it started.
+    First,
+}
+
+impl std::fmt::Display for AheadReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Epoch => f.write_str("epoch"),
+            Self::Partial => f.write_str("partial"),
+            Self::Unreadable => f.write_str("unreadable"),
+            Self::Grown { was } => write!(f, "grown(was {was})"),
+            Self::Shrunk { was } => write!(f, "shrunk(was {was})"),
+            Self::Dropped { was, by: Some(by) } => write!(f, "dropped(was {was} by {by})"),
+            Self::Dropped { was, by: None } => write!(f, "dropped(was {was} elsewhere)"),
+            Self::Retry => f.write_str("retry"),
+            Self::New => f.write_str("new"),
+            Self::First => f.write_str("first"),
+        }
+    }
+}
+
+/// Leaves named in the line of a pass of labelling ahead ([`precompute`]);
+/// the others labelled are counted.
+const LABELLED_LEAVES_LOGGED: usize = 8;
+
+/// A leaf's path under its shard, short and public: its bits (`0110`),
+/// `root` for the shard's one leaf, else its prefix's values dotted.
+fn leaf_path(prefix: &[u32]) -> String {
+    match prefix.strip_prefix(&[quil_forest::BIT_PATH_PREFIX_SENTINEL]) {
+        Some([]) => "root".into(),
+        Some(bits) if bits.iter().all(|&bit| bit <= 1) => bits
+            .iter()
+            .map(|&bit| if bit == 1 { '1' } else { '0' })
+            .collect(),
+        _ => prefix
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    }
+}
+
+/// The leaves a pass of labelling ahead labelled, each as
+/// `<path>:<nodes>:<reason>` ([`leaf_path`], [`AheadReason`]), the first
+/// [`LABELLED_LEAVES_LOGGED`] named and the rest counted; `none` for none.
+fn labelled_leaves_text(leaves: &[(String, u64, AheadReason)]) -> String {
+    if leaves.is_empty() {
+        return "none".into();
+    }
+    let mut parts: Vec<String> = leaves
+        .iter()
+        .take(LABELLED_LEAVES_LOGGED)
+        .map(|(path, n, reason)| format!("{path}:{n}:{reason}"))
+        .collect();
+    if leaves.len() > LABELLED_LEAVES_LOGGED {
+        parts.push(format!("+{} more", leaves.len() - LABELLED_LEAVES_LOGGED));
+    }
+    parts.join(", ")
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
@@ -694,7 +808,102 @@ impl LabelStore {
             refused: Arc::new(Mutex::new(HashSet::new())),
             swept: Arc::new(AtomicU64::new(0)),
             seen: Arc::new(Mutex::new(None)),
+            held: Arc::new(Mutex::new(HashMap::new())),
+            passes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn held(&self) -> MutexGuard<'_, HashMap<PathBuf, Held>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note that `member`'s leaf `leaf_id` has complete labels at `n` nodes
+    /// in `dir`, found or just labelled.
+    fn note_held(&self, dir: &Path, member: &[u8], leaf_id: &[u8], n: u64) {
+        let mut held = self.held();
+        if held
+            .get(dir)
+            .is_some_and(|held| held.n == n && held.removed_by.is_none())
+        {
+            return;
+        }
+        held.insert(
+            dir.to_path_buf(),
+            Held {
+                member: member.to_vec(),
+                leaf_id: leaf_id.to_vec(),
+                n,
+                removed_by: None,
+            },
+        );
+    }
+
+    /// Note that `by` removed the labels at `n` nodes in `dir`.
+    fn note_removed(&self, dir: &Path, n: u64, by: &'static str) {
+        if let Some(held) = self.held().get_mut(dir).filter(|held| held.n == n) {
+            held.removed_by = Some(by);
+        }
+    }
+
+    /// Why labelling ahead labels `member`'s leaf `leaf_id` of shard
+    /// `filter` for `epoch`, its data taking `exact` nodes, no labels kept
+    /// at a count the data allows having been found ([`Self::find`]): what
+    /// is kept for it on disk, else what this process saw of it before.
+    pub(crate) fn ahead_reason(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        filter: &[u8],
+        leaf_id: &[u8],
+        exact: u64,
+    ) -> AheadReason {
+        use quil_crypto::storage_proof::padded_nodes_allowed;
+        if !quil_types::consensus::stable_replica_keys_at(epoch) {
+            return AheadReason::Epoch;
+        }
+        let allowed = |n| padded_nodes_allowed(exact, n);
+        if self.resumable(epoch, member, leaf_id, allowed).is_some() {
+            return AheadReason::Partial;
+        }
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        let ready = counts_with(&dir, ".ready");
+        if ready.iter().any(|&n| allowed(n)) {
+            return AheadReason::Unreadable;
+        }
+        if let Some(&was) = ready.iter().max() {
+            return if exact > was {
+                AheadReason::Grown { was }
+            } else {
+                AheadReason::Shrunk { was }
+            };
+        }
+        if let Some(held) = self.held().get(&dir) {
+            return AheadReason::Dropped {
+                was: held.n,
+                by: held.removed_by,
+            };
+        }
+        let passes = self.passes.lock().unwrap_or_else(PoisonError::into_inner);
+        match passes.get(&(member.to_vec(), filter.to_vec())) {
+            None => AheadReason::First,
+            Some(leaves) if leaves.contains(leaf_id) => AheadReason::Retry,
+            Some(_) => AheadReason::New,
+        }
+    }
+
+    /// Note the leaves `leaf_ids` of `member`'s shard `filter` at a pass of
+    /// labelling ahead, forgetting what was held of its leaves gone since.
+    pub(crate) fn note_pass(&self, member: &[u8], filter: &[u8], leaf_ids: HashSet<Vec<u8>>) {
+        let of_shard = |leaf_id: &[u8]| {
+            leaf_id.starts_with(filter) && leaf_id.get(filter.len()) == Some(&0xFF)
+        };
+        self.held().retain(|_, held| {
+            held.member != member || !of_shard(&held.leaf_id) || leaf_ids.contains(&held.leaf_id)
+        });
+        self.passes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((member.to_vec(), filter.to_vec()), leaf_ids);
     }
 
     /// Override this store's local free-space policy, for an isolated benchmark.
@@ -1131,6 +1340,7 @@ impl LabelStore {
         for path in [ready, layers, columns, kept_path(&dir, n)] {
             let _ = fs::remove_file(path);
         }
+        self.note_removed(&dir, n, "check");
         if let Some(writer) = writer {
             end_claim(&dir, n, writer);
         }
@@ -1257,6 +1467,7 @@ impl LabelStore {
             return None;
         }
         note_used(&dir, n, epoch);
+        self.note_held(&dir, member, leaf_id, n);
         Some(Kept {
             n,
             comm_c,
@@ -1336,6 +1547,7 @@ impl LabelStore {
                             let _ = fs::remove_file(path);
                         }
                         counts_removed += 1;
+                        self.note_removed(&dir, n, "sweep");
                     }
                     Some(_) => {}
                 }
@@ -1569,6 +1781,7 @@ impl LabelStore {
             free = free.saturating_add(bytes);
             released.bytes = released.bytes.saturating_add(bytes);
             released.counts += 1;
+            self.note_removed(&candidate.dir, candidate.n, "release");
             if !released.epochs.contains(&candidate.epoch) {
                 released.epochs.push(candidate.epoch);
             }
@@ -2123,6 +2336,8 @@ impl Admitted<'_> {
         let staged = staged(&self.dir, self.n);
         fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
         fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
+        self.store
+            .note_held(&self.dir, &self.member, &self.leaf_id, self.n);
         // Complete: `ready` stands for the layers from now on.
         let _ = fs::remove_file(kept_path(&self.dir, self.n));
         let finished = finishing.elapsed();
@@ -3203,7 +3418,8 @@ pub(crate) fn ahead_orders(
 /// gives it back, keeping its whole layers, and goes on from them once its
 /// memory fits again ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL
 /// reached the epoch's snapshot frame ([`expired`]). Removes the labels of
-/// epochs that have begun.
+/// epochs that have begun. Its line names each leaf labelled, at its
+/// count, and why ([`AheadReason`]).
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -3239,12 +3455,12 @@ pub fn precompute(
         .collect::<Result<Vec<u128>>>()?;
     let orders = ahead_orders(epoch, crate::storage_jobs::ahead_place(), &sizes);
     let leaves: Vec<usize> = (0..captured.prefixes.len()).collect();
-    let labelled = crate::storage_jobs::for_each_parallel(&leaves, |&index| {
+    let outcomes = crate::storage_jobs::for_each_parallel(&leaves, |&index| {
         let (prefix, size, order) = (&captured.prefixes[index], sizes[index], orders[index]);
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
         // Past the epoch's snapshot frame, leaves not started yet are skipped.
         if expired(epoch) {
-            return Ok(Some(0));
+            return Ok((Some(0), None));
         }
         // A leaf's data is at least its values (`leaf_size`): one whose
         // labels at that count have no room is refused before its read,
@@ -3253,23 +3469,44 @@ pub fn precompute(
         if !store.holds(epoch, member, &leaf_id)
             && !store.may_admit(epoch, member, &leaf_id, least, Stage::Ahead)
         {
-            return Ok(None);
+            return Ok((None, None));
         }
         let exact = captured.node_count(prefix)?;
         if store
             .find(epoch, member, &leaf_id, |n| padded_nodes_allowed(exact, n))
             .is_some()
         {
-            return Ok(Some(0));
+            return Ok((Some(0), None));
         }
+        let reason = store.ahead_reason(epoch, member, filter, &leaf_id, exact);
         let leaf = Leaf {
             member,
             filter,
             leaf_id: &leaf_id,
             epoch,
         };
-        label_leaf_ahead(store, &leaf, exact, order, &params)
+        Ok((
+            label_leaf_ahead(store, &leaf, exact, order, &params)?,
+            Some(reason),
+        ))
     })?;
+    store.note_pass(
+        member,
+        filter,
+        captured
+            .prefixes
+            .iter()
+            .map(|prefix| quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix))
+            .collect(),
+    );
+    let named: Vec<(String, u64, AheadReason)> = outcomes
+        .iter()
+        .zip(&captured.prefixes)
+        .filter_map(|(&(n, reason), prefix)| {
+            Some((leaf_path(prefix), n.filter(|&n| n > 0)?, reason?))
+        })
+        .collect();
+    let labelled: Vec<Option<u64>> = outcomes.into_iter().map(|(n, _)| n).collect();
     let refused = labelled.iter().filter(|n| n.is_none()).count();
     let outcome = if expired(epoch) {
         "stopped at the epoch's snapshot frame: its snapshot labels the leaves not labelled by then"
@@ -3288,6 +3525,7 @@ pub fn precompute(
     info!(epoch, filter = %hex::encode(filter), leaves = labelled.len(),
         labelled = labelled.iter().filter(|n| n.is_some_and(|n| n > 0)).count(), refused,
         nodes = labelled.iter().flatten().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
+        labelled_leaves = %labelled_leaves_text(&named),
         outcome, "storage labels computed ahead of the epoch's snapshot");
     Ok(())
 }
@@ -4790,6 +5028,102 @@ mod tests {
         assert!(store
             .find(epoch, &member, leaf, |count| count == n)
             .is_some());
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The line of a pass of labelling ahead names each leaf it labels, at
+    /// its count, and why: a leaf new to the shard, one whose data outgrew
+    /// the count kept, and one at the count it had, whose labels the sweep
+    /// removed (2026-11-08: four relabels of seats' leaves at the count
+    /// labelled before could not be told from the line); a process's first
+    /// pass of a shard and a leaf it refused before say so, labels bound
+    /// to their epoch too, and the list stays bounded.
+    #[test]
+    fn labelling_ahead_names_each_leaf_its_count_and_why() {
+        use quil_crypto::storage_proof::precompute_nodes;
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("ahead-reasons");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, filter) = ([7u8; 32], [0x5Au8; 32]);
+        let prefix = |bits: &[u32]| {
+            let mut prefix = vec![quil_forest::BIT_PATH_PREFIX_SENTINEL];
+            prefix.extend_from_slice(bits);
+            prefix
+        };
+        let id = |prefix: &[u32]| quil_execution::global_intrinsic::leaf_id_bytes(&filter, prefix);
+        let (grown, retry, same, new) = (
+            prefix(&[0, 0]),
+            prefix(&[0, 1]),
+            prefix(&[1, 0]),
+            prefix(&[1, 1]),
+        );
+        let reason = |epoch, prefix: &[u32], exact| {
+            store.ahead_reason(epoch, &member, &filter, &id(prefix), exact)
+        };
+        assert_eq!(
+            reason(8, &grown, 100),
+            AheadReason::Epoch,
+            "labels bound to their epoch misnamed"
+        );
+        assert_eq!(
+            reason(10, &grown, 100),
+            AheadReason::First,
+            "a first pass misnamed"
+        );
+
+        // A pass for epoch 10 labels two leaves; the third had no room.
+        let (grown_was, same_n) = (precompute_nodes(100), precompute_nodes(200));
+        keep(&store, 10, &member, &id(&grown), grown_was);
+        keep(&store, 10, &member, &id(&same), same_n);
+        store.note_pass(
+            &member,
+            &filter,
+            [id(&grown), id(&retry), id(&same)].into_iter().collect(),
+        );
+        // One leaf is looked for in the epochs after; the other's labels
+        // go at the sweep of an epoch nothing looked for them for.
+        for epoch in [11, 12] {
+            assert!(store.find(epoch, &member, &id(&grown), |_| true).is_some());
+            store.sweep(epoch);
+        }
+        assert!(!store.holds(12, &member, &id(&same)), "swept");
+
+        // The next pass: one leaf's data outgrew its count, one is labelled
+        // again at the count it had, one is new, one was refused before.
+        let grown_exact = grown_was + 1;
+        let leaves = [
+            (
+                &grown,
+                precompute_nodes(grown_exact),
+                reason(13, &grown, grown_exact),
+            ),
+            (&same, same_n, reason(13, &same, 200)),
+            (&new, precompute_nodes(300), reason(13, &new, 300)),
+            (&retry, precompute_nodes(400), reason(13, &retry, 400)),
+        ]
+        .map(|(prefix, n, why)| (leaf_path(prefix), n, why));
+        assert_eq!(
+            labelled_leaves_text(&leaves),
+            format!(
+                "00:{}:grown(was {grown_was}), 10:{same_n}:dropped(was {same_n} by sweep), \
+                 11:{}:new, 01:{}:retry",
+                precompute_nodes(grown_exact),
+                precompute_nodes(300),
+                precompute_nodes(400),
+            ),
+            "the line misnamed a leaf, its count or why it was labelled"
+        );
+
+        // A shard's one leaf, and a bounded list.
+        assert_eq!(leaf_path(&prefix(&[])), "root");
+        assert_eq!(labelled_leaves_text(&[]), "none");
+        let many: Vec<_> = (0..LABELLED_LEAVES_LOGGED as u64 + 2)
+            .map(|n| ("root".to_string(), n, AheadReason::New))
+            .collect();
+        let text = labelled_leaves_text(&many);
+        assert_eq!(text.matches(":new").count(), LABELLED_LEAVES_LOGGED);
+        assert!(text.ends_with(", +2 more"), "{text}");
         quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
         let _ = fs::remove_dir_all(&dir);
     }
