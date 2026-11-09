@@ -1780,6 +1780,26 @@ pub fn claim_epoch_proof(
     Some(attempt)
 }
 
+/// Whether [`claim_epoch_proof`] would claim an attempt at `global_frame`,
+/// without claiming it, and the attempts claimed so far.
+pub fn epoch_proof_attempt_due(
+    member: &[u8],
+    filter: &[u8],
+    epoch: u64,
+    global_frame: u64,
+) -> (bool, u32) {
+    let Ok(attempts) = epoch_proof_attempts().lock() else {
+        return (false, 0);
+    };
+    match attempts.get(&(member.to_vec(), filter.to_vec(), epoch)) {
+        Some(&(at, attempt)) => (
+            global_frame >= at.saturating_add(seal_retry_frames()),
+            attempt,
+        ),
+        None => (true, 0),
+    }
+}
+
 /// Restart the retry clock of `(member, filter)`'s epoch proof settling
 /// `epoch` at the latest GLOBAL frame this process saw ([`global_frame`]):
 /// its part, or the node's proof carrying it, just went out, and GLOBAL needs
