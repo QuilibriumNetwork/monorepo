@@ -3198,7 +3198,7 @@ pub struct AppConsensusEngine {
     lineage_record_absent: bool,
 
     // Identity
-    sector_signer: Box<dyn quil_types::crypto::Signer>,
+    sector_signer: Arc<dyn quil_types::crypto::Signer>,
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
 
@@ -3211,6 +3211,14 @@ pub struct AppConsensusEngine {
     /// Callback that publishes finalized FrameHeader canonical bytes
     /// on `GLOBAL_PROVER`. Optional so legacy/test paths still work.
     coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+
+    /// This seat's storage epoch proof checks, run off the consensus
+    /// thread one at a time ([`Self::request_storage_epoch_check`]).
+    storage_epoch_checks: Arc<crate::storage_epoch_check::Checks>,
+    /// Run each check on the asking thread, as tests reading what it did
+    /// right after, under their thread's overrides, need.
+    #[cfg(test)]
+    storage_epoch_check_inline: bool,
 
     /// Backing KV store for persistent consensus + liveness state.
     /// `None` falls back to the in-memory stub.
@@ -3504,7 +3512,10 @@ impl AppConsensusEngine {
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
             lineage_record_absent: false,
-            sector_signer: deps.bls_signer,
+            sector_signer: Arc::from(deps.bls_signer),
+            storage_epoch_checks: Default::default(),
+            #[cfg(test)]
+            storage_epoch_check_inline: false,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3611,6 +3622,125 @@ impl AppConsensusEngine {
             &quil_store::encoding::consensus_materialized_cursor_key(&self.filter),
             &frame.to_be_bytes(),
         )
+    }
+
+    /// What this seat's storage epoch proof check reads, owned, so that it
+    /// runs off the consensus thread.
+    fn storage_epoch_check(&self) -> StorageEpochCheck {
+        StorageEpochCheck {
+            filter: self.filter.clone(),
+            local_prover_address: self.local_prover_address.clone(),
+            global_anchor_store: self.global_anchor_store.clone(),
+            global_anchor_source: self.global_anchor_source.clone(),
+            global_hypergraph: self.global_hypergraph.clone(),
+            coverage_publish: self.coverage_publish.clone(),
+            sector_signer: self.sector_signer.clone(),
+            prover_registry: self.prover_registry.clone(),
+            kv_db: self.kv_db.clone(),
+            hypergraph: self.hypergraph.clone(),
+        }
+    }
+
+    /// Ask for this seat's storage epoch proof check at `ask`
+    /// ([`StorageEpochCheck::prove_storage_epoch_if_due`]). It reads this
+    /// node's store, so it runs on a blocking thread, never on this
+    /// engine's consensus thread, one check at a time; what is asked while
+    /// one runs is checked once after it, at the newest frame asked
+    /// (`crate::storage_epoch_check`). A GLOBAL frame asked is noted at
+    /// once (`crate::storage_snapshot::note_global_frame`), however long
+    /// a check runs.
+    fn request_storage_epoch_check(&self, ask: crate::storage_epoch_check::Ask) {
+        use crate::storage_epoch_check::{Ask, Asking};
+        if let Ask::Frame(frame) = ask {
+            crate::storage_snapshot::note_global_frame(frame);
+        }
+        #[cfg(test)]
+        if self.storage_epoch_check_inline {
+            let check = self.storage_epoch_check();
+            let frame = match ask {
+                Ask::Frame(frame) => Some(frame),
+                Ask::Head => check.head(),
+            };
+            if let Some(frame) = frame {
+                check.prove_storage_epoch_if_due(frame);
+            }
+            return;
+        }
+        let running = match self
+            .storage_epoch_checks
+            .ask(ask, std::time::Instant::now())
+        {
+            Asking::Start(running) => running,
+            Asking::Queued(None) => return,
+            Asking::Queued(Some(ran)) => {
+                warn!(core_id = self.core_id, filter = %hex::encode(&self.filter), seconds = ran.as_secs(),
+                    scope = "this node",
+                    action = "the check reads this node's store: compare the 'store latency' line's fsync_probe_ms and max_write_ms; slow there is this node's disk",
+                    "storage epoch proof check still running: consensus does not wait for it, the frames asked meanwhile are checked once after it, and this seat's seals and settlements wait for it");
+                return;
+            }
+        };
+        let check = self.storage_epoch_check();
+        let work = move || {
+            let filter = check.filter.clone();
+            running.run(&filter, |asked| {
+                if let Some(frame) = asked.frame(|| check.head()) {
+                    check.prove_storage_epoch_if_due(frame);
+                }
+            });
+        };
+        // Dropped unrun (a runtime shutting down, a thread not spawned),
+        // the work frees the engine's run, and the next ask starts one.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(work)),
+            Err(_) => {
+                if let Err(error) = std::thread::Builder::new()
+                    .name("storage epoch check".into())
+                    .spawn(work)
+                {
+                    warn!(core_id = self.core_id, %error,
+                        "storage epoch proof check not started: no thread for it; the next GLOBAL frame asks again");
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
+        self.storage_epoch_check()
+            .prove_storage_epoch_if_due(global_frame_number);
+    }
+
+    #[cfg(test)]
+    fn label_storage_ahead(&self, global_frame_number: u64) {
+        self.storage_epoch_check()
+            .label_storage_ahead(global_frame_number);
+    }
+}
+
+/// What a seat's storage epoch proof check reads, owned so that it runs on
+/// a blocking thread ([`AppConsensusEngine::request_storage_epoch_check`]).
+struct StorageEpochCheck {
+    filter: Vec<u8>,
+    local_prover_address: Vec<u8>,
+    global_anchor_store: Arc<dyn ClockStore>,
+    global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    global_hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    sector_signer: Arc<dyn quil_types::crypto::Signer>,
+    prover_registry: Arc<dyn ProverRegistry>,
+    kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+}
+
+impl StorageEpochCheck {
+    /// The newest GLOBAL frame stored.
+    fn head(&self) -> Option<u64> {
+        self.global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header)
+            .map(|header| header.frame_number)
     }
 
     /// Hash storage proofs (decided 2026-10-26): label the leaves this member
@@ -3917,7 +4047,7 @@ impl AppConsensusEngine {
         };
         let missing = |number: u64| {
             self.global_anchor_store
-                .get_global_clock_frame(number)
+                .get_global_clock_frame_header(number)
                 .is_err()
         };
         // Near the window's end, or a retry interval into it, a seal whose
@@ -3936,9 +4066,9 @@ impl AppConsensusEngine {
         let beacon_output = match &seal {
             Some(slot) => match self
                 .global_anchor_store
-                .get_global_clock_frame(slot.registered_at + 1)
+                .get_global_clock_frame_header(slot.registered_at + 1)
                 .ok()
-                .and_then(|frame| frame.header.map(|header| header.output))
+                .map(|header| header.output)
             {
                 Some(output) => output,
                 None => {
@@ -4225,7 +4355,9 @@ impl AppConsensusEngine {
             crate::storage_jobs::spawn(lane, label, move || job(part.seals, part.settles));
         }
     }
+}
 
+impl AppConsensusEngine {
     /// Put this frame's materialization off while its confidential proofs
     /// verify on a background thread (`admission_verify`), so the engine
     /// keeps serving consensus, storage proofs and confirmations instead of
@@ -4676,7 +4808,9 @@ impl AppConsensusEngine {
         if let Some(held) = self.hold_for_data_import(frame_number, pre_state) {
             return Err(held);
         }
-        self.prove_storage_epoch_if_due(global_frame_number);
+        self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(
+            global_frame_number,
+        ));
         #[cfg(test)]
         if let Some(held) = held_for_proofs(&self.filter, frame_number) {
             return Err(held);
@@ -8198,12 +8332,9 @@ impl AppConsensusEngine {
                     // withholds it for a settlement left undone (before epoch
                     // 1342: kicks the member)
                     // (an in-process engine receives no GLOBAL frame messages).
-                    // `claim_epoch_proof` paces the attempts.
-                    if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
-                        .and_then(|frame| frame.header).map(|header| header.frame_number)
-                    {
-                        self.prove_storage_epoch_if_due(head);
-                    }
+                    // `claim_epoch_proof` paces the attempts. The check
+                    // reads the GLOBAL head itself, off this thread.
+                    self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Head);
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
                     // a timer tick while CW is still waiting for a subscribed
@@ -12241,7 +12372,9 @@ impl AppConsensusEngine {
         // whose committee stalls in the settlement window must still settle
         // what it committed, or GLOBAL withholds its storage share (before
         // epoch 1342: kicks it).
-        self.prove_storage_epoch_if_due(global_frame_number);
+        self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(
+            global_frame_number,
+        ));
 
         // Update difficulty from global frame header
         self.current_difficulty
@@ -21376,6 +21509,7 @@ mod tests {
         engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         engine.kv_db = Some(db.clone());
+        engine.storage_epoch_check_inline = true;
         engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
         let window = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
         let store_frame = |number: u64| {
@@ -21894,6 +22028,7 @@ mod tests {
         let sink = published.clone();
         engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
         engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.storage_epoch_check_inline = true;
         engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
         let epoch = 5;
         let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
@@ -21944,6 +22079,90 @@ mod tests {
         assert!(
             announced,
             "a settlement due on a running, stalled committee is prepared from a GLOBAL frame"
+        );
+    }
+
+    /// A store whose range reads wait while `slow` is set, up to 5 s: a
+    /// disk an epoch boundary's storage work saturates. Counts every range
+    /// read in `reads`.
+    struct SlowRangeReads {
+        inner: quil_store::RocksDb,
+        slow: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl quil_types::store::KvDb for SlowRangeReads {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            quil_types::store::KvDb::get(&self.inner, key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::set(&self.inner, key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::delete(&self.inner, key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            quil_types::store::KvDb::new_batch(&self.inner, indexed)
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.reads.fetch_add(1, SeqCst);
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while self.slow.load(SeqCst) && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            quil_types::store::KvDb::new_iter(&self.inner, lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            quil_types::store::KvDb::compact(&self.inner, start, end, parallelize)
+        }
+        fn compact_all(&self) -> Result<()> {
+            quil_types::store::KvDb::compact_all(&self.inner)
+        }
+        fn close(&self) -> Result<()> {
+            quil_types::store::KvDb::close(&self.inner)
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::delete_range(&self.inner, start, end)
+        }
+    }
+
+    /// The storage epoch proof check reads this node's store. On a disk an
+    /// epoch boundary's storage work saturated, it took 35-72 s on every
+    /// worker's consensus thread at once: votes waited, and the workers
+    /// refused proposals after (mainnet, 2026-11-10: 26-28 workers of one
+    /// node). A GLOBAL frame returns at once, and the check still reads.
+    #[tokio::test]
+    async fn a_slow_store_holds_no_consensus_thread_in_the_storage_epoch_proof_check() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let slow = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        engine.kv_db = Some(Arc::new(SlowRangeReads {
+            inner: quil_store::RocksDb::open_in_memory().unwrap(),
+            slow: slow.clone(),
+            reads: reads.clone(),
+        }));
+        let started = std::time::Instant::now();
+        at_global_frame(&mut engine, 1_000);
+        let held = started.elapsed();
+        slow.store(false, SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while reads.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            held < Duration::from_secs(1),
+            "CHECK-ON-CONSENSUS-THREAD: a GLOBAL frame held the consensus thread {held:?} while the storage epoch proof check read a slow store"
+        );
+        assert!(
+            reads.load(SeqCst) > 0,
+            "CHECK-NOT-RUN: the storage epoch proof check never read the store"
         );
     }
 
