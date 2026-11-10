@@ -3226,8 +3226,22 @@ impl ProverLifecycle {
             .filter(|a| self.allocator.expiry_awaits_view(a, frame_number).is_some())
             .map(|a| &a.confirmation_filter)
             .collect();
-        let unbound_held_count = all_our_filters
+        // A seat the allocator gives up is owed no worker: it binds none to
+        // it, and its committee does not seat it (`WorkerAllocator::gives_up`).
+        // Counted as owed one, seats lapsed over a node's downtime held every
+        // free worker until their leaves ended, two epochs (2026-11-10, an
+        // operator's node: 5 of 6 workers idle).
+        let held_filters: Vec<&Vec<u8>> = all_our_filters
             .iter()
+            .filter(|f| {
+                self.allocator
+                    .given_up_among(own_allocations, f, frame_number)
+                    .is_none()
+            })
+            .collect();
+        let unbound_held_count = held_filters
+            .iter()
+            .copied()
             .chain(expiry_held.iter().copied())
             .filter(|f| !worker_bound_filters.contains(*f))
             .collect::<std::collections::HashSet<_>>()
@@ -3240,8 +3254,9 @@ impl ProverLifecycle {
         // excess, but it does not count confirmations still in flight, so a
         // re-ranking between evaluations can confirm it too; the surplus leave
         // path then sheds it unless the halt-risk shield protects that shard.
-        let occupied = all_our_filters
+        let occupied = held_filters
             .iter()
+            .copied()
             .chain(&worker_bound_filters)
             .chain(expiry_held.iter().copied())
             .collect::<std::collections::HashSet<_>>()
@@ -3978,6 +3993,12 @@ impl ProverLifecycle {
                     Some(quil_types::consensus::AllocationPhase::Joining) => false,
                     Some(_) => true,
                     None => self.allocator.renewal_recovering(a, frame_number),
+                })
+                // Nor a seat the allocator gives up, unless a worker still
+                // serves it: it binds none to it.
+                .filter(|a| {
+                    worker_bound_filters.contains(&a.confirmation_filter)
+                        || self.allocator.gives_up(a, frame_number).is_none()
                 })
                 .collect();
             let owed_workers = held
@@ -12840,6 +12861,87 @@ mod proposal_loop_tests {
         );
     }
 
+    /// Sets the calling thread's leaver currency frame, cleared on drop.
+    struct LeaverCurrency;
+    impl LeaverCurrency {
+        fn at(frame: Option<u64>) -> Self {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(frame);
+            Self
+        }
+    }
+    impl Drop for LeaverCurrency {
+        fn drop(&mut self) {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(None);
+        }
+    }
+
+    /// A seat registered for epoch 2 on `filter`, left at `leave`; its leave
+    /// confirmed at `confirm` (0: not yet).
+    fn left_lapsed(filter: &[u8], leave: u64, confirm: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            epoch: 2,
+            leave_frame_number: leave,
+            leave_confirm_frame_number: confirm,
+            ..alloc(filter.to_vec(), ProverStatus::Leaving, 10)
+        }
+    }
+
+    /// Seats lapsed over a node's downtime and left after it are given up:
+    /// the allocator binds no worker to them and their committees do not
+    /// seat them. They take no free worker from joins, neither while the
+    /// leave awaits its confirm nor while a confirmed one serves out its
+    /// epoch. Counted as owed a worker, they kept 5 of an operator's 6
+    /// workers idle for two epochs after a restart (2026-11-10).
+    #[test]
+    fn seats_given_up_take_no_free_worker_from_joins() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = quil_types::consensus::epoch_length_frames();
+        let frame = 20 * e + 5;
+        let address = vec![0xCDu8; 32];
+        let left = filter_bytes(0xA1);
+        let departing = filter_bytes(0xA2);
+        let seats = vec![
+            left_lapsed(&left, 20 * e + 1, 0),
+            left_lapsed(&departing, 19 * e + 1, 20 * e + 1),
+        ];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), seats.clone()));
+        reg.set_summaries(vec![
+            shard_summary(left.clone(), 50),
+            shard_summary(departing.clone(), 50),
+            shard_summary(filter_bytes(0xB1), 1),
+            shard_summary(filter_bytes(0xB2), 1),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        for seat in &seats {
+            assert_eq!(
+                lifecycle.allocator.gives_up(seat, frame),
+                Some(crate::worker_allocator::GivenUp::LeftLapsed),
+                "fixture: {}",
+                hex::encode(&seat.confirmation_filter)
+            );
+        }
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle
+            .evaluate(frame, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let mut joined = proposed_join_filters(&actions);
+        joined.sort();
+        assert_eq!(
+            joined,
+            vec![filter_bytes(0xB1), filter_bytes(0xB2)],
+            "both free workers join other shards, none waits on a seat given up: {actions:?}"
+        );
+    }
+
     #[test]
     fn moving_to_fewer_cores_proposes_leaves_for_surplus() {
         let address = vec![0xCDu8; 32];
@@ -14378,6 +14480,68 @@ mod proposal_loop_tests {
             decide(false),
             (false, true),
             "the free worker is owed to the confirmed join"
+        );
+    }
+
+    /// A seat this node gives up is owed no worker at the confirm cap
+    /// either: the allocator binds none to it. A join proposed beside seats
+    /// lapsed over a downtime confirms in the epoch their leaves serve out
+    /// instead of being rejected for the worker they never get.
+    #[test]
+    fn a_pending_join_confirms_beside_a_seat_given_up() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = quil_types::consensus::epoch_length_frames();
+        let frame = 21 * e + 5;
+        let address = vec![0xCDu8; 32];
+        let waiting = filter_bytes(0xB0);
+        let given_up = left_lapsed(&filter_bytes(0xB1), 20 * e + 1, 21 * e + 1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(WorkerInfo {
+            core_id: 1,
+            filter: waiting.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(waiting.clone(), ProverStatus::Joining, 20 * e + 10),
+                given_up.clone(),
+            ],
+        ));
+        let mut counts = HashMap::new();
+        counts.insert(ProverStatus::Active, 2);
+        reg.set_summaries(vec![
+            ProverShardSummary {
+                filter: waiting.clone(),
+                status_counts: counts,
+                total_size: 1_000,
+            },
+            shard_summary(given_up.confirmation_filter.clone(), 5),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        assert_eq!(
+            lifecycle.allocator.gives_up(&given_up, frame),
+            Some(crate::worker_allocator::GivenUp::LeftLapsed),
+            "fixture"
+        );
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle
+            .evaluate(frame, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert!(
+            count_confirms(&actions).contains(&waiting)
+                && !count_reject_filters(&actions).contains(&waiting),
+            "the join's worker is owed to no seat it could serve: {actions:?}"
         );
     }
 
