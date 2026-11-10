@@ -680,25 +680,40 @@ fn an_excluded_member_is_seated_again_at_the_boundary_after_it_signs() {
     );
 }
 
-/// The schedule: not on mainnet, whatever the settings say; elsewhere the
-/// settings, with K and M at their defaults when unset or zero; never
-/// before one epoch after the signed-frame activation frame, nor without
-/// it.
+/// The schedule: on mainnet from its own frame, the first of an epoch, at
+/// or after the seal successor eligibility frame; elsewhere the settings,
+/// with K and M at their defaults when unset or zero; never before one
+/// epoch after the signed-frame activation frame, nor without it.
 #[test]
-fn the_silent_fence_is_not_scheduled_by_default() {
-    assert_eq!(silence::MAINNET_SILENT_FENCE_FRAME, None);
+fn the_silent_fence_is_scheduled_on_mainnet_from_its_frame() {
+    let mainnet = 1490 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+    assert_eq!(
+        silence::MAINNET_SILENT_FENCE_FRAME,
+        Some(mainnet),
+        "the mainnet silent fence frame"
+    );
     assert_eq!(
         silence::settings(),
         Settings {
-            frame: u64::MAX,
+            frame: mainnet,
             window: 90,
             evidence: 3
         },
         "without init, the mainnet settings"
     );
-    assert_eq!(silence::first_frame(), u64::MAX);
     let epoch = quil_types::consensus::epoch_length_frames();
+    let signed = quil_types::consensus::MAINNET_SIGNED_FRAME_ACTIVATION_FRAME.unwrap();
+    assert!(
+        mainnet >= signed + epoch,
+        "a full epoch of signatures first"
+    );
+    assert_eq!(silence::first_frame(), mainnet);
+    assert!(
+        MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME.unwrap() <= silence::first_frame(),
+        "a late seal of a stalled session seats current eligibility"
+    );
     quil_types::consensus::set_signed_frame_activation_frame_for_thread(Some(100));
+    set_silent_frame(None);
     assert_eq!(
         silence::first_frame(),
         u64::MAX,
