@@ -22,6 +22,8 @@
 //! are past its activity window, so the first finalization it hears prunes
 //! the views it voted in, and crashes it at each operation after that.
 //!
+//! A last test counts the member's journal syncs per finalize vote it signs.
+//!
 //! The simplex unit tests live in `commonware-consensus`, which the workspace
 //! excludes, so CI runs this one. It uses ed25519 and the simplex mocks.
 
@@ -85,6 +87,7 @@ enum Op {
 #[derive(Default)]
 struct HookState {
     ops: u64,
+    syncs: u64,
     crash_before: Option<u64>,
     crashed: Option<Op>,
 }
@@ -114,6 +117,9 @@ impl Hook {
             state.crashed = Some(op);
             return false;
         }
+        if matches!(op, Op::Sync | Op::WriteSync) {
+            state.syncs += 1;
+        }
         true
     }
 
@@ -132,6 +138,11 @@ impl Hook {
 
     fn crashed(&self) -> Option<Op> {
         self.state.lock().unwrap().crashed
+    }
+
+    /// Syncs (flushes to the device) of the journal so far.
+    fn syncs(&self) -> u64 {
+        self.state.lock().unwrap().syncs
     }
 
     fn restart(&self) {
@@ -412,6 +423,15 @@ impl Net {
             .filter(|(i, _)| *i == incarnation)
             .map(|(_, vote)| vote_view(vote))
             .max()
+    }
+
+    /// Finalize votes the target sent.
+    fn finalize_votes(&self) -> u64 {
+        let sent = self.sent.lock().unwrap();
+        let votes = sent
+            .iter()
+            .filter(|(_, vote)| matches!(vote, Vote::Finalize(_)));
+        votes.count() as u64
     }
 
     /// Whether the target sent a finalize vote above `view` in `incarnation`.
@@ -818,4 +838,42 @@ fn crash_at_each_journal_write_with_a_silent_member() {
 #[test]
 fn crash_after_catching_up_past_the_activity_window() {
     crash_at_every_point(Scenario::CatchUp);
+}
+
+/// Journal syncs per finalize vote of a member, all four live and no crash.
+/// Per view it syncs for its notarize vote, for the certification result
+/// with its finalize vote, and for the finalization: 3. The notarization
+/// certificate between the first two is not synced on its own (`must_sync` in
+/// the voter); the tip synced it too, 4.
+#[test]
+fn journal_syncs_per_finalize_vote() {
+    deterministic::Runner::timed(Duration::from_secs(600)).start(|context| async move {
+        let committee = Committee::new(&context, None);
+        let net = committee.net.clone();
+        let hook = Hook::new(partition(TARGET));
+        let _members: Vec<Member> = (0..MEMBERS)
+            .map(|index| {
+                let hook = (index == TARGET).then(|| hook.clone());
+                committee.start(&context, index, 0, hook)
+            })
+            .collect();
+        let finalized = |view| committee.finalized(TARGET) >= View::new(view);
+        wait_for(&context, &net, "view 10", Duration::from_secs(120), || {
+            finalized(10)
+        })
+        .await;
+        let (syncs, votes) = (hook.syncs(), net.finalize_votes());
+        wait_for(&context, &net, "view 40", Duration::from_secs(300), || {
+            finalized(40)
+        })
+        .await;
+        let syncs = hook.syncs() - syncs;
+        let votes = net.finalize_votes() - votes;
+        println!("SYNC-COUNT syncs={syncs} votes={votes}");
+        assert!(votes >= 25, "finalize votes in views 10-40: {votes}");
+        assert!(
+            syncs * 4 <= votes * 13,
+            "journal syncs per finalize vote: {syncs} for {votes} votes, over 3 each"
+        );
+    });
 }

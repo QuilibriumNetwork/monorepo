@@ -45,6 +45,28 @@ use std::{
 };
 use tracing::{debug, info, info_span, trace, warn, Instrument as _, Span};
 
+/// QUILIBRIUM: whether an appended `artifact` must be durable before the
+/// broadcast phase of the loop iteration that appended it.
+///
+/// A notarization need not be: it carries other members' signatures, not a
+/// vote of ours, and replay rebuilds our vote guards (`Round::replay`) from
+/// our own votes alone, so a restart that lost one cannot make us sign a
+/// conflicting vote. Without it the restarted voter waits in that view until
+/// the certificate reaches it again (peers' certificates, the resolver,
+/// nullify retries). It is made durable by the next synced append of its view
+/// (the section's records survive in order): the certification and finalize
+/// vote that follow it. This takes the notarization's own sync off the path
+/// to the finalize vote, which is the vote whose signature is credited.
+///
+/// Every other record keeps its sync: our own votes (a restart that forgot one
+/// could sign a conflicting one), finalizations (they let
+/// [Actor::prune_views] delete older views' votes, which a restart that lost
+/// the finalization could vote in again), certification results and
+/// nullifications (off that path; kept as upstream).
+const fn must_sync<S: Scheme<D>, D: Digest>(artifact: &Artifact<S, D>) -> bool {
+    !matches!(artifact, Artifact::Notarization(_))
+}
+
 /// Tracks which certificate type was received from the resolver in the current iteration.
 ///
 /// Used to prevent "boomerang" where we send a certificate back to the resolver
@@ -252,26 +274,26 @@ impl<
     ///
     /// The append is not immediately durable. All appends in an event loop
     /// iteration target the view being processed and are synced together by
-    /// [Self::sync_journal].
+    /// [Self::sync_journal] if any of them [must be durable](must_sync) before
+    /// the broadcast phase.
     async fn append_journal(&mut self, view: View, artifact: Artifact<S, D>) {
         if let Some(journal) = self.journal.as_mut() {
             journal
                 .append(view.get(), &artifact)
                 .await
                 .expect("unable to append to journal");
-            self.dirty = true;
+            self.dirty |= must_sync(&artifact);
         }
     }
 
     /// Syncs the journal section for `view` (the view being processed) if the
-    /// iteration appended anything.
+    /// iteration appended anything that [must be durable](must_sync).
     ///
     /// Invoked once per event loop iteration, after [Self::construct] and before
     /// [Self::notify] (regardless of whether anything will be broadcast), so
-    /// every vote and certificate we tell the network about is recoverable after
-    /// a restart. Deferring syncs to this boundary (rather than syncing after
-    /// each append) coalesces all appends in the same loop iteration into a
-    /// single sync.
+    /// every vote we tell the network about is recoverable after a restart.
+    /// Deferring syncs to this boundary (rather than syncing after each append)
+    /// coalesces all appends in the same loop iteration into a single sync.
     async fn sync_journal(&mut self, view: View) {
         if !self.dirty {
             return;
@@ -319,8 +341,10 @@ impl<
 
     /// Send a certificate to every peer.
     ///
-    /// Callers must sync pending journal appends first (via [Self::sync_journal])
-    /// so any state we advertise to the network survives a restart.
+    /// Callers must sync pending journal appends first (via [Self::sync_journal]).
+    /// QUILIBRIUM: a notarization may still be unsynced (see [must_sync]); it
+    /// carries other members' signatures, not a vote of ours, and peers that
+    /// received it keep it.
     fn broadcast_certificate<T: Sender>(
         &mut self,
         sender: &mut WrappedSender<T, Certificate<S, D>>,
@@ -809,7 +833,7 @@ impl<
 
     /// Builds and records any votes or certificates that became available for `view`.
     ///
-    /// Everything returned must be synced to the journal (via [Self::sync_journal])
+    /// Every vote returned must be synced to the journal (via [Self::sync_journal])
     /// before it is broadcast (via [Self::notify]).
     ///
     /// We don't need to iterate over all views to check for new actions because messages we receive
@@ -838,7 +862,8 @@ impl<
     /// Broadcasts everything constructed this iteration and reports it to the application.
     ///
     /// Callers must sync pending journal appends first (via [Self::sync_journal])
-    /// so no vote or certificate reaches the network before it is durable.
+    /// so no vote, and no certificate but a notarization (see [must_sync]),
+    /// reaches the network before it is durable.
     #[allow(clippy::type_complexity)]
     fn notify<Sp: Sender, Sr: Sender>(
         &mut self,
@@ -1250,8 +1275,9 @@ impl<
                     // Sync everything appended this iteration (during message
                     // processing and construction) in a single coalesced sync.
                     // This runs even if there is nothing to broadcast (e.g. a
-                    // certification result was recorded) so every artifact is
-                    // durable by the end of the iteration that appended it.
+                    // certification result was recorded) so every artifact
+                    // but a notarization is durable by the end of the
+                    // iteration that appended it (see [must_sync]).
                     self.sync_journal(view).await;
 
                     // Broadcast everything we built (and report it to the application).
