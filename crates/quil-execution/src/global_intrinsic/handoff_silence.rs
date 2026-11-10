@@ -77,10 +77,13 @@ pub const EVIDENCE_SHARDS: usize = 3;
 /// (`MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME`) at or before it, so a seal
 /// that closes a stalled session late seats current eligibility, which
 /// leaves silent members out, rather than the committee its request fixed.
-/// Not scheduled on mainnet until a release carrying it is adopted;
+/// Mainnet: 1,072,800, the first frame of epoch 1490, which GLOBAL cannot
+/// reach before 2026-11-13 02:00 UTC even at ten seconds a frame; set once
+/// every archive and 99.9% of the workers measured ran a release carrying
+/// the fence (2026-11-10 11:04 UTC);
 /// `QUIL_SILENT_FENCE_FRAME` elsewhere, never by default, with
 /// `QUIL_SILENT_WINDOW_FRAMES` (K) and `QUIL_SILENT_EVIDENCE_SHARDS` (M).
-pub const MAINNET_SILENT_FENCE_FRAME: Option<u64> = None;
+pub const MAINNET_SILENT_FENCE_FRAME: Option<u64> = Some(1_072_800);
 
 /// Kind of the handoff record of a member's silent exclusion on a filter.
 const SILENT: &[u8] = b"silent-exclusion";
