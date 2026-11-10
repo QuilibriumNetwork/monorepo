@@ -3461,3 +3461,119 @@ fn drain_anchor_raise_applies_from_its_frame_and_never_lowers_the_floor() {
     assert_eq!(drain_anchor_floor_at_for(6, (6, 1), 2), 2);
     assert_eq!(drain_anchor_floor_at_for(u64::MAX - 1, (u64::MAX, 9), 2), 2);
 }
+
+/// Each frame of a session earns credit once: one above the tip, then one
+/// below it GLOBAL never executed, within [`LATE_CREDIT_FRAMES`]; the tip and
+/// a frame executed before never again.
+#[test]
+fn a_credit_window_credits_each_frame_once() {
+    let window = |tip: u64, below: u64| CreditWindow { tip, below };
+    let (credit, first) = CreditWindow::execute(None, 1);
+    assert!(credit, "a session's first frame");
+    assert_eq!(first, window(1, 0));
+    // Frame 3 executes before frame 2: 1 executed, 2 not.
+    let (credit, ahead) = CreditWindow::execute(Some(first), 3);
+    assert!(credit);
+    assert_eq!(ahead, window(3, 0b10));
+    let (credit, late) = CreditWindow::execute(Some(ahead), 2);
+    assert!(credit, "late_header_not_credited");
+    assert_eq!(late, window(3, 0b11), "late_frame_not_recorded");
+    for frame in [1, 2, 3] {
+        assert_eq!(
+            CreditWindow::execute(Some(late), frame),
+            (false, late),
+            "frame {frame} executed again"
+        );
+    }
+    // Past the window nothing below the tip is credited.
+    let far = window(100, 0);
+    assert_eq!(
+        CreditWindow::execute(Some(far), 100 - LATE_CREDIT_FRAMES),
+        (true, window(100, 1 << (LATE_CREDIT_FRAMES - 1)))
+    );
+    assert_eq!(
+        CreditWindow::execute(Some(far), 99 - LATE_CREDIT_FRAMES),
+        (false, far)
+    );
+    // A jump past the window leaves the old tip outside it.
+    assert_eq!(
+        CreditWindow::execute(Some(first), 2 + LATE_CREDIT_FRAMES),
+        (true, window(2 + LATE_CREDIT_FRAMES, 0))
+    );
+    assert_eq!(
+        CreditWindow::execute(Some(first), 1 + LATE_CREDIT_FRAMES),
+        (
+            true,
+            window(1 + LATE_CREDIT_FRAMES, 1 << (LATE_CREDIT_FRAMES - 1))
+        )
+    );
+}
+
+/// A frame the window does not describe counts as executed: below a tip
+/// recorded without one, before the late header credit epoch, and up to a tip
+/// a seal drain advanced. A frame it left unexecuted keeps its place.
+#[test]
+fn a_credit_window_counts_frames_it_does_not_describe_as_executed() {
+    let window = |tip: u64, below: u64| CreditWindow { tip, below };
+    assert_eq!(CreditWindow::at(None, None), None);
+    assert_eq!(
+        CreditWindow::at(Some(window(3, 0)), None),
+        None,
+        "no tip, no window"
+    );
+    let unrecorded = CreditWindow::at(None, Some(9));
+    assert_eq!(
+        unrecorded,
+        Some(window(9, u64::MAX)),
+        "unrecorded_counted_unexecuted"
+    );
+    assert!(!CreditWindow::execute(unrecorded, 8).0);
+    // Frame 6 never executed; a drain took the tip from 7 to 10.
+    let recorded = window(7, 0);
+    assert_eq!(CreditWindow::at(Some(recorded), Some(7)), Some(recorded));
+    let drained = CreditWindow::at(Some(recorded), Some(10));
+    assert_eq!(
+        drained,
+        Some(window(10, 0b111)),
+        "drained_counted_unexecuted"
+    );
+    for frame in [7, 8, 9] {
+        assert!(!CreditWindow::execute(drained, frame).0, "frame {frame}");
+    }
+    assert!(CreditWindow::execute(drained, 6).0, "frame 6 still once");
+    assert_eq!(
+        CreditWindow::at(Some(recorded), Some(7 + LATE_CREDIT_FRAMES)),
+        Some(window(7 + LATE_CREDIT_FRAMES, u64::MAX))
+    );
+    assert_eq!(
+        CreditWindow::at(Some(window(12, 0)), Some(10)),
+        Some(window(10, u64::MAX)),
+        "a window above the tip describes nothing"
+    );
+}
+
+/// [`credit_header`] records a credited frame for the next header, and
+/// only a credited one.
+#[test]
+fn credit_header_records_the_frames_it_credits() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let id = [0x5a; 32];
+    assert!(credit_header(&state, 3, &id, None, 1).unwrap());
+    assert!(credit_header(&state, 4, &id, Some(1), 3).unwrap());
+    assert!(
+        credit_header(&state, 5, &id, Some(3), 2).unwrap(),
+        "late_header_not_credited"
+    );
+    assert!(
+        !credit_header(&state, 6, &id, Some(3), 2).unwrap(),
+        "credited_twice"
+    );
+    assert_eq!(
+        credit_window(&state, &id).unwrap(),
+        Some(CreditWindow {
+            tip: 3,
+            below: 0b11
+        })
+    );
+}

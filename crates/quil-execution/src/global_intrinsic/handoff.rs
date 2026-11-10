@@ -2050,6 +2050,122 @@ pub fn frames_since_tip_advance(
     Ok(frame.checked_sub(tip_frame_recording_frame()))
 }
 
+/// How far below a session's executed tip GLOBAL still credits a header it
+/// executes for the first time ([`credit_header`]).
+pub const LATE_CREDIT_FRAMES: u64 = 64;
+
+/// Which of the [`LATE_CREDIT_FRAMES`] frames below a session's executed tip
+/// GLOBAL has executed: bit `i` of `below` is frame `tip - 1 - i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreditWindow {
+    pub tip: u64,
+    pub below: u64,
+}
+
+impl CreditWindow {
+    /// `recorded` brought to the executed tip `tip`. Every frame it does not
+    /// describe counts as executed: below a tip recorded without a window
+    /// (before the late header credit epoch), and up to a tip that another
+    /// path advanced (a seal drain executes consecutive frames). `None` for a
+    /// session GLOBAL never executed.
+    pub fn at(recorded: Option<Self>, tip: Option<u64>) -> Option<Self> {
+        let tip = tip?;
+        Some(match recorded {
+            Some(window) if window.tip == tip => window,
+            Some(window) if window.tip < tip => {
+                let shift = tip - window.tip;
+                let below = if shift >= LATE_CREDIT_FRAMES {
+                    u64::MAX
+                } else {
+                    (window.below << shift) | ((1u64 << shift) - 1)
+                };
+                Self { tip, below }
+            }
+            _ => Self {
+                tip,
+                below: u64::MAX,
+            },
+        })
+    }
+
+    /// Execute the session's frame `frame` on `window`: whether it earns
+    /// credit, and the window after. A frame above the tip does and becomes
+    /// the tip, the old tip executed and the frames between not; one below
+    /// it does once, within the window; the tip itself never again.
+    pub fn execute(window: Option<Self>, frame: u64) -> (bool, Self) {
+        let Some(window) = window else {
+            return (
+                true,
+                Self {
+                    tip: frame,
+                    below: 0,
+                },
+            );
+        };
+        if frame > window.tip {
+            let shift = frame - window.tip;
+            let below = if shift > LATE_CREDIT_FRAMES {
+                0
+            } else {
+                window.below.checked_shl(shift as u32).unwrap_or(0) | (1u64 << (shift - 1))
+            };
+            return (true, Self { tip: frame, below });
+        }
+        let depth = window.tip - frame;
+        if depth == 0 || depth > LATE_CREDIT_FRAMES {
+            return (false, window);
+        }
+        let bit = 1u64 << (depth - 1);
+        if window.below & bit != 0 {
+            return (false, window);
+        }
+        (
+            true,
+            Self {
+                below: window.below | bit,
+                ..window
+            },
+        )
+    }
+}
+
+/// The [`CreditWindow`] GLOBAL last recorded for session `id`.
+pub fn credit_window(state: &impl Records, id: &[u8; 32]) -> Result<Option<CreditWindow>> {
+    read(state, b"credit-window", id)?
+        .map(|bytes| {
+            let corrupt = || QuilError::Store("corrupt session credit window".into());
+            let bytes = <[u8; 16]>::try_from(bytes).map_err(|_| corrupt())?;
+            let (tip, below) = bytes.split_at(8);
+            Ok(CreditWindow {
+                tip: u64::from_be_bytes(tip.try_into().map_err(|_| corrupt())?),
+                below: u64::from_be_bytes(below.try_into().map_err(|_| corrupt())?),
+            })
+        })
+        .transpose()
+}
+
+/// Whether GLOBAL frame `frame` credits session `id`'s header of frame
+/// `header_frame`, whose executed tip read `tip` before the header: each
+/// frame of a session once, also one executed after its successor
+/// ([`CreditWindow`]). A credited frame is recorded.
+pub fn credit_header(
+    state: &HypergraphState,
+    frame: u64,
+    id: &[u8; 32],
+    tip: Option<u64>,
+    header_frame: u64,
+) -> Result<bool> {
+    let window = CreditWindow::at(credit_window(state, id)?, tip);
+    let (credit, window) = CreditWindow::execute(window, header_frame);
+    if credit {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&window.tip.to_be_bytes());
+        bytes.extend_from_slice(&window.below.to_be_bytes());
+        write(state, frame, b"credit-window", id, &bytes)?;
+    }
+    Ok(credit)
+}
+
 /// The reward ring of each of a session's members, in member order, fixed at
 /// the session's first rewarded frame. Every frame the session certified is
 /// rewarded with these rings, whatever the members' allocations became after

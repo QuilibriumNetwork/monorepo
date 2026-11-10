@@ -863,6 +863,89 @@ pub fn set_anchored_issuance_epoch_for_thread(epoch: Option<u64>) {
     ANCHORED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which GLOBAL also credits a header of an authorized session
+/// that it executes after the frame's successor, once: the anchored issuance
+/// rules credit nothing at or below the session's executed tip, so a frame
+/// GLOBAL executed one GLOBAL frame after its successor earned its signers
+/// nothing and its root was never chained. From this epoch GLOBAL records
+/// which frames below the tip it executed and credits one it never did.
+/// Consensus-affecting for archives only (credit is archive state): every
+/// archive must run a build carrying the epoch before it, so archives upgrade
+/// together. Mainnet epoch 1496 (frame 1,077,120), which GLOBAL cannot reach
+/// before 2026-11-13 13:00 UTC even at ten seconds a frame: more than two
+/// days after a release published by 2026-11-11 12:00 UTC.
+/// `QUIL_LATE_HEADER_CREDIT_EPOCH` elsewhere, never by default.
+pub const MAINNET_LATE_HEADER_CREDIT_EPOCH: Option<u64> = Some(1496);
+
+static LATE_HEADER_CREDIT_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static LATE_HEADER_CREDIT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn late_header_credit_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_LATE_HEADER_CREDIT_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's late header credit epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_late_header_credit_epoch(network: u8) -> u64 {
+    *LATE_HEADER_CREDIT_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_LATE_HEADER_CREDIT_EPOCH").ok();
+        late_header_credit_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_late_header_credit_epoch`]; the mainnet epoch
+/// in a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX`: never.
+pub fn late_header_credit_epoch() -> u64 {
+    if let Some(epoch) = LATE_HEADER_CREDIT_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *LATE_HEADER_CREDIT_EPOCH.get_or_init(|| late_header_credit_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` credits a session's header executed after its
+/// successor ([`MAINNET_LATE_HEADER_CREDIT_EPOCH`]).
+pub fn late_header_credit_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= late_header_credit_epoch()
+}
+
+/// Set the late header credit epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_late_header_credit_epoch_for_thread(epoch: Option<u64>) {
+    LATE_HEADER_CREDIT_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod late_header_credit_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_late_header_credit_setting() {
+        assert_eq!(super::MAINNET_LATE_HEADER_CREDIT_EPOCH, Some(1496));
+        assert_eq!(1496 * super::EPOCH_LENGTH_FRAMES, 1_077_120);
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::late_header_credit_epoch_for(0, setting), 1496);
+        }
+        assert_eq!(super::late_header_credit_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::late_header_credit_epoch_for(1, Some("x")), u64::MAX);
+        assert_eq!(super::late_header_credit_epoch_for(1, None), u64::MAX);
+        let length = super::epoch_length_frames();
+        super::set_late_header_credit_epoch_for_thread(Some(7));
+        assert!(!super::late_header_credit_active(7 * length - 1));
+        assert!(super::late_header_credit_active(7 * length));
+        super::set_late_header_credit_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::late_header_credit_active(u64::MAX));
+        super::set_late_header_credit_epoch_for_thread(None);
+    }
+}
+
 /// The epoch from which nodes enforce strict GLOBAL_PEER_INFO validation:
 /// a KeyRegistry must sign its timestamp, and the mesh penalises a peer
 /// that forwards a PeerInfo, KeyRegistry or alert no release accepts.

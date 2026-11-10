@@ -1596,6 +1596,74 @@ fn global_prices_a_header_at_its_anchor_and_credits_each_frame_once() {
     );
 }
 
+/// GLOBAL can execute a session's frame one GLOBAL frame after the frame's
+/// successor. The anchored issuance rules credit nothing at or below the
+/// session's executed tip, so that frame earned its signers nothing, though
+/// GLOBAL never credited it. From the late header credit epoch GLOBAL credits
+/// it once; a frame it executes again stays uncredited.
+#[test]
+fn a_header_executed_after_its_successor_is_credited_once() {
+    let keys = keys();
+    let source = session(&keys, vec![0x68; 32]);
+    let anchor_output = vec![0x46; 32];
+    // Frames 1-3 at views 5, 7, 9, each extending the last, all anchored to
+    // GLOBAL frame 2.
+    let mut frames = vec![anchored_first_frame(&source, &keys, 2, &anchor_output)];
+    for (number, view, parent_view) in [(2u64, 7u64, 5u64), (3, 9, 7)] {
+        let previous = frames.last().unwrap().header.as_ref().unwrap();
+        let parent = quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+            .unwrap()
+            .to_vec();
+        frames.push(anchored_frame(
+            &source,
+            &keys,
+            number,
+            view,
+            parent_view,
+            parent,
+            2,
+            &anchor_output,
+        ));
+    }
+    let wire = |frame: &AppShardFrame| {
+        let mut op = canonical(frame);
+        op.global_frame_number = 2;
+        op.to_canonical_bytes().unwrap()
+    };
+    // GLOBAL frames 3-7 execute frames 1, 3 and 2, then 2 and 3 again.
+    let credited = |late_epoch: u64| {
+        quil_types::consensus::set_anchored_issuance_epoch_for_thread(Some(0));
+        quil_types::consensus::set_late_header_credit_epoch_for_thread(Some(late_epoch));
+        let fixture = Fixture::new(&source);
+        handoff::initialize(&fixture.state, 2, &source).unwrap();
+        commit(&fixture.state, 2);
+        store_global_frame_at(&fixture, 2, &anchor_output, 160_000);
+        let probe = Arc::new(DifficultyProbe::default());
+        let intrinsic = fixture.intrinsic_with(probe.clone());
+        for (number, index) in [(3u64, 0usize), (4, 2), (5, 1), (6, 1), (7, 2)] {
+            intrinsic
+                .invoke_step(number, &wire(&frames[index]), &fixture.state)
+                .unwrap();
+            commit(&fixture.state, number);
+        }
+        eprintln!("late header executed: frame 2 after frame 3, then both again");
+        let credited = probe.0.lock().unwrap().len();
+        quil_types::consensus::set_late_header_credit_epoch_for_thread(None);
+        quil_types::consensus::set_anchored_issuance_epoch_for_thread(None);
+        credited
+    };
+    assert_eq!(
+        credited(u64::MAX),
+        2,
+        "before_epoch_changed: before the epoch only frames 1 and 3 are credited"
+    );
+    assert_eq!(
+        credited(0),
+        3,
+        "late_header_not_credited: from the epoch frame 2 is credited too, once"
+    );
+}
+
 /// A sealed session's last headers can miss their lockstep window for good,
 /// and GLOBAL accepts a seal only at its executed tip (#699). The seal brings
 /// them: GLOBAL checks each against the session and executes it, from the
