@@ -7,11 +7,13 @@
 //! identity. See `node/p2p/peer_authenticator.go` in the Go tree and the
 //! `quil_tls` module here for the cert scheme.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::Uri;
 use hyper_util::rt::TokioIo;
@@ -23,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint};
 use tower::Service;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use quil_types::proto::global::app_shard_service_client::AppShardServiceClient;
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
@@ -93,6 +95,13 @@ impl ArchiveClientError {
                 || cause.downcast_ref::<std::io::Error>().is_some()
         })
     }
+
+    /// The connection the call went over is no longer usable: the dial or
+    /// the transport failed. A call that only outran its deadline leaves
+    /// its connection usable.
+    pub fn is_connection_failure(&self) -> bool {
+        matches!(self, Self::Transport(_)) || self.is_transport_failure()
+    }
 }
 
 /// `error` and every cause beneath it.
@@ -134,6 +143,308 @@ pub struct ArchiveClient {
     // app-shard frames for onboarding root cross-checks.
     app_shard: AppShardServiceClient<Channel>,
     endpoint: String,
+    /// Counts the connection as open until its last clone drops (PQNoise
+    /// dials; [`ENDPOINT_CONNECTIONS_WARN`]).
+    _open: Option<Arc<OpenConnection>>,
+}
+
+#[path = "archive_client_shared.rs"]
+pub mod shared;
+
+/// Where a dial was asked for: the caller of a `connect_*` function.
+type Site = &'static Location<'static>;
+
+/// This process's open connections plus dials in progress to one endpoint
+/// above which it warns. A node keeps one or two connections per archive;
+/// dozens mean a caller dials per request, which an archive's peer listener
+/// refuses past its per-source cap for every node behind the same address.
+const ENDPOINT_CONNECTIONS_WARN: usize = 32;
+
+/// The warning repeats at most this often per endpoint while it lasts.
+const ENDPOINT_LOAD_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// Dials counted for the warning's rate, and the most remembered.
+const DIAL_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DIALS_REMEMBERED: usize = 4096;
+
+/// Call sites named in the warning.
+const LOGGED_SITES: usize = 3;
+
+/// One endpoint's connections from this process.
+#[derive(Default)]
+struct EndpointLoad {
+    open: usize,
+    dialing: usize,
+    /// Dials started within [`DIAL_RATE_WINDOW`].
+    dials: VecDeque<Instant>,
+    /// Open plus dialing, by call site.
+    sites: HashMap<Site, usize>,
+    warned: Option<Instant>,
+    over_since: Option<Instant>,
+    peak: usize,
+}
+
+/// A line [`EndpointLoad::note`] asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadLine {
+    Many {
+        open: usize,
+        dialing: usize,
+        dials_last_60s: usize,
+        sites: String,
+    },
+    Normal {
+        open: usize,
+        dialing: usize,
+        peak: usize,
+        secs: u64,
+    },
+}
+
+impl EndpointLoad {
+    /// Takes the counts after a change at `now`: a warning when open plus
+    /// dialing passes [`ENDPOINT_CONNECTIONS_WARN`] (at most once per
+    /// [`ENDPOINT_LOAD_WARN_EVERY`]), and one line once it falls back to
+    /// half that.
+    fn note(&mut self, now: Instant) -> Option<LoadLine> {
+        while self
+            .dials
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > DIAL_RATE_WINDOW)
+        {
+            self.dials.pop_front();
+        }
+        let total = self.open + self.dialing;
+        if total > ENDPOINT_CONNECTIONS_WARN {
+            self.peak = self.peak.max(total);
+            self.over_since.get_or_insert(now);
+            if self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < ENDPOINT_LOAD_WARN_EVERY)
+            {
+                return None;
+            }
+            self.warned = Some(now);
+            let mut sites: Vec<(Site, usize)> = self
+                .sites
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(site, n)| (*site, *n))
+                .collect();
+            sites.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| (a.0.file(), a.0.line()).cmp(&(b.0.file(), b.0.line())))
+            });
+            let sites = sites
+                .iter()
+                .take(LOGGED_SITES)
+                .map(|(site, n)| format!("{}:{}={n}", site.file(), site.line()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(LoadLine::Many {
+                open: self.open,
+                dialing: self.dialing,
+                dials_last_60s: self.dials.len(),
+                sites,
+            });
+        }
+        if total <= ENDPOINT_CONNECTIONS_WARN / 2 {
+            if let Some(since) = self.over_since.take() {
+                return Some(LoadLine::Normal {
+                    open: self.open,
+                    dialing: self.dialing,
+                    peak: std::mem::take(&mut self.peak),
+                    secs: now.saturating_duration_since(since).as_secs(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Nothing open, dialing or owed a line, and no warning left to pace.
+    fn forgettable(&self, now: Instant) -> bool {
+        self.open == 0
+            && self.dialing == 0
+            && self.over_since.is_none()
+            && self
+                .warned
+                .is_none_or(|at| now.saturating_duration_since(at) >= ENDPOINT_LOAD_WARN_EVERY)
+    }
+}
+
+static ENDPOINT_LOADS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, EndpointLoad>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Apply `change` to `endpoint`'s load and log the line it asks for.
+fn update_load(endpoint: &str, change: impl FnOnce(&mut EndpointLoad)) {
+    let now = Instant::now();
+    let line = {
+        let mut loads = ENDPOINT_LOADS.lock();
+        let load = loads.entry(endpoint.to_string()).or_default();
+        change(load);
+        let line = load.note(now);
+        if load.forgettable(now) {
+            loads.remove(endpoint);
+        }
+        line
+    };
+    match line {
+        Some(LoadLine::Many {
+            open,
+            dialing,
+            dials_last_60s,
+            sites,
+        }) => warn!(
+            %endpoint,
+            open,
+            dialing,
+            dials_last_60s,
+            %sites,
+            threshold = ENDPOINT_CONNECTIONS_WARN,
+            action = "this node opens a connection per request to one archive; report this line",
+            "many connections from this node to one archive endpoint (repeated every 10 min while it lasts)"
+        ),
+        Some(LoadLine::Normal {
+            open,
+            dialing,
+            peak,
+            secs,
+        }) => info!(
+            %endpoint,
+            open,
+            dialing,
+            peak,
+            secs,
+            "connections from this node to one archive endpoint back to normal"
+        ),
+        None => {}
+    }
+}
+
+/// A PQNoise dial in progress, counted for its endpoint and call site.
+struct Dialing {
+    endpoint: String,
+    site: Site,
+    done: bool,
+}
+
+impl Dialing {
+    fn start(endpoint: &str, site: Site) -> Self {
+        update_load(endpoint, |load| {
+            load.dialing += 1;
+            *load.sites.entry(site).or_default() += 1;
+            load.dials.push_back(Instant::now());
+            if load.dials.len() > MAX_DIALS_REMEMBERED {
+                load.dials.pop_front();
+            }
+        });
+        Self {
+            endpoint: endpoint.to_string(),
+            site,
+            done: false,
+        }
+    }
+
+    /// The dial connected: counted as open until the last clone drops.
+    fn connected(mut self) -> Arc<OpenConnection> {
+        self.done = true;
+        update_load(&self.endpoint, |load| {
+            load.dialing = load.dialing.saturating_sub(1);
+            load.open += 1;
+        });
+        Arc::new(OpenConnection {
+            endpoint: std::mem::take(&mut self.endpoint),
+            site: self.site,
+        })
+    }
+}
+
+impl Drop for Dialing {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let site = self.site;
+        update_load(&self.endpoint, |load| {
+            load.dialing = load.dialing.saturating_sub(1);
+            if let Some(n) = load.sites.get_mut(site) {
+                *n = n.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// An open PQNoise connection, counted until its last client clone drops.
+struct OpenConnection {
+    endpoint: String,
+    site: Site,
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        let site = self.site;
+        update_load(&self.endpoint, |load| {
+            load.open = load.open.saturating_sub(1);
+            if let Some(n) = load.sites.get_mut(site) {
+                *n = n.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// `endpoint`'s open connections and dials in progress (tests).
+#[cfg(test)]
+fn endpoint_load(endpoint: &str) -> (usize, usize) {
+    ENDPOINT_LOADS
+        .lock()
+        .get(endpoint)
+        .map_or((0, 0), |load| (load.open, load.dialing))
+}
+
+/// Requests in flight at once on one shared submission connection; others
+/// wait for a slot, never for another connection. An archive's peer
+/// listener allows 256 streams per connection.
+pub const SUBMISSIONS_IN_FLIGHT: usize = 64;
+
+/// A shared connection nobody used for this long closes.
+pub const SHARED_IDLE: Duration = Duration::from_secs(60);
+
+/// A shared connection's key: the endpoint, the identity dialing it, and
+/// whether it carries submissions over 32 KiB. Those (storage epoch proofs,
+/// up to MBs) take a connection of their own, so a frame header or a
+/// confirmation never waits behind one in the connection's flow-control
+/// window.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SharedKey {
+    endpoint: String,
+    identity: Vec<u8>,
+    large: bool,
+}
+
+type SharedSet = shared::SharedConnections<SharedKey, ArchiveClient, ArchiveClientError>;
+
+/// The connections this process shares with archives for submissions and
+/// short reads, dialed and run on [`archive_io`], which lives as long as the
+/// process, whichever runtime a caller is on.
+fn shared_connections() -> &'static SharedSet {
+    static SET: std::sync::OnceLock<SharedSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        shared::SharedConnections::new(
+            SHARED_IDLE,
+            Some(SUBMISSIONS_IN_FLIGHT),
+            Some(archive_io().handle().clone()),
+        )
+    })
+}
+
+/// Why a submission over a shared connection failed.
+#[derive(Debug)]
+pub enum SharedSubmitError {
+    /// No connection could be made; callers that waited on the same dial
+    /// share its error.
+    Dial(Arc<ArchiveClientError>),
+    /// The submission failed on the connection.
+    Submit(ArchiveClientError),
 }
 
 /// Failing connections per archive address. A node retries an archive
@@ -344,6 +655,7 @@ impl ArchiveClient {
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
+            _open: None,
         })
     }
 
@@ -351,93 +663,182 @@ impl ArchiveClient {
     /// client cert from the given Ed448 seed and uses a custom rustls
     /// connector that accepts any server cert (Quilibrium peers self-sign;
     /// trust comes from the application-layer cross-signature in the SAN).
-    pub async fn connect_mtls(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        Self::connect_pq(addr, QuilPqNoiseConnector::new(falcon_signing_key.to_vec())).await
+    #[track_caller]
+    pub fn connect_mtls<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        Self::connect_pq(
+            addr,
+            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()),
+            site,
+        )
     }
 
     /// [`Self::connect_mtls`] to another archive: an endpoint answering with
     /// this node's identity fails with [`ArchiveClientError::is_own_endpoint`].
-    pub async fn connect_archive(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        let own = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
-            .map_err(|error| ArchiveClientError::TlsInit(format!("own identity: {error}")))?
-            .public()
-            .to_peer_id();
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).refusing_peer(own);
-        Self::connect_pq(addr, connector).await
+    #[track_caller]
+    pub fn connect_archive<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let own = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
+                .map_err(|error| ArchiveClientError::TlsInit(format!("own identity: {error}")))?
+                .public()
+                .to_peer_id();
+            let connector =
+                QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).refusing_peer(own);
+            Self::connect_pq(addr, connector, site).await
+        }
     }
 
     /// [`Self::connect_mtls`] to a node that must answer as `peer`: a dial
     /// to an endpoint taken from a peer's signed record, so that the
     /// record cannot name another node's address and have it answer for it.
-    pub async fn connect_peer(
-        addr: &str,
-        falcon_signing_key: &[u8],
+    #[track_caller]
+    pub fn connect_peer<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
         peer: quil_p2p::PeerId,
-    ) -> Result<Self, ArchiveClientError> {
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
         let connector =
             QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
-        Self::connect_pq(addr, connector).await
+        Self::connect_pq(addr, connector, site)
     }
 
     /// Connect only to this worker's own master, which holds the same Falcon
     /// identity. Historical canonical frames and the archive directory rely
     /// on this pin; possession of an unrelated peer key is insufficient.
-    pub async fn connect_own_master(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        let connector =
-            QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
-        Self::connect_pq(addr, connector).await
+    #[track_caller]
+    pub fn connect_own_master<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let connector =
+                QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
+            Self::connect_pq(addr, connector, site).await
+        }
     }
 
-    /// [`Self::connect_mtls`] for one submission of `bytes` bytes: its
-    /// requests may run for [`submit_deadline`] instead of
-    /// [`REQUEST_TIMEOUT`]. A request carries its body, and a fixed 15 s cut
-    /// a 0.54 MB storage epoch proof off below 36 KB/s to an archive; the
-    /// archives it goes to at once share the node's uplink.
-    pub async fn connect_mtls_for_submit(
+    /// The connection to the archive at `addr` this process shares for
+    /// submissions under 32 KiB and short reads, dialed as
+    /// [`Self::connect_mtls`] dials; each request on it may run for
+    /// [`REQUEST_TIMEOUT`]. Callers that find none wait on one dial. Hold the
+    /// result for the call, and [`shared::Shared::discard`] it when the call
+    /// fails in the transport ([`ArchiveClientError::is_connection_failure`]).
+    #[track_caller]
+    pub fn shared<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<shared::Shared<Self>, Arc<ArchiveClientError>>> + 'a {
+        let site = Location::caller();
+        Self::shared_lane(addr, falcon_signing_key, false, site)
+    }
+
+    async fn shared_lane(
         addr: &str,
         falcon_signing_key: &[u8],
-        bytes: usize,
-    ) -> Result<Self, ArchiveClientError> {
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec());
-        Self::dial_pq(
-            addr,
-            connector.pinned_for(addr),
-            dials_off_this_thread(),
-            submit_deadline(bytes),
-        )
-        .await
+        large: bool,
+        site: Site,
+    ) -> Result<shared::Shared<Self>, Arc<ArchiveClientError>> {
+        let key = SharedKey {
+            endpoint: addr.to_string(),
+            identity: falcon_signing_key.to_vec(),
+            large,
+        };
+        shared_connections()
+            .connect(&key, || {
+                let connector =
+                    QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).pinned_for(addr);
+                // A large submission sets its own deadline on each request,
+                // at most this.
+                let request_timeout = if large {
+                    SUBMIT_DEADLINE_CAP
+                } else {
+                    REQUEST_TIMEOUT
+                };
+                Self::dial_pq(addr, connector, true, request_timeout, site)
+            })
+            .await
+    }
+
+    /// Submit `data` to the archive at `addr` over the connection this
+    /// process shares with it, within [`submit_deadline`] for its size: a
+    /// request carries its body, and a fixed 15 s cut a 0.54 MB storage
+    /// epoch proof off below 36 KB/s to an archive. Submissions over 32 KiB
+    /// share a second connection. At most [`SUBMISSIONS_IN_FLIGHT`] run on
+    /// one connection at once; the rest wait for a slot within their
+    /// deadline. Each submission used to dial its own connection, and a
+    /// burst of them from one address hit the archive's per-source cap.
+    #[track_caller]
+    pub fn submit_shared<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+        data: Vec<u8>,
+    ) -> impl Future<Output = Result<(), SharedSubmitError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let deadline = submit_deadline(data.len());
+            let large = deadline > REQUEST_TIMEOUT;
+            let key = SharedKey {
+                endpoint: addr.to_string(),
+                identity: falcon_signing_key.to_vec(),
+                large,
+            };
+            let permit = tokio::time::timeout(deadline, shared_connections().permit(&key))
+                .await
+                .map_err(|_| {
+                    SharedSubmitError::Submit(ArchiveClientError::Rpc(
+                        tonic::Status::deadline_exceeded(
+                            "every submission slot on the shared connection stayed taken past the deadline",
+                        ),
+                    ))
+                })?;
+            let mut client = Self::shared_lane(addr, falcon_signing_key, large, site)
+                .await
+                .map_err(SharedSubmitError::Dial)?;
+            let submitted = client.submit_global_message_within(data, deadline).await;
+            drop(permit);
+            if let Err(error) = &submitted {
+                if error.is_connection_failure() {
+                    client.discard();
+                }
+            }
+            submitted.map_err(SharedSubmitError::Submit)
+        }
     }
 
     async fn connect_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
+        site: Site,
     ) -> Result<Self, ArchiveClientError> {
         Self::dial_pq(
             addr,
             connector.pinned_for(addr),
             dials_off_this_thread(),
             REQUEST_TIMEOUT,
+            site,
         )
         .await
     }
 
     /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
     /// the caller's runtime; each request on the channel may run for
-    /// `request_timeout`.
+    /// `request_timeout`. Counted for `site` while it dials and stays open
+    /// ([`ENDPOINT_CONNECTIONS_WARN`]).
     async fn dial_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
         off_thread: bool,
         request_timeout: Duration,
+        site: Site,
     ) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
@@ -467,6 +868,7 @@ impl ArchiveClient {
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (PQNoise)");
+        let dialing = Dialing::start(addr, site);
         let dialed = if off_thread {
             // The channel's connection and buffer tasks run where they are
             // spawned: the dial spawns them, and the buffer task those of a
@@ -508,6 +910,7 @@ impl ArchiveClient {
         };
         debug!(%addr, "archive client connected (mTLS)");
         log_connect_outage(addr, connect_outage(addr, true), "");
+        let open = dialing.connected();
         Ok(Self {
             // 64 MiB decode/encode limit (tonic defaults to 4 MiB). Full
             // global frames and app-shard size sets routinely exceed 4 MiB;
@@ -520,6 +923,7 @@ impl ArchiveClient {
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
+            _open: Some(open),
         })
     }
 
@@ -534,6 +938,19 @@ impl ArchiveClient {
         self.inner
             .submit_global_message(SubmitGlobalMessageRequest { data })
             .await?;
+        Ok(())
+    }
+
+    /// [`Self::submit_global_message`] within `deadline`, at most the
+    /// channel's own request timeout; the archive is told it too.
+    pub async fn submit_global_message_within(
+        &mut self,
+        data: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<(), ArchiveClientError> {
+        let mut request = tonic::Request::new(SubmitGlobalMessageRequest { data });
+        request.set_timeout(deadline);
+        self.inner.submit_global_message(request).await?;
         Ok(())
     }
 
@@ -2214,6 +2631,7 @@ mod off_thread_dial_tests {
                             QuilPqNoiseConnector::new(key),
                             off_thread,
                             REQUEST_TIMEOUT,
+                            Location::caller(),
                         ));
                         let dial = started.elapsed();
                         ready.wait();
@@ -2492,6 +2910,131 @@ mod flow_control_tests {
             took < DELAY * 4,
             "a {output}-byte response took {took:?} at a {:?} round trip",
             DELAY * 2
+        );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_load_tests {
+    use super::*;
+
+    #[track_caller]
+    fn here() -> Site {
+        Location::caller()
+    }
+
+    /// Past 32 connections to one endpoint the node warns once, naming the
+    /// call sites that hold them, again only after ten minutes, and logs one
+    /// line once the count falls back to half.
+    #[test]
+    fn many_connections_to_one_endpoint_warn_once_per_interval_and_end_with_one_line() {
+        let start = Instant::now();
+        let busy = here();
+        let other = here();
+        let mut load = EndpointLoad {
+            open: ENDPOINT_CONNECTIONS_WARN,
+            ..Default::default()
+        };
+        load.sites.insert(busy, ENDPOINT_CONNECTIONS_WARN);
+        assert_eq!(load.note(start), None, "at the threshold");
+        load.dialing = 2;
+        load.sites.insert(other, 2);
+        load.dials.extend([start, start]);
+        let Some(LoadLine::Many {
+            open,
+            dialing,
+            dials_last_60s,
+            sites,
+        }) = load.note(start)
+        else {
+            panic!("no warning past the threshold");
+        };
+        assert_eq!((open, dialing, dials_last_60s), (32, 2, 2));
+        assert_eq!(
+            sites,
+            format!(
+                "{}:{}=32 {}:{}=2",
+                busy.file(),
+                busy.line(),
+                other.file(),
+                other.line()
+            )
+        );
+        let later = start + Duration::from_secs(120);
+        assert_eq!(load.note(later), None, "warned again within ten minutes");
+        let much_later = start + ENDPOINT_LOAD_WARN_EVERY;
+        assert!(matches!(
+            load.note(much_later),
+            Some(LoadLine::Many {
+                dials_last_60s: 0,
+                ..
+            })
+        ));
+        load.open = 20;
+        load.dialing = 0;
+        assert_eq!(
+            load.note(much_later),
+            None,
+            "ended above half the threshold"
+        );
+        load.open = 16;
+        assert_eq!(
+            load.note(much_later + Duration::from_secs(5)),
+            Some(LoadLine::Normal {
+                open: 16,
+                dialing: 0,
+                peak: 34,
+                secs: 605
+            })
+        );
+        assert_eq!(load.note(much_later + Duration::from_secs(6)), None);
+        assert!(
+            !load.forgettable(much_later),
+            "a recent warning still paces"
+        );
+        assert!(!load.forgettable(much_later + ENDPOINT_LOAD_WARN_EVERY));
+        load.open = 0;
+        assert!(load.forgettable(much_later + ENDPOINT_LOAD_WARN_EVERY));
+    }
+
+    /// A PQNoise connection counts as dialing during its dial and as open
+    /// until the last clone of its client drops.
+    #[tokio::test]
+    async fn a_connection_counts_as_open_until_its_last_clone_drops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let key = server_key.clone();
+                tokio::spawn(async move {
+                    let stream = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        let key = quil_p2p::generate_falcon_signing_key();
+        assert_eq!(endpoint_load(&address), (0, 0));
+        let client = ArchiveClient::connect_mtls(&address, &key).await.unwrap();
+        let copy = client.clone();
+        assert_eq!(endpoint_load(&address), (1, 0));
+        drop(client);
+        assert_eq!(endpoint_load(&address), (1, 0), "a clone still holds it");
+        drop(copy);
+        assert_eq!(
+            endpoint_load(&address),
+            (0, 0),
+            "the connection stayed counted"
+        );
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        assert!(ArchiveClient::connect_mtls(&refused, &key).await.is_err());
+        assert_eq!(
+            endpoint_load(&refused),
+            (0, 0),
+            "a failed dial stayed counted"
         );
     }
 }

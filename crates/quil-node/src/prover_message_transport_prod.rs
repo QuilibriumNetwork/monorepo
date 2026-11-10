@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
 use quil_engine::prover_message_transport::ProverMessageTransport;
-use quil_rpc::archive_client::ArchiveClientError;
+use quil_rpc::archive_client::{ArchiveClientError, SharedSubmitError};
 use quil_rpc::{ArchiveClient, ArchiveEndpointPool};
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global::GlobalFrameHeader;
@@ -463,23 +463,24 @@ async fn submit_to_archives_with(
         let seed = seed.clone();
         async move {
             let dialing = Instant::now();
-            match ArchiveClient::connect_mtls_for_submit(&stream_addr, &seed, bytes.len()).await {
-                Ok(mut client) => match client.submit_global_message(bytes).await {
-                    Ok(()) => Ok(stream_addr),
-                    Err(e) => {
-                        debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
-                        let retry = asks_for_retry(&e, proof);
-                        Err((
-                            stream_addr,
-                            format!("submit rejected: {}", refusal_reason(&e)),
-                            retry,
-                        ))
-                    }
-                },
-                Err(e) => {
+            // Over the connection this process shares with the archive: a
+            // connection per submission let a burst from one address hit
+            // the archive's per-source connection cap.
+            match ArchiveClient::submit_shared(&stream_addr, &seed, bytes).await {
+                Ok(()) => Ok(stream_addr),
+                Err(SharedSubmitError::Submit(e)) => {
+                    debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
+                    let retry = asks_for_retry(&e, proof);
+                    Err((
+                        stream_addr,
+                        format!("submit rejected: {}", refusal_reason(&e)),
+                        retry,
+                    ))
+                }
+                Err(SharedSubmitError::Dial(e)) => {
                     debug!(addr = %stream_addr, error = %e, "prover bundle submit: archive connect failed");
                     let retry = asks_for_retry(&e, proof);
-                    Err((stream_addr, connect_failure(dialing.elapsed(), &e), retry))
+                    Err((stream_addr, connect_failure(dialing.elapsed(), &*e), retry))
                 }
             }
         }
@@ -538,8 +539,16 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 let addr_for_log = addr.clone();
                 handles.push(tokio::spawn(async move {
                     let attempt = async {
-                        let mut c = ArchiveClient::connect_mtls(&addr, &seed_copy).await.ok()?;
-                        let f = c.get_global_frame(0).await.ok()?;
+                        let mut c = ArchiveClient::shared(&addr, &seed_copy).await.ok()?;
+                        let f = c
+                            .get_global_frame(0)
+                            .await
+                            .inspect_err(|error| {
+                                if error.is_connection_failure() {
+                                    c.discard();
+                                }
+                            })
+                            .ok()?;
                         f.header.clone()
                     };
                     match tokio::time::timeout(PER_ARCHIVE_TIMEOUT, attempt).await {
@@ -1478,6 +1487,148 @@ mod tests {
             }
         });
         (address, taken)
+    }
+
+    /// An archive's counts: connections its listener accepted, submissions it
+    /// took, and the most it held at once.
+    #[derive(Clone, Default)]
+    struct Counts {
+        accepted: Arc<AtomicUsize>,
+        taken: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    /// An archive's peer listener (a PQNoise handshake, then `GlobalService`)
+    /// that holds each submission for `delay` before taking it. Returns its
+    /// address and [`Counts`].
+    async fn counting_archive(delay: Duration) -> (String, Counts) {
+        use quil_types::proto::global::global_service_server::GlobalServiceServer;
+        use quil_types::proto::global::GlobalFrame;
+        use tokio::net::TcpListener;
+        struct NoFrames;
+        impl quil_rpc::FrameLookup for NoFrames {
+            fn get_latest_frame(&self) -> Result<GlobalFrame, String> {
+                Err("no frames".into())
+            }
+            fn get_frame(&self, _frame_number: u64) -> Result<GlobalFrame, String> {
+                Err("no frames".into())
+            }
+        }
+        let counts = Counts::default();
+        let holding = Arc::new(AtomicUsize::new(0));
+        let handler: quil_rpc::SubmitHandler = {
+            let counts = counts.clone();
+            Arc::new(move |_request| {
+                let (counts, holding) = (counts.clone(), holding.clone());
+                Box::pin(async move {
+                    let held = holding.fetch_add(1, Ordering::SeqCst) + 1;
+                    counts.peak.fetch_max(held, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    holding.fetch_sub(1, Ordering::SeqCst);
+                    counts.taken.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = counts.accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let (key, streams_tx) = (server_key.clone(), streams_tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(stream) =
+                        quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &key).await
+                    {
+                        let _ = streams_tx.send(Ok::<_, std::io::Error>(stream));
+                    }
+                });
+            }
+        });
+        let incoming = futures::stream::unfold(streams, |mut streams| async move {
+            streams.recv().await.map(|stream| (stream, streams))
+        });
+        let service = GlobalServiceServer::new(
+            quil_rpc::GlobalRpcServer::new(Arc::new(NoFrames)).with_submit_handler(handler),
+        )
+        .max_decoding_message_size(64 << 20);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming),
+        );
+        (address, counts)
+    }
+
+    /// Two hundred submissions at once to an archive that holds each for
+    /// two seconds all reach it over one connection, at most 64 (the bound
+    /// per shared connection) at a time. Each used to dial a connection of
+    /// its own, so bursts from nodes behind one address held hundreds of
+    /// connections to every archive and its listener refused that address
+    /// at its per-source cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn submissions_at_once_share_one_connection_to_an_archive() {
+        let (address, counts) = counting_archive(Duration::from_secs(2)).await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(address).await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let submissions = (0..200u32).map(|n| {
+            let (pool, key) = (pool.clone(), key.clone());
+            tokio::spawn(async move {
+                submit_to_archives(&pool, Some(key), n.to_be_bytes().repeat(16))
+                    .await
+                    .1
+            })
+        });
+        let deliveries: Vec<Delivery> = futures::future::join_all(submissions)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let accepted = counts.accepted.load(Ordering::SeqCst);
+        assert!(
+            accepted <= 2,
+            "connections accepted for 200 submissions at once: {accepted}"
+        );
+        let undelivered: Vec<&Delivery> = deliveries.iter().filter(|d| d.accepted != 1).collect();
+        assert!(
+            undelivered.is_empty(),
+            "{} of 200 submissions not delivered, first {:?}",
+            undelivered.len(),
+            undelivered.first()
+        );
+        assert_eq!(counts.taken.load(Ordering::SeqCst), 200);
+        let peak = counts.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 64,
+            "submissions in flight at once on one connection: {peak}"
+        );
+    }
+
+    /// A submission over 32 KiB takes a connection of its own beside the one
+    /// smaller submissions share, so a storage epoch proof never holds a
+    /// frame header back in one connection's flow-control window; later
+    /// submissions of either size ride those two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_submission_takes_its_own_connection_beside_small_ones() {
+        let (address, counts) = counting_archive(Duration::ZERO).await;
+        let pool = quil_rpc::ArchiveEndpointPool::new(Duration::ZERO);
+        pool.add(address).await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let (small, large) = (vec![1u8; 64], vec![2u8; 64 << 10]);
+        for bytes in [small.clone(), large.clone(), small, large] {
+            let (_, delivery) = submit_to_archives(&pool, Some(key.clone()), bytes).await;
+            assert_eq!(delivery.accepted, 1, "{delivery:?}");
+        }
+        assert_eq!(
+            counts.accepted.load(Ordering::SeqCst),
+            2,
+            "connections for small and large submissions"
+        );
     }
 
     /// A 600 KB storage epoch proof sent over a link of 32 KiB/s takes about

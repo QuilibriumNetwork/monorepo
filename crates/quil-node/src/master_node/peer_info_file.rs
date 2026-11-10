@@ -195,29 +195,75 @@ pub(super) fn registered_member_endpoints(
 pub(super) type GapEndpoint = (String, Option<quil_p2p::PeerId>);
 
 /// The gap fetch's open connections, one per [`GapEndpoint`].
-pub(super) type GapClients = parking_lot::Mutex<HashMap<GapEndpoint, quil_rpc::ArchiveClient>>;
+pub(super) type GapClients = quil_rpc::archive_client::shared::SharedConnections<
+    GapEndpoint,
+    quil_rpc::ArchiveClient,
+    quil_rpc::ArchiveClientError,
+>;
+
+/// A gap-fetch connection unused this long closes.
+const GAP_CLIENT_IDLE: Duration = Duration::from_secs(60);
+
+/// An empty [`GapClients`].
+pub(super) fn gap_clients() -> GapClients {
+    GapClients::new(GAP_CLIENT_IDLE, None, None)
+}
 
 /// The connection `clients` holds for `endpoint`, else a new one, kept
-/// there. A member's endpoint must answer as that member, so a record
-/// naming another node's address cannot have that node stand in for it;
-/// an archive's is dialed as the pool pins it.
+/// there; fetches asking at once wait on one dial (up to sixteen fetches
+/// raced to dial an endpoint after its connection was dropped). A member's
+/// endpoint must answer as that member, so a record naming another node's
+/// address cannot have that node stand in for it; an archive's is dialed
+/// as the pool pins it.
 pub(super) async fn gap_fetch_client(
     clients: &GapClients,
     endpoint: &GapEndpoint,
     key: &[u8],
-) -> Result<quil_rpc::ArchiveClient, String> {
-    let cached = clients.lock().get(endpoint).cloned();
-    if let Some(client) = cached {
-        return Ok(client);
-    }
+) -> Result<quil_rpc::archive_client::shared::Shared<quil_rpc::ArchiveClient>, String> {
     let (addr, peer) = endpoint;
-    let client = match peer {
-        Some(peer) => quil_rpc::ArchiveClient::connect_peer(addr, key, *peer).await,
-        None => quil_rpc::ArchiveClient::connect_mtls(addr, key).await,
-    }
-    .map_err(|e| e.to_string())?;
-    clients.lock().insert(endpoint.clone(), client.clone());
-    Ok(client)
+    clients
+        .connect(endpoint, || async move {
+            match peer {
+                Some(peer) => quil_rpc::ArchiveClient::connect_peer(addr, key, *peer).await,
+                None => quil_rpc::ArchiveClient::connect_mtls(addr, key).await,
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What one gap fetch of a frame from one endpoint came to: the endpoint's
+/// answer or error, or `Err` when it did not answer within its deadline.
+pub(super) type GapAttempt = Result<
+    Result<Option<quil_types::proto::global::AppShardFrame>, String>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Fetch frame `number` of `filter` from `endpoint`, within `within`. The
+/// connection is dropped only when its transport failed: an endpoint that
+/// lacks the frame yet, or answers slowly, keeps it. Dropping it on any
+/// unanswered fetch made the next fetches to that endpoint dial again.
+pub(super) async fn gap_fetch(
+    clients: &GapClients,
+    endpoint: &GapEndpoint,
+    key: &[u8],
+    filter: Vec<u8>,
+    number: u64,
+    within: Duration,
+) -> GapAttempt {
+    tokio::time::timeout(within, async {
+        let mut client = gap_fetch_client(clients, endpoint, key).await?;
+        client
+            .get_app_shard_frame(filter, number)
+            .await
+            .map_err(|error| {
+                if error.is_connection_failure() {
+                    client.discard();
+                }
+                error.to_string()
+            })
+    })
+    .await
 }
 
 /// Saves the newest [`MAX_RECORDS`] records no older than [`MAX_AGE_MS`],
@@ -541,6 +587,7 @@ pub(super) fn another_peer() -> quil_p2p::PeerId {
 mod tests {
     use super::*;
     use quil_types::crypto::Signer as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FILTER: [u8; 35] = [7; 35];
     // TEST-NET-3 documentation address.
@@ -773,7 +820,7 @@ mod tests {
     async fn gap_fetch_dials_a_member_endpoint_only_as_its_member() {
         let (addr, member) = pqnoise_listener().await;
         let key = quil_p2p::generate_falcon_signing_key();
-        let clients = GapClients::default();
+        let clients = gap_clients();
         let impostor: GapEndpoint = (addr.clone(), Some(another_peer()));
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
@@ -785,7 +832,7 @@ mod tests {
             dialed.is_err(),
             "a node answering as another peer stood in for the member"
         );
-        assert!(!clients.lock().contains_key(&impostor));
+        assert_eq!(clients.kept(), 0);
         let endpoint: GapEndpoint = (addr, Some(member));
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
@@ -793,10 +840,104 @@ mod tests {
         )
         .await
         .expect("the dial ends");
-        if let Err(error) = dialed {
+        if let Err(error) = &dialed {
             panic!("the member was refused: {error}");
         }
-        assert!(clients.lock().contains_key(&endpoint));
+        drop(dialed);
+        let again = gap_fetch_client(&clients, &endpoint, &key).await;
+        assert!(again.is_ok_and(|client| client.kept()));
+    }
+
+    /// A PQNoise listener answering as `peer` that counts the connections
+    /// it accepted and holds every one open; gRPC calls on them never get an
+    /// answer.
+    async fn counting_listener() -> (String, quil_p2p::PeerId, Arc<AtomicUsize>) {
+        let key = quil_p2p::generate_falcon_signing_key();
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let stream = quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        (addr, peer, accepted)
+    }
+
+    /// Sixteen fetches asking at once for an endpoint whose connection was
+    /// dropped dial it once between them; each used to dial its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gap_fetches_asking_at_once_after_a_drop_dial_once() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        let first = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        first.discard();
+        drop(first);
+        let fetches = (0..16).map(|_| {
+            let (clients, endpoint, key) = (clients.clone(), endpoint.clone(), key.clone());
+            tokio::spawn(async move {
+                gap_fetch_client(&clients, &endpoint, &key)
+                    .await
+                    .map(|client| client.id())
+            })
+        });
+        let ids: Vec<u64> = futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap().unwrap())
+            .collect();
+        assert!(
+            ids.iter().all(|id| *id == ids[0]),
+            "gap fetches after a drop got different connections {ids:?}: no single flight"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "gap-fetch dials after a drop, expected one first connection and one for all sixteen: no single flight"
+        );
+    }
+
+    /// A fetch the endpoint does not answer in time keeps its connection:
+    /// the next fetch rides it rather than dialing again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gap_fetch_that_times_out_keeps_its_connection() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        // Dialed first, so that no fetch's deadline cuts the dial short.
+        drop(gap_fetch_client(&clients, &endpoint, &key).await.unwrap());
+        for number in [7, 8] {
+            let attempt = gap_fetch(
+                &clients,
+                &endpoint,
+                &key,
+                vec![7; 35],
+                number,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "gap-fetch timeout dropped the connection"
+        );
+        assert_eq!(clients.kept(), 1);
     }
 
     #[test]

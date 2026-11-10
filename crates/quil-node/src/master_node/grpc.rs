@@ -3237,9 +3237,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         // small (the mainnet committee currently has four
                         // members), and a topology-only archive must not hide
                         // a different archive with materialized state.
+                        // Over the connections this process shares with the
+                        // archives, held until the queries end.
+                        let mut held = Vec::new();
                         for endpoint in archive_pool.get_all().await {
-                            match quil_rpc::ArchiveClient::connect_mtls(&endpoint, &seed).await {
-                                Ok(client) => clients.push(client),
+                            match quil_rpc::ArchiveClient::shared(&endpoint, &seed).await {
+                                Ok(client) => {
+                                    clients.push((*client).clone());
+                                    held.push(client);
+                                }
                                 Err(e) => tracing::debug!(endpoint = %endpoint, error = %e, "shard info: archive-pool dial failed"),
                             }
                         }
