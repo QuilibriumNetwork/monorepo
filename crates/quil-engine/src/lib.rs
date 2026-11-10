@@ -74,6 +74,7 @@ pub mod shard_info;
 pub mod shard_rebalancer;
 pub mod spawn_gate;
 pub mod storage_epoch_batch;
+pub(crate) mod storage_epoch_check;
 pub mod storage_history;
 pub mod storage_jobs;
 pub mod storage_labels;

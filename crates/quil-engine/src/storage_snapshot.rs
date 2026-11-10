@@ -1960,8 +1960,10 @@ pub fn commitment(
 }
 
 /// The beacons of the frames GLOBAL chained into a seat's `slot`, in order:
-/// each from the output of the GLOBAL frame it anchors to. `None` when one of
-/// those GLOBAL frames is not stored here.
+/// each from the output of the GLOBAL frame it anchors to, read from its
+/// header alone: the request bundles are most of a frame's bytes, and every
+/// seat chained to a GLOBAL frame reads it. `None` when one of those GLOBAL
+/// frames is not stored here.
 pub fn chained_beacons(
     anchors: &dyn ClockStore,
     slot: &quil_types::consensus::StorageSeatSlot,
@@ -1969,7 +1971,7 @@ pub fn chained_beacons(
     slot.chained
         .iter()
         .map(|&(_, anchor)| {
-            let output = anchors.get_global_clock_frame(anchor).ok()?.header?.output;
+            let output = anchors.get_global_clock_frame_header(anchor).ok()?.output;
             quil_crypto::porep::derive_storage_beacon(anchor, &output)
                 .try_into()
                 .ok()
@@ -2338,6 +2340,58 @@ pub fn request(
 pub(crate) mod tests {
     use super::*;
     use quil_hypergraph::Location;
+
+    /// A chained frame's beacon is read from its GLOBAL frame's header alone:
+    /// a frame whose request bundles cannot be read still gives it, and its
+    /// bundles are not read.
+    #[test]
+    fn chained_beacons_read_global_frame_headers_alone() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let anchor = 40;
+        clock
+            .put_global_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: anchor,
+                        output: vec![9; 32],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        // A request bundle that does not decode: a full frame read fails.
+        quil_types::store::KvDb::set(
+            &db,
+            &quil_store::encoding::clock_global_frame_request_key(anchor, 0),
+            &[0xff],
+        )
+        .unwrap();
+        assert!(
+            ClockStore::get_global_clock_frame(&clock, anchor).is_err(),
+            "the frame's bundles do not decode"
+        );
+        let slot = quil_types::consensus::StorageSeatSlot {
+            epoch: 5,
+            leaves: vec![vec![0]],
+            registered_at: 1,
+            sealed_at: Some(2),
+            frames: 1,
+            accumulator: [0; 32],
+            chained: vec![(anchor + 5, anchor)],
+            open: true,
+        };
+        let beacon: [u8; 32] = quil_crypto::porep::derive_storage_beacon(anchor, &[9; 32])
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            chained_beacons(&clock, &slot),
+            Some(vec![beacon]),
+            "FULL-FRAME-READ: a chained frame's beacon read its GLOBAL frame's request bundles"
+        );
+    }
 
     /// A seat of `member` on `app` owing GLOBAL the settlement of `epoch`:
     /// its replicas encoded into `replicas`, and one root committed in GLOBAL
