@@ -580,41 +580,13 @@ fn sca_a_forged_frame_ends_a_bundle_at_no_more_cost_than_judging_it_whole() {
 #[test]
 fn sca_the_rank_byte_cap_refuses_a_union_retryably_and_it_recovers() {
     let (shard, mc, _, _) = one_shard(true);
-    // As the GLOBAL collector, which cert unions reach.
-    mc.set_class_shares();
+    // A collector without class shares: in the GLOBAL collector's, storage
+    // epoch proofs are held within their own shares and no longer fill a
+    // rank's reserved room.
     let held = shard.copy(&[0, 1, 2, 3, 4]);
     let held_len = held.len();
     assert_eq!(submit(&mc, held), SubmitOutcome::Accepted);
-    // Storage epoch proofs fill part of the reserved room, and another
-    // message the rest of the rank up to 16 bytes.
-    let mut proofs = 0usize;
-    for member in 0..5u8 {
-        use quil_execution::global_intrinsic::storage_epoch_proof::{
-            SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
-        };
-        let proof = StorageEpochProof {
-            member: [member; 32],
-            seats: vec![SeatProof {
-                shard_filter: vec![member; 32],
-                seals: true,
-                ..Default::default()
-            }],
-            proof: vec![member; 7 << 19],
-        };
-        let raw = CanonicalMessageBundle {
-            requests: vec![Some(CanonicalMessageRequest {
-                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
-                inner_bytes: proof.to_canonical_bytes(),
-            })],
-            timestamp: 0,
-        }
-        .to_canonical_bytes()
-        .unwrap();
-        proofs += raw.len();
-        assert_eq!(submit(&mc, raw), SubmitOutcome::Accepted);
-    }
-    assert!(proofs + held_len + 16 > super::super::RESERVED_BYTES_PER_RANK);
-    let filler = vec![0u8; MAX_BYTES_PER_RANK - proofs - held_len - 16];
+    let filler = vec![0u8; MAX_BYTES_PER_RANK - held_len - 16];
     assert_eq!(submit(&mc, filler.clone()), SubmitOutcome::Accepted);
     let copy = shard.copy(&[1, 2, 3, 4, 5]);
     assert_eq!(
