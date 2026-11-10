@@ -1975,13 +1975,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         SubmitRefusal::retry_later(format!("verification task failed: {error}"))
                     })?
                 } else {
-                    admit_peer_submit(
-                        &submit_mc,
-                        rank,
-                        data,
-                        quil_engine::message_collector::Provenance::Prover,
-                        &auth,
-                    )
+                    // Storage epoch proofs from active provers are held apart
+                    // from any other sender's; the lookup runs only for them.
+                    let provenance =
+                        quil_engine::message_collector::sender_provenance(&data, || {
+                            submit_prover(&auth)
+                        });
+                    admit_peer_submit(&submit_mc, rank, data, provenance, &auth)
                 };
                 match outcome {
                     quil_engine::message_collector::SubmitOutcome::Accepted => {
@@ -5728,6 +5728,129 @@ mod composite_scan_tests {
         );
         assert_eq!(seen.len(), usize::from(records) + 1);
         assert_eq!(seen.last(), Some(&1), "the high store's record, at the end");
+    }
+}
+
+#[cfg(test)]
+mod active_prover_tests {
+    use super::peer_is_active_prover;
+    use quil_engine::test_support::TestProverRegistry;
+    use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
+    use quil_types::crypto::{BlsConstructor as _, Signer as _};
+
+    /// A binding of the identity `seed_byte` to a fresh prover key, with
+    /// valid cross-signatures, and that key.
+    fn binding(seed_byte: u8) -> (quil_p2p::CanonicalKeyRegistry, Vec<u8>) {
+        quil_crypto::init();
+        let seed = [seed_byte; 57];
+        let identity = quil_crypto::Ed448Signer::from_bytes(
+            &seed,
+            &quil_crypto::Ed448Signer::derive_public(&seed).unwrap(),
+        )
+        .unwrap();
+        let ed448 = identity.public_key().to_vec();
+        let (prover, prover_key) = quil_crypto::FalconKeyConstructor.new_key().unwrap();
+        let domain = quil_p2p::signer_registry::KEY_REGISTRY_DOMAIN;
+        let mut identity_msg = domain.to_vec();
+        identity_msg.extend_from_slice(&prover_key);
+        let reg = quil_p2p::CanonicalKeyRegistry {
+            ed448_pubkey: ed448.clone(),
+            bls_pubkey: prover_key.clone(),
+            identity_to_prover_sig: identity.sign(&identity_msg).unwrap(),
+            prover_to_identity_sig: prover.sign_with_domain(&ed448, domain).unwrap(),
+            last_updated_ms: 1,
+            ..Default::default()
+        };
+        (reg, prover_key)
+    }
+
+    fn allocation(status: ProverStatus) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status,
+            confirmation_filter: vec![1; 32],
+            rejection_filter: Vec::new(),
+            join_frame_number: 1,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 1,
+            last_signed_frame_number: 0,
+            epoch: 0,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    fn prover(
+        key: &[u8],
+        status: ProverStatus,
+        allocations: Vec<ProverAllocationInfo>,
+    ) -> ProverInfo {
+        ProverInfo {
+            public_key: key.to_vec(),
+            address: quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(key)
+                .unwrap()
+                .to_vec(),
+            status,
+            kick_frame_number: 0,
+            allocations,
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: Vec::new(),
+        }
+    }
+
+    /// A peer bound in the signer registry to a prover key is an active
+    /// prover when that prover is Active or holds an Active allocation, not
+    /// while it is only joining; a peer with no binding is not, even when
+    /// its key's prover is Active. The submit paths hold storage epoch
+    /// proofs by this, and `GetGlobalProposal` admits callers by it.
+    #[test]
+    fn a_bound_peer_is_an_active_prover_by_its_status_or_an_active_allocation() {
+        let signers = quil_p2p::SignerRegistry::new();
+        let (reg, key) = binding(0x21);
+        assert!(signers.update(reg), "the binding verifies");
+        let peer = quil_p2p::peer_id_from_falcon_pubkey(&key);
+        let provers = TestProverRegistry::new();
+        let cases = [
+            ("active", ProverStatus::Active, vec![], true),
+            (
+                "active allocation",
+                ProverStatus::Joining,
+                vec![
+                    allocation(ProverStatus::Joining),
+                    allocation(ProverStatus::Active),
+                ],
+                true,
+            ),
+            (
+                "joining",
+                ProverStatus::Joining,
+                vec![allocation(ProverStatus::Joining)],
+                false,
+            ),
+        ];
+        for (case, status, allocations, active) in cases {
+            provers.set_prover(prover(&key, status, allocations));
+            assert_eq!(
+                peer_is_active_prover(&signers, &provers, &peer),
+                active,
+                "active-prover {case}"
+            );
+        }
+        // Unbound: its key's prover is Active, but no binding names its peer.
+        let (_, unbound) = binding(0x22);
+        provers.set_prover(prover(&unbound, ProverStatus::Active, vec![]));
+        let stranger = quil_p2p::peer_id_from_falcon_pubkey(&unbound);
+        assert!(
+            !peer_is_active_prover(&signers, &provers, &stranger),
+            "active-prover unbound"
+        );
     }
 }
 

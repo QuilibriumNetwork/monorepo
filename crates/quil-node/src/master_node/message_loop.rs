@@ -3777,11 +3777,24 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         });
                                     }
                                 } else {
+                                    // Storage epoch proofs from active provers
+                                    // are held apart from any other signer's;
+                                    // the lookup runs only for them.
+                                    let provenance = quil_engine::message_collector::sender_provenance(
+                                        &received.data,
+                                        || {
+                                            super::grpc::peer_is_active_prover(
+                                                &sr_for_recv,
+                                                pr_for_recv.as_ref(),
+                                                &received.from,
+                                            )
+                                        },
+                                    );
                                     admit_prover_message(
                                         &mc_for_recv,
                                         current_rank,
                                         received.clone(),
-                                        quil_engine::message_collector::Provenance::Prover,
+                                        provenance,
                                     );
                                 }
                             }
