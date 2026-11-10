@@ -17,6 +17,7 @@ mod shards;
 pub mod testing;
 mod token;
 mod worker;
+pub mod write_stats;
 
 pub use clock::{
     CandidatePrune, GlobalFrameCacheStats, KeptShard, PrunedShard, RocksClockStore,

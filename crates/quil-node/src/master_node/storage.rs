@@ -71,10 +71,11 @@ pub(crate) fn init(
     }
 
     std::fs::create_dir_all(&db_path)?;
+    let class = quil_store::write_stats::StoreClass::Master;
     let db = if archive_mode {
-        quil_store::RocksDb::open_archive(&db_path)?
+        quil_store::RocksDb::open_archive_counted(&db_path, class)?
     } else {
-        quil_store::RocksDb::open(&db_path)?
+        quil_store::RocksDb::open_counted(&db_path, class)?
     };
     let db_arc = Arc::new(db);
     db_arc

@@ -339,20 +339,38 @@ impl RocksDb {
     /// unless `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives each store its own of that
     /// size, as before the shared cache.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, None)
+        Self::open_with_block_cache(path, None, None)
     }
 
     /// [`Self::open`] for an archive's store, with its own block cache sized
     /// from memory ([`archive_block_cache_bytes`]).
     pub fn open_archive(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()))
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), None)
+    }
+
+    /// [`Self::open`] for one of the node's stores, its disk writes counted
+    /// under `class` ([`crate::write_stats`]).
+    pub fn open_counted(path: &Path, class: crate::write_stats::StoreClass) -> Result<Self> {
+        Self::open_with_block_cache(path, None, Some(class))
+    }
+
+    /// [`Self::open_archive`], its disk writes counted under `class`.
+    pub fn open_archive_counted(
+        path: &Path,
+        class: crate::write_stats::StoreClass,
+    ) -> Result<Self> {
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), Some(class))
     }
 
     /// A store with its own block cache of `block_cache_bytes`, or the
     /// shared one (`None`); `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives every store
-    /// its own of that size.
-    fn open_with_block_cache(path: &Path, block_cache_bytes: Option<usize>) -> Result<Self> {
-        let (opts, shared) = Self::store_options_for(block_cache_bytes);
+    /// its own of that size. Its writes are counted under `class`, if any.
+    fn open_with_block_cache(
+        path: &Path,
+        block_cache_bytes: Option<usize>,
+        class: Option<crate::write_stats::StoreClass>,
+    ) -> Result<Self> {
+        let (opts, shared) = Self::store_options_for(block_cache_bytes, class);
         let db = rocksdb::DB::open(&opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
 
@@ -371,13 +389,17 @@ impl RocksDb {
     /// open with them too.
     #[cfg(test)]
     pub(crate) fn store_options(block_cache_bytes: usize) -> rocksdb::Options {
-        Self::store_options_for(Some(block_cache_bytes)).0
+        Self::store_options_for(Some(block_cache_bytes), None).0
     }
 
     /// [`Self::store_options`], with the process's shared block cache for
-    /// `None`; and whether the cache is the shared one.
-    fn store_options_for(block_cache_bytes: Option<usize>) -> (rocksdb::Options, bool) {
-        let mut opts = rocksdb::Options::default();
+    /// `None`, counting writes under `class` if any; and whether the cache
+    /// is the shared one.
+    fn store_options_for(
+        block_cache_bytes: Option<usize>,
+        class: Option<crate::write_stats::StoreClass>,
+    ) -> (rocksdb::Options, bool) {
+        let mut opts = class.map_or_else(rocksdb::Options::default, |class| class.options());
         opts.create_if_missing(true);
 
         opts.set_write_buffer_size(64 * 1024 * 1024);
