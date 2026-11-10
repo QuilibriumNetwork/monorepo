@@ -97,6 +97,17 @@ impl CollectedMessage {
             capacity: kinds.capacity,
         }
     }
+
+    /// `data`, this message with signers added, charged to the same share.
+    fn with_signers(&self, data: Vec<u8>) -> Self {
+        let mut copy = Self::new(data);
+        if let (Some(parts), Some(held)) = (copy.capacity.as_mut(), &self.capacity) {
+            if parts.member == held.member {
+                parts.share = held.share;
+            }
+        }
+        copy
+    }
 }
 
 /// A message's class, for its share of a rank ([`RankBuffer::over_share`])
@@ -122,8 +133,11 @@ enum Class {
 /// What a persistent-sector capacity message names.
 #[derive(Clone)]
 struct CapacityParts {
-    /// The member it names; each member's share of a rank is capped.
+    /// The member it names.
     member: [u8; 32],
+    /// The share of a rank it is charged to: its member's, from its sender
+    /// ([`capacity_share`]).
+    share: [u8; 32],
     /// For a bundle of one precommit, which precommit it is
     /// ([`precommit_identity`]).
     precommit: Option<[u8; 32]>,
@@ -170,6 +184,7 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
                 member: proof.member,
+                share: capacity_share(&proof.member, Sender::Local),
                 precommit: if only {
                     precommit_identity(&proof)
                 } else {
@@ -201,6 +216,37 @@ fn precommit_identity(
     h.update(message.epoch.to_be_bytes());
     h.update(message.certificate.to_bytes());
     Some(h.finalize().into())
+}
+
+/// Who delivered a message, for the share of a rank its capacity message is
+/// charged to ([`capacity_share`]).
+#[derive(Clone, Copy)]
+enum Sender<'a> {
+    /// This node itself.
+    Local,
+    /// A sender the receiving node cannot name.
+    Unidentified,
+    /// A peer by its authenticated identity: a TLS client key or a gossip
+    /// signer, which no other sender can claim.
+    Peer(&'a [u8]),
+}
+
+/// The share of a rank a capacity message naming `member` is charged to: the
+/// member's, from `sender`. Each sender's capacity messages naming a member
+/// fill that sender's share of it.
+fn capacity_share(member: &[u8; 32], sender: Sender<'_>) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/collector/capacity-share/v1");
+    h.update(member);
+    match sender {
+        Sender::Local => h.update([0]),
+        Sender::Unidentified => h.update([1]),
+        Sender::Peer(peer) => {
+            h.update([2]);
+            h.update(peer);
+        }
+    }
+    h.finalize().into()
 }
 
 /// Whether `data` is a bundle carrying a persistent-sector capacity message.
@@ -308,10 +354,10 @@ const RESERVED_BYTES_PER_RANK: usize = MAX_BYTES_PER_RANK / 4;
 const CAPACITY_MESSAGES_PER_RANK: usize = 4096;
 const CAPACITY_BYTES_PER_RANK: usize = MAX_BYTES_PER_RANK / 4;
 
-/// The share of a rank the capacity messages naming one member may hold: a
-/// precommit per sector and about five certificates. The member is the one a
-/// message names, checked only when a leader validates it, so this stops one
-/// member's runaway sender, and the rank share bounds every other sender.
+/// The share of a rank the capacity messages naming one member from one
+/// sender may hold: a precommit per sector and about five certificates
+/// ([`capacity_share`]). This stops one member's runaway sender, and the rank
+/// share bounds every sender.
 const CAPACITY_MESSAGES_PER_MEMBER: usize = 64;
 const CAPACITY_BYTES_PER_MEMBER: usize = 4 << 20;
 
@@ -330,7 +376,7 @@ enum Share {
     Unreserved,
     /// The capacity messages' share.
     Capacity,
-    /// One member's share of capacity messages.
+    /// One member's share of capacity messages from one sender.
     Member,
 }
 
@@ -339,7 +385,8 @@ enum Share {
 struct Shares {
     /// Outside [`Class::Reserved`].
     unreserved: (usize, usize),
-    /// Capacity messages, in all and by member.
+    /// Capacity messages, in all and by member and sender
+    /// ([`CapacityParts::share`]).
     capacity: (usize, usize),
     members: HashMap<[u8; 32], (usize, usize)>,
     /// The precommits held ([`precommit_identity`]), with their copies.
@@ -356,7 +403,7 @@ impl Shares {
         if let Some(parts) = &message.capacity {
             self.capacity.0 += 1;
             self.capacity.1 += len;
-            let member = self.members.entry(parts.member).or_default();
+            let member = self.members.entry(parts.share).or_default();
             member.0 += 1;
             member.1 += len;
             if let Some(precommit) = parts.precommit {
@@ -374,11 +421,11 @@ impl Shares {
         if let Some(parts) = &message.capacity {
             self.capacity.0 -= 1;
             self.capacity.1 -= len;
-            if let Some(member) = self.members.get_mut(&parts.member) {
+            if let Some(member) = self.members.get_mut(&parts.share) {
                 member.0 -= 1;
                 member.1 -= len;
                 if member.0 == 0 {
-                    self.members.remove(&parts.member);
+                    self.members.remove(&parts.share);
                 }
             }
             if let Some(precommit) = parts.precommit {
@@ -448,7 +495,8 @@ impl RankBuffer {
 
     /// The share of this rank `message` would go over, if any: messages
     /// outside [`Class::Reserved`] stay out of the reserved room, and
-    /// capacity messages within their share and their member's.
+    /// capacity messages within their share and their member's from their
+    /// sender.
     fn over_share(&self, message: &CollectedMessage) -> Option<Share> {
         let len = message.data.len();
         let over = |(count, bytes): (usize, usize), max_count: usize, max_bytes: usize| {
@@ -475,7 +523,7 @@ impl RankBuffer {
         let member = self
             .shares
             .members
-            .get(&parts.member)
+            .get(&parts.share)
             .copied()
             .unwrap_or_default();
         if over(
@@ -1436,7 +1484,7 @@ impl MessageCollector {
             unreserved_bytes = state.unreserved.1,
             reserved_bytes = RESERVED_BYTES_PER_RANK,
             latest_member = %state.member.map(hex::encode).unwrap_or_default(),
-            "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's (latest_member names the last), unreserved_refused any other message over the room outside the reserve. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends when the rank advances or held messages ride a frame"
+            "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends when the rank advances or held messages ride a frame"
         );
     }
 
@@ -1790,7 +1838,7 @@ impl MessageCollector {
     /// private proposal copy, which has no verifier of its own).
     pub fn add_verified_message(&self, rank: u64, data: Vec<u8>) -> bool {
         matches!(
-            self.admit(rank, data, true, Provenance::Prover),
+            self.admit(rank, data, true, Provenance::Prover, Sender::Local),
             SubmitOutcome::Accepted
         )
     }
@@ -1810,7 +1858,7 @@ impl MessageCollector {
     /// For this node's own messages: a peer's go through
     /// [`Self::add_message_outcome_from`].
     pub fn add_message_outcome(&self, rank: u64, data: Vec<u8>) -> SubmitOutcome {
-        self.admit(rank, data, false, Provenance::Prover)
+        self.admit(rank, data, false, Provenance::Prover, Sender::Local)
     }
 
     /// [`Self::add_message_outcome`] for a message `provenance` delivered.
@@ -1820,7 +1868,25 @@ impl MessageCollector {
         data: Vec<u8>,
         provenance: Provenance,
     ) -> SubmitOutcome {
-        self.admit(rank, data, false, provenance)
+        let sender = match provenance {
+            Provenance::Prover => Sender::Local,
+            Provenance::Other => Sender::Unidentified,
+        };
+        self.admit(rank, data, false, provenance, sender)
+    }
+
+    /// [`Self::add_message_outcome_from`] for a message the peer `peer`
+    /// delivered: its authenticated identity (a TLS client key or a gossip
+    /// signer). A capacity message is charged to its member's share from
+    /// that peer ([`capacity_share`]).
+    pub fn add_message_outcome_by(
+        &self,
+        rank: u64,
+        data: Vec<u8>,
+        provenance: Provenance,
+        peer: &[u8],
+    ) -> SubmitOutcome {
+        self.admit(rank, data, false, provenance, Sender::Peer(peer))
     }
 
     fn admit(
@@ -1829,6 +1895,7 @@ impl MessageCollector {
         data: Vec<u8>,
         verified: bool,
         provenance: Provenance,
+        sender: Sender<'_>,
     ) -> SubmitOutcome {
         if self.no_proposer.load(std::sync::atomic::Ordering::Acquire) {
             return SubmitOutcome::Filtered(Refusal::NoProposer);
@@ -1857,6 +1924,9 @@ impl MessageCollector {
         }
 
         let mut message = CollectedMessage::new(data);
+        if let Some(parts) = message.capacity.as_mut() {
+            parts.share = capacity_share(&parts.member, sender);
+        }
         // Already included in a finalized frame → never re-accept. This
         // is what stops a message from re-entering the mempool after it
         // has been consumed by a committed frame. The archive already has
@@ -1932,7 +2002,7 @@ impl MessageCollector {
             // A bundle of several shard frames could not be compared with the
             // copies of each: its frames are admitted one by one.
             if checks.len() > 1 && self.shard_frame_verifier.read().unwrap().is_some() {
-                return self.admit_parts(rank, &message.data, provenance);
+                return self.admit_parts(rank, &message.data, provenance, sender);
             }
             // A copy of a verified frame adds the signers the held copy lacks.
             if let Some(outcome) = self.union_copy(&message, provenance) {
@@ -3759,6 +3829,74 @@ mod tests {
             mc.add_message_outcome(1, capacity_bundle(8, 0, 0, 800_000)),
             SubmitOutcome::Accepted,
             "another member's certificate is not refused for it"
+        );
+    }
+
+    /// The capacity messages naming a member that one sender delivers are
+    /// charged to that member's share from that sender: once they fill it,
+    /// the member's own precommit still goes in.
+    #[test]
+    fn member_share_is_kept_per_sender() {
+        let mc = global_collector();
+        let held = (0..=CAPACITY_MESSAGES_PER_MEMBER as u8)
+            .filter(|sector| {
+                mc.add_message_outcome_from(
+                    1,
+                    capacity_bundle(7, *sector, 100, 0),
+                    Provenance::Other,
+                ) == SubmitOutcome::Accepted
+            })
+            .count();
+        eprintln!("capacity messages held from one sender: {held}");
+        assert_eq!(
+            held, CAPACITY_MESSAGES_PER_MEMBER,
+            "one sender is held to one member's share"
+        );
+        assert_eq!(
+            mc.add_message_outcome(1, capacity_bundle(7, 200, 100, 0)),
+            SubmitOutcome::Accepted,
+            "class-share sender-share: another sender's share refused the member's own precommit"
+        );
+    }
+
+    /// Each peer's capacity messages naming a member hold at most one
+    /// member's share, precommits and certificates alike, and another peer's
+    /// messages naming that member still go in.
+    #[test]
+    fn each_sender_holds_at_most_one_share_per_member() {
+        let mc = global_collector();
+        let by = |peer: &[u8], data: Vec<u8>| {
+            mc.add_message_outcome_by(1, data, Provenance::Other, peer)
+        };
+        let held = (0..=CAPACITY_MESSAGES_PER_MEMBER as u8)
+            .filter(|sector| {
+                let data = if sector % 2 == 0 {
+                    capacity_bundle(7, *sector, 100, 0)
+                } else {
+                    capacity_bundle(7, *sector, 0, 64)
+                };
+                by(b"peer-a", data) == SubmitOutcome::Accepted
+            })
+            .count();
+        eprintln!("capacity messages held from one sender: {held}");
+        assert_eq!(
+            held, CAPACITY_MESSAGES_PER_MEMBER,
+            "one peer is held to one member's share"
+        );
+        assert_eq!(
+            by(b"peer-a", capacity_bundle(8, 1, 100, 0)),
+            SubmitOutcome::Accepted,
+            "the same peer naming another member"
+        );
+        assert_eq!(
+            by(b"peer-b", capacity_bundle(7, 200, 100, 0)),
+            SubmitOutcome::Accepted,
+            "class-share sender-share: one peer's share refused another peer's precommit naming the member"
+        );
+        assert_eq!(
+            by(b"peer-b", capacity_bundle(7, 201, 0, 64)),
+            SubmitOutcome::Accepted,
+            "class-share sender-share: one peer's share refused another peer's certificate naming the member"
         );
     }
 

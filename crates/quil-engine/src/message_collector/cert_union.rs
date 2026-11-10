@@ -27,7 +27,7 @@ use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageR
 
 use super::{
     extract_shard_frame_checks, unindex, Candidate, CollectedMessage, MessageCollector, Provenance,
-    RankBuffer, RankFullState, Refusal, Reject, RejectKind, ShardFrame, ShardFrameVerdict,
+    RankBuffer, RankFullState, Refusal, Reject, RejectKind, Sender, ShardFrame, ShardFrameVerdict,
     SubmitOutcome, MAX_BYTES_PER_RANK, VERIFICATION_WAIT,
 };
 use crate::proposal_pool::Intake;
@@ -469,13 +469,12 @@ impl MessageCollector {
         let Some(buffer) = buffers.get_mut(&rank) else {
             return SubmitOutcome::Duplicate;
         };
-        let Some(union) = buffer
+        let Some(mut union) = buffer
             .message(&key)
-            .and_then(|held| extended(&held.data, added))
+            .and_then(|held| Some(held.with_signers(extended(&held.data, added)?)))
         else {
             return SubmitOutcome::Duplicate;
         };
-        let mut union = CollectedMessage::new(union);
         union.verified = true;
         let union_key = union.hash;
         if buffer.replace(&key, union) {
@@ -562,7 +561,7 @@ impl MessageCollector {
         if union == message.data {
             return;
         }
-        *message = CollectedMessage::new(union);
+        *message = message.with_signers(union);
         message.verified = true;
         // A source of the same bytes would make this one a duplicate of a copy
         // still held unverified.
@@ -582,6 +581,7 @@ impl MessageCollector {
         rank: u64,
         data: &[u8],
         provenance: Provenance,
+        sender: Sender<'_>,
     ) -> SubmitOutcome {
         let Ok(bundle) = CanonicalMessageBundle::from_canonical_bytes(data) else {
             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
@@ -603,7 +603,7 @@ impl MessageCollector {
             let Ok(part) = part else {
                 return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
             };
-            match self.admit(rank, part, false, provenance) {
+            match self.admit(rank, part, false, provenance, sender) {
                 SubmitOutcome::Accepted => accepted = true,
                 SubmitOutcome::Duplicate => {}
                 SubmitOutcome::Filtered(Refusal::InvalidShardFrame) => {

@@ -1968,14 +1968,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         } else {
                             quil_engine::message_collector::Provenance::Other
                         };
-                        collector.add_message_outcome_from(rank, data, provenance)
+                        admit_peer_submit(&collector, rank, data, provenance, &sender)
                     })
                     .await
                     .map_err(|error| {
                         SubmitRefusal::retry_later(format!("verification task failed: {error}"))
                     })?
                 } else {
-                    submit_mc.add_message_outcome(rank, data)
+                    admit_peer_submit(
+                        &submit_mc,
+                        rank,
+                        data,
+                        quil_engine::message_collector::Provenance::Prover,
+                        &auth,
+                    )
                 };
                 match outcome {
                     quil_engine::message_collector::SubmitOutcome::Accepted => {
@@ -2429,12 +2435,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             }
             // Consensus rank, not frame number (see peer submit handler).
             let rank = node_submit_cf.effective_rank();
-            // NodeService authenticates no caller.
-            match node_submit_mc.add_message_outcome_from(
-                rank,
-                data,
-                quil_engine::message_collector::Provenance::Other,
-            ) {
+            match admit_user_submit(&node_submit_mc, rank, data) {
                 // Duplicate = already delivered → success (not a drop).
                 quil_engine::message_collector::SubmitOutcome::Accepted
                 | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
@@ -6171,6 +6172,181 @@ mod committed_app_head_tests {
         );
         crdt.set_covered_prefix(&[63; 43]).unwrap();
         assert!(committed_global_app_heads(&crdt, &[filter]).is_err());
+    }
+}
+
+/// Admits a peer's submit: a capacity message is charged to its member's
+/// share from `peer`, by its authenticated identity.
+fn admit_peer_submit(
+    collector: &quil_engine::message_collector::MessageCollector,
+    rank: u64,
+    data: Vec<u8>,
+    provenance: quil_engine::message_collector::Provenance,
+    peer: &quil_rpc::peer_auth_middleware::AuthenticatedPeer,
+) -> quil_engine::message_collector::SubmitOutcome {
+    collector.add_message_outcome_by(rank, data, provenance, &peer.peer_id.to_bytes())
+}
+
+/// Admits a NodeService submit. NodeService authenticates no caller, so a
+/// capacity message is charged to its member's share from no sender, apart
+/// from this node's and every peer's.
+fn admit_user_submit(
+    collector: &quil_engine::message_collector::MessageCollector,
+    rank: u64,
+    data: Vec<u8>,
+) -> quil_engine::message_collector::SubmitOutcome {
+    collector.add_message_outcome_from(
+        rank,
+        data,
+        quil_engine::message_collector::Provenance::Other,
+    )
+}
+
+#[cfg(test)]
+mod submit_sender_tests {
+    use super::super::message_loop::admit_prover_message;
+    use super::{admit_peer_submit, admit_user_submit};
+    use quil_engine::message_collector::{MessageCollector, Provenance, SubmitOutcome};
+    use quil_p2p::node::ReceivedMessage;
+    use quil_p2p::PeerId;
+    use quil_rpc::peer_auth_middleware::AuthenticatedPeer;
+
+    const RANK: u64 = 1;
+
+    /// A precommit naming `member`'s sector `sector`.
+    fn precommit(member: u8, sector: u8) -> Vec<u8> {
+        use quil_crypto::persistent_storage::{Certificate, Profile};
+        use quil_execution::global_intrinsic::persistent_storage::CapacityMessage;
+        use quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let message = CapacityMessage {
+            member: [member; 32],
+            epoch: 1500,
+            certificate: Certificate {
+                profile: Profile::Eleven,
+                sector: [sector; 32],
+                n: 32,
+                columns: [0; 32],
+                labels: [0; 32],
+            },
+            signed_at: 100,
+            signature: vec![1; 72],
+            proof: Vec::new(),
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: message.envelope().to_canonical_bytes(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Admits `member`'s precommits through `admit` until one is refused,
+    /// which must be before the 200th.
+    fn fill(member: u8, admit: impl Fn(Vec<u8>) -> SubmitOutcome) {
+        let held = (0..200u8)
+            .take_while(|sector| admit(precommit(member, *sector)) == SubmitOutcome::Accepted)
+            .count();
+        eprintln!("member {member}: {held} precommits held from one sender");
+        assert!(
+            (1..200).contains(&held),
+            "sender-wiring: one sender's precommits naming member {member} filled no share ({held} held)"
+        );
+    }
+
+    fn peer() -> AuthenticatedPeer {
+        AuthenticatedPeer {
+            peer_id: PeerId::random(),
+            falcon_public_key: Vec::new(),
+        }
+    }
+
+    fn gossiped(from: &[u8], data: Vec<u8>) -> ReceivedMessage {
+        ReceivedMessage {
+            bitmask: Vec::new(),
+            data,
+            from: from.to_vec(),
+            via: PeerId::random().to_bytes(),
+            direct: false,
+        }
+    }
+
+    /// Each of `outcomes` (a sender and its submit's outcome) went in beside
+    /// `full`'s full share.
+    fn admitted_beside(full: &str, outcomes: &[(&str, SubmitOutcome)]) {
+        for (sender, outcome) in outcomes {
+            assert_eq!(
+                *outcome,
+                SubmitOutcome::Accepted,
+                "sender-wiring: {full}'s full share refused {sender}"
+            );
+        }
+    }
+
+    /// Each submit path charges a capacity message to its member's share from
+    /// the sender it names: a gRPC submit from the peer's TLS identity, a
+    /// gossiped message from its signer, and a NodeService submit from no
+    /// sender. Each sender's full share leaves the others' room.
+    #[test]
+    fn each_submit_path_charges_capacity_shares_to_its_sender() {
+        let mc = MessageCollector::new();
+        mc.set_class_shares();
+        let local = |m| mc.add_message_outcome(RANK, precommit(m, 250));
+        let unnamed = |m| mc.add_message_outcome_from(RANK, precommit(m, 251), Provenance::Other);
+        let by = |m, peer: &[u8]| {
+            mc.add_message_outcome_by(RANK, precommit(m, 252), Provenance::Other, peer)
+        };
+
+        let (a, b) = (peer(), peer());
+        fill(7, |data| {
+            admit_peer_submit(&mc, RANK, data, Provenance::Prover, &a)
+        });
+        assert_ne!(
+            by(7, &a.peer_id.to_bytes()),
+            SubmitOutcome::Accepted,
+            "sender-wiring: a gRPC submit was not charged to its peer's identity"
+        );
+        let other = admit_peer_submit(&mc, RANK, precommit(7, 253), Provenance::Prover, &b);
+        admitted_beside(
+            "a gRPC peer",
+            &[
+                ("another peer", other),
+                ("this node", local(7)),
+                ("no sender", unnamed(7)),
+            ],
+        );
+
+        let (signer, second) = (PeerId::random().to_bytes(), PeerId::random().to_bytes());
+        fill(8, |data| {
+            admit_prover_message(&mc, RANK, gossiped(&signer, data), Provenance::Prover)
+        });
+        assert_ne!(
+            by(8, &signer),
+            SubmitOutcome::Accepted,
+            "sender-wiring: a gossiped message was not charged to its signer"
+        );
+        let message = gossiped(&second, precommit(8, 253));
+        let other = admit_prover_message(&mc, RANK, message, Provenance::Prover);
+        admitted_beside(
+            "a gossip signer",
+            &[
+                ("another signer", other),
+                ("this node", local(8)),
+                ("no sender", unnamed(8)),
+            ],
+        );
+
+        fill(9, |data| admit_user_submit(&mc, RANK, data));
+        assert_ne!(
+            unnamed(9),
+            SubmitOutcome::Accepted,
+            "sender-wiring: a NodeService submit was charged to a sender"
+        );
+        let other = admit_peer_submit(&mc, RANK, precommit(9, 253), Provenance::Prover, &a);
+        admitted_beside("NodeService", &[("a peer", other), ("this node", local(9))]);
     }
 }
 
