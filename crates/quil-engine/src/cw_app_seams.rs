@@ -184,8 +184,11 @@ fn encode_app_frame(frame: &AppShardFrame) -> Vec<u8> {
     prost::Message::encode_to_vec(frame)
 }
 
+/// A frame past the bundles and requests, or storage openings, a frame
+/// may carry (`frame_bound`) is refused unread: no member votes for one, as no
+/// follower or archive takes it.
 pub(crate) fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
-    <AppShardFrame as prost::Message>::decode(bytes).ok()
+    crate::frame_bound::decode_frame("consensus", bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -2990,6 +2993,28 @@ pub fn activate_app_consensus_cw(
 mod tests {
     use super::*;
     use quil_types::crypto::Signer as _;
+
+    /// A consensus frame past the bundles and requests a frame may carry is
+    /// refused unread; one at the bound decodes.
+    #[test]
+    fn consensus_frames_past_the_frame_bound_are_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let carrying = |items: usize| {
+            encode_app_frame(&AppShardFrame {
+                requests: bundles_of(items),
+                ..Default::default()
+            })
+        };
+        let before = refused_here();
+        assert!(
+            decode_app_frame(&carrying(MAX_APP_FRAME_ITEMS + 1)).is_none(),
+            "FRAME-BOUND: a consensus frame past the bound was decoded"
+        );
+        assert_eq!(refused_here(), before + 1);
+        let at = decode_app_frame(&carrying(MAX_APP_FRAME_ITEMS));
+        assert_eq!(at.map(|frame| frame.requests.len()), Some(2));
+        assert_eq!(refused_here(), before + 1);
+    }
 
     #[tokio::test]
     async fn shutdown_waits_for_host_exit() {

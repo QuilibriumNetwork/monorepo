@@ -401,6 +401,75 @@ fn bundle(requests: Vec<Vec<u8>>) -> Vec<u8> {
     .unwrap()
 }
 
+/// `count` requests of a type no converter reads, told apart by `n`.
+fn unconverted(n: u32, count: usize) -> Vec<Vec<u8>> {
+    (0..count as u32)
+        .map(|i| {
+            let mut inner = 0x0000_0201u32.to_be_bytes().to_vec();
+            inner.extend_from_slice(&n.to_be_bytes());
+            inner.extend_from_slice(&i.to_be_bytes());
+            inner
+        })
+        .collect()
+}
+
+/// A leader takes collected bundles while the frame has room, keeping room
+/// for its coin deliveries, and defers the rest, which stay collected.
+#[tokio::test]
+async fn a_leader_defers_bundles_past_the_frame_bound() {
+    use crate::frame_bound::{deferred_here, MAX_APP_FRAME_ITEMS};
+    let rig = rig(half(false), Proofs::Unconfigured);
+    // Two bundles of half the bound each: the frame's whole room.
+    for n in 0..2 {
+        let half = bundle(unconverted(n, MAX_APP_FRAME_ITEMS / 2 - 1));
+        assert!(rig.collector.add_message(0, half));
+    }
+    assert_eq!(rig.collector.total_pending(), 2);
+    let before = deferred_here();
+    turn(&rig.leader, 1);
+    assert_eq!(
+        deferred_here(),
+        before + 1,
+        "LEADER-DEFERRAL: the leader took a bundle into the room its coin deliveries need"
+    );
+    assert_eq!(rig.collector.total_pending(), 2, "a deferred bundle stays");
+}
+
+/// A bundle the leader holds (its shield names a source coin this node
+/// does not hold) takes no room in the frame: a bundle after it that
+/// fits is not deferred.
+#[tokio::test]
+async fn a_held_bundle_takes_no_room_in_the_frame() {
+    use crate::frame_bound::{deferred_here, MAX_APP_FRAME_ITEMS};
+    use quil_execution::manager::CommitOutlook;
+    // The shield's source coin is written into another rig's store only.
+    let other = rig(half(false), Proofs::Absent);
+    let rig = rig(half(false), Proofs::Absent);
+    let mut requests = vec![formed_shield(&other)];
+    requests.extend(unconverted(0, MAX_APP_FRAME_ITEMS - 2));
+    let held = bundle(requests);
+    let manager = rig.engine.execution_engine.as_ref().unwrap();
+    let canonical = crate::consensus_wire::app_bundle_to_canonical_bytes(
+        &crate::consensus_wire::decode_app_message_bundle(&held).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.commit_outlook(&manager.crdt(), &rig.leader.app_address, &canonical),
+        CommitOutlook::Pending,
+        "setup: the first bundle is held"
+    );
+    assert!(rig.collector.add_message(0, held));
+    assert!(rig.collector.add_message(0, bundle(unconverted(1, 1))));
+    assert_eq!(rig.collector.total_pending(), 2);
+    let before = deferred_here();
+    turn(&rig.leader, 1);
+    assert_eq!(
+        deferred_here(),
+        before,
+        "BUDGET-AFTER-HOLDS: a held bundle took the frame's room"
+    );
+}
+
 /// Offer gossip-sized bundles of junk shields of `source` until the rank cap
 /// is full or the shard stops taking them; the messages offered.
 fn flood(rig: &mut Rig, source: [u8; 32]) -> usize {

@@ -148,7 +148,10 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
 ///
 /// The check runs on the mirror's own thread ([`MirrorFeed`]); this loop
 /// reads only the frame's header, counts its request bundles unread and
-/// queues it under its sender's key ([`MirrorState::sender_key`]). Checked
+/// queues it under its sender's key ([`MirrorState::sender_key`]). A frame
+/// carrying more bundles and requests, or storage openings, than a frame
+/// may is refused first ([`frame_within_bound`]): it takes no room in the
+/// queue, and the mirror's worker never decodes it. Checked
 /// here, a peer's frame of many bundles held the loop for seconds, and the
 /// check reads the execution engines that GLOBAL execution locks. True when
 /// the frame was queued.
@@ -158,6 +161,9 @@ fn unrouted_shard_message(
     data: Vec<u8>,
     feed: &MirrorFeed,
 ) -> bool {
+    if !frame_within_bound("cluster mirror", sender.via, &data) {
+        return false;
+    }
     let Ok(outline) = <FrameOutline as prost::Message>::decode(data.as_slice()) else {
         return false;
     };
@@ -176,6 +182,13 @@ fn unrouted_shard_message(
     }
     feed.offer_sent(bitmask, &address, sender, data, outline.requests.len());
     true
+}
+
+/// Whether gossiped shard frame `data` carries no more bundles and
+/// requests, or storage openings, than a frame may
+/// ([`quil_engine::frame_bound`]), counted unread. A refusal is logged with `via`, the connected peer it came from.
+fn frame_within_bound(source: &'static str, via: &[u8], data: &[u8]) -> bool {
+    quil_engine::frame_bound::admit_frame(source, Some(via), data)
 }
 
 /// Who sent a gossiped shard frame, as the mirror's queue keys it
@@ -3864,7 +3877,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         break;
                                     }
                                     if bm == quil_engine::bitmasks::shard_frame_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Frame(std::mem::take(&mut received.data)));
+                                        if frame_within_bound("shard frame topic", &received.via, &received.data) {
+                                            handle.send(quil_engine::app_engine::AppEngineMessage::Frame(std::mem::take(&mut received.data)));
+                                        }
                                         routed = true;
                                         break;
                                     }
@@ -3951,6 +3966,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         Some((queue, admits)) => {
                                             if super::archive_ingest_queue::may_carry_shard_frame(bm)
                                                 && admits.may_queue(&received.data)
+                                                && frame_within_bound("archive ingest queue", &received.via, &received.data)
                                             {
                                                 queue.offer(std::mem::take(&mut received.data));
                                             }
@@ -5229,6 +5245,49 @@ mod tests {
             .shared
             .lock()
             .members_fresh(&shard.filter, std::time::Instant::now()));
+    }
+
+    /// A frame carrying more bundles and requests than a frame may is
+    /// refused before the loop reads its header and takes no room in the
+    /// mirror's queue; one at the limit is queued, and one cut short too
+    /// is refused.
+    #[test]
+    fn frames_past_the_frame_bound_are_refused_before_the_mirror_queue() {
+        use quil_engine::frame_bound::MAX_APP_FRAME_ITEMS;
+        use quil_types::proto::global::{MessageBundle, MessageRequest};
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let carrying = |items: usize| {
+            let mut frame = shard.frame(7);
+            frame.requests = vec![
+                MessageBundle {
+                    requests: vec![MessageRequest::default(); items - 2],
+                    timestamp: 5,
+                },
+                MessageBundle::default(),
+            ];
+            prost::Message::encode_to_vec(&frame)
+        };
+        let peer = MirrorSender {
+            signer: b"peer",
+            via: b"peer",
+        };
+        let feed = MirrorFeed::new();
+        assert!(
+            !unrouted_shard_message(&topic, peer, carrying(MAX_APP_FRAME_ITEMS + 1), &feed)
+                && feed.take().is_none(),
+            "FRAME-BOUND: a frame past the bound was queued for the mirror"
+        );
+        let over = carrying(MAX_APP_FRAME_ITEMS + 1);
+        assert!(!unrouted_shard_message(
+            &topic,
+            peer,
+            over[..over.len() - 1].to_vec(),
+            &feed
+        ));
+        let at = carrying(MAX_APP_FRAME_ITEMS);
+        assert!(unrouted_shard_message(&topic, peer, at.clone(), &feed));
+        assert_eq!(feed.take(), Some(at), "a frame at the bound is queued");
     }
 
     /// The worker reads and keeps committee members only for shards the

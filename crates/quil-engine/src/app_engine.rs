@@ -2050,6 +2050,34 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 }
             }
         }
+        // Members, followers and archives refuse a frame past the bundles
+        // and requests a frame may carry (`frame_bound`). Of the bundles
+        // every hold above left, the frame takes each, in collection order,
+        // while it has room, keeping room for the coin deliveries added
+        // below (each a bundle of one request); the rest stay in the
+        // collector for a later frame, within its retention.
+        let deliveries = 2 * quil_execution::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME;
+        let fits = crate::frame_bound::FrameItemBudget::within(
+            crate::frame_bound::MAX_APP_FRAME_ITEMS - deliveries,
+        )
+        .fit(request_bundles.iter().map(|bundle| bundle.requests.len()));
+        let deferred = fits.iter().filter(|fits| !**fits).count();
+        if deferred > 0 {
+            info!(
+                frame = frame_number,
+                rank,
+                deferred,
+                limit = crate::frame_bound::MAX_APP_FRAME_ITEMS,
+                action = "an expected wait: a later frame proposes them",
+                "deferring bundles past the bundles and requests a frame may carry"
+            );
+            retain_kept(
+                &fits,
+                &mut request_bundles,
+                &mut canonical_requests,
+                &mut origins,
+            );
+        }
         // The leader executes these after finalization like every member;
         // start verifying their proofs now.
         if let Some(exec) = self.execution_engine.as_ref() {
@@ -11698,8 +11726,7 @@ impl AppConsensusEngine {
         if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data)
-        else {
+        let Some(frame) = crate::frame_bound::decode_frame("shard frame topic", data) else {
             return;
         };
         let Some(h) = frame.header.as_ref() else {
@@ -14070,7 +14097,7 @@ fn block_sync_from(
         let seal = quil_cw_consensus::handoff::Seal::decode(bytes).ok()?;
         return (seal.checkpoint.frame > cursor && session() == Some(seal.session)).then_some(next);
     }
-    let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes).ok()?;
+    let frame = crate::frame_bound::decode_frame("consensus block", bytes)?;
     (frame.header?.frame_number > next).then_some(next)
 }
 
@@ -22913,6 +22940,37 @@ mod tests {
         assert_eq!(block_sync_from(&frame(2506), 2504, ours), Some(2505));
     }
 
+    /// A consensus block past the bundles and requests a frame may carry is
+    /// refused unread and asks for no sync; one at the bound is read.
+    #[test]
+    fn a_consensus_block_past_the_frame_bound_is_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let carrying = |items: usize| {
+            prost::Message::encode_to_vec(&quil_types::proto::global::AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    frame_number: 2506,
+                    ..Default::default()
+                }),
+                requests: bundles_of(items),
+                ..Default::default()
+            })
+        };
+        let ours = || Some([7; 32]);
+        let before = refused_here();
+        assert_eq!(
+            block_sync_from(&carrying(MAX_APP_FRAME_ITEMS + 1), 2504, ours),
+            None,
+            "FRAME-BOUND: a consensus block past the bound was read"
+        );
+        assert_eq!(refused_here(), before + 1);
+        assert_eq!(
+            block_sync_from(&carrying(MAX_APP_FRAME_ITEMS), 2504, ours),
+            Some(2505),
+            "a block at the bound is read"
+        );
+        assert_eq!(refused_here(), before + 1);
+    }
+
     /// Archive requests for one missing frame go at once, then after a
     /// minute, doubling to ten minutes; another frame starts afresh.
     #[test]
@@ -29983,6 +30041,33 @@ mod gossip_frame_tests {
 
     fn encode(frame: &AppShardFrame) -> Vec<u8> {
         prost::Message::encode_to_vec(frame)
+    }
+
+    /// A frame on the frame topic carrying more bundles and requests than
+    /// a frame may is refused unread; one at the limit is read.
+    #[tokio::test]
+    async fn a_frame_past_the_frame_bound_is_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let (mut engine, _handle) = build(None, false);
+        // At the cursor: a frame read is dropped right after its header.
+        let carrying = |items| {
+            let mut frame = unanchored(0, 0, vec![0; 32]);
+            frame.requests = bundles_of(items);
+            encode(&frame)
+        };
+        let before = refused_here();
+        engine
+            .handle_frame_message(&carrying(MAX_APP_FRAME_ITEMS + 1))
+            .await;
+        assert_eq!(
+            refused_here(),
+            before + 1,
+            "FRAME-BOUND: a frame past the bound was decoded"
+        );
+        engine
+            .handle_frame_message(&carrying(MAX_APP_FRAME_ITEMS))
+            .await;
+        assert_eq!(refused_here(), before + 1, "a frame at the bound is read");
     }
 
     /// Frame-topic gossip fills its own queue: a flood of it leaves the

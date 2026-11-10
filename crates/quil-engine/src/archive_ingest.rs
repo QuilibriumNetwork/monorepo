@@ -1056,9 +1056,10 @@ impl ArchiveAppShardIngest {
 
     /// Ingest a gossiped full `AppShardFrame` (prost bytes).
     pub fn ingest(&mut self, data: &[u8]) {
-        let frame = match <AppShardFrame as prost::Message>::decode(data) {
-            Ok(f) => f,
-            Err(_) => return,
+        // Refused unread past the bundles and requests, or storage
+        // openings, a frame may carry (`frame_bound`).
+        let Some(frame) = crate::frame_bound::decode_frame("archive ingest", data) else {
+            return;
         };
         let (address, frame_number) = match frame.header.as_ref() {
             Some(h) if !h.address.is_empty() => (h.address.clone(), h.frame_number),
@@ -3615,9 +3616,10 @@ pub fn ingest_gossiped(
     data: &[u8],
 ) {
     let lock = || lock_ingest(ingest);
-    let frame = match <AppShardFrame as prost::Message>::decode(data) {
-        Ok(f) => f,
-        Err(_) => return,
+    // Refused unread past the bundles and requests, or storage openings,
+    // a frame may carry (`frame_bound`).
+    let Some(frame) = crate::frame_bound::decode_frame("archive ingest", data) else {
+        return;
     };
     let (address, frame_number) = match frame.header.as_ref() {
         Some(h) if !h.address.is_empty() => (h.address.clone(), h.frame_number),
@@ -6727,6 +6729,75 @@ mod tests {
         );
         ingest_gossiped(&ingest, &verifier, &bytes);
         assert!(ingest.lock().unwrap().awaiting_anchor.contains_key(&held));
+    }
+
+    /// A gossiped frame of a tracked shard carrying 16,385 bundles and
+    /// requests is not decoded, so it parks nothing; one of 16,384 parks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gossiped_frame_past_the_frame_bound_parks_nothing() {
+        use quil_types::proto::global::{MessageBundle, MessageRequest};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _db, _registry, _requests) = tracking_fixture(std::slice::from_ref(&filter));
+        let ingest = std::sync::Mutex::new(ingest);
+        let verifier = ingest.lock().unwrap().verifier();
+        let carrying = |number: u64, items: usize| {
+            let mut frame = verified_frame(&filter, number);
+            frame.header.as_mut().unwrap().global_frame_number = 77;
+            frame.requests = vec![
+                MessageBundle {
+                    requests: vec![MessageRequest::default(); items - 2],
+                    timestamp: 5,
+                },
+                MessageBundle::default(),
+            ];
+            prost::Message::encode_to_vec(&frame)
+        };
+        ingest_gossiped(&ingest, &verifier, &carrying(1, 16_385));
+        assert!(
+            ingest.lock().unwrap().awaiting_anchor.is_empty(),
+            "FRAME-BOUND: a frame of 16,385 bundles and requests was decoded and parked"
+        );
+        ingest_gossiped(&ingest, &verifier, &carrying(2, 16_384));
+        let parked: Vec<u64> = ingest
+            .lock()
+            .unwrap()
+            .awaiting_anchor
+            .get(&filter)
+            .map(|frames| frames.keys().copied().collect())
+            .unwrap_or_default();
+        assert_eq!(parked, vec![2], "a frame at the bound parks");
+    }
+
+    /// A gossiped frame of a tracked shard carrying more bundles and
+    /// requests than a frame may is refused unread through either entry
+    /// and parks nothing; one at the limit is read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossiped_frames_past_the_frame_bound_are_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _db, _registry, _requests) = tracking_fixture(std::slice::from_ref(&filter));
+        let ingest = std::sync::Mutex::new(ingest);
+        let verifier = ingest.lock().unwrap().verifier();
+        let carrying = |number: u64, items: usize| {
+            let mut frame = verified_frame(&filter, number);
+            frame.header.as_mut().unwrap().global_frame_number = 77;
+            frame.requests = bundles_of(items);
+            prost::Message::encode_to_vec(&frame)
+        };
+        let before = refused_here();
+        ingest_gossiped(&ingest, &verifier, &carrying(1, MAX_APP_FRAME_ITEMS + 1));
+        ingest
+            .lock()
+            .unwrap()
+            .ingest(&carrying(2, MAX_APP_FRAME_ITEMS + 1));
+        assert_eq!(
+            refused_here(),
+            before + 2,
+            "FRAME-BOUND: a frame past the bound was decoded"
+        );
+        assert!(ingest.lock().unwrap().awaiting_anchor.is_empty());
+        ingest_gossiped(&ingest, &verifier, &carrying(3, MAX_APP_FRAME_ITEMS));
+        assert_eq!(refused_here(), before + 2, "a frame at the bound is read");
     }
 
     /// Forged frames of a tracked shard park at most
