@@ -162,26 +162,38 @@ impl Rig {
         fixture
     }
     fn over(signer: Arc<quil_crypto::FalconSigner>, fixture: Fixture) -> Self {
+        Self::over_with(signer, fixture, None)
+    }
+    /// A rig whose GLOBAL prover reports the application frame bodies it
+    /// holds through `bodies`, as an archive's does.
+    fn over_with(
+        signer: Arc<quil_crypto::FalconSigner>,
+        fixture: Fixture,
+        bodies: Option<crate::leader_provider::ShardBodyAvailability>,
+    ) -> Self {
         let source = Arc::new(fixture.source);
         let genesis_frame = state_frame(&source, 0, 0, digest_from_identity([0; 32]));
         let genesis = id(&genesis_frame);
         save(fixture.clock.as_ref(), &genesis_frame);
         let collector = Arc::new(MessageCollector::new());
-        let leader = Arc::new(GlobalLeaderProvider::new(
-            source.prover_registry.clone(),
-            Arc::new(TestFrameProver),
-            Arc::new(crate::difficulty::AsertDifficultyAdjuster::new(0, 0, 100)),
-            fixture.clock.clone(),
-            collector.clone(),
-            quil_crypto::poseidon::hash_bytes_to_32(signer.public_key())
-                .unwrap()
-                .to_vec(),
-            signer.public_key().to_vec(),
-            signer.clone(),
-            Arc::new(quil_tries::ShaInclusionProver),
-            Some(source.execution_manager.clone()),
-            Some(source.hypergraph.clone()),
-        ));
+        let leader = Arc::new(
+            GlobalLeaderProvider::new(
+                source.prover_registry.clone(),
+                Arc::new(TestFrameProver),
+                Arc::new(crate::difficulty::AsertDifficultyAdjuster::new(0, 0, 100)),
+                fixture.clock.clone(),
+                collector.clone(),
+                quil_crypto::poseidon::hash_bytes_to_32(signer.public_key())
+                    .unwrap()
+                    .to_vec(),
+                signer.public_key().to_vec(),
+                signer.clone(),
+                Arc::new(quil_tries::ShaInclusionProver),
+                Some(source.execution_manager.clone()),
+                Some(source.hypergraph.clone()),
+            )
+            .with_body_availability(bodies),
+        );
         let verifier = Arc::new(
             GlobalFrameVerifier::new(Arc::new(TestFrameProver))
                 .with_global_committee(vec![signer.public_key().to_vec()]),
@@ -688,6 +700,164 @@ fn a_voter_whose_engines_are_in_use_defers_instead_of_refusing() {
     assert_eq!(
         seam.verify_or_defer(context, id(&child), Some(encoded)),
         Ok(true)
+    );
+}
+
+/// An archive votes for a GLOBAL proposal only once it holds the
+/// application frame bodies of every shard header the proposal carries, as
+/// its leader proposes only those. Archives execute a finalized frame only
+/// with those bodies and wait for them without a bound, so a frame finalized
+/// with a header whose body no archive holds can never publish, and every
+/// later proposal and vote waits for it: GLOBAL halts. The leader's own check
+/// binds only a leader running it. Lacking a body, the voter defers (and its
+/// body check asks for the frame); holding it, it votes as before.
+#[test]
+fn a_voter_withholds_its_vote_from_a_shard_header_whose_body_it_lacks() {
+    use quil_types::proto::global::message_request::Request;
+    let shard = vec![0x22u8; 32];
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
+    let bodies: crate::leader_provider::ShardBodyAvailability = {
+        let (held, asked) = (held.clone(), asked.clone());
+        Arc::new(move |needs: &[crate::leader_provider::ShardBodyNeed]| {
+            asked.lock().unwrap().extend(
+                needs
+                    .iter()
+                    .map(|need| (need.address.clone(), need.frame_number)),
+            );
+            let held = held.load(std::sync::atomic::Ordering::SeqCst);
+            needs.iter().map(|_| held.then_some(1)).collect()
+        })
+    };
+    let signer = Arc::new(quil_crypto::FalconSigner::generate());
+    let fixture = Fixture::new(Some(signer.public_key()));
+    let rig = Rig::over_with(signer, fixture, Some(bodies));
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let mut child = state_frame(&expected.source, 2, context.view, context.parent);
+    let header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+        address: shard.clone(),
+        frame_number: 9,
+        rank: 9,
+        output: vec![0x5a; 32],
+        parent_selector: vec![0x11; 32],
+        requests_root: vec![0x01; 32],
+        state_roots: vec![vec![0; 32]; 4],
+        ..Default::default()
+    };
+    child
+        .requests
+        .push(quil_types::proto::global::MessageBundle {
+            requests: vec![quil_types::proto::global::MessageRequest {
+                request: Some(Request::Shard(
+                    quil_execution::global_intrinsic::conversions::frame_header_to_proto(&header),
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    body_root(&mut child);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+
+    let vote = seam.verify_or_defer(context, id(&child), Some(encoded.clone()));
+    eprintln!("BODY-GATE reach: vote on a proposal carrying an unheld shard body: {vote:?}");
+    assert!(
+        vote.is_err(),
+        "VULNERABLE: unheld_body_voted: this archive voted {vote:?} for GLOBAL frame 2 carrying \
+         shard {} frame 9, whose body it does not hold; finalized, no archive can publish it",
+        hex::encode(&shard)
+    );
+    assert!(
+        !seam.verify_with_context(context, id(&child), Some(encoded.clone())),
+        "unheld_body_voted: no deferral, no vote"
+    );
+    assert!(
+        asked.lock().unwrap().contains(&(shard.clone(), 9)),
+        "unheld_body_unasked: the voter's body check names the header's frame"
+    );
+
+    held.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "held_body_refused: with the body held the voter votes as before"
+    );
+}
+
+/// An archive's body check answered from its application frame ingest's
+/// record of the bodies it holds ([`crate::archive_ingest::HeldBodies`]).
+fn ingest_answers(
+    held: crate::archive_ingest::HeldBodies,
+) -> crate::leader_provider::ShardBodyAvailability {
+    Arc::new(move |needs: &[crate::leader_provider::ShardBodyNeed]| {
+        needs
+            .iter()
+            .map(|need| held.frames_held(&need.address, need.frame_number, need.empty))
+            .collect()
+    })
+}
+
+/// An archive votes for a GLOBAL proposal's shard header only while the
+/// body it holds at the header's number is the frame the header names.
+/// Sequenced ingest materializes at each number only the frame the carried
+/// header names, and drops another copy there to wait for the named one.
+/// Holding another frame at that number, the voter withholds its vote;
+/// holding the named one, it votes as before.
+#[test]
+fn a_voter_holding_another_frame_than_the_header_names_withholds_its_vote() {
+    use quil_types::proto::global::message_request::Request;
+    let shard = vec![0x22u8; 32];
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut ingest, named) = runtime
+        .block_on(async { crate::archive_ingest::tests::ingest_holding_another_frame(&shard) });
+    let signer = Arc::new(quil_crypto::FalconSigner::generate());
+    let fixture = Fixture::new(Some(signer.public_key()));
+    let rig = Rig::over_with(signer, fixture, Some(ingest_answers(ingest.held_bodies())));
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let mut child = state_frame(&expected.source, 2, context.view, context.parent);
+    child
+        .requests
+        .push(quil_types::proto::global::MessageBundle {
+            requests: vec![quil_types::proto::global::MessageRequest {
+                request: Some(Request::Shard(named.header.clone().unwrap())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    body_root(&mut child);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+
+    let vote = seam.verify_or_defer(context, id(&child), Some(encoded.clone()));
+    eprintln!(
+        "SIBLING-GATE reach: vote on a proposal naming another frame than the one held: {vote:?}"
+    );
+    assert!(
+        vote.is_err(),
+        "VULNERABLE: sibling_body_voted: this archive voted {vote:?} for GLOBAL frame 2 carrying \
+         shard {} frame 3 while it holds another frame 3; sequenced ingest drops that one and \
+         waits for the frame the header names",
+        hex::encode(&shard)
+    );
+
+    runtime.block_on(async {
+        crate::archive_ingest::tests::admit_certified(&mut ingest, &shard, named.clone())
+    });
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "named_body_refused: holding the frame the header names, the voter votes as before"
     );
 }
 

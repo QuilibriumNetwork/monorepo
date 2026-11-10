@@ -3973,7 +3973,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quil_types::proto::global::FrameHeader;
 
@@ -4139,6 +4139,38 @@ mod tests {
             requests: Vec::new(),
             storage_attestation: None,
         }
+    }
+
+    /// An archive ingest holding frames 1 and 2 of `filter`'s [`chain`] and,
+    /// at 3, another frame than the chain's, with the chain's frame 3: the
+    /// frame a GLOBAL proposal's header names there. Each header carries a
+    /// requests root and state roots, as a proposal's does.
+    pub(crate) fn ingest_holding_another_frame(
+        filter: &[u8],
+    ) -> (ArchiveAppShardIngest, AppShardFrame) {
+        let mut frames = chain(filter, 3);
+        for frame in &mut frames {
+            let header = frame.header.as_mut().unwrap();
+            header.requests_root = vec![0x01; 32];
+            header.state_roots = vec![vec![0; 32]; 4];
+        }
+        let mut other = frames[2].clone();
+        other.header.as_mut().unwrap().output = vec![0xb3; 32];
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in [&frames[0], &frames[1], &other] {
+            ingest.admit(filter, frame.clone(), true);
+        }
+        (ingest, frames[2].clone())
+    }
+
+    /// Admit `frame` of `filter` to `ingest`, certified.
+    pub(crate) fn admit_certified(
+        ingest: &mut ArchiveAppShardIngest,
+        filter: &[u8],
+        frame: AppShardFrame,
+    ) {
+        ingest.admit(filter, frame, true);
     }
 
     /// Frames `1..=to` of one shard, each naming the one before it.
@@ -5453,6 +5485,88 @@ mod tests {
         ingest.lock().unwrap().retry_pending();
         assert_eq!(held.frames_held(&unknown, 1, true), Some(1));
         assert_eq!(held.frames_held(&unknown, 1, false), None);
+    }
+
+    /// GLOBAL sequences the frames its certified headers name, by identity:
+    /// at each number an archive materializes only the frame the carried
+    /// header names, and down the buffer the parent each such frame names.
+    /// A buffered copy that is not the carried frame, nor the parent the
+    /// carried chain names down the buffer, is dropped, asked for again and
+    /// refused when it comes back; the frames below a dropped parent wait
+    /// for the carried one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_archive_materializes_only_the_shard_frames_global_carried() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let mut other2 = frames[1].clone();
+        other2.header.as_mut().unwrap().output = vec![0xb2; 32];
+        let mut other3 = frames[2].clone();
+        let header = other3.header.as_mut().unwrap();
+        header.output = vec![0xb3; 32];
+        header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&[0xb2; 32])
+            .unwrap()
+            .to_vec();
+        let (gap, mut gaps) = tokio::sync::mpsc::channel(64);
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.with_gap_fetch(gap).sequenced();
+        let buffered = |ingest: &ArchiveAppShardIngest| {
+            let mut numbers: Vec<u64> = ingest
+                .buffered
+                .get(&filter)
+                .map_or(Vec::new(), |m| m.keys().copied().collect());
+            numbers.sort();
+            numbers
+        };
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, other2.clone(), true);
+        ingest.admit(&filter, other3.clone(), true);
+        assert_eq!(
+            buffered(&ingest),
+            vec![1, 2, 3],
+            "setup: the other branch is held"
+        );
+        let vouched = HashMap::from([(3, frames[2].header.clone().unwrap())]);
+
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 3, &vouched, 0)
+                .unwrap()
+                && ingest.materialized_height(&filter).unwrap() == 0,
+            "carried_sibling: frames GLOBAL did not carry must not be materialized"
+        );
+        assert_eq!(buffered(&ingest), vec![1], "both other frames are dropped");
+        let mut asked = Vec::new();
+        while let Ok((address, number)) = gaps.try_recv() {
+            assert_eq!(address, filter);
+            asked.push(number);
+        }
+        assert_eq!(
+            asked,
+            vec![3, 2],
+            "the carried frames are asked for at once"
+        );
+
+        ingest.admit(&filter, other2, true);
+        ingest.admit(&filter, other3, true);
+        assert_eq!(
+            buffered(&ingest),
+            vec![1],
+            "carried_admitted: a dropped frame must be refused when it comes back"
+        );
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 3, &vouched, 0)
+                .unwrap()
+                && ingest.materialized_height(&filter).unwrap() == 0,
+            "carried_sibling: frames below a dropped copy wait for the carried one"
+        );
+
+        ingest.admit(&filter, frames[2].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        assert!(ingest
+            .materialize_through_vouched(&filter, 3, &vouched, 0)
+            .unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
 
     /// Archives that hold different bodies execute the same GLOBAL frame
