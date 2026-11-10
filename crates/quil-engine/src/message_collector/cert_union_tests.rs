@@ -1115,3 +1115,102 @@ fn a_union_keeps_the_coin_the_copy_it_extended_held() {
         "VULNERABLE: the union gave up the coin its copy held, and another shield of it was taken"
     );
 }
+
+/// A persistent-sector capacity message naming member 7's sector `sector`: a
+/// certificate with `proof_len` bytes of proof, or with 0 a precommit.
+fn capacity_request(sector: u8, proof_len: usize) -> CanonicalMessageRequest {
+    use quil_crypto::persistent_storage::{Certificate as SectorCertificate, Profile};
+    use quil_execution::global_intrinsic::persistent_storage::CapacityMessage;
+    use quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
+    let message = CapacityMessage {
+        member: [7; 32],
+        epoch: 1500,
+        certificate: SectorCertificate {
+            profile: Profile::Eleven,
+            sector: [sector; 32],
+            n: 32,
+            columns: [0; 32],
+            labels: [0; 32],
+        },
+        signed_at: 100,
+        signature: if proof_len == 0 {
+            vec![1; 72]
+        } else {
+            Vec::new()
+        },
+        proof: vec![sector; proof_len],
+    };
+    CanonicalMessageRequest {
+        inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+        inner_bytes: message.envelope().to_canonical_bytes(),
+    }
+}
+
+/// A bundle of `requests`.
+fn bundle_of(requests: Vec<CanonicalMessageRequest>) -> Vec<u8> {
+    CanonicalMessageBundle {
+        requests: requests.into_iter().map(Some).collect(),
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A union of copies of a bundle carrying a capacity message stays charged to
+/// the share of the sender whose copy it extended, and a verified copy taking
+/// in an unverified one's signers to its own sender's.
+#[test]
+fn sca_a_union_keeps_the_capacity_share_of_the_copy_it_extended() {
+    use super::super::CAPACITY_MESSAGES_PER_MEMBER;
+    let by = |mc: &MessageCollector, peer: &[u8], raw: Vec<u8>| {
+        mc.add_message_outcome_by(RANK, raw, Provenance::Other, peer)
+    };
+    let with_capacity = |shard: &Shard, signers: &[usize]| {
+        bundle_of(vec![
+            CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: shard.header(signers).to_canonical_bytes().unwrap(),
+            },
+            capacity_request(0xEE, 64),
+        ])
+    };
+    // What more of member 7's share `peer` may fill.
+    let room = |mc: &MessageCollector, peer: &[u8]| {
+        (0..=CAPACITY_MESSAGES_PER_MEMBER as u8)
+            .filter(|sector| {
+                by(mc, peer, bundle_of(vec![capacity_request(*sector, 0)]))
+                    == SubmitOutcome::Accepted
+            })
+            .count()
+    };
+
+    let (shard, mc, _, _) = one_shard(true);
+    mc.set_class_shares();
+    let first = with_capacity(&shard, &[0, 1, 2, 3, 4]);
+    assert_eq!(by(&mc, b"first", first), SubmitOutcome::Accepted);
+    let second = with_capacity(&shard, &[1, 2, 3, 4, 5]);
+    assert_eq!(by(&mc, b"second", second), SubmitOutcome::Accepted);
+    assert_eq!(shard.held_pays(&mc), vec![0, 1, 2, 3, 4, 5], "a union");
+    eprintln!("capacity union filed: signers 0-5");
+    assert_eq!(
+        room(&mc, b"first"),
+        CAPACITY_MESSAGES_PER_MEMBER - 1,
+        "class-share union-share: a union left the share of the copy it extended"
+    );
+
+    let (shard, mc, _, available) = one_shard(true);
+    mc.set_class_shares();
+    available.store(false, Ordering::SeqCst);
+    let first = with_capacity(&shard, &[0, 1, 2, 3, 4]);
+    assert_eq!(by(&mc, b"first", first), SubmitOutcome::Accepted);
+    available.store(true, Ordering::SeqCst);
+    let second = with_capacity(&shard, &[1, 2, 3, 4, 5]);
+    assert_eq!(by(&mc, b"second", second), SubmitOutcome::Accepted);
+    assert_eq!(shard.held_pays(&mc), vec![0, 1, 2, 3, 4, 5], "absorbed");
+    eprintln!("capacity union filed: signers 0-5");
+    assert_eq!(
+        room(&mc, b"second"),
+        CAPACITY_MESSAGES_PER_MEMBER - 1,
+        "class-share union-share: a verified copy taking in signers left its sender's share"
+    );
+}

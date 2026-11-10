@@ -1856,6 +1856,17 @@ impl MirrorRefusals {
     }
 }
 
+/// Admits a GLOBAL_PROVER message: a capacity message is charged to its
+/// member's share from the message's signer, or its direct sender.
+pub(super) fn admit_prover_message(
+    collector: &quil_engine::message_collector::MessageCollector,
+    rank: u64,
+    received: quil_p2p::node::ReceivedMessage,
+    provenance: quil_engine::message_collector::Provenance,
+) -> quil_engine::message_collector::SubmitOutcome {
+    collector.add_message_outcome_by(rank, received.data, provenance, &received.from)
+}
+
 /// An app-shard frame an archive fetched to fill a gap, fed back through the
 /// consensus loopback under the frame's own gossip topic, as if gossiped.
 pub(crate) fn gap_fetched_frame_message(
@@ -3747,27 +3758,31 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     // At most SHARD_FRAME_VERIFY_TASKS wait on the
                                     // blocking pool; the sender's relays cover a drop.
                                     if let Some(permit) = SHARD_FRAME_VERIFY_TASKS.try_enter() {
-                                        let (collector, data) = (mc_for_recv.clone(), received.data.clone());
+                                        let (collector, message) = (mc_for_recv.clone(), received.clone());
                                         // Only an active prover's message may have a
                                         // frame held before it can be verified.
-                                        let (signers, provers, from) =
-                                            (sr_for_recv.clone(), pr_for_recv.clone(), received.from.clone());
+                                        let (signers, provers) = (sr_for_recv.clone(), pr_for_recv.clone());
                                         tokio::task::spawn_blocking(move || {
                                             let _permit = permit;
                                             let provenance = if super::grpc::peer_is_active_prover(
                                                 &signers,
                                                 provers.as_ref(),
-                                                &from,
+                                                &message.from,
                                             ) {
                                                 quil_engine::message_collector::Provenance::Prover
                                             } else {
                                                 quil_engine::message_collector::Provenance::Other
                                             };
-                                            collector.add_message_from(current_rank, data, provenance)
+                                            admit_prover_message(&collector, current_rank, message, provenance)
                                         });
                                     }
                                 } else {
-                                    mc_for_recv.add_message(current_rank, received.data.clone());
+                                    admit_prover_message(
+                                        &mc_for_recv,
+                                        current_rank,
+                                        received.clone(),
+                                        quil_engine::message_collector::Provenance::Prover,
+                                    );
                                 }
                             }
                             GLOBAL_ALERT => {
