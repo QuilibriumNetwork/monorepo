@@ -30,6 +30,7 @@ pub mod event_distributor;
 pub mod execution_deferral;
 pub mod fees;
 pub mod fork_choice;
+pub mod frame_bound;
 pub mod frame_chain_checker;
 pub mod frame_maintenance;
 pub mod frame_materializer;

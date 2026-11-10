@@ -973,6 +973,12 @@ fn decode_message_bundle_gated(
     use quil_execution::message_envelope::CanonicalMessageBundle;
     use quil_types::proto::global as pb;
 
+    // An application's bundle must fit a frame (`frame_bound`): one that
+    // does not is refused before any request is built.
+    if matches!(gate, EncodingGate::App) {
+        crate::frame_bound::admit_bundle(data)
+            .map_err(|refusal| QuilError::InvalidArgument(format!("MessageBundle: {refusal}")))?;
+    }
     let canonical = CanonicalMessageBundle::from_canonical_bytes(data)?;
     let mut requests = Vec::with_capacity(canonical.requests.len());
     for entry in &canonical.requests {
@@ -2171,6 +2177,78 @@ mod tests {
             );
         }
         handoff::set_presence_exclusion_frame_for_thread(None);
+    }
+
+    /// A bundle submitted to an application shard that could not fit a
+    /// frame is refused before its requests are built, and a cut one
+    /// without panic; one at the limit, or with a zero-length request,
+    /// decodes. GLOBAL's admission keeps its own rules.
+    #[test]
+    fn app_bundles_past_the_frame_bound_are_refused() {
+        use crate::frame_bound::{refused_here, MAX_APP_FRAME_ITEMS};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let operation = |n: u32| {
+            let mut inner = 0x0512u32.to_be_bytes().to_vec();
+            inner.extend_from_slice(&n.to_be_bytes());
+            Some(CanonicalMessageRequest::wrap(inner).unwrap())
+        };
+        let bundle = |requests: Vec<Option<CanonicalMessageRequest>>| {
+            CanonicalMessageBundle {
+                requests,
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let limit = MAX_APP_FRAME_ITEMS as u32;
+        let at = bundle((0..limit - 1).map(operation).collect());
+        assert_eq!(
+            decode_app_message_bundle(&at).unwrap().requests.len(),
+            MAX_APP_FRAME_ITEMS - 1
+        );
+        let before = refused_here();
+        let over = bundle((0..limit).map(operation).collect());
+        assert!(decode_app_message_bundle(&over).is_err());
+        let empty = bundle(vec![operation(1), None]);
+        let zero = "ZERO-LENGTH: a bundle with a zero-length request was refused";
+        let decoded = decode_app_message_bundle(&empty).expect(zero);
+        assert_eq!(decoded.requests.len(), 2);
+        assert_eq!(refused_here(), before + 1);
+        assert_eq!(decode_message_bundle(&empty).unwrap().requests.len(), 2);
+        let two = bundle(vec![operation(1), operation(2)]);
+        for end in 0..two.len() {
+            assert!(decode_app_message_bundle(&two[..end]).is_err(), "{end}");
+        }
+        assert_eq!(decode_app_message_bundle(&two).unwrap().requests.len(), 2);
+    }
+
+    /// The smallest bundle the network carries: one request of a type no
+    /// converter reads. Its proto form is an empty request, which re-encodes
+    /// as a zero-length entry (20 bytes in all); nodes decode that form
+    /// again (the collector consumes it, a leader proposes it), so the
+    /// application decode takes it, as it did before the frame bound.
+    #[test]
+    fn app_bundles_of_unconverted_requests_decode_after_re_encoding() {
+        use crate::frame_bound::refused_here;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let mut inner = 0x0000_0201u32.to_be_bytes().to_vec();
+        inner.extend_from_slice(&[0xAA; 32]);
+        let submitted = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())],
+            timestamp: 1,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let before = refused_here();
+        let decoded = decode_app_message_bundle(&submitted).unwrap();
+        assert_eq!(decoded.requests, vec![Default::default()]);
+        let re_encoded = app_bundle_to_canonical_bytes(&decoded).unwrap();
+        assert_eq!(re_encoded.len(), 20);
+        assert_eq!(re_encoded[8..12], [0, 0, 0, 0]);
+        let zero = "ZERO-LENGTH: a bundle with a zero-length request was refused";
+        let again = decode_app_message_bundle(&re_encoded).expect(zero);
+        assert_eq!(again, decoded);
+        assert_eq!(refused_here(), before);
     }
 
     /// Claims and nullify reports are GLOBAL operations: every application
