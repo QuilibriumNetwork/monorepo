@@ -108,31 +108,6 @@ pub fn read(
     )
 }
 
-/// Whether `filter` counts its unsealed members in `epoch`, as no snapshot
-/// any registration of it could commit to is recorded in committed `state`
-/// (`quil_types::consensus::unrecorded_snapshot_admits_unsealed`).
-pub fn unrecorded_admits_unsealed(
-    state: &HypergraphState,
-    filter: &[u8],
-    epoch: u64,
-) -> Result<bool> {
-    let mut failed = None;
-    let admits =
-        quil_types::consensus::unrecorded_snapshot_admits_unsealed(filter, epoch, |shard| {
-            read(state, epoch, shard).map_or_else(
-                |error| {
-                    failed.get_or_insert(error);
-                    true
-                },
-                |snapshot| snapshot.is_some(),
-            )
-        });
-    match failed {
-        Some(error) => Err(error),
-        None => Ok(admits),
-    }
-}
-
 /// Record the roots of `header`, executed in GLOBAL frame `frame`, as its
 /// shard's snapshot for the next epoch: the first such header at or after
 /// that epoch's snapshot frame, in a hash-proof epoch. True when it recorded.

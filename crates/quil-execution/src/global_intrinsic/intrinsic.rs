@@ -3398,7 +3398,8 @@ impl GlobalIntrinsic {
     /// A drained header's openings root joins its proposer's storage seat as
     /// an executed frame's does, so its member proves it like the others; a
     /// drained frame earns no reward, and executed this late its root rarely
-    /// counts as published.
+    /// counts as published. A seat that earns no share in the epoch
+    /// (`storage_seat::Seat::earns_in`) chains none, as on the frame path.
     fn commit_drained_storage(
         &self,
         frame_number: u64,
@@ -3418,14 +3419,16 @@ impl GlobalIntrinsic {
         let Some(mut seat) = super::storage_seat::read(state, &member, &op.address)? else {
             return Ok(());
         };
-        if seat.commit(
-            epoch,
-            op.frame_number,
-            commitment.beacon,
-            frame_number,
-            &commitment.rho_n,
-            &commitment.root,
-        ) {
+        if seat.earns_in(epoch)
+            && seat.commit(
+                epoch,
+                op.frame_number,
+                commitment.beacon,
+                frame_number,
+                &commitment.rho_n,
+                &commitment.root,
+            )
+        {
             super::storage_seat::write(state, frame_number, &seat)?;
             if seat.first_commitment(epoch) {
                 let address = super::storage_seat::seat_address(&member, &op.address)?;

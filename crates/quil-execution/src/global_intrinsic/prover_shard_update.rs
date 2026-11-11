@@ -1347,7 +1347,10 @@ fn materialize_shard_update_timed(
 /// queues it for the epoch's expiry sweep. Each seat touched first closes an
 /// epoch whose settlement window ended; one that closes with committed roots
 /// never proved kicks its member (`storage.kicks`), before the storage kick
-/// suspension epoch only (`storage_seat::Seat::expire`). Returns how many
+/// suspension epoch only (`storage_seat::Seat::expire`). From the seal
+/// gate recovery epoch a participant earns and chains only with a
+/// registration sealed before the epoch (`storage_seat::Seat::earns_in`),
+/// as the participation gate admits the rest. Returns how many
 /// participants had shares held, their total, and which participants hold a
 /// sealed registration ([`HeldShares`]).
 fn hold_storage_shares(
@@ -1410,14 +1413,16 @@ fn hold_storage_shares(
             &mut work,
             &mut timing.counts,
             &mut |seat| {
-                seat.commit(
-                    epoch,
-                    frame_header.frame_number,
-                    commitment.beacon,
-                    current_frame_number,
-                    &commitment.rho_n,
-                    &commitment.root,
-                ) && seat.first_commitment(epoch)
+                seat.earns_in(epoch)
+                    && seat.commit(
+                        epoch,
+                        frame_header.frame_number,
+                        commitment.beacon,
+                        current_frame_number,
+                        &commitment.rho_n,
+                        &commitment.root,
+                    )
+                    && seat.first_commitment(epoch)
             },
         )?;
         timing.mark("commitment");
@@ -1444,13 +1449,14 @@ fn hold_storage_shares(
                 &mut timing.counts,
                 &mut |seat| {
                     sealed = seat.sealed_for(epoch);
-                    seat.hold(
-                        epoch,
-                        current_frame_number,
-                        frame_header.frame_number,
-                        share,
-                        committee,
-                    )
+                    seat.earns_in(epoch)
+                        && seat.hold(
+                            epoch,
+                            current_frame_number,
+                            frame_header.frame_number,
+                            share,
+                            committee,
+                        )
                 },
             )? {
                 held.provers += 1;
