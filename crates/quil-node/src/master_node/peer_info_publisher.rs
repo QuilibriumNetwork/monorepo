@@ -1193,6 +1193,29 @@ mod tests {
             assert_eq!(started.elapsed(), FIRST_PUBLISH_ADDRESS_WAIT);
         }
 
+        /// The first address needs two servers on distinct IPs, so the
+        /// first publish waits for a later probe: AutoNAT probes 15 s after
+        /// start and then every 90 s until it is sure, and an answer may
+        /// take the 30 s request timeout. One of the first three probes may
+        /// go to a server that does not count (a refusal, the first server
+        /// again, a second server on its IP): the third answers by 225 s.
+        /// Publishing before would hand every peer a record without
+        /// addresses, replacing the node's last one.
+        #[tokio::test(start_paused = true)]
+        async fn the_first_publish_waits_for_a_second_server() {
+            let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
+            let _driver = drive(tx, vec![(225, confirmed(&[TCP_A]))]);
+            let started = tokio::time::Instant::now();
+            let found = wait_for_first_address(&mut rx, selected, FIRST_PUBLISH_ADDRESS_WAIT).await;
+            println!("REACH autonat first publish waited");
+            assert!(
+                found,
+                "first publish before a second server: gave up after {} s",
+                started.elapsed().as_secs()
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(225));
+        }
+
         /// The first confirmation after startup publishes once it settles,
         /// not at the next 30-minute tick.
         #[tokio::test(start_paused = true)]

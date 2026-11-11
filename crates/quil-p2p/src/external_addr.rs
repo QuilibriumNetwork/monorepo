@@ -861,6 +861,46 @@ mod tests {
         );
     }
 
+    /// A node without an address, as at every start, takes its first one
+    /// only once two independent servers confirm it: one server, or any
+    /// number behind one IP, could otherwise set where peers dial it.
+    #[test]
+    fn a_first_address_needs_two_independent_servers() {
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let first = t.on_confirmed(&a, server_on("192.0.2.44"));
+        println!("REACH autonat first address confirmed");
+        assert_eq!(
+            first,
+            ConfirmOutcome::Pending,
+            "one server set the first address"
+        );
+        assert!(addrs(&t).is_empty());
+        assert_eq!(
+            t.on_confirmed(&a, server_on("192.0.2.44")),
+            ConfirmOutcome::Pending,
+            "servers behind one IP set the first address"
+        );
+        assert!(addrs(&t).is_empty());
+        // A server naming another IP starts a claim of its own, which needs
+        // a second server in turn.
+        let b = ma("/ip4/198.51.100.9/tcp/8336");
+        assert_eq!(
+            t.on_confirmed(&b, server_on("192.0.2.45")),
+            ConfirmOutcome::Pending
+        );
+        assert!(addrs(&t).is_empty());
+        assert_eq!(
+            t.on_confirmed(&b, server_on("192.0.2.46")),
+            ConfirmOutcome::Accepted
+        );
+        assert_eq!(addrs(&t), vec![b.to_string()]);
+        assert_eq!(
+            t.snapshot().last_change,
+            Some(ExternalAddrChange::Confirmed)
+        );
+    }
+
     #[test]
     fn reconfirming_the_current_address_changes_nothing() {
         let mut t = tracker();
@@ -915,6 +955,36 @@ mod tests {
             ConfirmOutcome::Accepted
         );
         assert_eq!(addrs(&t), vec!["/ip4/198.51.100.9/tcp/8336"]);
+    }
+
+    /// One holder of an IPv6 /48 (a usual site allocation, free from a
+    /// tunnel broker) is one operator: servers in two of its /64s do not
+    /// confirm a new IP; a server in another /48 does.
+    #[test]
+    fn servers_inside_one_ipv6_48_count_once() {
+        let mut t = tracker();
+        let old = ma("/ip4/203.0.113.7/tcp/8336");
+        let new = ma("/ip4/198.51.100.9/tcp/8336");
+        t.on_confirmed(&old, server_on("192.0.2.1"));
+        t.on_confirmed(&old, server_on("192.0.2.2"));
+        assert_eq!(addrs(&t), vec![old.to_string()]);
+        assert_eq!(
+            t.on_confirmed(&new, server_on("2001:db8:1:2::1")),
+            ConfirmOutcome::Pending
+        );
+        let second = t.on_confirmed(&new, server_on("2001:db8:1:3::1"));
+        println!("REACH autonat servers inside one /48 confirmed");
+        assert_eq!(
+            second,
+            ConfirmOutcome::Pending,
+            "two servers inside one /48 moved the address"
+        );
+        assert_eq!(addrs(&t), vec![old.to_string()]);
+        assert_eq!(
+            t.on_confirmed(&new, server_on("2001:db8:2::1")),
+            ConfirmOutcome::Accepted
+        );
+        assert_eq!(addrs(&t), vec![new.to_string()]);
     }
 
     /// A move to a new IP logs once when it starts, warns once after 30

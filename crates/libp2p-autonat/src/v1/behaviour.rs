@@ -832,4 +832,151 @@ mod tests {
         assert_eq!(sent[1], junk(39));
         assert_eq!(behaviour.eligible_servers(), 0);
     }
+
+    /// A behaviour listening on `/ip4/10.0.0.2/tcp/8336`, seen by a peer at
+    /// `/ip4/198.51.100.4/tcp/40001`, that sent one probe; its server and
+    /// the probe's request.
+    fn probed(local: PeerId) -> (Behaviour, PeerId, OutboundRequestId) {
+        let config = Config {
+            boot_delay: Duration::ZERO,
+            ..Config::default()
+        };
+        let mut behaviour = Behaviour::new(local, config);
+        let listen: Multiaddr = "/ip4/10.0.0.2/tcp/8336".parse().unwrap();
+        behaviour.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+            listener_id: ListenerId::next(),
+            addr: &listen,
+        }));
+        behaviour.probe_address("/ip4/198.51.100.4/tcp/40001".parse().unwrap());
+        let server = PeerId::random();
+        behaviour.add_server(server, None);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..500 {
+            match behaviour.poll(&mut cx) {
+                Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundProbe(
+                    OutboundProbeEvent::Request { peer, .. },
+                ))) => {
+                    assert_eq!(peer, server);
+                    let request = *behaviour.ongoing_outbound.keys().next().unwrap();
+                    return (behaviour, server, request);
+                }
+                Poll::Ready(_) => {}
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("no probe sent");
+    }
+
+    /// `server` answers `request` that it reached us at `address`.
+    fn answer(
+        behaviour: &mut Behaviour,
+        server: PeerId,
+        request_id: OutboundRequestId,
+        address: Multiaddr,
+    ) -> VecDeque<Action> {
+        behaviour
+            .as_client()
+            .handle_event(request_response::Event::Message {
+                peer: server,
+                connection_id: ConnectionId::new_unchecked(1),
+                message: request_response::Message::Response {
+                    request_id,
+                    response: DialResponse {
+                        result: Ok(address),
+                        status_text: None,
+                    },
+                },
+            })
+    }
+
+    /// Whether `actions` report that the probe reached this node.
+    fn reached(actions: &VecDeque<Action>) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                ToSwarm::GenerateEvent(Event::OutboundProbe(OutboundProbeEvent::Response { .. }))
+            )
+        })
+    }
+
+    /// QUILIBRIUM: a server's answer confirms an address only when it is
+    /// one the probe offered: a plain TCP or QUIC address on a probed port,
+    /// at an IP this node is known at, with no other peer's id. An external
+    /// candidate's IP is known only once a peer other than the server
+    /// observed this node there, since identify lets any peer plant a
+    /// candidate. Upstream confirmed whatever address the server named, so
+    /// one server could set this node's external address, and with it where
+    /// peers dial it.
+    #[test]
+    fn a_dial_back_answer_confirms_only_a_probed_address() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        for (address, why) in [
+            ("/ip4/10.0.0.2/tcp/9999".to_string(), "port not probed"),
+            ("/ip4/192.0.2.66/tcp/8336".to_string(), "IP never seen"),
+            (
+                "/ip4/10.0.0.2/udp/8336/quic-v1".to_string(),
+                "transport not probed",
+            ),
+            (
+                "/ip4/10.0.0.2/ip4/127.0.0.1/tcp/8336".to_string(),
+                "stacked IP",
+            ),
+            ("/ip4/10.0.0.2/tcp/8336/ws".to_string(), "protocol on top"),
+            (
+                format!("/ip4/10.0.0.2/tcp/8336/p2p/{other}"),
+                "another peer",
+            ),
+            (
+                format!("/ip4/198.51.100.4/tcp/40001/p2p/{me}"),
+                "candidate no other peer observed",
+            ),
+        ] {
+            let (mut behaviour, server, request) = probed(me);
+            let actions = answer(&mut behaviour, server, request, address.parse().unwrap());
+            println!("REACH autonat dial-back answer handled");
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, ToSwarm::ExternalAddrConfirmed(_))),
+                "unprobed address confirmed ({why}): {address}"
+            );
+            assert!(
+                !reached(&actions),
+                "unprobed address reported reached ({why}): {address}"
+            );
+            assert_eq!(behaviour.nat_status(), NatStatus::Unknown, "{why}");
+        }
+
+        // A listen address on the probed port is reached.
+        let (mut behaviour, server, request) = probed(me);
+        let reached_at: Multiaddr = format!("/ip4/10.0.0.2/tcp/8336/p2p/{me}").parse().unwrap();
+        let actions = answer(&mut behaviour, server, request, reached_at.clone());
+        assert!(reached(&actions), "probed address refused: {reached_at}");
+        assert_eq!(behaviour.nat_status(), NatStatus::Public(reached_at));
+    }
+
+    /// QUILIBRIUM: one server's answer, even on an address the probe
+    /// offered, adds no external address to the swarm. The swarm announces
+    /// its external addresses through identify and peers add them to
+    /// Kademlia, so the node adds one only once servers on two IPs confirm
+    /// it (`quil-p2p`'s external address tracker). Upstream confirmed the
+    /// address of every answer.
+    #[test]
+    fn one_servers_answer_sets_no_external_address() {
+        let me = PeerId::random();
+        let (mut behaviour, server, request) = probed(me);
+        let reached_at: Multiaddr = format!("/ip4/10.0.0.2/tcp/8336/p2p/{me}").parse().unwrap();
+        let actions = answer(&mut behaviour, server, request, reached_at.clone());
+        println!("REACH autonat dial-back answer handled");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ToSwarm::ExternalAddrConfirmed(_))),
+            "one server set an external address: {reached_at}"
+        );
+        assert!(reached(&actions), "probed address refused: {reached_at}");
+        assert_eq!(behaviour.nat_status(), NatStatus::Public(reached_at));
+    }
 }

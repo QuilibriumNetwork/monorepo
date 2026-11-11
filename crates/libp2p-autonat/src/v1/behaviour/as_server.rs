@@ -969,7 +969,128 @@ mod test {
         ))
     }
     fn random_port<'a>() -> Protocol<'a> {
-        Protocol::Tcp(rand::random())
+        Protocol::Tcp(rand::random::<u16>().max(1))
+    }
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    /// QUILIBRIUM: a server dials back only plain TCP and QUIC addresses,
+    /// rebuilt from the IP it observes for the client: the client names
+    /// the transport and port, nothing else. Upstream replaced only the
+    /// first IP of each address and dialed the rest as given, so a client
+    /// could make servers dial a second, stacked IP (their own loopback or
+    /// another host), a name they resolve, or a protocol layered on top.
+    #[test]
+    fn a_dial_back_goes_only_to_plain_tcp_or_quic_at_the_observed_ip() {
+        let peer = PeerId::random();
+        let observed = ma("/ip4/198.51.100.4/tcp/50123");
+        let demanded = vec![
+            ma("/ip4/10.0.0.2/tcp/8336"),
+            ma(&format!("/ip4/10.0.0.2/udp/8336/quic-v1/p2p/{peer}")),
+            ma("/ip4/203.0.113.9/ip4/127.0.0.1/tcp/8337"),
+            ma("/ip4/203.0.113.9/ip6/::1/tcp/8338"),
+            ma("/ip4/203.0.113.9/dns4/localhost/tcp/8339"),
+            ma("/ip4/203.0.113.9/tcp/8340/ws"),
+            ma("/ip4/203.0.113.9/udp/8341/quic-v1/webtransport"),
+            ma("/ip4/203.0.113.9/udp/8342"),
+            ma("/ip4/203.0.113.9/udp/8343/quic"),
+            ma("/ip4/203.0.113.9/tcp/0"),
+            ma(&format!("/ip4/203.0.113.9/tcp/8344/p2p/{peer}/p2p/{peer}")),
+            ma("/ip4/203.0.113.9/tcp/8345/tcp/8346"),
+        ];
+        let dialed = AsServer::filter_valid_addrs(peer, demanded, &observed);
+        println!("REACH autonat dial-back addresses filtered");
+        let expected = vec![
+            ma(&format!("/ip4/198.51.100.4/tcp/8336/p2p/{peer}")),
+            ma(&format!("/ip4/198.51.100.4/udp/8336/quic-v1/p2p/{peer}")),
+        ];
+        for addr in &dialed {
+            assert!(expected.contains(addr), "stacked address dialed: {addr}");
+        }
+        assert_eq!(dialed, expected);
+    }
+
+    /// QUILIBRIUM: the same over IPv6, and an address naming another peer
+    /// is never dialed: the dial-back goes to the client's id alone.
+    #[test]
+    fn a_dial_back_over_ip6_goes_only_to_the_client_at_the_observed_ip() {
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let observed = ma("/ip6/2001:db8::4/tcp/50123");
+        let demanded = vec![
+            ma("/ip6/fe80::2/tcp/8336"),
+            ma(&format!("/ip6/fe80::2/udp/8336/quic-v1/p2p/{peer}")),
+            ma("/ip4/10.0.0.2/tcp/9336"),
+            ma("/ip6/2001:db8::9/ip6/::1/tcp/8337"),
+            ma("/ip6/2001:db8::9/ip4/127.0.0.1/tcp/8338"),
+            ma("/ip6/2001:db8::9/dns6/localhost/tcp/8339"),
+            ma(&format!("/ip6/2001:db8::9/tcp/8340/p2p/{other}")),
+            ma(&format!("/ip4/10.0.0.2/udp/8341/quic-v1/p2p/{other}")),
+            ma(&format!("/ip6/2001:db8::9/tcp/8342/p2p/{other}/p2p/{peer}")),
+            ma(&format!("/ip6/2001:db8::9/tcp/8343/p2p/{peer}/p2p/{other}")),
+            ma(&format!("/p2p/{other}/ip6/2001:db8::9/tcp/8344")),
+        ];
+        let dialed = AsServer::filter_valid_addrs(peer, demanded, &observed);
+        println!("REACH autonat dial-back addresses filtered");
+        let expected = vec![
+            ma(&format!("/ip6/2001:db8::4/tcp/8336/p2p/{peer}")),
+            ma(&format!("/ip6/2001:db8::4/udp/8336/quic-v1/p2p/{peer}")),
+            ma(&format!("/ip6/2001:db8::4/tcp/9336/p2p/{peer}")),
+        ];
+        for addr in &dialed {
+            assert!(expected.contains(addr), "stacked address dialed: {addr}");
+        }
+        assert_eq!(dialed, expected);
+    }
+
+    /// QUILIBRIUM: a server dials back at most eight addresses of a
+    /// request, the most a client of this repository sends. It dials them
+    /// one at a time, each that does not answer taking up to the
+    /// transport timeout, within its budget of dial-backs in progress.
+    #[test]
+    fn a_dial_back_tries_at_most_eight_addresses() {
+        use libp2p_request_response::ProtocolSupport;
+
+        let config = Config::default();
+        let mut inner = request_response::Behaviour::with_codec(
+            AutoNatCodec,
+            std::iter::once((crate::DEFAULT_PROTOCOL_NAME, ProtocolSupport::Full)),
+            request_response::Config::default(),
+        );
+        let client = PeerId::random();
+        let connected = HashMap::from([(
+            client,
+            HashMap::from([(
+                ConnectionId::new_unchecked(1),
+                Some(ma("/ip4/198.51.100.4/tcp/50123")),
+            )]),
+        )]);
+        let mut server = AsServer {
+            inner: &mut inner,
+            config: &config,
+            connected: &connected,
+            probe_id: &mut ProbeId(0),
+            throttled_clients: &mut Vec::new(),
+            ongoing_inbound: &mut HashMap::new(),
+            stats: &mut ServerStats::default(),
+        };
+        let addresses = (0..12)
+            .map(|n| ma(&format!("/ip4/10.0.0.2/tcp/{}", 9000 + n)))
+            .collect();
+        let dialed = server
+            .resolve_inbound_request(
+                client,
+                DialRequest {
+                    peer_id: client,
+                    addresses,
+                },
+            )
+            .unwrap();
+        println!("REACH autonat dial-back request resolved");
+        assert!(dialed.len() <= 8, "{} addresses dialed back", dialed.len());
+        assert_eq!(dialed.len(), 8);
     }
 
     #[test]
