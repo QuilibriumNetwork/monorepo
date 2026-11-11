@@ -647,12 +647,11 @@ impl InMemoryProverRegistry {
         if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
             return true;
         }
-        let slot = self.get_storage_seat_slot(
-            member,
-            filter,
-            quil_types::consensus::epoch_for_frame(frame),
-        );
-        quil_types::consensus::storage_seat_eligible(filter, frame, slot)
+        let epoch = quil_types::consensus::epoch_for_frame(frame);
+        let slot = self.get_storage_seat_slot(member, filter, epoch);
+        quil_types::consensus::storage_member_eligible(filter, frame, slot, |shard| {
+            self.get_storage_snapshot(shard, epoch).is_some()
+        })
     }
 
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {

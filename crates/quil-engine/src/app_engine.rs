@@ -1494,15 +1494,23 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
         let committee_frame = anchor_gfn;
         if quil_types::consensus::sealed_storage_required_at(anchor_gfn) {
+            let epoch = quil_types::consensus::epoch_for_frame(anchor_gfn);
             let slot = self.prover_registry.get_storage_seat_slot(
                 &self.local_prover_address,
                 &self.filter,
-                quil_types::consensus::epoch_for_frame(anchor_gfn),
+                epoch,
             )?;
-            if !quil_types::consensus::storage_seat_eligible(
+            // A lookup error counts as recorded: no unsealed proposal.
+            if !quil_types::consensus::storage_member_eligible(
                 &self.filter,
                 anchor_gfn,
                 slot.as_ref(),
+                |shard| {
+                    !matches!(
+                        self.prover_registry.get_storage_snapshot(shard, epoch),
+                        Ok(None)
+                    )
+                },
             ) {
                 return Err(QuilError::NoVote(
                     "local storage is not sealed for this epoch".into(),
@@ -10993,18 +11001,20 @@ impl AppConsensusEngine {
                 if let Some(header) = frame.header.as_ref() {
                     let anchor = header.global_frame_number;
                     if quil_types::consensus::sealed_storage_required_at(anchor) {
+                        let epoch = quil_types::consensus::epoch_for_frame(anchor);
                         for address in [&member[..], &header.prover[..]] {
                             let slot = registry
-                                .get_storage_seat_slot(
-                                    address,
-                                    &filter,
-                                    quil_types::consensus::epoch_for_frame(anchor),
-                                )
+                                .get_storage_seat_slot(address, &filter, epoch)
                                 .map_err(|error| ("storage seal unavailable", error.to_string()))?;
-                            if !quil_types::consensus::storage_seat_eligible(
+                            // A lookup error counts as recorded, as GLOBAL
+                            // would refuse the header then.
+                            if !quil_types::consensus::storage_member_eligible(
                                 &filter,
                                 anchor,
                                 slot.as_ref(),
+                                |shard| {
+                                    !matches!(registry.get_storage_snapshot(shard, epoch), Ok(None))
+                                },
                             ) {
                                 return Err((
                                     "unsealed storage participant",

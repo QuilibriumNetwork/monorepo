@@ -1430,6 +1430,106 @@ pub fn set_sealed_storage_epoch_for_thread(epoch: Option<u64>) {
     SEALED_STORAGE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which GLOBAL's sealed participation gate cannot stop a
+/// shard for good. A registration for epoch `X` commits to the snapshot
+/// GLOBAL records from the first header of the shard it executes at or
+/// after [`storage_snapshot_frame`]`(X)`, and from
+/// [`MAINNET_SEALED_STORAGE_EPOCH`] GLOBAL refuses a header any of whose
+/// signers has no sealed seat for its anchor epoch. A shard whose headers
+/// were refused through that window had no snapshot, so no member could
+/// seal, no header was admitted in `X`, and no snapshot was recorded for
+/// `X + 1` either: five shards stopped for good at epoch 1467, whose first
+/// headers anchored in it a committee formed before it certified with
+/// unsealed signers. From this epoch a shard with no snapshot recorded for
+/// an epoch counts its members in that epoch without a sealed registration
+/// ([`unrecorded_snapshot_admits_unsealed`]): its first header after the
+/// next snapshot frame records the next snapshot, and from that epoch
+/// sealing is required again. A refused window now stalls a shard for at
+/// most the epoch after it. A shard a split creates reads its parent's
+/// snapshot, so one recorded for a shard whose filter is a prefix of its own
+/// counts too. Unsealed members are still paid no issuance share.
+/// Read from the header's anchor epoch. Consensus-affecting (header
+/// admission): every node that executes GLOBAL frames must run a build
+/// carrying the epoch before it; an older archive refuses the first header
+/// it admits, and its state diverges from GLOBAL's.
+/// Mainnet epoch 1484 (GLOBAL frame 1,068,480; proposed 2026-11-12);
+/// `QUIL_SEAL_GATE_RECOVERY_EPOCH` elsewhere, never by default.
+pub const MAINNET_SEAL_GATE_RECOVERY_EPOCH: Option<u64> = Some(1484);
+
+static SEAL_GATE_RECOVERY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_GATE_RECOVERY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_gate_recovery_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_GATE_RECOVERY_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's unrecorded snapshot epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_seal_gate_recovery_epoch(network: u8) -> u64 {
+    *SEAL_GATE_RECOVERY_EPOCH.get_or_init(|| {
+        seal_gate_recovery_epoch_for(
+            network,
+            std::env::var("QUIL_SEAL_GATE_RECOVERY_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_seal_gate_recovery_epoch`]; the mainnet epoch
+/// in a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn seal_gate_recovery_epoch() -> u64 {
+    if let Some(epoch) = SEAL_GATE_RECOVERY_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SEAL_GATE_RECOVERY_EPOCH.get_or_init(|| seal_gate_recovery_epoch_for(0, None))
+}
+
+/// Set the unrecorded snapshot epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_seal_gate_recovery_epoch_for_thread(epoch: Option<u64>) {
+    SEAL_GATE_RECOVERY_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// Whether shard `filter` counts its members in `epoch` without a sealed
+/// registration ([`MAINNET_SEAL_GATE_RECOVERY_EPOCH`]): sealing is
+/// required then, and `recorded` (whether GLOBAL recorded a storage
+/// snapshot of a filter for `epoch`) holds neither for the shard nor for
+/// any shard whose filter is a prefix of its own, down to its application.
+pub fn unrecorded_snapshot_admits_unsealed(
+    filter: &[u8],
+    epoch: u64,
+    mut recorded: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    !filter.is_empty()
+        && epoch >= seal_gate_recovery_epoch()
+        && sealed_storage_required(epoch)
+        && !(filter.len().min(32)..=filter.len()).any(|len| recorded(&filter[..len]))
+}
+
+/// [`storage_seat_eligible`], or a member of a shard whose epoch has no
+/// recorded snapshot ([`unrecorded_snapshot_admits_unsealed`]; `recorded`
+/// is asked only for a member without an eligible seat).
+pub fn storage_member_eligible(
+    filter: &[u8],
+    frame: u64,
+    slot: Option<&StorageSeatSlot>,
+    recorded: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    storage_seat_eligible(filter, frame, slot)
+        || unrecorded_snapshot_admits_unsealed(filter, epoch_for_frame(frame), recorded)
+}
+
 /// The epoch from which a storage seat that closes an epoch with committed
 /// openings roots its member never proved no longer kicks the member. The
 /// seat's epoch still ends `Expired` and its held issuance shares are still
@@ -4600,6 +4700,81 @@ mod sealed_storage_activation_tests {
             !unsealed_issuance_active(boundary),
             "unsealed issuance stops at epoch {first}"
         );
+    }
+
+    #[test]
+    fn seal_gate_recovery_epoch_is_the_mainnet_constant_and_mainnet_ignores_overrides() {
+        let first = MAINNET_SEAL_GATE_RECOVERY_EPOCH.expect("mainnet recovers");
+        assert!(
+            first > MAINNET_SEALED_STORAGE_EPOCH.expect("mainnet seals"),
+            "a recovery for shards that stopped at the sealed storage epoch"
+        );
+        for setting in [None, Some("0"), Some("9999"), Some("bad")] {
+            assert_eq!(seal_gate_recovery_epoch_for(0, setting), first);
+        }
+        assert_eq!(seal_gate_recovery_epoch_for(1, None), u64::MAX);
+        assert_eq!(seal_gate_recovery_epoch_for(1, Some("7")), 7);
+    }
+
+    /// A shard with no snapshot recorded for an epoch, its own or a split
+    /// parent's, counts its unsealed members in that epoch, from the
+    /// recovery epoch on; any recorded one keeps the sealed requirement.
+    #[test]
+    fn a_shard_without_a_recorded_snapshot_counts_its_unsealed_members() {
+        set_sealed_storage_epoch_for_thread(Some(20));
+        set_seal_gate_recovery_epoch_for_thread(Some(22));
+        let app = [7u8; 32];
+        let shard = [app.as_slice(), &[0, 8, 11]].concat();
+        let sibling = [app.as_slice(), &[0, 8, 12]].concat();
+        let frame = epoch_start_frame(23) + 5;
+        let none = |_: &[u8]| false;
+        assert!(unrecorded_snapshot_admits_unsealed(&shard, 23, none));
+        assert!(unrecorded_snapshot_admits_unsealed(&shard, 22, none));
+        assert!(
+            storage_member_eligible(&shard, frame, None, none),
+            "an unsealed member of a shard GLOBAL recorded nothing for"
+        );
+        assert!(
+            !storage_seat_eligible(&shard, frame, None),
+            "the seat alone still does not count"
+        );
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&shard, 21, none),
+            "before the recovery epoch"
+        );
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&[], 23, none),
+            "GLOBAL has no storage seats"
+        );
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == shard.as_slice()),
+            "its own snapshot is recorded"
+        );
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == &shard[..34]),
+            "a split parent's snapshot is recorded"
+        );
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == app.as_slice()),
+            "the application's whole-shard snapshot is recorded"
+        );
+        assert!(
+            unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == sibling.as_slice()),
+            "a sibling's snapshot is not this shard's data"
+        );
+        set_seal_gate_recovery_epoch_for_thread(Some(u64::MAX));
+        assert!(
+            !storage_member_eligible(&shard, frame, None, none),
+            "without the recovery epoch"
+        );
+        set_seal_gate_recovery_epoch_for_thread(Some(22));
+        set_sealed_storage_epoch_for_thread(Some(30));
+        assert!(
+            !unrecorded_snapshot_admits_unsealed(&shard, 23, none),
+            "before the sealed storage epoch nothing needs the recovery"
+        );
+        set_seal_gate_recovery_epoch_for_thread(None);
+        set_sealed_storage_epoch_for_thread(None);
     }
 }
 

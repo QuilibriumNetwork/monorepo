@@ -85,6 +85,10 @@ pub fn require_sealed_participant(
                 .sealed_at
                 .is_none_or(|at| at >= quil_types::consensus::epoch_start_frame(epoch))
     }) {
+        // No member could seal for an epoch GLOBAL recorded no snapshot of.
+        if super::storage_snapshot::unrecorded_admits_unsealed(state, filter, epoch)? {
+            return Ok(());
+        }
         return Err(QuilError::InvalidArgument(format!(
             "unsealed storage participant for epoch {epoch}"
         )));
