@@ -40,6 +40,19 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .and_then(|f| f.sync_all())
         .map_err(io)
 }
+/// [`atomic`], unless `path` holds `bytes` already. A leaf reserves its
+/// sector again at every GLOBAL frame ([`prewarm_sectors`]), and its lease
+/// and mapping seldom change: written again each time, a node holding 60
+/// sectors synced files and directories 240 times a frame or more, a third
+/// or more of its filesystem's journal commits, each about 40 KB on disk
+/// (2026-11-11). Nothing is lost: [`atomic`] is these files' only writer,
+/// and it synced the bytes read back before renaming them into place.
+fn atomic_unless_held(path: &Path, bytes: &[u8]) -> Result<()> {
+    if fs::read(path).is_ok_and(|held| held == bytes) {
+        return Ok(());
+    }
+    atomic(path, bytes)
+}
 fn home(store: &LabelStore, member: &[u8]) -> PathBuf {
     store
         .directory()
@@ -204,7 +217,7 @@ fn try_reserve(
                 if (bytes.len() == 48 || bytes.len() == 52) && bytes[16..48] == leaf_hash {
                     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                     if sector::padded_nodes_allowed(exact, n) {
-                        atomic(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
+                        atomic_unless_held(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
                         return Ok(Some((dir, id, n)));
                     }
                 }
@@ -239,11 +252,13 @@ fn try_reserve(
         let lease = candidate.dir.join(format!("lease-{epoch}"));
         match fs::read(&lease) {
             Ok(owner) if owner != leaf_hash => continue,
+            Ok(_) => {}
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
-            _ => {}
+            Err(_) => atomic(&lease, &leaf_hash)?,
         }
-        atomic(&lease, &leaf_hash)?;
-        atomic(&mapping, &candidate.cert.sector)?;
+        if mapped != Some(candidate.cert.sector) {
+            atomic(&mapping, &candidate.cert.sector)?;
+        }
         return Ok(Some((
             candidate.dir,
             candidate.cert.sector,
@@ -2035,6 +2050,50 @@ mod tests {
             "same-epoch leases cannot count one sector twice"
         );
         assert!(Sector::load(other).unwrap().is_none());
+        gates(false);
+    }
+    /// A leaf reserving its certified sector again, as it does at every
+    /// GLOBAL frame, leaves its lease and mapping as they are: rewritten,
+    /// each took a sync of its file and of its directory (2026-11-11). A
+    /// lease of a new epoch is still written, and a mapping to another
+    /// sector still moves to the one reserved.
+    #[test]
+    fn reserving_a_held_sector_again_rewrites_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        crate::storage_jobs::set_job_slots_for_test(1);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [23; 32];
+        let (path, id, n) = reserve(&store, &member, b"held", 1500, 100).unwrap();
+        initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        let leaf = hex::encode(digest(b"held"));
+        let mapping = home(&store, &member).join(format!("leaf-{leaf}"));
+        let lease = path.join("lease-1500");
+        let inodes = || {
+            (
+                fs::metadata(&lease).unwrap().ino(),
+                fs::metadata(&mapping).unwrap().ino(),
+            )
+        };
+        assert_eq!(reserve(&store, &member, b"held", 1500, 100).unwrap().1, id);
+        let held = inodes();
+        for _ in 0..3 {
+            assert_eq!(reserve(&store, &member, b"held", 1500, 100).unwrap().1, id);
+            assert_eq!(inodes(), held, "held_lease_or_mapping_rewritten");
+        }
+        assert_eq!(reserve(&store, &member, b"held", 1501, 100).unwrap().1, id);
+        let new_lease = fs::read(path.join("lease-1501")).unwrap();
+        assert_eq!(new_lease, digest(b"held"), "new_epoch_lease_unwritten");
+        // A mapping to a sector the leaf cannot use moves to the one it gets.
+        fs::write(&mapping, [9u8; 32]).unwrap();
+        assert_eq!(reserve(&store, &member, b"held", 1502, 100).unwrap().1, id);
+        assert_eq!(fs::read(&mapping).unwrap(), id, "mapping_not_moved");
         gates(false);
     }
     /// A sector's last layer, up to 2 GiB, goes to disk as its labels do: a
