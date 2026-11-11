@@ -20,6 +20,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
     task::{Context, Poll},
     time::Duration,
 };
@@ -34,6 +35,7 @@ use rand::{seq::SliceRandom, thread_rng};
 use web_time::Instant;
 
 use super::{
+    as_server::{ip_group, PlainAddr},
     Action, AutoNatCodec, Config, DialRequest, DialResponse, Event, HandleInnerEvent, NatStatus,
     ProbeId,
 };
@@ -52,6 +54,10 @@ pub enum OutboundProbeError {
     OutboundRequest(OutboundFailure),
     /// The server refused or failed to dial us.
     Response(ResponseError),
+    /// QUILIBRIUM: the server answered that it reached us at an address
+    /// the probe did not offer (see `answers_probe`); the answer is
+    /// ignored.
+    UnprobedAddress,
 }
 
 #[derive(Debug)]
@@ -81,6 +87,13 @@ pub enum OutboundProbeEvent {
     },
 }
 
+/// QUILIBRIUM: a probe waiting for its server's answer, with the addresses
+/// it offered (see `answers_probe`).
+pub(crate) struct OngoingOutbound {
+    pub(crate) probe_id: ProbeId,
+    pub(crate) addresses: Vec<Multiaddr>,
+}
+
 /// View over [`super::Behaviour`] in a client role.
 pub(crate) struct AsClient<'a> {
     pub(crate) inner: &'a mut request_response::Behaviour<AutoNatCodec>,
@@ -92,12 +105,35 @@ pub(crate) struct AsClient<'a> {
     pub(crate) throttled_servers: &'a mut Vec<(PeerId, Instant)>,
     pub(crate) nat_status: &'a mut NatStatus,
     pub(crate) confidence: &'a mut usize,
-    pub(crate) ongoing_outbound: &'a mut HashMap<OutboundRequestId, ProbeId>,
+    pub(crate) ongoing_outbound: &'a mut HashMap<OutboundRequestId, OngoingOutbound>,
     pub(crate) last_probe: &'a mut Option<Instant>,
     pub(crate) schedule_probe: &'a mut Delay,
     pub(crate) listen_addresses: &'a ListenAddresses,
     pub(crate) other_candidates: &'a VecDeque<Multiaddr>,
     pub(crate) last_probe_addresses: &'a mut Vec<Multiaddr>,
+    // QUILIBRIUM: see `Behaviour::note_observed_address`.
+    pub(crate) observers: &'a VecDeque<Observation>,
+}
+
+/// QUILIBRIUM: a peer's observation of this node's IP (identify's
+/// observed address), see `Behaviour::note_observed_address`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub(crate) observer: PeerId,
+    /// The observer's IP group (see [`observer_group`]), from the remote
+    /// address of the connection the observation came on.
+    pub(crate) group: IpAddr,
+    /// The IP the observer saw this node at.
+    pub(crate) seen: IpAddr,
+}
+
+/// QUILIBRIUM: the IP group of an observer: the /24 of an IPv4 address, or
+/// the /48 of an IPv6 one, as a server admits dial-backs (see
+/// `as_server::ip_group`). One host holds one group whatever its peer IDs,
+/// and so does one rented IPv4 block: by IPv4 address, the 64 addresses
+/// of one /26 filled the list and evicted every other observation.
+pub(crate) fn observer_group(ip: IpAddr) -> IpAddr {
+    ip_group(ip)
 }
 
 impl HandleInnerEvent for AsClient<'_> {
@@ -117,10 +153,41 @@ impl HandleInnerEvent for AsClient<'_> {
             } => {
                 tracing::debug!(?response, "Outbound dial-back request returned response");
 
-                let probe_id = self
+                let OngoingOutbound {
+                    probe_id,
+                    addresses,
+                } = self
                     .ongoing_outbound
                     .remove(&request_id)
                     .expect("OutboundRequestId exists.");
+
+                // QUILIBRIUM: an answer naming an address the probe did not
+                // offer confirms nothing and leaves the status unchanged.
+                if let Ok(address) = &response.result {
+                    let listen = self.listen_addresses.iter();
+                    if !answers_probe(
+                        self.local_peer_id,
+                        peer,
+                        address,
+                        &addresses,
+                        listen,
+                        self.observers,
+                    ) {
+                        tracing::debug!(
+                            %peer,
+                            %address,
+                            "Dial-back answer names an address the probe did not offer"
+                        );
+                        self.handle_reported_status(NatStatus::Unknown);
+                        return VecDeque::from([ToSwarm::GenerateEvent(Event::OutboundProbe(
+                            OutboundProbeEvent::Error {
+                                probe_id,
+                                peer: Some(peer),
+                                error: OutboundProbeError::UnprobedAddress,
+                            },
+                        ))]);
+                    }
+                }
 
                 let event = match response.result.clone() {
                     Ok(address) => OutboundProbeEvent::Response {
@@ -135,21 +202,22 @@ impl HandleInnerEvent for AsClient<'_> {
                     },
                 };
 
-                let mut actions = VecDeque::with_capacity(3);
+                let mut actions = VecDeque::with_capacity(2);
 
                 actions.push_back(ToSwarm::GenerateEvent(Event::OutboundProbe(event)));
 
-                if let Some(old) = self.handle_reported_status(response.result.clone().into()) {
+                if let Some(old) = self.handle_reported_status(response.result.into()) {
                     actions.push_back(ToSwarm::GenerateEvent(Event::StatusChanged {
                         old,
                         new: self.nat_status.clone(),
                     }));
                 }
 
-                if let Ok(address) = response.result {
-                    actions.push_back(ToSwarm::ExternalAddrConfirmed(address));
-                }
-
+                // QUILIBRIUM: no `ToSwarm::ExternalAddrConfirmed`. The swarm
+                // announces its external addresses through identify and
+                // peers add them to Kademlia, so one server's answer must
+                // not set one; the embedder adds the addresses servers on
+                // two IPs confirmed (`Swarm::add_external_address`).
                 actions
             }
             request_response::Event::OutboundFailure {
@@ -166,7 +234,7 @@ impl HandleInnerEvent for AsClient<'_> {
                 let probe_id = self
                     .ongoing_outbound
                     .remove(&request_id)
-                    .unwrap_or_else(|| self.probe_id.next());
+                    .map_or_else(|| self.probe_id.next(), |ongoing| ongoing.probe_id);
 
                 self.schedule_probe.reset(Duration::ZERO);
 
@@ -292,12 +360,18 @@ impl AsClient<'_> {
             &server,
             DialRequest {
                 peer_id: self.local_peer_id,
-                addresses,
+                addresses: addresses.clone(),
             },
         );
         self.throttled_servers.push((server, Instant::now()));
         tracing::debug!(peer=%server, "Send dial-back request to peer");
-        self.ongoing_outbound.insert(request_id, probe_id);
+        self.ongoing_outbound.insert(
+            request_id,
+            OngoingOutbound {
+                probe_id,
+                addresses,
+            },
+        );
         Ok(server)
     }
 
@@ -358,8 +432,9 @@ impl AsClient<'_> {
 }
 
 /// QUILIBRIUM: the most addresses one dial-back request carries. A server
-/// keeps the first `Config::max_peer_addresses` (16 by default) and dials
-/// them one at a time, so each address delays the ones behind it.
+/// keeps the first `Config::max_peer_addresses` (as many here, 16
+/// upstream) and dials them one at a time, so each address delays the ones
+/// behind it.
 pub(crate) const MAX_PROBE_ADDRESSES: usize = 8;
 
 /// QUILIBRIUM: the dial-back addresses of a probe.
@@ -415,6 +490,61 @@ fn dial_back_stack(addr: &Multiaddr) -> Option<Multiaddr> {
             .filter(|p| !matches!(p, Protocol::P2p(_)))
             .collect(),
     )
+}
+
+/// QUILIBRIUM: whether `server`'s answer that it reached us at `address`
+/// is one the probe offered: a plain TCP or QUIC address ([`PlainAddr`])
+/// without another peer's id, on the transport and port of an `offered`
+/// address, at the IP of a `listen` address or one a peer other than
+/// `server` observed us at (`observers`, see
+/// `Behaviour::note_observed_address`). A server rebuilds each address
+/// from the IP it observes us at, so the IP is checked against the IPs
+/// other peers know us at, not the probe's: the probe also offers external
+/// candidates, which identify takes from any peer, so the server itself
+/// could have planted one.
+///
+/// Upstream took any address a server named as confirmed, so a single
+/// server could set the node's external address, and with it where peers
+/// dial the node. The observer check is no bound on its own: the other
+/// peer can be another identity of the same operator, even on the
+/// server's IP. The bound is the embedder's, which takes an address only
+/// once servers on two IPs confirm it.
+pub(crate) fn answers_probe<'a>(
+    local_peer_id: PeerId,
+    server: PeerId,
+    address: &Multiaddr,
+    offered: &[Multiaddr],
+    mut listen: impl Iterator<Item = &'a Multiaddr>,
+    observers: &VecDeque<Observation>,
+) -> bool {
+    let Some(answer) = PlainAddr::of(address) else {
+        return false;
+    };
+    if answer.peer.is_some_and(|peer| peer != local_peer_id) {
+        return false;
+    }
+    let stack = dial_back_stack(address);
+    if !offered.iter().any(|a| dial_back_stack(a) == stack) {
+        return false;
+    }
+    let ip = match answer.ip {
+        Protocol::Ip4(ip) => IpAddr::V4(ip),
+        Protocol::Ip6(ip) => IpAddr::V6(ip),
+        _ => return false,
+    };
+    listen.any(|a| first_ip(a) == Some(ip))
+        || observers
+            .iter()
+            .any(|o| o.observer != server && o.seen == ip)
+}
+
+/// QUILIBRIUM: the IP an address starts with, if any.
+pub(crate) fn first_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    match addr.iter().next()? {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    }
 }
 
 impl From<Result<Multiaddr, ResponseError>> for NatStatus {
@@ -476,6 +606,76 @@ mod tests {
         let sent = probe_addresses(PeerId::random(), listen.iter(), candidates.iter());
         assert_eq!(sent, candidates);
         assert_eq!(stack(&candidates[0]), "/tcp/40001");
+    }
+
+    /// An answer must name an offered transport and port at an IP we are
+    /// known at, in a plain shape, with our peer id if any. An IP is known
+    /// from a listen address or from a peer other than the server.
+    #[test]
+    fn an_answer_names_an_offered_port_at_a_known_ip() {
+        let me = PeerId::random();
+        let server = PeerId::random();
+        let offered = [
+            ma("/ip4/10.0.0.2/tcp/9336"),
+            ma("/ip6/2001:db8::2/udp/9336/quic-v1"),
+            ma("/ip4/203.0.113.66/tcp/9336"),
+        ];
+        let listen = [
+            ma("/ip4/10.0.0.2/tcp/9336"),
+            ma("/ip6/2001:db8::2/udp/9336/quic-v1"),
+        ];
+        let seen = |s: &str| s.parse::<IpAddr>().unwrap();
+        let observers = VecDeque::from([
+            Observation {
+                observer: PeerId::random(),
+                group: seen("192.0.2.10"),
+                seen: seen("198.51.100.4"),
+            },
+            Observation {
+                observer: server,
+                group: seen("192.0.2.11"),
+                seen: seen("203.0.113.66"),
+            },
+        ]);
+        let answers = |answer: String| {
+            answers_probe(
+                me,
+                server,
+                &ma(&answer),
+                &offered,
+                listen.iter(),
+                &observers,
+            )
+        };
+        for answer in [
+            "/ip4/10.0.0.2/tcp/9336".to_string(),
+            format!("/ip4/198.51.100.4/tcp/9336/p2p/{me}"),
+            "/ip6/2001:db8::2/udp/9336/quic-v1".to_string(),
+            "/ip4/198.51.100.4/udp/9336/quic-v1".to_string(),
+        ] {
+            assert!(answers(answer.clone()), "probed address refused: {answer}");
+        }
+        println!("REACH autonat dial-back answer handled");
+        for answer in [
+            "/ip4/198.51.100.4/tcp/40001".to_string(),
+            "/ip4/198.51.100.5/tcp/9336".to_string(),
+            "/ip4/198.51.100.4/udp/9336".to_string(),
+            "/ip4/198.51.100.4/tcp/0".to_string(),
+            "/dns4/node.example.com/tcp/9336".to_string(),
+            format!("/ip4/198.51.100.4/tcp/9336/p2p/{}", PeerId::random()),
+            format!("/ip4/198.51.100.4/tcp/9336/p2p/{me}/p2p-circuit"),
+        ] {
+            assert!(
+                !answers(answer.clone()),
+                "unprobed address confirmed: {answer}"
+            );
+        }
+        // Offered, but only the answering server observed us at its IP.
+        let planted = "/ip4/203.0.113.66/tcp/9336";
+        assert!(
+            !answers(planted.to_string()),
+            "IP only the server observed confirmed: {planted}"
+        );
     }
 
     /// Upstream's list (every candidate, then the listen addresses) outgrows

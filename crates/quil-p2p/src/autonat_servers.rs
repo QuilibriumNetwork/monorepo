@@ -5,7 +5,7 @@
 //! a matching share of the probes, and peers that do not serve AutoNAT are
 //! drawn as well. [`ProbeServers`] registers a peer only once identify shows
 //! that it serves AutoNAT, at most one peer per remote IP (an IPv6 address
-//! counts by its /64), and only peers reached over an address family this
+//! counts by its /48), and only peers reached over an address family this
 //! node listens on, since a server dials back over the family it sees. The
 //! configured archive and bootstrap peers are registered from the start, so
 //! the first probe, 15 s after start, does not wait for identify. AutoNAT
@@ -36,12 +36,14 @@ pub(crate) fn ip_of(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
-/// The operator group of a remote IP: an IPv6 address counts by its /64,
-/// which one site or host typically holds whole.
+/// The operator group of a remote IP: an IPv6 address counts by its /48,
+/// which one site typically holds whole and a tunnel broker hands out for
+/// free. By /64, one holder of a /48 could fill this node's server list
+/// and count as two servers for the address tracker.
 pub(crate) fn ip_group(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 80) - 1))),
     }
 }
 
@@ -178,6 +180,15 @@ impl ProbeServers {
         // A configured peer stays a server: AutoNAT dials it when needed.
         self.capable.remove(&peer);
         self.release(peer)
+    }
+
+    /// The remote IP group (see [`ip_group`]) of `peer`'s open connection
+    /// `conn`, if it is an IP connection.
+    pub(crate) fn ip_of_connection(&self, conn: ConnectionId, peer: PeerId) -> Option<IpAddr> {
+        match self.conns.get(&conn) {
+            Some(&(p, ip)) if p == peer => Some(ip),
+            _ => None,
+        }
     }
 
     /// The remote IP group of server `peer` (see [`ip_group`]), if known.
@@ -434,9 +445,11 @@ mod tests {
         assert_eq!(net.servers.count(), 1);
     }
 
-    /// An IPv6 site counts once: addresses in one /64 give one server.
+    /// An IPv6 site counts once: addresses in one /48 (a usual site
+    /// allocation, free from a tunnel broker) give one server, so its
+    /// holder cannot fill this node's server list from its /64s.
     #[test]
-    fn ipv6_servers_count_by_their_slash_64() {
+    fn ipv6_servers_count_by_their_slash_48() {
         let mut net = Net::new();
         let first = PeerId::random();
         assert_eq!(
@@ -447,14 +460,21 @@ mod tests {
             .identified(PeerId::random(), "2001:db8:1:2:ffff::9", true)
             .1
             .is_empty());
+        let second = net.identified(PeerId::random(), "2001:db8:1:3::1", true).1;
+        println!("REACH autonat server inside one /48 identified");
+        assert!(
+            second.is_empty(),
+            "a second /64 inside one /48 gave a second server"
+        );
         let other = PeerId::random();
         assert_eq!(
-            net.identified(other, "2001:db8:1:3::1", true).1,
+            net.identified(other, "2001:db8:2:3::1", true).1,
             vec![Add(other)]
         );
+        assert_eq!(net.servers.count(), 2);
         assert_eq!(
             net.servers.ip_of_server(&first),
-            Some("2001:db8:1:2::".parse().unwrap())
+            Some("2001:db8:1::".parse().unwrap())
         );
     }
 
@@ -490,6 +510,295 @@ mod tests {
                 use_connected: false,
                 ..defaults
             }
+        );
+    }
+}
+
+/// A server's dial-backs, over real TCP swarms on loopback.
+#[cfg(test)]
+mod dial_back_tests {
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use libp2p::autonat::{
+        Behaviour, Config, Event, InboundProbeError, InboundProbeEvent, ResponseError,
+    };
+    use libp2p::multiaddr::Protocol;
+    use libp2p::swarm::SwarmEvent;
+    use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder};
+
+    /// Bound for each step: connection set-up and one request.
+    const STEP: Duration = Duration::from_secs(60);
+
+    /// The connection and request timeouts of the test swarms, far beyond
+    /// any test: a dial-back to an address that never answers, and its
+    /// request, stay in progress until the test ends, however loaded the
+    /// host. With the defaults (10 s and 30 s) a slow step let the first
+    /// dial-back end before the next client asked.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    fn swarm(config: Config) -> Swarm<Behaviour> {
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("tcp transport")
+            .with_behaviour(|key| Behaviour::new(key.public().to_peer_id(), config))
+            .expect("behaviour")
+            .with_swarm_config(|c| c.with_idle_connection_timeout(NEVER))
+            .with_connection_timeout(NEVER)
+            .build()
+    }
+
+    /// A server listening on loopback that never probes; its peer ID and
+    /// address.
+    async fn listening_server() -> (Swarm<Behaviour>, PeerId, Multiaddr) {
+        let mut server = swarm(Config {
+            boot_delay: NEVER,
+            only_global_ips: false,
+            timeout: NEVER,
+            ..Config::default()
+        });
+        let server_id = *server.local_peer_id();
+        server
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let server_addr = tokio::time::timeout(STEP, async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = server.select_next_some().await {
+                    return address;
+                }
+            }
+        })
+        .await
+        .expect("server listens");
+        (server, server_id, server_addr)
+    }
+
+    /// An address at `ip` where the kernel completes TCP connections into
+    /// the backlog of a listener nobody accepts from, and nothing answers
+    /// on them; with the listener, which must stay open.
+    fn silent(ip: &str) -> (std::net::TcpListener, Multiaddr) {
+        let listener = std::net::TcpListener::bind((ip, 0)).expect("silent listener");
+        let port = listener.local_addr().expect("silent address").port();
+        let addr = format!("/ip4/{ip}/tcp/{port}").parse().unwrap();
+        (listener, addr)
+    }
+
+    /// A client polled in the background that asks `server` at
+    /// `server_addr` to dial it back at `candidate` only (it listens
+    /// nowhere); its peer ID.
+    fn spawn_client(server: PeerId, server_addr: &Multiaddr, candidate: &Multiaddr) -> PeerId {
+        let mut client = swarm(Config {
+            boot_delay: Duration::ZERO,
+            use_connected: false,
+            only_global_ips: false,
+            timeout: NEVER,
+            ..Config::default()
+        });
+        client
+            .behaviour_mut()
+            .add_server(server, Some(server_addr.clone()));
+        client.behaviour_mut().probe_address(candidate.clone());
+        let id = *client.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                client.select_next_some().await;
+            }
+        });
+        id
+    }
+
+    /// A client at `ip`, dialed by `server` so that the server observes it
+    /// at `ip`, then polled in the background; it asks `server` to dial it
+    /// back at `candidate` only. It listens only until the server is
+    /// connected, so its request offers no listen address. Its peer ID.
+    async fn client_dialed_at(
+        server: &mut Swarm<Behaviour>,
+        ip: &str,
+        candidate: &Multiaddr,
+    ) -> PeerId {
+        // Probes before the server is added find none and retry a second
+        // later; after its answer the server stays throttled for the test.
+        let mut client = swarm(Config {
+            boot_delay: Duration::ZERO,
+            retry_interval: Duration::from_secs(1),
+            use_connected: false,
+            only_global_ips: false,
+            timeout: NEVER,
+            ..Config::default()
+        });
+        let id = *client.local_peer_id();
+        let server_id = *server.local_peer_id();
+        let listener = client
+            .listen_on(format!("/ip4/{ip}/tcp/0").parse().unwrap())
+            .expect("client listens");
+        let at = tokio::time::timeout(STEP, async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = client.select_next_some().await {
+                    return address;
+                }
+            }
+        })
+        .await
+        .expect("client listens");
+        server
+            .dial(at.with(Protocol::P2p(id)))
+            .expect("server dials the client");
+        tokio::time::timeout(STEP, async {
+            loop {
+                tokio::select! {
+                    event = client.select_next_some() => {
+                        if matches!(
+                            event,
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == server_id
+                        ) {
+                            return;
+                        }
+                    }
+                    event = server.select_next_some() => {
+                        if let SwarmEvent::Behaviour(Event::InboundProbe(event)) = event {
+                            panic!("dial-back event while a client connected: {event:?}");
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("server connects to the client");
+        assert!(client.remove_listener(listener));
+        tokio::time::timeout(STEP, async {
+            loop {
+                if let SwarmEvent::ListenerClosed { .. } = client.select_next_some().await {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("client stops listening");
+        client.behaviour_mut().add_server(server_id, None);
+        client.behaviour_mut().probe_address(candidate.clone());
+        tokio::spawn(async move {
+            loop {
+                client.select_next_some().await;
+            }
+        });
+        id
+    }
+
+    /// The server's next dial-back event, with its client.
+    async fn next_inbound(server: &mut Swarm<Behaviour>) -> (PeerId, InboundProbeEvent) {
+        let next = async {
+            loop {
+                if let SwarmEvent::Behaviour(Event::InboundProbe(event)) =
+                    server.select_next_some().await
+                {
+                    let peer = match &event {
+                        InboundProbeEvent::Request { peer, .. }
+                        | InboundProbeEvent::Response { peer, .. }
+                        | InboundProbeEvent::Error { peer, .. } => *peer,
+                    };
+                    return (peer, event);
+                }
+            }
+        };
+        tokio::time::timeout(STEP, next)
+            .await
+            .expect("no dial-back event within the step bound")
+    }
+
+    /// Whether `event` refused a request, which leaves the client's status
+    /// unchanged.
+    fn refused(event: &InboundProbeEvent) -> bool {
+        matches!(
+            event,
+            InboundProbeEvent::Error {
+                error: InboundProbeError::Response(ResponseError::DialRefused),
+                ..
+            }
+        )
+    }
+
+    /// QUILIBRIUM: a server runs one dial-back at a time per client IP (an
+    /// IPv6 /48), whatever the peer IDs behind it. Each dial-back holds one
+    /// of the few the server runs at once until it connects or its last
+    /// address times out, so one host with a few identities asking for
+    /// addresses that never answer held them all, and with them every
+    /// other node's probes to that server. Here the first client's address
+    /// accepts TCP and never answers the handshake, so its dial-back stays
+    /// in progress; a second peer ID from the same IP is then refused,
+    /// which leaves its status unchanged.
+    #[tokio::test]
+    async fn one_ip_gets_one_dial_back_at_a_time_whatever_its_peer_ids() {
+        let (mut server, server_id, server_addr) = listening_server().await;
+        let (_silent, silent_addr) = silent("127.0.0.1");
+
+        let first = spawn_client(server_id, &server_addr, &silent_addr);
+        let (peer, event) = next_inbound(&mut server).await;
+        assert_eq!(peer, first, "first event from another client: {event:?}");
+        assert!(
+            matches!(event, InboundProbeEvent::Request { .. }),
+            "first client's request refused: {event:?}"
+        );
+
+        let second = spawn_client(server_id, &server_addr, &silent_addr);
+        let (peer, event) = next_inbound(&mut server).await;
+        println!("REACH autonat second peer ID's request handled");
+        assert_eq!(
+            peer, second,
+            "the first client's dial-back ended before the second asked: {event:?}"
+        );
+        assert!(refused(&event), "second dial-back from one IP: {event:?}");
+    }
+
+    /// QUILIBRIUM: IPv4 clients count by their /24 for a dial-back: two
+    /// run at once, at two addresses. Sixteen addresses of one /28, a
+    /// cheap rented block, each asking for addresses that never answer,
+    /// held every dial-back a server runs at once, the same sixteen
+    /// against every server; with one at a time per /24, one address
+    /// there kept every other one's probes refused. Here a client at
+    /// 127.0.0.16, a second peer ID at that address, then a client at each
+    /// other address of 127.0.0.16/28 ask in turn while the dial-backs
+    /// started stay in progress: the first and the one at 127.0.0.17 run,
+    /// and the others are refused, which leaves their status unchanged.
+    #[tokio::test]
+    async fn one_ipv4_24_gets_two_dial_backs_at_a_time() {
+        let (mut server, ..) = listening_server().await;
+        let mut silent_listeners = Vec::new();
+        let mut running: Vec<String> = Vec::new();
+        for n in 16..32 {
+            let ip = format!("127.0.0.{n}");
+            let (listener, candidate) = silent(&ip);
+            silent_listeners.push(listener);
+            // A second peer ID at the first address asks right after it.
+            let clients_here = if n == 16 { 2 } else { 1 };
+            for _ in 0..clients_here {
+                let client = client_dialed_at(&mut server, &ip, &candidate).await;
+                let (peer, event) = next_inbound(&mut server).await;
+                assert_eq!(peer, client, "event from another client: {event:?}");
+                match event {
+                    InboundProbeEvent::Request { .. } => running.push(ip.clone()),
+                    ref event => assert!(refused(event), "request at {ip}: {event:?}"),
+                }
+            }
+        }
+        println!("REACH autonat requests from one /28 handled");
+        assert!(
+            running.len() <= 2,
+            "{} dial-backs at once from one IPv4 /28: {running:?}",
+            running.len()
+        );
+        assert!(
+            running.iter().filter(|ip| *ip == "127.0.0.16").count() <= 1,
+            "second dial-back from one IP of one IPv4 /24: {running:?}"
+        );
+        assert_eq!(
+            running,
+            ["127.0.0.16", "127.0.0.17"],
+            "a second address of one IPv4 /24 refused while the first ran"
         );
     }
 }

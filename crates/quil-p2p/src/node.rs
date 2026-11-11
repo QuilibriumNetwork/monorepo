@@ -949,10 +949,10 @@ impl P2PNode {
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-                                // AutoNAT's dial-back result. The tracker takes it
-                                // from the probe response below, which names the
-                                // confirming server.
-                                debug!(%address, "external address confirmed (AutoNAT dial-back)");
+                                // Nothing emits this: the vendored AutoNAT confirms
+                                // no address to the swarm, and `sync_swarm_external`
+                                // adds the tracker's (which raises no event).
+                                debug!(%address, "external address confirmed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
                                 // Nothing emits this today; handled for completeness.
@@ -968,11 +968,26 @@ impl P2PNode {
                                     &autonat_health,
                                     &swarm.behaviour().autonat.nat_status(),
                                 );
+                                sync_swarm_external(&mut swarm, &external_tracker);
                             }
                             libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
                                 NodeBehaviourEvent::Identify(
                                     libp2p::identify::Event::Received { connection_id, peer_id, info, .. }
                                 ) => {
+                                    // Which IP this peer sees us at: AutoNAT takes an
+                                    // answer at an IP no listen address has only when
+                                    // a peer other than its server saw us there. It
+                                    // keeps one observation per observer IP group, so
+                                    // the observer's remote IP goes with it.
+                                    if let Some(observer_ip) =
+                                        probe_servers.ip_of_connection(connection_id, peer_id)
+                                    {
+                                        swarm.behaviour_mut().autonat.note_observed_address(
+                                            peer_id,
+                                            observer_ip,
+                                            &info.observed_addr,
+                                        );
+                                    }
                                     let serves_autonat =
                                         info.protocols.contains(&libp2p::autonat::DEFAULT_PROTOCOL_NAME);
                                     crate::autonat_servers::apply(
@@ -1145,7 +1160,13 @@ impl P2PNode {
                                         let nat = swarm.behaviour().autonat.nat_status();
                                         let applied = external_tracker.apply(event, &nat, now);
                                         debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
+                                        // A first address waits for a second server: ask
+                                        // one now, not a retry interval later.
+                                        if external_tracker.probe_again_now(applied) {
+                                            swarm.behaviour_mut().autonat.probe_now();
+                                        }
                                         publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
+                                        sync_swarm_external(&mut swarm, &external_tracker);
                                         let owed = autonat_health.flush_status(&nat, now);
                                         for notice in owed.iter().chain(&notice) {
                                             crate::autonat_health::log(
@@ -1173,6 +1194,7 @@ impl P2PNode {
                                         );
                                     }
                                     publish_external(&external_tx, &mut external_tracker, &autonat_health, &new);
+                                    sync_swarm_external(&mut swarm, &external_tracker);
                                 }
                                 NodeBehaviourEvent::Direct(event) => {
                                     use crate::direct::DirectOutcome;
@@ -2227,6 +2249,31 @@ fn publish_external(
         *current = next;
         true
     });
+}
+
+/// Make the swarm's external addresses the tracker's accepted ones. The
+/// swarm announces them through identify, peers add them to Kademlia, and
+/// Kademlia serves while one exists, so one server's answer must not add
+/// one (the vendored AutoNAT no longer does); an address servers on two IPs
+/// confirmed goes in, and one the tracker moved off or dropped goes out.
+/// Runs after every tracker update.
+fn sync_swarm_external(swarm: &mut libp2p::Swarm<NodeBehaviour>, tracker: &ExternalAddrTracker) {
+    let (remove, add) = tracker.swarm_changes(swarm.external_addresses());
+    if remove.is_empty() && add.is_empty() {
+        return;
+    }
+    for addr in &remove {
+        swarm.remove_external_address(addr);
+    }
+    for addr in &add {
+        swarm.add_external_address(addr.clone());
+    }
+    info!(
+        added = ?add.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        removed = ?remove.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "external addresses announced to peers changed: AutoNAT servers on two IPs confirmed \
+         the added ones; the removed ones were moved off or went unconfirmed"
+    );
 }
 
 /// AutoNAT's server and request state for an operator line.

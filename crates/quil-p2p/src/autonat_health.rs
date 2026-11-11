@@ -66,9 +66,12 @@ pub(crate) enum ProbeFailure {
     BadRequest,
     /// The server failed internally.
     Internal,
+    /// The server answered that it reached this node at an address the
+    /// probe did not offer; the answer is ignored.
+    UnprobedAddress,
 }
 
-const CLASS_COUNT: usize = 11;
+const CLASS_COUNT: usize = 12;
 
 const CLASSES: [ProbeFailure; CLASS_COUNT] = [
     ProbeFailure::NoServer,
@@ -82,6 +85,7 @@ const CLASSES: [ProbeFailure; CLASS_COUNT] = [
     ProbeFailure::DialError,
     ProbeFailure::BadRequest,
     ProbeFailure::Internal,
+    ProbeFailure::UnprobedAddress,
 ];
 
 impl ProbeFailure {
@@ -102,6 +106,7 @@ impl ProbeFailure {
                 ResponseError::BadRequest => ProbeFailure::BadRequest,
                 ResponseError::InternalError => ProbeFailure::Internal,
             },
+            OutboundProbeError::UnprobedAddress => ProbeFailure::UnprobedAddress,
         }
     }
 
@@ -138,6 +143,7 @@ impl ProbeFailure {
             ProbeFailure::DialError => "dial_error",
             ProbeFailure::BadRequest => "bad_request",
             ProbeFailure::Internal => "internal",
+            ProbeFailure::UnprobedAddress => "unprobed_address",
         }
     }
 }
@@ -282,7 +288,8 @@ impl Run {
             ProbeFailure::UnsupportedProtocol
             | ProbeFailure::Io
             | ProbeFailure::BadRequest
-            | ProbeFailure::Internal => {
+            | ProbeFailure::Internal
+            | ProbeFailure::UnprobedAddress => {
                 "requests fail before any dial-back result, so reachability is unknown and a port \
                  forward does not help; report this line"
             }
@@ -633,6 +640,7 @@ mod tests {
                 OutboundProbeError::Response(ResponseError::InternalError),
                 Internal,
             ),
+            (OutboundProbeError::UnprobedAddress, UnprobedAddress),
         ];
         for (error, class) in cases {
             assert_eq!(ProbeFailure::of(&error), class, "{error:?}");

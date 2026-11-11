@@ -24,6 +24,7 @@ mod as_server;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     iter,
+    net::IpAddr,
     task::{Context, Poll},
     time::Duration,
 };
@@ -72,7 +73,35 @@ pub struct Config {
 
     // Server Config
     /// Max addresses that are tried per peer.
+    ///
+    /// QUILIBRIUM: 8 (upstream 16), the most this repository's clients
+    /// send (`as_client::MAX_PROBE_ADDRESSES`). They are dialed one at a
+    /// time, each that does not answer taking up to the transport timeout,
+    /// so the count sets how long a dial-back runs, not how many dials run
+    /// at once ([`Config::max_concurrent_dial_backs`] bounds those).
+    /// Clients without that limit send their external candidates first
+    /// and their listen addresses after; a lower count would leave their
+    /// listen port undialed more often.
     pub max_peer_addresses: usize,
+    /// QUILIBRIUM: max dial-backs in progress at once whose request is
+    /// open; those whose request failed (it timed out, or the client
+    /// closed it) answer no one and give their place at once, but count
+    /// until their dial ends against twice this in all. A request beyond
+    /// either is refused (`DialRefused`, which leaves the client's status
+    /// unchanged). 16 by default: with one dial-back per IP and two per IP
+    /// group (an IPv4 /24 or an IPv6 /48), holding them all takes 16 IPs in
+    /// 8 groups each keeping a request open, and each dial-back holds one
+    /// pending outgoing dial,
+    /// at most 32, which leaves half of the 64 this repository's node
+    /// allows to its other dials and its own probes.
+    pub max_concurrent_dial_backs: usize,
+    /// QUILIBRIUM: the age at which a dial-back the swarm never reported
+    /// ended is dropped, checked at each request. 160 s by default: twice
+    /// the longest a dial-back of [`Config::max_peer_addresses`] takes at
+    /// the swarm's default connection timeout (10 s each). The swarm
+    /// reports how every dial ends; this bounds the harm if a version
+    /// misses one, which would hold a place for good.
+    pub max_dial_back_age: Duration,
     /// Max total dial requests done in `[Config::throttle_clients_period`].
     pub throttle_clients_global_max: usize,
     /// Max dial requests done in `[Config::throttle_clients_period`] for a peer.
@@ -96,7 +125,9 @@ impl Default for Config {
             throttle_server_period: Duration::from_secs(90),
             use_connected: true,
             confidence_max: 3,
-            max_peer_addresses: 16,
+            max_peer_addresses: 8,
+            max_concurrent_dial_backs: 16,
+            max_dial_back_age: Duration::from_secs(160),
             throttle_clients_global_max: 30,
             throttle_clients_peer_max: 3,
             throttle_clients_period: Duration::from_secs(1),
@@ -190,7 +221,8 @@ pub struct Behaviour {
     server_stats: ServerStats,
 
     // Ongoing outbound probes and mapped to the inner request id.
-    ongoing_outbound: HashMap<OutboundRequestId, ProbeId>,
+    // QUILIBRIUM: with the addresses each probe offered.
+    ongoing_outbound: HashMap<OutboundRequestId, as_client::OngoingOutbound>,
 
     // Connected peers with the observed address of each connection.
     // If the endpoint of a connection is relayed or not global (in case of
@@ -216,6 +248,10 @@ pub struct Behaviour {
     other_candidates: VecDeque<Multiaddr>,
     // QUILIBRIUM: the addresses of the latest probe request.
     last_probe_addresses: Vec<Multiaddr>,
+    // QUILIBRIUM: the IP each observer group last observed this node at,
+    // most recent first, at most `MAX_OBSERVERS` (see
+    // `note_observed_address`).
+    observers: VecDeque<as_client::Observation>,
 }
 
 /// QUILIBRIUM: how many external address candidates the client keeps.
@@ -223,6 +259,11 @@ pub struct Behaviour {
 /// translation report a different port each; only the most recent ones are
 /// kept for the probe list (see `as_client::probe_addresses`).
 const MAX_CANDIDATES: usize = 16;
+
+/// QUILIBRIUM: how many observations of this node's IP the client keeps,
+/// one per peer and per observer IP group (see
+/// [`Behaviour::note_observed_address`]).
+const MAX_OBSERVERS: usize = 64;
 
 impl Behaviour {
     pub fn new(local_peer_id: PeerId, config: Config) -> Self {
@@ -252,6 +293,7 @@ impl Behaviour {
             other_candidates: Default::default(),
             last_probe_addresses: Vec::new(),
             server_stats: ServerStats::default(),
+            observers: VecDeque::new(),
         }
     }
 
@@ -299,6 +341,48 @@ impl Behaviour {
         self.other_candidates.push_front(candidate);
         self.other_candidates.truncate(MAX_CANDIDATES);
         self.as_client().on_new_address();
+    }
+
+    /// QUILIBRIUM: send the next probe now rather than at its scheduled
+    /// time. The servers of recent probes stay throttled
+    /// ([`Config::throttle_server_period`]), so it goes to another server,
+    /// or fails with `NoServer` when there is none. The embedder calls it
+    /// when a first address awaits a second server, which the next
+    /// scheduled probe would ask only a retry interval later.
+    pub fn probe_now(&mut self) {
+        self.schedule_probe.reset(Duration::ZERO);
+    }
+
+    /// QUILIBRIUM: `observer`, connected from `observer_ip` (the remote IP
+    /// of the connection identify ran on), saw this node at `observed`
+    /// (identify's observed address). A server's answer naming an IP that
+    /// no listen address has counts only when a peer other than that
+    /// server observed the node there (see `as_client::answers_probe`):
+    /// external candidates carry no observer, and one peer could plant a
+    /// candidate through identify and then answer a probe of it as a
+    /// server. Keeps the latest observation per peer and per observer IP
+    /// group (an IPv4 /24 or an IPv6 /48), for the [`MAX_OBSERVERS`] most
+    /// recent: one host or one rented block with any number of peer IDs,
+    /// pushing identify again and again, holds one entry and cannot evict
+    /// other hosts' observations; that takes [`MAX_OBSERVERS`] groups.
+    pub fn note_observed_address(
+        &mut self,
+        observer: PeerId,
+        observer_ip: IpAddr,
+        observed: &Multiaddr,
+    ) {
+        let Some(seen) = as_client::first_ip(observed) else {
+            return;
+        };
+        let group = as_client::observer_group(observer_ip);
+        self.observers
+            .retain(|o| o.observer != observer && o.group != group);
+        self.observers.push_front(as_client::Observation {
+            observer,
+            group,
+            seen,
+        });
+        self.observers.truncate(MAX_OBSERVERS);
     }
 
     /// QUILIBRIUM: what this node did as a server with other nodes'
@@ -356,6 +440,7 @@ impl Behaviour {
             listen_addresses: &self.listen_addresses,
             other_candidates: &self.other_candidates,
             last_probe_addresses: &mut self.last_probe_addresses,
+            observers: &self.observers,
         }
     }
 
@@ -396,7 +481,12 @@ impl Behaviour {
                 role_override: Endpoint::Dialer,
                 port_use: _,
             } => {
-                if let Some(event) = self.as_server().on_outbound_connection(&peer, address) {
+                // QUILIBRIUM: the connection id tells the dial-back from
+                // other connections to the client.
+                if let Some(event) = self
+                    .as_server()
+                    .on_outbound_connection(&peer, conn, address)
+                {
                     self.pending_actions
                         .push_back(ToSwarm::GenerateEvent(Event::InboundProbe(event)));
                 }
@@ -831,5 +921,313 @@ mod tests {
         assert_eq!(sent.len(), as_client::MAX_PROBE_ADDRESSES);
         assert_eq!(sent[1], junk(39));
         assert_eq!(behaviour.eligible_servers(), 0);
+    }
+
+    /// A behaviour listening on `/ip4/10.0.0.2/tcp/8336`, seen by a peer at
+    /// `/ip4/198.51.100.4/tcp/40001`, that sent one probe; its server and
+    /// the probe's request.
+    fn probed(local: PeerId) -> (Behaviour, PeerId, OutboundRequestId) {
+        let config = Config {
+            boot_delay: Duration::ZERO,
+            ..Config::default()
+        };
+        let mut behaviour = Behaviour::new(local, config);
+        let listen: Multiaddr = "/ip4/10.0.0.2/tcp/8336".parse().unwrap();
+        behaviour.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+            listener_id: ListenerId::next(),
+            addr: &listen,
+        }));
+        behaviour.probe_address("/ip4/198.51.100.4/tcp/40001".parse().unwrap());
+        let server = PeerId::random();
+        behaviour.add_server(server, None);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..500 {
+            match behaviour.poll(&mut cx) {
+                Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundProbe(
+                    OutboundProbeEvent::Request { peer, .. },
+                ))) => {
+                    assert_eq!(peer, server);
+                    let request = *behaviour.ongoing_outbound.keys().next().unwrap();
+                    return (behaviour, server, request);
+                }
+                Poll::Ready(_) => {}
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("no probe sent");
+    }
+
+    /// `server` answers `request` that it reached us at `address`.
+    fn answer(
+        behaviour: &mut Behaviour,
+        server: PeerId,
+        request_id: OutboundRequestId,
+        address: Multiaddr,
+    ) -> VecDeque<Action> {
+        behaviour
+            .as_client()
+            .handle_event(request_response::Event::Message {
+                peer: server,
+                connection_id: ConnectionId::new_unchecked(1),
+                message: request_response::Message::Response {
+                    request_id,
+                    response: DialResponse {
+                        result: Ok(address),
+                        status_text: None,
+                    },
+                },
+            })
+    }
+
+    /// Whether `actions` report that the probe reached this node.
+    fn reached(actions: &VecDeque<Action>) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                ToSwarm::GenerateEvent(Event::OutboundProbe(OutboundProbeEvent::Response { .. }))
+            )
+        })
+    }
+
+    /// QUILIBRIUM: a server's answer confirms an address only when it is
+    /// one the probe offered: a plain TCP or QUIC address on a probed port,
+    /// at an IP this node is known at, with no other peer's id. An external
+    /// candidate's IP is known only once a peer other than the server
+    /// observed this node there, since identify lets any peer plant a
+    /// candidate. Upstream confirmed whatever address the server named, so
+    /// one server could set this node's external address, and with it where
+    /// peers dial it.
+    #[test]
+    fn a_dial_back_answer_confirms_only_a_probed_address() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        for (address, why) in [
+            ("/ip4/10.0.0.2/tcp/9999".to_string(), "port not probed"),
+            ("/ip4/192.0.2.66/tcp/8336".to_string(), "IP never seen"),
+            (
+                "/ip4/10.0.0.2/udp/8336/quic-v1".to_string(),
+                "transport not probed",
+            ),
+            (
+                "/ip4/10.0.0.2/ip4/127.0.0.1/tcp/8336".to_string(),
+                "stacked IP",
+            ),
+            ("/ip4/10.0.0.2/tcp/8336/ws".to_string(), "protocol on top"),
+            (
+                format!("/ip4/10.0.0.2/tcp/8336/p2p/{other}"),
+                "another peer",
+            ),
+            (
+                format!("/ip4/198.51.100.4/tcp/40001/p2p/{me}"),
+                "candidate no other peer observed",
+            ),
+        ] {
+            let (mut behaviour, server, request) = probed(me);
+            let actions = answer(&mut behaviour, server, request, address.parse().unwrap());
+            println!("REACH autonat dial-back answer handled");
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, ToSwarm::ExternalAddrConfirmed(_))),
+                "unprobed address confirmed ({why}): {address}"
+            );
+            assert!(
+                !reached(&actions),
+                "unprobed address reported reached ({why}): {address}"
+            );
+            assert_eq!(behaviour.nat_status(), NatStatus::Unknown, "{why}");
+        }
+
+        // A listen address on the probed port is reached.
+        let (mut behaviour, server, request) = probed(me);
+        let reached_at: Multiaddr = format!("/ip4/10.0.0.2/tcp/8336/p2p/{me}").parse().unwrap();
+        let actions = answer(&mut behaviour, server, request, reached_at.clone());
+        assert!(reached(&actions), "probed address refused: {reached_at}");
+        assert_eq!(behaviour.nat_status(), NatStatus::Public(reached_at));
+    }
+
+    /// QUILIBRIUM: one server's answer, even on an address the probe
+    /// offered, adds no external address to the swarm. The swarm announces
+    /// its external addresses through identify and peers add them to
+    /// Kademlia, so the node adds one only once servers on two IPs confirm
+    /// it (`quil-p2p`'s external address tracker). Upstream confirmed the
+    /// address of every answer.
+    #[test]
+    fn one_servers_answer_sets_no_external_address() {
+        let me = PeerId::random();
+        let (mut behaviour, server, request) = probed(me);
+        let reached_at: Multiaddr = format!("/ip4/10.0.0.2/tcp/8336/p2p/{me}").parse().unwrap();
+        let actions = answer(&mut behaviour, server, request, reached_at.clone());
+        println!("REACH autonat dial-back answer handled");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ToSwarm::ExternalAddrConfirmed(_))),
+            "one server set an external address: {reached_at}"
+        );
+        assert!(reached(&actions), "probed address refused: {reached_at}");
+        assert_eq!(behaviour.nat_status(), NatStatus::Public(reached_at));
+    }
+
+    /// The remote IP of the `n`-th observer host in these tests, each in
+    /// its own IPv4 /24.
+    fn host(n: u16) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(
+            198,
+            18 + (n >> 8) as u8,
+            n as u8,
+            1,
+        ))
+    }
+
+    /// QUILIBRIUM: an answer at an IP no listen address has counts once a
+    /// peer other than the answering server observed this node there; the
+    /// server's own observation does not, nor does a later one of another
+    /// peer that replaced it. Observations are kept one per peer and per
+    /// observer IP group, for the most recent ones.
+    #[test]
+    fn a_candidate_ip_counts_only_when_another_peer_observed_it() {
+        let me = PeerId::random();
+        let at: Multiaddr = format!("/ip4/198.51.100.4/tcp/8336/p2p/{me}")
+            .parse()
+            .unwrap();
+        let observed: Multiaddr = "/ip4/198.51.100.4/tcp/51234".parse().unwrap();
+        let elsewhere: Multiaddr = "/ip4/192.0.2.9/tcp/51234".parse().unwrap();
+
+        let (mut behaviour, server, request) = probed(me);
+        behaviour.note_observed_address(server, host(1), &observed);
+        let actions = answer(&mut behaviour, server, request, at.clone());
+        println!("REACH autonat dial-back answer handled");
+        assert!(
+            !reached(&actions),
+            "IP only the server observed confirmed: {at}"
+        );
+
+        let (mut behaviour, server, request) = probed(me);
+        let witness = PeerId::random();
+        behaviour.note_observed_address(witness, host(2), &observed);
+        behaviour.note_observed_address(witness, host(2), &elsewhere);
+        let actions = answer(&mut behaviour, server, request, at.clone());
+        assert!(
+            !reached(&actions),
+            "IP a peer no longer observes confirmed: {at}"
+        );
+
+        let (mut behaviour, server, request) = probed(me);
+        behaviour.note_observed_address(server, host(1), &observed);
+        behaviour.note_observed_address(PeerId::random(), host(2), &observed);
+        let actions = answer(&mut behaviour, server, request, at.clone());
+        assert!(reached(&actions), "IP another peer observed refused: {at}");
+        assert_eq!(behaviour.nat_status(), NatStatus::Public(at));
+
+        for n in 0..MAX_OBSERVERS as u16 + 10 {
+            behaviour.note_observed_address(PeerId::random(), host(100 + n), &elsewhere);
+        }
+        assert_eq!(behaviour.observers.len(), MAX_OBSERVERS);
+    }
+
+    /// QUILIBRIUM: one host keeps one observation, whatever its peer IDs.
+    /// Identify reports a peer's observation at every push, so one host
+    /// with more peer IDs than the list holds, pushing again and again,
+    /// evicted every other host's observation while the list was kept per
+    /// peer; a NAT'd node's answers at its public IP then all failed as
+    /// unprobed, and it got no first address. An IPv6 host counts by its
+    /// /48.
+    #[test]
+    fn sybil_observers_on_one_host_keep_one_observation() {
+        let me = PeerId::random();
+        let at: Multiaddr = format!("/ip4/198.51.100.4/tcp/8336/p2p/{me}")
+            .parse()
+            .unwrap();
+        let observed: Multiaddr = "/ip4/198.51.100.4/tcp/51234".parse().unwrap();
+        let elsewhere: Multiaddr = "/ip4/192.0.2.9/tcp/51234".parse().unwrap();
+        let (mut behaviour, server, request) = probed(me);
+        behaviour.note_observed_address(PeerId::random(), host(1), &observed);
+        for n in 0..=MAX_OBSERVERS as u16 {
+            behaviour.note_observed_address(PeerId::random(), host(2), &elsewhere);
+            let site: IpAddr = format!("2001:db8:1:{n:x}::1").parse().unwrap();
+            behaviour.note_observed_address(PeerId::random(), site, &elsewhere);
+        }
+        println!("REACH autonat sybil observations noted");
+        assert_eq!(
+            behaviour.observers.len(),
+            3,
+            "sybil observers on one host took {} entries",
+            behaviour.observers.len()
+        );
+        let actions = answer(&mut behaviour, server, request, at.clone());
+        assert!(
+            reached(&actions),
+            "sybil observers on one host evicted an honest observation: {at}"
+        );
+    }
+
+    /// QUILIBRIUM: one IPv4 /24 keeps one observation, as a server admits
+    /// dial-backs by it. Kept by IPv4 address, the 64 addresses of one
+    /// rented /26, each pushing identify with its own peer ID, filled the
+    /// list and evicted every other observation, so a NAT'd node's answers
+    /// at its public IP all failed as unprobed.
+    #[test]
+    fn observers_in_one_ipv4_24_keep_one_observation() {
+        let me = PeerId::random();
+        let at: Multiaddr = format!("/ip4/198.51.100.4/tcp/8336/p2p/{me}")
+            .parse()
+            .unwrap();
+        let observed: Multiaddr = "/ip4/198.51.100.4/tcp/51234".parse().unwrap();
+        let elsewhere: Multiaddr = "/ip4/192.0.2.9/tcp/51234".parse().unwrap();
+        let (mut behaviour, server, request) = probed(me);
+        behaviour.note_observed_address(PeerId::random(), host(1), &observed);
+        for n in 64..128 {
+            let sybil = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n));
+            behaviour.note_observed_address(PeerId::random(), sybil, &elsewhere);
+        }
+        println!("REACH autonat sybil observations noted");
+        assert_eq!(
+            behaviour.observers.len(),
+            2,
+            "sybil observers in one IPv4 /26 took {} entries",
+            behaviour.observers.len()
+        );
+        let actions = answer(&mut behaviour, server, request, at.clone());
+        assert!(
+            reached(&actions),
+            "sybil observers in one IPv4 /26 evicted an honest observation: {at}"
+        );
+    }
+
+    /// QUILIBRIUM: `probe_now` sends the next probe at once, to a server
+    /// other than the one just asked, instead of a retry interval (90 s)
+    /// later. A first address needs servers on two IPs, so without it the
+    /// first address came with the second scheduled probe, about 105 s
+    /// after start.
+    #[test]
+    fn probe_now_asks_another_server_at_once() {
+        let me = PeerId::random();
+        let (mut behaviour, first, request) = probed(me);
+        let second = PeerId::random();
+        behaviour.add_server(second, None);
+        let reached_at: Multiaddr = format!("/ip4/10.0.0.2/tcp/8336/p2p/{me}").parse().unwrap();
+        let actions = answer(&mut behaviour, first, request, reached_at);
+        assert!(reached(&actions));
+
+        behaviour.probe_now();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut asked = None;
+        for _ in 0..500 {
+            match behaviour.poll(&mut cx) {
+                Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundProbe(
+                    OutboundProbeEvent::Request { peer, .. },
+                ))) => {
+                    asked = Some(peer);
+                    break;
+                }
+                Poll::Ready(_) => {}
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        println!("REACH autonat probe_now polled");
+        assert_eq!(asked, Some(second), "no probe right after probe_now");
     }
 }
