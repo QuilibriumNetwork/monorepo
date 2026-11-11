@@ -161,12 +161,18 @@ where
 const ANNOUNCE_CHANGE_SETTLE: Duration = Duration::from_secs(60);
 
 /// How long the first publish waits for an address when only AutoNAT can
-/// name one (no announce override, a wildcard listen address): its first
-/// probe runs 15 s after start and usually confirms at once. Publishing
-/// first would hand every peer a record without addresses, replacing the
-/// node's last one, until the confirmation publishes after the settle
-/// window.
-const FIRST_PUBLISH_ADDRESS_WAIT: Duration = Duration::from_secs(120);
+/// name one (no announce override, a wildcard listen address). A first
+/// address needs servers on two IPs: AutoNAT probes 15 s after start, then
+/// every 90 s until it is sure, and an answer may take its 30 s request
+/// timeout, so the third probe, which covers one of the first two going to
+/// a server that does not count, has its answer by 225 s
+/// (`quil_p2p::external_addr::first_address_due`); 15 s of margin on top.
+/// Normally the address comes within a minute: after the first answer the
+/// next probe goes out at once, and it only ever moves probes earlier.
+/// Publishing first would hand every peer a record without addresses,
+/// replacing the node's last one, until the confirmation publishes after
+/// the settle window. The wait ends as soon as the address is accepted.
+const FIRST_PUBLISH_ADDRESS_WAIT: Duration = Duration::from_secs(240);
 
 /// Minimum spacing of change-triggered publishes: a flapping NAT costs at most
 /// one extra PeerInfo per five minutes on top of the regular cadence.
@@ -437,8 +443,8 @@ enum UnconfirmedCause {
     /// the ports are likely not forwarded.
     Unreachable,
     /// Requests fail for a reason unrelated to reachability (`io`,
-    /// `bad_request`, `internal`, `unsupported_protocol`): a port forward
-    /// does not help.
+    /// `bad_request`, `internal`, `unsupported_protocol`,
+    /// `unprobed_address`): a port forward does not help.
     ProbesFailing,
     /// Neither: AutoNAT has not settled, its dial-backs reached no usable
     /// address, or the failures do not tell.
@@ -451,7 +457,7 @@ fn unconfirmed_cause(autonat: &AutonatSummary) -> UnconfirmedCause {
         Some(run)
             if matches!(
                 run.class,
-                "io" | "bad_request" | "internal" | "unsupported_protocol"
+                "io" | "bad_request" | "internal" | "unsupported_protocol" | "unprobed_address"
             ) =>
         {
             UnconfirmedCause::ProbesFailing
@@ -1216,6 +1222,20 @@ mod tests {
             assert_eq!(started.elapsed(), Duration::from_secs(225));
         }
 
+        /// The wait covers AutoNAT's third probe as configured, so a
+        /// change of its timings cannot cut the first publish short.
+        #[test]
+        fn the_first_publish_wait_covers_the_third_probe() {
+            let due = quil_p2p::external_addr::first_address_due();
+            println!("REACH autonat first publish waited");
+            assert!(
+                FIRST_PUBLISH_ADDRESS_WAIT >= due,
+                "first publish wait {FIRST_PUBLISH_ADDRESS_WAIT:?} ends before the third probe's \
+                 answer at {due:?}"
+            );
+            assert_eq!(due, Duration::from_secs(225));
+        }
+
         /// The first confirmation after startup publishes once it settles,
         /// not at the next 30-minute tick.
         #[tokio::test(start_paused = true)]
@@ -1367,7 +1387,13 @@ mod tests {
             use UnconfirmedCause::*;
             assert_eq!(unconfirmed_cause(&failing("dial_error", true)), Unreachable);
             assert_eq!(unconfirmed_cause(&failing("timeout", true)), Unreachable);
-            for class in ["io", "bad_request", "internal", "unsupported_protocol"] {
+            for class in [
+                "io",
+                "bad_request",
+                "internal",
+                "unsupported_protocol",
+                "unprobed_address",
+            ] {
                 assert_eq!(
                     unconfirmed_cause(&failing(class, false)),
                     ProbesFailing,

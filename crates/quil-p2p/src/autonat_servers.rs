@@ -5,7 +5,7 @@
 //! a matching share of the probes, and peers that do not serve AutoNAT are
 //! drawn as well. [`ProbeServers`] registers a peer only once identify shows
 //! that it serves AutoNAT, at most one peer per remote IP (an IPv6 address
-//! counts by its /64), and only peers reached over an address family this
+//! counts by its /48), and only peers reached over an address family this
 //! node listens on, since a server dials back over the family it sees. The
 //! configured archive and bootstrap peers are registered from the start, so
 //! the first probe, 15 s after start, does not wait for identify. AutoNAT
@@ -36,12 +36,14 @@ pub(crate) fn ip_of(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
-/// The operator group of a remote IP: an IPv6 address counts by its /64,
-/// which one site or host typically holds whole.
+/// The operator group of a remote IP: an IPv6 address counts by its /48,
+/// which one site typically holds whole and a tunnel broker hands out for
+/// free. By /64, one holder of a /48 could fill this node's server list
+/// and count as two servers for the address tracker.
 pub(crate) fn ip_group(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 80) - 1))),
     }
 }
 
@@ -178,6 +180,15 @@ impl ProbeServers {
         // A configured peer stays a server: AutoNAT dials it when needed.
         self.capable.remove(&peer);
         self.release(peer)
+    }
+
+    /// The remote IP group (see [`ip_group`]) of `peer`'s open connection
+    /// `conn`, if it is an IP connection.
+    pub(crate) fn ip_of_connection(&self, conn: ConnectionId, peer: PeerId) -> Option<IpAddr> {
+        match self.conns.get(&conn) {
+            Some(&(p, ip)) if p == peer => Some(ip),
+            _ => None,
+        }
     }
 
     /// The remote IP group of server `peer` (see [`ip_group`]), if known.
