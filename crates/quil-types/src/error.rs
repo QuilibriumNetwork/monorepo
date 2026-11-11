@@ -29,6 +29,13 @@ pub enum QuilError {
     #[error("execution unavailable: {0}")]
     StorageSnapshotPending(String),
 
+    /// Storage work done ahead of when it is needed stopped before its end
+    /// when told to, keeping what it did: to give its memory back to more
+    /// urgent work, or as its caller stops. Not a failure: it goes on from
+    /// what it kept when next asked.
+    #[error("stopped: {0}")]
+    StorageWorkStopped(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -132,6 +139,7 @@ impl QuilError {
                 | Self::Io(_)
                 | Self::ExecutionUnavailable(_)
                 | Self::StorageSnapshotPending(_)
+                | Self::StorageWorkStopped(_)
         )
     }
 

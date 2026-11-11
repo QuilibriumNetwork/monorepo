@@ -2448,8 +2448,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     members = builds.len(),
                                     behind = behind.len(),
                                     behind_global = %behind_list,
+                                    behind_releases = %super::committee_builds::behind_releases(&heads, &releases, global_head),
                                     global_head,
-                                    action = "nothing to fix on this node: these members' nodes stopped following GLOBAL, most likely on an outdated release; it ends when their operators upgrade",
+                                    action = super::committee_builds::BEHIND_ACTION,
                                     "app committee members behind GLOBAL"
                                 );
                             }
