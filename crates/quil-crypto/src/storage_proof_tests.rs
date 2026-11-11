@@ -1466,3 +1466,24 @@ fn trees_caps_and_encoding_match_a_scalar_tree_on_any_thread_count() {
         println!("REACH pin-scalar threads={threads}");
     }
 }
+
+#[test]
+fn parent_blocks_give_every_thread_work_on_short_levels() {
+    for width in [1, 4, 8, 16] {
+        for threads in [1, 2, 6, 16, 64] {
+            for parents in [1, 15, 16, 17, 256, 512, 4096, 1 << 20, 20_000_000] {
+                let block = parent_block(parents, width, threads);
+                let blocks = parents.div_ceil(block);
+                assert!(
+                    block.is_multiple_of(width)
+                        && block <= 256 * width
+                        && blocks >= threads.min(parents / 16.max(width)),
+                    "BLOCKS-IDLE parents={parents} width={width} threads={threads} block={block}"
+                );
+            }
+        }
+    }
+    // Whole levels keep their blocks of 256 SIMD groups.
+    assert_eq!(parent_block(20_000_000, 8, 6), 2048, "BLOCKS-WHOLE");
+    println!("REACH parent-block");
+}
