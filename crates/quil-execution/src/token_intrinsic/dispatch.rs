@@ -4,6 +4,7 @@ use super::{custom_mint, state::SnapshotLimits};
 use crate::{domains, hypergraph_state::HypergraphState, token_engine::*};
 use quil_lattice_ct::confidential::relation::backend::{
     worker_client::{ClientError, WorkerVerifier},
+    worker_process::WorkerError,
     worker_request::WorkerRequest,
 };
 #[cfg(test)]
@@ -1269,6 +1270,58 @@ const LONG_VERIFY: std::time::Duration = std::time::Duration::from_secs(60);
 /// 2026-10-29).
 const VERIFY_OVERRUN_FLOOR: std::time::Duration = std::time::Duration::from_secs(900);
 
+/// A verification of a size class measured on this node stops after this many
+/// times the class's mean, at least [`VERIFY_TIMEOUT_FLOOR`], at most the
+/// configured `proofWorker.wallTimeoutSecs`. A stuck child held its queue thread
+/// for the whole 1800 s (2026-11-01: a shard stalled 1855 s), and a verification
+/// beside three others takes twice as long as alone (125 s, 65 s).
+const VERIFY_TIMEOUT_MULTIPLE: f64 = 6.0;
+/// The least a measured class's verification is given: a class also holds
+/// smaller operations than the longest (a 180 KiB one-source shield and a
+/// 175 KiB 96-source one), and a loaded node took 5-8 min (devnet, 2026-10-29).
+const VERIFY_TIMEOUT_FLOOR: std::time::Duration = VERIFY_OVERRUN_FLOOR;
+/// Operations whose verification timed out, remembered so their next attempt
+/// gets the whole configured deadline; past it the oldest is forgotten.
+const TIMED_OUT_ENTRIES: usize = 1024;
+static TIMED_OUT: std::sync::Mutex<Option<VerdictSet>> = std::sync::Mutex::new(None);
+
+/// The deadline of a verification whose size class measures `class_micros` (0:
+/// not yet), when the node may give it at most `ceiling`. An unmeasured class,
+/// and an operation that already timed out, get `ceiling`: only accepted
+/// verdicts teach the estimate, so a deadline that never grew would refuse a
+/// slower node's verifications for good.
+fn verify_timeout(
+    class_micros: u64,
+    floor: std::time::Duration,
+    ceiling: std::time::Duration,
+    timed_out: bool,
+) -> std::time::Duration {
+    if class_micros == 0 || timed_out {
+        return ceiling;
+    }
+    std::time::Duration::from_secs_f64(class_micros as f64 / 1e6 * VERIFY_TIMEOUT_MULTIPLE)
+        .max(floor)
+        .min(ceiling)
+}
+
+fn timed_out_before(key: &[u8; 32]) -> bool {
+    TIMED_OUT
+        .lock()
+        .ok()
+        .is_some_and(|set| set.as_ref().is_some_and(|set| set.keys.contains(key)))
+}
+
+fn note_timed_out(key: [u8; 32], timed_out: bool) {
+    if let Ok(mut set) = TIMED_OUT.lock() {
+        let set = set.get_or_insert_with(VerdictSet::default);
+        if timed_out {
+            set.insert(key, TIMED_OUT_ENTRIES);
+        } else {
+            set.remove(&key);
+        }
+    }
+}
+
 /// When a verification estimated at `estimate_secs` has overrun.
 fn overrun_after(estimate_secs: f64) -> std::time::Duration {
     std::time::Duration::from_secs_f64((2.0 * estimate_secs).max(0.0)).max(VERIFY_OVERRUN_FLOOR)
@@ -1412,16 +1465,67 @@ fn worker_verdict(
     limits: CompileLimits,
     budget: NativeBudget,
 ) -> std::result::Result<bool, ClientError> {
+    worker_verdict_above(
+        VERIFY_TIMEOUT_FLOOR,
+        worker,
+        network,
+        application,
+        bytes,
+        limits,
+        budget,
+    )
+}
+
+/// [`worker_verdict`] whose deadline is at least `floor`. A timeout is local
+/// unavailability like a busy worker, never a verdict: the queue retries it, up
+/// to its failure bound, and the next attempt gets the whole configured
+/// deadline, so at worst this takes what a fixed deadline took.
+fn worker_verdict_above(
+    floor: std::time::Duration,
+    worker: &WorkerVerifier,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    bytes: &[u8],
+    limits: CompileLimits,
+    budget: NativeBudget,
+) -> std::result::Result<bool, ClientError> {
+    let key = verdict_key(network, application, bytes, limits, budget);
+    let timeout = verify_timeout(
+        VERIFY_CLASS_EWMA_MICROS[verify_class(bytes.len())]
+            .load(std::sync::atomic::Ordering::Relaxed),
+        floor,
+        worker.wall_timeout(),
+        timed_out_before(&key),
+    );
     let start = std::time::Instant::now();
-    let accepted = watched_verification(application, bytes.len(), || {
-        worker.verify(&WorkerRequest {
-            network: *network,
-            application: *application,
-            limits,
-            submission_bytes: budget.max_native_bytes,
-            transaction: bytes,
-        })
-    })?;
+    let outcome = watched_verification(application, bytes.len(), || {
+        worker.verify_within(
+            &WorkerRequest {
+                network: *network,
+                application: *application,
+                limits,
+                submission_bytes: budget.max_native_bytes,
+                transaction: bytes,
+            },
+            timeout,
+        )
+    });
+    if matches!(outcome, Err(ClientError::Process(WorkerError::Timeout))) {
+        note_timed_out(key, true);
+        tracing::warn!(
+            scope = "this node's proof worker",
+            application = %hex::encode(&application[..8]),
+            operation_bytes = bytes.len(),
+            timeout_secs = timeout.as_secs(),
+            ceiling_secs = worker.wall_timeout().as_secs(),
+            estimate_secs = estimated_verify_secs(bytes.len()).round() as u64,
+            action = "retried with the whole proofWorker.wallTimeoutSecs; if this repeats, check this \
+                      node's CPU and memory and the proof worker",
+            "confidential proof verification timed out and its child was killed"
+        );
+    }
+    let accepted = outcome?;
+    note_timed_out(key, false);
     if accepted {
         record_duration(bytes.len(), start.elapsed());
     }
@@ -1431,6 +1535,10 @@ fn worker_verdict(
 #[cfg(test)]
 #[path = "dispatch_estimate_tests.rs"]
 mod estimate_tests;
+
+#[cfg(test)]
+#[path = "dispatch_timeout_tests.rs"]
+mod timeout_tests;
 
 /// What [`TokenPolicy::preverify`] made of one operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

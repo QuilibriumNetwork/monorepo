@@ -833,12 +833,15 @@ impl TokenExecutionEngine {
     }
 
     /// The per-frame verification budget, in worker-seconds (budget seconds
-    /// times the worker's concurrency); `None` without a configured worker.
+    /// times the slots it counts, [`WorkerVerifier::budget_concurrency`]);
+    /// `None` without a configured worker.
+    ///
+    /// [`WorkerVerifier::budget_concurrency`]: quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::budget_concurrency
     #[cfg(feature = "native-proof")]
     pub fn verification_budget(&self) -> Option<f64> {
         self.token_worker.as_ref().map(|worker| {
             crate::token_intrinsic::dispatch::verification_budget_secs()
-                * worker.concurrency().max(1) as f64
+                * worker.budget_concurrency().max(1) as f64
         })
     }
 
@@ -847,9 +850,9 @@ impl TokenExecutionEngine {
     #[cfg(feature = "native-proof")]
     pub fn verification_capacity(&self) -> usize {
         match self.token_worker.as_ref() {
-            Some(worker) => {
-                crate::token_intrinsic::dispatch::frame_verification_capacity(worker.concurrency())
-            }
+            Some(worker) => crate::token_intrinsic::dispatch::frame_verification_capacity(
+                worker.budget_concurrency(),
+            ),
             None => usize::MAX,
         }
     }

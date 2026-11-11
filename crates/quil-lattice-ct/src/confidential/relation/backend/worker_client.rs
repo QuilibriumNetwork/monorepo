@@ -143,6 +143,8 @@ pub struct WorkerVerifier {
     worker_mode_arg: Option<&'static str>,
     /// A background verification (see [`Self::background`]).
     background: bool,
+    /// Slots a frame's verification budget counts; `None`: all of them.
+    budget_slots: Option<usize>,
 }
 
 /// Node-wide admission: one lock file per slot (`<path>` for slot 0, then
@@ -223,6 +225,7 @@ impl WorkerVerifier {
             max_resident_bytes: None,
             worker_mode_arg: None,
             background: false,
+            budget_slots: None,
         })
     }
 
@@ -260,6 +263,18 @@ impl WorkerVerifier {
         Ok(self)
     }
 
+    /// Count `slots` (1..=64) of this client's slots in a frame's verification
+    /// budget ([`Self::budget_concurrency`]) rather than all of them. What a
+    /// proposal's budget admits its members verify inline, so a node sized
+    /// to its machine does not ask more of members with smaller ones.
+    pub fn with_budget_slots(mut self, slots: usize) -> Result<Self, ClientError> {
+        if !(1..=64).contains(&slots) {
+            return Err(ClientError::Configuration);
+        }
+        self.budget_slots = Some(slots);
+        Ok(self)
+    }
+
     /// Cap the native aggregation threads of each child (1..=8). With N
     /// concurrent children, N × threads should not exceed the machine's cores.
     pub fn with_native_threads(mut self, threads: u8) -> Result<Self, ClientError> {
@@ -273,6 +288,19 @@ impl WorkerVerifier {
     /// Number of verifications this client admits concurrently.
     pub fn concurrency(&self) -> usize {
         self.slots.max
+    }
+
+    /// The slots a frame's verification budget counts: at most this client's
+    /// own ([`Self::with_budget_slots`]).
+    pub fn budget_concurrency(&self) -> usize {
+        self.budget_slots
+            .unwrap_or(self.slots.max)
+            .min(self.slots.max)
+    }
+
+    /// The configured wall-clock deadline of one verification.
+    pub fn wall_timeout(&self) -> Duration {
+        self.wall_timeout
     }
 
     /// A clone that waits and is accounted in its own fairness lane. Give each
@@ -420,6 +448,17 @@ impl WorkerVerifier {
     /// check authorization, canonical state/root eligibility, fees and replay.
     /// The permit remains held through worker exit and input-thread cleanup.
     pub fn verify(&self, request: &WorkerRequest<'_>) -> Result<bool, ClientError> {
+        self.verify_within(request, self.wall_timeout)
+    }
+
+    /// [`Self::verify`] with a wall-clock deadline of `timeout`, at most the
+    /// configured one. The deadline starts once a slot is held, so waiting
+    /// for one does not count.
+    pub fn verify_within(
+        &self,
+        request: &WorkerRequest<'_>,
+        timeout: Duration,
+    ) -> Result<bool, ClientError> {
         let deadline = Instant::now() + self.admission_wait;
         let _permit = self.acquire_local(deadline)?;
         let _shared = self
@@ -432,7 +471,7 @@ impl WorkerVerifier {
         run_worker_capped(
             self.command(),
             &bytes,
-            self.wall_timeout,
+            timeout.min(self.wall_timeout),
             self.max_resident_bytes,
         )
         .map_err(ClientError::Process)
@@ -869,6 +908,112 @@ mod tests {
         assert!(shared(&single).is_ok());
         drop((one, two, frames, single));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// However many processes a node runs and whatever count each chose,
+    /// background verifications together hold fewer slots than the largest
+    /// count: each process sizes its queue alone, and the files bound the node.
+    #[cfg(unix)]
+    #[test]
+    fn a_nodes_processes_together_stay_within_its_slots() {
+        let directory =
+            std::env::temp_dir().join(format!("quil-admission-node-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let client = |slots: usize| {
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_concurrency(slots)
+                .unwrap()
+                .with_shared_admission(directory.join("slots"))
+                .unwrap()
+                .background()
+        };
+        let clients: Vec<WorkerVerifier> = (0..8).map(|_| client(4)).collect();
+        let mut held = Vec::new();
+        for verifier in &clients {
+            if let Ok(permit) =
+                acquire_shared_for(verifier.shared_admission.as_deref().unwrap(), true)
+            {
+                held.push(permit);
+            }
+        }
+        assert_eq!(
+            held.len(),
+            3,
+            "8 processes of a 4-slot node verified past its 3"
+        );
+        // A process that chose fewer takes no more than its own.
+        let fewer = client(2);
+        assert!(acquire_shared_for(fewer.shared_admission.as_deref().unwrap(), true).is_err());
+        drop(held);
+        drop((clients, fewer));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_verification_stops_at_the_earlier_of_its_deadline_and_the_configured_one() {
+        let directory =
+            std::env::temp_dir().join(format!("quil-verify-within-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("slow.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nsleep 1\nexit {}\n",
+                super::super::worker_process::VALID_EXIT
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let request = WorkerRequest {
+            network: [1; 32],
+            application: [2; 32],
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            },
+            submission_bytes: 1 << 20,
+            transaction: &[7; 16],
+        };
+        let verifier = WorkerVerifier::new(script.clone(), 5, Duration::from_secs(30)).unwrap();
+        assert_eq!(verifier.wall_timeout(), Duration::from_secs(30));
+        assert!(matches!(
+            verifier.verify_within(&request, Duration::from_millis(100)),
+            Err(ClientError::Process(WorkerError::Timeout))
+        ));
+        assert!(matches!(
+            verifier.verify_within(&request, Duration::from_secs(20)),
+            Ok(true)
+        ));
+        // Never past the configured deadline.
+        let short = WorkerVerifier::new(script, 5, Duration::from_millis(100)).unwrap();
+        assert!(matches!(
+            short.verify_within(&request, Duration::from_secs(20)),
+            Err(ClientError::Process(WorkerError::Timeout))
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_budget_counts_at_most_the_clients_slots() {
+        let client =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_concurrency(8)
+                .unwrap();
+        assert_eq!(client.budget_concurrency(), 8);
+        let client = client.with_budget_slots(2).unwrap();
+        assert_eq!((client.budget_concurrency(), client.concurrency()), (2, 8));
+        assert_eq!(client.background().budget_concurrency(), 2);
+        let client = client.with_concurrency(1).unwrap();
+        assert_eq!(client.budget_concurrency(), 1);
+        assert!(client.clone().with_budget_slots(0).is_err());
+        assert!(client.with_budget_slots(65).is_err());
     }
 
     #[test]

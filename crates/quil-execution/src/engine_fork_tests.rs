@@ -291,6 +291,38 @@ fn fork_rejects_unfinished_state_and_ancillary_message_changes_for_every_engine(
 }
 
 #[cfg(feature = "native-proof")]
+/// A node sized to its machine asks of a frame what two slots verify: its
+/// proposals' budget is what members with fewer slots verify inline.
+#[test]
+fn the_frame_budget_counts_the_budget_slots_not_the_machine() {
+    let worker =
+        quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::new(
+            std::path::PathBuf::from("/unused/execution-budget-test-worker"),
+            10,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .with_concurrency(8)
+        .unwrap();
+    let policy = crate::token_intrinsic::dispatch::TokenPolicy::for_network(9);
+    let build = |worker| {
+        token(memory_crdt())
+            .with_token_proofs(policy)
+            .unwrap()
+            .with_token_worker(worker)
+            .unwrap()
+    };
+    let whole = build(worker.clone());
+    let two = build(worker.with_budget_slots(2).unwrap());
+    let secs = crate::token_intrinsic::dispatch::verification_budget_secs();
+    assert_eq!(whole.verification_budget(), Some(8.0 * secs));
+    assert_eq!(two.verification_budget(), Some(2.0 * secs));
+    assert_eq!(
+        two.verification_capacity(),
+        crate::token_intrinsic::dispatch::frame_verification_capacity(2)
+    );
+}
+
 #[test]
 fn fork_keeps_configured_token_limits_and_worker_capacity() {
     let mut policy = crate::token_intrinsic::dispatch::TokenPolicy::for_network(9);
