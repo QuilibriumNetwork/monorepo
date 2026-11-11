@@ -378,6 +378,14 @@ pub(crate) fn build_node_worker_as(
     let Some(worker) = build_worker(proof, slots)? else {
         return Ok(None);
     };
+    #[cfg(target_os = "macos")]
+    let worker = worker.with_memory_admission(std::sync::Arc::new(|deadline| {
+        // The measured depth-32 child peak is 2.73 GB; reserve 3 GiB from
+        // the same scheduler and host ledger as storage creation. Keep the
+        // permit through process exit, including failures and timeouts.
+        quil_engine::storage_jobs::reserve_verifier_until(3 << 30, deadline)
+            .map(|permit| Box::new(permit) as _)
+    }));
     let base = if config.db.path.is_empty() {
         PathBuf::from(".config/store")
     } else {

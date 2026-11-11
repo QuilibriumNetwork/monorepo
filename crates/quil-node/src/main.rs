@@ -1341,6 +1341,10 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         };
     }
 
+    // Resolve memory policy from local worker density before any storage
+    // jobs start, including those in standalone worker processes.
+    quil_engine::storage_jobs::set_memory_worker_count(config.engine.data_worker_count);
+
     // What this process runs with, as used: defaults applied, `QUIL_*`
     // overrides resolved. The master and each standalone worker log their own.
     {

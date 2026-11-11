@@ -2746,6 +2746,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         // memory watch subtracts from `allocated_mb`.
                         labelling_buffers_mb = %crate::mem_stats::fmt_mb(
                             quil_engine::storage_jobs::held_bytes()
+                                .saturating_sub(quil_engine::storage_jobs::verifier_bytes())
+                        ),
+                        verifier_reserved_mb = %crate::mem_stats::fmt_mb(
+                            quil_engine::storage_jobs::verifier_bytes()
                         ),
                         "memory snapshot"
                     );

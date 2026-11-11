@@ -111,6 +111,16 @@ pub fn chunk_leaves() -> usize {
         .unwrap_or(24)
 }
 
+fn memory_leaf_limit(configured: usize, all_native: bool, constrained: bool) -> usize {
+    // Legacy AIR work scales with sealed leaves. Persistent native seals do
+    // not allocate that AIR, so keep their efficient message-sized batches.
+    if constrained && !all_native {
+        configured.min(2)
+    } else {
+        configured
+    }
+}
+
 /// What a proof's STARK takes of its message, at most (about 0.75–1 MB).
 const STARK_ALLOWANCE: usize = 5 << 18;
 
@@ -1186,6 +1196,7 @@ impl<'a> Cursor<'a> {
 /// chunks of at most `leaves` sealed leaves and `bytes` of parts, each shard
 /// once, in order.
 fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<PreparedSeat>> {
+    let constrained = crate::storage_jobs::constrained_memory();
     let native = |seat: &PreparedSeat| {
         !seat.part.settles
             && !seat.claim.seals.is_empty()
@@ -1234,8 +1245,11 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
         let repeated = open
             .iter()
             .any(|held| held.part.shard_filter == seat.part.shard_filter);
-        let budget = limit(native(&seat) && open.iter().all(&native));
-        if !open.is_empty() && (repeated || weight + seat.weight() > leaves || size + part > budget)
+        let all_native = native(&seat) && open.iter().all(&native);
+        let budget = limit(all_native);
+        let leaf_limit = memory_leaf_limit(leaves, all_native, constrained);
+        if !open.is_empty()
+            && (repeated || weight + seat.weight() > leaf_limit || size + part > budget)
         {
             out.push(std::mem::take(&mut open));
             (weight, size) = (0, 0);
@@ -1736,6 +1750,13 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_small_hosts_legacy_batches_shrink_without_fragmenting_native_seals() {
+        assert_eq!(super::memory_leaf_limit(24, false, true), 2);
+        assert_eq!(super::memory_leaf_limit(1, false, true), 1);
+        assert_eq!(super::memory_leaf_limit(24, true, true), 24);
+        assert_eq!(super::memory_leaf_limit(24, false, false), 24);
+    }
     use super::*;
     use quil_execution::global_intrinsic::storage_epoch_proof::SealedLeaf;
 

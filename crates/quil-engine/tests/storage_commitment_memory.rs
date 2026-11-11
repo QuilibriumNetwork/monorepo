@@ -85,6 +85,39 @@ fn registration_root(tree: &MerkleTree) -> Vec<u8> {
 const MEMBER: [u8; 32] = [0x5A; 32];
 const FILTER: [u8; 35] = [0x3C; 35];
 
+/// Count the raw input too: ownership should release it before the packed
+/// replica is serialized. Check actual allocations, not just the estimate.
+#[test]
+fn owned_snapshot_encoding_reduces_the_measured_peak() {
+    use quil_crypto::{storage_hash, storage_proof};
+    let n = 1 << 18;
+    let raw = vec![17u8; n * storage_hash::DATA_BYTES_PER_NODE];
+    let labels = vec![storage_hash::ZERO; n];
+    let encode = |owned: bool| {
+        let input = raw.clone();
+        if owned {
+            storage_proof::encode_owned_with_labels(input, n as u64, &labels, [0; 32])
+        } else {
+            storage_proof::encode_with_labels(&input, n as u64, &labels, [0; 32])
+        }
+        .unwrap()
+    };
+    // Initialize Rayon and lazy hash tables before counting either path.
+    drop(encode(false));
+    let (borrowed, before) = measured(|| encode(false));
+    let (owned, after) = measured(|| encode(true));
+    assert_eq!(owned.replica, borrowed.replica);
+    assert_eq!(owned.registration_root(), borrowed.registration_root());
+    assert!(
+        before >= after + raw.len() / 2,
+        "owned encode did not release its raw payload: borrowed peak {before}, owned {after}"
+    );
+    eprintln!(
+        "snapshot encode peak: borrowed={before} owned={after} payload={}",
+        raw.len()
+    );
+}
+
 struct Leaf {
     leaf_id: Vec<u8>,
     nodes: Vec<u8>,

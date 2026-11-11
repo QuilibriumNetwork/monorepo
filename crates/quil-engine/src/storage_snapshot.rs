@@ -500,12 +500,28 @@ impl Captured {
 
 /// Peak bytes encoding a leaf of `nodes` nodes holds.
 pub(crate) fn encoding_bytes(nodes: u64) -> u64 {
-    quil_crypto::storage_proof::labelling_peak_bytes(nodes, &quil_crypto::sdr::SdrParams::default())
+    let params = quil_crypto::sdr::SdrParams::default();
+    if crate::storage_jobs::constrained_memory() {
+        // A cold encode reads the canonical payload while retaining its last
+        // label layer. Persistent/cached paths can read the payload first.
+        quil_crypto::storage_proof::encoding_owned_with_labels_bytes(nodes)
+            .saturating_add(nodes.saturating_mul(quil_crypto::storage_proof::NODE_BYTES as u64))
+            .max(
+                quil_crypto::storage_proof::label_leaf_peak_bytes_with_budget(
+                    nodes,
+                    &params,
+                    crate::storage_jobs::label_scratch_bytes(nodes, &params),
+                ),
+            )
+    } else {
+        quil_crypto::storage_proof::labelling_peak_bytes(nodes, &params)
+    }
 }
 
 /// The data bytes of a leaf whose entries' values come to `size` bytes,
 /// before it is read: a quarter more for the index, whose size the values'
 /// does not tell.
+#[cfg(test)]
 fn estimated_leaf_bytes(size: u128) -> u64 {
     let size = u64::try_from(size).unwrap_or(u64::MAX);
     size.saturating_add(size / 4)
@@ -1236,15 +1252,26 @@ fn encode_member_until(
                     LeafCount::Waiting,
                 )
         };
-        let memory = crate::storage_jobs::reserve_until(
-            encoding_bytes(data_node_count(estimated_leaf_bytes(size))),
-            &|| stop() || late(),
-        );
+        // Count canonical records and index bytes before allocating them.
+        // Values alone can underestimate an index-heavy snapshot, and growing
+        // a reservation after reading it cannot undo the memory peak.
+        let layout_nodes = captured.node_count(prefix)?;
+        // Labels can finish at a padded count while this job waits. Reserve
+        // the largest allowed count, so finding them never enlarges a held
+        // reservation after the payload has already been allocated.
+        let planned_nodes = quil_crypto::storage_proof::max_padded_nodes(layout_nodes);
+        let memory =
+            crate::storage_jobs::reserve_until(encoding_bytes(planned_nodes), &|| stop() || late());
         let Some(mut memory) = memory.filter(|_| !stop()) else {
             return Err(stopped());
         };
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
+        if exact != layout_nodes {
+            return Err(unavailable(
+                "snapshot layout changed before encoding".into(),
+            ));
+        }
         // Labels kept that are not whole are labelled again rather than
         // encoded from: a registration from them could never be sealed.
         let ahead = store.and_then(|store| {
@@ -1296,7 +1323,7 @@ fn encode_member_until(
         let nodes = ahead.as_ref().map_or(count, |(labels, _)| labels.n);
         memory.resize(ahead.as_ref().map_or_else(
             || encoding_bytes(nodes),
-            |(labels, _)| quil_crypto::storage_proof::encoding_with_labels_bytes(labels.n),
+            |(labels, _)| quil_crypto::storage_proof::encoding_owned_with_labels_bytes(labels.n),
         ));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
@@ -1317,8 +1344,15 @@ fn encode_member_until(
                 LeafWork::LabellingNow
             },
         );
+        let mut data = Some(data);
         let from_kept = ahead.and_then(|(kept, last)| {
-            quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
+            quil_crypto::storage_proof::encode_owned_with_labels(
+                data.take().expect("snapshot payload"),
+                kept.n,
+                &last,
+                kept.comm_c,
+            )
+            .ok()
         });
         let ahead = from_kept.is_some();
         if !ahead {
@@ -1330,7 +1364,6 @@ fn encode_member_until(
         // labels cannot be written, encoded as by a process that keeps no
         // labels, and its seal labels it again: a failed write does not fail
         // the snapshot, whose retry would label every leaf again.
-        let mut data = Some(data);
         if from_kept.is_none() {
             data.take();
         }
@@ -1417,7 +1450,7 @@ fn encode_member_until(
                     }
                 };
                 let fresh = captured.leaf_data(prefix)?;
-                quil_crypto::storage_proof::encode_with_labels(&fresh, n, &last, comm_c)
+                quil_crypto::storage_proof::encode_owned_with_labels(fresh, n, &last, comm_c)
                     .map_err(QuilError::Internal)?
             }
         };

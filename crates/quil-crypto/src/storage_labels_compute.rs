@@ -240,17 +240,22 @@ enum Columns {
     Disk { file: File, n: usize },
 }
 impl Columns {
-    fn new(n: usize, budget: u64) -> Self {
+    fn new(n: usize, budget: u64) -> std::io::Result<Self> {
+        Self::new_with(n, budget, scratch_file)
+    }
+
+    fn new_with(
+        n: usize,
+        budget: u64,
+        create: impl FnOnce() -> std::io::Result<File>,
+    ) -> std::io::Result<Self> {
         if !resident_columns(n, budget) {
-            if let Ok(file) = scratch_file().and_then(|file| {
-                file.set_len((n * hash::DIGEST_BYTES) as u64)?;
-                Ok(file)
-            }) {
-                return Self::Disk { file, n };
-            }
+            let file = create()?;
+            file.set_len((n * hash::DIGEST_BYTES) as u64)?;
+            return Ok(Self::Disk { file, n });
         }
         COMPUTE_COUNTS[3].fetch_add(1, Ordering::Relaxed);
-        Self::Memory(vec![hash::ZERO; n])
+        Ok(Self::Memory(vec![hash::ZERO; n]))
     }
     fn update(&mut self, layer: &[Digest]) -> std::io::Result<()> {
         match self {
@@ -387,7 +392,13 @@ pub(crate) fn label_resume(
     if stop() {
         return None;
     }
-    let mut columns = Columns::new(n, memory_budget());
+    let mut columns = match Columns::new(n, memory_budget()) {
+        Ok(columns) => columns,
+        Err(error) => {
+            tracing::warn!(%error, "storage label scratch I/O failed; no unreserved column buffer allocated");
+            return None;
+        }
+    };
     let mut prev = vec![hash::ZERO; n];
     for layer in 0..kept {
         if stop() || !read_layer(layer, &mut prev) {
@@ -533,7 +544,7 @@ fn compute(requests: &[Request]) -> std::io::Result<()> {
     let mut columns: Vec<_> = requests
         .iter()
         .map(|r| Columns::new(r.n, r.memory_budget))
-        .collect();
+        .collect::<std::io::Result<Vec<_>>>()?;
     let zero = [Packed::ZERO; 8];
     let key: PackedDigest = std::array::from_fn(|j| {
         Packed::from_fn(|lane| requests.get(lane).map_or(hash::ZERO[j], |r| r.key[j]))
@@ -699,7 +710,7 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
     if request.cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let mut columns = Columns::new(request.n, request.memory_budget);
+    let mut columns = Columns::new(request.n, request.memory_budget)?;
     let mut prev = Arc::new(vec![hash::ZERO; request.n]);
     let mut cur = vec![hash::ZERO; request.n];
     for layer in 0..layers {
@@ -741,6 +752,14 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_column_scratch_never_falls_back_to_unreserved_memory() {
+        let result = Columns::new_with(73, 0, || Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert!(matches!(result, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied));
+        let resident =
+            Columns::new_with(73, 73 * 32, || panic!("resident columns need no file")).unwrap();
+        assert!(matches!(resident, Columns::Memory(_)));
+    }
     #[test]
     fn concurrent_builders_share_one_resident_graph_and_cancellation_does_not_poison_it() {
         let key = GraphKey {
