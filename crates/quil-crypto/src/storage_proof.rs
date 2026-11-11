@@ -774,6 +774,15 @@ pub fn encoding_with_labels_bytes(n: u64) -> u64 {
         .saturating_add(4 << 20)
 }
 
+/// An owned input is freed after packing, before serializing the replica.
+/// Four layers also cover reading the canonical payload from its entries
+/// before loading labels. Reading it with labels already held needs another
+/// layer, which the snapshot's cold-encode reservation adds.
+pub fn encoding_owned_with_labels_bytes(n: u64) -> u64 {
+    n.saturating_mul((4 * NODE_BYTES) as u64)
+        .saturating_add(4 << 20)
+}
+
 /// Conservative encoding / dense-seal peak for a leaf of `n` nodes. Resident graph and column scratch is included even when shared.
 pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
@@ -796,6 +805,29 @@ pub fn label_leaf_peak_bytes(n: u64, params: &SdrParams) -> u64 {
         let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
         n.saturating_mul((3 * NODE_BYTES + parents) as u64)
     }
+}
+
+/// Peak with a bounded resident scratch budget. Two layers plus resident
+/// columns, or two layers including the final disk-column readback. The public
+/// parent graph is resident only when it fits after the column accumulator.
+/// A failed graph scratch file falls back to deriving parents, not a full
+/// in-memory graph. A failed column scratch file fails without allocating an
+/// unreserved layer.
+pub fn label_leaf_peak_bytes_with_budget(n: u64, params: &SdrParams, budget: u64) -> u64 {
+    if !params.optimized() {
+        return label_leaf_peak_bytes(n, params);
+    }
+    let layer = n.saturating_mul(NODE_BYTES as u64);
+    let columns = if layer <= budget { layer } else { 0 };
+    let graph = n.saturating_mul(4 * (params.drg_degree + params.expander_degree) as u64);
+    layer
+        .saturating_mul(if columns > 0 { 3 } else { 2 })
+        .saturating_add(if graph <= budget.saturating_sub(columns) {
+            graph
+        } else {
+            0
+        })
+        .saturating_add(4 << 20)
 }
 
 /// Nodes a registration may pad a leaf's data with, with zeros, beyond its
@@ -962,7 +994,28 @@ pub fn encode_with_labels(
     last: &[Digest],
     comm_c: Node,
 ) -> Result<EncodedLeaf, String> {
-    let mut data = packed_data(data);
+    encode_packed_with_labels(packed_data(data), n, last, comm_c)
+}
+
+/// [`encode_with_labels`] releasing its raw input before the replica and
+/// serialized output coexist. Commitments and replica bytes are unchanged.
+pub fn encode_owned_with_labels(
+    data: Vec<u8>,
+    n: u64,
+    last: &[Digest],
+    comm_c: Node,
+) -> Result<EncodedLeaf, String> {
+    let packed = packed_data(&data);
+    drop(data);
+    encode_packed_with_labels(packed, n, last, comm_c)
+}
+
+fn encode_packed_with_labels(
+    mut data: Vec<Digest>,
+    n: u64,
+    last: &[Digest],
+    comm_c: Node,
+) -> Result<EncodedLeaf, String> {
     if n >= MAX_NODES || (n as usize) < data.len() || last.len() as u64 != n {
         return Err(format!(
             "labels of {} nodes at {n} for data of {}",

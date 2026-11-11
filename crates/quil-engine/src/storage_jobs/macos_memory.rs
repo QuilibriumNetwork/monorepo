@@ -2,13 +2,14 @@
 //!
 //! sysinfo 0.37 subtracts compressor pages from free + inactive + purgeable
 //! pages on macOS. That can saturate to zero while the kernel reports normal
-//! pressure. Counting only free pages also misses memory macOS can reclaim
-//! through compression and swap. Instead, while pressure is normal, budget
-//! non-wired physical capacity minus this process's dirty/compressed footprint.
+//! pressure. Budget free, file-backed and purgeable physical pages instead,
+//! without lending other applications' anonymous pages or subtracting the
+//! compressor a second time. Keep headroom for the OS, and bound the result
+//! by physical capacity minus this process's dirty/compressed footprint.
 //! Admission applies its usual 75% share and accounts for outstanding jobs.
-//! This is a scheduling budget, not a promise of immediately free RAM: the
-//! kernel can reclaim other applications' pages. Warning/critical pressure
-//! stops additional admission; running work drains normally.
+//! Warning/critical pressure stops additional admission; running work drains.
+//! Page-counter definitions: Apple's osfmk/mach/vm_statistics.h. Speculative
+//! pages already belong to free_count and must not be added again.
 //!
 //! Apple exports dispatch values (normal=1, warning=2, critical=4) via this
 //! sysctl, rather than its internal pressure enum (normal=0):
@@ -20,6 +21,8 @@ pub(super) struct Snapshot {
     pub wired: u64,
     /// Includes compressed dirty pages, unlike resident size alone.
     pub footprint: u64,
+    /// Free + file-backed + purgeable pages, without speculative duplication.
+    pub reclaimable: u64,
     pub pressure: u32,
 }
 
@@ -32,6 +35,10 @@ impl Snapshot {
         self.total
             .saturating_sub(self.wired)
             .saturating_sub(self.footprint)
+            .min(self.reclaimable)
+            // Admission leaves another 25% of this budget unused. This
+            // additional floor covers host growth while a job starts.
+            .saturating_sub((self.total / 32).clamp(256 << 20, 1 << 30))
     }
 }
 
@@ -110,6 +117,10 @@ fn snapshot() -> Option<Snapshot> {
         total,
         wired: u64::from(vm.wire_count).saturating_mul(page_size as u64),
         footprint: usage.ri_phys_footprint,
+        reclaimable: u64::from(vm.free_count)
+            .saturating_add(u64::from(vm.external_page_count))
+            .saturating_add(u64::from(vm.purgeable_count))
+            .saturating_mul(page_size as u64),
         pressure,
     })
 }
@@ -120,6 +131,35 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
+    fn a_small_mac_does_not_lend_other_applications_anonymous_memory() {
+        let mac = Snapshot {
+            total: 16 * GIB,
+            wired: 2 * GIB,
+            footprint: 4 * GIB,
+            reclaimable: 3 * GIB,
+            pressure: 1,
+        };
+        // The old capacity-minus-own-footprint rule offered 10 GiB here.
+        assert_eq!(mac.headroom(), 3 * GIB - GIB / 2);
+        assert_eq!(
+            Snapshot {
+                reclaimable: 256 << 20,
+                ..mac
+            }
+            .headroom(),
+            0
+        );
+        assert_eq!(
+            Snapshot {
+                footprint: 15 * GIB,
+                ..mac
+            }
+            .headroom(),
+            0
+        );
+    }
+
+    #[test]
     fn compressed_pages_do_not_turn_normal_pressure_into_zero_capacity() {
         // The failing host had ~25 GiB in its compressor and ~17 GiB in
         // free/inactive/purgeable pages: sysinfo reported zero available.
@@ -127,9 +167,10 @@ mod tests {
             total: 64 * GIB,
             wired: 7 * GIB,
             footprint: 3 * GIB,
+            reclaimable: 17 * GIB,
             pressure: 1,
         };
-        assert!(normal.headroom() > 9 * 3_649_044_480 * 100 / 75);
+        assert_eq!(normal.headroom(), 16 * GIB);
         // The process's own compressed allocations remain charged even if
         // macOS has reduced its RSS, and kernel wired memory is unavailable.
         assert_eq!(
@@ -138,7 +179,7 @@ mod tests {
                 ..normal
             }
             .headroom(),
-            7 * GIB
+            6 * GIB
         );
         assert_eq!(
             Snapshot {
@@ -158,6 +199,7 @@ mod tests {
                     total: 64 * GIB,
                     wired: 0,
                     footprint: 0,
+                    reclaimable: 16 * GIB,
                     pressure
                 }
                 .headroom(),

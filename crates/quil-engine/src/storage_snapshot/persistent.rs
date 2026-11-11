@@ -720,8 +720,9 @@ pub(super) fn encode_leaf(
     if stop() {
         return Err(unavailable("persistent snapshot stopped".into()));
     }
-    let _memory = crate::storage_jobs::reserve_until(proof::encoding_with_labels_bytes(n), stop)
-        .ok_or_else(|| unavailable("persistent encoding stopped waiting for memory".into()))?;
+    let _memory =
+        crate::storage_jobs::reserve_until(proof::encoding_owned_with_labels_bytes(n), stop)
+            .ok_or_else(|| unavailable("persistent encoding stopped waiting for memory".into()))?;
     let data = captured.leaf_data(prefix)?;
     if proof::data_node_count(data.len() as u64) != exact {
         return Err(unavailable(
@@ -753,7 +754,7 @@ pub(super) fn encode_leaf(
         ));
     }
     let last = found?;
-    let encoded = proof::encode_with_labels(&data, n, &last, sector.cert.labels)
+    let encoded = proof::encode_owned_with_labels(data, n, &last, sector.cert.labels)
         .map_err(QuilError::InvalidArgument)?;
     let root = sector::Registration {
         profile: sector.cert.profile,

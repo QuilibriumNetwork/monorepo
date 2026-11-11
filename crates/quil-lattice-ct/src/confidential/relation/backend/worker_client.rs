@@ -60,6 +60,12 @@ pub fn take_longest_slot_hold() -> Duration {
 /// a stalled verifier cannot accumulate blocked threads without bound.
 const MAX_WAITERS_PER_SLOT: usize = 4;
 
+/// A caller's memory reservation, held until the child has exited. Keeping
+/// admission behind a callback lets the node share its storage-job budget
+/// without coupling this verifier client to the engine.
+pub type MemoryPermit = Box<dyn Send>;
+pub type MemoryAdmission = dyn Fn(Instant) -> Option<MemoryPermit> + Send + Sync;
+
 /// In-process admission slots shared by every clone of one client.
 ///
 /// Callers that may wait are served fairly across LANES (one per execution
@@ -145,6 +151,7 @@ pub struct WorkerVerifier {
     background: bool,
     /// Slots a frame's verification budget counts; `None`: all of them.
     budget_slots: Option<usize>,
+    memory_admission: Option<Arc<MemoryAdmission>>,
 }
 
 /// Node-wide admission: one lock file per slot (`<path>` for slot 0, then
@@ -226,6 +233,7 @@ impl WorkerVerifier {
             worker_mode_arg: None,
             background: false,
             budget_slots: None,
+            memory_admission: None,
         })
     }
 
@@ -321,6 +329,13 @@ impl WorkerVerifier {
         }
         self.admission_wait = wait;
         Ok(self)
+    }
+
+    /// Reserve memory before encoding the request or starting its child.
+    /// A refused reservation is local unavailability, never an invalid proof.
+    pub fn with_memory_admission(mut self, admit: Arc<MemoryAdmission>) -> Self {
+        self.memory_admission = Some(admit);
+        self
     }
 
     /// Kill a child whose resident memory exceeds `bytes` (sampled by this
@@ -466,6 +481,11 @@ impl WorkerVerifier {
             .as_deref()
             .map(|shared| acquire_shared_until(shared, deadline, self.background))
             .transpose()?;
+        let _memory = self
+            .memory_admission
+            .as_ref()
+            .map(|admit| admit(deadline).ok_or(ClientError::Busy))
+            .transpose()?;
         let _held = SlotHeld(Instant::now());
         let bytes = request.encode().map_err(ClientError::Request)?;
         run_worker_capped(
@@ -557,6 +577,73 @@ fn test_limit_secs(value: Option<&str>, default: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::confidential::transfer::CompileLimits;
+
+    #[test]
+    fn memory_admission_is_shared_by_clones_and_refusal_starts_no_child() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_memory_admission(Arc::new(move |_| {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    None
+                }));
+        // Invalid input proves admission runs before request allocation too.
+        let request = WorkerRequest {
+            network: [0; 32],
+            application: [0; 32],
+            limits: CompileLimits {
+                max_inputs: 1,
+                max_outputs: 1,
+                max_depth: 1,
+            },
+            submission_bytes: 0,
+            transaction: &[],
+        };
+        for clone in [client.clone(), client.background(), client.for_lane(7)] {
+            assert!(matches!(clone.verify(&request), Err(ClientError::Busy)));
+            assert_eq!(clone.slots.state.lock().unwrap().used, 0);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_request_failure_releases_its_memory_reservation() {
+        struct Permit(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = held.clone();
+        let client =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_memory_admission(Arc::new(move |_| {
+                    assert!(!observed.swap(true, std::sync::atomic::Ordering::SeqCst));
+                    Some(Box::new(Permit(observed.clone())))
+                }));
+        let request = WorkerRequest {
+            network: [0; 32],
+            application: [0; 32],
+            limits: CompileLimits {
+                max_inputs: 1,
+                max_outputs: 1,
+                max_depth: 1,
+            },
+            submission_bytes: 0,
+            transaction: &[],
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                client.verify(&request),
+                Err(ClientError::Request(_))
+            ));
+            assert!(!held.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
 
     /// Each verification's slot time adds to the busy total when it ends,
     /// and the longest is kept until taken, which resets it.

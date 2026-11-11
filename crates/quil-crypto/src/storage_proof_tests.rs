@@ -4,6 +4,40 @@ use crate::storage_hash as hash;
 const LEAF: &[u8] = b"leaf-A";
 const EPOCH: u64 = 9;
 
+#[test]
+fn bounded_scratch_and_owned_encoding_preserve_replicas_and_commitments() {
+    let raw = data(1025 * hash::DATA_BYTES_PER_NODE, 71);
+    let key = sdr::replica_key(&member(72), LEAF, EPOCH);
+    for layers in [3, 11] {
+        let p = SdrParams { layers, ..params() };
+        let reference = encode_leaf(&raw, &key, &p);
+        let (last, columns) =
+            with_label_memory_budget(0, || label_leaf(reference.n, &key, &p, &mut |_, _| {}));
+        let comm_c = MerkleCap::from_digests(&columns, seal_cap_height(reference.n))
+            .commitment(Tree::Column);
+        let encoded = encode_owned_with_labels(raw.clone(), reference.n, &last, comm_c).unwrap();
+        assert_eq!(encoded.replica, reference.replica);
+        assert_eq!(encoded.registration_root(), reference.registration_root());
+        assert_eq!(encoded.data_cap.to_bytes(), reference.data_cap.to_bytes());
+        assert_eq!(
+            encoded.replica_cap.to_bytes(),
+            reference.replica_cap.to_bytes()
+        );
+        let graph_bytes = reference.n * 56;
+        let bounded = label_leaf_peak_bytes_with_budget(reference.n, &p, reference.n * 32);
+        let resident = label_leaf_peak_bytes_with_budget(
+            reference.n,
+            &p,
+            label_scratch_memory_bytes(reference.n, &p),
+        );
+        assert_eq!(resident - bounded, graph_bytes);
+        let owner = member(72);
+        let stmt = statement(&owner, &encoded, b"bounded-memory-beacon");
+        let seal = prove_seal(&encoded.replica, &stmt, &p, 8).unwrap();
+        assert!(verify_seal(&stmt, &seal, &p, 8).is_ok());
+    }
+}
+
 fn member(seed: u8) -> Vec<u8> {
     vec![seed; 32]
 }

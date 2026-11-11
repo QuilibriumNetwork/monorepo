@@ -235,7 +235,12 @@ const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
 /// the worker's layer buffers, allocator margin and the layer write buffer
 /// ([`FLUSH_CHUNK_BYTES`]).
 pub(crate) fn label_ahead_bytes(n: u64) -> u64 {
-    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes(n, &SdrParams::default());
+    let params = SdrParams::default();
+    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes_with_budget(
+        n,
+        &params,
+        crate::storage_jobs::label_scratch_bytes(n, &params),
+    );
     peak.saturating_add(peak / 100 * LABEL_AHEAD_MARGIN_PERCENT)
         .saturating_add(FLUSH_CHUNK_BYTES as u64)
 }
@@ -2092,7 +2097,7 @@ impl Admitted<'_> {
         let paths = paths(&self.dir, self.n);
         let tally = FlushTally::default();
         let result = quil_crypto::storage_proof::with_label_memory_budget(
-            quil_crypto::storage_proof::label_scratch_memory_bytes(self.n, params),
+            crate::storage_jobs::label_scratch_bytes(self.n, params),
             || self.write(params, &paths, stop, layers, &tally),
         );
         tally.log(self.epoch, &self.leaf_id, self.n, self.stage);

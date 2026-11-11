@@ -11,7 +11,8 @@
 //! available to the node ([`MEMORY_SHARE_PERCENT`]) and a core is free of
 //! them. A node with the memory encodes every seat at once; one without
 //! encodes as many as fit, then the next as each finishes. Work due now
-//! alone runs whatever its size; work done ahead of when it is needed
+//! alone may exceed the share on platforms without strict admission; macOS
+//! requires urgent work and verifier children to fit too. Work done ahead
 //! ([`reserve_ahead`]) runs, alone too, only within the jobs' share of what
 //! is available ([`Admission::fits`]): admitted alone whatever its size, a
 //! leaf labelled ahead reserving 8.0 GB started on a 16 GB host with 0.54 GB
@@ -84,7 +85,7 @@
 //! its stores, which exit tears down under a thread still using them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -470,6 +471,12 @@ pub fn held_bytes() -> u64 {
     admission().held_bytes()
 }
 
+/// The share of reservations held for child processes, outside this process's
+/// allocator. Do not report these as resident labelling buffers.
+pub fn verifier_bytes() -> u64 {
+    admission().state().verifier_bytes
+}
+
 /// Reserve `bytes` for a job's work: waits, behind the smaller reservations
 /// and those of its size asked for before it, until it fits beside the ones
 /// held.
@@ -482,6 +489,66 @@ pub fn reserve(bytes: u64) -> Reservation {
 /// waits, which then leaves the queue, holding neither memory nor a place.
 pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservation> {
     admission().reserve_until(bytes, Urgency::Due, expired)
+}
+
+/// Transaction-verifier children share storage jobs' memory and host ledger.
+/// They never use the oversized-job escape, and respect their caller's short
+/// admission deadline so a memory wait cannot block frame execution.
+pub fn reserve_verifier_until(bytes: u64, deadline: Instant) -> Option<Reservation> {
+    let expired = || Instant::now() >= deadline || stopping();
+    if stopping() {
+        return None;
+    }
+    // Like verifier slot admission, try once even for a zero wait budget.
+    // The deadline cancels waiting; it does not forbid an immediate grant.
+    admission()
+        .reserve_until(bytes, Urgency::Verification, &expired)
+        .filter(|_| !stopping())
+}
+
+/// A 512 MiB sector's resident labelling reservation is about 2.6 GiB.
+/// At most 4 GiB of host RAM per worker leaves too little room for that,
+/// the worker's other state, the master and verifiers. Use disk scratch
+/// there, irrespective of the Mac's total capacity. Admission still checks
+/// the memory actually available before each job starts.
+const RESIDENT_LABEL_MEMORY_PER_WORKER: u64 = 4 << 30;
+
+/// Zero means the automatic CPU-based worker count, as in `dataWorkerCount`.
+static MEMORY_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the configured local data-worker count before starting storage work.
+/// Zero or negative uses the automatic process CPU count less the master's.
+/// Standalone workers use their local configuration, not a remote cluster's
+/// endpoint count: those endpoints may live on different hosts.
+pub fn set_memory_worker_count(configured: i32) {
+    MEMORY_WORKERS.store(configured.max(0) as usize, Ordering::Relaxed);
+}
+
+fn memory_worker_count() -> usize {
+    match MEMORY_WORKERS.load(Ordering::Relaxed) {
+        0 => job_slots(),
+        configured => configured,
+    }
+}
+
+fn memory_per_worker_is_constrained(memory: u64, workers: usize) -> bool {
+    u128::from(memory) <= workers.max(1) as u128 * u128::from(RESIDENT_LABEL_MEMORY_PER_WORKER)
+}
+
+/// Keep graph and column scratch on disk on Macs with little RAM per worker,
+/// leaving two layer buffers resident without changing labels or commitments.
+pub(crate) fn constrained_memory() -> bool {
+    cfg!(target_os = "macos")
+        && total_memory()
+            .is_some_and(|bytes| memory_per_worker_is_constrained(bytes, memory_worker_count()))
+}
+
+pub(crate) fn label_scratch_bytes(n: u64, params: &quil_crypto::sdr::SdrParams) -> u64 {
+    if constrained_memory() && params.optimized() {
+        0
+    } else {
+        quil_crypto::storage_proof::label_scratch_memory_bytes(n, params)
+    }
 }
 
 /// Reserve `bytes` for work done ahead of when it is needed (labelling a
@@ -564,6 +631,8 @@ fn admission() -> &'static Admission {
     ADMISSION.get_or_init(|| {
         let slots = job_slots();
         let mut admission = Admission::new(slots, Box::new(available_memory));
+        // macOS must not admit urgent work by evicting other applications.
+        admission.strict_due = cfg!(target_os = "macos") && !cfg!(test);
         // `job_slots` is one per CPU less the master's.
         let cpus = slots.saturating_add(1);
         // Tests size the node's admission as the smallest node's, whatever
@@ -623,6 +692,8 @@ pub fn install_master_ledger(labels_dir: &std::path::Path) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Urgency {
     Due,
+    /// Due now, but always bounded by memory, including when alone.
+    Verification,
     Ahead,
 }
 
@@ -876,6 +947,7 @@ pub struct Reservation {
     ticket: u64,
     /// Whether it labels a leaf now ([`Self::labelling_now`]).
     labelling: bool,
+    verification: bool,
 }
 
 impl Reservation {
@@ -887,6 +959,12 @@ impl Reservation {
             .reserved
             .saturating_sub(self.bytes)
             .saturating_add(bytes);
+        if self.verification {
+            state.verifier_bytes = state
+                .verifier_bytes
+                .saturating_sub(self.bytes)
+                .saturating_add(bytes);
+        }
         self.bytes = bytes;
         if let Some(yielding) = state.yielding.get_mut(&self.ticket) {
             yielding.bytes = bytes;
@@ -1003,6 +1081,9 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.admission.state();
         state.reserved = state.reserved.saturating_sub(self.bytes);
+        if self.verification {
+            state.verifier_bytes = state.verifier_bytes.saturating_sub(self.bytes);
+        }
         state.holders = state.holders.saturating_sub(1);
         state.yielding.remove(&self.ticket);
         if self.labelling {
@@ -1026,6 +1107,7 @@ impl Drop for Reservation {
 /// smallest first, then those for work ahead in their order
 /// ([`AheadOrder`]), each once it fits ([`Admission::admit_waiting`]).
 pub struct Admission {
+    strict_due: bool,
     state: Mutex<State>,
     /// [`PASS_WINDOW`], shorter in tests.
     pass_window: Duration,
@@ -1052,6 +1134,7 @@ pub struct Admission {
 
 #[derive(Default)]
 struct State {
+    verifier_bytes: u64,
     /// What the host's other processes' jobs hold, read at each pass
     /// ([`Admission::admit_waiting`]).
     others: crate::storage_ledger::Held,
@@ -1208,6 +1291,7 @@ impl Admission {
     /// `available` reports (`None` when it cannot tell: one at a time).
     pub fn new(slots: usize, available: Box<dyn Fn() -> Option<u64> + Send + Sync>) -> Self {
         Self {
+            strict_due: false,
             state: Mutex::new(State::default()),
             pass_window: PASS_WINDOW,
             changed: Condvar::new(),
@@ -1303,7 +1387,7 @@ impl Admission {
                 && state
                     .waiting
                     .iter()
-                    .any(|waiting| waiting.urgency == Urgency::Due),
+                    .any(|waiting| waiting.urgency != Urgency::Ahead),
         };
         if let Err(error) = ledger.publish(held) {
             if !self.ledger_warned.swap(true, Ordering::Relaxed) {
@@ -1316,12 +1400,20 @@ impl Admission {
     }
 
     /// With the host's other processes ([`install_host_ledger`]), a pass
-    /// over the waiting reservations ([`Self::admit_waiting`]) once
-    /// [`RECHECK`] passed since the last, also with none waiting here: work
+    /// over the waiting reservations ([`Self::admit_waiting`]) periodically,
+    /// also with none waiting here: work
     /// due now in another process asks labelling ahead here to give its
     /// memory back.
     fn look_elsewhere(&self, state: &mut State) {
-        if self.ledger.get().is_some() && state.last_pass.is_none_or(|at| at.elapsed() >= RECHECK) {
+        // Native verifier admission has a short deadline: other processes
+        // must see its request and release ahead work before that expires.
+        let interval = if self.strict_due {
+            Duration::from_millis(250)
+        } else {
+            RECHECK
+        };
+        if self.ledger.get().is_some() && state.last_pass.is_none_or(|at| at.elapsed() >= interval)
+        {
             self.admit_waiting(state);
         }
     }
@@ -1446,7 +1538,7 @@ impl Admission {
         // Work due now goes before every reservation for work ahead, and
         // before larger ones for work due now: the shortest ends first.
         let place = match urgency {
-            Urgency::Due => (0, bytes, ticket, 0, 0),
+            Urgency::Due | Urgency::Verification => (0, bytes, ticket, 0, 0),
             Urgency::Ahead => {
                 let order = order.unwrap_or(AheadOrder {
                     deferrable: false,
@@ -1483,6 +1575,16 @@ impl Admission {
         let started = Instant::now();
         let mut waited = false;
         while !self.take_grant(&mut state, ticket) {
+            if urgency == Urgency::Verification {
+                // A zero admission wait means try once, then refuse promptly.
+                drop(state);
+                let gone = expired();
+                state = self.state();
+                if gone {
+                    self.leave(state, ticket, urgency, bytes, started);
+                    return None;
+                }
+            }
             if !waited {
                 waited = true;
                 let (labelling, cap) = (
@@ -1526,7 +1628,7 @@ impl Admission {
                             .iter()
                             .position(|waiting| waiting.ticket == ticket)
                             .unwrap_or(0),
-                        due = urgency == Urgency::Due,
+                        due = urgency != Urgency::Ahead,
                         "storage job waits to start: `limit` is what binds: memory (the \
                          reservations held plus this job exceed the share), job_slots (every \
                          slot is held) or queue_order (it would fit, but a job ahead of it in \
@@ -1537,13 +1639,24 @@ impl Admission {
             }
             state = self
                 .changed
-                .wait_timeout(state, RECHECK)
+                .wait_timeout(
+                    state,
+                    if urgency == Urgency::Verification {
+                        RECHECK.min(Duration::from_millis(25))
+                    } else {
+                        RECHECK
+                    },
+                )
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
             // Not under the lock: the caller's look may take its own.
             drop(state);
             let gone = expired();
             state = self.state();
+            if urgency == Urgency::Verification {
+                // A different process may have yielded since the last look.
+                state.stale = true;
+            }
             if gone {
                 self.leave(state, ticket, urgency, bytes, started);
                 return None;
@@ -1555,7 +1668,7 @@ impl Admission {
             info!(
                 bytes,
                 jobs,
-                due = urgency == Urgency::Due,
+                due = urgency != Urgency::Ahead,
                 seconds = started.elapsed().as_secs_f64(),
                 "storage job has its memory"
             );
@@ -1567,6 +1680,7 @@ impl Admission {
             bytes,
             ticket,
             labelling: false,
+            verification: urgency == Urgency::Verification,
         })
     }
 
@@ -1648,6 +1762,9 @@ impl Admission {
                 ahead_granted |= waiting.urgency == Urgency::Ahead;
                 state.waiting.remove(index);
                 state.reserved = state.reserved.saturating_add(waiting.bytes);
+                if waiting.urgency == Urgency::Verification {
+                    state.verifier_bytes = state.verifier_bytes.saturating_add(waiting.bytes);
+                }
                 state.holders += 1;
                 state.granted.insert(waiting.ticket);
                 if let Some(lock) = state.alone_pending.take() {
@@ -2000,7 +2117,7 @@ impl Admission {
             passed.holding = true;
             info!(
                 bytes,
-                due = urgency == Urgency::Due,
+                due = urgency != Urgency::Ahead,
                 passed = passed.times,
                 seconds = since.as_secs_f64(),
                 reserved,
@@ -2032,6 +2149,9 @@ impl Admission {
             state.waiting.remove(index);
         } else if state.granted.remove(&ticket) {
             state.reserved = state.reserved.saturating_sub(bytes);
+            if urgency == Urgency::Verification {
+                state.verifier_bytes = state.verifier_bytes.saturating_sub(bytes);
+            }
             state.holders = state.holders.saturating_sub(1);
             state.yielding.remove(&ticket);
             if state
@@ -2059,7 +2179,7 @@ impl Admission {
         drop(state);
         info!(
             bytes,
-            due = urgency == Urgency::Due,
+            due = urgency != Urgency::Ahead,
             seconds = started.elapsed().as_secs_f64(),
             waiting,
             jobs,
@@ -2072,6 +2192,12 @@ impl Admission {
 
     /// Reserve `bytes` for a settlement ([`reserve_settlement`]).
     pub fn reserve_settlement(&'static self, bytes: u64) -> Reservation {
+        // The old fast lane admits an unbounded settlement when alone. On
+        // macOS use the ordinary urgent queue, which can reclaim memory from
+        // labelling ahead, rather than bypassing its physical-memory budget.
+        if self.strict_due {
+            return self.reserve(bytes);
+        }
         let mut state = self.state();
         let ticket = state.next_ticket;
         state.next_ticket += 1;
@@ -2105,6 +2231,7 @@ impl Admission {
             bytes,
             ticket,
             labelling: false,
+            verification: false,
         }
     }
 
@@ -2157,9 +2284,14 @@ impl Admission {
                 });
             return match urgency {
                 // Alone on the host, beyond the share: one process at a time.
-                Urgency::Due => within || (others == 0 && self.take_alone(state)),
+                Urgency::Due => {
+                    within || (!self.strict_due && others == 0 && self.take_alone(state))
+                }
+                Urgency::Verification => within,
                 // Unknown memory: one at a time on the host.
-                Urgency::Ahead => within || (state.idle_available.is_none() && others == 0),
+                Urgency::Ahead => {
+                    within || (!self.strict_due && state.idle_available.is_none() && others == 0)
+                }
             };
         }
         if state.holders >= self.slots {
@@ -2241,6 +2373,202 @@ mod tests {
     const GIB: u64 = 1 << 30;
     const SOON: Duration = Duration::from_secs(10);
     const NOT_YET: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn disk_scratch_follows_ram_per_worker_instead_of_total_mac_capacity() {
+        for (gib, workers, constrained) in [
+            (16, 6, true),
+            (32, 12, true),
+            (64, 24, true),
+            (128, 48, true),
+            (16, 2, false),
+            (64, 6, false),
+            (16, 4, true),
+        ] {
+            assert_eq!(
+                memory_per_worker_is_constrained(gib * GIB, workers),
+                constrained,
+                "{gib} GiB with {workers} workers"
+            );
+        }
+        assert!(!memory_per_worker_is_constrained(16 * GIB + 1, 4));
+        assert!(memory_per_worker_is_constrained(4 * GIB, 0));
+        assert!(!memory_per_worker_is_constrained(u64::MAX, 1));
+        assert!(memory_per_worker_is_constrained(u64::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn configured_memory_workers_take_precedence_over_automatic_cpu_slots() {
+        set_memory_worker_count(6);
+        assert_eq!(memory_worker_count(), 6);
+        set_memory_worker_count(0);
+        assert_eq!(memory_worker_count(), job_slots());
+        set_memory_worker_count(-1);
+        assert_eq!(memory_worker_count(), job_slots());
+    }
+
+    #[test]
+    fn six_workers_and_a_verifier_complete_within_a_small_hosts_budget() {
+        // A 16 GiB host with 8 GiB available gives heavy jobs a 6 GiB share.
+        let mut scheduler = Admission::new(7, Box::new(|| Some(8 * GIB)));
+        scheduler.strict_due = true;
+        let scheduler: &'static Admission = Box::leak(Box::new(scheduler));
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for worker in 0..7 {
+                let completed = &completed;
+                scope.spawn(move || {
+                    let urgency = if worker == 6 {
+                        Urgency::Verification
+                    } else {
+                        Urgency::Due
+                    };
+                    for _ in 0..3 {
+                        let _held = scheduler.reserve_with(3 * GIB, urgency);
+                        assert!(scheduler.held_bytes() <= 6 * GIB);
+                        std::thread::sleep(Duration::from_millis(2));
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(completed.load(Ordering::SeqCst), 21);
+        assert_eq!(scheduler.held_bytes(), 0);
+    }
+
+    #[test]
+    fn strict_urgent_work_waits_without_the_oversized_escape() {
+        let memory = Arc::new(AtomicU64::new(2 * GIB));
+        let probe = memory.clone();
+        let mut scheduler = Admission::new(6, Box::new(move || Some(probe.load(Ordering::SeqCst))));
+        scheduler.strict_due = true;
+        let scheduler = Box::leak(Box::new(scheduler));
+        let work = hold(scheduler, 3 * GIB);
+        assert!(still_waiting(&work));
+        assert_eq!(scheduler.held_bytes(), 0);
+        memory.store(8 * GIB, Ordering::SeqCst);
+        scheduler.changed.notify_all();
+        assert!(granted(&work));
+        drop(work.release);
+    }
+
+    #[test]
+    fn verifier_memory_wait_respects_its_short_deadline_and_can_retry() {
+        let (scheduler, _) = admission(6, 8 * GIB);
+        let storage = scheduler.reserve(6 * GIB);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(40);
+        assert!(scheduler
+            .reserve_until(3 * GIB, Urgency::Verification, &|| Instant::now()
+                >= deadline)
+            .is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(waiting(scheduler), 0);
+        drop(storage);
+        let retry = scheduler.reserve_with(3 * GIB, Urgency::Verification);
+        assert_eq!(scheduler.held_bytes(), 3 * GIB);
+        assert_eq!(scheduler.state().verifier_bytes, 3 * GIB);
+        drop(retry);
+        assert_eq!(scheduler.held_bytes(), 0);
+        assert_eq!(scheduler.state().verifier_bytes, 0);
+    }
+
+    #[test]
+    fn a_verifier_with_no_wait_budget_can_take_free_memory_but_never_waits() {
+        let (scheduler, _) = admission(6, 8 * GIB);
+        let child = scheduler.reserve_until(3 * GIB, Urgency::Verification, &|| true);
+        assert!(child.is_some(), "an immediate grant needs no wait budget");
+        drop(child);
+        let storage = scheduler.reserve(6 * GIB);
+        assert!(scheduler
+            .reserve_until(3 * GIB, Urgency::Verification, &|| true)
+            .is_none());
+        assert_eq!(waiting(scheduler), 0);
+        drop(storage);
+    }
+
+    #[test]
+    fn verifier_reservations_count_against_other_processes_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |id| {
+            let mut a = Admission::new(6, Box::new(|| Some(8 * GIB)));
+            a.strict_due = true;
+            assert!(a.use_ledger(HostLedger::open_as(dir.path(), id).unwrap()));
+            Box::leak(Box::new(a)) as &'static Admission
+        };
+        let storage = make("storage");
+        let verifier = make("verifier");
+        let held = storage.reserve(5 * GIB);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(verifier
+            .reserve_until(3 * GIB, Urgency::Verification, &|| Instant::now()
+                >= deadline)
+            .is_none());
+        assert_eq!(verifier.held_bytes(), 0);
+        drop(held);
+        let child = verifier.reserve_with(3 * GIB, Urgency::Verification);
+        assert_eq!(storage.ledger.get().unwrap().others().bytes, 3 * GIB);
+        drop(child);
+        assert_eq!(storage.ledger.get().unwrap().others().bytes, 0);
+    }
+
+    #[test]
+    fn a_verifier_can_reclaim_another_processs_ahead_memory_before_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |id| {
+            let mut a = Admission::new(6, Box::new(|| Some(8 * GIB)));
+            a.strict_due = true;
+            assert!(a.use_ledger(HostLedger::open_as(dir.path(), id).unwrap()));
+            Box::leak(Box::new(a)) as &'static Admission
+        };
+        let storage = make("storage");
+        let verifier = make("verifier");
+        let held = storage
+            .reserve_ahead_in(5 * GIB, None, true, false, &|| false)
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let stop = Instant::now() + Duration::from_secs(3);
+            while !held.yield_requested() {
+                if Instant::now() >= stop {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        });
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let child = verifier.reserve_until(3 * GIB, Urgency::Verification, &|| {
+            Instant::now() >= deadline
+        });
+        assert!(
+            worker.join().unwrap(),
+            "ahead work must notice the verifier"
+        );
+        assert!(
+            child.is_some(),
+            "the verifier must observe the released memory"
+        );
+        drop(child);
+    }
+
+    #[test]
+    fn strict_settlements_cannot_bypass_the_memory_budget() {
+        let available = Arc::new(AtomicU64::new(2 * GIB));
+        let probe = available.clone();
+        let mut a = Admission::new(6, Box::new(move || Some(probe.load(Ordering::SeqCst))));
+        a.strict_due = true;
+        let a: &'static Admission = Box::leak(Box::new(a));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(a.reserve_settlement(3 * GIB)).unwrap());
+        assert!(rx.recv_timeout(NOT_YET).is_err());
+        assert_eq!(a.held_bytes(), 0);
+        available.store(8 * GIB, Ordering::SeqCst);
+        a.changed.notify_all();
+        drop(
+            rx.recv_timeout(SOON)
+                .expect("settlement resumes when memory fits"),
+        );
+    }
 
     /// An admission of `slots` jobs sharing what the returned bytes say is
     /// available, its memory alone: without the cap on labelling ahead
@@ -3857,13 +4185,15 @@ mod tests {
     }
 
     /// Regression for the 64 GiB Mac whose sysinfo estimate saturated to zero
-    /// despite normal kernel pressure, silently serializing nine cold sectors.
+    /// despite normal kernel pressure. Physical reclaimable pages admit two
+    /// cold sectors here, not nine by lending other applications' memory.
     #[test]
-    fn macos_normal_pressure_admits_nine_cold_sectors() {
+    fn macos_normal_pressure_admits_only_reclaimable_cold_sectors() {
         let snapshot = macos_memory::Snapshot {
             total: 64 * GIB,
             wired: 7 * GIB,
             footprint: 3 * GIB,
+            reclaimable: 17 * GIB,
             pressure: 1,
         };
         let admission = Box::leak(Box::new(Admission::new(
@@ -3874,19 +4204,22 @@ mod tests {
             1 << 24,
             &quil_crypto::sdr::SdrParams::default(),
         ) + (400 << 20);
-        let held: Vec<_> = (0..9)
+        let held: Vec<_> = (0..2)
             .map(|leaf| {
                 let held = hold_parallel(admission, cold_bytes, ahead(false, 1, leaf));
                 assert!(
                     granted(&held),
-                    "every cold sector fits alongside the others"
+                    "two cold sectors fit without evicting anonymous pages"
                 );
                 held
             })
             .collect();
-        assert_eq!(admission.state().holders, 9);
+        assert_eq!(admission.state().holders, 2);
         let extra = hold_parallel(admission, cold_bytes, ahead(false, 1, 9));
-        assert!(still_waiting(&extra), "the CPU slot limit still applies");
+        assert!(
+            still_waiting(&extra),
+            "memory binds even with CPU slots free"
+        );
         drop(held);
         assert!(granted(&extra));
     }
@@ -3903,6 +4236,7 @@ mod tests {
                         total: 64 * GIB,
                         wired: 7 * GIB,
                         footprint: 3 * GIB,
+                        reclaimable: 54 * GIB,
                         pressure: probe.load(Ordering::SeqCst),
                     }
                     .headroom(),
