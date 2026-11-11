@@ -25,6 +25,34 @@ pub fn verify_code_deployment(compiler: &dyn CircuitCompiler, circuit: &[u8]) ->
     Ok(true)
 }
 
+/// Refuse a CodeDeployment or CodeExecute whose domain is not the
+/// application the message is routed to, or is a system-managed domain.
+///
+/// Both ops write a vertex into their own `domain` field, while the
+/// engine, its fee and its shard are chosen by the routing address. An op
+/// naming another application would write that application's state from a
+/// message routed (and paid) elsewhere; the compute base domain routes to
+/// this engine itself, so a deploy there must not land in it either.
+pub fn check_op_domain(op: &str, op_domain: &[u8; 32], routing: &[u8]) -> Result<()> {
+    if routing.get(..32) != Some(&op_domain[..]) {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: domain {} is not the routing domain {}",
+            hex::encode(op_domain),
+            hex::encode(routing),
+        )));
+    }
+    if *op_domain == crate::domains::GLOBAL
+        || *op_domain == crate::domains::COMPUTE
+        || *op_domain == crate::domains::QUIL_TOKEN
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: write into system-managed domain {} rejected",
+            hex::encode(op_domain),
+        )));
+    }
+    Ok(())
+}
+
 /// Get the cost of a code deployment (proportional to circuit size).
 pub fn code_deployment_cost(circuit: &[u8]) -> BigInt {
     BigInt::from(circuit.len() as i64)

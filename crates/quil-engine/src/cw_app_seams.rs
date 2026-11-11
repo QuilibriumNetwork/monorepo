@@ -1351,6 +1351,30 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.cross_domain_compute_now(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                anchor = header.global_frame_number,
+                latest_global = latest,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: anchored before the compute domain frame, it runs a \
+                 compute op naming another application"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "frame runs a cross-domain compute op",
+                format!(
+                    "frame {}, anchor {}, latest GLOBAL frame {latest}",
+                    header.frame_number, header.global_frame_number
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 view,
@@ -5382,6 +5406,157 @@ mod tests {
         assert!(
             votes_for(&frame(100, foreign)),
             "voter refused a frame anchored at the domain frame"
+        );
+    }
+
+    /// The voter's cross-domain check, past the domain frame for a proposal
+    /// anchored before it, on each kind of compute op: a CodeDeployment
+    /// naming another application, a deploy or execute into the compute base
+    /// domain (system-managed), and ops naming the shard's own application,
+    /// which pass. A sub-shard, whose filter is longer than its application's
+    /// address, is judged by that application. A shard the compute engine
+    /// does not run (a token or hypergraph application) is not judged: its
+    /// engine ignores these ops on both sides of the frame. Without a route
+    /// every shard is judged.
+    #[test]
+    fn a_voter_judges_each_compute_op_by_the_shard_it_runs_on() {
+        use quil_execution::compute_intrinsic::{CodeDeployment, CodeExecute};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::store::ClockStore as _;
+        // The test-network setting; nextest runs each test in its own process.
+        std::env::set_var("QUIL_COMPUTE_DOMAIN_FRAME", "100");
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let latest = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: 100,
+                output: vec![100; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&latest, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let voter = |route: Option<crate::frame_validator::ComputeRoute>| {
+            let validator = BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone());
+            match route {
+                Some(route) => validator.with_compute_route(route),
+                None => validator,
+            }
+        };
+        // A frame of shard `shard` anchored before the domain frame, carrying
+        // one bundle of `inner`.
+        let frame = |shard: [u8; 32], inner: Vec<u8>| {
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    address: shard.to_vec(),
+                    frame_number: 7,
+                    global_frame_number: 99,
+                    ..Default::default()
+                }),
+                requests: vec![crate::consensus_wire::decode_app_message_bundle(&bundle).unwrap()],
+                ..Default::default()
+            }
+        };
+        let execute = |domain: [u8; 32]| {
+            CodeExecute {
+                proof_of_payment: vec![vec![0u8; 57]],
+                domain,
+                rendezvous: [0x44; 32],
+                execute_operations: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let deploy = |domain: [u8; 32]| {
+            CodeDeployment {
+                circuit: vec![0xAA; 16],
+                input_types: Vec::new(),
+                output_types: Vec::new(),
+                domain,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let app = [1u8; 32];
+        let foreign = [2u8; 32];
+        let base = quil_execution::domains::COMPUTE;
+        let compute = voter(Some(Arc::new(|_: &[u8]| true)));
+
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(app, deploy(foreign)))
+                .is_some(),
+            "voter passed a cross-domain deploy at a stale anchor"
+        );
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(base, deploy(base)))
+                .is_some(),
+            "voter passed a compute base deploy written at a stale anchor"
+        );
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(base, execute(base)))
+                .is_some(),
+            "voter passed an execute into the compute base domain at a stale anchor"
+        );
+        for inner in [execute(app), deploy(app)] {
+            assert!(
+                compute
+                    .cross_domain_compute_now(&frame(app, inner))
+                    .is_none(),
+                "voter refused an op naming the shard's own application"
+            );
+        }
+        // A sub-shard's filter extends its application's address.
+        let sub_shard = |inner: Vec<u8>| {
+            let mut shard_frame = frame(app, inner);
+            if let Some(header) = shard_frame.header.as_mut() {
+                header.address.extend_from_slice(&[0x05, 0x80]);
+            }
+            shard_frame
+        };
+        for inner in [execute(app), deploy(app)] {
+            assert!(
+                compute
+                    .cross_domain_compute_now(&sub_shard(inner))
+                    .is_none(),
+                "voter refused an op naming its sub-shard's application"
+            );
+        }
+        assert!(
+            compute
+                .cross_domain_compute_now(&sub_shard(execute(foreign)))
+                .is_some(),
+            "voter passed a cross-domain execute on a sub-shard"
+        );
+        assert!(
+            voter(Some(Arc::new(|_: &[u8]| false)))
+                .cross_domain_compute_now(&frame(app, execute(foreign)))
+                .is_none(),
+            "voter refused a compute op on a shard the compute engine does not run"
+        );
+        assert!(
+            voter(None)
+                .cross_domain_compute_now(&frame(app, execute(foreign)))
+                .is_some(),
+            "voter without a route passed a cross-domain execute"
         );
     }
 

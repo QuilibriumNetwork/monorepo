@@ -921,6 +921,18 @@ impl ExecutionEngineManager {
         1
     }
 
+    /// Whether this node routes a message addressed to `address` to the
+    /// compute engine, as execution does: the compute base domain, or an
+    /// application deployed with the compute type domain. Only the compute
+    /// engine runs a compute op that crosses its domain
+    /// ([`crate::compute_domain::crosses_domain`]): a token or hypergraph
+    /// application's engine ignores it on either side of the domain frame,
+    /// so a bundle routed there is never counted.
+    pub fn routes_to_compute(&self, address: &[u8]) -> bool {
+        self.select_engine(address)
+            .is_ok_and(|engine| engine == "compute")
+    }
+
     /// Whether a canonical bundle holds an operation dispatch refuses before
     /// any native work ([`TokenPolicy::preflight`]: encoding, context,
     /// dimensions): a pure check of its bytes and this network's limits, run
@@ -4967,6 +4979,134 @@ mod tests {
         );
 
         assert_eq!(m.select_engine(&deployed).unwrap(), "token");
+    }
+
+    /// Only the compute engine runs a CodeExecute or CodeDeployment, so only
+    /// a bundle routed to it can carry one that crosses its domain: the
+    /// compute base domain and an application deployed as compute count, a
+    /// token or hypergraph application and an unknown address (no engine,
+    /// refused alike on both sides of the domain frame) do not.
+    #[test]
+    fn a_compute_op_crosses_its_domain_only_where_compute_runs() {
+        use crate::compute_intrinsic::{CodeDeployment, CodeExecute};
+        use crate::hypergraph_state::HypergraphState;
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            mem_store,
+            inclusion_prover.clone(),
+        ));
+        let deploy_as = |app: &[u8; 32], intrinsic: &[u8; 32]| {
+            let state = HypergraphState::new(crdt.clone());
+            let mut config = quil_tries::VectorCommitmentTree::new();
+            config
+                .insert(&[0x40u8], b"cfg", &[], &num_bigint::BigInt::from(3))
+                .unwrap();
+            let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+                (0..14).map(|_| None).collect();
+            additional[13] = Some(config);
+            state
+                .init_metadata_vertex(
+                    app,
+                    &mut quil_tries::VectorCommitmentTree::new(),
+                    &mut quil_tries::VectorCommitmentTree::new(),
+                    "schema",
+                    &mut additional,
+                    intrinsic,
+                    1,
+                    inclusion_prover.as_ref(),
+                )
+                .unwrap();
+            state.commit().unwrap();
+        };
+        let compute_app = [0x42u8; 32];
+        let token_app = [0x43u8; 32];
+        deploy_as(&compute_app, &domains::COMPUTE);
+        deploy_as(
+            &token_app,
+            &crate::token_intrinsic::constants::token_base_domain(),
+        );
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        let m = ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            Arc::new(crate::testing::NoopHypergraphConfigResolver),
+            true,
+        );
+        let bundle = |inner: Vec<u8>| {
+            crate::message_envelope::CanonicalMessageBundle {
+                requests: vec![Some(crate::message_envelope::CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let execute = |domain: [u8; 32]| {
+            bundle(
+                CodeExecute {
+                    proof_of_payment: vec![vec![0u8; 57]],
+                    domain,
+                    rendezvous: [0x44; 32],
+                    execute_operations: Vec::new(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            )
+        };
+        let deploy = |domain: [u8; 32]| {
+            bundle(
+                CodeDeployment {
+                    circuit: vec![0xAA; 16],
+                    input_types: Vec::new(),
+                    output_types: Vec::new(),
+                    domain,
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            )
+        };
+        let foreign = [0x22u8; 32];
+        // As the leader and the voter judge a bundle: its ops, then its route.
+        let crosses = |address: &[u8; 32], message: &[u8]| {
+            crate::compute_domain::crosses_domain(address, message) && m.routes_to_compute(address)
+        };
+
+        assert!(
+            crosses(&compute_app, &execute(foreign)),
+            "a compute application's foreign execute was not counted"
+        );
+        assert!(
+            crosses(&compute_app, &deploy(foreign)),
+            "a compute application's foreign deploy was not counted"
+        );
+        assert!(
+            !crosses(&compute_app, &execute(compute_app)),
+            "an execute naming its own compute application was counted"
+        );
+        assert!(
+            crosses(&domains::COMPUTE, &execute(domains::COMPUTE)),
+            "an execute into the compute base domain was not counted"
+        );
+        for (route, what) in [
+            (token_app, "a token application"),
+            (domains::QUIL_TOKEN, "the QUIL token"),
+            (
+                crate::hypergraph_intrinsic::hypergraph_base_domain(),
+                "the hypergraph base",
+            ),
+            ([0x45u8; 32], "an unknown address"),
+        ] {
+            assert!(
+                !crosses(&route, &execute(foreign)),
+                "{what} counted a compute op it never runs"
+            );
+        }
     }
 
     #[test]

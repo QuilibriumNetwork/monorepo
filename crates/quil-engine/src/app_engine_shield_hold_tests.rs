@@ -18,7 +18,7 @@ const PROBE: usize = 8 * 1024;
 const STALL_RANKS: u64 = 720;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Proofs {
+pub(super) enum Proofs {
     /// No token policy: confidential operations are not checked or budgeted.
     Unconfigured,
     /// A policy over a worker that cannot run.
@@ -33,10 +33,10 @@ enum Proofs {
 /// What a proof holds for the [`Proofs::Refuting`] worker to reject it.
 const REFUTED_PROOF: &[u8] = b"REFUTEDPROOF";
 
-struct Rig {
-    engine: AppConsensusEngine,
-    collector: Arc<MessageCollector>,
-    leader: AppLeaderProvider,
+pub(super) struct Rig {
+    pub(super) engine: AppConsensusEngine,
+    pub(super) collector: Arc<MessageCollector>,
+    pub(super) leader: AppLeaderProvider,
     registry: Arc<crate::test_support::TestProverRegistry>,
     _slots: Vec<std::fs::File>,
     dir: std::path::PathBuf,
@@ -48,7 +48,7 @@ impl Drop for Rig {
     }
 }
 
-fn rig(filter: Vec<u8>, proofs: Proofs) -> Rig {
+pub(super) fn rig(filter: Vec<u8>, proofs: Proofs) -> Rig {
     let rocks = quil_store::RocksDb::open_in_memory().unwrap();
     let store = Arc::new(quil_store::RocksHypergraphStore::new(rocks.inner()));
     let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
@@ -196,7 +196,7 @@ fn rig(filter: Vec<u8>, proofs: Proofs) -> Rig {
 
 /// This shard's leader takes its turn at `rank`, whatever the rest of the
 /// proposal comes to: the mempool's fate is settled before it builds a frame.
-fn turn(leader: &AppLeaderProvider, rank: u64) {
+pub(super) fn turn(leader: &AppLeaderProvider, rank: u64) {
     let genesis = quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap();
     let id: quil_consensus::models::Identity = genesis.to_vec();
     let _ = leader.prove_next_state(rank, &leader.filter, 0, &id);
@@ -382,7 +382,7 @@ fn legacy_source(rig: &Rig) -> ([u8; 32], [u8; 57], Vec<u8>) {
     (source, private, public)
 }
 
-fn bundle(requests: Vec<Vec<u8>>) -> Vec<u8> {
+pub(super) fn bundle(requests: Vec<Vec<u8>>) -> Vec<u8> {
     let requests = requests
         .into_iter()
         .map(|inner| {

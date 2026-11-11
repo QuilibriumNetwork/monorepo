@@ -2337,6 +2337,13 @@ impl ComputeExecutionEngine {
                     let dep = crate::compute_intrinsic::CodeDeployment::from_canonical_bytes(
                         inner_bytes,
                     )?;
+                    if crate::compute_domain::compute_domain_guarded(context) {
+                        crate::compute_intrinsic::intrinsic::check_op_domain(
+                            "code deploy",
+                            &dep.domain,
+                            address,
+                        )?;
+                    }
                     let _ = crate::compute_intrinsic::intrinsic::verify_code_deployment(
                         cc,
                         &dep.circuit,
@@ -2352,6 +2359,13 @@ impl ComputeExecutionEngine {
                 crate::compute_intrinsic::TYPE_CODE_EXECUTE => {
                     let ex =
                         crate::compute_intrinsic::CodeExecute::from_canonical_bytes(inner_bytes)?;
+                    if crate::compute_domain::compute_domain_guarded(context) {
+                        crate::compute_intrinsic::intrinsic::check_op_domain(
+                            "code execute",
+                            &ex.domain,
+                            address,
+                        )?;
+                    }
                     let ok = crate::compute_intrinsic::intrinsic::verify_code_execute(&ex)?;
                     if !ok {
                         return Err(QuilError::InvalidArgument(

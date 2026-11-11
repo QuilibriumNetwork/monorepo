@@ -1,4 +1,5 @@
 pub mod canonical_cursor;
+pub mod compute_domain;
 pub mod compute_engine;
 pub mod compute_intrinsic;
 pub mod config_replay;
