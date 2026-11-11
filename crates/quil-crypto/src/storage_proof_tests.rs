@@ -1362,3 +1362,107 @@ fn a_leaf_labelled_under_another_replica_key_fails_for_good_at_its_columns() {
         "kept_columns_final"
     );
 }
+
+/// The tree over `leaves`, one scalar hash at a time: what every level of
+/// [`MerkleTree`], [`MerkleCap`] and [`encode_with_labels`] must equal,
+/// however they split the hashing across SIMD lanes, blocks and threads.
+fn scalar_levels(leaves: &[Digest]) -> Vec<Vec<Digest>> {
+    let mut levels = vec![leaves.to_vec()];
+    for height in 0..tree_depth(leaves.len() as u64) {
+        let below = levels.last().expect("a level");
+        let next = below
+            .chunks(2)
+            .map(|pair| {
+                let right = pair
+                    .get(1)
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(height));
+                hash::compress(&pair[0], &right, Domain::Node)
+            })
+            .collect();
+        levels.push(next);
+    }
+    levels
+}
+
+fn scalar_commitment(tree: Tree, leaves: &[Digest]) -> Node {
+    let levels = scalar_levels(leaves);
+    hash::to_bytes(&bind(tree, leaves.len() as u64, &levels.last().unwrap()[0]))
+}
+
+#[test]
+fn trees_caps_and_encoding_match_a_scalar_tree_on_any_thread_count() {
+    let leaves: Vec<Vec<Digest>> = [1, 2, 3, 1023, 1025, 9000]
+        .iter()
+        .map(|&n| hash::digests_from_bytes(&nodes(n, 5)).unwrap())
+        .collect();
+    let reference: Vec<_> = leaves.iter().map(|l| scalar_levels(l)).collect();
+    let n = 5000u64;
+    let raw = data(4000 * hash::DATA_BYTES_PER_NODE + 7, 7);
+    let last = hash::digests_from_bytes(&nodes(n as usize, 9)).unwrap();
+    let mut padded = packed_data(&raw);
+    padded.resize(n as usize, hash::ZERO);
+    let replica: Vec<Digest> = padded
+        .iter()
+        .zip(&last)
+        .map(|(d, l)| hash::add(d, l))
+        .collect();
+    for threads in [1, 3, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for (digests, levels) in leaves.iter().zip(&reference) {
+                let n = digests.len();
+                let tree = MerkleTree::from_digests(digests.clone());
+                assert!(tree.levels == *levels, "PIN-TREE n={n} threads={threads}");
+                let bytes = hash::digests_to_bytes(digests);
+                for height in [0, 3, CAP_HEIGHT] {
+                    let at = height.min(levels.len() - 1);
+                    let cap = MerkleCap::from_digests(digests, height);
+                    assert!(
+                        cap.levels == levels[at..],
+                        "PIN-CAP n={n} height={height} threads={threads}"
+                    );
+                    let read = MerkleCap::from_reader(n as u64, height, |range| {
+                        Some(digests[range.start as usize..range.end as usize].to_vec())
+                    });
+                    assert!(
+                        read.as_ref() == Some(&cap),
+                        "PIN-READ n={n} height={height} threads={threads}"
+                    );
+                    for i in [0, n / 2, n - 1] {
+                        let path: Vec<Node> = (0..levels.len() - 1)
+                            .map(|h| {
+                                hash::to_bytes(
+                                    &levels[h]
+                                        .get((i >> h) ^ 1)
+                                        .copied()
+                                        .unwrap_or_else(|| empty_subtree(h)),
+                                )
+                            })
+                            .collect();
+                        assert!(
+                            cap.path(&bytes, i as u64) == Some(path),
+                            "PIN-PATH n={n} height={height} index={i} threads={threads}"
+                        );
+                    }
+                }
+            }
+            let encoded = encode_with_labels(&raw, n, &last, [3; NODE_BYTES]).unwrap();
+            let data_levels = scalar_levels(&padded);
+            let replica_levels = scalar_levels(&replica);
+            assert!(
+                encoded.replica == hash::digests_to_bytes(&replica)
+                    && encoded.comm_d == scalar_commitment(Tree::Data, &padded)
+                    && encoded.comm_r == scalar_commitment(Tree::Replica, &replica)
+                    && encoded.comm_c == [3; NODE_BYTES]
+                    && encoded.data_cap.levels == data_levels[seal_cap_height(n)..]
+                    && encoded.replica_cap.levels == replica_levels[CAP_HEIGHT..],
+                "PIN-ENCODE threads={threads}"
+            );
+        });
+        println!("REACH pin-scalar threads={threads}");
+    }
+}
