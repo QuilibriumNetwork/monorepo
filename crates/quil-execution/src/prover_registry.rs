@@ -684,13 +684,8 @@ impl InMemoryProverRegistry {
     }
 
     fn storage_eligible(&self, member: &[u8], filter: &[u8], frame: u64) -> bool {
-        if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
-            return true;
-        }
-        let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let slot = self.get_storage_seat_slot(member, filter, epoch);
-        quil_types::consensus::storage_member_eligible(filter, frame, slot, |shard| {
-            self.get_storage_snapshot(shard, epoch).is_some()
+        quil_types::consensus::storage_member_eligible(filter, frame, |epoch| {
+            self.get_storage_seat_slot(member, filter, epoch)
         })
     }
 
@@ -3590,20 +3585,22 @@ impl CommittedProverScan {
     }
 
     pub fn active_on_filter(&self, filter: &[u8], frame_number: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        // From the seal gate recovery epoch sealing gates rewards only, so an
+        // unsealed member is scheduled as a sealed one is.
+        let sealed_only = !filter.is_empty()
+            && quil_types::consensus::sealed_storage_required(epoch)
+            && !quil_types::consensus::seal_gate_rewards_only(epoch);
         let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             for (prover_ref, alloc) in &self.allocations {
                 if alloc.confirmation_filter != filter
                     || !committee_eligible(alloc, frame_number, lenient)
-                    || (!filter.is_empty()
-                        && quil_types::consensus::sealed_storage_required_at(frame_number)
+                    || (sealed_only
                         && !self
                             .seats
                             .get(&(prover_ref.clone(), filter.to_vec()))
-                            .is_some_and(|epochs| {
-                                epochs
-                                    .contains(&quil_types::consensus::epoch_for_frame(frame_number))
-                            }))
+                            .is_some_and(|epochs| epochs.contains(&epoch)))
                 {
                     continue;
                 }
@@ -8808,14 +8805,16 @@ mod tests {
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
 
-    /// A shard GLOBAL recorded no snapshot for an epoch, its own or a split
-    /// parent's, has no member that could seal: its unsealed members are its
-    /// committee and leaders in that epoch, as GLOBAL admits their headers.
-    /// A recorded snapshot keeps the sealed requirement. Scheduling (the
-    /// committed scan) still counts sealed members only, so the shard keeps
-    /// its current session. Epoch 2000 is past the mainnet recovery epoch.
+    /// From the seal gate recovery epoch sealing gates rewards only: a
+    /// shard's unsealed members are its committee, its leaders and its
+    /// scheduled members, whether or not GLOBAL recorded its snapshot or a
+    /// split parent's. Counting only sealed members once a snapshot was
+    /// recorded left a shard whose snapshot came after its members' renewal
+    /// grace with every member unsealed and no leader that would propose.
+    /// Before the recovery epoch only sealed members count. Epoch 2000 is
+    /// past the mainnet recovery epoch.
     #[test]
-    fn a_shard_with_no_recorded_snapshot_keeps_its_unsealed_committee() {
+    fn unsealed_members_are_a_shards_committee_from_the_recovery_epoch() {
         quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1467));
         let epoch = 2000;
         let frame = quil_types::consensus::epoch_start_frame(epoch) + 20;
@@ -8857,17 +8856,6 @@ mod tests {
                 .map(|(a, p)| (a.clone(), p.allocations[0].clone()))
                 .collect(),
         );
-        assert_eq!(
-            registry.get_active_provers(&filter, frame).len(),
-            3,
-            "no member of a shard with no snapshot recorded for epoch {epoch} counts, so it \
-             never produces again"
-        );
-        assert_eq!(
-            registry.get_ordered_provers(&[0; 32], &filter, frame).len(),
-            3
-        );
-        assert!(scan.active_on_filter(&filter, frame).is_empty());
         let recorded = |filter: &[u8]| {
             (
                 (filter.to_vec(), (epoch % 4) as u8),
@@ -8880,20 +8868,47 @@ mod tests {
             )
         };
         for (shard, why) in [
-            (filter.clone(), "its own snapshot"),
-            (parent.clone(), "its split parent's snapshot"),
+            (None, "no snapshot"),
+            (Some(&filter), "its own snapshot"),
+            (Some(&parent), "its split parent's snapshot"),
         ] {
-            let (key, snapshot) = recorded(&shard);
-            registry.snapshot_cache.insert(key.clone(), snapshot);
-            assert!(
-                registry.get_active_provers(&filter, frame).is_empty(),
-                "{why} is recorded"
+            let key = shard.map(|shard| {
+                let (key, snapshot) = recorded(shard.as_slice());
+                registry.snapshot_cache.insert(key.clone(), snapshot);
+                key
+            });
+            assert_eq!(
+                registry.get_active_provers(&filter, frame).len(),
+                3,
+                "with {why} recorded no unsealed member counts, so no leader proposes and \
+                 the shard produces nothing in epoch {epoch}"
             );
-            assert!(registry
-                .get_ordered_provers(&[0; 32], &filter, frame)
-                .is_empty());
-            registry.snapshot_cache.remove(&key);
+            assert_eq!(
+                registry.get_ordered_provers(&[0; 32], &filter, frame).len(),
+                3,
+                "{why}: leader order"
+            );
+            assert_eq!(
+                scan.active_on_filter(&filter, frame).len(),
+                3,
+                "{why}: an unsealed member is not scheduled"
+            );
+            if let Some(key) = key {
+                registry.snapshot_cache.remove(&key);
+            }
         }
+        let before = quil_types::consensus::epoch_start_frame(1470) + 20;
+        assert!(
+            registry.get_active_provers(&filter, before).is_empty(),
+            "before the recovery epoch an unsealed member does not count"
+        );
+        assert!(registry
+            .get_ordered_provers(&[0; 32], &filter, before)
+            .is_empty());
+        assert!(
+            scan.active_on_filter(&filter, before).is_empty(),
+            "before the recovery epoch an unsealed member is not scheduled"
+        );
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
 }

@@ -1215,6 +1215,28 @@ pub fn storage_snapshot_frame(target_epoch: u64) -> u64 {
         + STORAGE_SNAPSHOT_OFFSET
 }
 
+/// GLOBAL frames a renewal signed at its grace frame keeps for inclusion
+/// before its epoch ends. GLOBAL refuses a confirm signed in one epoch and
+/// included in the next (`validate_confirm_epoch`), which leaves its seat
+/// expired.
+pub const RENEWAL_INCLUSION_FRAMES: u64 = 8;
+
+/// GLOBAL frames after an epoch's snapshot frame within which a renewal waits
+/// for the member's snapshot of it to be encoded; past them a member without
+/// one renews without a registration (its seat stays, its frames that epoch
+/// are unattested). Four ninths of an epoch, 320 frames on mainnet: the most
+/// that leaves a seat which labels its leaves at the snapshot as long again to
+/// label them for its seal before the epoch begins (decided 2026-10-26). A
+/// seat whose leaves were labelled ahead needs neither. In short epochs it
+/// ends [`RENEWAL_INCLUSION_FRAMES`] frames before the epoch's last frame, so
+/// a renewal made at it can still land.
+pub fn storage_snapshot_grace() -> u64 {
+    let length = epoch_length_frames();
+    let reserve = STORAGE_SNAPSHOT_OFFSET + 1 + RENEWAL_INCLUSION_FRAMES;
+    let latest = length.saturating_sub(reserve);
+    (length * 4 / 9).min(latest)
+}
+
 /// The epoch whose registrations snapshot their leaf data at an app frame
 /// anchored at `anchor` whose predecessor was anchored at `previous_anchor`:
 /// the shard's state just before its first frame anchored at or after
@@ -1446,22 +1468,19 @@ pub fn set_sealed_storage_epoch_for_thread(epoch: Option<u64>) {
 /// ([`seal_gate_rewards_only`]): GLOBAL admits a certified header whatever
 /// its signers' and prover's seats, and a participant without a seat sealed
 /// before the epoch earns no issuance share and chains no openings root.
-/// Its fees are paid as before, and it proposes and votes
-/// ([`storage_participant_admitted`]). And a shard with no snapshot recorded
-/// for an epoch counts its members in that epoch without a sealed
-/// registration in its committee and leader order
-/// ([`unrecorded_snapshot_admits_unsealed`]): its first header after the
-/// next snapshot frame records the next snapshot, and from that epoch its
-/// committee requires sealed members again. A shard a split creates reads
-/// its parent's snapshot, so one recorded for a shard whose filter is a
-/// prefix of its own counts too. Committee scheduling still counts sealed
-/// members only.
+/// Its fees are paid as before, it proposes and votes
+/// ([`storage_participant_admitted`]), and it counts in its shard's
+/// committee, leader order and committee scheduling
+/// ([`storage_member_eligible`]). Counting only sealed members there left a
+/// shard whose snapshot was recorded after its members' renewal grace with
+/// every member seated and unsealed, no leader that would propose, and no
+/// frame in the epoch.
 ///
 /// Read from the header's anchor epoch. Consensus-affecting (header
-/// admission and issuance): every node that executes GLOBAL frames must run
-/// a build carrying the epoch before it; an older archive refuses the first
-/// header with an unsealed signer that GLOBAL admits, and its state diverges
-/// from GLOBAL's.
+/// admission, issuance and committee scheduling): every node that executes
+/// GLOBAL frames must run a build carrying the epoch before it; an older
+/// archive refuses the first header with an unsealed signer that GLOBAL
+/// admits, and its state diverges from GLOBAL's.
 /// Mainnet epoch 1484 (GLOBAL frame 1,068,480; proposed 2026-11-12);
 /// `QUIL_SEAL_GATE_RECOVERY_EPOCH` elsewhere, never by default.
 pub const MAINNET_SEAL_GATE_RECOVERY_EPOCH: Option<u64> = Some(1484);
@@ -1481,7 +1500,7 @@ fn seal_gate_recovery_epoch_for(network: u8, setting: Option<&str>) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Fix this process's unrecorded snapshot epoch from its network, and return
+/// Fix this process's seal gate recovery epoch from its network, and return
 /// it. Called at startup before any frame is processed; the first call
 /// decides.
 pub fn init_seal_gate_recovery_epoch(network: u8) -> u64 {
@@ -1505,7 +1524,7 @@ pub fn seal_gate_recovery_epoch() -> u64 {
     *SEAL_GATE_RECOVERY_EPOCH.get_or_init(|| seal_gate_recovery_epoch_for(0, None))
 }
 
-/// Set the unrecorded snapshot epoch for the calling thread only (tests).
+/// Set the seal gate recovery epoch for the calling thread only (tests).
 /// `Some(u64::MAX)` disables it; `None` restores the process setting.
 pub fn set_seal_gate_recovery_epoch_for_thread(epoch: Option<u64>) {
     SEAL_GATE_RECOVERY_OVERRIDE.with(|cell| cell.set(epoch));
@@ -1535,33 +1554,21 @@ pub fn storage_participant_admitted<E>(
     Ok(storage_seat_eligible(filter, frame, slot(epoch)?.as_ref()))
 }
 
-/// Whether shard `filter` counts its members in `epoch` without a sealed
-/// registration ([`MAINNET_SEAL_GATE_RECOVERY_EPOCH`]): sealing is
-/// required then, and `recorded` (whether GLOBAL recorded a storage
-/// snapshot of a filter for `epoch`) holds neither for the shard nor for
-/// any shard whose filter is a prefix of its own, down to its application.
-pub fn unrecorded_snapshot_admits_unsealed(
-    filter: &[u8],
-    epoch: u64,
-    mut recorded: impl FnMut(&[u8]) -> bool,
-) -> bool {
-    !filter.is_empty()
-        && epoch >= seal_gate_recovery_epoch()
-        && sealed_storage_required(epoch)
-        && !(filter.len().min(32)..=filter.len()).any(|len| recorded(&filter[..len]))
-}
-
-/// [`storage_seat_eligible`], or a member of a shard whose epoch has no
-/// recorded snapshot ([`unrecorded_snapshot_admits_unsealed`]; `recorded`
-/// is asked only for a member without an eligible seat).
-pub fn storage_member_eligible(
+/// Whether a member counts in shard `filter`'s committee and leader order at
+/// GLOBAL frame `frame` (committee scheduling applies the same rule): any
+/// member before the sealed storage epoch or from the seal gate recovery
+/// epoch ([`seal_gate_rewards_only`]), else one whose seat slot for the
+/// frame's epoch, read by `slot` only then, is [`storage_seat_eligible`].
+pub fn storage_member_eligible<'a>(
     filter: &[u8],
     frame: u64,
-    slot: Option<&StorageSeatSlot>,
-    recorded: impl FnMut(&[u8]) -> bool,
+    slot: impl FnOnce(u64) -> Option<&'a StorageSeatSlot>,
 ) -> bool {
-    storage_seat_eligible(filter, frame, slot)
-        || unrecorded_snapshot_admits_unsealed(filter, epoch_for_frame(frame), recorded)
+    let epoch = epoch_for_frame(frame);
+    if filter.is_empty() || !sealed_storage_required(epoch) || seal_gate_rewards_only(epoch) {
+        return true;
+    }
+    storage_seat_eligible(filter, frame, slot(epoch))
 }
 
 /// The epoch from which a storage seat that closes an epoch with committed
@@ -4809,62 +4816,60 @@ mod sealed_storage_activation_tests {
         set_sealed_storage_epoch_for_thread(None);
     }
 
-    /// A shard with no snapshot recorded for an epoch, its own or a split
-    /// parent's, counts its unsealed members in that epoch, from the
-    /// recovery epoch on; any recorded one keeps the sealed requirement.
+    /// From the recovery epoch an unsealed member counts in its shard's
+    /// committee, leader order and scheduling, whether or not the shard's
+    /// snapshot is recorded; before it only a sealed seat counts, and its
+    /// slot is read only then.
     #[test]
-    fn a_shard_without_a_recorded_snapshot_counts_its_unsealed_members() {
+    fn an_unsealed_member_counts_in_its_committee_from_the_recovery_epoch() {
         set_sealed_storage_epoch_for_thread(Some(20));
         set_seal_gate_recovery_epoch_for_thread(Some(22));
-        let app = [7u8; 32];
-        let shard = [app.as_slice(), &[0, 8, 11]].concat();
-        let sibling = [app.as_slice(), &[0, 8, 12]].concat();
-        let frame = epoch_start_frame(23) + 5;
-        let none = |_: &[u8]| false;
-        assert!(unrecorded_snapshot_admits_unsealed(&shard, 23, none));
-        assert!(unrecorded_snapshot_admits_unsealed(&shard, 22, none));
+        let shard = [[7u8; 32].as_slice(), &[0, 8, 11]].concat();
+        let sealed = StorageSeatSlot {
+            epoch: 21,
+            leaves: vec![vec![0]],
+            registered_at: 1,
+            sealed_at: Some(2),
+            frames: 0,
+            accumulator: [0; 32],
+            chained: Vec::new(),
+            open: true,
+        };
+        let unread = |_: u64| -> Option<&'static StorageSeatSlot> {
+            panic!("the seat is read only before the recovery epoch")
+        };
+        for epoch in [22, 23] {
+            assert!(
+                storage_member_eligible(&shard, epoch_start_frame(epoch) + 5, unread),
+                "an unsealed member counts in epoch {epoch}, from the recovery epoch"
+            );
+        }
+        let before = epoch_start_frame(21) + 5;
         assert!(
-            storage_member_eligible(&shard, frame, None, none),
-            "an unsealed member of a shard GLOBAL recorded nothing for"
+            !storage_member_eligible(&shard, before, |_| None),
+            "before the recovery epoch an unsealed member does not count"
         );
         assert!(
-            !storage_seat_eligible(&shard, frame, None),
-            "the seat alone still does not count"
+            storage_member_eligible(&shard, before, |epoch| {
+                assert_eq!(epoch, 21, "the slot is read for the frame's epoch");
+                Some(&sealed)
+            }),
+            "before the recovery epoch a sealed member counts"
         );
         assert!(
-            !unrecorded_snapshot_admits_unsealed(&shard, 21, none),
-            "before the recovery epoch"
-        );
-        assert!(
-            !unrecorded_snapshot_admits_unsealed(&[], 23, none),
+            storage_member_eligible(&[], before, unread),
             "GLOBAL has no storage seats"
-        );
-        assert!(
-            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == shard.as_slice()),
-            "its own snapshot is recorded"
-        );
-        assert!(
-            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == &shard[..34]),
-            "a split parent's snapshot is recorded"
-        );
-        assert!(
-            !unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == app.as_slice()),
-            "the application's whole-shard snapshot is recorded"
-        );
-        assert!(
-            unrecorded_snapshot_admits_unsealed(&shard, 23, |f: &[u8]| f == sibling.as_slice()),
-            "a sibling's snapshot is not this shard's data"
         );
         set_seal_gate_recovery_epoch_for_thread(Some(u64::MAX));
         assert!(
-            !storage_member_eligible(&shard, frame, None, none),
-            "without the recovery epoch"
+            !storage_member_eligible(&shard, epoch_start_frame(23) + 5, |_| None),
+            "without the recovery epoch an unsealed member does not count"
         );
         set_seal_gate_recovery_epoch_for_thread(Some(22));
         set_sealed_storage_epoch_for_thread(Some(30));
         assert!(
-            !unrecorded_snapshot_admits_unsealed(&shard, 23, none),
-            "before the sealed storage epoch nothing needs the recovery"
+            storage_member_eligible(&shard, epoch_start_frame(23) + 5, unread),
+            "before the sealed storage epoch every member counts"
         );
         set_seal_gate_recovery_epoch_for_thread(None);
         set_sealed_storage_epoch_for_thread(None);
