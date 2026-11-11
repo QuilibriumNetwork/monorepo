@@ -442,3 +442,60 @@ fn before_the_config_replay_frame_deploys_and_updates_apply_as_before() {
     );
     crate::config_replay::set_config_replay_frame_for_thread(None);
 }
+
+/// An application shard's frame is judged by its GLOBAL anchor, which the
+/// shard's leader picks. An owner's update signed before the config replay
+/// frame, over its domain alone, and replaced since by a bound update,
+/// applies again in a shard frame anchored before the replay frame and
+/// restores the configuration it carried; anchored at the replay frame the
+/// same bytes are refused. A voter keeps such a frame out (cw_app_seams).
+#[test]
+fn a_frame_anchored_before_the_replay_frame_reapplies_a_replaced_update() {
+    crate::config_replay::set_config_replay_frame_for_thread(Some(100));
+    let engine = engine();
+    let owner = FalconSigner::generate();
+    let original = config(b"zero", &owner);
+    let domain = materialize::token_deploy_domain(&original).unwrap();
+    apply(&engine, 10, &token_base_domain(), deploy(&original))
+        .expect("harness: the deploy applies");
+    let early = unbound_update(&domain, &config(b"one", &owner), &owner);
+    apply(&engine, 11, &domain, early.clone())
+        .expect("harness: before the frame an unbound update applies");
+    apply(
+        &engine,
+        101,
+        &domain,
+        update(&engine, &domain, &config(b"two", &owner), &owner),
+    )
+    .expect("harness: from the frame a bound update applies");
+
+    let in_shard = |anchor: u64| -> Result<()> {
+        let message = CanonicalMessageRequest::wrap(early.clone())?.to_canonical_bytes()?;
+        engine.validate_message(500, &domain, &message)?;
+        engine
+            .process_message_with_context(
+                quil_types::execution::FrameExecutionContext {
+                    frame_number: 500,
+                    finalized_global_frame: Some(anchor),
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                    venue: Some(quil_types::execution::Venue::Application),
+                },
+                &num_bigint::BigInt::from(0),
+                &domain,
+                &message,
+            )
+            .map(|_| ())
+    };
+    let bound = in_shard(100);
+    assert!(
+        bound.is_err() && stored(&engine, &domain).name == b"two",
+        "harness: a frame anchored at the replay frame applied the replaced update ({bound:?})"
+    );
+    let stale = in_shard(99);
+    assert!(
+        stale.is_ok() && stored(&engine, &domain).name == b"one",
+        "PREMISE: a frame anchored before the replay frame did not apply the replaced \
+         update again ({stale:?})"
+    );
+    crate::config_replay::set_config_replay_frame_for_thread(None);
+}
