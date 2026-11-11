@@ -2378,6 +2378,9 @@ pub mod silence;
 #[path = "handoff_superseded.rs"]
 pub mod superseded;
 
+#[path = "handoff_fee_fence.rs"]
+pub mod fee_fence;
+
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
 mod tests;

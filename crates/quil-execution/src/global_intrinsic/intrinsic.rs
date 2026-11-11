@@ -42,6 +42,19 @@ mod fork_tests;
 #[path = "header_cost_tests.rs"]
 mod header_cost_tests;
 
+/// How GLOBAL takes a shard frame header that passed
+/// [`GlobalIntrinsic::admit_anchor_and_output`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderAdmission {
+    /// A frame of its shard, executed as such.
+    Frame,
+    /// Its fee vote lies out of bounds at its anchor
+    /// ([`crate::fee_vote::fee_vote_out_of_bounds_at`]): members refuse the
+    /// frame and GLOBAL never executes it. Certified by its session, it fences
+    /// that session at its executed tip ([`super::handoff::fee_fence`]).
+    FeeFence,
+}
+
 /// The global intrinsic: holds dependencies for signature
 /// verification and state lookups. Dispatches `validate` and
 /// `invoke_step` calls to per-op handlers.
@@ -1081,7 +1094,11 @@ impl GlobalIntrinsic {
                 // number, fee total, settlement relay, ...) must reproduce
                 // the certified output, and a relay must be canonical for its
                 // window.
-                Self::check_anchor_and_output(self.clock_store.as_deref(), frame_number, &op)?;
+                let admission =
+                    Self::admit_anchor_and_output(self.clock_store.as_deref(), frame_number, &op)?;
+                if admission == HeaderAdmission::FeeFence {
+                    return self.validate_fee_fence(frame_number, &op, fp, bls, pr);
+                }
                 super::prover_shard_update::verify_settlement_relay(&op)?;
                 // CW path: a simplex-finalized shard frame's sig field
                 // holds the magic-prefixed finalization certificate, not a BLS
@@ -2812,8 +2829,98 @@ impl GlobalIntrinsic {
         Self::verify_anchored_output(self.clock_store.as_deref(), op)
     }
 
-    /// [`Self::verify_shard_frame_output`] against `clock_store`.
+    /// Admission of a header voting out of bounds at its anchor
+    /// ([`HeaderAdmission::FeeFence`]): GLOBAL frame `frame_number` carries it
+    /// only as evidence that fences its session, so it needs that session's
+    /// certificate and a session the fence applies to
+    /// ([`super::handoff::fee_fence::check`]), and nothing else of the frame.
+    fn validate_fee_fence(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        fp: &dyn quil_types::crypto::FrameProver,
+        bls: &dyn quil_types::crypto::BlsConstructor,
+        pr: &dyn quil_types::consensus::ProverRegistry,
+    ) -> Result<bool> {
+        let crdt = self.hypergraph.as_ref().ok_or_else(|| {
+            QuilError::ExecutionUnavailable(
+                "FrameHeader: authenticated global state is required for session lookup".into(),
+            )
+        })?;
+        let state = HypergraphState::new(crdt.clone());
+        let session = Self::fee_fence_session(&state, frame_number, op, fp, bls, pr)?;
+        super::handoff::fee_fence::check(&state, &session, &op.address, op.frame_number)?;
+        Ok(true)
+    }
+
+    /// The session whose certificate `op`, voting out of bounds, carries,
+    /// verified as for any header. A legacy certificate names no session and
+    /// is refused with the fee vote's refusal.
+    fn fee_fence_session(
+        state: &HypergraphState,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        fp: &dyn quil_types::crypto::FrameProver,
+        bls: &dyn quil_types::crypto::BlsConstructor,
+        pr: &dyn quil_types::consensus::ProverRegistry,
+    ) -> Result<[u8; 32]> {
+        let refused = || {
+            crate::fee_vote::check_fee_vote(
+                op.frame_number,
+                op.global_frame_number,
+                op.fee_multiplier_vote as u64,
+            )
+            .err()
+            .unwrap_or_else(|| QuilError::Internal("fee vote fence: vote in bounds".into()))
+        };
+        if quil_cw_consensus::app_cert::unwrap_cert_from_header(&op.public_key_signature_bls48581)
+            .is_none()
+        {
+            return Err(refused());
+        }
+        let committee_frame = if op.global_frame_number > 0 {
+            op.global_frame_number
+        } else {
+            frame_number
+        };
+        let (_, _, session) = super::prover_shard_update::verify_frame_header_session(
+            state,
+            op,
+            fp,
+            bls,
+            pr,
+            committee_frame,
+            frame_number,
+        )?;
+        session.ok_or_else(refused)
+    }
+
+    /// [`Self::verify_shard_frame_output`] against `clock_store`, then
+    /// refusing a fee vote out of bounds at the header's anchor, as the
+    /// shard's members and sync refuse the frame
+    /// ([`crate::fee_vote::check_fee_vote`]): the frame priced its writes at
+    /// that vote, and GLOBAL must not commit a frame they refuse. Seal drains
+    /// and archive vouching check a header's output here; header admission
+    /// and execution take such a header as a fence instead
+    /// ([`Self::admit_anchor_and_output`]). The output comes first: a node
+    /// lacking the anchor gets the unavailable class whatever the vote, and
+    /// waits for the anchor as header admission and execution do, rather
+    /// than refuse a header other nodes take as a fence.
     fn verify_anchored_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        Self::recompute_anchored_output(clock_store, op)?;
+        crate::fee_vote::check_fee_vote(
+            op.frame_number,
+            op.global_frame_number,
+            op.fee_multiplier_vote as u64,
+        )
+    }
+
+    /// Recompute `op`'s output against its anchored GLOBAL frame from
+    /// `clock_store`, whatever its fee vote.
+    fn recompute_anchored_output(
         clock_store: Option<&dyn quil_types::store::ClockStore>,
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
@@ -2840,12 +2947,15 @@ impl GlobalIntrinsic {
 
     /// What GLOBAL frame `frame_number` checks of a shard frame header before
     /// its certificate: it names an anchor, the anchor lies in the frame's
-    /// window, and the header's fields reproduce its output. The certificate
-    /// signs only the view and the output's digest, so until this passes a
-    /// header's other fields, its frame number among them, are claims.
+    /// window, its fee vote lies in bounds, and the header's fields reproduce
+    /// its output. The certificate signs only the view and the output's
+    /// digest, so until this passes a header's other fields, its frame number
+    /// among them, are claims.
     /// An error of the unavailable class is a local gap: an anchor in the
-    /// window this node lacks. Any other error refuses the header on every
-    /// node, whatever its certificate.
+    /// window this node lacks. Any other error means the frame never
+    /// executes, whatever its certificate: archives vouch for no such header,
+    /// and one whose fee vote alone is out of bounds can only fence its
+    /// session ([`Self::admit_anchor_and_output`]).
     pub fn check_anchor_and_output(
         clock_store: Option<&dyn quil_types::store::ClockStore>,
         frame_number: u64,
@@ -2854,6 +2964,31 @@ impl GlobalIntrinsic {
         Self::require_global_anchor(frame_number, op)?;
         Self::refuse_anchor_outside_window(frame_number, op)?;
         Self::verify_anchored_output(clock_store, op)
+    }
+
+    /// [`Self::check_anchor_and_output`] as GLOBAL header admission and
+    /// execution apply it: a header whose fields reproduce its output but
+    /// whose fee vote lies out of bounds at its anchor is not refused here but
+    /// taken as [`HeaderAdmission::FeeFence`], and its caller requires its
+    /// session's certificate before it fences that session. Every header in
+    /// bounds, and every header anchored before the fee vote bound frame, is a
+    /// [`HeaderAdmission::Frame`] exactly when `check_anchor_and_output`
+    /// accepts it.
+    pub fn admit_anchor_and_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<HeaderAdmission> {
+        Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
+        Self::recompute_anchored_output(clock_store, op)?;
+        if crate::fee_vote::fee_vote_out_of_bounds_at(
+            op.global_frame_number,
+            op.fee_multiplier_vote as u64,
+        ) {
+            return Ok(HeaderAdmission::FeeFence);
+        }
+        Ok(HeaderAdmission::Frame)
     }
 
     /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
@@ -3685,9 +3820,45 @@ impl GlobalIntrinsic {
             })?;
         timing.mark("session");
 
-        self.verify_shard_frame_output(op)
-            .map_err(|e| QuilError::InvalidArgument(format!("invoke_frame_header: {e}")))?;
+        // An anchor this node lacks is a local gap: the frame waits for it,
+        // as archive sync waits for its anchors, rather than skip a header
+        // every node holding the anchor executes or takes as a fence.
+        let admission =
+            Self::admit_anchor_and_output(self.clock_store.as_deref(), frame_number, op).map_err(
+                |e| {
+                    if e.is_execution_unavailable() {
+                        e
+                    } else {
+                        QuilError::InvalidArgument(format!("invoke_frame_header: {e}"))
+                    }
+                },
+            )?;
         timing.mark("output");
+        if admission == HeaderAdmission::FeeFence {
+            // Certified by its session, a frame voting out of bounds fences
+            // that session at its executed tip; nothing of the frame executes.
+            let session = match session {
+                Some(session) => session,
+                None => {
+                    crate::fee_vote::check_fee_vote(
+                        op.frame_number,
+                        op.global_frame_number,
+                        op.fee_multiplier_vote as u64,
+                    )?;
+                    return Err(QuilError::Internal("fee vote fence: vote in bounds".into()));
+                }
+            };
+            super::handoff::fee_fence::fence(
+                state,
+                frame_number,
+                &session,
+                &op.address,
+                op.frame_number,
+                op.fee_multiplier_vote as u64,
+                op.global_frame_number,
+            )?;
+            return Ok(());
+        }
         super::prover_shard_update::verify_settlement_relay(op)?;
         // A certified header's accumulator report must be canonical and name
         // subtrees its own shard can own; checked by every node, like the relay.
@@ -7331,6 +7502,242 @@ mod tests {
         header.global_frame_number = first - 1;
         assert!(GlobalIntrinsic::require_global_anchor(first, &header).is_ok());
         quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+    }
+
+    /// GLOBAL refuses a shard frame header whose fee vote lies outside
+    /// 90..=110 from the fee vote bound frame, judged by the header's anchor
+    /// as the shard's sync judges the frame, so it never commits a frame the
+    /// shard's members refuse. Under the process default (mainnet) a header
+    /// anchored the frame before passes whatever its vote; anchored at it,
+    /// one out of bounds is refused before its certificate is read.
+    #[test]
+    fn a_shard_header_with_a_fee_vote_out_of_range_is_refused_from_the_bound_frame() {
+        use quil_types::store::ClockStore as _;
+        const BOUND: u64 = 1_097_280;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = quil_store::RocksClockStore::new(db.inner());
+        for number in [BOUND - 1, BOUND] {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = store.new_transaction(false).unwrap();
+            store.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        }
+        let clock: &dyn quil_types::store::ClockStore = &store;
+        let check = |anchor: u64, vote: i64| {
+            let mut op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![1; 32],
+                frame_number: 7,
+                global_frame_number: anchor,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            op.output = quil_crypto::porep::deterministic_app_frame_output(
+                &op.parent_selector,
+                &op.requests_root,
+                &op.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+                op.frame_number,
+                op.rank,
+                &op.prover,
+                op.difficulty,
+                op.fee_multiplier_vote as u64,
+                op.timestamp,
+                &op.storage_attestation_root,
+                op.fee_total_value(),
+                &op.settlements,
+                &op.accumulator,
+                &op.spends,
+            );
+            GlobalIntrinsic::check_anchor_and_output(Some(clock), BOUND + 1, &op)
+        };
+        for vote in [90, 100, 110] {
+            check(BOUND - 1, vote).unwrap();
+            check(BOUND, vote).unwrap();
+        }
+        for vote in [0, 89, 111, -1] {
+            check(BOUND - 1, vote).unwrap();
+            let refused = check(BOUND, vote)
+                .expect_err("GLOBAL admitted a header voting out of bounds at the bound frame")
+                .to_string();
+            assert!(refused.contains("fee multiplier vote"), "{refused}");
+        }
+    }
+
+    /// GLOBAL header admission and execution, under the process default
+    /// (mainnet): a header in bounds, or anchored before the bound frame, is a
+    /// frame as `check_anchor_and_output` accepts it; one out of bounds from
+    /// the bound frame is only fence evidence, never a frame, and only once its
+    /// fields reproduce its output, so the vote is the one its certificate
+    /// covers. A header outside the anchor window is refused either way.
+    #[test]
+    fn a_header_voting_out_of_bounds_is_admitted_only_as_fence_evidence() {
+        use quil_types::store::ClockStore as _;
+        const BOUND: u64 = 1_097_280;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = quil_store::RocksClockStore::new(db.inner());
+        for number in [BOUND - 1, BOUND] {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = store.new_transaction(false).unwrap();
+            store.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        }
+        let clock: &dyn quil_types::store::ClockStore = &store;
+        let header = |anchor: u64, vote: i64| {
+            let mut op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![1; 32],
+                frame_number: 7,
+                global_frame_number: anchor,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            op.output = quil_crypto::porep::deterministic_app_frame_output(
+                &op.parent_selector,
+                &op.requests_root,
+                &op.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+                op.frame_number,
+                op.rank,
+                &op.prover,
+                op.difficulty,
+                op.fee_multiplier_vote as u64,
+                op.timestamp,
+                &op.storage_attestation_root,
+                op.fee_total_value(),
+                &op.settlements,
+                &op.accumulator,
+                &op.spends,
+            );
+            op
+        };
+        let admit = |op: &crate::global_intrinsic::frame_header::FrameHeader| {
+            GlobalIntrinsic::admit_anchor_and_output(Some(clock), BOUND + 1, op)
+        };
+        for vote in [90, 100, 110] {
+            for anchor in [BOUND - 1, BOUND] {
+                assert_eq!(
+                    admit(&header(anchor, vote)).unwrap(),
+                    HeaderAdmission::Frame,
+                    "an honest header voting {vote} anchored at {anchor}"
+                );
+            }
+        }
+        for vote in [0, 89, 111, -1] {
+            assert_eq!(
+                admit(&header(BOUND - 1, vote)).unwrap(),
+                HeaderAdmission::Frame,
+                "vote {vote} before the bound frame"
+            );
+            assert_eq!(
+                admit(&header(BOUND, vote))
+                    .expect("a header voting out of bounds was refused unfenced"),
+                HeaderAdmission::FeeFence,
+                "GLOBAL took a header voting {vote} out of bounds as a frame"
+            );
+            let mut rewritten = header(BOUND, vote);
+            rewritten.fee_multiplier_vote = 100;
+            assert!(admit(&rewritten).is_err(), "a rewritten vote");
+            let mut rewritten = header(BOUND, 100);
+            rewritten.fee_multiplier_vote = vote;
+            assert!(admit(&rewritten).is_err(), "a rewritten vote {vote}");
+        }
+        assert!(
+            GlobalIntrinsic::admit_anchor_and_output(Some(clock), BOUND + 100, &header(BOUND, 0))
+                .is_err(),
+            "outside the anchor window"
+        );
+    }
+
+    /// A node lacking a header's anchor, inside its window, cannot judge the
+    /// header: archive vouching, header admission and seal drains get the
+    /// unavailable class whatever its fee vote, so an archive waits for the
+    /// anchor (`archive_sync`'s unheld anchors) rather than refuse a header
+    /// that the archives holding it take as a fence, which would split GLOBAL
+    /// state. Once the anchor is held, a vote out of bounds is refused here
+    /// and admitted only as fence evidence.
+    #[test]
+    fn an_unheld_anchor_is_unavailable_whatever_the_fee_vote() {
+        use quil_types::store::ClockStore as _;
+        const BOUND: u64 = 1_097_280;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = quil_store::RocksClockStore::new(db.inner());
+        let clock: &dyn quil_types::store::ClockStore = &store;
+        let header = |vote: i64| {
+            let mut op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![1; 32],
+                frame_number: 7,
+                global_frame_number: BOUND,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            op.output = quil_crypto::porep::deterministic_app_frame_output(
+                &op.parent_selector,
+                &op.requests_root,
+                &op.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(BOUND, &[BOUND as u8; 516]),
+                op.frame_number,
+                op.rank,
+                &op.prover,
+                op.difficulty,
+                op.fee_multiplier_vote as u64,
+                op.timestamp,
+                &op.storage_attestation_root,
+                op.fee_total_value(),
+                &op.settlements,
+                &op.accumulator,
+                &op.spends,
+            );
+            op
+        };
+        for vote in [100, 0, 89, 111, -1] {
+            let op = header(vote);
+            let vouched = GlobalIntrinsic::check_anchor_and_output(Some(clock), BOUND + 1, &op)
+                .expect_err("a header judged without its anchor");
+            assert!(
+                vouched.is_execution_unavailable(),
+                "SPLIT: an archive lacking the anchor refused a header voting {vote} \
+                 instead of waiting: {vouched}"
+            );
+            let admitted = GlobalIntrinsic::admit_anchor_and_output(Some(clock), BOUND + 1, &op)
+                .expect_err("a header admitted without its anchor");
+            assert!(admitted.is_execution_unavailable(), "{admitted}");
+        }
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: BOUND,
+                output: vec![BOUND as u8; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let txn = store.new_transaction(false).unwrap();
+        store.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        GlobalIntrinsic::check_anchor_and_output(Some(clock), BOUND + 1, &header(100)).unwrap();
+        for vote in [0, 89, 111, -1] {
+            let refused =
+                GlobalIntrinsic::check_anchor_and_output(Some(clock), BOUND + 1, &header(vote))
+                    .expect_err("a vote out of bounds vouched for");
+            assert!(!refused.is_execution_unavailable(), "{refused}");
+            assert_eq!(
+                GlobalIntrinsic::admit_anchor_and_output(Some(clock), BOUND + 1, &header(vote))
+                    .unwrap(),
+                HeaderAdmission::FeeFence
+            );
+        }
     }
 
     struct AcceptAll;

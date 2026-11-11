@@ -80,6 +80,18 @@ fn sign(
     parent: u64,
     digest: [u8; 32],
 ) -> Vec<u8> {
+    sign_by(session, keys, view, parent, digest, 3)
+}
+
+/// [`sign`] with the votes of the first `signers` of `keys`.
+fn sign_by(
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+    signers: usize,
+) -> Vec<u8> {
     let proposal = Proposal::new(
         Round::new(Epoch::new(session.generation), View::new(view)),
         View::new(parent),
@@ -98,7 +110,7 @@ fn sign(
             Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap()
         })
         .collect();
-    let votes: Vec<_> = schemes[..3]
+    let votes: Vec<_> = schemes[..signers]
         .iter()
         .map(|scheme| {
             scheme
@@ -188,6 +200,7 @@ fn canonical(frame: &AppShardFrame) -> CanonicalHeader {
         requests_root: h.requests_root.clone(),
         state_roots: h.state_roots.clone(),
         prover: h.prover.clone(),
+        fee_multiplier_vote: h.fee_multiplier_vote as i64,
         public_key_signature_bls48581: h
             .public_key_signature_bls48581
             .as_ref()
@@ -822,71 +835,18 @@ impl CrowdRig {
             })
             .collect();
         handoff::set_seal_drain_frame_for_thread(Some(CROWD_FRAME));
-
-        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
-        let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-            fixture.inclusion.clone(),
-            crypto.key_manager,
-            fixture.state.crdt().clone(),
-            crypto.circuit_compiler,
-            fixture.clock.clone(),
-            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
-            true,
-        ));
-        manager
-            .install_global_frame_header_deps(
-                fixture.registry.clone(),
-                Arc::new(ZeroRewards),
-                Arc::new(quil_crypto::FalconKeyConstructor),
-                fixture.inclusion.clone(),
-                fixture.prover.clone(),
-            )
-            .unwrap();
-        // The parent the leader builds on, as its materializer recorded it.
-        let parent_output = vec![0x55; 516];
-        store_global_frame(&fixture, CROWD_FRAME - 1, &parent_output);
-        fixture
-            .state
-            .crdt()
-            .record_prover_root(CROWD_FRAME - 1, vec![0x77; 32]);
-        let signer = Arc::new(quil_crypto::FalconSigner::generate());
-        let address = quil_crypto::poseidon::hash_bytes_to_32(signer.public_key())
-            .unwrap()
-            .to_vec();
-        let registry = Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
-            address: address.clone(),
-            public_key: signer.public_key().to_vec(),
-            status: ProverStatus::Active,
-            kick_frame_number: 0,
-            allocations: Vec::new(),
-            available_storage: 0,
-            seniority: 1,
-            delegate_address: Vec::new(),
-        }]));
-        let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
-        let leader = quil_engine::leader_provider::GlobalLeaderProvider::new(
-            registry,
-            Arc::new(CrowdFrameProver),
-            Arc::new(quil_engine::difficulty::AsertDifficultyAdjuster::new(
-                0, 0, 100,
-            )),
-            fixture.clock.clone(),
-            collector.clone(),
-            address,
-            signer.public_key().to_vec(),
-            signer,
-            Arc::new(quil_tries::ShaInclusionProver),
-            Some(manager.clone()),
-            Some(fixture.state.crdt().clone()),
-        );
+        let ArchiveLeader {
+            manager,
+            collector,
+            leader,
+            parent,
+        } = ArchiveLeader::new(&fixture);
         Self {
             _fixture: fixture,
             manager,
             collector,
             leader,
-            parent: quil_crypto::poseidon::hash_bytes_to_32(&parent_output)
-                .unwrap()
-                .to_vec(),
+            parent,
             seals,
         }
     }
@@ -1049,27 +1009,115 @@ impl CrowdRig {
     /// The canonical bundles this leader's proposal of [`CROWD_FRAME`] at
     /// `rank` carries.
     fn propose(&self, rank: u64) -> Vec<Vec<u8>> {
-        use quil_consensus::leader_provider::LeaderProvider as _;
-        let state = self
-            .leader
-            .prove_next_state(rank, &[], CROWD_FRAME - 1, &self.parent)
-            .unwrap_or_else(|error| {
-                panic!("SETUP: the leader must propose GLOBAL frame {CROWD_FRAME}: {error}")
-            });
-        assert_eq!(state.state.frame_number, CROWD_FRAME);
-        state
-            .state
-            .messages
-            .iter()
-            .map(|bundle| {
-                quil_engine::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
-                    bundle,
-                    Some(CROWD_FRAME),
-                )
-                .unwrap()
-            })
-            .collect()
+        propose(&self.leader, &self.parent, rank)
     }
+}
+
+/// A GLOBAL archive leader over a fixture's state and clock, proposing
+/// [`CROWD_FRAME`] with the engine manager validating, as an archive does.
+struct ArchiveLeader {
+    manager: Arc<quil_execution::ExecutionEngineManager>,
+    collector: Arc<quil_engine::message_collector::MessageCollector>,
+    leader: quil_engine::leader_provider::GlobalLeaderProvider,
+    /// Identity of stored GLOBAL frame [`CROWD_FRAME`] - 1.
+    parent: Vec<u8>,
+}
+
+impl ArchiveLeader {
+    fn new(fixture: &Fixture) -> Self {
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+            fixture.inclusion.clone(),
+            crypto.key_manager,
+            fixture.state.crdt().clone(),
+            crypto.circuit_compiler,
+            fixture.clock.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
+        ));
+        manager
+            .install_global_frame_header_deps(
+                fixture.registry.clone(),
+                Arc::new(ZeroRewards),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                fixture.inclusion.clone(),
+                fixture.prover.clone(),
+            )
+            .unwrap();
+        // The parent the leader builds on, as its materializer recorded it.
+        let parent_output = vec![0x55; 516];
+        store_global_frame(fixture, CROWD_FRAME - 1, &parent_output);
+        fixture
+            .state
+            .crdt()
+            .record_prover_root(CROWD_FRAME - 1, vec![0x77; 32]);
+        let signer = Arc::new(quil_crypto::FalconSigner::generate());
+        let address = quil_crypto::poseidon::hash_bytes_to_32(signer.public_key())
+            .unwrap()
+            .to_vec();
+        let registry = Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+            address: address.clone(),
+            public_key: signer.public_key().to_vec(),
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: Vec::new(),
+            available_storage: 0,
+            seniority: 1,
+            delegate_address: Vec::new(),
+        }]));
+        let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+        let leader = quil_engine::leader_provider::GlobalLeaderProvider::new(
+            registry,
+            Arc::new(CrowdFrameProver),
+            Arc::new(quil_engine::difficulty::AsertDifficultyAdjuster::new(
+                0, 0, 100,
+            )),
+            fixture.clock.clone(),
+            collector.clone(),
+            address,
+            signer.public_key().to_vec(),
+            signer,
+            Arc::new(quil_tries::ShaInclusionProver),
+            Some(manager.clone()),
+            Some(fixture.state.crdt().clone()),
+        );
+        Self {
+            manager,
+            collector,
+            leader,
+            parent: quil_crypto::poseidon::hash_bytes_to_32(&parent_output)
+                .unwrap()
+                .to_vec(),
+        }
+    }
+}
+
+/// The canonical bundles `leader`'s proposal of [`CROWD_FRAME`] on `parent`
+/// at `rank` carries.
+fn propose(
+    leader: &quil_engine::leader_provider::GlobalLeaderProvider,
+    parent: &[u8],
+    rank: u64,
+) -> Vec<Vec<u8>> {
+    use quil_consensus::leader_provider::LeaderProvider as _;
+    let state = leader
+        .prove_next_state(rank, &[], CROWD_FRAME - 1, &parent.to_vec())
+        .unwrap_or_else(|error| {
+            panic!("SETUP: the leader must propose GLOBAL frame {CROWD_FRAME}: {error}")
+        });
+    assert_eq!(state.state.frame_number, CROWD_FRAME);
+    state
+        .state
+        .messages
+        .iter()
+        .map(|bundle| {
+            quil_engine::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                bundle,
+                Some(CROWD_FRAME),
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 impl Drop for CrowdRig {
@@ -1882,6 +1930,18 @@ fn certify_anchored(
     parent_view: u64,
     anchor_output: &[u8],
 ) {
+    certify_anchored_by(header, session, keys, parent_view, anchor_output, 3);
+}
+
+/// [`certify_anchored`] with the votes of the first `signers` of `keys`.
+fn certify_anchored_by(
+    header: &mut FrameHeader,
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    parent_view: u64,
+    anchor_output: &[u8],
+    signers: usize,
+) {
     header.output = quil_crypto::porep::deterministic_app_frame_output(
         &header.parent_selector,
         &header.requests_root,
@@ -1899,12 +1959,13 @@ fn certify_anchored(
         &header.accumulator,
         &header.spends,
     );
-    let certificate = sign(
+    let certificate = sign_by(
         session,
         keys,
         header.rank,
         parent_view,
         quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
+        signers,
     );
     header.public_key_signature_bls48581 = Some(Bls48581AggregateSignature {
         signature: wrap_cert_for_header(&certificate),
@@ -3304,4 +3365,582 @@ fn seal_drain_fix_admits_genuine_anchors_at_both_edges() {
         }
     }
     eprintln!("SD FIX: genuine anchors at both edges are admitted and executed");
+}
+
+/// Frames 1 to `votes.len()` of `session`, unanchored, each extending the
+/// last, frame n at view 2n + 3 voting `votes[n - 1]`, certified by `keys`.
+fn voting_chain(session: &Session, keys: &[FalconPrivateKey], votes: &[u64]) -> Vec<AppShardFrame> {
+    let mut frames: Vec<AppShardFrame> = Vec::new();
+    for (index, vote) in votes.iter().enumerate() {
+        let number = session.base_frame + 1 + index as u64;
+        let (parent, parent_view) = match frames.last() {
+            Some(previous) => {
+                let previous = previous.header.as_ref().unwrap();
+                (
+                    quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+                        .unwrap()
+                        .to_vec(),
+                    previous.rank,
+                )
+            }
+            None => (session.genesis.to_vec(), 0),
+        };
+        let mut header = FrameHeader {
+            address: session.filter.clone(),
+            frame_number: number,
+            rank: 2 * (index as u64 + 1) + 3,
+            difficulty: 1,
+            fee_multiplier_vote: *vote,
+            parent_selector: parent,
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify(&mut header, session, keys, parent_view);
+        frames.push(AppShardFrame {
+            header: Some(header),
+            ..Default::default()
+        });
+    }
+    frames
+}
+
+/// From the fee vote bound frame (here 0, so every header is judged), a
+/// quorum of members without the bound certifies frame 3 voting 0 and
+/// extends it with frame 4. Members carrying the bound refuse frame 3 and
+/// cannot follow. GLOBAL executes neither: frame 3's header fences the
+/// session at its executed tip, frame 2, and authorizes its successor from
+/// there with the same committee, which then produces from a frame those
+/// members hold. Frame 4 is refused past the fence, and the session is fenced
+/// once. Headers in bounds execute as frames and fence nothing.
+#[test]
+fn a_frame_voting_out_of_bounds_fences_its_session_at_the_executed_tip() {
+    let keys = keys();
+    let source = session(&keys, vec![0x65; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(Some(0));
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+    let id = source.id().unwrap();
+    let frames = voting_chain(&source, &keys, &[100, 110, 0, 90]);
+    let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
+
+    // Frames 1 and 2, in bounds, execute as frames.
+    for (index, global) in [(0usize, 3u64), (1, 4)] {
+        assert!(intrinsic
+            .validate(global, &wire(&frames[index]), None, None)
+            .unwrap());
+        intrinsic
+            .invoke_step(global, &wire(&frames[index]), &fixture.state)
+            .unwrap_or_else(|error| panic!("an honest header was refused: {error}"));
+        commit(&fixture.state, global);
+    }
+    let tip = handoff::session_tip(&fixture.state, &id).unwrap().unwrap();
+    assert_eq!(tip.frame, 2);
+    assert!(!handoff::is_fenced(&fixture.state, &id).unwrap());
+
+    // Frame 3, voting 0, then frame 4, which extends it, reach GLOBAL.
+    let fenced = intrinsic.invoke_step(5, &wire(&frames[2]), &fixture.state);
+    commit(&fixture.state, 5);
+    let descendant = intrinsic.invoke_step(6, &wire(&frames[3]), &fixture.state);
+    commit(&fixture.state, 6);
+    assert!(
+        handoff::is_fenced(&fixture.state, &id).unwrap(),
+        "GLOBAL left a session that certified a frame voting out of bounds unfenced \
+         (frame 3: {fenced:?}; frame 4: {descendant:?})"
+    );
+    fenced.expect("the header voting out of bounds fences its session");
+    assert!(
+        descendant.is_err(),
+        "GLOBAL executed a frame extending one voting out of bounds"
+    );
+    assert_eq!(
+        handoff::session_tip(&fixture.state, &id).unwrap().unwrap(),
+        tip,
+        "nothing of the refused frame or its descendant executed"
+    );
+    let fence = handoff::closed_checkpoint(&fixture.state, &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (fence.frame, fence.view, fence.digest),
+        (tip.frame, tip.view, tip.digest),
+        "fenced at the executed tip"
+    );
+    assert_eq!(
+        handoff::schedule::fence_frame(&fixture.state, &id).unwrap(),
+        Some(5)
+    );
+    let successor = handoff::head(&fixture.state, &source.filter)
+        .unwrap()
+        .unwrap();
+    assert_eq!(successor.generation, 2);
+    assert_eq!(
+        successor.base_frame, tip.frame,
+        "the successor starts at the tip"
+    );
+    assert_eq!(successor.members, source.members, "the same committee");
+
+    // Once: frame 3 again fences nothing more.
+    assert!(intrinsic
+        .validate(7, &wire(&frames[2]), None, None)
+        .is_err());
+    assert!(intrinsic
+        .invoke_step(7, &wire(&frames[2]), &fixture.state)
+        .is_err());
+
+    // The successor produces from the tip.
+    let next = voting_chain(&successor, &keys, &[100]);
+    assert!(intrinsic.validate(7, &wire(&next[0]), None, None).unwrap());
+    intrinsic
+        .invoke_step(7, &wire(&next[0]), &fixture.state)
+        .unwrap();
+    commit(&fixture.state, 7);
+    assert_eq!(
+        handoff::session_tip(&fixture.state, &successor.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .frame,
+        tip.frame + 1
+    );
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(None);
+}
+
+/// A certified frame voting out of bounds whose header no member submits
+/// (devnet r6 d5, 2026-11-12: its members withheld it) reached GLOBAL never:
+/// every archive refused its body at ingest and GLOBAL leaders held its
+/// descendants back for that body, so the shard's GLOBAL inclusion halted
+/// for every member, with no bound. An archive refusing it offers GLOBAL its
+/// header, once, which fences the session at the executed tip. A frame in
+/// bounds is not offered, nor one whose certificate is not its own.
+#[test]
+fn an_archive_refusing_a_certified_frame_voting_out_of_bounds_offers_its_fence() {
+    use quil_engine::archive_ingest::{FeeFenceOffers, FrameCheck};
+    let keys = keys();
+    let source = session(&keys, vec![0x67; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(Some(0));
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+    let id = source.id().unwrap();
+    let frames = voting_chain(&source, &keys, &[100, 0, 90]);
+    let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
+    intrinsic
+        .invoke_step(3, &wire(&frames[0]), &fixture.state)
+        .unwrap();
+    commit(&fixture.state, 3);
+    let tip = handoff::session_tip(&fixture.state, &id).unwrap().unwrap();
+
+    let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = offered.clone();
+    let verifier = fixture
+        .archive()
+        .with_fee_fence_offers(FeeFenceOffers::new(Arc::new(move |bytes| {
+            sink.lock().unwrap().push(bytes)
+        })))
+        .verifier();
+    let mut borrowed = frames[1].clone();
+    let certificate = frames[0].header.as_ref().unwrap();
+    borrowed
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = certificate.public_key_signature_bls48581.clone();
+    for frame in [&frames[0], &frames[2], &borrowed] {
+        let _ = verifier.check(frame);
+    }
+    assert!(
+        offered.lock().unwrap().is_empty(),
+        "offered a frame in bounds, or one under another frame's certificate"
+    );
+    for _ in 0..3 {
+        assert_eq!(verifier.check(&frames[1]), FrameCheck::Refused);
+    }
+    let offered = offered.lock().unwrap().clone();
+    assert_eq!(
+        offered.len(),
+        1,
+        "HALT: an archive refusing a certified frame voting out of bounds offered GLOBAL \
+         no fence, or offered it more than once"
+    );
+
+    intrinsic
+        .invoke_step(4, &offered[0], &fixture.state)
+        .unwrap_or_else(|error| panic!("GLOBAL refused the offered fence: {error}"));
+    commit(&fixture.state, 4);
+    assert!(handoff::is_fenced(&fixture.state, &id).unwrap());
+    let fence = handoff::closed_checkpoint(&fixture.state, &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!((fence.frame, fence.digest), (tip.frame, tip.digest));
+    assert!(
+        intrinsic
+            .invoke_step(5, &wire(&frames[2]), &fixture.state)
+            .is_err(),
+        "GLOBAL executed a descendant past the fence"
+    );
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(None);
+}
+
+/// A header voting out of bounds is admitted as fence evidence only with its
+/// session's certificate and above the executed tip: a forged certificate
+/// is refused, and so is the header once GLOBAL executed a frame at or
+/// above it (here its descendant, out of order), since a fence at the tip
+/// would then name a descendant of the refused frame. Neither fences the
+/// session.
+#[test]
+fn a_frame_voting_out_of_bounds_fences_only_with_its_certificate_above_the_tip() {
+    let keys = keys();
+    let source = session(&keys, vec![0x66; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(Some(0));
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+    let id = source.id().unwrap();
+    let frames = voting_chain(&source, &keys, &[100, 0, 100]);
+    let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
+
+    // Signed by keys that are not the session's.
+    let forged = voting_chain(&source, &self::keys(), &[100, 0]);
+    assert!(intrinsic
+        .validate(3, &wire(&forged[1]), None, None)
+        .is_err());
+    assert!(intrinsic
+        .invoke_step(3, &wire(&forged[1]), &fixture.state)
+        .is_err());
+
+    for (index, global) in [(0usize, 3u64), (2, 4)] {
+        intrinsic
+            .invoke_step(global, &wire(&frames[index]), &fixture.state)
+            .unwrap();
+        commit(&fixture.state, global);
+    }
+    assert_eq!(
+        handoff::session_tip(&fixture.state, &id)
+            .unwrap()
+            .unwrap()
+            .frame,
+        3
+    );
+    assert!(intrinsic
+        .validate(5, &wire(&frames[1]), None, None)
+        .is_err());
+    assert!(intrinsic
+        .invoke_step(5, &wire(&frames[1]), &fixture.state)
+        .is_err());
+    commit(&fixture.state, 5);
+    assert!(!handoff::is_fenced(&fixture.state, &id).unwrap());
+    assert_eq!(
+        handoff::head(&fixture.state, &source.filter)
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(None);
+}
+
+/// A session whose frame 1 GLOBAL executed at frame 3, judged from the fee
+/// vote bound frame 0 (every header), and an archive leader proposing
+/// [`CROWD_FRAME`] over it.
+struct FenceRig {
+    fixture: Fixture,
+    keys: Vec<FalconPrivateKey>,
+    source: Session,
+    first: AppShardFrame,
+    /// The timestamp of every frame 2 the rig makes, so that two of them
+    /// differ only by their signers.
+    timestamp: i64,
+    archive: ArchiveLeader,
+}
+
+impl FenceRig {
+    fn new(filter: u8) -> Self {
+        let keys = keys();
+        let source = session(&keys, vec![filter; 32]);
+        let fixture = Fixture::new(&source);
+        quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(Some(0));
+        handoff::initialize(&fixture.state, 2, &source).unwrap();
+        commit(&fixture.state, 2);
+        let first = voting_chain(&source, &keys, &[100]).remove(0);
+        fixture
+            .intrinsic()
+            .invoke_step(
+                3,
+                &canonical(&first).to_canonical_bytes().unwrap(),
+                &fixture.state,
+            )
+            .unwrap();
+        commit(&fixture.state, 3);
+        let archive = ArchiveLeader::new(&fixture);
+        Self {
+            fixture,
+            keys,
+            source,
+            first,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            archive,
+        }
+    }
+
+    /// The canonical header of frame 2, extending frame 1 and voting `vote`,
+    /// anchored at GLOBAL frame `anchor` whose output is `anchor_output`,
+    /// certified by `signers` of the session's four members.
+    fn second(&self, vote: u64, anchor: u64, anchor_output: &[u8], signers: usize) -> Vec<u8> {
+        let first = self.first.header.as_ref().unwrap();
+        let mut header = FrameHeader {
+            address: self.source.filter.clone(),
+            frame_number: 2,
+            rank: 7,
+            difficulty: 1,
+            timestamp: self.timestamp,
+            global_frame_number: anchor,
+            fee_multiplier_vote: vote,
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&first.output)
+                .unwrap()
+                .to_vec(),
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify_anchored_by(
+            &mut header,
+            &self.source,
+            &self.keys,
+            first.rank,
+            anchor_output,
+            signers,
+        );
+        quil_execution::global_intrinsic::conversions::frame_header_from_proto(&header)
+            .to_canonical_bytes()
+            .unwrap()
+    }
+
+    fn propose(&self, rank: u64) -> Vec<Vec<u8>> {
+        propose(&self.archive.leader, &self.archive.parent, rank)
+    }
+
+    fn validate(&self, bundle: &[u8]) -> Result<()> {
+        self.archive
+            .manager
+            .validate_message(CROWD_FRAME, &quil_execution::domains::GLOBAL, bundle)
+    }
+
+    fn fenced(&self) -> bool {
+        handoff::is_fenced(&self.fixture.state, &self.source.id().unwrap()).unwrap()
+    }
+}
+
+impl Drop for FenceRig {
+    fn drop(&mut self) {
+        quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread(None);
+    }
+}
+
+/// A GLOBAL message bundle carrying the shard frame header bytes `header`.
+fn header_bundle(header: Vec<u8>) -> Vec<u8> {
+    quil_execution::message_envelope::CanonicalMessageBundle {
+        requests: vec![Some(
+            quil_execution::message_envelope::CanonicalMessageRequest {
+                inner_type_prefix:
+                    quil_execution::global_intrinsic::frame_header::TYPE_FRAME_HEADER,
+                inner_bytes: header,
+            },
+        )],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// An archive lacking the GLOBAL frame a header voting out of bounds anchors
+/// to, inside its window, cannot judge it: validation and execution give the
+/// unavailable class, so the GLOBAL frame carrying it waits for the anchor,
+/// as archive sync waits for its anchors. Refused instead, the archives
+/// lacking the anchor would skip the header that the others execute as a
+/// fence, and GLOBAL state would split. Once the anchor is held, the header
+/// fences its session at the executed tip.
+#[test]
+fn a_header_voting_out_of_bounds_waits_for_its_anchor_and_then_fences() {
+    let rig = FenceRig::new(0x67);
+    let anchor_output = vec![0x46; 516];
+    let header = rig.second(0, 4, &anchor_output, 3);
+    let intrinsic = rig.fixture.intrinsic();
+    let validated = intrinsic.validate(5, &header, None, None).map(|_| ());
+    let executed = intrinsic.invoke_step(5, &header, &rig.fixture.state);
+    for (what, outcome) in [("validation", validated), ("execution", executed)] {
+        let error = outcome.expect_err("a header judged without its anchor");
+        assert!(
+            error.is_execution_unavailable(),
+            "SPLIT: GLOBAL {what} without the anchor refused a header voting out of bounds \
+             instead of waiting for the anchor: {error}"
+        );
+    }
+    assert!(!rig.fenced());
+
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    intrinsic
+        .invoke_step(5, &header, &rig.fixture.state)
+        .unwrap_or_else(|error| {
+            panic!("the header did not fence once its anchor was held: {error}")
+        });
+    commit(&rig.fixture.state, 5);
+    assert!(rig.fenced());
+    let id = rig.source.id().unwrap();
+    assert_eq!(
+        handoff::closed_checkpoint(&rig.fixture.state, &id)
+            .unwrap()
+            .unwrap()
+            .frame,
+        1,
+        "fenced at the executed tip"
+    );
+}
+
+/// A GLOBAL leader that cannot judge a header voting out of bounds yet (it
+/// lacks the anchor) leaves it in the mempool, as it leaves a shard tip it
+/// cannot judge, and carries it once it can. Dropped, the header would be
+/// lost: its session's members already refused the frame, and GLOBAL would
+/// never fence the session.
+#[test]
+fn a_leader_keeps_a_header_voting_out_of_bounds_it_cannot_judge_yet() {
+    let rig = FenceRig::new(0x68);
+    let anchor_output = vec![0x47; 516];
+    let evidence = header_bundle(rig.second(0, 4, &anchor_output, 3));
+    assert!(
+        rig.archive.collector.add_message(1, evidence.clone()),
+        "SETUP: the mempool must take the header"
+    );
+    let unavailable = rig
+        .validate(&evidence)
+        .expect_err("SETUP: the leader must lack the anchor");
+    assert!(
+        unavailable.is_execution_unavailable(),
+        "SETUP: {unavailable}"
+    );
+
+    let proposal = rig.propose(1);
+    assert!(!proposal.contains(&evidence));
+    assert_eq!(
+        rig.archive.collector.total_pending(),
+        1,
+        "LOST: the leader dropped a header voting out of bounds it could not judge yet"
+    );
+
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    rig.validate(&evidence)
+        .unwrap_or_else(|error| panic!("SETUP: the header must validate with its anchor: {error}"));
+    assert!(
+        rig.propose(2).contains(&evidence),
+        "LOST: the header did not ride once the leader held its anchor"
+    );
+}
+
+/// Copies of one header voting out of bounds: one with bytes appended that
+/// still decodes to the header never reaches the mempool; one whose
+/// appended bytes do not decode is no copy, validation refuses it and a
+/// leader drops it; and of two valid copies, differing only by their
+/// signers, one rides, the one with the most signers; the other waits.
+/// Every copy that rode would cost every archive a certificate verification
+/// before its refusal, and any peer can make copies.
+#[test]
+fn a_proposal_carries_one_copy_of_a_header_voting_out_of_bounds() {
+    use quil_engine::message_collector::{Refusal, SubmitOutcome};
+    let rig = FenceRig::new(0x69);
+    let anchor_output = vec![0x48; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let most = rig.second(0, 4, &anchor_output, 4);
+    // An empty attestation trailer, then bytes the decoder ignores.
+    let mut appended = most.clone();
+    appended.extend_from_slice(&[0, 0, 0, 0, 0xee, 0xee, 0xee]);
+    assert_eq!(
+        CanonicalHeader::from_canonical_bytes(&appended).unwrap(),
+        CanonicalHeader::from_canonical_bytes(&most).unwrap(),
+        "SETUP: the header with bytes appended must decode to the header"
+    );
+    assert_eq!(
+        rig.archive
+            .collector
+            .add_message_outcome(1, header_bundle(appended)),
+        SubmitOutcome::Filtered(Refusal::InvalidShardFrame),
+        "COPIES: a header with bytes appended reached the mempool"
+    );
+    let mut undecodable = most.clone();
+    undecodable.extend_from_slice(&[0xee; 3]);
+    let refused = rig
+        .validate(&header_bundle(undecodable))
+        .expect_err("COPIES: a header with bytes appended that do not decode validated");
+    assert!(
+        !refused.is_execution_unavailable(),
+        "COPIES: a leader keeps a header that does not decode: {refused}"
+    );
+    let copies = [
+        header_bundle(rig.second(0, 4, &anchor_output, 3)),
+        header_bundle(most),
+    ];
+    for copy in &copies {
+        assert!(
+            rig.archive.collector.add_message(1, copy.clone()),
+            "SETUP: the mempool must take each valid copy"
+        );
+        rig.validate(copy)
+            .unwrap_or_else(|error| panic!("SETUP: each copy must validate: {error}"));
+    }
+
+    let proposal = rig.propose(1);
+    assert_eq!(
+        carried(&proposal, &copies),
+        1,
+        "COPIES: a proposal carried {} copies of one header voting out of bounds",
+        carried(&proposal, &copies)
+    );
+    assert!(
+        proposal.contains(&copies[1]),
+        "the copy with the most signers rides"
+    );
+    assert_eq!(
+        rig.archive.collector.total_pending(),
+        2,
+        "the other copy waits"
+    );
+}
+
+/// A header voting out of bounds without its session's certificate (here a
+/// legacy aggregate signature in its place) names no session to fence: it is
+/// refused with the fee vote's refusal and fences nothing.
+#[test]
+fn a_header_voting_out_of_bounds_without_a_session_certificate_fences_nothing() {
+    let rig = FenceRig::new(0x6a);
+    let anchor_output = vec![0x49; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let mut op =
+        CanonicalHeader::from_canonical_bytes(&rig.second(0, 4, &anchor_output, 3)).unwrap();
+    op.public_key_signature_bls48581 = vec![0xab; 74];
+    let legacy = op.to_canonical_bytes().unwrap();
+    let intrinsic = rig.fixture.intrinsic();
+    let refused = intrinsic
+        .validate(5, &legacy, None, None)
+        .expect_err("LEGACY: a header without a session certificate admitted as fence evidence")
+        .to_string();
+    assert!(
+        refused.contains("fee multiplier vote"),
+        "LEGACY: refused for another reason: {refused}"
+    );
+    assert!(intrinsic
+        .invoke_step(5, &legacy, &rig.fixture.state)
+        .is_err());
+    assert!(!rig.fenced());
+    assert_eq!(
+        handoff::head(&rig.fixture.state, &rig.source.filter)
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
 }

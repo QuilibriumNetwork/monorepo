@@ -1386,6 +1386,24 @@ impl AppLeaderProvider {
         resolve_global_anchor(self.global_anchor_store.as_ref())
     }
 
+    /// The fee multiplier vote this leader proposes in a frame anchored at
+    /// GLOBAL frame `anchor`: its fee window's base moved by the frame
+    /// cadence, kept inside the bounds members enforce once they apply there
+    /// (a no-op for every vote computed today; see
+    /// `fees::MIN_FEE_MULTIPLIER_VOTE`).
+    fn proposal_fee_vote(&self, anchor: u64, now_ms: i64, previous_timestamp_ms: i64) -> u64 {
+        crate::fees::proposer_fee_vote(
+            anchor,
+            crate::fees::compute_fee_multiplier_vote(
+                self.fee_manager.as_ref(),
+                &self.filter,
+                now_ms,
+                previous_timestamp_ms,
+                self.reward_greedy,
+            ),
+        )
+    }
+
     /// The GLOBAL frame whose EPOCH defines this shard's committee. Prover
     /// lifecycle (join/leave activation, epoch re-confirm) is GLOBAL-frame-defined
     /// (`JoinConfirmFrameNumber`/`Epoch` are written by the global intrinsic), so
@@ -2187,18 +2205,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .map(|h| h.timestamp)
             .unwrap_or(now_ms - 10_000); // assume 10s at genesis
 
-        // Kept inside the bounds members enforce once they apply (a no-op
-        // for every vote computed today; see `fees::MIN_FEE_MULTIPLIER_VOTE`).
-        let fee_multiplier_vote = crate::fees::proposer_fee_vote(
-            anchor_gfn,
-            crate::fees::compute_fee_multiplier_vote(
-                self.fee_manager.as_ref(),
-                &self.filter,
-                now_ms,
-                previous_timestamp_ms,
-                self.reward_greedy,
-            ),
-        );
+        let fee_multiplier_vote = self.proposal_fee_vote(anchor_gfn, now_ms, previous_timestamp_ms);
 
         // Per-frame shard state roots: 4 × 64-byte phase commitments
         // (vertex_adds / vertex_removes / hyperedge_adds /
@@ -5181,6 +5188,28 @@ impl AppConsensusEngine {
                 );
                 return Ok(false);
             }
+            crate::app_handoff::FenceRewind::Unapplied {
+                fence,
+                fenced,
+                generation,
+                dropped,
+            } => {
+                let records = self.finalized_records_directory().map_or(0, |directory| {
+                    crate::cw_app_seams::FinalizedRecords::open(directory).map_or(0, |records| {
+                        records.discard_unapplied_above(fence, &fenced, generation)
+                    })
+                });
+                if dropped > 0 || records > 0 {
+                    info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation,
+                        fence, dropped_frames = dropped, dropped_records = records,
+                        "dropped the fenced session's frames past the fence, which this worker never applied");
+                }
+                self.end_unrewindable_fence(
+                    "nothing to rewind past the fence: none applied there",
+                    std::time::Instant::now(),
+                );
+                return Ok(false);
+            }
             crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
                 let now = std::time::Instant::now();
                 self.note_unrewindable_fence(&fence, error.as_ref(), now);
@@ -5201,15 +5230,21 @@ impl AppConsensusEngine {
         self.set_materialized_frame(fence);
         self.shard_frame_number = fence;
         let _ = self.fee_manager.rewind_to_frame(&self.filter, fence);
-        if let Some(base) = self.cw_storage_base.as_ref() {
-            let directory = base
-                .join("cw-app-consensus")
-                .join(format!("finalized-{}", hex::encode(&self.filter)));
+        if let Some(directory) = self.finalized_records_directory() {
             if let Ok(records) = crate::cw_app_seams::FinalizedRecords::open(directory) {
                 records.discard_above(fence);
             }
         }
         Ok(true)
+    }
+
+    /// Where this shard's finalized records are kept, if anywhere
+    /// ([`crate::cw_app_seams::FinalizedRecords`]).
+    fn finalized_records_directory(&self) -> Option<std::path::PathBuf> {
+        self.cw_storage_base.as_ref().map(|base| {
+            base.join("cw-app-consensus")
+                .join(format!("finalized-{}", hex::encode(&self.filter)))
+        })
     }
 
     /// Tell the archive recovery turns whether an owed re-anchor's requested

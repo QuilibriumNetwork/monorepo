@@ -273,7 +273,12 @@ fn proposal_app_frame_budget() -> u64 {
     })
 }
 
-/// The bodies the shard headers a proof bundle carries need.
+/// The bodies the shard headers a proof bundle carries need. A header voting
+/// out of bounds at its anchor needs none: archives refuse its frame, and
+/// GLOBAL executes it only as the fence of its session
+/// (`quil_execution::global_intrinsic::handoff::fee_fence`), which
+/// materializes nothing. Held back for a body no archive holds, it would
+/// never ride, and the session would stall unfenced.
 pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
@@ -287,6 +292,12 @@ pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
         .filter(|request| request.inner_type_prefix == TYPE_FRAME_HEADER)
         .filter_map(|request| FrameHeader::from_canonical_bytes(&request.inner_bytes).ok())
         .filter(|header| !header.address.is_empty())
+        .filter(|header| {
+            !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                header.global_frame_number,
+                header.fee_multiplier_vote as u64,
+            )
+        })
         .map(|header| ShardBodyNeed {
             empty: crate::archive_ingest::requests_root_is_empty(&header.requests_root),
             address: header.address,
@@ -1281,7 +1292,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // latency-sensitive prove path. Structurally-invalid bundles were
         // already rejected at ingest.
         // ------------------------------------------------------------------
-        let collected = capacity_last(self.message_collector.collect_for_rank(rank));
+        let collected = fee_fence_copies_by_signers(capacity_last(
+            self.message_collector.collect_for_rank(rank),
+        ));
         // The VDF must commit exactly the body we can serialize. A permissive
         // engine validator can accept bytes that are not a canonical bundle;
         // hashing those and dropping them during the later decode makes our
@@ -1373,6 +1386,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // 160 s here and no leader could propose.
                 let validation_started = std::time::Instant::now();
                 let (mut deferred, mut deferred_capacity) = (0usize, 0usize);
+                // Fee vote fence headers: one copy per shard frame rides, the
+                // first that validates in `fee_fence_copies_by_signers`'
+                // order, and the others wait in the mempool. One this node
+                // cannot judge now (an anchor or state it lacks) waits too.
+                let mut fence_riding: std::collections::HashSet<(Vec<u8>, u64)> =
+                    std::collections::HashSet::new();
+                let mut fence_unavailable = 0usize;
                 // Op kinds → (messages, total ms, slowest ms), logged when
                 // validation is slow, to tell one costly op from a slow store.
                 let mut validation_ms: std::collections::HashMap<String, (usize, u64, u64)> =
@@ -1411,6 +1431,12 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     // A copy of seals that another copy already carries waits
                     // in the mempool, unvalidated.
                     if handoff.held_back(index) {
+                        continue;
+                    }
+                    let fence_keys = crate::message_collector::fee_fence_keys(&raw);
+                    if !fence_keys.is_empty()
+                        && fence_keys.iter().all(|key| fence_riding.contains(key))
+                    {
                         continue;
                     }
                     let hash: [u8; 32] = Sha256::digest(&raw).into();
@@ -1458,7 +1484,20 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match outcome {
                         Ok(()) => {
                             handoff.ride(index);
+                            fence_riding.extend(fence_keys);
                             valid.push((index, raw));
+                        }
+                        // Fence evidence this node cannot judge now waits for
+                        // a later frame within its anchor window, as a shard
+                        // tip does: dropped, it would leave its session's
+                        // members waiting on a frame GLOBAL never fences.
+                        Err(e) if e.is_execution_unavailable() && !fence_keys.is_empty() => {
+                            fence_unavailable += 1;
+                            tracing::debug!(
+                                frame = frame_number,
+                                error = %e,
+                                "fee vote fence header not verifiable this frame; left for a later one",
+                            );
                         }
                         Err(e) => {
                             let error = e.to_string();
@@ -1657,6 +1696,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         frame = frame_number,
                         deferred = tips.deferred,
                         "shard-frame proofs not verified this frame; left for a later one",
+                    );
+                }
+                if fence_unavailable > 0 {
+                    tracing::info!(
+                        frame = frame_number,
+                        deferred = fence_unavailable,
+                        scope = "this node",
+                        until = "it holds the GLOBAL frame each header anchors to",
+                        "fee vote fence headers not verifiable this frame; left for a later one",
                     );
                 }
                 if !invalid.is_empty() {
@@ -1957,6 +2005,26 @@ pub(crate) fn capacity_last(collected: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         .into_iter()
         .partition(|raw| crate::message_collector::carries_capacity_message(raw));
     rest.into_iter().chain(capacity).collect()
+}
+
+/// `collected` with the bundles carrying fee vote fence headers
+/// ([`crate::message_collector::fee_fence_keys`]) in their own places, most
+/// signers first, read from each certificate's bitmap and not verified; every
+/// other bundle keeps its place. A proposal carries the first copy of each
+/// fence that validates.
+pub(crate) fn fee_fence_copies_by_signers(mut collected: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let places: Vec<usize> = (0..collected.len())
+        .filter(|&place| !crate::message_collector::fee_fence_keys(&collected[place]).is_empty())
+        .collect();
+    let mut copies: Vec<Vec<u8>> = places
+        .iter()
+        .map(|&place| std::mem::take(&mut collected[place]))
+        .collect();
+    crate::message_collector::order_copies_by_signers(&mut copies);
+    for (place, copy) in places.into_iter().zip(copies) {
+        collected[place] = copy;
+    }
+    collected
 }
 
 /// The committee-handoff submissions a bundle carries, when it carries
@@ -3272,6 +3340,64 @@ mod tests {
             hold_back_unavailable_shard_proofs(vec![withheld], &none_held, None, u64::MAX);
         assert!(ready.is_empty());
         assert_eq!(missing, vec![need(0x22, 9)]);
+    }
+
+    /// Under the process default (mainnet's), a header voting out of bounds
+    /// and anchored at the fee vote bound frame is fence evidence: it needs no
+    /// body, rides though no body is held, and the collector holds it as no
+    /// shard frame, so its session's next frame cannot supersede it. Anchored
+    /// the frame before, or voting in bounds, it is a shard frame as before.
+    #[test]
+    fn a_header_voting_out_of_bounds_rides_as_fence_evidence_without_a_body() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        const BOUND: u64 = 1_097_280;
+        let bundle = |anchor: u64, vote: i64| {
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_FRAME_HEADER,
+                    inner_bytes: FrameHeader {
+                        address: vec![0x44; 32],
+                        frame_number: 7,
+                        global_frame_number: anchor,
+                        fee_multiplier_vote: vote,
+                        ..Default::default()
+                    }
+                    .to_canonical_bytes()
+                    .unwrap(),
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
+        for (anchor, vote) in [(BOUND - 1, 0), (BOUND, 90), (BOUND, 100), (BOUND, 110)] {
+            let frame = bundle(anchor, vote);
+            assert_eq!(shard_body_needs(&frame).len(), 1, "{anchor} {vote}");
+            assert!(crate::message_collector::bundle_has_shard_frame(&frame));
+            let selection =
+                hold_back_unavailable_shard_proofs(vec![frame], &none_held, None, u64::MAX);
+            assert!(selection.ready.is_empty(), "{anchor} {vote}");
+        }
+        for vote in [0, 89, 111, -1] {
+            let evidence = bundle(BOUND, vote);
+            assert!(
+                shard_body_needs(&evidence).is_empty(),
+                "a header voting {vote} waited for a body no archive holds"
+            );
+            assert!(
+                !crate::message_collector::bundle_has_shard_frame(&evidence),
+                "the collector held a header voting {vote} as a shard frame"
+            );
+            let selection = hold_back_unavailable_shard_proofs(
+                vec![evidence.clone()],
+                &none_held,
+                None,
+                u64::MAX,
+            );
+            assert_eq!(selection.ready, vec![evidence], "vote {vote}");
+        }
     }
 
     /// Shard headers whose bodies are held ride smallest gap first within the
