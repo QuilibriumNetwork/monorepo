@@ -1,6 +1,7 @@
 //! Bounds on what a received application shard frame carries (request
-//! bundles, their requests and storage openings) and on the requests of a
-//! message bundle submitted to a shard, counted from the encoding before
+//! bundles, their requests and storage openings), on the requests of a
+//! message bundle submitted to a shard and on the bundles and requests of
+//! a GLOBAL frame received over gossip, counted from the encoding before
 //! it is decoded.
 //!
 //! [`check_frame`] walks a frame's protobuf encoding without allocating
@@ -28,7 +29,7 @@ use tracing::warn;
 /// the mirror checks frames of at most 1,024 bundles
 /// (`MIRROR_MAX_REQUESTS`, quil-node), a GLOBAL frame followed over gossip
 /// carries at most 65,536 bundles and 65,536 requests
-/// (`MAX_GOSSIP_GLOBAL_BUNDLES`, `_REQUESTS`, quil-node), and a shard's
+/// ([`MAX_GOSSIP_GLOBAL_BUNDLES`], [`MAX_GOSSIP_GLOBAL_REQUESTS`]), and a shard's
 /// collector holds at most 65,536 messages a rank (`message_collector`).
 /// This is 16 times the mirror's and a quarter of GLOBAL's.
 pub const MAX_APP_FRAME_ITEMS: usize = 16_384;
@@ -201,6 +202,82 @@ pub fn admit_bundle(data: &[u8]) -> Result<usize, FrameRefusal> {
     })
 }
 
+/// Request bundles a GLOBAL frame followed over gossip may carry. A frame
+/// that carries more is not followed over gossip; the archive poller
+/// fetches it from a trusted source, which has no such bound.
+pub const MAX_GOSSIP_GLOBAL_BUNDLES: usize = 65_536;
+
+/// Requests, over all its bundles, a GLOBAL frame followed over gossip may
+/// carry. A frame's size does not bound them: a zero-length request is
+/// four bytes of the frame's encoding and decodes into a whole
+/// `MessageRequest` (`consensus_wire`).
+pub const MAX_GOSSIP_GLOBAL_REQUESTS: usize = 65_536;
+
+/// Counts the bundles and requests of the canonical GLOBAL frame `data`,
+/// without allocating, and refuses one past [`MAX_GOSSIP_GLOBAL_BUNDLES`]
+/// or [`MAX_GOSSIP_GLOBAL_REQUESTS`], or one whose header or bundles end
+/// past its data. Each bundle's declared request count is what its
+/// decoder builds at most; the requests themselves, the type, header and
+/// timestamps are left to the decoder (`consensus_wire::decode_global_frame`).
+pub fn check_global_frame(data: &[u8]) -> Result<FrameItems, FrameRefusal> {
+    let mut at = 4;
+    let header = read_u32(data, &mut at).ok_or(FrameRefusal::Malformed)? as usize;
+    at = skip(data, at, header)?;
+    let mut items = FrameItems {
+        bundles: read_u32(data, &mut at).ok_or(FrameRefusal::Malformed)? as usize,
+        ..FrameItems::default()
+    };
+    if items.bundles > MAX_GOSSIP_GLOBAL_BUNDLES {
+        return Err(FrameRefusal::TooMany(items));
+    }
+    for _ in 0..items.bundles {
+        let len = read_u32(data, &mut at).ok_or(FrameRefusal::Malformed)? as usize;
+        let end = skip(data, at, len)?;
+        let bundle = &data[at..end];
+        at = end;
+        let mut within = 4;
+        let requests = read_u32(bundle, &mut within).ok_or(FrameRefusal::Malformed)? as usize;
+        items.requests = items.requests.saturating_add(requests);
+        if items.requests > MAX_GOSSIP_GLOBAL_REQUESTS {
+            return Err(FrameRefusal::TooMany(items));
+        }
+    }
+    Ok(items)
+}
+
+/// [`check_global_frame`] for a GLOBAL frame received over gossip from
+/// `source`; a frame past the bound is logged. A malformed one is left to
+/// its decoder's refusal.
+pub fn admit_global_frame(source: &'static str, data: &[u8]) -> Result<FrameItems, FrameRefusal> {
+    let checked = check_global_frame(data);
+    if let Err(FrameRefusal::TooMany(counted)) = checked {
+        #[cfg(test)]
+        REFUSED_HERE.with(|count| count.set(count.get() + 1));
+        if let Some(refused) = GLOBAL_FRAMES_REFUSED.due(Instant::now()) {
+            warn!(
+                source,
+                bytes = data.len(),
+                bundles = counted.bundles,
+                requests = counted.requests,
+                bundles_limit = MAX_GOSSIP_GLOBAL_BUNDLES,
+                requests_limit = MAX_GOSSIP_GLOBAL_REQUESTS,
+                refused_since_last_line = refused,
+                check = "none for a genuine frame: the archive poller fetches it; \
+                         else the frame's publisher",
+                "GLOBAL frame past the gossip bound refused before decoding"
+            );
+        }
+    }
+    checked
+}
+
+/// The offset `len` bytes past `at` in `data`, if they are there.
+fn skip(data: &[u8], at: usize, len: usize) -> Result<usize, FrameRefusal> {
+    at.checked_add(len)
+        .filter(|&next| next <= data.len())
+        .ok_or(FrameRefusal::Malformed)
+}
+
 /// A proposal's running count of bundles and requests, which keeps it
 /// within its limit, at most [`MAX_APP_FRAME_ITEMS`].
 #[derive(Debug)]
@@ -279,6 +356,7 @@ impl RefusalLine {
 
 static FRAMES_REFUSED: RefusalLine = RefusalLine::new();
 static BUNDLES_REFUSED: RefusalLine = RefusalLine::new();
+static GLOBAL_FRAMES_REFUSED: RefusalLine = RefusalLine::new();
 
 #[cfg(test)]
 thread_local! {
@@ -721,5 +799,110 @@ mod tests {
         assert_eq!(line.due(start + Duration::from_secs(599)), None);
         assert_eq!(line.due(start + REFUSAL_REPEAT), Some(3));
         assert_eq!(line.due(start + REFUSAL_REPEAT), None);
+    }
+
+    /// A canonical GLOBAL frame carrying `bundles`, with a default header.
+    fn global_frame(bundles: &[Vec<u8>]) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader;
+        let header = GlobalFrameHeader::default().to_canonical_bytes().unwrap();
+        let mut frame = crate::consensus_wire::GLOBAL_FRAME_TYPE
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&(bundles.len() as u32).to_be_bytes());
+        for bundle in bundles {
+            frame.extend_from_slice(&(bundle.len() as u32).to_be_bytes());
+            frame.extend_from_slice(bundle);
+        }
+        frame
+    }
+
+    /// The walk counts every bundle and request the GLOBAL frame decoder
+    /// builds, zero-length requests included, and refuses a frame cut
+    /// short.
+    #[test]
+    fn counts_the_bundles_and_requests_of_a_global_frame() {
+        let data = global_frame(&[
+            canonical(vec![operation(1), None, operation(2)]),
+            canonical(Vec::new()),
+            canonical(vec![None]),
+        ]);
+        let counted = FrameItems {
+            bundles: 3,
+            requests: 4,
+            openings: 0,
+        };
+        assert_eq!(
+            check_global_frame(&data),
+            Ok(counted),
+            "GLOBAL-COUNT: the walk miscounted a GLOBAL frame"
+        );
+        let decoded = crate::consensus_wire::decode_global_frame(&data).unwrap();
+        let requests: usize = decoded.requests.iter().map(|b| b.requests.len()).sum();
+        assert_eq!((decoded.requests.len(), requests), (3, 4));
+        for end in 0..data.len() {
+            assert_eq!(
+                check_global_frame(&data[..end]),
+                Err(FrameRefusal::Malformed),
+                "{end}"
+            );
+        }
+    }
+
+    /// A GLOBAL frame past the gossip bound, in requests over its bundles
+    /// or in bundles, is refused unread and logged; one at either bound
+    /// is admitted and decodes.
+    #[test]
+    fn global_frames_past_the_gossip_bound_are_refused_unread() {
+        let requests = |n: usize| canonical(vec![None; n]);
+        let before = refused_here();
+        let at = global_frame(&[requests(MAX_GOSSIP_GLOBAL_REQUESTS)]);
+        assert_eq!(
+            admit_global_frame("test", &at).map(|items| items.requests),
+            Ok(MAX_GOSSIP_GLOBAL_REQUESTS),
+            "GLOBAL-AT-BOUND: a frame at the request bound was refused"
+        );
+        let decoded = crate::consensus_wire::decode_global_frame(&at).unwrap();
+        assert_eq!(
+            decoded.requests[0].requests.len(),
+            MAX_GOSSIP_GLOBAL_REQUESTS
+        );
+        let over = global_frame(&[requests(MAX_GOSSIP_GLOBAL_REQUESTS), requests(1)]);
+        assert_eq!(
+            admit_global_frame("test", &over),
+            Err(FrameRefusal::TooMany(FrameItems {
+                bundles: 2,
+                requests: MAX_GOSSIP_GLOBAL_REQUESTS + 1,
+                openings: 0,
+            })),
+            "GLOBAL-REQUESTS: a frame past the request bound was admitted"
+        );
+        let empty = requests(0);
+        let empties = vec![empty; MAX_GOSSIP_GLOBAL_BUNDLES + 1];
+        let past = global_frame(&empties);
+        assert!(
+            matches!(
+                admit_global_frame("test", &past),
+                Err(FrameRefusal::TooMany(FrameItems { bundles, .. }))
+                    if bundles == MAX_GOSSIP_GLOBAL_BUNDLES + 1
+            ),
+            "GLOBAL-BUNDLES: a frame past the bundle bound was admitted"
+        );
+        let at_bundles = global_frame(&empties[1..]);
+        assert_eq!(
+            admit_global_frame("test", &at_bundles).map(|items| items.bundles),
+            Ok(MAX_GOSSIP_GLOBAL_BUNDLES),
+            "GLOBAL-AT-BOUND: a frame at the bundle bound was refused"
+        );
+        assert_eq!(
+            admit_global_frame("test", &at[..at.len() - 1]),
+            Err(FrameRefusal::Malformed)
+        );
+        assert_eq!(
+            refused_here(),
+            before + 2,
+            "a malformed frame is not logged"
+        );
     }
 }

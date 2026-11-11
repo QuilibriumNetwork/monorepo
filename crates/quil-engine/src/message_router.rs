@@ -396,7 +396,10 @@ pub fn validator_global_prover() -> TopicValidator {
 /// `GlobalFrame` canonical-bytes blob with the 4-byte
 /// `GLOBAL_FRAME_TYPE = 0x030E` prefix; we round-trip through the
 /// canonical decoder so partially-truncated frames are dropped before
-/// they reach the queue.
+/// they reach the queue. A frame carrying more bundles or requests than a
+/// GLOBAL frame followed over gossip may is refused first, unread
+/// ([`crate::frame_bound::admit_global_frame`]): decoding it would build a
+/// request for every four bytes of its body.
 pub fn validator_global_frame() -> TopicValidator {
     use ValidationOutcome::{Accept, Reject};
     Arc::new(|data: &[u8]| -> ValidationOutcome {
@@ -406,6 +409,15 @@ pub fn validator_global_frame() -> TopicValidator {
         let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
         if tp != crate::consensus_wire::GLOBAL_FRAME_TYPE {
             return Reject("frame_bad_type");
+        }
+        match crate::frame_bound::admit_global_frame("global frame topic", data) {
+            Ok(_) => {}
+            Err(crate::frame_bound::FrameRefusal::TooMany(_)) => {
+                return Reject("frame_past_gossip_bound");
+            }
+            Err(crate::frame_bound::FrameRefusal::Malformed) => {
+                return Reject("frame_decode_failed");
+            }
         }
         if crate::consensus_wire::decode_global_frame(data).is_ok() {
             Accept

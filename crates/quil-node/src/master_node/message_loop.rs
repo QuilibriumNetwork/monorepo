@@ -3436,9 +3436,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // huge frame simply isn't followed over gossip and is instead
                                         // fetched by the RPC poller (which has no such cap and trusts its
                                         // mTLS source), so correctness is preserved.
+                                        // The topic's validator refused a canonical frame past these
+                                        // before decoding it (`frame_bound::admit_global_frame`).
                                         {
-                                            const MAX_GOSSIP_GLOBAL_BUNDLES: usize = 65_536;
-                                            const MAX_GOSSIP_GLOBAL_REQUESTS: usize = 65_536;
+                                            use quil_engine::frame_bound::{
+                                                MAX_GOSSIP_GLOBAL_BUNDLES, MAX_GOSSIP_GLOBAL_REQUESTS,
+                                            };
                                             let total_requests: usize =
                                                 frame.requests.iter().map(|b| b.requests.len()).sum();
                                             if frame.requests.len() > MAX_GOSSIP_GLOBAL_BUNDLES
