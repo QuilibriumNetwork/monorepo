@@ -8760,4 +8760,93 @@ mod tests {
         assert!(scan.active_on_filter(&filter, boundary).is_empty());
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
+
+    /// A shard GLOBAL recorded no snapshot for an epoch, its own or a split
+    /// parent's, has no member that could seal: its unsealed members are its
+    /// committee and leaders in that epoch, as GLOBAL admits their headers.
+    /// A recorded snapshot keeps the sealed requirement. Scheduling (the
+    /// committed scan) still counts sealed members only, so the shard keeps
+    /// its current session. Epoch 2000 is past the mainnet recovery epoch.
+    #[test]
+    fn a_shard_with_no_recorded_snapshot_keeps_its_unsealed_committee() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1467));
+        let epoch = 2000;
+        let frame = quil_types::consensus::epoch_start_frame(epoch) + 20;
+        let parent = [vec![0x72; 32], vec![0, 8]].concat();
+        let filter = [parent.clone(), vec![11]].concat();
+        let mut registry = InMemoryProverRegistry::new();
+        for id in 1..=3 {
+            let address = vec![id; 32];
+            let mut alloc = leaving_alloc(filter.clone(), epoch, 0, 0);
+            alloc.status = ProverStatus::Active;
+            registry.prover_cache.insert(
+                address.clone(),
+                ProverInfo {
+                    public_key: vec![id; 897],
+                    address: address.clone(),
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![alloc],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            );
+            registry
+                .filter_cache
+                .entry(filter.clone())
+                .or_default()
+                .push(address);
+        }
+        let scan = CommittedProverScan::from_parts(
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.public_key.clone()))
+                .collect(),
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.allocations[0].clone()))
+                .collect(),
+        );
+        assert_eq!(
+            registry.get_active_provers(&filter, frame).len(),
+            3,
+            "no member of a shard with no snapshot recorded for epoch {epoch} counts, so it \
+             never produces again"
+        );
+        assert_eq!(
+            registry.get_ordered_provers(&[0; 32], &filter, frame).len(),
+            3
+        );
+        assert!(scan.active_on_filter(&filter, frame).is_empty());
+        let recorded = |filter: &[u8]| {
+            (
+                (filter.to_vec(), (epoch % 4) as u8),
+                quil_types::consensus::StorageSnapshotRoots {
+                    epoch,
+                    frame: 90,
+                    anchor: frame - 700,
+                    roots: [[4; 32]; 4],
+                },
+            )
+        };
+        for (shard, why) in [
+            (filter.clone(), "its own snapshot"),
+            (parent.clone(), "its split parent's snapshot"),
+        ] {
+            let (key, snapshot) = recorded(&shard);
+            registry.snapshot_cache.insert(key.clone(), snapshot);
+            assert!(
+                registry.get_active_provers(&filter, frame).is_empty(),
+                "{why} is recorded"
+            );
+            assert!(registry
+                .get_ordered_provers(&[0; 32], &filter, frame)
+                .is_empty());
+            registry.snapshot_cache.remove(&key);
+        }
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
 }

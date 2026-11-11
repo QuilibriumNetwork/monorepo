@@ -5418,6 +5418,140 @@ mod tests {
         pay_unsealed_issuance(false);
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
+
+    /// From the sealed storage epoch GLOBAL refused a header any of whose
+    /// signers held no seat sealed before the header's anchor epoch, so one
+    /// unsealed signer of a certified header stopped its shard (five mainnet
+    /// shards from epoch 1467). From the seal gate recovery epoch sealing
+    /// gates rewards only: the header is admitted, an unsealed or late-sealed
+    /// participant earns no issuance share and chains no root, and a sealed
+    /// one earns as before. Before that epoch the gate refuses as it did.
+    /// Epoch 2000 is past the mainnet recovery epoch; the shard's snapshot
+    /// is recorded, so its members could have sealed.
+    #[test]
+    fn an_unsealed_signer_no_longer_refuses_a_header_and_earns_no_issuance() {
+        use super::super::storage_seat::{self, require_sealed_participant, Seat};
+        let epoch = 2000;
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1467));
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(1300));
+        let state = make_state();
+        let filter = vec![0xC1; 32];
+        let at = quil_types::consensus::storage_snapshot_frame(epoch);
+        let mut snapshot = fake_header(filter.clone(), 9);
+        snapshot.global_frame_number = at - 2;
+        snapshot.state_roots = vec![vec![5; 32], vec![0; 32], vec![5; 32], vec![0; 32]];
+        assert!(super::super::storage_snapshot::record(&state, at, &snapshot).unwrap());
+        let provers: Vec<_> = (1..=4).map(|id| fake_prover(id, 1, 0, &filter)).collect();
+        for prover in &provers {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        let start = quil_types::consensus::epoch_start_frame(epoch);
+        give_seat(&state, &provers[0], &filter, epoch, true);
+        give_seat(&state, &provers[1], &filter, epoch, false);
+        // provers[2] holds no seat; provers[3] sealed after the epoch began.
+        let late = <[u8; 32]>::try_from(provers[3].address.as_slice()).unwrap();
+        let mut seat = Seat::new(late, filter.clone());
+        seat.register(epoch, &[vec![]], 10);
+        assert!(seat.seal(epoch, start + 1));
+        storage_seat::write(&state, start + 1, &seat).unwrap();
+
+        let before = 1483;
+        let refused = require_sealed_participant(
+            &state,
+            &provers[1].address,
+            &filter,
+            quil_types::consensus::epoch_start_frame(before) + 6,
+            before,
+        );
+        assert!(
+            refused.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains("unsealed storage participant for epoch 1483")),
+            "before the recovery epoch the seal gate refuses as it did: {refused:?}"
+        );
+        let admitted =
+            require_sealed_participant(&state, &provers[1].address, &filter, start + 6, epoch);
+        assert!(
+            admitted.is_ok(),
+            "an unsealed signer refuses its header, so its shard stops: {admitted:?}"
+        );
+
+        let reward: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8000)));
+        let participants: Vec<usize> = (0..provers.len()).collect();
+        let run = |prover: usize, frame_number: u64, frame: u64| {
+            let mut header = fake_header(filter.clone(), frame_number);
+            header.global_frame_number = start + 5;
+            header.prover = provers[prover].address.clone();
+            header.fee_total = super::super::frame_header::fee_total_to_bytes(400);
+            let mut storage = StorageFrame {
+                epoch,
+                commitment: Some(StorageCommitment {
+                    root: [frame_number as u8; 32],
+                    beacon: start + 5,
+                    rho_n: vec![7; 32],
+                }),
+                ..Default::default()
+            };
+            materialize_prover_shard_update_with_fees(
+                &header,
+                frame,
+                &state,
+                &noop_registry(),
+                &noop_frame_prover(),
+                &reward,
+                4096,
+                provers.clone(),
+                &participants,
+                ShardMetadata {
+                    state_size: 1024,
+                    shard_count: 1,
+                },
+                0,
+                None,
+                Some(&mut storage),
+                HeaderIssuance::claimed(&header),
+            )
+        };
+        run(0, 10, start + 6).expect("an unsealed signer refuses its header, so its shard stops");
+        run(3, 11, start + 7).expect("a late-sealed proposer refuses its header");
+        let chained = |p: &ProverInfo| {
+            let member = <[u8; 32]>::try_from(p.address.as_slice()).unwrap();
+            storage_seat::read(&state, &member, &filter)
+                .unwrap()
+                .and_then(|seat| seat.slot(epoch).map(|slot| slot.frames))
+        };
+        assert!(
+            held_share(&state, &provers[0], &filter, epoch).unwrap() > BigInt::from(0),
+            "the sealed member's share is held in its seat"
+        );
+        assert_eq!(chained(&provers[0]), Some(1), "the sealed proposer's root");
+        assert_eq!(
+            held_share(&state, &provers[1], &filter, epoch),
+            Some(BigInt::from(0)),
+            "an unsealed signer earns no issuance share"
+        );
+        assert_eq!(
+            held_share(&state, &provers[3], &filter, epoch),
+            Some(BigInt::from(0)),
+            "a member sealed after the epoch began earns no issuance share in it"
+        );
+        assert_eq!(
+            chained(&provers[3]),
+            Some(0),
+            "a member sealed after the epoch began chains no root in it"
+        );
+        let fees = reward_balance(&state, &provers[0]);
+        assert!(fees > BigInt::from(0), "fees are paid at once");
+        for prover in &provers[1..] {
+            assert_eq!(
+                reward_balance(&state, prover),
+                fees,
+                "an unsealed participant is paid its fees and no issuance"
+            );
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
     #[test]
     fn sealed_storage_committed_scan_reads_the_canonical_seats() {
         use super::super::{materialize, storage_seat};
