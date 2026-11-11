@@ -159,10 +159,11 @@ fn parent_level(level: &[Digest], height: usize) -> Vec<Digest> {
     use p3_field::PackedValue;
     let mut out = vec![hash::ZERO; level.len().div_ceil(2)];
     let width = hash::packing_width();
-    out.par_chunks_mut(256 * width)
+    let block = parent_block(out.len(), width, rayon::current_num_threads());
+    out.par_chunks_mut(block)
         .enumerate()
-        .for_each(|(block, output)| {
-            let start = block * 256 * width;
+        .for_each(|(index, output)| {
+            let start = index * block;
             for (group, chunk) in output.chunks_mut(width).enumerate() {
                 let at = start + group * width;
                 if chunk.len() == width {
@@ -196,6 +197,26 @@ fn parent_level(level: &[Digest], height: usize) -> Vec<Digest> {
             }
         });
     out
+}
+
+/// Parents per task of [`parent_level`]: whole SIMD groups of `width`, at
+/// most 256 groups, and on a short level (a cap's subtree, 512 parents at
+/// its widest) about four tasks per thread of at least 16 parents, so a
+/// lone subtree ([`MerkleCap::subtree_path`]) keeps every thread busy.
+fn parent_block(parents: usize, width: usize, threads: usize) -> usize {
+    parents
+        .div_ceil(4 * threads.max(1))
+        .clamp(16, 256 * width)
+        .next_multiple_of(width)
+}
+
+/// The root of the subtree over `leaves`, `height` levels up.
+fn subtree_root(leaves: &[Digest], height: usize) -> Digest {
+    let mut level = std::borrow::Cow::Borrowed(leaves);
+    for h in 0..height {
+        level = parent_level(&level, h).into();
+    }
+    level[0]
 }
 
 /// A whole tree, every level held.
@@ -369,8 +390,9 @@ pub struct MerkleCap {
 }
 
 impl MerkleCap {
-    /// Build only the upper levels, retaining at most one subtree below
-    /// the cap at a time. The reader supplies canonical digests in order.
+    /// Build only the upper levels, retaining at most two subtrees below the
+    /// cap per thread at a time. The reader supplies canonical digests in
+    /// order; each batch it reads is hashed in parallel, a subtree per task.
     pub fn from_reader(
         n: u64,
         height: usize,
@@ -381,30 +403,50 @@ impl MerkleCap {
         }
         let height = height.min(tree_depth(n));
         let step = 1u64.checked_shl(height as u32)?;
+        let batch = 2 * rayon::current_num_threads();
         let mut bottom = Vec::with_capacity(n.div_ceil(step) as usize);
-        for start in (0..n).step_by(step as usize) {
-            let end = (start + step).min(n);
-            let mut level = read(start..end)?;
-            if level.len() as u64 != end - start {
-                return None;
+        let mut subtrees = Vec::with_capacity(batch);
+        let mut start = 0;
+        while start < n {
+            subtrees.clear();
+            while start < n && subtrees.len() < batch {
+                let end = (start + step).min(n);
+                let leaves = read(start..end)?;
+                if leaves.len() as u64 != end - start {
+                    return None;
+                }
+                subtrees.push(leaves);
+                start = end;
             }
-            for h in 0..height {
-                level = parent_level(&level, h);
-            }
-            bottom.push(level[0]);
+            bottom.par_extend(
+                subtrees
+                    .par_iter()
+                    .map(|leaves| subtree_root(leaves, height)),
+            );
         }
-        let mut levels = vec![bottom];
-        for h in height..tree_depth(n) {
-            levels.push(parent_level(levels.last()?, h));
-        }
-        Some(Self { n, height, levels })
+        Some(Self::above(n, height, bottom))
     }
 
+    /// [`Self::from_reader`] over leaves already in memory: every subtree
+    /// below the cap hashed in parallel, a subtree per task.
     pub fn from_digests(nodes: &[Digest], height: usize) -> Self {
-        Self::from_reader(nodes.len() as u64, height, |range| {
-            Some(nodes[range.start as usize..range.end as usize].to_vec())
-        })
-        .expect("nonempty bounded leaf")
+        let n = nodes.len() as u64;
+        assert!(n != 0 && n < MAX_NODES, "nonempty bounded leaf");
+        let height = height.min(tree_depth(n));
+        let bottom = nodes
+            .par_chunks(1 << height)
+            .map(|leaves| subtree_root(leaves, height))
+            .collect();
+        Self::above(n, height, bottom)
+    }
+
+    /// The cap over `bottom`, the roots of its subtrees of `2^height` leaves.
+    fn above(n: u64, height: usize, bottom: Vec<Digest>) -> Self {
+        let mut levels = vec![bottom];
+        for h in height..tree_depth(n) {
+            levels.push(parent_level(levels.last().expect("a level"), h));
+        }
+        Self { n, height, levels }
     }
 
     pub fn commitment(&self, tree: Tree) -> Node {
@@ -768,7 +810,8 @@ pub fn label_working_bytes(n: u64, params: &SdrParams) -> u64 {
 }
 
 /// Encoding from labels already computed holds the raw payload, last layer,
-/// packed replica and serialized output; tree construction holds one subtree.
+/// packed replica and serialized output; tree construction holds a
+/// subtree's levels per thread.
 pub fn encoding_with_labels_bytes(n: u64) -> u64 {
     n.saturating_mul((5 * NODE_BYTES) as u64)
         .saturating_add(4 << 20)
