@@ -2821,10 +2821,27 @@ impl Drop for FlushPermit<'_> {
     }
 }
 
+/// Bytes this process wrote through [`ChunkedWriter`]s: to leaves' label
+/// files (layers and columns), and to sectors' last layers
+/// ([`write_digests_paced`]).
+static LABEL_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+static SECTOR_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(label files, sector files)` bytes this process wrote since it started
+/// ([`LABEL_FILE_BYTES`], [`SECTOR_FILE_BYTES`]).
+pub fn file_bytes_written() -> (u64, u64) {
+    (
+        LABEL_FILE_BYTES.load(Ordering::Relaxed),
+        SECTOR_FILE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 /// What writing a leaf's labels waited for and took ([`ChunkedWriter`]),
 /// logged once its labelling ends ([`Self::log`]).
 #[derive(Default)]
 struct FlushTally {
+    /// Whether the bytes are a sector's last layer's, not labels'.
+    sector: bool,
     /// Chunks written and pushed to disk, and their bytes.
     chunks: Cell<u64>,
     bytes: Cell<u64>,
@@ -2852,6 +2869,12 @@ impl FlushTally {
         self.chunks.set(self.chunks.get() + 1);
         self.bytes.set(self.bytes.get() + bytes);
         self.disk.set(self.disk.get() + took);
+        let files = if self.sector {
+            &SECTOR_FILE_BYTES
+        } else {
+            &LABEL_FILE_BYTES
+        };
+        files.fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn synced(&self, took: Duration) {
@@ -3069,7 +3092,10 @@ impl<W: ChunkSink> Write for ChunkedWriter<'_, W> {
 /// once and then synced held the stores' synced commits behind all of it
 /// (2026-11-07).
 pub(crate) fn write_digests_paced(path: &Path, digests: &[Digest]) -> std::io::Result<()> {
-    let tally = FlushTally::default();
+    let tally = FlushTally {
+        sector: true,
+        ..FlushTally::default()
+    };
     let mut writer =
         ChunkedWriter::new(File::create(path)?, 0, chunk_bytes(), flush_gate(), &tally);
     for digests in digests.chunks(1024) {
@@ -4096,6 +4122,33 @@ mod tests {
                  well under {FLUSH_TARGET:?}: labelling is slowed for nothing"
             );
         }
+    }
+
+    /// Bytes a chunked writer writes count as label files', and those of a
+    /// sector's last layer as sector files'.
+    #[test]
+    fn written_bytes_count_as_label_or_sector_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = hash::from_bytes(&[0u8; NODE_BYTES]).unwrap();
+        let before = file_bytes_written();
+        write_digests_paced(&dir.path().join("last"), &[digest; 100]).unwrap();
+        let sector = file_bytes_written();
+        assert_eq!(
+            (sector.0 - before.0, sector.1 - before.1),
+            (0, 100 * NODE_BYTES as u64),
+            "sector_as_labels"
+        );
+        let tally = FlushTally::default();
+        let file = File::create(dir.path().join("layers")).unwrap();
+        let mut writer = ChunkedWriter::new(file, 0, 4096, flush_gate(), &tally);
+        writer.write_all(&[1u8; 10_000]).unwrap();
+        writer.finish().unwrap();
+        let labels = file_bytes_written();
+        assert_eq!(
+            (labels.0 - sector.0, labels.1 - sector.1),
+            (10_000, 0),
+            "labels_uncounted"
+        );
     }
 
     /// A disk too slow even for the smallest chunk in [`FLUSH_TARGET`]

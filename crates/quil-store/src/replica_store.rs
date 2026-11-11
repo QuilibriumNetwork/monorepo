@@ -210,6 +210,18 @@ impl std::fmt::Debug for LoadedReplica {
     }
 }
 
+/// Replica bytes this process put into its stores: whole replicas
+/// ([`ReplicaStore::put`]) and the chunks of hash-proof leaves it wrote
+/// ([`ReplicaStore::put_hash`]), before the stores' own write-ahead log,
+/// flushes and compactions write them again.
+static WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Replica bytes this process put into its stores since it started
+/// ([`WRITTEN_BYTES`]).
+pub fn replica_bytes_written() -> u64 {
+    WRITTEN_BYTES.load(Ordering::Relaxed)
+}
+
 /// Whole replicas this process holds now, read from its stores (one being
 /// converted to the chunked layout included), and the most it held at once
 /// since the previous call: `(held, peak)` bytes.
@@ -861,7 +873,9 @@ impl ReplicaStore {
 
     /// Persist `replica` for `(epoch, leaf_id)`, replacing any prior value.
     pub fn put(&self, epoch: u64, leaf_id: &[u8], replica: &[u8]) -> Result<()> {
-        self.db.set(&replica_key(epoch, leaf_id), replica)
+        self.db.set(&replica_key(epoch, leaf_id), replica)?;
+        WRITTEN_BYTES.fetch_add(replica.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Fetch the replica for `(epoch, leaf_id)`, or `None`.
@@ -1018,6 +1032,7 @@ impl ReplicaStore {
                 bytes += nodes.len() as u64;
             }
             txn.commit()?;
+            WRITTEN_BYTES.fetch_add(bytes, Ordering::Relaxed);
             // Synced on its own, so the store's next synced commit does not
             // take it; past the target, the disk is left to them a while.
             let started = Instant::now();
@@ -2861,6 +2876,31 @@ mod tests {
         }
         put(7, &e7, &cap7);
         check(7, &e7);
+    }
+
+    /// The replica bytes counted as written are those put: a whole
+    /// replica's, and of a leaf written in its changed chunks only those.
+    #[test]
+    fn counts_the_replica_bytes_it_puts() {
+        let s = store();
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(3 * c, 5);
+        let (e4, cap4) = changed(&e3, &[c + 1]);
+        let before = replica_bytes_written();
+        s.put(2, b"whole", b"abc").unwrap();
+        assert_eq!(replica_bytes_written() - before, 3, "whole_uncounted");
+        for (epoch, nodes, cap) in [(3, &e3, &cap3), (4, &e4, &cap4)] {
+            s.put_hash(epoch, b"leaf", nodes, cap, &registered(cap))
+                .unwrap();
+            s.put_data_cap(epoch, b"leaf", &MerkleCap::from_bytes(cap).unwrap())
+                .unwrap();
+            s.note_snapshot(epoch, b"leaf", &[epoch as u8; 32]).unwrap();
+        }
+        assert_eq!(
+            replica_bytes_written() - before,
+            3 + e3.len() as u64 + (c * NODE_BYTES) as u64,
+            "chunks_miscounted: a whole leaf, then one changed chunk"
+        );
     }
 
     /// A write of a leaf in its changed chunks stopped at any point, as by

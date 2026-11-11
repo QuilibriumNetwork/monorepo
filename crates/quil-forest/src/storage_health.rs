@@ -590,6 +590,15 @@ pub fn store_path(role: StoreRole) -> Option<PathBuf> {
         .map(|store| store.path.clone())
 }
 
+/// The directories of this process's open registered stores, to find the
+/// disks they write to; never logged.
+pub fn store_dirs() -> Vec<PathBuf> {
+    open_stores()
+        .iter()
+        .map(|store| store.path.clone())
+        .collect()
+}
+
 static HELD: Mutex<BTreeSet<StoreRole>> = Mutex::new(BTreeSet::new());
 
 /// Mark the store of `role` as stopped for its recovery, until
