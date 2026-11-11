@@ -82,16 +82,35 @@ static SOURCE_FAILURES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// How long passes try an archive last after one gave up on it for its
+/// pace ([`crate::archive_pace`]): each pass that tried it first would lose
+/// a pace window to it.
+const SLOW_SOURCE_AVOID: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 pub(crate) fn source_failed(addr: &str) {
+    avoid_source(addr, SOURCE_AVOID);
+}
+
+/// An archive given up on for serving a sync below the minimum rate.
+pub(crate) fn source_slow(addr: &str) {
+    avoid_source(addr, SLOW_SOURCE_AVOID);
+}
+
+/// Try `addr` last for `period`, or longer if already avoided for longer.
+fn avoid_source(addr: &str, period: std::time::Duration) {
+    let until = std::time::Instant::now() + period;
     SOURCE_FAILURES
         .lock()
         .unwrap()
-        .insert(addr.to_string(), std::time::Instant::now());
+        .entry(addr.to_string())
+        .and_modify(|avoided| *avoided = (*avoided).max(until))
+        .or_insert(until);
 }
 
 fn recently_failed(addr: &str) -> bool {
     let mut failures = SOURCE_FAILURES.lock().unwrap();
-    failures.retain(|_, at| at.elapsed() < SOURCE_AVOID);
+    let now = std::time::Instant::now();
+    failures.retain(|_, until| *until > now);
     failures.contains_key(addr)
 }
 

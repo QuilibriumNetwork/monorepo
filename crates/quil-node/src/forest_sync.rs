@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use quil_hypergraph::addressing::get_bloom_filter_indices;
+use quil_rpc::sync_pace::{PeerPace, Wait, PACE_GIVEN_UP};
 use quil_rpc::{ArchiveClient, RemoteTreeReader};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ShardKey;
@@ -377,9 +378,14 @@ async fn sync_phase_data(
     bit_path: Vec<bool>,
     anchor: Option<quil_forest::SubtreeSyncAnchor>,
     hold: bool,
+    pace: Option<&Arc<PeerPace>>,
 ) -> Result<[u8; 32]> {
-    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase)
-        .labelled(filter.to_vec());
+    let mut remote =
+        RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase)
+            .labelled(filter.to_vec());
+    if let Some(pace) = pace {
+        remote = remote.paced(pace.clone());
+    }
     let (client, store, shard) = (client.clone(), crdt.clone(), shard_id.to_vec());
     let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
         let (mut client, store, shard) = (client.clone(), store.clone(), shard.clone());
@@ -398,6 +404,7 @@ async fn sync_phase_data(
         remote,
         fetch,
         hold,
+        pace.map(Arc::as_ref),
     )
     .await
 }
@@ -427,6 +434,7 @@ async fn install_phase<R, F, Fut>(
     source: R,
     mut fetch: F,
     hold: bool,
+    pace: Option<&PeerPace>,
 ) -> Result<[u8; 32]>
 where
     R: quil_forest::BatchTreeReader + Send + 'static,
@@ -516,7 +524,19 @@ where
                 take += 1;
             }
             let leaves = plan.remaining()[..take].to_vec();
-            let blobs = fetch(leaves).await?;
+            let blobs = match pace {
+                None => fetch(leaves).await?,
+                // A chunk's wait counts toward its archive's pace; one
+                // given up on ends the install, its installed chunks kept.
+                Some(pace) => {
+                    let blobs = pace
+                        .remote(Wait::Fetch, fetch(leaves))
+                        .await
+                        .ok_or_else(|| QuilError::ExecutionUnavailable(PACE_GIVEN_UP.into()))??;
+                    pace.add_leaves(take as u64, bytes as u64);
+                    blobs
+                }
+            };
             let c = crdt.clone();
             let (returned, applied) = tokio::task::spawn_blocking(move || {
                 let applied = c.apply_sync_chunk(&mut plan, &blobs);
@@ -617,6 +637,7 @@ pub async fn sync_one_phase(
         Vec::new(),
         remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot),
         false,
+        None,
     )
     .await
 }
@@ -647,6 +668,7 @@ pub async fn sync_subtree_one_phase(
         bit_path,
         pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot),
         false,
+        None,
     )
     .await
 }
@@ -676,17 +698,23 @@ pub async fn sync_single_shard_verified(
 }
 
 /// [`sync_single_shard_verified`] of the GLOBAL prover tree, pinned to
-/// `expected_va_root`, that leaves the committed GLOBAL view withheld from
-/// its first installed chunk until the caller records the frame the root
-/// belongs to with `HypergraphCrdt::checkpoint_synced_view`. Committee
-/// session reads (`CommittedView::capture`) then never see the synced
-/// records with the cursor from before them. A hold left by a failed sync
-/// or checkpoint ends at the next successful checkpoint.
-pub async fn sync_global_view_verified(
+/// `expected_va_root`, its archive reads and blob fetches counted in `pace`
+/// and failing once `pace` gives up on the archive
+/// ([`crate::archive_pace`]); chunks installed before that stay.
+///
+/// With `hold_view`, the committed GLOBAL view is withheld from the first
+/// installed chunk until the caller records the frame the root belongs to
+/// with `HypergraphCrdt::checkpoint_synced_view`. Committee session reads
+/// (`CommittedView::capture`) then never see the synced records with the
+/// cursor from before them. A hold left by a failed sync or checkpoint ends
+/// at the next successful checkpoint.
+pub async fn sync_prover_tree_paced(
     addr: &str,
     falcon_signing_key: &[u8],
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     expected_va_root: &[u8],
+    hold_view: bool,
+    pace: Arc<PeerPace>,
 ) -> Result<Option<u64>> {
     sync_shard_phases(
         addr,
@@ -694,8 +722,8 @@ pub async fn sync_global_view_verified(
         crdt,
         &PROVER_SHARD,
         [expected_va_root, &[], &[], &[]],
-        false,
-        true,
+        hold_view,
+        Some(&pace),
     )
     .await
 }
@@ -736,7 +764,7 @@ pub async fn sync_shard_phases_verified(
         shard_id,
         expected,
         false,
-        false,
+        None,
     )
     .await
 }
@@ -747,8 +775,8 @@ async fn sync_shard_phases(
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
     expected: [&[u8]; 4],
-    pinned_only: bool,
     hold: bool,
+    pace: Option<&Arc<PeerPace>>,
 ) -> Result<Option<u64>> {
     for root in expected {
         phase_anchor(root)?;
@@ -756,13 +784,13 @@ async fn sync_shard_phases(
     let mut client = ArchiveClient::connect_mtls(addr, falcon_signing_key)
         .await
         .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
-    sync_shard_phases_on(&mut client, crdt, shard_id, expected, pinned_only, hold).await
+    sync_shard_phases_on(&mut client, crdt, shard_id, expected, false, hold, pace).await
 }
 
 /// [`sync_shard_phases_verified`] over an already connected archive client;
 /// with `pinned_only`, only the phases `expected` pins are synced, and an
 /// unpinned phase is left as it is rather than taken from the peer's head.
-/// With `hold`, see [`sync_global_view_verified`].
+/// With `hold` and `pace`, see [`sync_prover_tree_paced`].
 pub(crate) async fn sync_shard_phases_on(
     client: &mut ArchiveClient,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -770,6 +798,7 @@ pub(crate) async fn sync_shard_phases_on(
     expected: [&[u8]; 4],
     pinned_only: bool,
     hold: bool,
+    pace: Option<&Arc<PeerPace>>,
 ) -> Result<Option<u64>> {
     for root in expected {
         phase_anchor(root)?;
@@ -822,6 +851,7 @@ pub(crate) async fn sync_shard_phases_on(
             Vec::new(),
             Some(quil_forest::SubtreeSyncAnchor::AppRoot(remote_root)),
             hold,
+            pace,
         )
         .await?;
         if !exp.is_empty() {
@@ -982,6 +1012,7 @@ mod tests {
             reader,
             fetch,
             false,
+            None,
         )
         .await
     }
@@ -1014,6 +1045,7 @@ mod tests {
             reader,
             fetch,
             hold,
+            None,
         )
         .await
     }
@@ -1117,6 +1149,91 @@ mod tests {
             "no leaf fetched twice"
         );
         assert!(!target.sync_incomplete(&large, &[]).unwrap());
+    }
+
+    /// An archive that slows down mid-install is given up on within a pace
+    /// window, and the next archive installs only the rest: the chunks the
+    /// slow one installed stay. A slow archive held a regular node's GLOBAL
+    /// prover tree pull, and its committed view, for 28 minutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_archive_is_given_up_mid_install_and_the_next_installs_only_the_rest() {
+        use crate::archive_pace::{PacedArchives, MAX_SLOW_FAILOVERS};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let app = [0x76; 32];
+        let (source, version, root) = source_of(app, 3_000);
+        let target = memory_crdt();
+        let fetched = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        // Archive 0 serves its first chunk at once, then 10 leaves a second.
+        let install = |archive: usize, pace: Arc<PeerPace>| {
+            let (source, target, fetched) = (source.clone(), target.clone(), fetched.clone());
+            async move {
+                let reader = quil_hypergraph::testing::CrdtTreeReader {
+                    source,
+                    shard_id: app.to_vec(),
+                    phase: 0,
+                };
+                let chunks = Arc::new(AtomicUsize::new(0));
+                let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
+                    let slow = archive == 0 && chunks.fetch_add(1, Ordering::SeqCst) > 0;
+                    let fetched = fetched.clone();
+                    async move {
+                        if slow {
+                            let secs = leaves.len() as u64 / 10;
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        }
+                        fetched[archive].fetch_add(leaves.len(), Ordering::SeqCst);
+                        Ok::<_, QuilError>(leaves.iter().map(|(key, _)| blob_of(key)).collect())
+                    }
+                };
+                install_phase(
+                    &target,
+                    &app,
+                    &app,
+                    0,
+                    version,
+                    Vec::new(),
+                    Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+                    reader,
+                    fetch,
+                    true,
+                    Some(&pace),
+                )
+                .await
+                .map(|_| Some(1))
+            }
+        };
+        let mut archives =
+            PacedArchives::new(vec!["slow".into(), "fast".into()], MAX_SLOW_FAILOVERS);
+        let mut pulled_from = None;
+        while let Some(attempt) = archives.next_archive() {
+            let archive = usize::from(attempt.addr == "fast");
+            let Some(synced) = archives.pull(&attempt, |pace| install(archive, pace)).await else {
+                continue;
+            };
+            synced.unwrap();
+            pulled_from = Some(attempt.addr);
+            break;
+        }
+        let [slow, fast] = [0, 1].map(|i| fetched[i].load(Ordering::SeqCst));
+        assert_eq!(
+            pulled_from.as_deref(),
+            Some("fast"),
+            "the pull waited on the slow archive ({slow} leaves from it, {fast} from the next)"
+        );
+        assert_eq!(slow, 1_024, "the slow archive's first chunk was installed");
+        assert_eq!(
+            fast,
+            3_000 - 1_024,
+            "the next archive fetched only the rest"
+        );
+        assert_eq!(target.serve_forest_head(&app, 0).unwrap().1, root);
+        // The view stays withheld across the failover until the cursor of
+        // the completed pull is recorded.
+        assert!(target.sync_incomplete(&app, &[]).unwrap());
+        target
+            .checkpoint_synced_view(&app, 7, b"test/cursor")
+            .unwrap();
+        assert!(!target.sync_incomplete(&app, &[]).unwrap());
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<quil_hypergraph::HypergraphCrdt>) {
