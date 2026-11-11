@@ -26,11 +26,12 @@ const SHARED: &str =
     "It gets, per request: this node's release and build fingerprint, GLOBAL head \
 frame, worker count, store write state and store and disk read times; its health conditions \
 (kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
-the GLOBAL frames an expected wait ends at, and for GLOBAL's progress its head, its recent \
-frame rate and how many GLOBAL provers this node hears); and per worker its core ID, public \
-shard filter, allocation, phase, blocker, frames, committee generation, recovery state and \
-failure counts, and when these last changed.\n\
-It gets no log text, addresses or keys.\n";
+a slow store fsync time, the GLOBAL frames an expected wait ends at, and for GLOBAL's progress \
+its head, its recent frame rate and how many GLOBAL provers this node hears); and per worker \
+its core ID, public shard filter, allocation, phase, blocker, frames, committee generation, \
+recovery state and failure counts, and when these last changed.\n\
+It gets no log text, addresses or keys, and no condition about this node's rewards or \
+addresses.\n";
 
 const APPLY: &str = "The node reads this at start: restart it to apply. This command restarts \
 nothing.\n";
@@ -450,6 +451,10 @@ mod tests {
             threshold: _,
             shards: _,
             omitted_shards: _,
+            store_io: _,
+            reward_hour_units: _,
+            reward_day_units: _,
+            store_fsync_ms: _,
             global: _,
             wait: _,
         } = HealthCondition::default();

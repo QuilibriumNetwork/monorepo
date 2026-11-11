@@ -21,6 +21,7 @@ pub mod prover_counts;
 pub mod proxy_pubsub;
 pub mod pubsub_proxy;
 pub mod quil_tls;
+pub mod reachability;
 pub mod shard_info_refresh;
 pub mod stub_services;
 
