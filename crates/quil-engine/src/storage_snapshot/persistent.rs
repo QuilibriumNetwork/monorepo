@@ -40,6 +40,19 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .and_then(|f| f.sync_all())
         .map_err(io)
 }
+/// [`atomic`], unless `path` holds `bytes` already. A leaf reserves its
+/// sector again at every GLOBAL frame ([`prewarm_sectors`]), and its lease
+/// and mapping seldom change: written again each time, a node holding 60
+/// sectors synced files and directories 240 times a frame or more, a third
+/// or more of its filesystem's journal commits, each about 40 KB on disk
+/// (2026-11-11). Nothing is lost: [`atomic`] is these files' only writer,
+/// and it synced the bytes read back before renaming them into place.
+fn atomic_unless_held(path: &Path, bytes: &[u8]) -> Result<()> {
+    if fs::read(path).is_ok_and(|held| held == bytes) {
+        return Ok(());
+    }
+    atomic(path, bytes)
+}
 fn home(store: &LabelStore, member: &[u8]) -> PathBuf {
     store
         .directory()
@@ -204,7 +217,7 @@ fn try_reserve(
                 if (bytes.len() == 48 || bytes.len() == 52) && bytes[16..48] == leaf_hash {
                     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                     if sector::padded_nodes_allowed(exact, n) {
-                        atomic(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
+                        atomic_unless_held(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
                         return Ok(Some((dir, id, n)));
                     }
                 }
@@ -239,11 +252,13 @@ fn try_reserve(
         let lease = candidate.dir.join(format!("lease-{epoch}"));
         match fs::read(&lease) {
             Ok(owner) if owner != leaf_hash => continue,
+            Ok(_) => {}
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
-            _ => {}
+            Err(_) => atomic(&lease, &leaf_hash)?,
         }
-        atomic(&lease, &leaf_hash)?;
-        atomic(&mapping, &candidate.cert.sector)?;
+        if mapped != Some(candidate.cert.sector) {
+            atomic(&mapping, &candidate.cert.sector)?;
+        }
         return Ok(Some((
             candidate.dir,
             candidate.cert.sector,
