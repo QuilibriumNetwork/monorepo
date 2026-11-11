@@ -1991,6 +1991,50 @@ mod tests {
         assert!(Sector::load(other).unwrap().is_none());
         gates(false);
     }
+    /// A leaf reserving its certified sector again, as it does at every
+    /// GLOBAL frame, leaves its lease and mapping as they are: rewritten,
+    /// each took a sync of its file and of its directory (2026-11-11). A
+    /// lease of a new epoch is still written, and a mapping to another
+    /// sector still moves to the one reserved.
+    #[test]
+    fn reserving_a_held_sector_again_rewrites_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        crate::storage_jobs::set_job_slots_for_test(1);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [23; 32];
+        let (path, id, n) = reserve(&store, &member, b"held", 1500, 100).unwrap();
+        initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let mut sector = Sector::load(path.clone()).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        let leaf = hex::encode(digest(b"held"));
+        let mapping = home(&store, &member).join(format!("leaf-{leaf}"));
+        let lease = path.join("lease-1500");
+        let inodes = || {
+            (
+                fs::metadata(&lease).unwrap().ino(),
+                fs::metadata(&mapping).unwrap().ino(),
+            )
+        };
+        assert_eq!(reserve(&store, &member, b"held", 1500, 100).unwrap().1, id);
+        let held = inodes();
+        for _ in 0..3 {
+            assert_eq!(reserve(&store, &member, b"held", 1500, 100).unwrap().1, id);
+            assert_eq!(inodes(), held, "held_lease_or_mapping_rewritten");
+        }
+        assert_eq!(reserve(&store, &member, b"held", 1501, 100).unwrap().1, id);
+        let new_lease = fs::read(path.join("lease-1501")).unwrap();
+        assert_eq!(new_lease, digest(b"held"), "new_epoch_lease_unwritten");
+        // A mapping to a sector the leaf cannot use moves to the one it gets.
+        fs::write(&mapping, [9u8; 32]).unwrap();
+        assert_eq!(reserve(&store, &member, b"held", 1502, 100).unwrap().1, id);
+        assert_eq!(fs::read(&mapping).unwrap(), id, "mapping_not_moved");
+        gates(false);
+    }
     /// A sector's last layer, up to 2 GiB, goes to disk as its labels do: a
     /// chunk at a time through the flush gate, paced, then synced. Written
     /// whole, then synced, it held the stores' synced commits behind all of
