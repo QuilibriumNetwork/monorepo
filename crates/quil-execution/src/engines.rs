@@ -4130,6 +4130,395 @@ mod tests {
     }
 
     // =================================================================
+    // Compute ops write only into the application they are routed to
+    // =================================================================
+
+    /// A compiler that accepts every circuit, so a CodeDeployment reaches
+    /// its domain checks and materialization.
+    struct AcceptingCompiler;
+
+    impl quil_types::execution::CircuitCompiler for AcceptingCompiler {
+        fn compile(&self, _: &str, _: &[Vec<i32>]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 16])
+        }
+        fn validate_circuit(&self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    const APP_A: [u8; 32] = [0x11; 32];
+    const APP_B: [u8; 32] = [0x22; 32];
+
+    fn compute_crdt() -> Arc<quil_hypergraph::HypergraphCrdt> {
+        Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ))
+    }
+
+    fn compute_engine_on(crdt: &Arc<quil_hypergraph::HypergraphCrdt>) -> ComputeExecutionEngine {
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        ComputeExecutionEngine::new_with_state(
+            ExecutionMode::Application,
+            crdt.clone(),
+            stubs.key_manager,
+            Arc::new(AcceptingCompiler),
+        )
+    }
+
+    /// A one-request bundle carrying `inner` (canonical bytes with prefix).
+    fn compute_bundle(inner: Vec<u8>) -> Vec<u8> {
+        compute_bundle_of(vec![inner])
+    }
+
+    /// A bundle carrying each of `inners` as a request, in order.
+    fn compute_bundle_of(inners: Vec<Vec<u8>>) -> Vec<u8> {
+        CanonicalMessageBundle {
+            requests: inners
+                .into_iter()
+                .map(|inner| {
+                    Some(CanonicalMessageRequest {
+                        inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                        inner_bytes: inner,
+                    })
+                })
+                .collect(),
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Run `message` routed to `route` through the engine and say what it did.
+    fn route_compute(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        route: &[u8; 32],
+        message: &[u8],
+    ) -> Result<ProcessMessageResult> {
+        route_compute_in(crdt, Placement::Bare(7), route, message)
+    }
+
+    /// The frame a compute op executes in, with the context production
+    /// passes for it.
+    #[derive(Clone, Copy, Debug)]
+    enum Placement {
+        /// GLOBAL frame `n`: the GLOBAL materializer passes `n - 1` as its
+        /// finalized GLOBAL frame, in the global venue.
+        Global(u64),
+        /// An application shard's frame `frame`, anchored at GLOBAL frame
+        /// `anchor`, in the application venue.
+        Shard { frame: u64, anchor: u64 },
+        /// A context naming no GLOBAL frame (an unanchored application frame,
+        /// a direct `process_message`), judged by its own number.
+        Bare(u64),
+    }
+
+    impl Placement {
+        fn context(self) -> quil_types::execution::FrameExecutionContext {
+            use quil_types::execution::Venue;
+            let (frame_number, finalized_global_frame, venue) = match self {
+                Placement::Global(n) => (n, n.checked_sub(1), Some(Venue::Global)),
+                Placement::Shard { frame, anchor } => {
+                    (frame, Some(anchor), Some(Venue::Application))
+                }
+                Placement::Bare(n) => (n, None, None),
+            };
+            quil_types::execution::FrameExecutionContext {
+                frame_number,
+                finalized_global_frame,
+                venue,
+                shard: quil_types::execution::ShardPath::WHOLE,
+            }
+        }
+    }
+
+    /// As [`route_compute`], in the frame `placement` names.
+    fn route_compute_in(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        placement: Placement,
+        route: &[u8; 32],
+        message: &[u8],
+    ) -> Result<ProcessMessageResult> {
+        let result = compute_engine_on(crdt).process_message_with_context(
+            placement.context(),
+            &BigInt::from(0),
+            route,
+            message,
+        );
+        println!(
+            "REACH compute op routed to {} in {placement:?} processed: {}",
+            hex::encode(&route[..4]),
+            match &result {
+                Ok(_) => "admitted".to_string(),
+                Err(e) => format!("refused ({e})"),
+            }
+        );
+        result
+    }
+
+    fn vertex_at(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        domain: &[u8; 32],
+        address: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
+        crate::hypergraph_state::HypergraphState::new(crdt.clone())
+            .get(domain, address, &disc)
+            .unwrap()
+    }
+
+    /// A free (zero-payer) CodeExecute naming `domain`, writing `rendezvous`.
+    fn free_execute(domain: [u8; 32], rendezvous: [u8; 32], identifier: &[u8]) -> Vec<u8> {
+        use crate::compute_intrinsic::intrinsic::EXECUTION_CONTEXT_HYPERGRAPH;
+        use crate::compute_intrinsic::{Application, CodeExecute, ExecuteOperation};
+        let operation = ExecuteOperation {
+            application: Application {
+                address: domain.to_vec(),
+                execution_context: EXECUTION_CONTEXT_HYPERGRAPH,
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+            identifier: identifier.to_vec(),
+            dependencies: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        CodeExecute {
+            proof_of_payment: vec![vec![0u8; 57]],
+            domain,
+            rendezvous,
+            execute_operations: vec![operation],
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn code_deploy(domain: [u8; 32], circuit: &[u8]) -> Vec<u8> {
+        crate::compute_intrinsic::CodeDeployment {
+            circuit: circuit.to_vec(),
+            input_types: Vec::new(),
+            output_types: Vec::new(),
+            domain,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A free CodeExecute routed to application A may not overwrite a vertex
+    /// of application B: the op's domain must be the routing domain.
+    #[test]
+    fn compute_code_execute_refuses_a_domain_other_than_its_route() {
+        let crdt = compute_crdt();
+        // B's own vertex, written by an op routed to B (the control: an op
+        // naming its routing domain executes).
+        let victim_address = [0x33; 32];
+        let victim = compute_bundle(free_execute(APP_B, victim_address, b"owner"));
+        route_compute(&crdt, &APP_B, &victim).unwrap();
+        let before = vertex_at(&crdt, &APP_B, &victim_address);
+        assert!(before.is_some());
+
+        let foreign = compute_bundle(free_execute(APP_B, victim_address, b"intruder"));
+        let result = route_compute(&crdt, &APP_A, &foreign);
+        assert_eq!(
+            vertex_at(&crdt, &APP_B, &victim_address),
+            before,
+            "foreign domain written: a bundle routed to A overwrote B's vertex"
+        );
+        assert!(result.is_err(), "foreign domain admitted: {result:?}");
+    }
+
+    /// A bundle routed to A whose first op names A and whose second names B
+    /// fails as a whole: neither op's vertex is written, so a foreign op
+    /// cannot ride behind an op of the application it is routed to, and the
+    /// refusal leaves no partial write behind.
+    #[test]
+    fn compute_bundle_with_a_foreign_op_writes_none_of_its_ops() {
+        let own_address = [0x55; 32];
+        let foreign_address = [0x66; 32];
+        let own = free_execute(APP_A, own_address, b"owner");
+
+        // Control: the first op alone is written.
+        let alone = compute_crdt();
+        route_compute(&alone, &APP_A, &compute_bundle(own.clone())).unwrap();
+        assert!(vertex_at(&alone, &APP_A, &own_address).is_some());
+
+        let crdt = compute_crdt();
+        let mixed = compute_bundle_of(vec![own, free_execute(APP_B, foreign_address, b"intruder")]);
+        let result = route_compute(&crdt, &APP_A, &mixed);
+        assert!(
+            vertex_at(&crdt, &APP_B, &foreign_address).is_none(),
+            "mixed bundle wrote its foreign op"
+        );
+        assert!(result.is_err(), "mixed bundle admitted: {result:?}");
+        assert!(
+            vertex_at(&crdt, &APP_A, &own_address).is_none(),
+            "mixed bundle kept its own-domain op"
+        );
+    }
+
+    /// A CodeDeployment may not write into GLOBAL (routed to the compute base
+    /// domain, as a bundle opening with a ComputeDeploy is) nor into an
+    /// application it is not routed to.
+    #[test]
+    fn compute_code_deploy_refuses_global_and_foreign_domains() {
+        let crdt = compute_crdt();
+        let circuit = b"circuit".to_vec();
+        let at = |domain: &[u8; 32]| {
+            crate::compute_intrinsic::intrinsic::code_deployment_address(domain, &circuit).unwrap()
+        };
+
+        // Control: a deployment into its own application is written.
+        route_compute(&crdt, &APP_A, &compute_bundle(code_deploy(APP_A, &circuit))).unwrap();
+        assert!(vertex_at(&crdt, &APP_A, &at(&APP_A)).is_some());
+
+        let global = route_compute(
+            &crdt,
+            &domains::COMPUTE,
+            &compute_bundle(code_deploy(domains::GLOBAL, &circuit)),
+        );
+        assert!(
+            vertex_at(&crdt, &domains::GLOBAL, &at(&domains::GLOBAL)).is_none(),
+            "deploy into global written"
+        );
+        assert!(global.is_err(), "deploy into global admitted: {global:?}");
+
+        let foreign = route_compute(&crdt, &APP_A, &compute_bundle(code_deploy(APP_B, &circuit)));
+        assert!(
+            vertex_at(&crdt, &APP_B, &at(&APP_B)).is_none(),
+            "foreign deploy written"
+        );
+        assert!(foreign.is_err(), "foreign deploy admitted: {foreign:?}");
+    }
+
+    /// A CodeDeployment routed to the compute base domain may not write into
+    /// that system-managed domain itself.
+    #[test]
+    fn compute_code_deploy_refuses_the_compute_base_domain() {
+        let crdt = compute_crdt();
+        let circuit = b"circuit".to_vec();
+        let result = route_compute(
+            &crdt,
+            &domains::COMPUTE,
+            &compute_bundle(code_deploy(domains::COMPUTE, &circuit)),
+        );
+        let at = crate::compute_intrinsic::intrinsic::code_deployment_address(
+            &domains::COMPUTE,
+            &circuit,
+        )
+        .unwrap();
+        assert!(
+            vertex_at(&crdt, &domains::COMPUTE, &at).is_none(),
+            "compute base deploy written"
+        );
+        assert!(result.is_err(), "compute base deploy admitted: {result:?}");
+    }
+
+    /// The GLOBAL frame the domain frame tests pin through the test-network
+    /// setting; nextest runs each test in its own process.
+    const DOMAIN_FRAME: u64 = 100;
+
+    fn pin_domain_frame() {
+        std::env::set_var("QUIL_COMPUTE_DOMAIN_FRAME", DOMAIN_FRAME.to_string());
+    }
+
+    /// On a fresh state, whether a free CodeExecute routed to A naming B and
+    /// a CodeDeployment into GLOBAL routed to the compute base domain each
+    /// wrote its vertex, in the frame `placement` names.
+    fn cross_domain_writes(placement: Placement) -> [bool; 2] {
+        let crdt = compute_crdt();
+        let rendezvous = [0x44; 32];
+        let execute = compute_bundle(free_execute(APP_B, rendezvous, b"intruder"));
+        let executed = route_compute_in(&crdt, placement, &APP_A, &execute);
+        let circuit = b"circuit".to_vec();
+        let deploy = compute_bundle(code_deploy(domains::GLOBAL, &circuit));
+        let deployed = route_compute_in(&crdt, placement, &domains::COMPUTE, &deploy);
+        let at = crate::compute_intrinsic::intrinsic::code_deployment_address(
+            &domains::GLOBAL,
+            &circuit,
+        )
+        .unwrap();
+        let written = [
+            vertex_at(&crdt, &APP_B, &rendezvous).is_some(),
+            vertex_at(&crdt, &domains::GLOBAL, &at).is_some(),
+        ];
+        assert_eq!(
+            written,
+            [executed.is_ok(), deployed.is_ok()],
+            "an op wrote only if admitted: {executed:?} {deployed:?}"
+        );
+        written
+    }
+
+    /// Before the domain frame a cross-domain compute op executes as older
+    /// builds execute it, so replayed history and a mixed network agree.
+    /// GLOBAL frame `DOMAIN_FRAME` is judged by the frame before it, and an
+    /// application shard's frame by its GLOBAL anchor, whatever its own
+    /// number.
+    #[test]
+    fn compute_cross_domain_ops_run_before_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(2),
+            Placement::Global(DOMAIN_FRAME),
+            Placement::Shard {
+                frame: DOMAIN_FRAME + 400,
+                anchor: DOMAIN_FRAME - 1,
+            },
+            Placement::Bare(DOMAIN_FRAME - 1),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [true, true],
+                "refused before the domain frame: {placement:?}"
+            );
+        }
+    }
+
+    /// At the domain frame both cross-domain ops are refused: by GLOBAL from
+    /// frame `DOMAIN_FRAME + 1` (judged by `DOMAIN_FRAME`), and in an
+    /// application shard's frame anchored at `DOMAIN_FRAME`.
+    #[test]
+    fn compute_cross_domain_ops_are_refused_at_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(DOMAIN_FRAME + 1),
+            Placement::Shard {
+                frame: 5,
+                anchor: DOMAIN_FRAME,
+            },
+            Placement::Bare(DOMAIN_FRAME),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [false, false],
+                "written at the domain frame: {placement:?}"
+            );
+        }
+    }
+
+    /// After the domain frame both cross-domain ops stay refused, whatever
+    /// an application frame's own number.
+    #[test]
+    fn compute_cross_domain_ops_are_refused_after_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(DOMAIN_FRAME + 2),
+            Placement::Global(1_000_000),
+            Placement::Shard {
+                frame: 5,
+                anchor: DOMAIN_FRAME + 1,
+            },
+            Placement::Bare(DOMAIN_FRAME + 1),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [false, false],
+                "written after the domain frame: {placement:?}"
+            );
+        }
+    }
+
+    // =================================================================
     // HypergraphExecutionEngine
     // =================================================================
 
