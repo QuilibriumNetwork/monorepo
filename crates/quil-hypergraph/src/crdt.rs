@@ -236,6 +236,39 @@ pub struct CommittedShardSnapshot {
     pub records: Arc<dyn quil_types::store::SnapshotReadable>,
 }
 
+/// GLOBAL vertex reads at retained roots over one committed view
+/// ([`HypergraphCrdt::committed_global_view`]). Every read of one view sees
+/// the same commits; none waits for the commit lock.
+pub struct CommittedGlobalView(Arc<dyn quil_types::store::SnapshotReadable>);
+
+impl CommittedGlobalView {
+    /// The blob of the GLOBAL vertex at `data_address` in the tree whose root
+    /// is `root`: the read [`HypergraphCrdt::global_vertex_present_at_root`]
+    /// makes under the commit lock. A root this view does not index is
+    /// `ExecutionUnavailable`, as there.
+    pub fn vertex_blob_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let app = [0xff; 32];
+        let (version, _) = self
+            .0
+            .root_version("vertex", "adds", &app, root)?
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable("historical global reward root unavailable".into())
+            })?;
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: app,
+        };
+        let mut vertex = app.to_vec();
+        vertex.extend_from_slice(data_address);
+        self.0
+            .vertex_underlying_at("vertex", "adds", &shard, &vertex, version)
+    }
+}
+
 /// An authenticated diff whose complete reconstruction was checked before
 /// the first write. Only `apply_sync_chunk` advances it, after durable commit.
 pub struct ForestSyncPlan {
@@ -5461,6 +5494,16 @@ impl HypergraphCrdt {
         Ok(self
             .global_vertex_blob_at_root(root, data_address)?
             .is_some())
+    }
+
+    /// A committed view for GLOBAL vertex reads at retained roots, taken as
+    /// [`Self::capture_committed_snapshot`] takes it: once any capture has
+    /// returned (a node's periodic health read makes one), it waits for no
+    /// commit lock holder. A GLOBAL finalization holds that lock while it
+    /// executes a frame, minutes when the frame carries a large proof, and
+    /// a holder changes nothing readers see until it releases.
+    pub fn committed_global_view(&self) -> Result<CommittedGlobalView> {
+        Ok(CommittedGlobalView(self.capture_committed_snapshot()?))
     }
 
     /// `(version, vertex key, blob)` of a GLOBAL vertex at a retained root. The

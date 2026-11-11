@@ -1751,6 +1751,34 @@ pub trait SnapshotReadable: Send + Sync {
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    /// [`HypergraphStore::get_root_version`] at the captured sequence.
+    fn root_version(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        Err(QuilError::Store(
+            "snapshot root index reads are unsupported by this backend".into(),
+        ))
+    }
+
+    /// [`HypergraphStore::load_vertex_underlying_at`] at the captured
+    /// sequence: the blob as of tree version `version`.
+    fn vertex_underlying_at(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _vertex_key: &[u8],
+        _version: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(QuilError::Store(
+            "snapshot versioned vertex reads are unsupported by this backend".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
