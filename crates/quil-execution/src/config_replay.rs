@@ -16,6 +16,12 @@
 //!
 //! Before the frame both behave as older builds do, so history replays
 //! unchanged.
+//!
+//! An application shard's frame is judged by its GLOBAL anchor, which its
+//! leader picks among the GLOBAL frames its voters hold. A voter whose own
+//! latest GLOBAL frame has reached the frame therefore refuses a proposal
+//! judged before it that carries an op [`carries_configuration_op`] finds,
+//! so no leader applies an update again by citing an older anchor.
 
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::FrameExecutionContext;
@@ -88,6 +94,33 @@ pub fn config_replay_guarded(context: FrameExecutionContext) -> bool {
         context
             .finalized_global_frame
             .unwrap_or(context.frame_number),
+    )
+}
+
+/// The deploys and updates a frame executes by [`config_replay_guarded`]:
+/// token, hypergraph and compute.
+const CONFIGURATION_OPS: [u32; 6] = [
+    crate::token_intrinsic::TYPE_TOKEN_DEPLOY,
+    crate::token_intrinsic::TYPE_TOKEN_UPDATE,
+    crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_DEPLOYMENT,
+    crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_UPDATE,
+    crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY,
+    crate::compute_intrinsic::config::TYPE_COMPUTE_UPDATE,
+];
+
+/// Whether `bundle`, a canonical message bundle, carries a token,
+/// hypergraph or compute deploy or update: an op a frame judged before
+/// [`config_replay_frame`] runs under the older rules. A bundle that does
+/// not decode is not counted; no frame runs it.
+pub fn carries_configuration_op(bundle: &[u8]) -> bool {
+    crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle).is_ok_and(
+        |bundle| {
+            bundle
+                .requests
+                .iter()
+                .flatten()
+                .any(|request| CONFIGURATION_OPS.contains(&request.inner_type_prefix))
+        },
     )
 }
 
@@ -275,6 +308,63 @@ mod tests {
         assert!(!at(99, None));
         assert!(at(100, None));
         set_config_replay_frame_for_thread(None);
+    }
+
+    #[test]
+    fn the_voter_check_counts_each_deploy_and_update() {
+        use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let bundle = |prefixes: &[u32]| {
+            CanonicalMessageBundle {
+                requests: prefixes
+                    .iter()
+                    .map(|prefix| {
+                        Some(CanonicalMessageRequest {
+                            inner_type_prefix: *prefix,
+                            inner_bytes: prefix.to_be_bytes().to_vec(),
+                        })
+                    })
+                    .collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let execute = crate::compute_intrinsic::TYPE_CODE_EXECUTE;
+        let vertex = crate::hypergraph_intrinsic::canonical::TYPE_VERTEX_ADD;
+        // Named here, not read from CONFIGURATION_OPS: a deleted entry fails.
+        for (name, op) in [
+            ("token deploy", crate::token_intrinsic::TYPE_TOKEN_DEPLOY),
+            ("token update", crate::token_intrinsic::TYPE_TOKEN_UPDATE),
+            (
+                "hypergraph deploy",
+                crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_DEPLOYMENT,
+            ),
+            (
+                "hypergraph update",
+                crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_UPDATE,
+            ),
+            (
+                "compute deploy",
+                crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY,
+            ),
+            (
+                "compute update",
+                crate::compute_intrinsic::config::TYPE_COMPUTE_UPDATE,
+            ),
+        ] {
+            assert!(
+                carries_configuration_op(&bundle(&[execute, op])),
+                "configuration op {name} ({op:#06x}) not counted"
+            );
+        }
+        assert!(
+            !carries_configuration_op(&bundle(&[execute, vertex])),
+            "a bundle without a configuration op was counted"
+        );
+        assert!(
+            !carries_configuration_op(&bundle(&[])[..4]),
+            "an undecodable bundle was counted"
+        );
     }
 
     #[test]

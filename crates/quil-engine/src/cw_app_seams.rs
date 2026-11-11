@@ -1327,6 +1327,30 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.config_replay_stale_now(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                anchor = header.global_frame_number,
+                latest_global = latest,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: anchored before the config replay frame, it carries a \
+                 deploy or an owner's update"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "frame replays a configuration op",
+                format!(
+                    "frame {}, anchor {}, latest GLOBAL frame {latest}",
+                    header.frame_number, header.global_frame_number
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 view,
@@ -5210,6 +5234,517 @@ mod tests {
             "sync judges by the anchor"
         );
         crate::fees::set_fee_vote_bound_frame_for_thread(None);
+    }
+
+    /// From the config replay frame, an owner's update signs the metadata
+    /// vertex it replaces, so an update applies once. Execution judges an
+    /// application shard's frame by its GLOBAL anchor, which the shard's
+    /// leader picks among the GLOBAL frames its voters hold: a frame
+    /// anchored before the replay frame runs an update signed before it,
+    /// over its domain alone, again. A voter whose latest GLOBAL frame has
+    /// reached the replay frame refuses a proposal anchored before it that
+    /// carries a deploy or an update. It votes for one anchored at the
+    /// replay frame (execution binds the update there), for a stale-anchored
+    /// one carrying neither, and for any before the replay frame.
+    #[test]
+    fn a_stale_anchor_does_not_replay_a_configuration_update() {
+        use quil_types::store::ClockStore as _;
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put_global(99);
+        let filter = vec![1; 32];
+        let validator = Arc::new(
+            BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone()),
+        );
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            validator.clone(),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| Ok(()))),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
+        let bundle = |inner: Vec<u8>| {
+            use quil_execution::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest,
+            };
+            let canonical = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            let bundle = crate::consensus_wire::decode_app_message_bundle(&canonical).unwrap();
+            assert_eq!(
+                crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).unwrap(),
+                canonical,
+                "harness: the op did not survive the frame encoding"
+            );
+            bundle
+        };
+        // The owner's update of the token at `filter`, signed the way a
+        // client signed it before the replay frame: over its domain alone.
+        let owner = quil_crypto::FalconSigner::generate();
+        let mut update = quil_execution::token_intrinsic::TokenUpdate {
+            config: quil_execution::token_intrinsic::TokenConfiguration {
+                behavior: 1,
+                units: vec![1],
+                name: b"zero".to_vec(),
+                symbol: b"RPL".to_vec(),
+                owner_public_key: owner.public_key().to_vec(),
+                ..Default::default()
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+            rdf_schema: Vec::new(),
+            public_key_signature_bls48581: Vec::new(),
+        };
+        update.public_key_signature_bls48581 = owner
+            .sign_with_domain(
+                &update.to_canonical_bytes().unwrap(),
+                &quil_execution::config_replay::update_signing_domain(
+                    &filter,
+                    quil_execution::config_replay::TOKEN_UPDATE_TAG,
+                    None,
+                ),
+            )
+            .unwrap();
+        let replayed = bundle(update.to_canonical_bytes().unwrap());
+        // A free CodeExecute of the shard's own application: no deploy or
+        // update.
+        let execute = bundle(
+            quil_execution::compute_intrinsic::CodeExecute {
+                proof_of_payment: vec![vec![0u8; 57]],
+                domain: [1; 32],
+                rendezvous: [0x44; 32],
+                execute_operations: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+        );
+        // A frame of shard `filter` anchored at `anchor`, carrying `body`.
+        let frame = |anchor: u64, body: &quil_types::proto::global::MessageBundle| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 7,
+                rank: 43,
+                parent_selector: vec![7; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                global_frame_number: anchor,
+                timestamp: 1_000,
+                fee_multiplier_vote: 100,
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+                0,
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
+            );
+            AppShardFrame {
+                header: Some(header),
+                requests: vec![body.clone()],
+                ..Default::default()
+            }
+        };
+        let votes_for = |frame: &AppShardFrame| {
+            proposer.verify(
+                43,
+                digest_from_identity([7; 32]),
+                app_frame_digest(frame).unwrap(),
+                Some(encode_app_frame(frame)),
+            )
+        };
+
+        assert!(
+            votes_for(&frame(99, &replayed)),
+            "voter refused before the replay frame"
+        );
+
+        // This voter has reached the replay frame; the leader cites 99.
+        put_global(100);
+        assert!(
+            !votes_for(&frame(99, &replayed)),
+            "a stale anchor replayed a configuration update after the replay frame"
+        );
+        liveness.settle(Step::Verify, 43, false);
+        assert_eq!(
+            liveness
+                .decisions()
+                .refused
+                .get("frame replays a configuration op"),
+            Some(&1)
+        );
+        assert!(
+            votes_for(&frame(99, &execute)),
+            "voter refused a stale-anchored frame without a configuration op"
+        );
+        assert!(
+            votes_for(&frame(100, &replayed)),
+            "voter refused a frame anchored at the replay frame"
+        );
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
+    }
+
+    /// A voter of shard `[1; 32]` whose clock holds GLOBAL frames 99 and
+    /// 100: past a config replay frame of 100.
+    struct ReplayVoter {
+        _db: quil_store::RocksDb,
+        proposer: AppSeamProposer,
+        liveness: Arc<Liveness>,
+    }
+
+    impl ReplayVoter {
+        fn new() -> Self {
+            use quil_types::store::ClockStore as _;
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+            for number in [99, 100] {
+                let frame = quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: number,
+                        output: vec![number as u8; 516],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let txn = clock.new_transaction(false).unwrap();
+                clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+                txn.commit().unwrap();
+            }
+            let validator = BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock);
+            let liveness = Arc::new(Liveness::default());
+            let proposer = AppSeamProposer::new(
+                Arc::new(NoProposal),
+                Arc::new(validator),
+                Arc::new(|_| unreachable!()),
+                vec![1; 32],
+                Some(Arc::new(|_| Ok(()))),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+            .with_liveness(Some(liveness.clone()));
+            Self {
+                _db: db,
+                proposer,
+                liveness,
+            }
+        }
+
+        /// Whether it votes for `frame` in view 43. A refusal must be the
+        /// config replay check's.
+        fn votes_for(&self, frame: &AppShardFrame) -> bool {
+            let refusals = || {
+                self.liveness
+                    .decisions()
+                    .refused
+                    .get("frame replays a configuration op")
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let before = refusals();
+            let voted = self.proposer.verify(
+                43,
+                digest_from_identity([7; 32]),
+                app_frame_digest(frame).unwrap(),
+                Some(encode_app_frame(frame)),
+            );
+            if !voted {
+                self.liveness.settle(Step::Verify, 43, false);
+                assert_eq!(
+                    refusals(),
+                    before + 1,
+                    "harness: refused for another reason: {:?}",
+                    self.liveness.decisions().refused
+                );
+            }
+            voted
+        }
+    }
+
+    /// The bundle of one canonical request `inner`, as a shard frame
+    /// carries it.
+    fn replay_bundle(inner: Vec<u8>) -> quil_types::proto::global::MessageBundle {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let canonical = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                inner_bytes: inner,
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let bundle = crate::consensus_wire::decode_app_message_bundle(&canonical).unwrap();
+        assert_eq!(
+            crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).unwrap(),
+            canonical,
+            "harness: the request did not survive the frame encoding"
+        );
+        bundle
+    }
+
+    /// A frame of shard `[1; 32]` in view 43, numbered `number`, anchored
+    /// at `anchor` (0: none) and carrying `bundles`.
+    fn replay_frame(
+        number: u64,
+        anchor: u64,
+        bundles: &[quil_types::proto::global::MessageBundle],
+    ) -> AppShardFrame {
+        let mut header = quil_types::proto::global::FrameHeader {
+            address: vec![1; 32],
+            frame_number: number,
+            rank: 43,
+            parent_selector: vec![7; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            global_frame_number: anchor,
+            timestamp: 1_000,
+            fee_multiplier_vote: 100,
+            ..Default::default()
+        };
+        let beacon = match anchor {
+            0 => quil_crypto::porep::derive_storage_beacon(0, &[]),
+            anchor => quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+        };
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector,
+            &header.requests_root,
+            &header.state_roots,
+            &beacon,
+            header.frame_number,
+            header.rank,
+            &header.prover,
+            header.difficulty,
+            header.fee_multiplier_vote,
+            header.timestamp,
+            &header.storage_attestation_root,
+            0,
+            &header.settlements,
+            &header.accumulator,
+            &header.spends,
+        );
+        AppShardFrame {
+            header: Some(header),
+            requests: bundles.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A token, a hypergraph and a compute deploy and update, named.
+    fn configuration_ops() -> [(&'static str, Vec<u8>); 6] {
+        use quil_execution::compute_intrinsic::config::{ComputeDeploy, ComputeUpdate};
+        use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
+        use quil_execution::hypergraph_intrinsic::types::{
+            HypergraphConfiguration, HypergraphDeploy, HypergraphUpdate,
+        };
+        use quil_execution::token_intrinsic::{TokenDeploy, TokenUpdate};
+        let schema = b"schema".to_vec();
+        let signature = vec![0x66; 74];
+        let hypergraph = HypergraphConfiguration {
+            read_public_key: vec![0x11; 1158],
+            write_public_key: vec![0x22; 897],
+            owner_public_key: vec![0x33; 897],
+        };
+        [
+            (
+                "token deploy",
+                TokenDeploy {
+                    config: Vec::new(),
+                    rdf_schema: schema.clone(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+            (
+                "token update",
+                TokenUpdate {
+                    config: Vec::new(),
+                    rdf_schema: schema.clone(),
+                    public_key_signature_bls48581: signature.clone(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+            (
+                "hypergraph deploy",
+                HypergraphDeploy {
+                    config: Some(hypergraph.clone()),
+                    rdf_schema: schema.clone(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+            (
+                "hypergraph update",
+                HypergraphUpdate {
+                    config: Some(hypergraph),
+                    rdf_schema: Vec::new(),
+                    // One Falcon signature's length: the aggregate's decoder
+                    // refuses a length no Falcon signature list has.
+                    public_key_signature_bls48581: Some(AggregateSignature {
+                        signature: vec![0x66; quil_crypto::FALCON_SIGNATURE_LEN],
+                        public_key: None,
+                        bitmask: Vec::new(),
+                    }),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+            (
+                "compute deploy",
+                ComputeDeploy {
+                    config: Vec::new(),
+                    rdf_schema: schema.clone(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+            (
+                "compute update",
+                ComputeUpdate {
+                    config: Vec::new(),
+                    rdf_schema: schema,
+                    public_key_signature_bls48581: signature,
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// A free CodeExecute of the shard's own application: no deploy or
+    /// update.
+    fn replay_free_execute() -> Vec<u8> {
+        quil_execution::compute_intrinsic::CodeExecute {
+            proof_of_payment: vec![vec![0u8; 57]],
+            domain: [1; 32],
+            rendezvous: [0x44; 32],
+            execute_operations: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Past the config replay frame a voter refuses a proposal anchored
+    /// before it that carries a token, hypergraph or compute deploy or
+    /// update, each of them, and votes for one anchored at it.
+    #[test]
+    fn a_stale_anchor_replays_no_deploy_or_update_of_any_kind() {
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        let voter = ReplayVoter::new();
+        for (name, op) in configuration_ops() {
+            let bundle = replay_bundle(op);
+            assert!(
+                !voter.votes_for(&replay_frame(7, 99, std::slice::from_ref(&bundle))),
+                "a stale anchor replayed a {name}"
+            );
+            assert!(
+                voter.votes_for(&replay_frame(7, 100, &[bundle])),
+                "voter refused a {name} anchored at the replay frame"
+            );
+        }
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
+    }
+
+    /// A voter reads every bundle of a stale-anchored proposal: a deploy or
+    /// update in any one of them refuses it.
+    #[test]
+    fn a_configuration_op_in_any_bundle_of_a_stale_frame_is_refused() {
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        let voter = ReplayVoter::new();
+        let execute = replay_bundle(replay_free_execute());
+        let [_, _, _, (_, update), ..] = configuration_ops();
+        let update = replay_bundle(update);
+        assert!(
+            voter.votes_for(&replay_frame(
+                7,
+                99,
+                &[execute.clone(), execute.clone(), execute.clone()]
+            )),
+            "voter refused a stale-anchored frame whose bundles carry no deploy or update"
+        );
+        assert!(
+            !voter.votes_for(&replay_frame(
+                7,
+                99,
+                &[execute.clone(), update.clone(), execute.clone()]
+            )),
+            "a deploy or update in a stale frame's middle bundle was replayed"
+        );
+        assert!(
+            !voter.votes_for(&replay_frame(7, 99, &[execute.clone(), execute, update])),
+            "a deploy or update in a stale frame's last bundle was replayed"
+        );
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
+    }
+
+    /// Without a GLOBAL anchor a voter judges a proposal by its own number,
+    /// as execution does: past the replay frame it refuses an unanchored
+    /// one numbered before it that carries an update, and votes for one
+    /// carrying none or numbered at the replay frame.
+    #[test]
+    fn an_unanchored_proposal_is_judged_by_its_own_number_for_config_replay() {
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        // From the required-anchor epoch an unanchored proposal is refused
+        // before this check.
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(u64::MAX));
+        let voter = ReplayVoter::new();
+        let [_, (_, update), ..] = configuration_ops();
+        let update = replay_bundle(update);
+        let execute = replay_bundle(replay_free_execute());
+        assert!(
+            !voter.votes_for(&replay_frame(99, 0, std::slice::from_ref(&update))),
+            "an unanchored frame numbered before the replay frame replayed a configuration update"
+        );
+        assert!(
+            voter.votes_for(&replay_frame(99, 0, &[execute])),
+            "voter refused an unanchored frame without a deploy or update"
+        );
+        assert!(
+            voter.votes_for(&replay_frame(100, 0, &[update])),
+            "voter refused an unanchored frame numbered at the replay frame"
+        );
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
     }
 
     /// A voter whose latest GLOBAL frame is in the required-anchor epoch
