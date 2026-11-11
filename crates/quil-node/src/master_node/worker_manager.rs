@@ -1074,12 +1074,19 @@ pub(crate) fn init(
                         let key = key.clone();
                         Box::pin(async move {
                             let endpoint = pool.next().await?;
-                            let mut client = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &key)
+                            // The connection this process shares with the
+                            // archive, not one per frame.
+                            let mut client = quil_rpc::ArchiveClient::shared(&endpoint, &key)
                                 .await
                                 .ok()?;
                             client
                                 .get_app_shard_frame(filter, frame_number)
                                 .await
+                                .inspect_err(|error| {
+                                    if error.is_connection_failure() {
+                                        client.discard();
+                                    }
+                                })
                                 .ok()
                                 .flatten()
                         })

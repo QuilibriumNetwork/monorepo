@@ -1526,7 +1526,7 @@ pub(crate) async fn start(
         // each second used to open a new connection to every endpoint it
         // asked.
         type GapEndpoint = peer_info_file::GapEndpoint;
-        let clients: Arc<peer_info_file::GapClients> = Default::default();
+        let clients = Arc::new(peer_info_file::gap_clients());
         detached_spawner.detach("archive-shard-gap-fetch", async move {
             use futures::StreamExt;
             // Fetches at once, across shards. Four, each of one frame asked for
@@ -1606,23 +1606,17 @@ pub(crate) async fn start(
                         let len = members.len();
                         members.rotate_left(turn.wrapping_add(frame_number as usize) % len);
                     }
-                    // A failed or timed-out endpoint's connection is dropped
-                    // and opened again on its next request. A member's dial
-                    // must reach the peer whose record named the endpoint.
+                    // An endpoint's connection is dropped when its transport
+                    // failed, and opened again (once, however many fetches
+                    // ask) on its next request; one that only did not answer
+                    // in time is kept. A member's dial must reach the peer
+                    // whose record named the endpoint.
                     let fetch_from = |addr: String, peer: Option<quil_p2p::PeerId>, number: u64| {
                         let filter = filter.clone();
                         let clients = clients.clone();
                         async move {
                             let endpoint: GapEndpoint = (addr, peer);
-                            let fetch = async {
-                                let mut client = peer_info_file::gap_fetch_client(&clients, &endpoint, key).await?;
-                                client.get_app_shard_frame(filter, number).await.map_err(|e| e.to_string())
-                            };
-                            let fetched = tokio::time::timeout(PER_ENDPOINT, fetch).await;
-                            if !matches!(fetched, Ok(Ok(_))) {
-                                clients.lock().remove(&endpoint);
-                            }
-                            fetched
+                            peer_info_file::gap_fetch(&clients, &endpoint, key, filter, number, PER_ENDPOINT).await
                         }
                     };
                     let first = pool.next().await;
