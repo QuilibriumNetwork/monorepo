@@ -1155,6 +1155,37 @@ impl BlsAppFrameValidator {
         crate::fees::fee_vote_bounded_at(latest).then_some(latest)
     }
 
+    /// This node's latest GLOBAL frame, when it has reached the config
+    /// replay frame ([`quil_execution::config_replay`]) while `frame`
+    /// executes before it and carries a token, hypergraph or compute deploy
+    /// or update. Execution judges a shard frame by its GLOBAL anchor (by
+    /// its own number without one, as `materialize_app_shard_requests`
+    /// passes it), which its leader picks: such a frame would apply an
+    /// update signed before the replay frame again, or a replaced deploy. A
+    /// voter refuses it, so no leader replays one by citing an older anchor.
+    /// `None` otherwise, and without a clock.
+    pub fn config_replay_stale_now(&self, frame: &AppShardFrame) -> Option<u64> {
+        use quil_execution::config_replay::{carries_configuration_op, config_replay_guarded_at};
+        let header = frame.header.as_ref()?;
+        let judged = match header.global_frame_number {
+            0 => header.frame_number,
+            anchor => anchor,
+        };
+        if config_replay_guarded_at(judged) {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        if !config_replay_guarded_at(latest) {
+            return None;
+        }
+        frame
+            .requests
+            .iter()
+            .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
+            .any(|bytes| carries_configuration_op(&bytes))
+            .then_some(latest)
+    }
+
     /// The GLOBAL frame `frame` is anchored to, when this node's clock does
     /// not hold it, with the latest GLOBAL frame it does hold (`None`: none
     /// or no clock). `None` when the anchor is held or the frame has none.
@@ -2655,6 +2686,93 @@ mod tests {
         );
         assert!(!archive_global_body_authenticated(&GlobalFrame::default()));
         quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+    }
+
+    /// Without a GLOBAL anchor execution judges a shard frame by its own
+    /// number, and so does a voter's config replay check: past the replay
+    /// frame it refuses an unanchored frame numbered before it that carries
+    /// an owner's update, and not one numbered at it.
+    #[test]
+    fn an_unanchored_frame_is_judged_by_its_own_number_for_config_replay() {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::global::FrameHeader;
+        use quil_types::store::ClockStore as _;
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .put_global_clock_frame(
+                &GlobalFrame {
+                    header: Some(GlobalFrameHeader {
+                        frame_number: 100,
+                        output: vec![100; 516],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let validator = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls),
+            Arc::new(StubFrameProver),
+        )
+        .with_clock_store(clock);
+        let update = quil_execution::token_intrinsic::TokenUpdate {
+            config: quil_execution::token_intrinsic::TokenConfiguration {
+                behavior: 1,
+                units: vec![1],
+                name: b"zero".to_vec(),
+                symbol: b"RPL".to_vec(),
+                owner_public_key: quil_crypto::FalconSigner::generate().public_key().to_vec(),
+                ..Default::default()
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+            rdf_schema: Vec::new(),
+            public_key_signature_bls48581: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let canonical = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: u32::from_be_bytes(update[..4].try_into().unwrap()),
+                inner_bytes: update,
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let bundle = crate::consensus_wire::decode_app_message_bundle(&canonical).unwrap();
+        assert_eq!(
+            crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).unwrap(),
+            canonical,
+            "harness: the update did not survive the frame encoding"
+        );
+        let frame = |frame_number: u64| AppShardFrame {
+            header: Some(FrameHeader {
+                address: vec![1; 32],
+                frame_number,
+                ..Default::default()
+            }),
+            requests: vec![bundle.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            validator.config_replay_stale_now(&frame(99)),
+            Some(100),
+            "an unanchored frame numbered before the replay frame replayed a configuration update"
+        );
+        assert_eq!(
+            validator.config_replay_stale_now(&frame(100)),
+            None,
+            "voter refused an unanchored frame numbered at the replay frame"
+        );
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
     }
 
     // ---- test stubs ----
