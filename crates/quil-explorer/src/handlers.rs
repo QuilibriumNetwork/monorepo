@@ -708,9 +708,59 @@ fn convert_prover_info(info: &ProverInfo, filter: Option<&[u8]>) -> RestProverIn
     }
 }
 
+/// The status the explorer reports for an allocation. A kick stores the
+/// same allocation status byte as a join rejection (4, decoded as
+/// `Rejected`; nothing writes the `Kicked` byte), so a `Rejected`
+/// allocation whose kick frame is its latest lifecycle frame is reported
+/// as `Kicked`, a tie included. A later join, confirm, reject, leave,
+/// pause or resume frame means the allocation moved on after the kick (a
+/// rejoin), and its stored status stands. `last_active_frame_number`
+/// records activity, not a transition, and is not compared.
+fn allocation_status(alloc: &ProverAllocationInfo) -> ProverStatus {
+    if alloc.status != ProverStatus::Rejected || alloc.kick_frame_number == 0 {
+        return alloc.status;
+    }
+    let latest_other = [
+        alloc.join_frame_number,
+        alloc.join_confirm_frame_number,
+        alloc.join_reject_frame_number,
+        alloc.leave_frame_number,
+        alloc.leave_confirm_frame_number,
+        alloc.leave_reject_frame_number,
+        alloc.pause_frame_number,
+        alloc.resume_frame_number,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    if alloc.kick_frame_number >= latest_other {
+        ProverStatus::Kicked
+    } else {
+        alloc.status
+    }
+}
+
+/// `provers` with at least one allocation on `filter` whose reported
+/// status ([`allocation_status`]) is `status`, sorted by address: the
+/// registry's `get_provers_by_status`, which reads the stored status and
+/// so never finds a kicked allocation.
+fn provers_with_status(
+    mut provers: Vec<ProverInfo>,
+    filter: &[u8],
+    status: ProverStatus,
+) -> Vec<ProverInfo> {
+    provers.retain(|p| {
+        p.allocations
+            .iter()
+            .any(|a| a.confirmation_filter == filter && allocation_status(a) == status)
+    });
+    provers.sort_by(|a, b| a.address.cmp(&b.address));
+    provers
+}
+
 fn convert_allocation(alloc: &ProverAllocationInfo) -> RestProverAllocation {
     RestProverAllocation {
-        status: prover_status_to_string(alloc.status),
+        status: prover_status_to_string(allocation_status(alloc)),
         confirmation_filter: encode_hex_or_empty(&alloc.confirmation_filter),
         rejection_filter: encode_hex_or_empty(&alloc.rejection_filter),
         join_frame_number: alloc.join_frame_number,
@@ -836,9 +886,10 @@ pub async fn handle_provers(
         }
         let result = if !status_param.is_empty() {
             match parse_prover_status(status_param) {
-                Some(StatusParam::Known(status)) => {
-                    state.prover_registry.get_provers_by_status(&filter, status)
-                }
+                Some(StatusParam::Known(status)) => state
+                    .prover_registry
+                    .get_provers(&filter)
+                    .map(|provers| provers_with_status(provers, &filter, status)),
                 Some(StatusParam::NumericEmpty) => Ok(Vec::new()),
                 None => return error(StatusCode::BAD_REQUEST, "invalid status"),
             }
@@ -1737,20 +1788,39 @@ pub async fn handle_kicked(method: Method, State(state): State<ExplorerState>) -
     let Some((_, provers)) = all_provers(&state, frame) else {
         return provers_unavailable();
     };
+    json_ok(&kicked_entries(&provers), None)
+}
+
+/// The provers kicked as a whole or with at least one kicked allocation
+/// ([`allocation_status`]), most recently kicked first. A prover vertex
+/// kicked as a whole is dropped by the registry, so in practice the
+/// entries come from kicked allocations; `status` is the prover's own and
+/// `kick_frame_number` the latest of its kick and its allocations' kicks.
+fn kicked_entries(provers: &[ProverInfo]) -> Vec<KickedEntry> {
     let mut entries: Vec<KickedEntry> = provers
         .iter()
-        .filter(|p| p.status == ProverStatus::Kicked)
-        .map(|p| KickedEntry {
-            address: hex::encode(&p.address),
-            public_key: hex::encode(&p.public_key),
-            status: prover_status_to_string(p.status),
-            kick_frame_number: p.kick_frame_number,
-            seniority: p.seniority,
+        .filter_map(|p| {
+            let allocation_kick = p
+                .allocations
+                .iter()
+                .filter(|a| allocation_status(a) == ProverStatus::Kicked)
+                .map(|a| a.kick_frame_number)
+                .max();
+            if p.status != ProverStatus::Kicked && allocation_kick.is_none() {
+                return None;
+            }
+            Some(KickedEntry {
+                address: hex::encode(&p.address),
+                public_key: hex::encode(&p.public_key),
+                status: prover_status_to_string(p.status),
+                kick_frame_number: p.kick_frame_number.max(allocation_kick.unwrap_or(0)),
+                seniority: p.seniority,
+            })
         })
         .collect();
     // Most-recently kicked first.
     entries.sort_by(|a, b| b.kick_frame_number.cmp(&a.kick_frame_number));
-    json_ok(&entries, None)
+    entries
 }
 
 #[derive(Serialize)]
@@ -4114,5 +4184,159 @@ mod tests {
         // its frame and leaves it in place, so the next request builds again.
         assert_eq!(read(11, None), Some((10, 7)));
         assert_eq!(read(11, Some(8)), Some((11, 8)));
+    }
+
+    /// An allocation on `filter` with the stored `status` and no frames
+    /// but those the caller sets.
+    fn alloc_with(status: ProverStatus, filter: u8) -> ProverAllocationInfo {
+        let mut a = active_alloc(vec![filter], 0);
+        a.status = status;
+        a
+    }
+
+    /// Issue 1347: a kick stores the join-rejection byte, so the registry
+    /// decodes it as `Rejected`; the explorer reports it as `kicked`.
+    #[test]
+    fn convert_allocation_reports_a_kick_as_kicked() {
+        // The issue's record: a confirmed join, then a kick.
+        let mut confirmed = alloc_with(ProverStatus::Rejected, 0xAA);
+        confirmed.join_frame_number = 952_561;
+        confirmed.join_confirm_frame_number = 953_312;
+        confirmed.last_active_frame_number = 954_098;
+        confirmed.kick_frame_number = 954_729;
+        assert_eq!(
+            convert_allocation(&confirmed).status,
+            "kicked",
+            "a kick after a confirmed join reads kicked"
+        );
+        // A join rejected earlier, then a kick.
+        let mut rejected_first = alloc_with(ProverStatus::Rejected, 0xAA);
+        rejected_first.join_frame_number = 100;
+        rejected_first.join_reject_frame_number = 200;
+        rejected_first.kick_frame_number = 300;
+        assert_eq!(
+            convert_allocation(&rejected_first).status,
+            "kicked",
+            "a kick after a join rejection reads kicked"
+        );
+    }
+
+    #[test]
+    fn convert_allocation_keeps_a_join_rejection_rejected() {
+        let mut a = alloc_with(ProverStatus::Rejected, 0xAA);
+        a.join_frame_number = 100;
+        a.join_reject_frame_number = 150;
+        assert_eq!(
+            convert_allocation(&a).status,
+            "rejected",
+            "a join rejection with no kick reads rejected"
+        );
+    }
+
+    /// A rejoin after a kick reports the rejoin's own status: the kick
+    /// frame is no longer the latest lifecycle frame.
+    #[test]
+    fn convert_allocation_reports_a_rejoin_after_a_kick_by_its_status() {
+        let mut rejected_rejoin = alloc_with(ProverStatus::Rejected, 0xAA);
+        rejected_rejoin.kick_frame_number = 300;
+        rejected_rejoin.join_frame_number = 400;
+        rejected_rejoin.join_reject_frame_number = 450;
+        assert_eq!(
+            convert_allocation(&rejected_rejoin).status,
+            "rejected",
+            "a join rejected after the kick reads rejected"
+        );
+        let mut active_rejoin = alloc_with(ProverStatus::Active, 0xAA);
+        active_rejoin.kick_frame_number = 300;
+        active_rejoin.join_frame_number = 400;
+        active_rejoin.join_confirm_frame_number = 500;
+        assert_eq!(convert_allocation(&active_rejoin).status, "active");
+        let mut joining_rejoin = alloc_with(ProverStatus::Joining, 0xAA);
+        joining_rejoin.kick_frame_number = 300;
+        joining_rejoin.join_frame_number = 400;
+        assert_eq!(convert_allocation(&joining_rejoin).status, "joining");
+    }
+
+    /// `/provers?status=` filters by the reported allocation status on
+    /// the filter: kicked and rejected apart, other filters ignored.
+    #[test]
+    fn provers_with_status_finds_kicked_allocations() {
+        let prover = |address: u8, alloc: ProverAllocationInfo| {
+            let mut p = prover_on(address, 0, 0);
+            p.allocations = vec![alloc];
+            p
+        };
+        let mut kicked = alloc_with(ProverStatus::Rejected, 0xAA);
+        kicked.join_frame_number = 10;
+        kicked.kick_frame_number = 20;
+        let mut join_rejected = alloc_with(ProverStatus::Rejected, 0xAA);
+        join_rejected.join_frame_number = 10;
+        join_rejected.join_reject_frame_number = 20;
+        let mut kicked_elsewhere = kicked.clone();
+        kicked_elsewhere.confirmation_filter = vec![0xBB];
+        let mut rejoin_rejected = join_rejected.clone();
+        rejoin_rejected.kick_frame_number = 5;
+        let provers = vec![
+            prover(0xD0, rejoin_rejected),
+            prover(0xC0, kicked_elsewhere),
+            prover(0xB0, join_rejected),
+            prover(0xA0, kicked),
+        ];
+        let addresses = |filter: u8, status| {
+            provers_with_status(provers.clone(), &[filter], status)
+                .into_iter()
+                .map(|p| p.address[0])
+                .collect::<Vec<u8>>()
+        };
+        assert_eq!(
+            addresses(0xAA, ProverStatus::Kicked),
+            [0xA0],
+            "the kicked allocation on the filter lists its prover"
+        );
+        assert_eq!(
+            addresses(0xAA, ProverStatus::Rejected),
+            [0xB0, 0xD0],
+            "join rejections list their provers, the kicked one not"
+        );
+        assert_eq!(addresses(0xBB, ProverStatus::Kicked), [0xC0]);
+        assert!(addresses(0xAA, ProverStatus::Active).is_empty());
+    }
+
+    /// `/provers/kicked` lists provers with a kicked allocation (the
+    /// registry drops a prover vertex kicked as a whole) beside any
+    /// prover the registry reports kicked, most recent kick first.
+    #[test]
+    fn kicked_entries_list_provers_with_kicked_allocations() {
+        let kicked_at = |frame: u64| {
+            let mut a = alloc_with(ProverStatus::Rejected, 0xAA);
+            a.join_frame_number = 10;
+            a.kick_frame_number = frame;
+            a
+        };
+        let mut serving = prover_on(0xA1, 0xBB, 0);
+        serving.allocations.push(kicked_at(900));
+        let mut evicted = prover_on(0xA2, 0xAA, 0);
+        evicted.allocations = vec![kicked_at(950)];
+        let mut join_rejected = prover_on(0xA3, 0xAA, 0);
+        join_rejected.allocations = vec![alloc_with(ProverStatus::Rejected, 0xAA)];
+        join_rejected.allocations[0].join_reject_frame_number = 20;
+        let mut whole = prover_on(0xA4, 0xAA, 0);
+        whole.status = ProverStatus::Kicked;
+        whole.kick_frame_number = 800;
+        whole.allocations.clear();
+        let entries: Vec<(String, String, u64)> =
+            kicked_entries(&[serving, evicted, join_rejected, whole])
+                .into_iter()
+                .map(|e| (e.address, e.status, e.kick_frame_number))
+                .collect();
+        assert_eq!(
+            entries,
+            [
+                ("a2".to_string(), "active".to_string(), 950),
+                ("a1".to_string(), "active".to_string(), 900),
+                ("a4".to_string(), "kicked".to_string(), 800),
+            ],
+            "a prover with a kicked allocation is listed"
+        );
     }
 }
