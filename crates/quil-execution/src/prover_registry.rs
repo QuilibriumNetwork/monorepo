@@ -269,6 +269,46 @@ impl InMemoryProverRegistry {
             .filter(|snapshot| snapshot.epoch == epoch)
     }
 
+    /// Cache `info` on its allocations' filters, as a refresh reading its
+    /// rows would, for tests outside this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_prover_for_tests(&mut self, info: ProverInfo) {
+        for alloc in &info.allocations {
+            let filter = alloc.confirmation_filter.clone();
+            let members = self.filter_cache.entry(filter).or_default();
+            if !members.contains(&info.address) {
+                members.push(info.address.clone());
+                members.sort();
+            }
+        }
+        self.prover_cache.insert(info.address.clone(), info);
+    }
+
+    /// Cache `member`'s storage seat slot on `filter`, for tests outside
+    /// this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_storage_seat_slot_for_tests(
+        &mut self,
+        member: &[u8],
+        filter: &[u8],
+        slot: quil_types::consensus::StorageSeatSlot,
+    ) {
+        let key = (member.to_vec(), filter.to_vec());
+        self.seat_cache.entry(key).or_default().push(slot);
+    }
+
+    /// Cache a storage snapshot GLOBAL recorded for `filter`, for tests
+    /// outside this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_storage_snapshot_for_tests(
+        &mut self,
+        filter: &[u8],
+        snapshot: quil_types::consensus::StorageSnapshotRoots,
+    ) {
+        let key = (filter.to_vec(), (snapshot.epoch % 4) as u8);
+        self.snapshot_cache.insert(key, snapshot);
+    }
+
     /// Total cached leaf-root epoch entries across all members (diagnostics).
     /// One registration contributes up to three entries; use
     /// `leaf_root_vertex_count` for the number of registration vertices.
@@ -2469,6 +2509,14 @@ impl SharedProverRegistry {
     {
         let guard = self.inner.read().expect("prover registry lock poisoned");
         f(&guard)
+    }
+
+    /// Edit the inner registry under a write lock, for tests outside this
+    /// crate that read a canonical registry over chosen rows.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn write_for_tests<R>(&self, f: impl FnOnce(&mut InMemoryProverRegistry) -> R) -> R {
+        let mut guard = self.inner.write().expect("prover registry lock poisoned");
+        f(&mut guard)
     }
 }
 
