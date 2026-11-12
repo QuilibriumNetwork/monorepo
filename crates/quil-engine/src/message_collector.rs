@@ -15,6 +15,8 @@ use crate::proposal_pool::Intake;
 use quil_execution::manager::ShieldClaim;
 
 mod cert_union;
+#[cfg(test)]
+mod seal_deadline_tests;
 pub(crate) use cert_union::order_copies_by_signers;
 pub use cert_union::{session_committees, Committee, CommitteeSource};
 
