@@ -3597,3 +3597,149 @@ mod shared_redial_tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod fetched_frame_bound_tests {
+    use super::*;
+    use quil_engine::frame_bound::MAX_APP_FRAME_ITEMS;
+    use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+    use quil_types::proto::global::{FrameHeader, MessageBundle, MessageRequest};
+
+    /// How a fetched frame refused before it is decoded reads.
+    const REFUSED: &str = "fetched frame refused";
+
+    /// Answers frame `n` of a filter with what its function builds.
+    struct Serves(fn(Vec<u8>, u64) -> AppShardFrame);
+
+    #[tonic::async_trait]
+    impl crate::stub_services::AppShardFrameProvider for Serves {
+        async fn get_app_shard_frame(
+            &self,
+            filter: Vec<u8>,
+            frame_number: u64,
+        ) -> Result<Option<AppShardFrame>, tonic::Status> {
+            Ok(Some((self.0)(filter, frame_number)))
+        }
+    }
+
+    /// Frame `frame_number` of `filter`: one bundle of `requests` empty
+    /// requests.
+    fn padded(filter: Vec<u8>, frame_number: u64, requests: usize) -> AppShardFrame {
+        AppShardFrame {
+            header: Some(FrameHeader {
+                address: filter,
+                frame_number,
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle {
+                requests: vec![MessageRequest::default(); requests],
+                timestamp: 0,
+            }],
+            storage_attestation: None,
+        }
+    }
+
+    /// Frame 2 carries four times the bundles and requests a frame may;
+    /// every other frame as many as it may.
+    fn at_or_past_bound(filter: Vec<u8>, frame_number: u64) -> AppShardFrame {
+        let requests = if frame_number == 2 {
+            4 * MAX_APP_FRAME_ITEMS
+        } else {
+            MAX_APP_FRAME_ITEMS - 1
+        };
+        padded(filter, frame_number, requests)
+    }
+
+    /// A stream endpoint serving the frames `frames` builds: the address
+    /// to dial.
+    async fn serve(frames: fn(Vec<u8>, u64) -> AppShardFrame) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                if streams_tx.send(Ok::<_, std::io::Error>(tcp)).is_err() {
+                    return;
+                }
+            }
+        });
+        let frames =
+            crate::stub_services::AppShardRpcServer::with_provider(Arc::new(Serves(frames)));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    AppShardServiceServer::new(frames).max_encoding_message_size(64 * 1024 * 1024),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                    streams,
+                )),
+        );
+        address
+    }
+
+    /// Bundles and requests `frame` carries.
+    fn items(frame: &AppShardFrame) -> usize {
+        let requests: usize = frame.requests.iter().map(|b| b.requests.len()).sum();
+        frame.requests.len() + requests
+    }
+
+    /// A frame fetched from a peer is refused before it is decoded when it
+    /// carries more bundles and requests than a frame may
+    /// ([`MAX_APP_FRAME_ITEMS`]), as a frame received over gossip is, with
+    /// its own error, which leaves the connection in use; a frame at the
+    /// bound is fetched, before and after on the same connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetched_frame_past_the_frame_bound_is_refused() {
+        let filter = vec![0x21; 32];
+        let endpoint = serve(at_or_past_bound).await;
+        let mut client = ArchiveClient::connect_plaintext(&endpoint).await.unwrap();
+        let frame = client
+            .get_app_shard_frame(filter.clone(), 1)
+            .await
+            .expect("a frame at the bound is fetched")
+            .expect("a frame at the bound is answered");
+        assert_eq!(items(&frame), MAX_APP_FRAME_ITEMS);
+
+        let fetched = client.get_app_shard_frame(filter.clone(), 2).await;
+        eprintln!("REACH fetched-frame-bound");
+        match fetched {
+            Ok(Some(frame)) => {
+                let requests: usize = frame.requests.iter().map(|b| b.requests.len()).sum();
+                let wire = prost::Message::encoded_len(&frame);
+                let heap = frame
+                    .requests
+                    .iter()
+                    .map(|b| b.requests.capacity())
+                    .sum::<usize>()
+                    * std::mem::size_of::<MessageRequest>();
+                panic!(
+                    "FRAME-BOUND: a fetched frame of {requests} requests ({wire} wire bytes) \
+                     was decoded into {heap} bytes of requests ({}x its size), past the \
+                     {MAX_APP_FRAME_ITEMS} bundles and requests a frame carries",
+                    heap / wire
+                );
+            }
+            Ok(None) => panic!(
+                "FRAME-BOUND-NONE: a frame past the bound was taken as no frame, not refused"
+            ),
+            Err(error) => {
+                assert!(
+                    error.to_string().starts_with(REFUSED),
+                    "FRAME-BOUND-CAUSE: the fetch failed for another cause: {error}"
+                );
+                assert!(
+                    !error.is_connection_failure(),
+                    "FRAME-BOUND-DISCARD: the refusal reads as a connection failure, \
+                     which discards the connection: {error}"
+                );
+            }
+        }
+
+        let frame = client
+            .get_app_shard_frame(filter, 3)
+            .await
+            .expect("FRAME-BOUND-AFTER: the connection serves the next fetch")
+            .expect("a frame at the bound is answered");
+        assert_eq!(items(&frame), MAX_APP_FRAME_ITEMS);
+    }
+}
