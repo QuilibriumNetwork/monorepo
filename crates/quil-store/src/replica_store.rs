@@ -110,6 +110,21 @@ const WHOLE_REPLICA_FILE_BYTES: u64 = 128 << 20;
 /// ([`compact_evicted`]): an epoch evicts once per store, and its compaction
 /// reads about one epoch of a store's replicas.
 const EVICTED_COMPACTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+/// An eviction compacts its range once the bytes it can free reach this
+/// share of the chunks the range keeps ([`evicted_compaction`]), 1/4: a
+/// compaction writes every kept chunk again, so it writes about 4 bytes
+/// per byte it frees (compacting at every epoch: about 1/s, for a share s
+/// of the chunks changed per epoch, 25 at 4%), and the dead chunks it
+/// leaves take at most a quarter of the kept ones' space, plus one
+/// epoch's.
+const EVICTED_GARBAGE_SHARE: u64 = 4;
+/// Most epochs a store's evicted range goes uncompacted in this process
+/// ([`evicted_compaction`]): the exit for what its estimate cannot see,
+/// such as space a snapshot held at the last compaction, and a bound on
+/// the range deletions lookups there step over.
+const EVICTED_COMPACTION_EPOCHS: u64 = 8;
+/// Bytes of a whole chunk of nodes.
+const CHUNK_BYTES: u64 = CHUNK_NODES * NODE_BYTES as u64;
 /// What the cached leaf records ([`ReplicaStore::get_hash_leaf`]) may hold:
 /// a 1 GiB replica's cap is about 2 MiB.
 const LEAF_CACHE_BYTES: usize = 128 << 20;
@@ -446,14 +461,115 @@ fn reclaim(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], what: &'static str) {
 /// store's replicas.
 static RECLAIMING: Mutex<()> = Mutex::new(());
 
+/// Whether an eviction compacts its range now ([`compact_evicted`]).
+#[derive(Debug, PartialEq, Eq)]
+struct EvictedCompaction {
+    /// Why it compacts, or `None` to leave the range as it is.
+    reason: Option<&'static str>,
+    /// Bytes the range holds past the chunks it keeps and the last
+    /// compaction's residual: what a compaction would free, at most.
+    garbage: u64,
+    /// The fewest such bytes it compacts for.
+    compact_at: u64,
+    /// The epoch below which it compacts whatever it can free.
+    by_epoch: u64,
+}
+
+/// [`EvictedCompaction`] for a range of `range` bytes in table files, of
+/// which the chunks live leaves read take `kept`, below `keep_from`, after
+/// `last`. It compacts once the bytes it can free reach
+/// 1/[`EVICTED_GARBAGE_SHARE`] of `kept`, or [`EVICTED_COMPACTION_EPOCHS`]
+/// epochs after `last` (after this eviction, without one): space comes
+/// back within that many epochs, or sooner as dead chunks pile up.
+fn evicted_compaction(
+    range: u64,
+    kept: u64,
+    last: Option<LastCompaction>,
+    keep_from: u64,
+) -> EvictedCompaction {
+    let since = last.map_or(keep_from, |last| last.below);
+    let garbage = range
+        .saturating_sub(kept)
+        .saturating_sub(last.map_or(0, |last| last.residual));
+    let compact_at = (kept / EVICTED_GARBAGE_SHARE).max(1);
+    let by_epoch = since.saturating_add(EVICTED_COMPACTION_EPOCHS);
+    let reason = if garbage >= compact_at {
+        Some("garbage")
+    } else if keep_from >= by_epoch {
+        Some("epochs")
+    } else {
+        None
+    };
+    EvictedCompaction {
+        reason,
+        garbage,
+        compact_at,
+        by_epoch,
+    }
+}
+
+/// What the table files overlapping a range `[lo, hi)` hold within it,
+/// about: `range` the bytes of those files, counted whole, `span` of the
+/// files overlapping `[lo, end)`, `past` of those overlapping `[hi, end)`,
+/// and `above` the live bytes there. A file holding keys on both sides of
+/// `hi`, as each new epoch's do (its chunks, and the [`RUNS_WITNESS`] keys
+/// it writes under earlier epochs), counts without what lies past `hi`:
+/// what is live there less what the files wholly past `hi` hold.
+fn bytes_within(range: u64, span: u64, past: u64, above: u64) -> u64 {
+    let both = (range + past).saturating_sub(span);
+    let past_only = span.saturating_sub(range);
+    range.saturating_sub(above.saturating_sub(past_only).min(both))
+}
+
+/// Bytes of the chunks below `keep_from` that `runs` read, each counted
+/// once (runs of several records may overlap), a leaf's last chunk as a
+/// whole one: what an eviction below `keep_from` keeps.
+fn kept_chunk_bytes(runs: &std::collections::BTreeSet<ChunkRun>, keep_from: u64) -> u64 {
+    let mut bytes = 0;
+    // The leaf whose runs are being summed, and the chunk they reach.
+    let mut reached: Option<(u64, &[u8], u64)> = None;
+    for (epoch, id, first, end) in runs.iter().filter(|run| run.0 < keep_from) {
+        // A runs witness holds no chunk.
+        let end = (*end).min(u64::from(RUNS_WITNESS));
+        let from = match reached {
+            Some((e, i, until)) if e == *epoch && i == id.as_slice() => (*first).max(until),
+            _ => *first,
+        };
+        if end > from {
+            bytes += (end - from) * CHUNK_BYTES;
+            reached = Some((*epoch, id.as_slice(), end));
+        }
+    }
+    bytes
+}
+
+/// Record `last` as the store's [`LastCompaction`].
+fn note_evicted_compaction(db: &Arc<dyn KvDb>, last: LastCompaction) {
+    let mut compactions = evicted_compactions();
+    compactions.retain(|_, (open, _)| open.strong_count() > 0);
+    let id = Arc::as_ptr(db) as *const () as usize;
+    compactions.insert(id, (Arc::downgrade(db), last));
+}
+
 /// Compact the evicted chunks `[lo, hi)` of the replicas below `keep_from`
-/// in `store`, logging its start and end, and a warning once it runs past
+/// in `store`, when [`evicted_compaction`] says to, `kept` the bytes of the
+/// chunks there that live leaves read, `above` those of the live chunks
+/// from `keep_from` on; else log why not. It logs its start
+/// and end, and a warning once it runs past
 /// [`EVICTED_COMPACTION_BUDGET`]. The lines give the bytes of the table
-/// files overlapping the range (`range_mb`: files bordering it count whole)
+/// files overlapping the range (`range_mb`, about: [`bytes_within`])
 /// and of the whole store (which the next epoch's encoding may be filling
 /// meanwhile): a range still as large after its compaction is held by a
 /// snapshot or iterator older than the eviction.
-fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, store: &str) {
+fn compact_evicted(
+    db: &Arc<dyn KvDb>,
+    lo: &[u8],
+    hi: &[u8],
+    keep_from: u64,
+    kept: u64,
+    above: u64,
+    store: &str,
+) {
     let _one = RECLAIMING.lock().unwrap_or_else(PoisonError::into_inner);
     let failed = |error: &QuilError, ms: u64| {
         tracing::warn!(store, below_epoch = keep_from, ms, %error, scope = "this node",
@@ -462,9 +578,16 @@ fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, sto
             "compacting evicted storage replicas failed: their disk space stays taken until \
              RocksDB compacts there")
     };
+    // The keys of the range's kind past it: the newest epochs' chunks.
+    let end = meta_key(HASH_NODES + 1, 0, &[]);
     let measure = || -> Result<(u64, u64)> {
         Ok((
-            db.live_file_bytes(Some((lo, hi)))?,
+            bytes_within(
+                db.live_file_bytes(Some((lo, hi)))?,
+                db.live_file_bytes(Some((lo, &end)))?,
+                db.live_file_bytes(Some((hi, &end)))?,
+                above,
+            ),
             db.live_file_bytes(None)?,
         ))
     };
@@ -473,12 +596,46 @@ fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, sto
         Ok(bytes) => bytes,
         Err(error) => return failed(&error, 0),
     };
+    let id = Arc::as_ptr(db) as *const () as usize;
+    let last = evicted_compactions()
+        .get(&id)
+        .filter(|(open, _)| open.strong_count() > 0)
+        .map(|&(_, last)| last);
+    let decided = evicted_compaction(in_range, kept, last, keep_from);
+    let Some(reason) = decided.reason else {
+        if last.is_none() {
+            note_evicted_compaction(
+                db,
+                LastCompaction {
+                    below: keep_from,
+                    residual: 0,
+                },
+            );
+        }
+        tracing::info!(
+            store,
+            below_epoch = keep_from,
+            range_mb = in_range >> 20,
+            kept_mb = kept >> 20,
+            garbage_mb = decided.garbage >> 20,
+            compact_at_mb = decided.compact_at >> 20,
+            compact_by_epoch = decided.by_epoch,
+            reason = "little to free",
+            "evicted storage replicas left uncompacted: a compaction would write their kept \
+             chunks again for little space; it runs once garbage_mb reaches compact_at_mb, or \
+             at the eviction below compact_by_epoch"
+        );
+        return;
+    };
     tracing::info!(
         store,
         below_epoch = keep_from,
         range_mb = in_range >> 20,
+        kept_mb = kept >> 20,
+        garbage_mb = decided.garbage >> 20,
         store_mb = before >> 20,
         budget_s = EVICTED_COMPACTION_BUDGET.as_secs(),
+        reason,
         "compacting evicted storage replicas: their disk space returns when it ends"
     );
     let started = std::time::Instant::now();
@@ -512,11 +669,20 @@ fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, sto
         Ok(bytes) => bytes,
         Err(error) => return failed(&error, ms),
     };
+    let residual = in_range_after.saturating_sub(kept);
+    note_evicted_compaction(
+        db,
+        LastCompaction {
+            below: keep_from,
+            residual,
+        },
+    );
     tracing::info!(
         store,
         below_epoch = keep_from,
         range_mb_before = in_range >> 20,
         range_mb_after = in_range_after >> 20,
+        residual_mb = residual >> 20,
         store_mb_before = before >> 20,
         store_mb_after = after >> 20,
         ms,
@@ -850,6 +1016,32 @@ type EvictedBelow = HashMap<usize, (std::sync::Weak<dyn KvDb>, u64)>;
 fn evicted_below() -> std::sync::MutexGuard<'static, EvictedBelow> {
     static EVICTED: OnceLock<Mutex<EvictedBelow>> = OnceLock::new();
     EVICTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The last compaction of a store's evicted range in this process
+/// ([`compact_evicted`]), or, before one, its first eviction left
+/// uncompacted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LastCompaction {
+    /// The epoch it was below.
+    below: u64,
+    /// Bytes its range held past the chunks it kept once compacted: what
+    /// [`bytes_within`] counts of files bordering the range, and what a
+    /// snapshot held.
+    /// Later estimates leave them out.
+    residual: u64,
+}
+
+type EvictedCompactions = HashMap<usize, (std::sync::Weak<dyn KvDb>, LastCompaction)>;
+
+/// [`LastCompaction`] of each open store, by store, held weakly as
+/// [`LeafCache`] holds its stores.
+fn evicted_compactions() -> std::sync::MutexGuard<'static, EvictedCompactions> {
+    static COMPACTIONS: OnceLock<Mutex<EvictedCompactions>> = OnceLock::new();
+    COMPACTIONS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1786,6 +1978,7 @@ impl ReplicaStore {
     fn evict(&self, keep_from: u64, store: &str) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         let pinned = self.referenced_chunks(keep_from)?;
+        let kept = kept_chunk_bytes(&pinned, keep_from);
         let mut lo = Vec::with_capacity(9);
         lo.push(STORAGE_REPLICA);
         lo.extend_from_slice(&0u64.to_be_bytes());
@@ -1824,17 +2017,74 @@ impl ReplicaStore {
             })
             .collect();
         protected.sort();
+        // A gap between the kept runs is deleted only while it holds a
+        // chunk, and from that chunk on: an earlier eviction deleted the
+        // rest, and deleting it again at every epoch laid range deletions
+        // over the whole kept range, which automatic compaction then
+        // rewrote to drop. Each gap is probed for its first key alone: an
+        // iterator over the whole range read every kept chunk.
+        let delete_gap = |from: &[u8], to: &[u8]| -> Result<()> {
+            if from >= to {
+                return Ok(());
+            }
+            if let Some(first) = self.db.first_key_in(from, to)? {
+                self.db.delete_range(&first, to)?;
+            }
+            Ok(())
+        };
         for (lo, hi) in protected {
             if at < lo {
-                self.db.delete_range(&at, &lo)?;
+                delete_gap(&at, &lo)?;
             }
             at = at.max(hi);
         }
-        if at < until {
-            self.db.delete_range(&at, &until)?;
-        }
-        self.compact_evicted_in_background(keep_from, store);
+        delete_gap(&at, &until)?;
+        let above = self.own_chunk_bytes(keep_from)?;
+        self.compact_evicted_in_background(keep_from, kept, above, store);
         Ok(())
+    }
+
+    /// Bytes of the chunks the leaf records of epochs `from` on hold under
+    /// their own epoch: what the chunk keys from `from` on take, live.
+    fn own_chunk_bytes(&self, from: u64) -> Result<u64> {
+        let mut bytes = 0;
+        for kind in [HASH_LEAF, LEAF_RUNS] {
+            let mut iter = self
+                .db
+                .new_iter(&meta_key(kind, from, &[]), &meta_key(kind + 1, 0, &[]))?;
+            let mut ok = iter.first();
+            while ok {
+                let key = iter.key();
+                // Legacy records hold no chunks; aliases and runs read
+                // earlier epochs' too.
+                if let (Some(epoch), Ok(leaf)) = (
+                    key.get(3..11)
+                        .map(|epoch| u64::from_be_bytes(epoch.try_into().expect("8 bytes"))),
+                    HashLeaf::layout(iter.value()),
+                ) {
+                    let chunks = leaf.chunks();
+                    let own = if leaf.sources.is_empty() {
+                        chunks
+                    } else {
+                        let ends = leaf
+                            .sources
+                            .iter()
+                            .skip(1)
+                            .map(|&(next, _)| u64::from(next));
+                        leaf.sources
+                            .iter()
+                            .zip(ends.chain(std::iter::once(chunks)))
+                            .filter(|((_, source), _)| *source == epoch)
+                            .map(|(&(first, _), end)| end.saturating_sub(u64::from(first)))
+                            .sum()
+                    };
+                    bytes += own * leaf.chunk_nodes * NODE_BYTES as u64;
+                }
+                ok = iter.next();
+            }
+            iter.close()?;
+        }
+        Ok(bytes)
     }
 
     /// Compact the evicted epochs' chunks ([`HASH_NODES`] keys below
@@ -1842,8 +2092,12 @@ impl ReplicaStore {
     /// range deletion only hides them: until a compaction through the
     /// bottommost level reaches them they keep their space, an epoch of a
     /// store's replicas, for as long as automatic compaction leaves those
-    /// files alone (days on a regular node).
-    fn compact_evicted_in_background(&self, keep_from: u64, store: &str) {
+    /// files alone (days on a regular node). Yet the range also holds the
+    /// chunks live leaves still read (`kept` bytes), most of it once
+    /// leaves are written in changed chunks, and a compaction writes them
+    /// all again: so only once there is enough to free
+    /// ([`evicted_compaction`]).
+    fn compact_evicted_in_background(&self, keep_from: u64, kept: u64, above: u64, store: &str) {
         let lo = meta_key(HASH_NODES, 0, &[]);
         let hi = meta_key(HASH_NODES, keep_from, &[]);
         match self
@@ -1865,7 +2119,7 @@ impl ReplicaStore {
             .name("replica-reclaim".into())
             .spawn(move || {
                 let _running = running;
-                compact_evicted(&db, &lo, &hi, keep_from, &name);
+                compact_evicted(&db, &lo, &hi, keep_from, kept, above, &name);
                 // The store may close here: before the thread is counted out.
                 drop(db);
             });
@@ -2477,6 +2731,540 @@ mod tests {
             "the kept epoch's chunks stay"
         );
         assert!(s.db.get(&chunk_key(4, b"leaf", 0)).unwrap().is_none());
+    }
+
+    /// What a [`CountingCompactions`] counts.
+    #[derive(Default)]
+    struct Counts {
+        /// Compactions of evicted chunks ([`compact_evicted`]).
+        evicted: AtomicU64,
+        /// Range deletions of chunks.
+        chunk_ranges: AtomicU64,
+        /// Where each range deletion of chunks starts.
+        chunk_range_starts: Mutex<Vec<Vec<u8>>>,
+        /// The bounds of each iterator opened.
+        iterated: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    /// A store on disk counting the compactions of evicted chunks it ran,
+    /// and its range deletions of chunks.
+    struct CountingCompactions {
+        inner: Arc<crate::RocksDb>,
+        counts: Arc<Counts>,
+    }
+
+    impl KvDb for CountingCompactions {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn get_with(&self, key: &[u8], read: &mut dyn FnMut(&[u8])) -> Result<bool> {
+            self.inner.get_with(key, read)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            self.inner.new_batch(indexed)
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.counts
+                .iterated
+                .lock()
+                .unwrap()
+                .push((lower.to_vec(), upper.to_vec()));
+            self.inner.new_iter(lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            self.inner.compact(start, end, parallelize)
+        }
+        fn compact_reclaiming(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            min_file_bytes: u64,
+        ) -> Result<bool> {
+            let ran = self.inner.compact_reclaiming(start, end, min_file_bytes)?;
+            if ran && start == meta_key(HASH_NODES, 0, &[]).as_slice() {
+                self.counts.evicted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(ran)
+        }
+        fn holds_file_of(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
+            self.inner.holds_file_of(start, end, min_file_bytes)
+        }
+        fn live_file_bytes(&self, range: Option<(&[u8], &[u8])>) -> Result<u64> {
+            self.inner.live_file_bytes(range)
+        }
+        fn compact_all(&self) -> Result<()> {
+            self.inner.compact_all()
+        }
+        fn sync_wal(&self) -> Result<()> {
+            self.inner.sync_wal()
+        }
+        fn close(&self) -> Result<()> {
+            self.inner.close()
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            if start.starts_with(&[STORAGE_REPLICA, META, HASH_NODES]) {
+                self.counts.chunk_ranges.fetch_add(1, Ordering::SeqCst);
+                self.counts
+                    .chunk_range_starts
+                    .lock()
+                    .unwrap()
+                    .push(start.to_vec());
+            }
+            self.inner.delete_range(start, end)
+        }
+    }
+
+    /// A replica store over a [`CountingCompactions`] over `inner`, the
+    /// store under it, and its counts.
+    fn counting_over(
+        inner: Arc<crate::RocksDb>,
+    ) -> (ReplicaStore, Arc<crate::RocksDb>, Arc<Counts>) {
+        let counts = Arc::new(Counts::default());
+        let db = CountingCompactions {
+            inner: inner.clone(),
+            counts: counts.clone(),
+        };
+        (ReplicaStore::new(Arc::new(db)), inner, counts)
+    }
+
+    /// [`counting_over`] a store in `dir`.
+    fn counting(dir: &std::path::Path) -> (ReplicaStore, Arc<crate::RocksDb>, Arc<Counts>) {
+        counting_over(Arc::new(crate::RocksDb::open(dir).unwrap()))
+    }
+
+    /// Store `nodes` as the leaf at `epoch`, for the next epoch to read
+    /// its unchanged chunks from, and write its table file.
+    fn put_epoch(s: &ReplicaStore, db: &crate::RocksDb, epoch: u64, nodes: &[u8], cap: &[u8]) {
+        s.put_hash(epoch, b"leaf", nodes, cap, &[epoch as u8; 96])
+            .unwrap();
+        s.note_snapshot(epoch, b"leaf", &[epoch as u8; 32]).unwrap();
+        db.inner().flush().unwrap();
+    }
+
+    /// Evict below `keep_from` and wait for what it starts: how many
+    /// compactions of evicted chunks have run since the store opened.
+    fn evict_counted(s: &ReplicaStore, keep_from: u64, counts: &Counts) -> u64 {
+        s.evict_below_epoch(keep_from).unwrap();
+        assert_eq!(
+            wait_for_background_work(std::time::Duration::from_secs(120)),
+            0
+        );
+        counts.evicted.load(Ordering::SeqCst)
+    }
+
+    /// An eviction whose range is nearly all chunks a live leaf still
+    /// reads leaves it uncompacted: compacting it at every epoch wrote
+    /// them all again for little space, about 1/s bytes per byte freed
+    /// when a share s of the chunks changes per epoch (25 at 4%).
+    #[test]
+    fn an_eviction_with_little_to_free_leaves_its_range_uncompacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(64 * c, 41);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        // One chunk of 64 changed: 63 kept, one dead.
+        let (e4, cap4) = changed(&e3, &[5 * c + 3]);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        let compactions = evict_counted(&s, 4, &counts);
+        assert_eq!(
+            compactions, 0,
+            "EVICT-SKIP: an eviction freeing one chunk of 64 compacted its range, writing the \
+             63 kept chunks again"
+        );
+        let read = s.get_hash(4, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// An eviction freeing at least a quarter of what its range keeps
+    /// compacts it, and the dead chunks' space returns.
+    #[test]
+    fn an_eviction_freeing_a_quarter_of_its_kept_chunks_compacts_its_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let chunk = (CHUNK_NODES as usize * NODE_BYTES) as u64;
+        let (e3, cap3) = hash_leaf(64 * c, 43);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        // 24 chunks of 64 changed: 40 kept, 24 dead.
+        let nodes: Vec<usize> = (0..24).map(|k| k * c + 7).collect();
+        let (e4, cap4) = changed(&e3, &nodes);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        let before = table_bytes(&db);
+        let compactions = evict_counted(&s, 4, &counts);
+        assert_eq!(
+            compactions, 1,
+            "EVICT-COMPACT: an eviction freeing 24 chunks of 64 ran {compactions} compactions \
+             of its range"
+        );
+        let after = table_bytes(&db);
+        assert!(
+            after + 16 * chunk < before,
+            "EVICT-COMPACT: the 24 dead chunks still take space: {before} bytes before, \
+             {after} after"
+        );
+        let read = s.get_hash(4, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// A range with too little to free at each eviction is still compacted
+    /// at the eighth eviction after its last compaction, or after its
+    /// first eviction: dead chunks never pile up longer, and only then are
+    /// the kept ones written again.
+    #[test]
+    fn a_range_with_little_to_free_is_compacted_within_eight_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (mut nodes, cap) = hash_leaf(64 * c, 47);
+        put_epoch(&s, &db, 3, &nodes, &cap);
+        let (mut compactions, mut uncompacted) = (0, 0);
+        for epoch in 4..24u64 {
+            // One chunk changed at each epoch: one dead at each eviction.
+            let (next, cap) = changed(&nodes, &[(epoch as usize % 64) * c + 1]);
+            put_epoch(&s, &db, epoch, &next, &cap);
+            nodes = next;
+            let count = evict_counted(&s, epoch, &counts);
+            if count > compactions {
+                uncompacted = 0;
+            } else {
+                uncompacted += 1;
+            }
+            compactions = count;
+            assert!(
+                uncompacted <= 8,
+                "EVICT-BOUND: {uncompacted} evictions in a row, through epoch {epoch}, left \
+                 the range uncompacted"
+            );
+        }
+        assert!(
+            compactions <= 3,
+            "EVICT-EPOCHS: {compactions} of 20 evictions each freeing one chunk of 64 \
+             compacted the range, writing the kept chunks again each time"
+        );
+        let read = s.get_hash(23, b"leaf").unwrap().unwrap();
+        assert!(
+            read.replica[..] == nodes[..],
+            "the live leaf reads as written"
+        );
+    }
+
+    /// An eviction freeing less than a quarter of what its range keeps
+    /// leaves it uncompacted, though the new epoch's table file, holding
+    /// keys on both sides of the range's end, overlaps it: the file counts
+    /// without its chunks past the end.
+    #[test]
+    fn an_eviction_freeing_under_a_quarter_of_its_kept_chunks_leaves_its_range_uncompacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(64 * c, 53);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        // 10 chunks of 64 changed: 54 kept, 10 dead, under 54/4.
+        let nodes: Vec<usize> = (0..10).map(|k| k * 6 * c + 2).collect();
+        let (e4, cap4) = changed(&e3, &nodes);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        let compactions = evict_counted(&s, 4, &counts);
+        assert_eq!(
+            compactions, 0,
+            "EVICT-UNDER: an eviction freeing 10 chunks of 64 compacted its range, writing the \
+             54 kept chunks again"
+        );
+        let read = s.get_hash(4, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// The keys under [`HASH_NODES`] below `keep_from` in `s`, chunks and
+    /// [`RUNS_WITNESS`] keys.
+    fn chunk_key_list(s: &ReplicaStore, keep_from: u64) -> Vec<Vec<u8>> {
+        let mut iter =
+            s.db.new_iter(
+                &meta_key(HASH_NODES, 0, &[]),
+                &meta_key(HASH_NODES, keep_from, &[]),
+            )
+            .unwrap();
+        let mut keys = Vec::new();
+        let mut ok = iter.first();
+        while ok {
+            keys.push(iter.key().to_vec());
+            ok = iter.next();
+        }
+        iter.close().unwrap();
+        keys
+    }
+
+    /// The chunk keys below `keep_from` in `s`, [`RUNS_WITNESS`] keys left
+    /// out.
+    fn chunk_keys_below(s: &ReplicaStore, keep_from: u64) -> usize {
+        chunk_key_list(s, keep_from)
+            .iter()
+            .filter(|key| !key.ends_with(&RUNS_WITNESS.to_be_bytes()))
+            .count()
+    }
+
+    /// Evictions at each epoch delete every chunk no live leaf reads, a
+    /// leaf no later epoch wrote again included, and keep every one the
+    /// live leaf reads.
+    #[test]
+    fn evictions_delete_every_dead_chunk_and_keep_every_read_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (mut nodes, cap) = hash_leaf(16 * c, 57);
+        put_epoch(&s, &db, 3, &nodes, &cap);
+        let (gone, gone_cap) = hash_leaf(4 * c, 59);
+        s.put_hash(5, b"gone", &gone, &gone_cap, &[5; 96]).unwrap();
+        for epoch in 4..12u64 {
+            // Two chunks changed at each epoch.
+            let e = epoch as usize;
+            let (next, cap) = changed(&nodes, &[(e * 3 % 16) * c + 1, (e * 5 + 1) % 16 * c + 1]);
+            put_epoch(&s, &db, epoch, &next, &cap);
+            nodes = next;
+            evict_counted(&s, epoch, &counts);
+        }
+        let keys = chunk_keys_below(&s, 11);
+        assert_eq!(
+            keys, 14,
+            "EVICT-DEAD: {keys} chunk keys below epoch 11, of which the live leaf reads 14"
+        );
+        let read = s.get_hash(11, b"leaf").unwrap().unwrap();
+        assert!(
+            read.replica[..] == nodes[..],
+            "the live leaf reads as written"
+        );
+    }
+
+    /// An eviction with no chunk newly dead lays no range deletion over
+    /// the chunks: deleting the gaps between kept chunks again at every
+    /// epoch spread range deletions over the whole kept range, which
+    /// automatic compaction rewrote to drop.
+    #[test]
+    fn an_eviction_deletes_no_chunk_range_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(16 * c, 61);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        let (e4, cap4) = changed(&e3, &[2 * c + 1, 9 * c + 1]);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        evict_counted(&s, 4, &counts);
+        // Epoch 5 changes nothing: it reads epoch 3's and 4's chunks.
+        put_epoch(&s, &db, 5, &e4, &cap4);
+        let before = counts.chunk_ranges.load(Ordering::SeqCst);
+        evict_counted(&s, 5, &counts);
+        let again = counts.chunk_ranges.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            again, 0,
+            "EVICT-AGAIN: an eviction with no chunk newly dead laid {again} range deletions \
+             over the kept chunks"
+        );
+        assert_eq!(
+            chunk_keys_below(&s, 5),
+            16,
+            "every chunk epoch 5 reads is kept"
+        );
+        let read = s.get_hash(5, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// An eviction deletes a gap between kept chunks from its first chunk
+    /// on, not from the gap's start: what lies before that chunk an
+    /// earlier eviction deleted, and deleting it again lays one more range
+    /// deletion over it.
+    #[test]
+    fn an_eviction_deletes_a_gap_from_its_first_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(16 * c, 63);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        // Epoch 3's chunk 9 dies at epoch 4's eviction, its chunk 10 at
+        // epoch 5's: a gap from chunk 9 to 11 then holds chunk 10 alone.
+        let (e4, cap4) = changed(&e3, &[9 * c + 1]);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        evict_counted(&s, 4, &counts);
+        let (e5, cap5) = changed(&e4, &[10 * c + 1]);
+        put_epoch(&s, &db, 5, &e5, &cap5);
+        let held = chunk_key_list(&s, 5);
+        counts.chunk_range_starts.lock().unwrap().clear();
+        evict_counted(&s, 5, &counts);
+        let starts = std::mem::take(&mut *counts.chunk_range_starts.lock().unwrap());
+        assert!(
+            s.db.get(&chunk_key(3, b"leaf", 10)).unwrap().is_none(),
+            "epoch 3's chunk 10, which no live leaf reads, is deleted"
+        );
+        let elsewhere = starts.iter().filter(|&start| !held.contains(start)).count();
+        assert_eq!(
+            elsewhere,
+            0,
+            "EVICT-FROM: {elsewhere} of the eviction's {} range deletions of chunks start \
+             at no chunk it found",
+            starts.len()
+        );
+        let read = s.get_hash(5, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e5[..], "the live leaf reads as written");
+    }
+
+    /// An eviction finds the chunks to delete without reading the ones it
+    /// keeps: an iterator over the whole evicted range copied every kept
+    /// chunk into memory, under the lock every replica write waits on.
+    #[test]
+    fn an_eviction_reads_no_kept_chunk_to_find_the_dead_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, db, counts) = counting(dir.path());
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(16 * c, 67);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        let (e4, cap4) = changed(&e3, &[2 * c + 1, 9 * c + 1]);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        counts.iterated.lock().unwrap().clear();
+        evict_counted(&s, 4, &counts);
+        let iterated = std::mem::take(&mut *counts.iterated.lock().unwrap());
+        assert_eq!(
+            chunk_keys_below(&s, 4),
+            14,
+            "the eviction keeps the 14 chunks of epoch 3 the live leaf reads"
+        );
+        let kept = chunk_key_list(&s, 4);
+        let read = iterated
+            .iter()
+            .map(|(lower, upper)| {
+                kept.iter()
+                    .filter(|key| lower <= *key && *key < upper)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            read,
+            0,
+            "EVICT-LOAD: an iterator of the eviction spans {read} of the {} chunk keys it \
+             keeps",
+            kept.len()
+        );
+        let read = s.get_hash(4, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// Bytes RocksDB's compactions wrote, its own and the evictions', over
+    /// 24 epoch boundaries of a store in levels as a node's, its sizes
+    /// scaled down (1 MiB table files, 4 MiB level base, 32 MiB of
+    /// replicas): four leaves of 256 chunks, 10 of each changed at each
+    /// epoch, about 4%. Compacting the whole evicted range at every
+    /// boundary wrote every kept chunk again each time: at least the
+    /// replicas' size per boundary. Keeping the dead chunks instead makes
+    /// the table files grow by 4% of the replicas per boundary.
+    #[test]
+    fn epoch_boundaries_write_the_kept_chunks_again_rarely() {
+        use rocksdb::statistics::Ticker;
+        const LEAVES: usize = 4;
+        const CHUNKS: usize = 256;
+        const CHANGED: usize = 10;
+        const BOUNDARIES: u64 = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = crate::RocksDb::store_options(8 << 20);
+        opts.enable_statistics();
+        opts.set_write_buffer_size(1 << 20);
+        opts.set_target_file_size_base(1 << 20);
+        opts.set_max_bytes_for_level_base(4 << 20);
+        let (s, db, counts) = counting_over(Arc::new(
+            crate::RocksDb::open_with_options(dir.path(), &opts).unwrap(),
+        ));
+        // RocksDB's flushes and compactions done.
+        let settle = || {
+            let started = Instant::now();
+            let busy = |name: &str| db.inner().property_int_value(name).unwrap().unwrap_or(0) > 0;
+            while [
+                "rocksdb.num-running-compactions",
+                "rocksdb.num-running-flushes",
+                "rocksdb.compaction-pending",
+                "rocksdb.mem-table-flush-pending",
+            ]
+            .into_iter()
+            .any(busy)
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(600),
+                    "RocksDB's background work still pending after 600 s"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let c = CHUNK_NODES as usize;
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..LEAVES)
+            .map(|l| {
+                let (nodes, cap) = hash_leaf(CHUNKS * c, 70 + l as u32);
+                (format!("leaf{l}").into_bytes(), nodes, cap)
+            })
+            .collect();
+        for (id, nodes, cap) in &leaves {
+            s.put_hash(3, id, nodes, cap, &[3; 96]).unwrap();
+            s.note_snapshot(3, id, &[3; 32]).unwrap();
+        }
+        settle();
+        let compacted = || opts.get_ticker_count(Ticker::CompactWriteBytes);
+        let flushed = || opts.get_ticker_count(Ticker::FlushWriteBytes);
+        let (compacted_from, flushed_from) = (compacted(), flushed());
+        let mut per_boundary = Vec::new();
+        for epoch in 4..4 + BOUNDARIES {
+            let before = compacted();
+            for (l, (id, nodes, cap)) in leaves.iter_mut().enumerate() {
+                // The cap is left as it was: only the bytes tell which
+                // chunks changed, and nothing here reads the leaf back.
+                for k in 0..CHANGED {
+                    let chunk = (epoch as usize * 97 + l * 7 + k * 26) % CHUNKS;
+                    let at = (chunk * c + 1) * NODE_BYTES;
+                    let element = u32::from_le_bytes(nodes[at..at + 4].try_into().unwrap());
+                    nodes[at..at + 4].copy_from_slice(&((element + 1) % (1 << 30)).to_le_bytes());
+                }
+                s.put_hash(epoch, id, nodes, cap, &[epoch as u8; 96])
+                    .unwrap();
+                s.note_snapshot(epoch, id, &[epoch as u8; 32]).unwrap();
+            }
+            evict_counted(&s, epoch, &counts);
+            settle();
+            per_boundary.push((compacted() - before) >> 10);
+        }
+        let replicas = (LEAVES * CHUNKS * CHUNK_NODES as usize * NODE_BYTES) as u64;
+        let total = compacted() - compacted_from;
+        println!(
+            "EVICT-WRITES total boundaries={BOUNDARIES} replicas_mib={} flushed_mib={} \
+             compacted_mib={} compacted_replicas_per_boundary={:.2} eviction_compactions={} \
+             tables_mib={} per_boundary_kib={per_boundary:?}",
+            replicas >> 20,
+            (flushed() - flushed_from) >> 20,
+            total >> 20,
+            total as f64 / (BOUNDARIES * replicas) as f64,
+            counts.evicted.load(Ordering::SeqCst),
+            table_bytes(&db) >> 20,
+        );
+        assert!(
+            total < BOUNDARIES * replicas / 2,
+            "EVICT-WRITES: {BOUNDARIES} epoch boundaries compacted {} MiB, over half the {} MiB \
+             of replicas at each",
+            total >> 20,
+            replicas >> 20
+        );
+        // Dead chunks up to a quarter of the kept ones, one epoch's more,
+        // and the files' own overhead: an eighth of the replicas.
+        let tables = table_bytes(&db);
+        assert!(
+            tables < replicas * 5 / 4 + replicas / 8,
+            "EVICT-SPACE: after {BOUNDARIES} epoch boundaries the table files take {} MiB for \
+             {} MiB of replicas",
+            tables >> 20,
+            replicas >> 20
+        );
     }
 
     #[test]
