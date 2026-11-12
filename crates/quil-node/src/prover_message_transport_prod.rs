@@ -962,7 +962,8 @@ fn transient(error: &ArchiveClientError) -> bool {
         ArchiveClientError::Transport(_) | ArchiveClientError::TlsInit(_) => true,
         ArchiveClientError::InvalidEndpoint(_)
         | ArchiveClientError::MissingField(_)
-        | ArchiveClientError::Tls(_) => false,
+        | ArchiveClientError::Tls(_)
+        | ArchiveClientError::FrameRefused(_) => false,
     }
 }
 

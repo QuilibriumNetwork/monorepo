@@ -53,7 +53,39 @@ pub enum ArchiveClientError {
     Tls(#[from] QuilTlsError),
     #[error("tls init error: {0}")]
     TlsInit(String),
+    /// A peer's answer to [`ArchiveClient::get_app_shard_frame`] was
+    /// refused before its frame was decoded: past
+    /// [`MAX_FETCHED_FRAME_BYTES`], or carrying more than a frame may
+    /// ([`quil_engine::frame_bound`]). Not a connection failure
+    /// ([`Self::is_connection_failure`]): the connection still works. A
+    /// caller may still stop using a peer that sent one; the prover-tree
+    /// syncer closes its connection to that archive.
+    #[error("fetched frame refused: {0}")]
+    FrameRefused(String),
 }
+
+/// Bytes a peer's answer to [`ArchiveClient::get_app_shard_frame`] may
+/// take: twice the gossip message ceiling
+/// ([`quil_p2p::protocol::MAX_MESSAGE_SIZE`], 16 MiB). Shard consensus
+/// proposes a frame over gossip and its leader publishes the whole frame
+/// there, so a committed frame took at most the ceiling in one of its two
+/// encodings; the margin covers the other. A frame at the item and
+/// opening bounds with the longest storage paths takes less than the
+/// ceiling (`the_largest_honest_frame_is_fetched`).
+pub const MAX_FETCHED_FRAME_BYTES: usize = 2 * quil_p2p::protocol::MAX_MESSAGE_SIZE;
+
+/// The answer to `GetAppShardFrame` with its frame left encoded, so that
+/// the frame is counted ([`quil_engine::frame_bound::check_frame`]) before
+/// it is decoded; the unread proof is skipped. A frame sent in pieces is
+/// taken from its last piece, which is what is counted.
+#[derive(Clone, PartialEq, prost::Message)]
+struct EncodedFrameAnswer {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    frame: Option<Vec<u8>>,
+}
+
+/// How tonic refuses an answer past the decoding limit, before reading it.
+const PAST_DECODING_LIMIT: &str = "Error, decoded message length too large";
 
 /// The endpoint answered with this node's own identity: the mainnet archive
 /// address list names every archive, this one included.
@@ -150,6 +182,9 @@ pub struct ArchiveClient {
     // registered on the peer server); used by the state-jump to fetch attested
     // app-shard frames for onboarding root cross-checks.
     app_shard: AppShardServiceClient<Channel>,
+    /// The same channel for `GetAppShardFrame`, whose answers are taken up
+    /// to [`MAX_FETCHED_FRAME_BYTES`] and counted before they are decoded.
+    frames: tonic::client::Grpc<Channel>,
     endpoint: String,
     /// Counts the connection as open until its last clone drops (PQNoise
     /// dials; [`ENDPOINT_CONNECTIONS_WARN`]).
@@ -850,6 +885,8 @@ impl ArchiveClient {
             inner: GlobalServiceClient::new(channel.clone())
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
+            frames: tonic::client::Grpc::new(channel.clone())
+                .max_decoding_message_size(MAX_FETCHED_FRAME_BYTES),
             app_shard: AppShardServiceClient::new(channel)
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
@@ -1118,6 +1155,8 @@ impl ArchiveClient {
             inner: GlobalServiceClient::new(channel.clone())
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
+            frames: tonic::client::Grpc::new(channel.clone())
+                .max_decoding_message_size(MAX_FETCHED_FRAME_BYTES),
             app_shard: AppShardServiceClient::new(channel)
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
@@ -1744,20 +1783,62 @@ impl ArchiveClient {
     /// The returned `FrameHeader.state_roots[0]` is the app's aggregate
     /// vertex-adds root — the state-jump onboarding path cross-checks the
     /// locally-synced app tree against it. `None` if the peer has no frame.
+    /// An answer past [`MAX_FETCHED_FRAME_BYTES`], or a frame carrying more
+    /// than a frame may ([`quil_engine::frame_bound`]), is refused before it
+    /// is decoded ([`ArchiveClientError::FrameRefused`]): a few bytes per
+    /// request decode to hundreds.
     pub async fn get_app_shard_frame(
         &mut self,
         filter: Vec<u8>,
         frame_number: u64,
     ) -> Result<Option<AppShardFrame>, ArchiveClientError> {
-        let resp = self
-            .app_shard
-            .get_app_shard_frame(GetAppShardFrameRequest {
-                filter,
-                frame_number,
-            })
-            .await?
-            .into_inner();
-        Ok(resp.frame)
+        const SERVICE: &str = "quilibrium.node.global.pb.AppShardService";
+        let mut frames = self.frames.clone();
+        frames
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {e}")))?;
+        let mut request = tonic::Request::new(GetAppShardFrameRequest {
+            filter,
+            frame_number,
+        });
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new(SERVICE, "GetAppShardFrame"));
+        let path = http::uri::PathAndQuery::from_static(
+            "/quilibrium.node.global.pb.AppShardService/GetAppShardFrame",
+        );
+        let codec =
+            tonic::codec::ProstCodec::<GetAppShardFrameRequest, EncodedFrameAnswer>::default();
+        let answer = match frames.unary(request, path, codec).await {
+            Ok(answer) => answer.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::OutOfRange
+                    && status.message().starts_with(PAST_DECODING_LIMIT) =>
+            {
+                return Err(ArchiveClientError::FrameRefused(format!(
+                    "the answer is past the {MAX_FETCHED_FRAME_BYTES} bytes a frame's \
+                     answer may take ({})",
+                    status.message()
+                )));
+            }
+            Err(status) => return Err(status.into()),
+        };
+        let Some(frame) = answer.frame else {
+            return Ok(None);
+        };
+        if let Err(refusal) = quil_engine::frame_bound::check_frame(&frame) {
+            // Logged as a refused gossiped frame is, at most every few
+            // minutes.
+            quil_engine::frame_bound::admit_frame("frame fetch", None, &frame);
+            return Err(ArchiveClientError::FrameRefused(format!(
+                "a frame of {} bytes: {refusal}",
+                frame.len()
+            )));
+        }
+        let frame = <AppShardFrame as prost::Message>::decode(frame.as_slice())
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        Ok(Some(frame))
     }
 
     /// One page of `filter`'s recorded outgoing records from `from_frame`:
@@ -3601,9 +3682,11 @@ mod shared_redial_tests {
 #[cfg(test)]
 mod fetched_frame_bound_tests {
     use super::*;
-    use quil_engine::frame_bound::MAX_APP_FRAME_ITEMS;
+    use quil_engine::frame_bound::{MAX_APP_FRAME_ITEMS, MAX_APP_FRAME_OPENINGS};
     use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
-    use quil_types::proto::global::{FrameHeader, MessageBundle, MessageRequest};
+    use quil_types::proto::global::{
+        FrameHeader, MessageBundle, MessageRequest, StorageAttestation, StorageOpening,
+    };
 
     /// How a fetched frame refused before it is decoded reads.
     const REFUSED: &str = "fetched frame refused";
@@ -3741,5 +3824,181 @@ mod fetched_frame_bound_tests {
             .expect("FRAME-BOUND-AFTER: the connection serves the next fetch")
             .expect("a frame at the bound is answered");
         assert_eq!(items(&frame), MAX_APP_FRAME_ITEMS);
+    }
+
+    /// Storage path nodes of an opening of the largest replica a seat
+    /// registers: 2^30 nodes (`MAX_NODES`, quil-crypto `storage_proof`).
+    fn longest_path() -> usize {
+        quil_crypto::storage_proof::tree_depth(1 << 30)
+    }
+
+    /// The largest frame a committee carries as far as the bounds and field
+    /// widths fix it: a full header, [`MAX_APP_FRAME_ITEMS`] bundles and
+    /// requests, and [`MAX_APP_FRAME_OPENINGS`] storage openings with the
+    /// longest paths, plus `padding` bytes in its first request.
+    fn largest_frame_padded(filter: Vec<u8>, frame_number: u64, padding: usize) -> AppShardFrame {
+        use quil_crypto::storage_proof::{NODE_BYTES, REGISTRATION_ROOT_BYTES};
+        use quil_types::proto::global::message_request::Request;
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let opening = StorageOpening {
+            shard_id: vec![0x5a; 64],
+            epoch: u64::MAX,
+            member_id: vec![0x5b; 32],
+            query: u32::MAX,
+            leaf_root: vec![0x5c; REGISTRATION_ROOT_BYTES],
+            num_blocks: 1 << 30,
+            path_commits: vec![vec![0x5d; NODE_BYTES]; longest_path()],
+            path_proofs: Vec::new(),
+            commitment: Vec::new(),
+            value: vec![0x5e; NODE_BYTES],
+            proof: Vec::new(),
+        };
+        let mut requests = vec![MessageRequest::default(); MAX_APP_FRAME_ITEMS - 1];
+        requests[0].request = Some(Request::CommitteeHandoff(vec![0x5f; padding]));
+        AppShardFrame {
+            header: Some(FrameHeader {
+                address: filter,
+                frame_number,
+                rank: u64::MAX,
+                timestamp: i64::MAX,
+                difficulty: u32::MAX,
+                output: vec![1; 516],
+                parent_selector: vec![2; 32],
+                requests_root: vec![3; 74],
+                state_roots: vec![vec![4; 74]; 4],
+                prover: vec![5; 32],
+                fee_multiplier_vote: u64::MAX,
+                public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                    signature: vec![6; 74],
+                    public_key: Some(Bls48581g2PublicKey {
+                        key_value: vec![7; 585],
+                    }),
+                    bitmask: vec![8; 512],
+                }),
+                storage_attestation_root: vec![9; 32],
+                global_frame_number: u64::MAX,
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle {
+                requests,
+                timestamp: i64::MAX,
+            }],
+            storage_attestation: Some(StorageAttestation {
+                openings: vec![opening; MAX_APP_FRAME_OPENINGS],
+            }),
+        }
+    }
+
+    /// [`largest_frame_padded`] padded to the gossip message ceiling
+    /// ([`quil_p2p::protocol::MAX_MESSAGE_SIZE`]): no committed frame is
+    /// longer in the encoding gossip carried it in.
+    fn largest_frame(filter: Vec<u8>, frame_number: u64) -> AppShardFrame {
+        let ceiling = quil_p2p::protocol::MAX_MESSAGE_SIZE;
+        let mut padding = 0;
+        for _ in 0..8 {
+            let frame = largest_frame_padded(filter.clone(), frame_number, padding);
+            let len = prost::Message::encoded_len(&frame);
+            if len == ceiling {
+                return frame;
+            }
+            padding = (padding + ceiling).checked_sub(len).unwrap();
+        }
+        panic!("no padding makes the largest frame {ceiling} bytes");
+    }
+
+    /// The largest frame a committee carries, at the bundle, request and
+    /// opening bounds and as long as gossip carries, is fetched whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_largest_honest_frame_is_fetched() {
+        let filter = vec![0x21; 32];
+        let fixed = prost::Message::encoded_len(&largest_frame_padded(filter.clone(), 1, 0));
+        eprintln!(
+            "MEASURE fetched-frame: at {MAX_APP_FRAME_ITEMS} bundles and requests and \
+             {MAX_APP_FRAME_OPENINGS} openings of {} path nodes a frame takes {fixed} bytes; \
+             padded to the gossip ceiling {} bytes; the answer may take {MAX_FETCHED_FRAME_BYTES}",
+            longest_path(),
+            quil_p2p::protocol::MAX_MESSAGE_SIZE
+        );
+        assert!(fixed < quil_p2p::protocol::MAX_MESSAGE_SIZE);
+
+        let endpoint = serve(largest_frame).await;
+        let mut client = ArchiveClient::connect_plaintext(&endpoint).await.unwrap();
+        let frame = match client.get_app_shard_frame(filter, 1).await {
+            Ok(Some(frame)) => frame,
+            other => panic!("FRAME-HONEST: the largest honest frame was not fetched: {other:?}"),
+        };
+        assert_eq!(
+            prost::Message::encoded_len(&frame),
+            quil_p2p::protocol::MAX_MESSAGE_SIZE
+        );
+        assert_eq!(items(&frame), MAX_APP_FRAME_ITEMS);
+        assert_eq!(
+            frame.storage_attestation.map(|a| a.openings.len()),
+            Some(MAX_APP_FRAME_OPENINGS)
+        );
+    }
+
+    /// Requests frame 2's padding is spread over: each holds an eighth of
+    /// [`MAX_FETCHED_FRAME_BYTES`], so the frame's decode takes about
+    /// 36 MiB, within the frame bound's 64 MiB
+    /// ([`quil_engine::frame_bound::MAX_APP_FRAME_DECODED`]).
+    const PADDED_REQUESTS: usize = 8;
+
+    /// Frame 2's answer is past [`MAX_FETCHED_FRAME_BYTES`] by its framing
+    /// but within the frame bound, so only the byte cap refuses it; every
+    /// other frame is one bundle of one request.
+    fn past_byte_cap(filter: Vec<u8>, frame_number: u64) -> AppShardFrame {
+        use quil_types::proto::global::message_request::Request;
+        if frame_number != 2 {
+            return padded(filter, frame_number, 1);
+        }
+        let mut frame = padded(filter, frame_number, PADDED_REQUESTS);
+        for request in &mut frame.requests[0].requests {
+            let padding = vec![0x5f; MAX_FETCHED_FRAME_BYTES / PADDED_REQUESTS];
+            request.request = Some(Request::CommitteeHandoff(padding));
+        }
+        frame
+    }
+
+    /// An answer past [`MAX_FETCHED_FRAME_BYTES`] whose frame is within
+    /// the frame bound is refused before it is read, with the frame
+    /// bound's error, which is not a connection failure: the next fetch
+    /// on the connection is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetched_answer_past_the_byte_cap_is_refused() {
+        let filter = vec![0x21; 32];
+        let past = prost::Message::encode_to_vec(&past_byte_cap(filter.clone(), 2));
+        assert!(past.len() > MAX_FETCHED_FRAME_BYTES);
+        assert!(
+            quil_engine::frame_bound::check_frame(&past).is_ok(),
+            "FRAME-BYTES-WINDOW: the frame bound refuses the answer too, so the byte cap \
+             goes untested"
+        );
+        drop(past);
+        let endpoint = serve(past_byte_cap).await;
+        let mut client = ArchiveClient::connect_plaintext(&endpoint).await.unwrap();
+        match client.get_app_shard_frame(filter.clone(), 2).await {
+            Ok(frame) => panic!(
+                "FRAME-BYTES: an answer past the {MAX_FETCHED_FRAME_BYTES} bytes was taken \
+                 ({} bytes)",
+                frame.map_or(0, |frame| prost::Message::encoded_len(&frame))
+            ),
+            Err(error) => {
+                assert!(
+                    error.to_string().starts_with(REFUSED),
+                    "FRAME-BYTES-CAUSE: the fetch failed for another cause: {error}"
+                );
+                assert!(
+                    !error.is_connection_failure(),
+                    "FRAME-BYTES-DISCARD: the refusal reads as a connection failure: {error}"
+                );
+            }
+        }
+        let frame = client
+            .get_app_shard_frame(filter, 3)
+            .await
+            .expect("FRAME-BYTES-AFTER: the connection serves the next fetch")
+            .expect("a frame is answered");
+        assert_eq!(items(&frame), 2);
     }
 }
