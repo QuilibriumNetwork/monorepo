@@ -804,6 +804,16 @@ impl GlobalParentExecutor {
         (number > published && finalized > published).then_some((published, finalized))
     }
 
+    /// The first shard header the proposal `frame` carries whose bodies this
+    /// archive does not hold, with what asking for them did
+    /// ([`GlobalLeaderProvider::unheld_shard_body`]).
+    pub(crate) fn unheld_shard_body(
+        &self,
+        frame: &quil_types::proto::global::GlobalFrame,
+    ) -> Option<crate::leader_provider::UnheldShardBody> {
+        self.leader.unheld_shard_body(frame)
+    }
+
     /// Whether finalization ingests application frames before executing a
     /// GLOBAL frame here ([`Self::sequence_with_ingest`]): a private execution
     /// of a finalized frame before its publication then differs from it.

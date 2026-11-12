@@ -2106,11 +2106,7 @@ fn vouched_shard_headers(
     frame_prover: &dyn quil_types::crypto::FrameProver,
     prover_registry: &quil_execution::SharedProverRegistry,
 ) -> VouchedHeaders {
-    use quil_execution::global_intrinsic::{
-        conversions, intrinsic::GlobalIntrinsic, prover_shard_update,
-    };
     use quil_types::proto::global::message_request::Request;
-    let bls = quil_crypto::FalconKeyConstructor;
     let mut vouched = VouchedHeaders {
         shards: Default::default(),
         unheld_anchors: Default::default(),
@@ -2123,40 +2119,93 @@ fn vouched_shard_headers(
         let Some(Request::Shard(header)) = request.request.as_ref() else {
             continue;
         };
-        let op = conversions::frame_header_from_proto(header);
-        match GlobalIntrinsic::check_anchor_and_output(Some(clock), frame_number, &op) {
-            Ok(()) => {}
-            Err(error) if error.is_execution_unavailable() => {
-                vouched.unheld_anchors.insert(op.global_frame_number);
-                continue;
-            }
-            Err(_) => continue,
-        }
-        let committee_frame = if op.global_frame_number > 0 {
-            op.global_frame_number
-        } else {
-            frame_number
-        };
-        if prover_shard_update::verify_frame_header_session(
-            state,
-            &op,
-            frame_prover,
-            &bls,
-            prover_registry,
-            committee_frame,
+        match vouch_shard_header(
+            header,
             frame_number,
-        )
-        .is_err()
-        {
-            continue;
+            clock,
+            state,
+            frame_prover,
+            prover_registry,
+        ) {
+            HeaderVouch::Vouched => {
+                vouched
+                    .shards
+                    .entry(header.address.clone())
+                    .or_default()
+                    .insert(header.frame_number, header.clone());
+            }
+            HeaderVouch::UnheldAnchor(anchor) => {
+                vouched.unheld_anchors.insert(anchor);
+            }
+            HeaderVouch::Unavailable(_) | HeaderVouch::Refused(_) => {}
         }
-        vouched
-            .shards
-            .entry(op.address.clone())
-            .or_default()
-            .insert(op.frame_number, header.clone());
     }
     vouched
+}
+
+/// What GLOBAL execution of frame `frame_number` makes of one shard header
+/// it carries ([`vouch_shard_header`]).
+#[derive(Debug)]
+enum HeaderVouch {
+    /// Its anchor and output check and its certificate verifies.
+    Vouched,
+    /// Its anchor, inside the frame's window, is missing from this node's
+    /// clock: not judged yet.
+    UnheldAnchor(u64),
+    /// Its certificate could not be checked yet (state or registry
+    /// unavailable): not judged yet.
+    Unavailable(String),
+    /// Execution refuses it.
+    Refused(String),
+}
+
+/// The check [`vouched_shard_headers`] applies to each header: what GLOBAL
+/// execution checks first ([`GlobalIntrinsic::check_anchor_and_output`]),
+/// then the certificate against the shard's session. A GLOBAL voter applies
+/// the same check before it asks for a header's bodies
+/// ([`shard_body_fetch`]), so a header execution would vouch for is always
+/// fetched.
+///
+/// [`GlobalIntrinsic::check_anchor_and_output`]: quil_execution::global_intrinsic::intrinsic::GlobalIntrinsic::check_anchor_and_output
+fn vouch_shard_header(
+    header: &quil_types::proto::global::FrameHeader,
+    frame_number: u64,
+    clock: &dyn quil_types::store::ClockStore,
+    state: &quil_execution::hypergraph_state::HypergraphState,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+    prover_registry: &quil_execution::SharedProverRegistry,
+) -> HeaderVouch {
+    use quil_execution::global_intrinsic::{
+        conversions, intrinsic::GlobalIntrinsic, prover_shard_update,
+    };
+    let op = conversions::frame_header_from_proto(header);
+    match GlobalIntrinsic::check_anchor_and_output(Some(clock), frame_number, &op) {
+        Ok(()) => {}
+        Err(error) if error.is_execution_unavailable() => {
+            return HeaderVouch::UnheldAnchor(op.global_frame_number);
+        }
+        Err(error) => return HeaderVouch::Refused(error.to_string()),
+    }
+    let committee_frame = if op.global_frame_number > 0 {
+        op.global_frame_number
+    } else {
+        frame_number
+    };
+    match prover_shard_update::verify_frame_header_session(
+        state,
+        &op,
+        frame_prover,
+        &quil_crypto::FalconKeyConstructor,
+        prover_registry,
+        committee_frame,
+        frame_number,
+    ) {
+        Ok(_) => HeaderVouch::Vouched,
+        Err(error) if error.is_execution_unavailable() => {
+            HeaderVouch::Unavailable(error.to_string())
+        }
+        Err(error) => HeaderVouch::Refused(error.to_string()),
+    }
 }
 
 /// Which shard headers a GLOBAL proposal may carry: those whose application
@@ -2173,20 +2222,45 @@ fn vouched_shard_headers(
 ///
 /// On a test network (`network` other than 0), while the file
 /// `QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE` names exists, no shard header is
-/// reported held: a devnet holds shard inclusion back with it, to check that
-/// shards whose headers were held back past the frame buffer recover.
+/// reported held for this archive's proposals: a devnet holds shard
+/// inclusion back with it, to check that shards whose headers were held back
+/// past the frame buffer recover ([`body_availability_holding`]). While the
+/// file `QUIL_DEVNET_HOLD_VOTE_BODIES_FILE` names exists, this archive's
+/// voter finds no shard body held, to check how GLOBAL fares when voters lack
+/// the bodies a proposal's headers need.
 fn shard_body_availability(
     cell: AppIngestCell,
     network: u8,
+) -> quil_engine::leader_provider::ShardBodyAvailability {
+    let devnet_file = |name: &str| {
+        (network != 0)
+            .then(|| std::env::var_os(name))
+            .flatten()
+            .map(std::path::PathBuf::from)
+    };
+    body_availability_holding(
+        cell,
+        devnet_file("QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE"),
+        devnet_file("QUIL_DEVNET_HOLD_VOTE_BODIES_FILE"),
+    )
+}
+
+/// [`shard_body_availability`], holding shard headers back from this
+/// archive's proposals while `hold_file` exists, and answering this archive's
+/// voter that it holds no shard body while `vote_hold_file` exists. Each
+/// file acts on its side only: a voter's check ignores `hold_file`, since
+/// an archive holding headers back from its proposals declined every
+/// proposal carrying one, and a devnet holding on some archives stalled
+/// GLOBAL.
+fn body_availability_holding(
+    cell: AppIngestCell,
+    hold_file: Option<std::path::PathBuf>,
+    vote_hold_file: Option<std::path::PathBuf>,
 ) -> quil_engine::leader_provider::ShardBodyAvailability {
     use quil_engine::archive_ingest::HeldBodies;
     use quil_engine::leader_provider::ShardBodyNeed;
     use std::sync::TryLockError;
     let held: std::sync::OnceLock<HeldBodies> = std::sync::OnceLock::new();
-    let hold_file = (network != 0)
-        .then(|| std::env::var_os("QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE"))
-        .flatten()
-        .map(std::path::PathBuf::from);
     Arc::new(move |needs: &[ShardBodyNeed]| {
         if needs.is_empty() {
             return Vec::new();
@@ -2194,14 +2268,24 @@ fn shard_body_availability(
         let Some(ingest) = cell.get() else {
             return vec![None; needs.len()]; // not built yet: nothing executes
         };
-        if hold_file.as_ref().is_some_and(|file| file.exists()) {
+        let hold = hold_file.as_ref().is_some_and(|file| file.exists());
+        if hold && !needs.iter().any(|need| need.vote) {
             debug!(
                 shard_headers = needs.len(),
                 "devnet: shard headers held back while QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE exists"
             );
             return vec![None; needs.len()];
         }
-        // The handle, once: never wait for the ingest under the lease.
+        let vote_hold = vote_hold_file.as_ref().is_some_and(|file| file.exists());
+        if vote_hold && needs.iter().all(|need| need.vote) {
+            debug!(
+                shard_headers = needs.len(),
+                "devnet: shard bodies reported unheld to this voter while QUIL_DEVNET_HOLD_VOTE_BODIES_FILE exists"
+            );
+            return vec![None; needs.len()];
+        }
+        // The handle, once: never wait for the ingest, which a proposal asks
+        // under the GLOBAL execution lease and a voter on its vote check.
         let held = match held.get() {
             Some(held) => held,
             None => match ingest.try_lock() {
@@ -2217,9 +2301,238 @@ fn shard_body_availability(
         };
         needs
             .iter()
-            .map(|need| held.frames_held(&need.address, need.frame_number, need.empty))
+            .map(|need| {
+                if need.vote {
+                    (!vote_hold).then(|| held.held_for_vote(need)).flatten()
+                } else if hold {
+                    None
+                } else {
+                    held.frames_held_for(need)
+                }
+            })
             .collect()
     })
+}
+
+/// A shard header a GLOBAL proposal carries, by its digest, and the number of
+/// the GLOBAL frame proposed ([`VoteVerdicts`]).
+type VerdictKey = ([u8; 32], u64);
+
+/// A GLOBAL voter's verdicts on the shard headers proposals carry
+/// ([`shard_body_fetch`]), so a recheck of a deferred vote verifies nothing
+/// again: the last [`Self::KEPT`] definite ones (vouched or refused), and a
+/// header whose certificate could not be checked yet until
+/// [`Self::UNJUDGED_RETRY`] has passed. A header whose anchor this archive's
+/// clock lacks is not remembered: it is judged again on every check, which
+/// ends at the clock lookup.
+#[derive(Default)]
+struct VoteVerdicts {
+    /// Oldest first: `Some(vouched)` once judged, `None` until the instant.
+    known: std::sync::Mutex<
+        std::collections::VecDeque<(VerdictKey, Option<bool>, std::time::Instant)>,
+    >,
+}
+
+impl VoteVerdicts {
+    /// How many verdicts are kept, well above the headers one check asks
+    /// about (`VOTE_BODY_ASKS` in the leader provider).
+    const KEPT: usize = 256;
+    /// How long a header whose certificate could not be checked is answered
+    /// as such before it is judged again.
+    const UNJUDGED_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Whether GLOBAL execution would vouch for `key`'s header: remembered,
+    /// or judged at `now` by `judge`, told whether the header was never
+    /// judged before; `Err` says why it is not judged yet.
+    fn vouched(
+        &self,
+        key: VerdictKey,
+        now: std::time::Instant,
+        judge: impl FnOnce(bool) -> HeaderVouch,
+    ) -> Result<bool, quil_engine::leader_provider::ShardBodyAsk> {
+        use quil_engine::leader_provider::ShardBodyAsk;
+        let cached = self
+            .known
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(seen, _, _)| *seen == key)
+            .map(|&(_, judged, retry)| (judged, retry));
+        match cached {
+            Some((Some(vouched), _)) => return Ok(vouched),
+            Some((None, retry)) if retry > now => return Err(ShardBodyAsk::Unavailable),
+            _ => {}
+        }
+        let judged = match judge(cached.is_none()) {
+            HeaderVouch::Vouched => Some(true),
+            HeaderVouch::Refused(_) => Some(false),
+            HeaderVouch::UnheldAnchor(anchor) => {
+                return Err(ShardBodyAsk::UnheldAnchor { anchor });
+            }
+            HeaderVouch::Unavailable(_) => None,
+        };
+        let mut known = self.known.lock().unwrap_or_else(|p| p.into_inner());
+        known.retain(|(seen, _, _)| *seen != key);
+        if known.len() >= Self::KEPT {
+            known.pop_front();
+        }
+        known.push_back((key, judged, now + Self::UNJUDGED_RETRY));
+        judged.ok_or(ShardBodyAsk::Unavailable)
+    }
+}
+
+/// [`vouch_shard_header`] against this node's live clock, state and prover
+/// registry, as a GLOBAL voter judges a proposal's header
+/// ([`shard_body_fetch`]); a refusal only as [`judged_at_parent`] keeps it.
+fn live_header_judge(
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    clock: Arc<dyn quil_types::store::ClockStore>,
+) -> impl Fn(&quil_types::proto::global::FrameHeader, u64) -> HeaderVouch + Send + Sync + 'static {
+    move |header, frame_number| {
+        let verdict = vouch_shard_header(
+            header,
+            frame_number,
+            clock.as_ref(),
+            &quil_execution::hypergraph_state::HypergraphState::new(crdt.clone()),
+            frame_prover.as_ref(),
+            &prover_registry,
+        );
+        let executed = crdt
+            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+            .ok();
+        judged_at_parent(verdict, executed, frame_number)
+    }
+}
+
+/// A voter's verdict on a header of proposed GLOBAL frame `frame_number`,
+/// judged against state executed through GLOBAL frame `executed`. Sequenced
+/// ingest judges it against the state the proposal's parent left
+/// ([`vouched_shard_headers`]), and a refused header does not hold the vote
+/// ([`ShardBodyAsk::Refused`]): a refusal found against any other state, the
+/// session or registry a later or earlier frame left, could let the vote
+/// pass without bodies execution then waits for. It is not judged yet
+/// ([`HeaderVouch::Unavailable`]), so it holds the vote and is judged again.
+///
+/// [`ShardBodyAsk::Refused`]: quil_engine::leader_provider::ShardBodyAsk::Refused
+fn judged_at_parent(verdict: HeaderVouch, executed: Option<u64>, frame_number: u64) -> HeaderVouch {
+    match verdict {
+        HeaderVouch::Refused(error) if executed != frame_number.checked_sub(1) => {
+            HeaderVouch::Unavailable(format!(
+                "refused ({error}) against the state of GLOBAL frame {}, not the proposed frame's \
+                 parent",
+                executed.map_or_else(|| "unknown".to_string(), |executed| executed.to_string())
+            ))
+        }
+        verdict => verdict,
+    }
+}
+
+/// How a GLOBAL voter asks for the bodies of a shard header a proposal
+/// carries and this archive lacks
+/// ([`quil_engine::leader_provider::ShardBodyFetch`]): once GLOBAL execution
+/// of the proposed frame would vouch for the header (`judge`; in production
+/// [`live_header_judge`], the check sequenced ingest waits by), the ingest
+/// asks for its frames at once on the gap queue, for any shard
+/// (`ArchiveAppShardIngest::ask_for_vote`), and says what it did. Never waits
+/// for the ingest, which sequenced execution holds while it materializes: the
+/// voter asks again on each recheck of its deferred vote while it is held.
+/// The voter does not hold the GLOBAL execution lease here (it takes it after
+/// this check, to execute the proposal), so the header is judged against the
+/// live clock, state and prover registry. A refused header does not hold the
+/// vote, so a refusal stands only when this node has executed exactly the
+/// proposal's parent, the state execution judges it against
+/// ([`judged_at_parent`]); against any other it is judged again later.
+///
+/// Verdicts are remembered ([`VoteVerdicts`]), so a recheck verifies nothing
+/// again: a refusal answered from them is [`ShardBodyAsk::RefusedBefore`],
+/// which costs the voter's per-check bound nothing. A header execution
+/// refuses is never asked for and warned once; sequenced ingest never waits
+/// for its bodies, so it does not hold the vote either. A header not judged
+/// yet (its anchor missing from this archive's clock, or its session
+/// unreadable) is neither remembered for good nor blamed on the leader: it is
+/// judged again on a later check. A header whose frame, or a parent below
+/// it, this archive holds as another frame is answered
+/// [`ShardBodyAsk::OtherFrame`]: its vote waits for the named frame.
+fn shard_body_fetch(
+    cell: AppIngestCell,
+    judge: impl Fn(&quil_types::proto::global::FrameHeader, u64) -> HeaderVouch + Send + Sync + 'static,
+) -> quil_engine::leader_provider::ShardBodyFetch {
+    use quil_engine::archive_ingest::HeldMismatch;
+    use quil_engine::leader_provider::ShardBodyAsk;
+    use sha2::Digest as _;
+    use std::sync::TryLockError;
+    let verdicts = VoteVerdicts::default();
+    Arc::new(
+        move |header: &quil_types::proto::global::FrameHeader, frame_number: u64| -> ShardBodyAsk {
+            let Some(ingest) = cell.get() else {
+                return ShardBodyAsk::IngestUnavailable;
+            };
+            let key = (
+                sha2::Sha256::digest(prost::Message::encode_to_vec(header)).into(),
+                frame_number,
+            );
+            let judged = std::cell::Cell::new(false);
+            let vouched = verdicts.vouched(key, std::time::Instant::now(), |first| {
+                judged.set(true);
+                let verdict = judge(header, frame_number);
+                match &verdict {
+                    HeaderVouch::Refused(error) => {
+                        warn!(scope = "GLOBAL vote", address = %hex::encode(&header.address),
+                            frame = header.frame_number, anchor = header.global_frame_number,
+                            proposed = frame_number, %error,
+                            action = "check the proposing leader's build",
+                            "GLOBAL vote: a proposal carries a shard header GLOBAL execution refuses; \
+                             this archive does not ask for its bodies and does not wait for them to vote");
+                    }
+                    HeaderVouch::Unavailable(error) if first => {
+                        info!(scope = "GLOBAL vote", address = %hex::encode(&header.address),
+                            frame = header.frame_number, proposed = frame_number, %error,
+                            check = "this archive's prover registry and state sync",
+                            "GLOBAL vote: cannot check a proposal's shard header certificate yet; \
+                             asks for its bodies once it can");
+                    }
+                    _ => {}
+                }
+                verdict
+            });
+            match vouched {
+                Ok(true) => {}
+                Ok(false) if judged.get() => return ShardBodyAsk::Refused,
+                Ok(false) => return ShardBodyAsk::RefusedBefore,
+                Err(ask) => return ask,
+            }
+            let mut ingest = match ingest.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return ShardBodyAsk::IngestUnavailable,
+            };
+            let empty = quil_engine::archive_ingest::requests_root_is_empty(&header.requests_root);
+            match ingest.ask_for_vote(&header.address, header.frame_number, empty) {
+                Ok(0) => {}
+                Ok(requested) => {
+                    info!(scope = "GLOBAL vote", address = %hex::encode(&header.address),
+                    frame = header.frame_number, requested,
+                    check = "the vote waits for these frames up to the vote patience (20 s); a decline line names \
+                             this shard if they did not arrive",
+                    "GLOBAL vote: this archive lacks application frame bodies a proposal's shard header needs; \
+                     asked for them at once")
+                }
+                Err(error) => {
+                    debug!(%error, address = %hex::encode(&header.address),
+                        "GLOBAL vote: shard body ask unavailable");
+                    return ShardBodyAsk::IngestUnavailable;
+                }
+            }
+            let need = quil_engine::leader_provider::ShardBodyNeed::for_vote(header);
+            match ingest.held_bodies().other_copy(&need) {
+                Some(HeldMismatch::Other(frame)) => ShardBodyAsk::OtherFrame { frame },
+                Some(HeldMismatch::Unknown(frame)) => ShardBodyAsk::UnknownFrame { frame },
+                None => ShardBodyAsk::Asked,
+            }
+        },
+    )
 }
 
 /// Whether a GLOBAL proposal holds a shard's header back while this archive's
@@ -2357,6 +2670,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     // that sequenced ingest waits for.
     let body_availability =
         archive_mode.then(|| shard_body_availability(app_ingest.clone(), network));
+    // A GLOBAL voter lacking a proposal's bodies asks for them at once.
+    let body_fetch = archive_mode.then(|| {
+        shard_body_fetch(
+            app_ingest.clone(),
+            live_header_judge(
+                crdt.clone(),
+                frame_prover.clone(),
+                prover_registry.clone(),
+                clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+            ),
+        )
+    });
     // ... and holds it back while archives verify the expensive proofs its
     // frames carry, which GLOBAL execution would otherwise wait for.
     let proof_settlement = archive_mode.then(|| shard_proof_settlement(app_ingest.clone()));
@@ -3017,6 +3342,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_finalization = global_finalization.clone();
             let sync_ingest = sequenced_ingest.clone();
             let sync_bodies = body_availability.clone();
+            let sync_fetch = body_fetch.clone();
             let sync_settlement = proof_settlement.clone();
             let sync_archive_mode = archive_mode;
             // Committee endpoints for the direct global-consensus publisher.
@@ -4524,6 +4850,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     Some(sync_crdt.clone()),
                                                 )
                                                 .with_body_availability(sync_bodies.clone())
+                                                .with_body_fetch(sync_fetch.clone())
                                                 .with_proof_settlement(sync_settlement.clone());
                                             let leader_provider = Arc::new(leader_provider);
 
