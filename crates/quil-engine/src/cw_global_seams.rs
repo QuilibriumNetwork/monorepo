@@ -569,7 +569,10 @@ impl GlobalSeamProposer {
     /// not authenticate a claimed height. Only validated or recovered frames
     /// may populate `block_meta`. A block is held as its sending member's
     /// ([`BlockStore::put_from`]), so one member's bodies under a digest
-    /// cannot crowd out another's. `name` labels a sender in logs.
+    /// cannot crowd out another's. `name` labels a sender in logs. A body
+    /// carrying more bundles and requests than a GLOBAL frame may
+    /// ([`crate::frame_bound::MAX_GLOBAL_FRAME_ITEMS`]) cannot finalize and
+    /// is refused before it is decoded.
     fn peer_ingress(
         self: &Arc<Self>,
         store: BlockStore,
@@ -577,6 +580,12 @@ impl GlobalSeamProposer {
     ) -> Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync> {
         let finalizer = self.finalizer.clone();
         Arc::new(move |from: &FalconPublicKey, bytes: Vec<u8>| {
+            if crate::frame_bound::admit_global_block("committee block", &bytes, || name(from))
+                .is_err()
+            {
+                tracing::debug!("cw block ingress: body refused before decoding, dropping");
+                return;
+            }
             let Ok(frame) = decode_global_frame(&bytes) else {
                 tracing::debug!("cw block ingress: undecodable frame, dropping");
                 return;
@@ -2334,7 +2343,7 @@ mod ingress_tests {
 
     /// Bundles and requests a GLOBAL frame may carry: the selected-parent
     /// executor refuses a frame past them (`max_frame_items`).
-    const FRAME_ITEMS: usize = 100_000;
+    const FRAME_ITEMS: usize = crate::frame_bound::MAX_GLOBAL_FRAME_ITEMS;
 
     /// A GLOBAL frame whose header `frame_digest` names, with one bundle
     /// of `requests` zero-length requests: four wire bytes a request.

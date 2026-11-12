@@ -73,7 +73,7 @@ impl Default for GlobalParentLimits {
                 max_metadata_entries: 100_000,
                 max_metadata_bytes: 32 << 20,
                 max_frame_bytes: MAX_GLOBAL_FRAME_BYTES,
-                max_frame_items: 100_000,
+                max_frame_items: crate::frame_bound::MAX_GLOBAL_FRAME_ITEMS,
             },
             max_ancestors: 32,
             max_ancestry_bytes: 64 << 20,
