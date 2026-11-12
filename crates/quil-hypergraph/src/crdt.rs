@@ -7295,9 +7295,10 @@ mod size_index_tests {
         assert!(hg.world_size_at(299).is_some());
     }
 
-    /// A coin-shaped vertex whose data-address top bits route it to a shard: byte0
-    /// selects the top-of-tree bit-path (so `< 0x04` → shard `[0]`, `0x04` → `[1]`
-    /// in the binary grid the tests below use), the rest disambiguates the leaf.
+    /// A coin-shaped vertex whose data-address top bits route it to a shard.
+    /// The binary grid `[0]`/`[1]` the tests below use resolves to the one-bit
+    /// paths `0`/`1`, so byte0's top bit selects the shard (`< 0x80` → `[0]`,
+    /// `>= 0x80` → `[1]`); the rest disambiguates the leaf.
     fn at(app: [u8; 32], b0: u8, b1: u8, b2: u8) -> Location {
         Location {
             app_address: app,
@@ -7322,15 +7323,15 @@ mod size_index_tests {
         let app = [7u8; 32];
         let c = crdt();
         c.set_unified_tree(true);
-        // Binary split grid: shard `[0]` (top-6-bits 000000) and `[1]` (000001).
+        // Binary split grid: shard `[0]` (top address bit 0) and `[1]` (bit 1).
         c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
-        // Three leaves under `[0]` (byte0 == 0x00) + one under `[1]` (byte0 0x04).
+        // Three leaves under `[0]` (byte0 0x00) + one under `[1]` (byte0 0x80).
         c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
         c.add_vertex(&at(app, 0x00, 0xFE, 0x22), b"coin-bb")
             .unwrap();
         c.add_vertex(&at(app, 0x00, 0xF0, 0x33), b"coin-ccc")
             .unwrap();
-        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd")
+        c.add_vertex(&at(app, 0x80, 0xAB, 0x44), b"coin-dddd")
             .unwrap();
         c.commit(1).unwrap();
 
@@ -7342,6 +7343,10 @@ mod size_index_tests {
         assert!(
             scan.values().any(|(cnt, _)| *cnt > 0),
             "precondition: scan found leaves (grid/version wired)"
+        );
+        assert!(
+            nonzero(&scan).len() >= 2,
+            "precondition: leaves populate both shards\nscan={scan:?}"
         );
         assert_eq!(
             forest, scan,
@@ -7363,7 +7368,7 @@ mod size_index_tests {
         c.set_unified_tree(true);
         c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
         c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
-        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd")
+        c.add_vertex(&at(app, 0x80, 0xAB, 0x44), b"coin-dddd")
             .unwrap();
         // Add then remove a leaf under `[0]` — a spent coin, removed TWICE (the
         // second remove must not zero the tombstone's recorded size).
@@ -7374,9 +7379,9 @@ mod size_index_tests {
         // Remove an id that was never added — an empty add placeholder + tombstone.
         c.remove_vertex(&at(app, 0x00, 0x77, 0x77)).unwrap();
         // A live hyperedge and a removed one under `[1]`.
-        c.add_hyperedge(&at(app, 0x04, 0x01, 0x02), b"edge-live")
+        c.add_hyperedge(&at(app, 0x80, 0x01, 0x02), b"edge-live")
             .unwrap();
-        let dead_edge = at(app, 0x04, 0x03, 0x04);
+        let dead_edge = at(app, 0x80, 0x03, 0x04);
         c.add_hyperedge(&dead_edge, b"edge-dead-longer").unwrap();
         c.remove_hyperedge(&dead_edge).unwrap();
         c.commit(1).unwrap();
@@ -7386,6 +7391,10 @@ mod size_index_tests {
         let mut forest = HashMap::new();
         c.forest_app_buckets(&app, &mut forest).unwrap();
 
+        assert!(
+            nonzero(&scan).len() >= 2,
+            "precondition: leaves populate both shards\nscan={scan:?}"
+        );
         assert_eq!(
             forest, scan,
             "forest vs scan must agree under removes (spent, double-remove, \
