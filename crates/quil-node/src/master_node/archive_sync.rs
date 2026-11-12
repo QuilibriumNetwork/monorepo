@@ -4018,6 +4018,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                         }
                                                         mc.mark_skipped(&result.skipped_bundles);
                                                         if let Some(header) = frame.header.as_ref() {
+                                                            mc.note_finalized_frame(header.frame_number);
                                                             if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                         }
                                                         pipeline.announce(&frame);
@@ -4090,6 +4091,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     }
                                                     mc.mark_skipped(&result.skipped_bundles);
                                                     if let Some(header) = frame.header.as_ref() {
+                                                        mc.note_finalized_frame(header.frame_number);
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
                                                     if let Some(pipeline) = pipeline.as_ref() {
@@ -4131,6 +4133,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 if m.last_materialized_frame() >= frame_number {
                                                     catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {
+                                                        mc.note_finalized_frame(header.frame_number);
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
                                                     // A consensus finalization that went
