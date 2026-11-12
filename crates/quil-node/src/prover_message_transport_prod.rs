@@ -124,6 +124,31 @@ pub(crate) struct SubmitRetryQueue {
     pending: std::sync::Mutex<VecDeque<Queued>>,
     running: AtomicBool,
     ids: AtomicU64,
+    /// What became of the storage epoch proofs of each window, summarized
+    /// once it ends ([`SubmitRetryQueue::report_windows`]). Locked after
+    /// `pending` when both are.
+    tally: std::sync::Mutex<std::collections::BTreeMap<u64, WindowTally>>,
+}
+
+/// What became of the storage epoch proofs whose window ends at one frame
+/// (an epoch's settlements and the seals due with them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowTally {
+    /// Proofs handed to this transport.
+    published: u64,
+    /// Of those, proofs whose seats all waited in the retry queue: they
+    /// took the queued copy's place instead of being sent at once.
+    folded: u64,
+    /// Sends to the archives, first sends and resends.
+    sent: u64,
+    /// Sends an archive took.
+    accepted: u64,
+    /// Sends every archive refused for now (sent again).
+    refused: u64,
+    /// Sends every archive refused for good (not sent again).
+    refused_for_good: u64,
+    /// Proofs still queued when the window ended.
+    undelivered: u64,
 }
 
 /// One queued submission.
@@ -212,6 +237,69 @@ impl SubmitRetryQueue {
     fn len(&self) -> usize {
         self.pending.lock().unwrap().len()
     }
+
+    /// Whether queued storage epoch proofs of `proof`'s member cover each of
+    /// its seats: sent at once, it would go to the archives beside them.
+    fn holds(&self, proof: &StorageProofSubmission) -> bool {
+        let pending = self.pending.lock().unwrap();
+        proof.seats.iter().all(|seat| {
+            pending
+                .iter()
+                .filter_map(|queued| queued.proof.as_ref())
+                .any(|queued| queued.member == proof.member && queued.covers_seat(seat))
+        })
+    }
+
+    /// Count in the tally of the window ending at `window_end`.
+    fn tally(&self, window_end: u64, count: impl FnOnce(&mut WindowTally)) {
+        count(self.tally.lock().unwrap().entry(window_end).or_default());
+    }
+
+    /// Log, once, what became of the storage epoch proofs of each window
+    /// that ended by `frame`, this node's latest GLOBAL frame.
+    fn report_windows(&self, frame: Option<u64>) {
+        let Some(frame) = frame else {
+            return;
+        };
+        let ended: Vec<(u64, WindowTally)> = {
+            let mut tally = self.tally.lock().unwrap();
+            let open = tally.split_off(&frame.saturating_add(1));
+            std::mem::replace(&mut *tally, open).into_iter().collect()
+        };
+        for (window_end, t) in ended {
+            // A window ending at the start of epoch E + 2 settles epoch E.
+            let epoch = (window_end / quil_types::consensus::epoch_length_frames().max(1))
+                .saturating_sub(2);
+            macro_rules! window_line {
+                ($level:ident) => {
+                    $level!(epoch, window_end, published = t.published, folded = t.folded,
+                        sent = t.sent, accepted = t.accepted, refused = t.refused,
+                        refused_for_good = t.refused_for_good, undelivered = t.undelivered,
+                        "storage epoch proofs of a window that ended: published by this node's workers (folded: sent again while \
+                         the retry queue held their seats, so they went at its next round instead of at once), sends to the \
+                         archives, sends an archive took, sends every archive refused for now or for good, and proofs still \
+                         undelivered when the window ended. Settlement shows in each worker's 'storage settlement recorded' \
+                         line; undelivered above 0 means GLOBAL withholds those seats' storage share, refused well above \
+                         accepted that the archives' held proofs were full")
+                };
+            }
+            if t.undelivered > 0 {
+                window_line!(warn);
+            } else {
+                window_line!(info);
+            }
+        }
+    }
+}
+
+/// `delay` less a random part of up to half of it, so nodes refused
+/// together do not all send again together.
+fn jittered(delay: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let half = delay / 2;
+    let spread = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
+    let draw = std::collections::hash_map::RandomState::new().hash_one(Instant::now());
+    delay - Duration::from_nanos(draw % spread.saturating_add(1))
 }
 
 /// The archives' answers to one submission.
@@ -263,10 +351,14 @@ fn asks_for_retry(error: &ArchiveClientError, proof: bool) -> bool {
     retryable(error) || (proof && transient(error))
 }
 
-/// Resend the queue until it empties. A round sends it oldest first and ends
-/// at the first message other than a storage epoch proof still refused for
-/// now everywhere. `frame` reads this node's latest GLOBAL frame, at which a
-/// storage epoch proof's window ends.
+/// Resend the queue until it empties. A round sends the storage epoch proofs
+/// whose window ends soonest first, then the other messages, each oldest
+/// first, and ends at the first message other than a storage epoch proof
+/// still refused for now everywhere. Rounds start a jittered back-off apart:
+/// from `timing.first`, doubling after a round that ended at a message still
+/// refused, up to `timing.longest`, each wait a random part of up to half
+/// shorter ([`jittered`]). `frame` reads this node's latest GLOBAL frame, at
+/// which a storage epoch proof's window ends.
 async fn run_retries<F, Fut, G>(
     queue: Arc<SubmitRetryQueue>,
     timing: RetryTiming,
@@ -279,17 +371,26 @@ async fn run_retries<F, Fut, G>(
 {
     let mut delay = timing.first;
     loop {
-        tokio::time::sleep(delay).await;
-        let mut after = 0;
+        tokio::time::sleep(jittered(delay)).await;
+        let mut sent = std::collections::HashSet::new();
         let mut failed = false;
         loop {
             let next = {
                 let frame = frame();
                 let mut pending = queue.pending.lock().unwrap();
-                expire(&mut pending, timing, frame);
+                for window_end in expire(&mut pending, timing, frame) {
+                    queue.tally(window_end, |t| t.undelivered += 1);
+                }
+                drop(pending);
+                queue.report_windows(frame);
+                let pending = queue.pending.lock().unwrap();
                 pending
                     .iter()
-                    .find(|queued| queued.id >= after)
+                    .filter(|queued| !sent.contains(&queued.id))
+                    .min_by_key(|queued| {
+                        let window_end = queued.proof.as_ref().map(|proof| proof.window_end);
+                        (window_end.unwrap_or(u64::MAX), queued.id)
+                    })
                     .map(|queued| (queued.id, queued.bytes.clone()))
             };
             let Some((id, bytes)) = next else {
@@ -306,7 +407,7 @@ async fn run_retries<F, Fut, G>(
                 continue;
             };
             let delivery = submit(bytes).await;
-            after = id + 1;
+            sent.insert(id);
             match resent(&queue, id, &delivery, timing, &frame) {
                 Resent::Done => delay = timing.first,
                 Resent::ProofFailed => failed = true,
@@ -341,6 +442,18 @@ fn resent(
     let Some(index) = pending.iter().position(|queued| queued.id == id) else {
         return Resent::Done;
     };
+    if let Some(proof) = &pending[index].proof {
+        queue.tally(proof.window_end, |t| {
+            t.sent += 1;
+            if delivery.accepted > 0 {
+                t.accepted += 1;
+            } else if delivery.retry > 0 {
+                t.refused += 1;
+            } else {
+                t.refused_for_good += 1;
+            }
+        });
+    }
     if delivery.accepted == 0 && delivery.retry > 0 {
         let queued = &mut pending[index];
         queued.attempts += 1;
@@ -386,8 +499,10 @@ fn resent(
 /// Drop what can no longer land: a message refused for `timing.give_up`, a
 /// storage epoch proof once `frame`, this node's latest GLOBAL frame, is at
 /// its window's end (or after `timing.proof_give_up` while none is known).
-fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64>) {
+/// Returns the window ends of the storage epoch proofs dropped.
+fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64>) -> Vec<u64> {
     let mut given_up = 0;
+    let mut undelivered = Vec::new();
     pending.retain(|queued| {
         let Some(proof) = &queued.proof else {
             let keep = queued.queued.elapsed() < timing.give_up;
@@ -404,6 +519,7 @@ fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64
                 attempts = queued.attempts + 1, secs = queued.queued.elapsed().as_secs(),
                 consequence = proof.consequence(),
                 "storage epoch proof undelivered when its window ended: no archive took it");
+            undelivered.push(proof.window_end);
         }
         !closed
     });
@@ -413,6 +529,7 @@ fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64
             "prover submissions still refused by every archive — giving up"
         );
     }
+    undelivered
 }
 
 /// `value`, or "unknown".
@@ -612,6 +729,27 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         let started = Instant::now();
         let proof = StorageProofSubmission::of(&bundle_bytes);
         let bytes = bundle_bytes.len();
+        if let Some(proof) = &proof {
+            self.retry_queue
+                .report_windows(latest_frame(self.clock_store.as_ref()));
+            self.retry_queue
+                .tally(proof.window_end, |t| t.published += 1);
+            // A worker sends a seat's part again while no archive has taken
+            // the last one (about every ten GLOBAL frames): with the queue
+            // holding its seats, it takes the queued copy's place and goes
+            // at the queue's next round, so each pending seat is sent once a
+            // round instead of also at once to every archive.
+            if self.retry_queue.holds(proof) {
+                self.retry_queue.tally(proof.window_end, |t| t.folded += 1);
+                if self.retry_queue.push(bundle_bytes) {
+                    self.start_retries();
+                }
+                let (member, shards, epochs) = proof.fields();
+                debug!(member, ?shards, ?epochs, bytes, queued = self.retry_queue.len(),
+                    "storage epoch proof sent again while the retry queue holds its seats: it replaces the queued copy and goes at the queue's next round");
+                return Ok(());
+            }
+        }
         // Fan out to archives concurrently. Each closure connects + submits
         // independently so a slow / unreachable archive does not block the
         // others.
@@ -656,24 +794,19 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // Every archive refused it for now: resend it later.
         let queued = outcome.is_err() && delivery.retry > 0;
         if queued && self.retry_queue.push(bundle_bytes) {
-            let (pool, seed) = (self.archive_pool.clone(), self.falcon_signing_key.clone());
-            let clock_store = self.clock_store.clone();
-            tokio::spawn(run_retries(
-                self.retry_queue.clone(),
-                RETRY_TIMING,
-                move |bytes| {
-                    let (pool, seed) = (pool.clone(), seed.clone());
-                    let resending_proof = carries_storage_proof(&bytes);
-                    async move {
-                        submit_to_archives_with(&pool, seed, bytes, resending_proof)
-                            .await
-                            .1
-                    }
-                },
-                move || latest_frame(clock_store.as_ref()),
-            ));
+            self.start_retries();
         }
         if let Some(proof) = &proof {
+            self.retry_queue.tally(proof.window_end, |t| {
+                t.sent += 1;
+                if grpc_ok_count > 0 {
+                    t.accepted += 1;
+                } else if queued {
+                    t.refused += 1;
+                } else if outcome.is_err() {
+                    t.refused_for_good += 1;
+                }
+            });
             let (member, shards, epochs) = proof.fields();
             let (window_end, frames_left, mins_left) =
                 proof.time_left(latest_frame(self.clock_store.as_ref()));
@@ -718,6 +851,28 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             }
             outcome => outcome,
         }
+    }
+}
+
+impl ProdProverMessageTransport {
+    /// Start the worker that resends the retry queue.
+    fn start_retries(&self) {
+        let (pool, seed) = (self.archive_pool.clone(), self.falcon_signing_key.clone());
+        let clock_store = self.clock_store.clone();
+        tokio::spawn(run_retries(
+            self.retry_queue.clone(),
+            RETRY_TIMING,
+            move |bytes| {
+                let (pool, seed) = (pool.clone(), seed.clone());
+                let resending_proof = carries_storage_proof(&bytes);
+                async move {
+                    submit_to_archives_with(&pool, seed, bytes, resending_proof)
+                        .await
+                        .1
+                }
+            },
+            move || latest_frame(clock_store.as_ref()),
+        ));
     }
 }
 
@@ -1010,12 +1165,16 @@ impl StorageProofSubmission {
     /// Whether `other` is needless once this is delivered: the same member,
     /// and each of its seats sealed or settled here for the same epoch.
     fn covers(&self, other: &Self) -> bool {
-        self.member == other.member
-            && other.seats.iter().all(|(shard, epoch, seals, settles)| {
-                self.seats.iter().any(|(s, e, se, st)| {
-                    s == shard && e == epoch && (*se || !seals) && (*st || !settles)
-                })
-            })
+        self.member == other.member && other.seats.iter().all(|seat| self.covers_seat(seat))
+    }
+
+    /// Whether delivering this makes `seat` (shard, epoch, seals, settles)
+    /// of the same member needless.
+    fn covers_seat(&self, seat: &(Vec<u8>, u64, bool, bool)) -> bool {
+        let (shard, epoch, seals, settles) = seat;
+        self.seats
+            .iter()
+            .any(|(s, e, se, st)| s == shard && e == epoch && (*se || !seals) && (*st || !settles))
     }
 
     /// Its member, shards and epochs, for log lines.
