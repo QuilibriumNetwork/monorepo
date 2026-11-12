@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use num_bigint::{BigInt, Sign};
 use quil_engine::global_stall::GlobalReach;
-use quil_forest::store_io::{health_cause, SlowCause};
+use quil_forest::store_io::{health_cause, SlowCause, END_AFTER};
 use quil_types::consensus::{EffectiveStatus, SILENT_RENEWAL_BLOCKER};
 use quil_types::proto::diagnostics::{
     AffectedShard, ConditionAction, ConditionKind, ConditionScope, ConditionSeverity,
@@ -289,6 +289,18 @@ pub fn store_io_figures(io: &StoreIoHealth) -> String {
         (None, None) => {}
     }
     parts.join(", ")
+}
+
+/// A slow verdict whose latest intervals (minutes) are under every
+/// threshold: how many of the [`END_AFTER`] that end it; `None` otherwise
+/// and from nodes that predate it.
+pub fn store_io_recovering(io: &StoreIoHealth) -> Option<String> {
+    (io.verdict() == StoreIoVerdict::Slow && io.recovering_intervals > 0).then(|| {
+        format!(
+            "recovering: {} of {END_AFTER} clear minutes",
+            io.recovering_intervals
+        )
+    })
 }
 
 /// The store's 4 KiB write and fsync against its bound, both in ms.
@@ -2059,10 +2071,12 @@ pub fn notice_text(c: &HealthCondition) -> String {
                 let io = io.unwrap_or_default();
                 let figures = store_io_figures(&io);
                 let cause = store_io_scope(&io);
-                if figures.is_empty() {
-                    format!("Store reads slow ({cause}).")
-                } else {
-                    format!("Store reads slow ({cause}): {figures}.")
+                // Recovering: the figures are the last slow minute's, which
+                // the health report gives; the notice says how far it is.
+                match store_io_recovering(&io) {
+                    Some(recovering) => format!("Store reads slow ({cause}), {recovering}."),
+                    None if figures.is_empty() => format!("Store reads slow ({cause})."),
+                    None => format!("Store reads slow ({cause}): {figures}."),
                 }
             }
         },
@@ -4383,6 +4397,40 @@ mod tests {
         reg.observe_store_io(Some(ok), T0 + 15_000);
         reg.evaluate(T0 + 15_000, &no_cadence);
         assert!(current(&reg, ConditionKind::StoreIoSlow).is_none());
+    }
+
+    /// A slow verdict whose latest minutes are clear says it is recovering
+    /// and how far, its label from the last slow minute; a node that
+    /// predates the count reads as before.
+    #[test]
+    fn a_recovering_store_notice_says_how_far_it_is() {
+        let text = |io: StoreIoHealth| {
+            notice_text(&HealthCondition {
+                kind: ConditionKind::StoreIoSlow as i32,
+                store_io: Some(io),
+                ..Default::default()
+            })
+        };
+        let mut recovering = slow_io();
+        recovering.recovering_intervals = 2;
+        assert_eq!(
+            text(recovering),
+            "Store reads slow (this node's disk), recovering: 2 of 3 clear minutes.",
+            "STORE-NOTICE recovering"
+        );
+        let mut bare = StoreIoHealth {
+            recovering_intervals: 1,
+            ..Default::default()
+        };
+        bare.set_verdict(StoreIoVerdict::Slow);
+        assert_eq!(
+            text(bare),
+            "Store reads slow (disk not ruled out), recovering: 1 of 3 clear minutes.",
+            "STORE-NOTICE recovering bare"
+        );
+        assert!(text(slow_io()).starts_with("Store reads slow (this node's disk): canary"));
+        recovering.set_verdict(StoreIoVerdict::Ok);
+        assert_eq!(store_io_recovering(&recovering), None);
     }
 
     /// The store's fsync at or past its bound is the store condition, with

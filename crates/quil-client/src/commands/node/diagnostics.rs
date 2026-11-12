@@ -20,7 +20,9 @@ use clap::{Args, Subcommand};
 use quil_forest::store_io::{health_cause, SlowCause};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
-use quil_rpc::health_conditions::{store_io_figures, MASTER_STORE_WRITE_FAILED};
+use quil_rpc::health_conditions::{
+    store_io_figures, store_io_recovering, MASTER_STORE_WRITE_FAILED,
+};
 use quil_rpc::reachability::{ip_class, IpClass};
 use quil_types::proto::diagnostics::{
     Blocker, ConditionKind, ConditionSeverity, GetHealthReportRequest, HealthConditions,
@@ -721,7 +723,14 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
                      this node's load (CPU, memory pressure, compaction)."
                 }
             };
-            format!("Store I/O: slow for {slow} ({figures}); {what}")
+            match store_io_recovering(io) {
+                Some(recovering) => {
+                    format!(
+                        "Store I/O: slow for {slow}, {recovering} (last slow: {figures}); {what}"
+                    )
+                }
+                None => format!("Store I/O: slow for {slow} ({figures}); {what}"),
+            }
         }
         StoreIoVerdict::Ok => format!("Store I/O: ok ({figures})."),
         _ => "Store I/O: not measured.".to_string(),
@@ -1292,6 +1301,32 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             "Store I/O: not measured."
         );
         assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Store I/O"));
+    }
+
+    /// A slow verdict whose latest minutes are clear: the line says it is
+    /// recovering and gives the last slow minute's figures.
+    #[test]
+    fn a_recovering_store_io_line_gives_the_last_slow_figures() {
+        let mut io = StoreIoHealth {
+            slow_secs: 750,
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 412_000,
+            disk_reads: Some(40),
+            disk_writes: Some(10),
+            disk_read_await_us: Some(25_400),
+            disk_write_await_us: Some(3_100),
+            recovering_intervals: 1,
+            ..Default::default()
+        };
+        io.set_verdict(StoreIoVerdict::Slow);
+        assert_eq!(
+            store_io_line(Some(&io)).unwrap(),
+            "Store I/O: slow for 12m, recovering: 1 of 3 clear minutes (last slow: canary \
+             p99 412ms of 58 reads in 60s, disk read 25ms/op, write 3.1ms/op); this \
+             node's disk is the cause: check TRIM, the disk's health and other I/O load.",
+            "STORE-LINE recovering"
+        );
     }
 
     #[test]
