@@ -816,7 +816,11 @@ impl SeatCertificates {
     /// still a seat whose allocation was active by the epoch, else counted
     /// since before the epoch began), and is done. An unsealed slot with no
     /// roots and no tips counted is nothing, unless the counts are partial
-    /// and the seat is still one active by the epoch. Each line is this
+    /// and the seat is still one active by the epoch: a process that began
+    /// after such an epoch ended logs its closed line, partial, even when
+    /// the process before counted no tip and logged none, as it cannot tell
+    /// that seat from one whose ended line the process before logged and
+    /// whose closed line would be lost. Each line is this
     /// process's only if it counted the seat before the line fell due (the
     /// epoch ended, the settlement closed, or for no slot the next epoch
     /// ended); else the process before logged it, and it is marked logged,
@@ -2090,6 +2094,55 @@ mod tests {
         unread.observe_global(6 * l + 10);
         unread.observe_global(7 * l);
         assert!(lines(&mut unread).is_empty(), "registry unread");
+    }
+
+    #[test]
+    fn an_unsealed_slot_that_ended_before_a_restart_still_logs_its_closed_line() {
+        let l = epoch_length();
+        let active = BTreeMap::from([(FILTER.to_vec(), 3)]);
+        // Epoch 6 holds an unsealed slot: only a sealed one chains roots.
+        // It expires when epoch 8 begins.
+        let open = [slot(6, false, 0, 0, Outcome::Open)];
+        let expired = [slot(6, false, 0, 0, Outcome::Expired(8 * l))];
+        // Epoch 6's lines as `(stage, counts_complete)`.
+        let lines = |t: &mut SeatCertificates, slots: &[SlotRead]| -> Vec<(&'static str, bool)> {
+            t.rewards(FILTER, slots, T0)
+                .iter()
+                .filter_map(|log| match log {
+                    SeatLog::Reward {
+                        epoch: 6,
+                        stage,
+                        complete,
+                        ..
+                    } => Some((*stage, *complete)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The process before counted all of epoch 6, a tip included, and
+        // logged its ended line.
+        let mut before = seated(T0);
+        before.active_from(&active);
+        before.observe_global(6 * l - 1);
+        assert!(before.count(FILTER, 1, ms(T0), member(5, 4, true), 6 * l + 20, T0));
+        before.observe_global(7 * l);
+        assert_eq!(lines(&mut before, &open), [("ended", true)]);
+        // Restarted inside epoch 7: the ended line was the process
+        // before's; the closed line falls due in this one, partial.
+        let mut t = seated(T0);
+        t.active_from(&active);
+        t.observe_global(7 * l + 10);
+        assert!(
+            lines(&mut t, &open).is_empty(),
+            "relogged_after_restart: an ended line the process before logged"
+        );
+        t.observe_global(8 * l);
+        assert_eq!(
+            lines(&mut t, &expired),
+            [("closed", false)],
+            "unsealed_closed_lost: the closed line due after a restart"
+        );
+        assert!(lines(&mut t, &expired).is_empty(), "once");
     }
 
     #[test]
