@@ -70,11 +70,21 @@ fn now() -> u64 {
     settlement_window(EPOCH).0
 }
 
-/// A collector that has proposed `frame`, so it knows the current frame.
+/// A collector that saw `frame` finalized, so it knows the current frame.
 fn knowing(frame: u64) -> MessageCollector {
     let mc = global_collector();
-    mc.snapshot_for_proposal(1, 0, 0, Some(frame), &[]).unwrap();
+    mc.note_finalized_frame(frame);
     mc
+}
+
+/// Whether `mc` holds `bytes` at any rank.
+fn holds(mc: &MessageCollector, bytes: &[u8]) -> bool {
+    let key = message_key(bytes);
+    mc.buffers
+        .read()
+        .unwrap()
+        .values()
+        .any(|b| b.contains(&key))
 }
 
 /// Fill `provenance`'s share at `rank` with `make(id)` proofs, ids from
@@ -197,18 +207,19 @@ fn a_proof_past_its_window_rides_no_frame() {
         taken.is_empty(),
         "seal-deadline closed: a proposal of frame {end} carried a settlement whose window ended there"
     );
+    mc.note_finalized_frame(end - 1);
     for rank in 1..=RETENTION_WINDOW + 1 {
         mc.prune_after_finalization(rank);
     }
     assert_eq!(
         mc.pending_count(50),
         0,
-        "seal-deadline closed-drop: a proof past its window is still held"
+        "seal-deadline closed-drop: a proof due by the next frame to finalize is still held"
     );
 }
 
-/// A proof already past its window at the newest frame proposed takes no
-/// room from held proofs.
+/// A proof whose window ends by the next frame to finalize takes no room
+/// from held proofs.
 #[test]
 fn a_proof_past_its_window_makes_no_room() {
     let end = settlement_window(EPOCH).1;
@@ -219,7 +230,7 @@ fn a_proof_past_its_window_makes_no_room() {
         }
     }
     let held = mc.pending_count(1);
-    mc.snapshot_for_proposal(1, 0, 0, Some(end), &[]).unwrap();
+    mc.note_finalized_frame(end - 1);
     let outcome = mc.add_message_outcome(1, soon(101));
     eprintln!("REACH seal-deadline closed-room outcome={outcome:?}");
     assert_eq!(
@@ -249,6 +260,36 @@ fn a_full_share_makes_no_room_before_the_frame_is_known() {
         held,
         "seal-deadline unknown-frame: a held proof left before the frame was known"
     );
+}
+
+/// A finalized frame tells a collector that has proposed none, as after a
+/// restart, the current frame: a full share makes room for a proof due
+/// sooner than some it holds, and none for one whose window that frame
+/// ended.
+#[test]
+fn a_finalized_frame_tells_the_collector_the_current_frame() {
+    let mc = global_collector();
+    let held = fill(&mc, 1, Provenance::Prover, 1, late);
+    mc.note_finalized_frame(settlement_window(EPOCH).1 - 1);
+    let outcome = mc.add_message_outcome(1, soon(101));
+    eprintln!("REACH seal-deadline finalized-closed outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "seal-deadline finalized-closed: a settlement due by the next frame to finalize took room"
+    );
+    assert_eq!(mc.pending_count(1), held);
+    let mc = global_collector();
+    let held = fill(&mc, 1, Provenance::Prover, 1, late);
+    mc.note_finalized_frame(now());
+    let outcome = mc.add_message_outcome(1, soon(101));
+    eprintln!("REACH seal-deadline finalized outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "seal-deadline finalized: a settlement due before every held seal was refused after a finalized frame"
+    );
+    assert_eq!(mc.pending_count(1), held, "one seal left for it");
 }
 
 /// Other senders' share makes room for a proof due sooner as the active
@@ -307,6 +348,112 @@ fn a_share_that_cannot_make_room_drops_nothing() {
         held + 1,
         "seal-deadline short: a held seal left though its room could not take the settlement"
     );
+}
+
+/// A proposal's frame may be abandoned, as one built on ancestors not yet
+/// finalized: only a finalized frame ends a held proof's window. A proof
+/// due after the next frame to finalize stays held, takes no other's room
+/// as past its window, and rides that frame.
+#[test]
+fn an_abandoned_proposal_ends_no_window() {
+    let end = settlement_window(EPOCH).1;
+    let mc = knowing(end - 3);
+    let held = fill(&mc, 1, Provenance::Prover, 1, soon);
+    // A proposal of a frame past the settlements' windows, never finalized.
+    mc.snapshot_for_proposal(1, 0, 0, Some(end + 1), &[])
+        .unwrap();
+    let outcome = mc.add_message_outcome(1, late(200));
+    eprintln!("REACH seal-deadline abandoned outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "seal-deadline abandoned: a seal took the room of settlements an abandoned proposal passed"
+    );
+    for rank in 1..=RETENTION_WINDOW + 1 {
+        mc.prune_after_finalization(rank);
+    }
+    assert_eq!(
+        mc.pending_count(1),
+        held,
+        "seal-deadline abandoned: settlements an abandoned proposal passed left"
+    );
+    let taken = mc
+        .snapshot_for_proposal(1, 16 << 20, 10_000, Some(end - 2), &[])
+        .unwrap();
+    assert!(!taken.is_empty(), "the next frame carries the settlements");
+}
+
+/// A full share makes room first from proofs past their window, before
+/// any due later than the proof it takes.
+#[test]
+fn a_full_share_makes_room_from_proofs_past_their_window_first() {
+    let mc = global_collector();
+    let closed = proof(1, EPOCH - 1, true);
+    assert_eq!(
+        mc.add_message_outcome(1, closed.clone()),
+        SubmitOutcome::Accepted
+    );
+    let held = 1 + fill(&mc, 1, Provenance::Prover, 2, late);
+    let newest = late(1 + held as u32);
+    assert!(holds(&mc, &late(held as u32)) && !holds(&mc, &newest));
+    mc.note_finalized_frame(now());
+    let outcome = mc.add_message_outcome(1, soon(101));
+    eprintln!("REACH seal-deadline closed-first outcome={outcome:?}");
+    assert_eq!(outcome, SubmitOutcome::Accepted);
+    assert!(
+        !holds(&mc, &closed) && holds(&mc, &late(held as u32)),
+        "seal-deadline closed-first: a seal due later left before the settlement past its window"
+    );
+}
+
+/// A proof another sender delivered and an active prover then sent moves
+/// to the provers' share: proofs due sooner take its room there.
+#[test]
+fn a_promoted_proof_makes_room_in_the_provers_share() {
+    let mc = knowing(now());
+    let promoted = late(1);
+    assert_eq!(
+        mc.add_message_outcome_from(1, promoted.clone(), Provenance::Other),
+        SubmitOutcome::Accepted
+    );
+    assert_eq!(
+        mc.add_message_outcome_from(1, promoted.clone(), Provenance::Prover),
+        SubmitOutcome::Duplicate
+    );
+    let held = fill(&mc, 1, Provenance::Prover, 100, soon);
+    eprintln!("REACH seal-deadline promote-index held={held}");
+    assert!(
+        !holds(&mc, &promoted),
+        "seal-deadline promote-index: settlements found no room in the seal promoted to the provers' share"
+    );
+    assert_eq!(mc.pending_count(1), held);
+}
+
+/// An active prover's copy of a proof another sender delivered makes room
+/// in the provers' full share as its submit would, so it rides with theirs.
+#[test]
+fn a_promotion_into_a_full_share_makes_room_for_a_proof_due_sooner() {
+    let mc = knowing(now());
+    let mut of = HashMap::new();
+    let promoted = soon(101);
+    of.insert(sha256(&promoted), 101);
+    assert_eq!(
+        mc.add_message_outcome_from(1, promoted.clone(), Provenance::Other),
+        SubmitOutcome::Accepted
+    );
+    let held = 1 + fill(&mc, 1, Provenance::Prover, 1, late);
+    let outcome = mc.add_message_outcome_from(1, promoted, Provenance::Prover);
+    eprintln!("REACH seal-deadline promote-evict outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Duplicate,
+        "seal-deadline promote-evict: a prover's copy of a settlement due before every held seal was refused"
+    );
+    assert_eq!(mc.pending_count(1), held - 1, "one seal left for it");
+    let taken = mc
+        .snapshot_for_proposal(1, 16 << 20, 10_000, None, &[])
+        .unwrap();
+    assert_eq!(ids(&taken, &of), [101], "the settlement rides first");
 }
 
 /// A shard frame header for shard `addr`, about `len` bytes.
@@ -451,6 +598,7 @@ fn settlements_ride_before_their_window_ends_under_110_percent_demand() {
         }
         for archive in &archives {
             archive.mark_finalized(&taken);
+            archive.note_finalized_frame(frame);
             archive.prune_after_finalization(frame);
         }
     }
