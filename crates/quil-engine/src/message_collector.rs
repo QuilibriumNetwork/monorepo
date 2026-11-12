@@ -5967,6 +5967,41 @@ mod tests {
         );
     }
 
+    /// One active prover's storage epoch proofs leave room in the provers'
+    /// share for another member's. Proofs are not verified on arrival, so
+    /// one prover can send any number of distinct ones: forty of 600 KB
+    /// arrive from one peer, then a member's genuine proof from its own.
+    #[test]
+    fn one_active_provers_proofs_leave_room_for_another_members_proof() {
+        let mc = global_collector();
+        let flood: Vec<SubmitOutcome> = (1..=40u32)
+            .map(|id| {
+                mc.add_message_outcome_by(
+                    1,
+                    numbered_epoch_proof(id, 600_000),
+                    Provenance::Prover,
+                    b"one-prover",
+                )
+            })
+            .collect();
+        let held = flood
+            .iter()
+            .filter(|outcome| **outcome == SubmitOutcome::Accepted)
+            .count();
+        let genuine = mc.add_message_outcome_by(
+            1,
+            numbered_epoch_proof(1_000, 650_000),
+            Provenance::Prover,
+            b"member",
+        );
+        eprintln!("REACH seal-sender flood_held={held} of 40, genuine={genuine:?}");
+        assert_eq!(
+            genuine,
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-FLOOD: one prover's {held} proofs filled the provers' share ({SEAL_BYTES_HELD} bytes) and a member's genuine proof was refused"
+        );
+    }
+
     /// Held storage epoch proofs that age out without riding a frame are
     /// counted for the summary line.
     #[test]
