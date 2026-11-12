@@ -1,8 +1,9 @@
 //! Workers above the configured count drain: they take no new seat or join,
-//! their seats leave only through the surplus leave (lowest reward first,
-//! never one the halt-risk shield holds), and each is retired once it holds
-//! no seat and no join. This module says where each draining worker stands,
-//! for the summary the lifecycle logs once per epoch.
+//! their seats leave only through the surplus leave (before any seat of a
+//! worker within the count, lowest reward first, never one the halt-risk
+//! shield holds), and each is retired once it holds no seat and no join.
+//! This module says where each draining worker stands, for the summary the
+//! lifecycle logs once per epoch.
 
 use quil_types::consensus::{
     epoch_for_frame, epoch_length_frames, AllocationPhase, EffectiveStatus, ProverAllocationInfo,
@@ -46,8 +47,8 @@ pub(crate) enum DrainSeat {
     Shielded { active: u64 },
     /// The surplus leave chose it; it publishes when its cooldown ends.
     Selected,
-    /// No surplus leave names it: no Active seat is surplus, or seats of
-    /// lower reward make up the surplus.
+    /// No surplus leave names it: no Active seat is surplus, or draining
+    /// seats of lower reward make up the surplus.
     Kept,
     /// Missed its epoch renewal: not counted Active, so the surplus leave does
     /// not name it; it is renewed or its worker released.
@@ -204,9 +205,9 @@ impl DrainSummary {
             "workers above the configured count are draining: they take no new seat, their seats leave through \
              the surplus leave (eligible seats, lowest reward first), and each stops once it holds no seat or \
              join. Expected waits: a leave departs at its epoch once confirmed; a shielded seat is held until its \
-             shard has more than 4 active provers; a kept seat is not surplus (lower-reward seats make up the \
-             surplus, or none is) and stays until it departs; a joining seat drains once its join is confirmed \
-             or expires"
+             shard has more than 4 active provers; a kept seat is not surplus (lower-reward draining seats make \
+             up the surplus, or none is) and stays until it departs; a joining seat drains once its join is \
+             confirmed or expires"
         );
         let stalled: Vec<String> = self
             .seats
