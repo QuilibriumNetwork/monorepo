@@ -4949,7 +4949,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 && sync_mat.is_none()
                                 && quil_types::consensus::committee_handoff_policy().is_some()
                                 && anchor.cursor.is_some();
-                            for addr in reconcile_peers.iter() {
+                            // Each archive pulled from under a pace watchdog; one
+                            // serving below the floor is given up on for the next,
+                            // a bounded number of times a pass.
+                            let mut archives = crate::archive_pace::PacedArchives::new(
+                                reconcile_peers.clone(),
+                                crate::archive_pace::MAX_SLOW_FAILOVERS,
+                            );
+                            let (key, pinned): (&[u8], &[u8]) = (&seed[..], &expected_root);
+                            while let Some(attempt) = archives.next_archive() {
+                                let addr = &attempt.addr;
                                 // Snapshot the local reward balance before the
                                 // sync pulls fresh leaves. Compared against the
                                 // post-sync balance to surface credits that
@@ -4961,14 +4970,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 // Forest sync of the global prover shard, pinned to the
                                 // finalized prover_tree_commitment. A peer whose tree
                                 // does not match it returns Ok(false) → try the next.
-                                let synced = if record_view {
-                                    crate::forest_sync::sync_global_view_verified(
-                                        addr, &seed[..], sync_crdt.clone(), &expected_root,
-                                    ).await
-                                } else {
-                                    crate::forest_sync::sync_single_shard_verified(
-                                        addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
-                                    ).await
+                                // One given up on for its pace was warned of; it is
+                                // tried again after the rest.
+                                let crdt = sync_crdt.clone();
+                                let Some(synced) = archives.pull(&attempt, |pace| {
+                                    crate::forest_sync::sync_prover_tree_paced(
+                                        addr, key, crdt, pinned, record_view, pace,
+                                    )
+                                }).await else {
+                                    continue;
                                 };
                                 match synced {
                                     Ok(conv) => {

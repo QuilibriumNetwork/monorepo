@@ -270,6 +270,8 @@ pub struct RemoteTreeReader {
     /// Cleared when the archive cannot list leaves (an older build): an empty
     /// subtree is then walked node by node.
     listing: std::sync::atomic::AtomicBool,
+    /// The sync's pace from this archive ([`Self::paced`]).
+    pace: Option<std::sync::Arc<crate::sync_pace::PeerPace>>,
 }
 
 impl RemoteTreeReader {
@@ -291,6 +293,26 @@ impl RemoteTreeReader {
             started: std::time::Instant::now(),
             batched: std::sync::atomic::AtomicBool::new(true),
             listing: std::sync::atomic::AtomicBool::new(true),
+            pace: None,
+        }
+    }
+
+    /// Count this walk's reads and archive time in `pace`, and fail its
+    /// reads, the one in flight included, once `pace` gives up on the
+    /// archive.
+    pub fn paced(mut self, pace: std::sync::Arc<crate::sync_pace::PeerPace>) -> Self {
+        self.pace = Some(pace);
+        self
+    }
+
+    /// Run the archive call `call` on the runtime, in the walk's pace.
+    fn wait<T>(&self, call: impl Future<Output = T>) -> Result<T> {
+        match &self.pace {
+            None => Ok(self.handle.block_on(call)),
+            Some(pace) => self
+                .handle
+                .block_on(pace.remote(crate::sync_pace::Wait::Walk, call))
+                .ok_or_else(|| anyhow::anyhow!(crate::sync_pace::PACE_GIVEN_UP)),
         }
     }
 
@@ -308,6 +330,9 @@ impl RemoteTreeReader {
             .reads
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         let reads = before + n as u64;
+        if let Some(pace) = &self.pace {
+            pace.add_reads(n as u64);
+        }
         let crossed =
             reads >= 1024 && (64 - before.leading_zeros()) != (64 - reads.leading_zeros());
         if (crossed || (reads >= 1024 && reads.is_power_of_two()))
@@ -332,8 +357,7 @@ impl TreeReader for RemoteTreeReader {
         let shard_id = self.shard_id.clone();
         let phase = self.phase;
         let bytes = self
-            .handle
-            .block_on(async move { client.get_forest_node(shard_id, phase, key_bytes).await })
+            .wait(async move { client.get_forest_node(shard_id, phase, key_bytes).await })?
             .map_err(|e| anyhow::anyhow!("remote get_forest_node: {e}"))?;
         match bytes {
             Some(b) => Ok(Some(borsh::from_slice(&b)?)),
@@ -351,13 +375,12 @@ impl TreeReader for RemoteTreeReader {
         let shard_id = self.shard_id.clone();
         let phase = self.phase;
         let kh = key_hash.0.to_vec();
-        self.handle
-            .block_on(async move {
-                client
-                    .get_forest_value(shard_id, phase, max_version, kh)
-                    .await
-            })
-            .map_err(|e| anyhow::anyhow!("remote get_forest_value: {e}"))
+        self.wait(async move {
+            client
+                .get_forest_value(shard_id, phase, max_version, kh)
+                .await
+        })?
+        .map_err(|e| anyhow::anyhow!("remote get_forest_value: {e}"))
     }
 
     fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
@@ -498,8 +521,7 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             .map(borsh::to_vec)
             .collect::<std::io::Result<Vec<_>>>()?;
         let answers = self
-            .handle
-            .block_on(self.nodes(encoded))
+            .wait(self.nodes(encoded))?
             .map_err(|e| anyhow::anyhow!("remote get_forest_nodes: {e}"))?;
         answers
             .into_iter()
@@ -521,7 +543,7 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             return Ok(None);
         }
         let (first, last) = quil_forest::key_range_under(bit_path);
-        match self.handle.block_on(self.listed(version, first, last)) {
+        match self.wait(self.listed(version, first, last))? {
             Ok(leaves) => Ok(leaves),
             Err(e) if e.is_unimplemented() => {
                 self.listing
@@ -542,8 +564,7 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             .iter()
             .map(|(version, key)| (*version, key.0.to_vec()))
             .collect();
-        self.handle
-            .block_on(self.values(reads))
+        self.wait(self.values(reads))?
             .map_err(|e| anyhow::anyhow!("remote get_forest_values: {e}"))
     }
 }
@@ -889,6 +910,108 @@ mod tests {
             matches!(outcome, Ok(Err(_)) | Ok(Ok(None))),
             "listing pages stepping back within their range were still followed after 5 s: \
              {served} pages of two leaves listed ({outcome:?})"
+        );
+    }
+
+    /// A sync's walk read waiting on an archive that never answers ends as
+    /// soon as the sync gives up on the archive, not at the read's deadline
+    /// (30 s, then sent again): an archive too slow to answer held a regular
+    /// node's GLOBAL prover tree pull for 28 minutes.
+    #[test]
+    fn a_paced_walk_read_ends_when_its_archive_is_given_up() {
+        use crate::sync_pace::{PeerPace, PACE_GIVEN_UP};
+        use std::sync::Arc;
+        use tonic::codegen::http;
+
+        /// An archive's GlobalService that never answers.
+        #[derive(Clone)]
+        struct Silent;
+
+        impl tonic::server::NamedService for Silent {
+            const NAME: &'static str = "quilibrium.node.global.pb.GlobalService";
+        }
+
+        impl tonic::codegen::Service<http::Request<tonic::body::BoxBody>> for Silent {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _: http::Request<tonic::body::BoxBody>) -> Self::Future {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        struct Incoming(tokio::net::TcpListener);
+
+        impl futures::Stream for Incoming {
+            type Item = std::io::Result<tokio::net::TcpStream>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.0
+                    .poll_accept(cx)
+                    .map(|result| Some(result.map(|(stream, _)| stream)))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        runtime.spawn(
+            tonic::transport::Server::builder()
+                .add_service(Silent)
+                .serve_with_incoming(Incoming(listener)),
+        );
+        let client = runtime
+            .block_on(ArchiveClient::connect_plaintext(&address))
+            .unwrap();
+        let pace = Arc::new(PeerPace::default());
+        let reader = RemoteTreeReader::new(client, runtime.handle().clone(), vec![1; 32], 0)
+            .paced(pace.clone());
+        let root = NodeKey::new(1, jmt::storage::NibblePath::new(vec![]));
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = quil_forest::BatchTreeReader::get_nodes(&reader, &[root]);
+            let _ = done.send(read.map(|nodes| nodes.len()).map_err(|e| e.to_string()));
+        });
+        // Wait until the read is in flight: its archive wait is counted.
+        let mut early = None;
+        while pace.sample().waited_ms == 0 {
+            match outcome.recv_timeout(Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                answered => {
+                    early = Some(answered);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            early, None,
+            "the read ended before its archive was given up"
+        );
+        assert_eq!(pace.summary().reads, 1);
+        pace.give_up();
+        // Under the read's own 30 s deadline.
+        let outcome = outcome.recv_timeout(Duration::from_secs(20));
+        runtime.shutdown_background();
+        assert!(
+            matches!(&outcome, Ok(Err(error)) if error.contains(PACE_GIVEN_UP)),
+            "the walk read went on waiting after its archive was given up: {outcome:?}"
         );
     }
 }

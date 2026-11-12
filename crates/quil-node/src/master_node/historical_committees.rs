@@ -488,6 +488,7 @@ impl HistoricalCommittees {
                     expected,
                     true,
                     false,
+                    None,
                 )
                 .await
             };

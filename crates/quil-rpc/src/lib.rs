@@ -24,6 +24,7 @@ pub mod quil_tls;
 pub mod reachability;
 pub mod shard_info_refresh;
 pub mod stub_services;
+pub mod sync_pace;
 
 pub use archive_client::{
     build_quil_client_config, ArchiveClient, ArchiveClientError, QuilPqNoiseConnector,

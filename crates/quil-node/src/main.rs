@@ -22,6 +22,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod effective_config;
 mod logging;
 
+mod archive_pace;
 mod forest_sync;
 mod prover_message_transport_prod;
 mod prover_tree_syncer_prod;
