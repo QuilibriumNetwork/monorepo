@@ -111,6 +111,10 @@ pub fn read(
 /// Record the roots of `header`, executed in GLOBAL frame `frame`, as its
 /// shard's snapshot for the next epoch: the first such header at or after
 /// that epoch's snapshot frame, in a hash-proof epoch. True when it recorded.
+/// Each record logs its frame against the renewal grace frame: a member
+/// renewing at or after that frame without the snapshot encoded renews
+/// without a registration, so a late record leaves the shard's members
+/// unsealed in the epoch.
 pub fn record(
     state: &HypergraphState,
     frame: u64,
@@ -152,6 +156,19 @@ pub fn record(
         frame,
         blob,
     )?;
+    use quil_types::consensus::{storage_snapshot_frame, storage_snapshot_grace};
+    let grace_frame = storage_snapshot_frame(epoch) + storage_snapshot_grace();
+    let late = frame >= grace_frame;
+    let action = if late {
+        "the shard's members had no snapshot to encode by the renewal grace frame and renewed \
+         without a registration, so they are unsealed in the epoch; check why no header of the \
+         shard executed in GLOBAL between the snapshot frame and the grace frame"
+    } else {
+        "no action needed"
+    };
+    tracing::info!(epoch, frame, grace_frame, late, filter = %hex::encode(&header.address),
+        shard_frame = header.frame_number, anchor = header.global_frame_number, action,
+        "storage snapshot recorded");
     Ok(true)
 }
 

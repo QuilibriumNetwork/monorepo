@@ -232,6 +232,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_UNSEALED_ISSUANCE_EPOCH override active (localnet only)"
         );
     }
+    let recovery_epoch = quil_types::consensus::init_seal_gate_recovery_epoch(network);
+    if network != 0 && recovery_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = recovery_epoch,
+            "QUIL_SEAL_GATE_RECOVERY_EPOCH override active (localnet only)"
+        );
+    }
     let kick_suspension_epoch = quil_types::consensus::init_storage_kick_suspension_epoch(network);
     if network != 0 && kick_suspension_epoch != u64::MAX {
         tracing::warn!(

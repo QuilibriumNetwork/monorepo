@@ -926,10 +926,17 @@ pub fn seal_unprovable(
 /// seal. From the unsealed issuance epoch (mainnet 1321) and before the
 /// sealed storage epoch (mainnet 1467) an unsealed participant is paid its
 /// share at once, so nothing is withheld; from the sealed storage epoch an
-/// unsealed seat is not eligible for its committees.
+/// unsealed seat is not eligible for its committees, and from the seal gate
+/// recovery epoch (mainnet 1484) it serves them and earns no issuance share.
 pub fn unsealed_seat_outcome(seal_epoch: u64) -> &'static str {
-    use quil_types::consensus::{sealed_storage_required, unsealed_issuance_epoch};
-    if sealed_storage_required(seal_epoch) {
+    use quil_types::consensus::{
+        seal_gate_rewards_only, sealed_storage_required, unsealed_issuance_epoch,
+    };
+    if seal_gate_rewards_only(seal_epoch) {
+        "from the seal gate recovery epoch a seat without a registration sealed before the \
+         epoch serves its committees in that epoch and earns no issuance share there; its \
+         fees are paid"
+    } else if sealed_storage_required(seal_epoch) {
         "from the sealed storage epoch a seat without a sealed registration sits out its \
          committees in that epoch and earns nothing there"
     } else if seal_epoch >= unsealed_issuance_epoch() {
@@ -2640,25 +2647,29 @@ mod tests {
     /// The warn for a failed seal says what GLOBAL does with an unsealed
     /// seat: from the unsealed issuance epoch (mainnet 1321) to the sealed
     /// storage epoch (mainnet 1467) it pays the share at once, so nothing is
-    /// withheld; from the sealed storage epoch the seat sits out.
+    /// withheld; from the sealed storage epoch the seat sits out, and from
+    /// the seal gate recovery epoch (mainnet 1484) it serves unpaid.
     #[test]
     fn a_failed_seal_names_what_global_does_with_an_unsealed_seat() {
         use quil_types::consensus::{
-            set_persistent_storage_epoch_for_thread, set_sealed_storage_epoch_for_thread,
-            set_unsealed_issuance_epoch_for_thread,
+            set_persistent_storage_epoch_for_thread, set_seal_gate_recovery_epoch_for_thread,
+            set_sealed_storage_epoch_for_thread, set_unsealed_issuance_epoch_for_thread,
         };
         set_unsealed_issuance_epoch_for_thread(Some(1321));
         set_sealed_storage_epoch_for_thread(Some(1467));
         set_persistent_storage_epoch_for_thread(Some(1467));
-        let outcomes: Vec<&str> = [1320, 1321, 1433, 1466, 1467, 1500]
+        set_seal_gate_recovery_epoch_for_thread(Some(1476));
+        let outcomes: Vec<&str> = [1320, 1321, 1433, 1466, 1467, 1475, 1476, 1500]
             .into_iter()
             .map(unsealed_seat_outcome)
             .collect();
         set_unsealed_issuance_epoch_for_thread(None);
         set_sealed_storage_epoch_for_thread(None);
         set_persistent_storage_epoch_for_thread(None);
+        set_seal_gate_recovery_epoch_for_thread(None);
         let paid = |outcome: &str| outcome.contains("pays an unsealed participant");
         let sits_out = |outcome: &str| outcome.contains("sits out");
+        let serves = |outcome: &str| outcome.contains("serves its committees");
         assert!(
             !paid(outcomes[0]) && !sits_out(outcomes[0]),
             "{}",
@@ -2670,9 +2681,15 @@ mod tests {
                 "unsealed_outcome_wrong: {outcome}"
             );
         }
-        for outcome in &outcomes[4..] {
+        for outcome in &outcomes[4..6] {
             assert!(
-                sits_out(outcome) && !paid(outcome),
+                sits_out(outcome) && !paid(outcome) && !serves(outcome),
+                "unsealed_outcome_wrong: {outcome}"
+            );
+        }
+        for outcome in &outcomes[6..] {
+            assert!(
+                serves(outcome) && !sits_out(outcome) && !paid(outcome),
                 "unsealed_outcome_wrong: {outcome}"
             );
         }

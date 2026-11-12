@@ -63,7 +63,7 @@ fn leader(rig: &Rig, anchor: Arc<dyn ClockStore>) -> Arc<AppLeaderProvider> {
 fn leader_with(
     rig: &Rig,
     anchor: Arc<dyn ClockStore>,
-    registry: Arc<crate::test_support::TestProverRegistry>,
+    registry: Arc<dyn ProverRegistry>,
 ) -> Arc<AppLeaderProvider> {
     Arc::new(AppLeaderProvider {
         filter: rig.filter.clone(),
@@ -1844,4 +1844,119 @@ fn seal_checkpoint_takes_its_validated_data_frame_though_another_view_came_first
     };
     assert_eq!(prepared.view, RANK);
     assert_eq!(prepared.digest, digest);
+}
+
+/// From the seal gate recovery epoch (mainnet 1484) sealing gates rewards
+/// only. A shard whose snapshot GLOBAL recorded after its members' renewal
+/// grace has every member renewed unsealed and still seated; its leaders
+/// counted no member without a sealed seat and declined every turn ("0
+/// active prover(s)"), so the shard produced nothing in the epoch (devnet,
+/// 2026-11-11). Before the recovery epoch an unsealed leader still
+/// declines.
+#[test]
+fn an_unsealed_seated_committee_proposes_from_the_recovery_epoch() {
+    use quil_consensus::leader_provider::LeaderProvider as _;
+    use quil_types::consensus::{
+        epoch_start_frame, ProverAllocationInfo, ProverInfo, ProverStatus, StorageSeatSlot,
+        StorageSnapshotRoots,
+    };
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1467));
+    let rig = rig();
+    let (before, epoch) = (1470, 2000);
+    let start = epoch_start_frame(epoch);
+    let registry = Arc::new(quil_execution::prover_registry::SharedProverRegistry::new());
+    registry.write_for_tests(|cache| {
+        for id in 1..=3u8 {
+            let allocation = ProverAllocationInfo {
+                status: ProverStatus::Active,
+                confirmation_filter: rig.filter.clone(),
+                rejection_filter: Vec::new(),
+                join_frame_number: 0,
+                leave_frame_number: 0,
+                pause_frame_number: 0,
+                resume_frame_number: 0,
+                kick_frame_number: 0,
+                join_confirm_frame_number: 0,
+                join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0,
+                leave_reject_frame_number: 0,
+                last_active_frame_number: 0,
+                last_signed_frame_number: 0,
+                epoch,
+                ring: 0,
+                vertex_address: Vec::new(),
+            };
+            cache.insert_prover_for_tests(ProverInfo {
+                public_key: vec![id; 897],
+                address: vec![id; 32],
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![allocation],
+                available_storage: 0,
+                seniority: 0,
+                delegate_address: Vec::new(),
+            });
+        }
+        // This member registered and never sealed; the others renewed
+        // without a registration.
+        cache.insert_storage_seat_slot_for_tests(
+            &[1; 32],
+            &rig.filter,
+            StorageSeatSlot {
+                epoch,
+                leaves: vec![vec![0]],
+                registered_at: start - 100,
+                sealed_at: None,
+                frames: 0,
+                accumulator: [0; 32],
+                chained: Vec::new(),
+                open: true,
+            },
+        );
+        cache.insert_storage_snapshot_for_tests(
+            &rig.filter,
+            StorageSnapshotRoots {
+                epoch,
+                frame: 90,
+                anchor: start - 300,
+                roots: [[4; 32]; 4],
+            },
+        );
+    });
+    let propose_at = |anchor: u64| {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: anchor,
+                output: vec![7; 516],
+                ..Default::default()
+            }),
+            requests: vec![],
+        };
+        let txn = store.new_transaction(false).unwrap();
+        store.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let resolved = crate::app_engine::resolve_global_anchor(&*store).0;
+        assert_eq!(resolved, anchor, "the proposal anchors where the test says");
+        let led = leader_with(&rig, store, registry.clone());
+        let parent: quil_consensus::models::Identity = genesis().to_vec();
+        led.prove_next_state(RANK, &rig.filter, 0, &parent)
+    };
+    let declined = match propose_at(epoch_start_frame(before) + 20) {
+        Ok(_) => panic!("before the recovery epoch an unsealed leader proposed"),
+        Err(error) => error.to_string(),
+    };
+    let proposed = propose_at(start + 20);
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    assert!(
+        declined.contains("local storage is not sealed"),
+        "before the recovery epoch an unsealed leader declines: {declined}"
+    );
+    assert!(
+        proposed.is_ok(),
+        "an unsealed seated committee builds no proposal from the recovery epoch, so its \
+         shard produces nothing in the epoch: {:?}",
+        proposed.err()
+    );
 }

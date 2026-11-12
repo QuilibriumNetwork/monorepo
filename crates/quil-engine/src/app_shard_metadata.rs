@@ -560,28 +560,10 @@ pub fn compute_storage_confirm(
     Ok(all)
 }
 
-/// GLOBAL frames a renewal signed at its grace frame keeps for inclusion
-/// before its epoch ends. GLOBAL refuses a confirm signed in one epoch and
-/// included in the next (`validate_confirm_epoch`), which leaves its seat
-/// expired.
-pub const RENEWAL_INCLUSION_FRAMES: u64 = 8;
-
-/// GLOBAL frames after an epoch's snapshot frame within which a renewal waits
-/// for the member's snapshot of it to be encoded; past them a member without
-/// one renews without a registration (its seat stays, its frames that epoch
-/// are unattested). Four ninths of an epoch, 320 frames on mainnet: the most
-/// that leaves a seat which labels its leaves at the snapshot as long again to
-/// label them for its seal before the epoch begins (decided 2026-10-26). A
-/// seat whose leaves were labelled ahead (`crate::storage_labels`) needs
-/// neither. In short epochs it ends [`RENEWAL_INCLUSION_FRAMES`] frames
-/// before the epoch's last frame, so a renewal made at it can still land.
-pub fn storage_snapshot_grace() -> u64 {
-    let length = quil_types::consensus::epoch_length_frames();
-    let latest = length.saturating_sub(
-        quil_types::consensus::STORAGE_SNAPSHOT_OFFSET + 1 + RENEWAL_INCLUSION_FRAMES,
-    );
-    (length * 4 / 9).min(latest)
-}
+/// The renewal grace, defined beside the snapshot frame so GLOBAL reads it
+/// too. A seat whose leaves were labelled ahead (`crate::storage_labels`)
+/// needs none.
+pub use quil_types::consensus::{storage_snapshot_grace, RENEWAL_INCLUSION_FRAMES};
 
 /// Ask for the snapshot of each of a seat's `filters` (its shard, then the
 /// shards a change creates from it) that `member` has not encoded for

@@ -1493,21 +1493,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Committee epoch is GLOBAL-frame-defined; read it at the anchor, NOT the
         // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
         let committee_frame = anchor_gfn;
-        if quil_types::consensus::sealed_storage_required_at(anchor_gfn) {
-            let slot = self.prover_registry.get_storage_seat_slot(
-                &self.local_prover_address,
-                &self.filter,
-                quil_types::consensus::epoch_for_frame(anchor_gfn),
-            )?;
-            if !quil_types::consensus::storage_seat_eligible(
-                &self.filter,
-                anchor_gfn,
-                slot.as_ref(),
-            ) {
-                return Err(QuilError::NoVote(
-                    "local storage is not sealed for this epoch".into(),
-                ));
-            }
+        // From the seal gate recovery epoch an unsealed member proposes as
+        // GLOBAL admits its header; it earns no issuance share.
+        if !quil_types::consensus::storage_participant_admitted(
+            &self.filter,
+            anchor_gfn,
+            |epoch| {
+                self.prover_registry.get_storage_seat_slot(
+                    &self.local_prover_address,
+                    &self.filter,
+                    epoch,
+                )
+            },
+        )? {
+            return Err(QuilError::NoVote(
+                "local storage is not sealed for this epoch".into(),
+            ));
         }
         let active = self
             .prover_registry
@@ -10992,25 +10993,20 @@ impl AppConsensusEngine {
             Arc::new(move |frame: &quil_types::proto::global::AppShardFrame| {
                 if let Some(header) = frame.header.as_ref() {
                     let anchor = header.global_frame_number;
-                    if quil_types::consensus::sealed_storage_required_at(anchor) {
-                        for address in [&member[..], &header.prover[..]] {
-                            let slot = registry
-                                .get_storage_seat_slot(
-                                    address,
-                                    &filter,
-                                    quil_types::consensus::epoch_for_frame(anchor),
-                                )
-                                .map_err(|error| ("storage seal unavailable", error.to_string()))?;
-                            if !quil_types::consensus::storage_seat_eligible(
-                                &filter,
-                                anchor,
-                                slot.as_ref(),
-                            ) {
-                                return Err((
-                                    "unsealed storage participant",
-                                    format!("anchor {anchor}"),
-                                ));
-                            }
+                    // From the seal gate recovery epoch unsealed members
+                    // vote and propose, as GLOBAL admits their headers.
+                    for address in [&member[..], &header.prover[..]] {
+                        let admitted = quil_types::consensus::storage_participant_admitted(
+                            &filter,
+                            anchor,
+                            |epoch| registry.get_storage_seat_slot(address, &filter, epoch),
+                        )
+                        .map_err(|error| ("storage seal unavailable", error.to_string()))?;
+                        if !admitted {
+                            return Err((
+                                "unsealed storage participant",
+                                format!("anchor {anchor}"),
+                            ));
                         }
                     }
                 }
