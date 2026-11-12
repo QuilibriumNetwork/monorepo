@@ -124,14 +124,22 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// for them, and the window leaves the slower readers of finalized bodies
 /// (materialization, recovery) time to take them. A reader that takes them
 /// later than that holds the window at the lowest view it still has to take
-/// ([`BlockStore::hold_from`]). Over a cap, the store evicts first the
-/// candidates' bodies (of blocks no certificate names and this node never
-/// verified), those of the sender holding the most first, and the other
-/// bodies held beside a certified block's first while none is verified,
-/// then the blocks of the oldest views, but never a verified or certified
-/// block of the latest `protected_views` views or of the held window. Each
-/// member's candidate bodies of one view are held to a quota as well. A
-/// body that arrives after a certificate named it is stored as certified.
+/// ([`BlockStore::hold_from`]). The candidates' bodies (of blocks no
+/// certificate names and this node never verified) have caps of their own,
+/// those of the sender holding the most going first, and so do the other bodies
+/// held beside a certified block's first while none is verified, the oldest
+/// views' first. Over the byte cap, the latter go first, then the blocks of
+/// views below the latest `protected_views` views, candidates before vouched
+/// blocks and the oldest views first, and only then the candidates' bodies of
+/// later views: an application shard's finalized bodies older than the
+/// protected views thus go before a new proposal, and a later reader of one
+/// (recovery) reads it from storage or fetches it again. Over the block cap
+/// alone, the candidates' bodies go first, then the blocks of the oldest views.
+/// Never a verified or certified block of the protected views, nor a finalized
+/// body a reader has still to take. Each member's candidate bodies of one view
+/// are held to a quota as well. A body that arrives after a certificate named
+/// it is stored as certified. Past three quarters of its byte cap the store
+/// warns.
 #[derive(Clone, Default)]
 pub struct BlockStore {
     inner: Arc<Mutex<Blocks>>,
@@ -203,10 +211,17 @@ impl Default for BlockStoreLimits {
 impl BlockStoreLimits {
     /// GLOBAL: its finalizer takes each finalized body when the finalization
     /// is reported, and proposals and ancestors are also kept in the clock
-    /// store, so a shorter window suffices.
+    /// store, so a shorter window suffices. Its frames average about 4 MB,
+    /// so the window's verified frames take about 550 MB: the byte cap holds
+    /// them and the candidate budget below three quarters of it, where the
+    /// store warns, and a window of frames almost twice as large below it.
+    /// With the alternates' budget full too, about 820 MB in all, the store
+    /// passes that warn mark (about 805 MB): peers delivering bodies can
+    /// raise the warn, at most once a minute.
     pub fn global() -> Self {
         Self {
             keep_views: 128,
+            max_bytes: 1 << 30,
             ..Self::default()
         }
     }
@@ -379,6 +394,7 @@ struct Blocks {
     /// Names the next body stored ([`Origin::body`]).
     next_body: u64,
     evicted: Evicted,
+    pressure: Pressure,
 }
 
 /// Blocks evicted over a cap since the last eviction log line.
@@ -390,19 +406,90 @@ struct Evicted {
     last_report: Option<std::time::Instant>,
 }
 
-/// One eviction log line.
-struct EvictionReport {
+/// The store's bytes past three quarters of its byte cap ([`pressure_marks`]).
+#[derive(Default)]
+struct Pressure {
+    /// When the bytes passed the high mark, until they are back at the low.
+    since: Option<std::time::Instant>,
+    /// The most bytes held since.
+    peak: usize,
+    /// Whether a line reported this stretch.
+    reported: bool,
+    last_report: Option<std::time::Instant>,
+}
+
+/// Past the first mark, three quarters of `max_bytes`, a store warns that it
+/// nears its byte cap; it is back once at the second, five eighths of it.
+fn pressure_marks(max_bytes: usize) -> (usize, usize) {
+    (max_bytes - max_bytes / 4, max_bytes - max_bytes / 8 * 3)
+}
+
+/// A store's line about its bytes nearing its byte cap: past the high mark
+/// at once, again at most once a [`EVICTION_REPORT_INTERVAL`], and back at
+/// the low mark once a line reported it.
+#[derive(Debug, PartialEq, Eq)]
+enum PressureLine {
+    /// Past the high mark for `lasted` (zero: it just passed it).
+    Above {
+        lasted: std::time::Duration,
+        peak: usize,
+    },
+    /// Back at the low mark after `lasted` past the high one.
+    Cleared {
+        lasted: std::time::Duration,
+        peak: usize,
+    },
+}
+
+/// The lines one change of a store logs: what it evicted over a cap and
+/// its bytes nearing the byte cap.
+struct CapReport {
     scope: String,
     candidates: u64,
     vouched: u64,
     bytes: u64,
     held_blocks: usize,
     held_bytes: usize,
+    max_bytes: usize,
+    candidate_bytes: usize,
+    alternate_bytes: usize,
     since_previous: Option<std::time::Duration>,
+    pressure: Option<PressureLine>,
 }
 
-impl EvictionReport {
+impl CapReport {
     fn log(&self) {
+        if self.candidates > 0 || self.vouched > 0 {
+            self.log_evictions();
+        }
+        match self.pressure {
+            Some(PressureLine::Above { lasted, peak }) => tracing::warn!(
+                scope = %self.scope,
+                held_bytes = self.held_bytes,
+                held_blocks = self.held_blocks,
+                max_bytes = self.max_bytes,
+                peak_bytes = peak,
+                candidate_bytes = self.candidate_bytes,
+                alternate_bytes = self.alternate_bytes,
+                above_for_s = lasted.as_secs(),
+                "consensus block store past three quarters of its byte cap: at the cap it \
+                 evicts verified or certified blocks of old views; candidate_bytes and \
+                 alternate_bytes are peer deliveries this node has not verified; report this \
+                 line if it repeats"
+            ),
+            Some(PressureLine::Cleared { lasted, peak }) => tracing::info!(
+                scope = %self.scope,
+                held_bytes = self.held_bytes,
+                max_bytes = self.max_bytes,
+                peak_bytes = peak,
+                above_for_s = lasted.as_secs(),
+                "consensus block store back below five eighths of its byte cap"
+            ),
+            None => {}
+        }
+    }
+
+    fn log_evictions(&self) {
         let window = match self.since_previous {
             Some(elapsed) => format!("the last {}s", elapsed.as_secs()),
             None => "the store started".to_string(),
@@ -458,6 +545,7 @@ impl Blocks {
             next_seq: 0,
             next_body: 0,
             evicted: Evicted::default(),
+            pressure: Pressure::default(),
         }
     }
 
@@ -468,7 +556,7 @@ impl Blocks {
         bytes: Vec<u8>,
         verified: bool,
         sender: Option<&[u8]>,
-    ) -> Option<EvictionReport> {
+    ) -> Option<CapReport> {
         self.place(digest, bytes, verified, sender);
         self.enforce_caps()
     }
@@ -514,7 +602,7 @@ impl Blocks {
         digest: Digest,
         bytes: Vec<u8>,
         sender: Option<&[u8]>,
-    ) -> Option<EvictionReport> {
+    ) -> Option<CapReport> {
         if !self.map.contains_key(&digest) {
             self.place(digest, bytes, false, sender);
             self.hold_quota(sender);
@@ -779,7 +867,7 @@ impl Blocks {
     /// A certificate names `digest`; `view` is its view, when it is one of
     /// this store's. A candidate's alternates then count against the cap of
     /// those beside certified blocks.
-    fn certify(&mut self, digest: &Digest, view: Option<u64>) -> Option<EvictionReport> {
+    fn certify(&mut self, digest: &Digest, view: Option<u64>) -> Option<CapReport> {
         if let Some(view) = view {
             self.note_certificate(view);
         }
@@ -806,11 +894,11 @@ impl Blocks {
 
     /// `view` finalized, and a reader still has to take the finalized bodies
     /// from `held` on.
-    fn finalize(&mut self, view: u64, held: Option<u64>) {
+    fn finalize(&mut self, view: u64, held: Option<u64>) -> Option<CapReport> {
         self.note_certificate(view);
         self.held_view = held;
         if view <= self.finalized_view {
-            return;
+            return None;
         }
         self.finalized_view = view;
         let anchor = held.map_or(view, |held| held.min(view));
@@ -826,9 +914,10 @@ impl Blocks {
         }
         self.certified_digests
             .retain(|_, certified| *certified >= below);
+        self.cap_report(std::time::Instant::now())
     }
 
-    fn enforce_caps(&mut self) -> Option<EvictionReport> {
+    fn enforce_caps(&mut self) -> Option<CapReport> {
         let limits = self.limits;
         // A member writes the header the digest hashes, so it can make up
         // any number of digests: evicted oldest first, a member's tiny made-up
@@ -866,40 +955,52 @@ impl Blocks {
             };
             self.drop_alternates(&victim);
         }
+        // A reader still has to take the finalized bodies from the held view
+        // on; those it took go as other blocks of old views do.
         let mut floor = self.certified_view.saturating_sub(limits.protected_views);
         if let Some(held) = self.held_view {
-            floor = floor.min(held.saturating_sub(limits.keep_views));
+            floor = floor.min(held);
         }
+        let old = |block: &StoredBlock| block.view < floor;
         while self.map.len() > limits.max_blocks || self.bytes > limits.max_bytes {
-            let by_bytes = self.map.len() <= limits.max_blocks;
-            // Over the byte cap alone, the blocks of views below the
-            // protected ones go first: GLOBAL's verified frames of its window
-            // alone fill the cap, and with the candidates going first each new
-            // proposal's body was evicted on arrival, before a voter read it.
-            if by_bytes {
-                if let Some(victim) = self.eviction_victim(|block| block.view < floor) {
+            let over_bytes = self.bytes > limits.max_bytes;
+            // Over the byte cap, alone or with the block cap, the blocks of
+            // views below the protected ones go first: GLOBAL's verified
+            // frames of its window can fill the cap, and with the candidates
+            // going first each new proposal's body was evicted on arrival,
+            // before a voter read it.
+            if over_bytes {
+                if let Some(victim) = self.eviction_victim(old) {
                     self.evict(&victim);
                     continue;
                 }
             }
-            // Candidates first, as above, then vouched blocks of old views.
+            // Then candidates, the member holding the most first. Over the
+            // block cap alone they go first, made-up digests costing a member
+            // nothing, and the blocks of old views after them.
+            let by_bytes = self.map.len() <= limits.max_blocks;
             if let Some((body, victim)) = self.crowding_victim(by_bytes) {
                 if !self.remove_body(&victim, body) {
                     break;
                 }
                 continue;
             }
-            let Some(victim) = self.eviction_victim(|block| block.view < floor) else {
+            if over_bytes {
+                break;
+            }
+            let Some(victim) = self.eviction_victim(old) else {
                 break;
             };
             self.evict(&victim);
         }
-        self.eviction_report(std::time::Instant::now())
+        self.cap_report(std::time::Instant::now())
     }
 
     /// The block to evict first among the `eligible`: candidates before
     /// vouched blocks, then the lowest view, then the earliest arrival.
-    /// Candidate bodies go by [`Self::crowding_victim`] instead.
+    /// Candidate bodies go by [`Self::crowding_victim`] instead, body by
+    /// body, but over the byte cap a candidate of a view below the protected
+    /// ones goes here, as a block.
     fn eviction_victim(&self, eligible: impl Fn(&StoredBlock) -> bool) -> Option<Digest> {
         self.map
             .iter()
@@ -919,28 +1020,82 @@ impl Blocks {
         }
     }
 
-    /// At most one report per [`EVICTION_REPORT_INTERVAL`]; the first
-    /// eviction after a quiet interval is reported at once.
-    fn eviction_report(&mut self, now: std::time::Instant) -> Option<EvictionReport> {
-        if self.evicted.candidates == 0 && self.evicted.vouched == 0 {
-            return None;
-        }
+    /// Evictions at most once per [`EVICTION_REPORT_INTERVAL`], the first
+    /// after a quiet interval at once; and the [`PressureLine`] due.
+    fn cap_report(&mut self, now: std::time::Instant) -> Option<CapReport> {
+        let pressure = self.pressure_line(now);
         let since_previous = self
             .evicted
             .last_report
             .map(|last| now.saturating_duration_since(last));
-        if since_previous.is_some_and(|elapsed| elapsed < EVICTION_REPORT_INTERVAL) {
+        let evictions = (self.evicted.candidates > 0 || self.evicted.vouched > 0)
+            && since_previous.is_none_or(|elapsed| elapsed >= EVICTION_REPORT_INTERVAL);
+        if !evictions && pressure.is_none() {
             return None;
         }
-        self.evicted.last_report = Some(now);
-        Some(EvictionReport {
+        let (candidates, vouched, bytes) = if evictions {
+            self.evicted.last_report = Some(now);
+            (
+                std::mem::take(&mut self.evicted.candidates),
+                std::mem::take(&mut self.evicted.vouched),
+                std::mem::take(&mut self.evicted.bytes),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        Some(CapReport {
             scope: self.scope.clone(),
-            candidates: std::mem::take(&mut self.evicted.candidates),
-            vouched: std::mem::take(&mut self.evicted.vouched),
-            bytes: std::mem::take(&mut self.evicted.bytes),
+            candidates,
+            vouched,
+            bytes,
             held_blocks: self.map.len(),
             held_bytes: self.bytes,
+            max_bytes: self.limits.max_bytes,
+            candidate_bytes: self.candidate_bytes,
+            alternate_bytes: self.certified_alternate_bytes,
             since_previous,
+            pressure,
+        })
+    }
+
+    /// The line due about the bytes nearing the byte cap: past the high mark
+    /// ([`pressure_marks`]) at once and then at most once a
+    /// [`EVICTION_REPORT_INTERVAL`] until they are back at the low mark,
+    /// which is reported if a line reported the stretch.
+    fn pressure_line(&mut self, now: std::time::Instant) -> Option<PressureLine> {
+        let (high, low) = pressure_marks(self.limits.max_bytes);
+        let bytes = self.bytes;
+        let pressure = &mut self.pressure;
+        let since = match pressure.since {
+            Some(since) => since,
+            None if bytes > high => {
+                pressure.since = Some(now);
+                pressure.peak = 0;
+                pressure.reported = false;
+                now
+            }
+            None => return None,
+        };
+        pressure.peak = pressure.peak.max(bytes);
+        let lasted = now.saturating_duration_since(since);
+        if bytes <= low {
+            pressure.since = None;
+            return pressure.reported.then_some(PressureLine::Cleared {
+                lasted,
+                peak: pressure.peak,
+            });
+        }
+        if pressure
+            .last_report
+            .is_some_and(|last| now.saturating_duration_since(last) < EVICTION_REPORT_INTERVAL)
+        {
+            return None;
+        }
+        pressure.last_report = Some(now);
+        pressure.reported = true;
+        Some(PressureLine::Above {
+            lasted,
+            peak: pressure.peak,
         })
     }
 }
@@ -1127,7 +1282,10 @@ impl BlockStore {
         // holds it while it reads the store.
         let hold = self.inner.lock().hold.clone();
         let held = hold.and_then(|hold| hold());
-        self.inner.lock().finalize(view, held);
+        let report = self.inner.lock().finalize(view, held);
+        if let Some(report) = report {
+            report.log();
+        }
     }
 
     /// Let a reader that takes finalized bodies later than their
@@ -3132,6 +3290,94 @@ mod block_store_bound_tests {
             assert_eq!(store.usage(), (16, 16 << 10));
         }
         assert_eq!(held(&store, 25..=40), 16);
+    }
+
+    /// Past three quarters of its byte cap a store warns at once, then at
+    /// most once a minute until it is back at five eighths, and says so:
+    /// an operator sees it nearing the cap before it evicts verified blocks.
+    #[test]
+    fn a_store_nearing_its_byte_cap_warns_at_once_then_once_a_minute() {
+        let limits = BlockStoreLimits {
+            max_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let mut blocks = Blocks::new(limits, "test".to_string());
+        let start = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        let line = |blocks: &mut Blocks, at: u64| {
+            blocks
+                .cap_report(start + secs(at))
+                .and_then(|report| report.pressure)
+        };
+        for n in 1..=4u32 {
+            blocks.place(digest_n(n), vec![0; 12 << 10], true, None);
+        }
+        assert_eq!(
+            line(&mut blocks, 0),
+            None,
+            "NEAR-CAP: warned at three quarters"
+        );
+        blocks.place(digest_n(5), vec![0; 1 << 10], true, None);
+        assert_eq!(
+            line(&mut blocks, 0),
+            Some(PressureLine::Above {
+                lasted: secs(0),
+                peak: 49 << 10,
+            }),
+            "NEAR-CAP: no warn past three quarters of the byte cap"
+        );
+        assert_eq!(
+            line(&mut blocks, 59),
+            None,
+            "NEAR-CAP: warned twice in a minute"
+        );
+        blocks.place(digest_n(6), vec![0; 2 << 10], true, None);
+        assert_eq!(
+            line(&mut blocks, 60),
+            Some(PressureLine::Above {
+                lasted: secs(60),
+                peak: 51 << 10,
+            }),
+            "NEAR-CAP: no warn a minute later"
+        );
+        blocks.take(&digest_n(6));
+        blocks.take(&digest_n(5));
+        assert_eq!(blocks.bytes, 48 << 10);
+        assert_eq!(
+            line(&mut blocks, 61),
+            None,
+            "NEAR-CAP: back above five eighths"
+        );
+        blocks.take(&digest_n(1));
+        assert_eq!(
+            line(&mut blocks, 62),
+            Some(PressureLine::Cleared {
+                lasted: secs(62),
+                peak: 51 << 10,
+            }),
+            "NEAR-CAP: no line once back at five eighths"
+        );
+        assert_eq!(
+            line(&mut blocks, 63),
+            None,
+            "NEAR-CAP: said twice it was back"
+        );
+        // Past the mark again within a minute of the last warn: the next
+        // one waits for the minute.
+        blocks.place(digest_n(7), vec![0; 13 << 10], true, None);
+        assert_eq!(
+            line(&mut blocks, 70),
+            None,
+            "NEAR-CAP: warned twice in a minute"
+        );
+        assert_eq!(
+            line(&mut blocks, 120),
+            Some(PressureLine::Above {
+                lasted: secs(50),
+                peak: 49 << 10,
+            }),
+            "NEAR-CAP: no warn a minute after the last"
+        );
     }
 
     /// A body that arrives after a certificate named it is stored as a
