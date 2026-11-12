@@ -2828,19 +2828,69 @@ mod block_store_bound_tests {
         assert_eq!(store.usage(), (4, 13 << 10));
     }
 
-    /// About the average GLOBAL frame: its window's verified frames alone
+    /// About the average GLOBAL frame.
+    const AVERAGE_GLOBAL_FRAME: usize = 4_300_000;
+
+    /// GLOBAL frames twice the average: its window's verified frames alone
     /// pass GLOBAL's byte cap.
-    const GLOBAL_FRAME: usize = 4_300_000;
+    const GLOBAL_FRAME: usize = 2 * AVERAGE_GLOBAL_FRAME;
 
     /// Seal and certify a frame of `GLOBAL_FRAME` bytes for each view, each
     /// finalized in turn, as GLOBAL's own verified frames.
     fn fill_verified(store: &BlockStore, views: std::ops::RangeInclusive<u32>) {
+        fill_frames(store, views, GLOBAL_FRAME);
+    }
+
+    /// [`fill_verified`] with frames of `frame` bytes.
+    fn fill_frames(store: &BlockStore, views: std::ops::RangeInclusive<u32>, frame: usize) {
         for view in views {
             store.observe_certificate(view.into());
-            store.seal(digest_n(view), vec![0; GLOBAL_FRAME]);
+            store.seal(digest_n(view), vec![0; frame]);
             store.certified(&digest_n(view), view.into());
             store.finalized(view.into());
         }
+    }
+
+    /// GLOBAL's byte cap holds its window of average frames and full
+    /// candidate budgets with room to spare: at the cap the store evicts
+    /// verified frames of old views, so a cap its window fills evicts at
+    /// every frame and repeats its warn each minute.
+    #[test]
+    fn global_byte_cap_holds_its_window_of_average_frames_and_candidates() {
+        let limits = BlockStoreLimits::global();
+        let store = BlockStore::with_limits(limits, "GLOBAL");
+        let window = limits.keep_views as u32;
+        fill_frames(&store, 1..=2 * window, AVERAGE_GLOBAL_FRAME);
+        // Members fill the candidate budget, each to its quota of the view.
+        let quota = limits.max_sender_candidate_bytes / AVERAGE_GLOBAL_FRAME;
+        let budget = limits.max_candidate_bytes / AVERAGE_GLOBAL_FRAME;
+        for member in 0..budget.div_ceil(quota) as u32 {
+            for n in 0..quota as u32 {
+                let made_up = digest_n(10_000 + 100 * member + n);
+                store.put_from(
+                    made_up,
+                    vec![0; AVERAGE_GLOBAL_FRAME],
+                    &member.to_be_bytes(),
+                );
+            }
+        }
+        assert_eq!(
+            held(&store, window..=2 * window) as u32,
+            window + 1,
+            "GLOBAL-CAP: the byte cap evicted verified frames of GLOBAL's window of average frames"
+        );
+        let (blocks, bytes) = store.usage();
+        assert_eq!(
+            blocks,
+            window as usize + 1 + budget,
+            "rig check: the candidate budget is full"
+        );
+        assert!(
+            bytes <= limits.max_bytes / 4 * 3,
+            "GLOBAL-CAP: {bytes} bytes of average frames and candidates leave no room below \
+             three quarters of GLOBAL's byte cap ({})",
+            limits.max_bytes
+        );
     }
 
     /// Whether `digest`'s body is the leader's frame of `GLOBAL_FRAME` ones.
@@ -2936,7 +2986,8 @@ mod block_store_bound_tests {
             ..BlockStoreLimits::global()
         };
         let store = BlockStore::with_limits(limits, "GLOBAL");
-        fill_verified(&store, 1..=100);
+        let views = (limits.max_bytes / GLOBAL_FRAME - 2 * quota) as u32;
+        fill_verified(&store, 1..=views);
         store.put_from(proposal, vec![1; GLOBAL_FRAME], b"leader");
         for member in 0..4u32 {
             for n in 0..16u32 {
@@ -2954,7 +3005,7 @@ mod block_store_bound_tests {
             holds_leader_frame(&store, &proposal),
             "VULNERABLE: members' made-up frames evicted the leader's proposal over the byte cap"
         );
-        assert_eq!(held(&store, 1..=100), 100);
+        assert_eq!(held(&store, 1..=views), views as usize);
     }
 
     /// A reader still taking finalized bodies holds the window at the lowest
@@ -2980,6 +3031,107 @@ mod block_store_bound_tests {
         store.finalized(31);
         assert_eq!(held(&store, 1..=20), 0);
         assert_eq!(held(&store, 21..=30), 10);
+    }
+
+    /// Over the byte cap, a reader's hold keeps the finalized bodies it has
+    /// still to take, and only those: the ones it took go before a new
+    /// proposal's body, as with no reader, or each proposal was evicted on
+    /// arrival and refused until the reader caught up.
+    #[test]
+    fn over_the_byte_cap_a_hold_keeps_only_bodies_the_reader_has_not_taken() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            protected_views: 2,
+            max_bytes: 32 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let pending = Arc::new(std::sync::Mutex::new(Some(15u64)));
+        let hold = pending.clone();
+        store.hold_from(Arc::new(move || *hold.lock().unwrap()));
+        for view in 1..=30u32 {
+            store.observe_certificate(view.into());
+            store.seal(digest_n(view), vec![view as u8; 1 << 10]);
+            store.certified(&digest_n(view), view.into());
+            store.finalized(view.into());
+        }
+        assert_eq!(
+            store.usage(),
+            (26, 26 << 10),
+            "rig check: views 5 to 30 held"
+        );
+        // The reader lags: nothing more finalizes while views go on, and
+        // each proposal is verified and certified after it arrives.
+        for view in 31..=40u32 {
+            store.observe_certificate(view.into());
+            let proposal = digest_n(1000 + view);
+            store.put_from(proposal, vec![0xaa; 1 << 10], b"leader");
+            assert_eq!(
+                store.get(&proposal),
+                Some(vec![0xaa; 1 << 10]),
+                "LIVENESS: with a reader's hold, the proposal of view {view} was evicted on \
+                 arrival while bodies the reader took were held"
+            );
+            store.seal(proposal, vec![0xaa; 1 << 10]);
+            store.certified(&proposal, view.into());
+        }
+        // A member floods made-up candidates: the bodies the reader took
+        // go, then the member's own, never one the reader has still to take.
+        store.observe_certificate(41);
+        let proposal = digest_n(1041);
+        store.put_from(proposal, vec![0xaa; 1 << 10], b"leader");
+        for n in 0..8u32 {
+            store.put_from(digest_n(2000 + n), vec![0xbb; 1 << 10], b"member");
+        }
+        assert_eq!(
+            held(&store, 15..=30),
+            16,
+            "HOLD: a finalized body the reader has still to take was evicted over the byte cap"
+        );
+        assert_eq!(store.get(&proposal), Some(vec![0xaa; 1 << 10]));
+        assert_eq!(
+            held(&store, 1..=14),
+            0,
+            "the bodies the reader took went first"
+        );
+        assert_eq!(held(&store, 1031..=1040), 10);
+        assert_eq!(held(&store, 2000..2008), 5);
+        assert_eq!(store.usage(), (32, 32 << 10));
+    }
+
+    /// Over the block and byte caps at once, the blocks of views below the
+    /// protected ones go before a new proposal's body, as over the byte cap
+    /// alone.
+    #[test]
+    fn over_both_caps_blocks_of_old_views_go_before_a_new_proposal() {
+        let limits = BlockStoreLimits {
+            keep_views: 1000,
+            protected_views: 2,
+            max_blocks: 16,
+            max_bytes: 16 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for view in 1..=16u32 {
+            store.observe_certificate(view.into());
+            store.seal(digest_n(view), vec![view as u8; 1 << 10]);
+            store.certified(&digest_n(view), view.into());
+        }
+        assert_eq!(store.usage(), (16, 16 << 10), "rig check: at both caps");
+        for view in 17..=40u32 {
+            store.observe_certificate(view.into());
+            let proposal = digest_n(view);
+            store.put_from(proposal, vec![0xaa; 1 << 10], b"leader");
+            assert_eq!(
+                store.get(&proposal),
+                Some(vec![0xaa; 1 << 10]),
+                "LIVENESS: over both caps, the proposal of view {view} was evicted on arrival"
+            );
+            store.seal(proposal, vec![0xaa; 1 << 10]);
+            store.certified(&proposal, view.into());
+            assert_eq!(store.usage(), (16, 16 << 10));
+        }
+        assert_eq!(held(&store, 25..=40), 16);
     }
 
     /// A body that arrives after a certificate named it is stored as a
