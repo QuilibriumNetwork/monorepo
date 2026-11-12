@@ -392,6 +392,18 @@ impl RocksDb {
         Self::store_options_for(Some(block_cache_bytes), None).0
     }
 
+    /// A store opened with `opts` as they are, without migrations: tests
+    /// that size its levels or count its writes.
+    #[cfg(test)]
+    pub(crate) fn open_with_options(path: &Path, opts: &rocksdb::Options) -> Result<Self> {
+        let db = rocksdb::DB::open(opts, path)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
+        Ok(Self {
+            db: Self::coordinated(db),
+            shared_block_cache: false,
+        })
+    }
+
     /// [`Self::store_options`], with the process's shared block cache for
     /// `None`, counting writes under `class` if any; and whether the cache
     /// is the shared one.
@@ -894,6 +906,25 @@ impl store::KvDb for RocksDb {
         self.make_iter(lower, upper)
     }
 
+    /// One seek of a bounded iterator, its key copied alone: the
+    /// [`RocksIterator`] of [`Self::new_iter`] copies every value in its
+    /// bounds first. The blocks it reads stay out of the block cache.
+    fn first_key_in(&self, lower: &[u8], upper: &[u8]) -> Result<Option<Vec<u8>>> {
+        if lower >= upper {
+            return Ok(None);
+        }
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_upper_bound(upper.to_vec());
+        options.fill_cache(false);
+        let mut iter = self.db.raw_iterator_opt(options);
+        iter.seek(lower);
+        if let Some(key) = iter.key() {
+            return Ok(Some(key.to_vec()));
+        }
+        iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(None)
+    }
+
     fn compact(&self, start: &[u8], end: &[u8], _parallelize: bool) -> Result<()> {
         self.db.compact_range(Some(start), Some(end));
         Ok(())
@@ -1155,5 +1186,36 @@ impl store::Iterator for RocksIterator {
         }
         self.pos = self.entries.len() as i64 - 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod first_key_tests {
+    use super::*;
+    use quil_types::store::KvDb;
+
+    /// A range's first key is its first live one: keys a range deletion
+    /// hides are stepped over, and a key at the range's end is past it.
+    #[test]
+    fn first_key_in_finds_the_first_live_key_within_its_bounds() {
+        let rocks = RocksDb::open_in_memory().unwrap();
+        let db: &dyn KvDb = &rocks;
+        for key in [b"a1", b"b1", b"b2", b"b3", b"c1"] {
+            db.set(key, &[7; 64]).unwrap();
+        }
+        db.delete_range(b"b1", b"b3").unwrap();
+        let first = |lower: &[u8], upper: &[u8]| db.first_key_in(lower, upper).unwrap();
+        assert_eq!(
+            first(b"b", b"c"),
+            Some(b"b3".to_vec()),
+            "PROBE-HIDDEN: the first key of b.. is b3, b1 and b2 deleted"
+        );
+        assert_eq!(
+            first(b"a2", b"b3"),
+            None,
+            "PROBE-BOUND: a2..b3 holds no live key; b3 is its end"
+        );
+        assert_eq!(first(b"a", b"z"), Some(b"a1".to_vec()));
+        assert_eq!(first(b"c", b"b"), None, "an empty range holds no key");
     }
 }

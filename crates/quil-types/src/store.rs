@@ -62,6 +62,16 @@ pub trait KvDb: Send + Sync {
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
+    /// The first key in `[lower, upper)`, or `None`: a probe of a range
+    /// whose values are too large to read, which RocksDB answers without
+    /// reading them out. Elsewhere through [`Self::new_iter`], which may
+    /// read the whole range.
+    fn first_key_in(&self, lower: &[u8], upper: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut iter = self.new_iter(lower, upper)?;
+        let key = iter.first().then(|| iter.key().to_vec());
+        iter.close()?;
+        Ok(key)
+    }
     fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()>;
     /// Compact `[start, end)` through the bottommost level, without holding
     /// off automatic compactions, when a live file overlapping it is at
