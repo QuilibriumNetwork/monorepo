@@ -562,10 +562,77 @@ pub(super) fn claim_command(
         .join(" ")
 }
 
+/// Why one mint authorization status read got no answer, when another read
+/// may get one: the node or the path to it, not the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unanswered {
+    /// No connection to the node.
+    Connect,
+    /// A per-request deadline, this client's or the node's, passed.
+    Deadline,
+    /// The connection failed during the read.
+    Transport,
+    /// The node's status readers were all busy.
+    Busy,
+}
+
+impl Unanswered {
+    /// The class of a failed read worth repeating, or `None` for an answer
+    /// from the node itself. A status this client made from a transport
+    /// failure or its own deadline carries that failure as its source; one
+    /// the node sent carries none. The node's own Unavailable means it does
+    /// not report authorization status.
+    fn of(status: &tonic::Status) -> Option<Self> {
+        let local = std::error::Error::source(status).is_some();
+        match status.code() {
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => Some(Self::Deadline),
+            _ if local => Some(Self::Transport),
+            tonic::Code::ResourceExhausted | tonic::Code::Aborted => Some(Self::Busy),
+            _ => None,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Self::Connect => "cannot reach the node",
+            Self::Deadline => "no answer before the request's deadline",
+            Self::Transport => "the connection failed",
+            Self::Busy => "the node's status readers are busy",
+        }
+    }
+}
+
+/// One status read: the node's answer, or why there was none.
+enum StatusRead {
+    Answer(Result<quil_types::proto::node::GetMintAuthorizationStatusResponse, tonic::Status>),
+    Unanswered(Unanswered, String),
+}
+
+async fn read_mint_status(tc: &TokenCtx, receipt: &[u8; 32]) -> StatusRead {
+    let mut client = match tc.connect().await {
+        Ok(client) => client,
+        Err(error) => return StatusRead::Unanswered(Unanswered::Connect, format!("{error:#}")),
+    };
+    let status = client
+        .get_mint_authorization_status(quil_types::proto::node::GetMintAuthorizationStatusRequest {
+            receipt: receipt.to_vec(),
+        })
+        .await;
+    match status {
+        Ok(response) => StatusRead::Answer(Ok(response.into_inner())),
+        Err(status) => match Unanswered::of(&status) {
+            Some(class) => StatusRead::Unanswered(class, status.to_string()),
+            None => StatusRead::Answer(Err(status)),
+        },
+    }
+}
+
 /// Wait until `deadline` for the node to report the reward mint authorization
-/// `mint` claimable, polling at least once. A node that does not report
-/// authorization status (an older release, or one without a coin provider)
-/// leaves the claim to find out: `Ok(false)`.
+/// `mint` claimable, polling at least once. A read the node does not answer
+/// (a deadline, a lost connection, busy readers) is read again until the
+/// deadline, said once per class; every read after the first ends with the
+/// wait. A node that does not report authorization status (an older release,
+/// or one without a coin provider) leaves the claim to find out: `Ok(false)`.
 pub(in crate::commands::token) async fn await_claimable(
     tc: &TokenCtx,
     mint: &quil_lattice_ct::confidential::mint::MintStatement,
@@ -574,26 +641,34 @@ pub(in crate::commands::token) async fn await_claimable(
 ) -> anyhow::Result<bool> {
     use quil_types::proto::node::MintAuthorizationState as State;
     let receipt = quil_execution::token_intrinsic::mint_authorization::receipt_address(mint)?;
+    let mut noticed: Vec<Unanswered> = Vec::new();
+    let mut first = true;
     loop {
-        let status = tc
-            .connect()
-            .await?
-            .get_mint_authorization_status(
-                quil_types::proto::node::GetMintAuthorizationStatusRequest {
-                    receipt: receipt.to_vec(),
-                },
-            )
-            .await;
-        let pending = match status {
-            Ok(status) => {
-                let status = status.into_inner();
+        // The first read keeps the channel's own deadline, so `--wait 0`
+        // still reads once; a later one ends with the wait.
+        let read = if first {
+            read_mint_status(tc, &receipt).await
+        } else {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            tokio::time::timeout(left, read_mint_status(tc, &receipt))
+                .await
+                .unwrap_or_else(|_| {
+                    StatusRead::Unanswered(
+                        Unanswered::Deadline,
+                        "no answer before the wait ended".into(),
+                    )
+                })
+        };
+        first = false;
+        let pending = match read {
+            StatusRead::Answer(Ok(status)) => {
                 if status.state() == State::Claimable {
                     say!("The mint authorization is claimable: {}.", status.reason);
                     return Ok(true);
                 }
                 format!("{}: {}", mint_state_label(status.state()), status.reason)
             }
-            Err(status)
+            StatusRead::Answer(Err(status))
                 if matches!(
                     status.code(),
                     tonic::Code::Unimplemented | tonic::Code::Unavailable
@@ -606,7 +681,23 @@ pub(in crate::commands::token) async fn await_claimable(
                 );
                 return Ok(false);
             }
-            Err(status) => anyhow::bail!("mint authorization status: {status}"),
+            StatusRead::Answer(Err(status)) => {
+                anyhow::bail!("mint authorization status: {status}")
+            }
+            StatusRead::Unanswered(class, detail) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if !noticed.contains(&class) && left >= POLL {
+                    noticed.push(class);
+                    say!(
+                        "Mint authorization status: {} ({detail}); reading again every {} s \
+                         for the {} s left of the wait.",
+                        class.what(),
+                        POLL.as_secs(),
+                        left.as_secs()
+                    );
+                }
+                format!("the last status read failed: {}: {detail}", class.what())
+            }
         };
         if std::time::Instant::now() + POLL > deadline {
             anyhow::bail!(
@@ -798,5 +889,232 @@ mod tests {
             "{pending}"
         );
         assert!(pending.ends_with("Check again with: qclient token inclusion 0x01"));
+    }
+
+    /// A node whose status reads answer `script` in turn, each after its
+    /// delay; the last entry repeats.
+    struct ScriptedStatus {
+        script: Vec<(
+            std::time::Duration,
+            quil_types::proto::node::MintAuthorizationState,
+        )>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl quil_types::store::CoinWitnessProvider for ScriptedStatus {
+        fn mint_authorization_status(
+            &self,
+            _receipt: &[u8; 32],
+        ) -> quil_types::error::Result<quil_types::store::MintAuthorizationStatusData> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (delay, state) = self.script[call.min(self.script.len() - 1)];
+            std::thread::sleep(delay);
+            Ok(quil_types::store::MintAuthorizationStatusData {
+                state,
+                reason: format!("read {call}"),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The node's own per-request deadline, which a slow status read
+    /// passes: the node answers it with `Cancelled: Timeout expired`.
+    const NODE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(300);
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// A node config whose listener serves `provider`, and a wallet
+    /// context on it. The directory and the server's stop live as long as
+    /// the returned values.
+    async fn status_node(
+        provider: std::sync::Arc<ScriptedStatus>,
+    ) -> (
+        tempfile::TempDir,
+        TokenCtx,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use crate::commands::token::test_nodes;
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let node = test_nodes::write(&directory.path().join("node"), 41, &listen);
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&node.dir, None, false),
+        )
+        .unwrap();
+        let server =
+            quil_rpc::node_service::NodeRpcServer::new().with_coin_witness_provider(provider);
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async {
+            tonic::transport::Server::builder()
+                .timeout(NODE_DEADLINE)
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        (directory, tc, stop, serving)
+    }
+
+    fn mint_statement(network: [u8; 32]) -> quil_lattice_ct::confidential::mint::MintStatement {
+        use quil_lattice_ct::confidential::mint::{MintStatement, RewardClaim};
+        MintStatement {
+            network,
+            application: quil_execution::domains::QUIL_TOKEN,
+            cited_frame: 1,
+            reward_root: [3; 32],
+            fee: 1,
+            outputs: submitted([0; 32], 1, false).outputs,
+            claims: vec![RewardClaim {
+                owner: [4; 32],
+                value: 8,
+                public_key: [0; 897],
+                forest_proof: vec![1],
+            }],
+        }
+    }
+
+    /// Lines the code under `work` sent to the output, in order.
+    async fn lines_of<F: std::future::Future>(work: F) -> (F::Output, Vec<String>) {
+        let (sink, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let output = crate::commands::token::output::capture(sink, work).await;
+        let mut all = Vec::new();
+        while let Ok(line) = lines.try_recv() {
+            all.push(line);
+        }
+        (output, all)
+    }
+
+    /// While GLOBAL finalization is busy a status read can pass its deadline;
+    /// the wait reads again, says so once, and ends when it is claimable.
+    #[tokio::test]
+    async fn a_status_read_past_its_deadline_is_read_again_within_the_wait() {
+        use quil_types::proto::node::MintAuthorizationState as State;
+        let provider = std::sync::Arc::new(ScriptedStatus {
+            script: vec![
+                (SLOW, State::NotIncluded),
+                (SLOW, State::NotIncluded),
+                (std::time::Duration::ZERO, State::AwaitingCitableRoot),
+                (std::time::Duration::ZERO, State::Claimable),
+            ],
+            calls: Default::default(),
+        });
+        let (directory, tc, stop, serving) = status_node(provider.clone()).await;
+        let network =
+            quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+        let saved = directory.path().join("mint-1.bin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (result, lines) = lines_of(await_claimable(
+            &tc,
+            &mint_statement(network),
+            &saved,
+            deadline,
+        ))
+        .await;
+        let claimable = result.expect("read_not_retried: one unanswered read ended the wait");
+        assert!(claimable, "{lines:?}");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "{lines:?}"
+        );
+        let notices = lines
+            .iter()
+            .filter(|line| line.contains("reading again every 5 s"))
+            .count();
+        assert_eq!(notices, 1, "said once per class: {lines:?}");
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    /// Unanswered until the wait ends: the error says the read failed and
+    /// names the saved authorization's `--claim` command.
+    #[tokio::test]
+    async fn an_unanswered_status_wait_ends_naming_the_claim_command() {
+        use quil_types::proto::node::MintAuthorizationState as State;
+        let provider = std::sync::Arc::new(ScriptedStatus {
+            script: vec![(SLOW, State::NotIncluded)],
+            calls: Default::default(),
+        });
+        let (directory, tc, stop, serving) = status_node(provider).await;
+        let network =
+            quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+        let saved = directory.path().join("mint-1.bin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let started = std::time::Instant::now();
+        let (result, _) = lines_of(await_claimable(
+            &tc,
+            &mint_statement(network),
+            &saved,
+            deadline,
+        ))
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("the last status read failed")
+                && error.contains(&format!("token mint --claim {}", saved.display())),
+            "no_claim_command: {error}"
+        );
+        // It read again before the wait ended, and stopped with it.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(5),
+            "{error}"
+        );
+        assert!(std::time::Instant::now() < deadline + SLOW, "{error}");
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    /// A deadline or transport failure this client made carries its source;
+    /// the node's own answers carry none, and its Unavailable is final.
+    #[test]
+    fn unanswered_reads_are_told_from_the_nodes_answers() {
+        let own_deadline = tonic::Status::from_error(Box::new(tonic::TimeoutExpired(())));
+        assert_eq!(own_deadline.code(), tonic::Code::Cancelled);
+        assert_eq!(Unanswered::of(&own_deadline), Some(Unanswered::Deadline));
+        let refused = tonic::Status::from_error(Box::new(tonic::ConnectError(Box::new(
+            std::io::Error::other("connection refused"),
+        ))));
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            Unanswered::of(&refused),
+            Some(Unanswered::Transport),
+            "local_failure_taken_for_an_answer"
+        );
+        for (status, class) in [
+            (
+                tonic::Status::cancelled("Timeout expired"),
+                Some(Unanswered::Deadline),
+            ),
+            (
+                tonic::Status::deadline_exceeded("late"),
+                Some(Unanswered::Deadline),
+            ),
+            (
+                tonic::Status::resource_exhausted("busy"),
+                Some(Unanswered::Busy),
+            ),
+            (tonic::Status::aborted("again"), Some(Unanswered::Busy)),
+            (
+                tonic::Status::unavailable("coin witness provider not available"),
+                None,
+            ),
+            (tonic::Status::unimplemented("old node"), None),
+            (tonic::Status::internal("broken"), None),
+            (tonic::Status::invalid_argument("bad receipt"), None),
+        ] {
+            assert_eq!(Unanswered::of(&status), class, "{status}");
+        }
     }
 }

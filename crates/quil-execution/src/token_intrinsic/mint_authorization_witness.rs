@@ -182,16 +182,52 @@ fn witness_logged(
     result.map(|(_, witness)| witness)
 }
 
+/// A status read slower than this logs its duration: it answers in
+/// milliseconds unless something holds it up, while a client polls it every
+/// few seconds.
+const SLOW_STATUS: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Why a claim through this node can or cannot be made now, for the
 /// `GetMintAuthorizationStatus` RPC only. Bounded: one read per frame of the
-/// lookback (headers only) plus a binary search over the retained roots in it,
-/// each probe holding the commit lock for two point reads. Writes nothing.
+/// lookback (headers only) plus a binary search over the retained roots in it.
+/// The receipt reads go to one committed view
+/// ([`quil_hypergraph::HypergraphCrdt::committed_global_view`]), so a GLOBAL
+/// finalization holding the commit lock while it executes a frame does not
+/// hold this up. Writes nothing.
 pub fn status(
     state: &HypergraphState,
     clock: &dyn ClockStore,
     receipt: &[u8; 32],
     shard_anchor: Option<u64>,
 ) -> Result<MintAuthorizationStatusData> {
+    let started = std::time::Instant::now();
+    let waited = quil_hypergraph::crdt::commit_lock_wait_on_this_thread();
+    let result = status_now(state, clock, receipt, shard_anchor);
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_STATUS {
+        let lock_wait =
+            quil_hypergraph::crdt::commit_lock_wait_on_this_thread().saturating_sub(waited);
+        tracing::warn!(
+            receipt = %hex::encode(receipt),
+            secs = elapsed.as_secs(),
+            commit_lock_wait_secs = lock_wait.as_secs(),
+            state = ?result.as_ref().map(|status| status.state),
+            scope = "this node",
+            action = "a GLOBAL commit, sync or pruning held the commit lock (commit_lock_wait_secs), \
+                      or this node's disk is slow; clients asking meanwhile wait or time out",
+            "mint authorization status read was slow"
+        );
+    }
+    result
+}
+
+fn status_now(
+    state: &HypergraphState,
+    clock: &dyn ClockStore,
+    receipt: &[u8; 32],
+    shard_anchor: Option<u64>,
+) -> Result<MintAuthorizationStatusData> {
+    let view = state.crdt().committed_global_view()?;
     let head = clock
         .get_latest_global_clock_frame()?
         .header
@@ -204,13 +240,13 @@ pub fn status(
         head_frame: head,
         ..Default::default()
     };
-    let at_cap = retained(witness_at_cap(state, clock, receipt, cap))?;
+    let at_cap = retained(present_at_cap(state, clock, &view, receipt, cap))?;
     if let Some((frame, _)) = &at_cap {
         out.cited_frame = *frame;
     }
     // The newest root known to hold the receipt, starting the inclusion search.
     let holding = match at_cap {
-        Some((frame, witness)) if witness.found => {
+        Some((frame, true)) => {
             out.state = MintAuthorizationState::Claimable;
             Some(frame)
         }
@@ -224,8 +260,9 @@ pub fn status(
                 }
                 Some((root, header)) => {
                     out.searched_frame = header.frame_number;
-                    if retained(state.crdt().global_vertex_present_at_root(&root, receipt))?
-                        .unwrap_or(false)
+                    if retained(view.vertex_blob_at_root(&root, receipt))?
+                        .flatten()
+                        .is_some()
                     {
                         out.state = if at_cap.is_some() {
                             MintAuthorizationState::AwaitingCitableRoot
@@ -246,7 +283,7 @@ pub fn status(
         if out.searched_frame == 0 {
             out.searched_frame = holding;
         }
-        let (first, earliest) = first_root_holding(state, clock, receipt, holding);
+        let (first, earliest) = first_root_holding(state, clock, &view, receipt, holding);
         out.first_root_frame = first;
         // A header carries its parent's root: first in the root of frame F
         // means executed at frame F-1 or earlier.
@@ -255,6 +292,30 @@ pub fn status(
     }
     out.reason = reason(&out);
     Ok(out)
+}
+
+/// The frame of the newest retained root at or below `cap`, and whether it
+/// holds the receipt within the witness's record limit: whether
+/// [`witness_at_cap`] would find it, read from `view`.
+fn present_at_cap(
+    state: &HypergraphState,
+    clock: &dyn ClockStore,
+    view: &quil_hypergraph::crdt::CommittedGlobalView,
+    receipt: &[u8; 32],
+    cap: u64,
+) -> Result<(u64, bool)> {
+    let unavailable = |message: &str| {
+        QuilError::ExecutionUnavailable(format!("mint authorization witness: {message}"))
+    };
+    let (root, header) =
+        super::reward_witness::newest_retained_global_root(state, clock, Some(cap))
+            .map_err(|e| unavailable(&e.to_string()))?;
+    match view.vertex_blob_at_root(&root, receipt)? {
+        Some(blob) if blob.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES => {
+            Err(unavailable("receipt record exceeds witness limit"))
+        }
+        blob => Ok((header.frame_number, blob.is_some())),
+    }
 }
 
 /// `Ok(None)` when the history asked for is not retained here.
@@ -272,6 +333,7 @@ fn retained<T>(result: Result<T>) -> Result<Option<T>> {
 fn first_root_holding(
     state: &HypergraphState,
     clock: &dyn ClockStore,
+    view: &quil_hypergraph::crdt::CommittedGlobalView,
     receipt: &[u8; 32],
     holding: u64,
 ) -> (u64, u64) {
@@ -288,10 +350,9 @@ fn first_root_holding(
     let frames: Vec<u64> = roots.iter().map(|(frame, _)| *frame).collect();
     first_holding(&frames, |frame| {
         let index = frames.binary_search(&frame).ok()?;
-        state
-            .crdt()
-            .global_vertex_present_at_root(&roots[index].1, receipt)
+        view.vertex_blob_at_root(&roots[index].1, receipt)
             .ok()
+            .map(|blob| blob.is_some())
     })
 }
 
@@ -686,5 +747,44 @@ mod tests {
         assert_eq!(log.admit(CLAIM_WAIT_LOG_EVERY_SECS - 1), None);
         assert_eq!(log.admit(CLAIM_WAIT_LOG_EVERY_SECS), Some(2));
         assert_eq!(log.admit(CLAIM_WAIT_LOG_EVERY_SECS + 1), None);
+    }
+
+    /// A GLOBAL finalization holds the commit lock while it executes a
+    /// frame, minutes when it verifies a large proof. The status read answers
+    /// meanwhile, from the state committed before the holder took the lock.
+    #[test]
+    fn the_status_answers_while_a_finalization_holds_the_commit_lock() {
+        let chain = chain();
+        // A running node's periodic health read has captured a view by now.
+        let before = status_of(&chain, &RECEIPT, Some(14));
+        assert_eq!(before.state, MintAuthorizationState::Claimable);
+        let crdt = chain.state.crdt().clone();
+        let held = crdt.hold_commit_lock();
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(status(
+                    &chain.state,
+                    chain.clock.as_ref(),
+                    &RECEIPT,
+                    Some(14),
+                ));
+            });
+            // It answers in milliseconds; a read waiting for the holder never
+            // does, so the generous bound only ends a failing run.
+            let answered = answers.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            let now = answered
+                .expect("status_blocked_by_commit_lock: no answer while the lock was held")
+                .unwrap();
+            assert_eq!(
+                (now.state, now.cited_frame, now.first_root_frame),
+                (before.state, before.cited_frame, before.first_root_frame)
+            );
+            assert_eq!(
+                (now.inclusion_frame, now.inclusion_frame_earliest),
+                (INCLUDED_AT, INCLUDED_AT)
+            );
+        });
     }
 }

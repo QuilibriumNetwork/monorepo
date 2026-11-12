@@ -1256,6 +1256,55 @@ macro_rules! impl_hypergraph_snapshot {
                     .get(&key)
                     .map_err(|e| QuilError::Store(e.to_string()))
             }
+
+            fn root_version(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_id: &[u8],
+                root_hash: &[u8],
+            ) -> Result<Option<(u64, u64)>> {
+                let key = crate::encoding::hypergraph_root_version_key(
+                    set_type, phase_type, shard_id, root_hash,
+                );
+                Ok(self
+                    .snapshot
+                    .get(&key)
+                    .map_err(|e| QuilError::Store(e.to_string()))?
+                    .filter(|v| v.len() == 16)
+                    .map(|v| {
+                        (
+                            u64::from_be_bytes(v[..8].try_into().unwrap()),
+                            u64::from_be_bytes(v[8..16].try_into().unwrap()),
+                        )
+                    }))
+            }
+
+            fn vertex_underlying_at(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_key: &quil_types::store::ShardKey,
+                vertex_key: &[u8],
+                version: u64,
+            ) -> Result<Option<Vec<u8>>> {
+                // As the live read: the newest version at or below `version`,
+                // else an unversioned blob written before versions existed.
+                if let Some(blob) = vertex_version_at(
+                    &self.snapshot,
+                    set_type,
+                    phase_type,
+                    shard_key,
+                    vertex_key,
+                    version,
+                )? {
+                    return Ok(Some(blob));
+                }
+                let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+                self.snapshot
+                    .get(&key)
+                    .map_err(|e| QuilError::Store(e.to_string()))
+            }
         }
     };
 }
