@@ -538,20 +538,30 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 let seed_copy = seed.clone();
                 let addr_for_log = addr.clone();
                 handles.push(tokio::spawn(async move {
+                    // The request's own deadline counts towards dropping a
+                    // shared connection that answers nothing.
+                    let deadline = tokio::time::Instant::now() + PER_ARCHIVE_TIMEOUT;
                     let attempt = async {
-                        let mut c = ArchiveClient::shared(&addr, &seed_copy).await.ok()?;
-                        let f = c
-                            .get_global_frame(0)
-                            .await
-                            .inspect_err(|error| {
-                                if error.is_connection_failure() {
-                                    c.discard();
-                                }
-                            })
-                            .ok()?;
-                        f.header.clone()
+                        let Ok(mut c) = tokio::time::timeout_at(
+                            deadline,
+                            ArchiveClient::shared(&addr, &seed_copy),
+                        )
+                        .await?
+                        else {
+                            return Ok(None);
+                        };
+                        let fetched =
+                            tokio::time::timeout_at(deadline, c.get_global_frame(0)).await;
+                        match &fetched {
+                            Ok(frame) => c.settle(
+                                frame.as_ref().map(|_| ()),
+                                quil_rpc::archive_client::SHARED_SHORT,
+                            ),
+                            Err(_) => c.deadline_passed(quil_rpc::archive_client::SHARED_SHORT),
+                        }
+                        Ok::<_, tokio::time::error::Elapsed>(fetched?.ok().and_then(|f| f.header))
                     };
-                    match tokio::time::timeout(PER_ARCHIVE_TIMEOUT, attempt).await {
+                    match attempt.await {
                         Ok(Some(h)) => Some((addr_for_log, h)),
                         Ok(None) => {
                             tracing::debug!(

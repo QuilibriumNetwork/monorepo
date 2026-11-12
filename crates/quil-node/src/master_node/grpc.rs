@@ -90,13 +90,26 @@ fn local_shard_info_incomplete(basis: &num_bigint::BigInt, archive_mode: bool) -
     !archive_mode || basis.sign() == num_bigint::Sign::NoSign
 }
 
+/// A connection this process shares with an archive.
+type SharedArchiveClient = quil_rpc::archive_client::shared::Shared<quil_rpc::ArchiveClient>;
+
+/// Each shard's info from `client`; `shared`, the shared connection it
+/// rides (if any), gets each request's outcome.
 async fn fetch_remote_app_shards(
     client: &mut quil_rpc::ArchiveClient,
+    shared: Option<&SharedArchiveClient>,
     shard_keys: &[Vec<u8>],
 ) -> RemoteAppShardMap {
     let mut out = RemoteAppShardMap::with_capacity(shard_keys.len());
     for shard_key in shard_keys {
-        match client.get_app_shards(shard_key.clone(), Vec::new()).await {
+        let fetched = client.get_app_shards(shard_key.clone(), Vec::new()).await;
+        if let Some(shared) = shared {
+            shared.settle(
+                fetched.as_ref().map(|_| ()),
+                quil_rpc::archive_client::SHARED_SHORT,
+            );
+        }
+        match fetched {
             Ok(infos) => {
                 out.insert(shard_key.clone(), infos);
             }
@@ -3225,10 +3238,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         let mut unique: HashMap<Vec<u8>, ()> = HashMap::new();
                         for s in shards_store.range_app_shards()? { unique.insert(s.shard_key, ()); }
                         let unique_keys: Vec<Vec<u8>> = unique.into_keys().collect();
-                        let mut clients: Vec<quil_rpc::ArchiveClient> = Vec::new();
+                        let mut clients: Vec<(quil_rpc::ArchiveClient, Option<SharedArchiveClient>)> = Vec::new();
                         match clock_store.get_latest_global_clock_frame() {
                             Ok(frame) => match quil_rpc::peer_dial::dial_latest_frame_prover(&frame, key_store, move |peer_id| peer_info_lookup(peer_id), &seed).await {
-                                Ok(c) => clients.push(c),
+                                Ok(c) => clients.push((c, None)),
                                 Err(e) => tracing::debug!(error = %e, "shard info: dial_latest_frame_prover failed"),
                             },
                             Err(e) => tracing::debug!(error = %e, "shard info: no latest frame yet"),
@@ -3241,22 +3254,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         // members), and a topology-only archive must not hide
                         // a different archive with materialized state.
                         // Over the connections this process shares with the
-                        // archives, held until the queries end.
-                        let mut held = Vec::new();
+                        // archives, each held until its queries end.
                         for endpoint in archive_pool.get_all().await {
                             match quil_rpc::ArchiveClient::shared(&endpoint, &seed).await {
-                                Ok(client) => {
-                                    clients.push((*client).clone());
-                                    held.push(client);
-                                }
+                                Ok(client) => clients.push(((*client).clone(), Some(client))),
                                 Err(e) => tracing::debug!(endpoint = %endpoint, error = %e, "shard info: archive-pool dial failed"),
                             }
                         }
                         if clients.is_empty() {
                             return Err(quil_types::error::QuilError::Internal("shard info: no archive endpoint reachable for fallback".into()));
                         }
-                        for mut client in clients {
-                            let out = fetch_remote_app_shards(&mut client, &unique_keys).await;
+                        for (mut client, shared) in clients {
+                            let out = fetch_remote_app_shards(&mut client, shared.as_ref(), &unique_keys).await;
                             if has_nonzero_remote_shard_size(&out) {
                                 return Ok::<_, quil_types::error::QuilError>(out);
                             }

@@ -102,6 +102,14 @@ impl ArchiveClientError {
     pub fn is_connection_failure(&self) -> bool {
         matches!(self, Self::Transport(_)) || self.is_transport_failure()
     }
+
+    /// The request got no answer within its deadline: this client's
+    /// ([`Self::is_timeout`]) or the archive's, which it reports as
+    /// `DeadlineExceeded`.
+    fn missed_deadline(&self) -> bool {
+        self.is_timeout()
+            || matches!(self, Self::Rpc(status) if status.code() == tonic::Code::DeadlineExceeded)
+    }
 }
 
 /// `error` and every cause beneath it.
@@ -423,6 +431,73 @@ struct SharedKey {
 
 type SharedSet = shared::SharedConnections<SharedKey, ArchiveClient, ArchiveClientError>;
 
+/// The shared archive connection for submissions under 32 KiB and short
+/// reads ([`ArchiveClient::shared`]), as its redial warning names it.
+pub const SHARED_SHORT: &str = "archive submissions and short reads";
+
+/// The shared archive connection for submissions over 32 KiB.
+const SHARED_LARGE: &str = "archive submissions over 32 KiB";
+
+/// A redial warning repeats at most this often per class of connection.
+const REDIAL_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// When each class of shared connection last warned of a redial.
+static REDIAL_WARNED: std::sync::LazyLock<parking_lot::Mutex<HashMap<&'static str, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl shared::Shared<ArchiveClient> {
+    /// Note how a request over this shared connection of `class` ended: a
+    /// transport failure drops the connection at once, a missed deadline
+    /// counts towards a redial ([`Self::deadline_passed`]), and any other
+    /// outcome is an answer, which ends the count.
+    pub fn settle(&self, outcome: Result<(), &ArchiveClientError>, class: &'static str) {
+        match outcome {
+            Err(error) if error.is_connection_failure() => self.discard(),
+            Err(error) if error.missed_deadline() => self.deadline_passed(class),
+            _ => self.answered(),
+        }
+    }
+
+    /// A request over this shared connection of `class` got no answer
+    /// within its deadline, the caller's own included. The
+    /// [`shared::DEADLINE_FAILURES_BEFORE_REDIAL`]th in a row drops the
+    /// connection, warned once per class every ten minutes.
+    pub fn deadline_passed(&self, class: &'static str) {
+        let Some(failures) = self.timed_out() else {
+            return;
+        };
+        let now = Instant::now();
+        let due = {
+            let mut warned = REDIAL_WARNED.lock();
+            let due = warned
+                .get(class)
+                .is_none_or(|at| now.duration_since(*at) >= REDIAL_WARN_EVERY);
+            if due {
+                warned.insert(class, now);
+            }
+            due
+        };
+        if due {
+            warn!(
+                class,
+                deadline_failures = failures,
+                scope = "peer",
+                repeats_every_s = REDIAL_WARN_EVERY.as_secs(),
+                action = "no action needed: the next request dials a fresh connection; \
+                          if this repeats, the far end or the path to it takes requests \
+                          without answering them",
+                "a shared connection answered none of its last requests in time; dropped it"
+            );
+        } else {
+            debug!(
+                class,
+                deadline_failures = failures,
+                "a shared connection answered none of its last requests in time; dropped it"
+            );
+        }
+    }
+}
+
 /// The connections this process shares with archives for submissions and
 /// short reads, dialed and run on [`archive_io`], which lives as long as the
 /// process, whichever runtime a caller is on.
@@ -730,8 +805,9 @@ impl ArchiveClient {
     /// submissions under 32 KiB and short reads, dialed as
     /// [`Self::connect_mtls`] dials; each request on it may run for
     /// [`REQUEST_TIMEOUT`]. Callers that find none wait on one dial. Hold the
-    /// result for the call, and [`shared::Shared::discard`] it when the call
-    /// fails in the transport ([`ArchiveClientError::is_connection_failure`]).
+    /// result for the call, and [`shared::Shared::settle`] each request's
+    /// outcome on it with [`SHARED_SHORT`]: a transport failure drops it, and
+    /// so do requests that keep missing their deadline.
     #[track_caller]
     pub fn shared<'a>(
         addr: &'a str,
@@ -805,11 +881,10 @@ impl ArchiveClient {
                 .map_err(SharedSubmitError::Dial)?;
             let submitted = client.submit_global_message_within(data, deadline).await;
             drop(permit);
-            if let Err(error) = &submitted {
-                if error.is_connection_failure() {
-                    client.discard();
-                }
-            }
+            client.settle(
+                submitted.as_ref().map(|_| ()),
+                if large { SHARED_LARGE } else { SHARED_SHORT },
+            );
             submitted.map_err(SharedSubmitError::Submit)
         }
     }
@@ -3036,5 +3111,99 @@ mod endpoint_load_tests {
             (0, 0),
             "a failed dial stayed counted"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_redial_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Submissions in a row a connection may leave unanswered before it is
+    /// dropped (`shared::DEADLINE_FAILURES_BEFORE_REDIAL`).
+    const REDIAL_AFTER: usize = 3;
+
+    /// A peer listener that counts the connections it accepted and holds
+    /// each one open without answering any request on it.
+    async fn silent_archive() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let key = server_key.clone();
+                tokio::spawn(async move {
+                    let stream = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        (address, accepted)
+    }
+
+    /// `count` submissions at once to `address` over the shared connection;
+    /// each must miss its deadline.
+    async fn unanswered_submissions(address: &str, key: &[u8], count: usize) {
+        let submissions = (0..count).map(|_| {
+            let (address, key) = (address.to_string(), key.to_vec());
+            tokio::spawn(
+                async move { ArchiveClient::submit_shared(&address, &key, vec![1; 64]).await },
+            )
+        });
+        for submitted in futures::future::join_all(submissions).await {
+            match submitted.unwrap() {
+                Err(SharedSubmitError::Submit(error)) if error.is_timeout() => {}
+                other => panic!("the submission did not miss its deadline: {other:?}"),
+            }
+        }
+    }
+
+    /// Three submissions in a row that an archive leaves unanswered drop
+    /// the shared connection: the next caller dials a fresh one. It used to
+    /// be kept while traffic kept it from going idle, so every submission
+    /// to an archive that took requests without answering them failed
+    /// until restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submissions_unanswered_three_times_in_a_row_dial_a_fresh_connection() {
+        let (address, accepted) = silent_archive().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let first = ArchiveClient::shared(&address, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        unanswered_submissions(&address, &key, REDIAL_AFTER).await;
+        eprintln!("REACH submit-redial");
+        let next = ArchiveClient::shared(&address, &key).await.unwrap();
+        assert!(
+            !next.kept() && next.id() != first_id,
+            "unanswered_connection_kept: {REDIAL_AFTER} submissions in a row went unanswered and the next caller rode the same connection"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "unanswered_connection_kept: expected one fresh dial"
+        );
+    }
+
+    /// One submission an archive leaves unanswered keeps the shared
+    /// connection: one slow answer is no reason to dial again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_submission_unanswered_once_keeps_its_connection() {
+        let (address, accepted) = silent_archive().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let first = ArchiveClient::shared(&address, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        unanswered_submissions(&address, &key, 1).await;
+        eprintln!("REACH submit-redial");
+        let next = ArchiveClient::shared(&address, &key).await.unwrap();
+        assert!(
+            next.kept() && next.id() == first_id,
+            "single_timeout_redialed: one unanswered submission dropped the connection"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }

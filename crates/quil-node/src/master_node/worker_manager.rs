@@ -1079,16 +1079,12 @@ pub(crate) fn init(
                             let mut client = quil_rpc::ArchiveClient::shared(&endpoint, &key)
                                 .await
                                 .ok()?;
-                            client
-                                .get_app_shard_frame(filter, frame_number)
-                                .await
-                                .inspect_err(|error| {
-                                    if error.is_connection_failure() {
-                                        client.discard();
-                                    }
-                                })
-                                .ok()
-                                .flatten()
+                            let fetched = client.get_app_shard_frame(filter, frame_number).await;
+                            client.settle(
+                                fetched.as_ref().map(|_| ()),
+                                quil_rpc::archive_client::SHARED_SHORT,
+                            );
+                            fetched.ok().flatten()
                         })
                             as std::pin::Pin<
                                 Box<

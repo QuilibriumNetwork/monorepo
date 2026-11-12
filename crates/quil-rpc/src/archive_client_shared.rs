@@ -10,7 +10,9 @@
 //! when it fails, so a burst opens at most one connection. A connection
 //! nobody holds closes once unused for the set's idle limit (a sweep runs
 //! while any is kept, so within one and a half times that limit), and is
-//! dropped at once when its caller saw the transport fail.
+//! dropped at once when its caller saw the transport fail, or after
+//! [`DEADLINE_FAILURES_BEFORE_REDIAL`] requests in a row on it outran their
+//! deadline with no answer between.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,6 +20,16 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+
+/// Requests in a row on a kept connection that may outrun their deadline,
+/// with no answer between, before the connection is dropped and the next
+/// caller dials a fresh one. A far end that keeps answering a connection's
+/// pings but none of its requests (a stuck handler, streams leaked up to its
+/// per-connection limit) otherwise failed every request on it until restart,
+/// as the traffic kept it from going idle. One slow answer does not redial;
+/// three in a row, each a whole deadline long, cost at most one needless
+/// dial when the connection was healthy after all.
+pub const DEADLINE_FAILURES_BEFORE_REDIAL: u32 = 3;
 
 /// A shared connection a caller holds: idle time counts from its release.
 pub struct Shared<C> {
@@ -45,6 +57,29 @@ impl<C> Shared<C> {
         if kept.as_ref().is_some_and(|kept| kept.id == self.id) {
             *kept = None;
         }
+    }
+
+    /// A request on this connection was answered (an error the far end sent
+    /// included): its run of deadline failures ends.
+    pub fn answered(&self) {
+        if let Some(kept) = self.slot.lock().as_mut().filter(|kept| kept.id == self.id) {
+            kept.deadline_failures = 0;
+        }
+    }
+
+    /// A request on this connection outran its deadline. The
+    /// [`DEADLINE_FAILURES_BEFORE_REDIAL`]th in a row drops the connection
+    /// from its set, as [`Self::discard`] does, and returns that count.
+    pub fn timed_out(&self) -> Option<u32> {
+        let mut kept = self.slot.lock();
+        let current = kept.as_mut().filter(|kept| kept.id == self.id)?;
+        current.deadline_failures += 1;
+        let failures = current.deadline_failures;
+        if failures < DEADLINE_FAILURES_BEFORE_REDIAL {
+            return None;
+        }
+        *kept = None;
+        Some(failures)
     }
 }
 
@@ -78,6 +113,8 @@ struct Kept<C> {
     busy: usize,
     /// When it was last taken or released.
     used: Instant,
+    /// Requests on it in a row that outran their deadline.
+    deadline_failures: u32,
 }
 
 impl<C> Kept<C> {
@@ -217,6 +254,7 @@ where
                     id,
                     busy: 1,
                     used: Instant::now(),
+                    deadline_failures: 0,
                 });
                 *last_failure = None;
                 drop(last_failure);

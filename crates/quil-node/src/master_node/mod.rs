@@ -1607,10 +1607,11 @@ pub(crate) async fn start(
                         members.rotate_left(turn.wrapping_add(frame_number as usize) % len);
                     }
                     // An endpoint's connection is dropped when its transport
-                    // failed, and opened again (once, however many fetches
-                    // ask) on its next request; one that only did not answer
-                    // in time is kept. A member's dial must reach the peer
-                    // whose record named the endpoint.
+                    // failed or it answered none of three fetches in a row in
+                    // time, and opened again (once, however many fetches ask)
+                    // on its next request; one that only missed a deadline
+                    // is kept. A member's dial must reach the peer whose
+                    // record named the endpoint.
                     let fetch_from = |addr: String, peer: Option<quil_p2p::PeerId>, number: u64| {
                         let filter = filter.clone();
                         let clients = clients.clone();

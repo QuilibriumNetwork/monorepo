@@ -240,9 +240,14 @@ pub(super) type GapAttempt = Result<
 >;
 
 /// Fetch frame `number` of `filter` from `endpoint`, within `within`. The
-/// connection is dropped only when its transport failed: an endpoint that
-/// lacks the frame yet, or answers slowly, keeps it. Dropping it on any
-/// unanswered fetch made the next fetches to that endpoint dial again.
+/// connection is dropped when its transport failed, or when it answered
+/// none of [`DEADLINE_FAILURES_BEFORE_REDIAL`] fetches in a row in time: an
+/// endpoint that lacks the frame yet, or answers one fetch slowly, keeps it.
+/// Dropping it on any unanswered fetch made the next fetches to that
+/// endpoint dial again; keeping it on every one left an endpoint that took
+/// fetches without answering them unasked until restart.
+///
+/// [`DEADLINE_FAILURES_BEFORE_REDIAL`]: quil_rpc::archive_client::shared::DEADLINE_FAILURES_BEFORE_REDIAL
 pub(super) async fn gap_fetch(
     clients: &GapClients,
     endpoint: &GapEndpoint,
@@ -251,19 +256,23 @@ pub(super) async fn gap_fetch(
     number: u64,
     within: Duration,
 ) -> GapAttempt {
-    tokio::time::timeout(within, async {
-        let mut client = gap_fetch_client(clients, endpoint, key).await?;
-        client
-            .get_app_shard_frame(filter, number)
-            .await
-            .map_err(|error| {
-                if error.is_connection_failure() {
-                    client.discard();
-                }
-                error.to_string()
-            })
-    })
-    .await
+    let class = match endpoint.1 {
+        Some(_) => "shard member gap fetches",
+        None => "archive gap fetches",
+    };
+    let deadline = tokio::time::Instant::now() + within;
+    let connect = gap_fetch_client(clients, endpoint, key);
+    let mut client = match tokio::time::timeout_at(deadline, connect).await? {
+        Ok(client) => client,
+        Err(error) => return Ok(Err(error)),
+    };
+    let fetch = client.get_app_shard_frame(filter, number);
+    let fetched = tokio::time::timeout_at(deadline, fetch).await;
+    match &fetched {
+        Ok(answer) => client.settle(answer.as_ref().map(|_| ()), class),
+        Err(_) => client.deadline_passed(class),
+    }
+    fetched.map(|answer| answer.map_err(|error| error.to_string()))
 }
 
 /// Saves the newest [`MAX_RECORDS`] records no older than [`MAX_AGE_MS`],
@@ -938,6 +947,157 @@ mod tests {
             "gap-fetch timeout dropped the connection"
         );
         assert_eq!(clients.kept(), 1);
+    }
+
+    /// Fetches in a row a connection may leave unanswered before it is
+    /// dropped (`shared::DEADLINE_FAILURES_BEFORE_REDIAL`).
+    const REDIAL_AFTER: usize = 3;
+
+    /// A filter the endpoints below hold every fetch of unanswered.
+    const UNANSWERED: [u8; 35] = [7; 35];
+
+    /// Holds every frame read until the client gives up on it.
+    struct NeverAnswers;
+
+    #[tonic::async_trait]
+    impl quil_rpc::stub_services::AppShardFrameProvider for NeverAnswers {
+        async fn get_app_shard_frame(
+            &self,
+            _filter: Vec<u8>,
+            _frame_number: u64,
+        ) -> Result<Option<quil_types::proto::global::AppShardFrame>, tonic::Status> {
+            std::future::pending().await
+        }
+    }
+
+    /// A peer listener answering as its peer, counting the connections it
+    /// accepted: it refuses a frame read with an empty filter at once, and
+    /// holds every other one unanswered.
+    async fn answering_listener() -> (String, quil_p2p::PeerId, Arc<AtomicUsize>) {
+        use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let (key, streams_tx) = (key.clone(), streams_tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(stream) =
+                        quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &key).await
+                    {
+                        let _ = streams_tx.send(stream);
+                    }
+                });
+            }
+        });
+        let incoming = futures::stream::unfold(streams, |mut streams| async move {
+            let stream = streams.recv().await?;
+            Some((Ok::<_, std::io::Error>(stream), streams))
+        });
+        let frames =
+            quil_rpc::stub_services::AppShardRpcServer::with_provider(Arc::new(NeverAnswers));
+        tokio::spawn(
+            quil_rpc::pqnoise_channel::peer_server()
+                .add_service(AppShardServiceServer::new(frames))
+                .serve_with_incoming(incoming),
+        );
+        (addr, peer, accepted)
+    }
+
+    /// An endpoint that answers none of three fetches in a row in time has
+    /// its connection dropped: the next fetch dials a fresh one. It used to
+    /// be kept while fetches kept it from going idle, so an endpoint that
+    /// took requests without answering them was never asked again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_fetches_unanswered_three_times_in_a_row_dial_a_fresh_connection() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        let first = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        for number in 0..REDIAL_AFTER as u64 {
+            let attempt = gap_fetch(
+                &clients,
+                &endpoint,
+                &key,
+                UNANSWERED.to_vec(),
+                number,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        eprintln!("REACH gap-redial");
+        let next = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        assert!(
+            !next.kept() && next.id() != first_id,
+            "unanswered_connection_kept: {REDIAL_AFTER} fetches in a row went unanswered and the next rode the same connection"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "unanswered_connection_kept: expected one fresh dial"
+        );
+    }
+
+    /// An answer between unanswered fetches starts their count again: two,
+    /// an answer and two more keep the connection; a third in a row after
+    /// the answer drops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_restarts_the_count_of_unanswered_gap_fetches() {
+        let (addr, member, accepted) = answering_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        drop(gap_fetch_client(&clients, &endpoint, &key).await.unwrap());
+        let (clients, endpoint, key) = (&clients, &endpoint, &key);
+        let fetch = move |filter: Vec<u8>| {
+            gap_fetch(
+                clients,
+                endpoint,
+                key,
+                filter,
+                1,
+                Duration::from_millis(500),
+            )
+        };
+        for _ in 1..REDIAL_AFTER {
+            let attempt = fetch(UNANSWERED.to_vec()).await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        let answered = fetch(Vec::new()).await;
+        assert!(
+            matches!(answered, Ok(Err(_))),
+            "the listener did not refuse an empty filter: {answered:?}"
+        );
+        for _ in 1..REDIAL_AFTER {
+            let attempt = fetch(UNANSWERED.to_vec()).await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        eprintln!("REACH gap-redial");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "answer_did_not_restart_count: the connection was dropped before {REDIAL_AFTER} unanswered fetches followed the answer"
+        );
+        let attempt = fetch(UNANSWERED.to_vec()).await;
+        assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        let next = gap_fetch_client(clients, endpoint, key).await.unwrap();
+        assert!(
+            !next.kept(),
+            "unanswered_after_answer_kept: {REDIAL_AFTER} fetches in a row after the answer went unanswered and the next rode the same connection"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[test]
