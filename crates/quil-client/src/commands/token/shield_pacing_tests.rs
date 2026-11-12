@@ -1,4 +1,8 @@
 use super::*;
+use quil_rpc::health_conditions::global_progress_notice;
+use quil_types::proto::diagnostics::{
+    ConditionKind, GlobalProgress, HealthCondition, HealthConditions,
+};
 
 const START: u64 = 1_000_000;
 const NEVER: (u64, u64) = (u64::MAX - 1, u64::MAX);
@@ -450,6 +454,96 @@ async fn shield_pacing_inclusion_timeout_excludes_global_pauses() {
         .expect("a stalled GLOBAL is not an inclusion timeout");
 }
 
+/// What the run reads from a node health report holding these GLOBAL
+/// conditions (`ShieldAllIo::global`): its stall notice, if any.
+fn reported(kinds: &[ConditionKind]) -> Option<String> {
+    let conditions = kinds
+        .iter()
+        .map(|kind| HealthCondition {
+            kind: *kind as i32,
+            threshold: if *kind == ConditionKind::GlobalFramesSlow {
+                330
+            } else {
+                120
+            },
+            global: Some(GlobalProgress {
+                advanced_frames: 280,
+                span_secs: 3_600,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    global_progress_notice(&HealthConditions {
+        conditions,
+        sources: Vec::new(),
+    })
+}
+
+/// GLOBAL advancing under 330 frames an hour (`Global frames slow`) is no
+/// stall: it still includes each batch, so the run goes on at its pace and
+/// never pauses.
+#[tokio::test]
+async fn shield_pacing_does_not_pause_while_global_frames_are_slow() {
+    // 300 frames an hour, reported slow, for the first 3,000 s.
+    let slow_until = START + 3_000;
+    let node = move |t: u64| GlobalRead {
+        head: 1_000 + t / 12,
+        degraded: if t < slow_until {
+            reported(&[ConditionKind::GlobalFramesSlow])
+        } else {
+            None
+        },
+    };
+    let mut io = Fake::new(node, |_| Some(30));
+    run(&mut io, 3, pacing(300)).await.unwrap();
+    assert!(
+        io.position(|e| matches!(e, ShieldEvent::Paused { .. }))
+            .is_none(),
+        "a slow GLOBAL paused the run: {:#?}",
+        io.events
+    );
+    assert_eq!(io.submits[0].1, START + 150);
+    assert!(io.submits[2].1 < slow_until, "{:?}", io.submits);
+}
+
+/// A reported stall pauses the run, with the stall's notice, although the
+/// report also holds `Global frames slow`; the run resumes after the
+/// recovery time once the stall ends, while the hour's frames stay slow.
+#[tokio::test]
+async fn shield_pacing_pauses_for_a_reported_global_stall_only() {
+    let (from, to) = (START + 20, START + 2_000);
+    let slow_until = to + 3_600;
+    let stall = node_with_stall(from, to);
+    let node = move |t: u64| {
+        let mut kinds = Vec::new();
+        if t >= from + 120 && t < to {
+            kinds.push(ConditionKind::GlobalHeadUnchanged);
+        }
+        if t >= from + 120 && t < slow_until {
+            kinds.push(ConditionKind::GlobalFramesSlow);
+        }
+        GlobalRead {
+            head: stall(t).head,
+            degraded: reported(&kinds),
+        }
+    };
+    let mut io = Fake::new(node, |_| Some(30));
+    run(&mut io, 1, pacing(0)).await.unwrap();
+    let paused = io
+        .position(|e| matches!(e, ShieldEvent::Paused { .. }))
+        .expect("a stall pauses the run");
+    let ShieldEvent::Paused { reason, .. } = &io.events[paused] else {
+        unreachable!()
+    };
+    assert_eq!(reason, "Global head unchanged >120s");
+    let sent = io.submits[0].1;
+    assert!(
+        sent >= to + RECOVERY_SECS && sent < to + RECOVERY_SECS + 2 * POLL_SECS,
+        "submitted at {sent}, not {RECOVERY_SECS} s after the stall ended at {to}"
+    );
+}
+
 /// A repeated pause notice names the node's state as the decision reads it
 /// then, not the condition that started the pause; recovery counts only
 /// time the node reports GLOBAL healthy.
@@ -462,7 +556,7 @@ fn shield_pacing_still_paused_names_the_nodes_current_state() {
         })
     };
     let head = "Global head unchanged >120s";
-    let slow = "Global frames slow: 300 in the last hour, below 330";
+    let again = "Global head unchanged >120s: 2 of 9 GLOBAL provers reachable, 6 needed";
     let mut health = Health::default();
     assert_eq!(health.observe(0, read(None)), None);
     assert_eq!(
@@ -477,13 +571,13 @@ fn shield_pacing_still_paused_names_the_nodes_current_state() {
             reason: "the node reports GLOBAL healthy for 300 s of the 600 s needed".into(),
         })
     );
-    // The node reports GLOBAL slow: the recovery starts again.
-    assert_eq!(health.observe(700, read(Some(slow))), None);
+    // GLOBAL stalls again: the recovery starts again.
+    assert_eq!(health.observe(700, read(Some(again))), None);
     assert_eq!(
-        health.observe(1_215, read(Some(slow))),
+        health.observe(1_215, read(Some(again))),
         Some(Change::StillPaused {
             secs: 1_200,
-            reason: slow.into(),
+            reason: again.into(),
         })
     );
     assert_eq!(health.degraded(), Some(head));

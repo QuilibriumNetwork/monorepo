@@ -2,7 +2,7 @@
 //! batches, a confirmation names them, `y` runs them in the background
 //! through the CLI's own functions, paced as the CLI paces them: one batch
 //! at a time, each proved after the previous one's inclusion, submissions 5 min
-//! apart, held while GLOBAL is degraded. One run at a time; `esc` stops
+//! apart, held while GLOBAL stalls. One run at a time; `esc` stops
 //! one before its next submission and quitting during one asks first, each
 //! confirmed by `y`. `--render` reads and quotes but never runs.
 //!

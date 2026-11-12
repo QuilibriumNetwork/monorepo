@@ -5,11 +5,12 @@
 //! archives verify. The run therefore (1) proves and submits one batch at a
 //! time and waits for its inclusion before starting the next, (2) keeps a
 //! minimum spacing between submissions, and (3) pauses while the node reports
-//! GLOBAL's progress degraded: its health conditions `Global head unchanged`
-//! and `Global frames slow` (`quil_rpc::health_conditions`), the node's one
-//! judgement of GLOBAL progress. The driver is generic over [`ShieldIo`] so a
-//! fake clock and fake reads test every path; the CLI prints its events, the
-//! node manager shows them as notices.
+//! GLOBAL stalled: its health condition `Global head unchanged`
+//! (`quil_rpc::health_conditions`), the node's one judgement of a GLOBAL
+//! stall. `Global frames slow` does not pause it: a slow GLOBAL still
+//! includes, and (1) already paces the run to it. The driver is generic over
+//! [`ShieldIo`] so a fake clock and fake reads test every path; the CLI
+//! prints its events, the node manager shows them as notices.
 
 /// Default minimum spacing between two submissions (at most 12 per hour).
 pub(crate) const DEFAULT_MIN_INTERVAL_SECS: u64 = 300;
@@ -65,7 +66,7 @@ pub(crate) enum Change {
 pub(crate) struct GlobalRead {
     /// The node's GLOBAL head.
     pub head: u64,
-    /// The node's current GLOBAL progress condition, if any, as a clause.
+    /// The node's current GLOBAL stall condition, if any, as a clause.
     pub degraded: Option<String>,
 }
 
@@ -81,7 +82,7 @@ struct Degraded {
 
 /// The run's pause, from the node's GLOBAL judgement read before each step.
 /// The node judges; the run only decides when to submit: it pauses while
-/// the node reports a GLOBAL progress condition, or its judgement cannot be
+/// the node reports a GLOBAL stall condition, or its judgement cannot be
 /// read for [`UNREAD_SECS`], and resumes after [`RECOVERY_SECS`] without.
 #[derive(Debug, Default)]
 pub(crate) struct Health {
@@ -265,8 +266,8 @@ impl ShieldEvent {
                 min_interval,
             } => format!(
                 "Pacing {batches} batch{}: one at a time, each proved after the previous one's \
-                 inclusion, submissions at least {min_interval} s apart, paused while GLOBAL is \
-                 degraded.",
+                 inclusion, submissions at least {min_interval} s apart, paused while GLOBAL \
+                 stalls.",
                 if *batches == 1 { "" } else { "es" }
             ),
             Self::Skipped {
@@ -442,7 +443,7 @@ pub(crate) trait ShieldIo {
     /// Wall-clock Unix seconds.
     fn unix(&self) -> u64;
     async fn sleep(&mut self, secs: u64);
-    /// The node's GLOBAL head and its GLOBAL progress condition, if one is
+    /// The node's GLOBAL head and its GLOBAL stall condition, if one is
     /// current; an error when they cannot be read, or the node predates
     /// health conditions.
     async fn global(&mut self) -> anyhow::Result<GlobalRead>;

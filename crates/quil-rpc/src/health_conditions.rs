@@ -2085,18 +2085,15 @@ pub fn notice_text(c: &HealthCondition) -> String {
     }
 }
 
-/// The notice of the worst current GLOBAL progress condition, if any, as a
-/// clause without its final stop: what a paced shield pauses for.
+/// The notice of a current GLOBAL stall (`Global head unchanged`), if any,
+/// as a clause without its final stop: what a paced shield pauses for.
+/// `Global frames slow` is no stall: GLOBAL still includes, and each batch
+/// already waits for the previous one's inclusion.
 pub fn global_progress_notice(health: &HealthConditions) -> Option<String> {
     health
         .conditions
         .iter()
-        .find(|c| {
-            matches!(
-                ConditionKind::try_from(c.kind),
-                Ok(ConditionKind::GlobalHeadUnchanged | ConditionKind::GlobalFramesSlow)
-            )
-        })
+        .find(|c| c.kind == ConditionKind::GlobalHeadUnchanged as i32)
         .map(|c| notice_text(c).trim_end_matches('.').to_string())
 }
 
@@ -3436,8 +3433,8 @@ mod tests {
         assert_eq!(kinds[&1_515], [ConditionKind::GlobalFramesSlow as i32]);
     }
 
-    /// A paced shield pauses for the worst GLOBAL progress condition and for
-    /// no other kind.
+    /// A paced shield pauses for GLOBAL's head unchanged and for no other
+    /// kind: slow GLOBAL frames still include its batches.
     #[test]
     fn the_global_progress_notice_is_the_worst_global_condition() {
         let condition = |kind: ConditionKind, severity: ConditionSeverity| HealthCondition {
@@ -3455,17 +3452,25 @@ mod tests {
             ConditionKind::LocalAppFramesUnchanged,
             ConditionSeverity::Warning,
         );
+        let slow = condition(ConditionKind::GlobalFramesSlow, ConditionSeverity::Warning);
         let mut health = HealthConditions {
             conditions: vec![
-                condition(ConditionKind::GlobalHeadUnchanged, ConditionSeverity::Error),
+                slow.clone(),
                 local.clone(),
-                condition(ConditionKind::GlobalFramesSlow, ConditionSeverity::Warning),
+                condition(ConditionKind::GlobalHeadUnchanged, ConditionSeverity::Error),
             ],
             sources: Vec::new(),
         };
         assert_eq!(
             global_progress_notice(&health).as_deref(),
-            Some("Global head unchanged >120s")
+            Some("Global head unchanged >120s"),
+            "the shield pauses for the stall alone"
+        );
+        health.conditions = vec![slow, local.clone()];
+        assert_eq!(
+            global_progress_notice(&health),
+            None,
+            "slow GLOBAL frames pause the shield"
         );
         health.conditions = vec![local];
         assert_eq!(global_progress_notice(&health), None);
