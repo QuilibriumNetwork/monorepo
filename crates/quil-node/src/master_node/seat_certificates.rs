@@ -140,6 +140,9 @@ struct Seat {
     first_global: u64,
     /// When the seat's slots were last read from committed state.
     read_at: u64,
+    /// The first epoch committed state says the seat's allocation was
+    /// active in ([`SeatCertificates::active_from`]); `None` when unread.
+    active_from: Option<u64>,
 }
 
 /// The shard frames of one epoch this node's seat was counted in.
@@ -169,6 +172,7 @@ impl Seat {
             rewards_logged: BTreeMap::new(),
             first_global: 0,
             read_at: 0,
+            active_from: None,
         }
     }
 
@@ -290,6 +294,9 @@ pub(crate) enum SeatLog {
         counts: EpochCount,
         /// Whether this process observed GLOBAL from before the epoch began.
         complete: bool,
+        /// The GLOBAL frame this process began counting the seat at: the
+        /// counts cover only the epoch's frames since, when not `complete`.
+        counted_from: u64,
         committee: u32,
     },
     /// What the prover's reward balance gained in the last hour.
@@ -447,6 +454,16 @@ impl SeatCertificates {
         });
         while seat.memberships.len() > MAX_GENERATIONS {
             seat.memberships.pop_front();
+        }
+    }
+
+    /// Note the first epoch each seat's allocation was active in, as the
+    /// prover registry holds it (`epochs`, by filter; a seat absent is
+    /// unread). It says which seats were held in an epoch this process did
+    /// not see begin, as after a restart.
+    pub fn active_from(&mut self, epochs: &BTreeMap<Vec<u8>, u64>) {
+        for (filter, seat) in self.seats.iter_mut() {
+            seat.active_from = epochs.get(filter).copied();
         }
     }
 
@@ -796,7 +813,14 @@ impl SeatCertificates {
     /// epoch the seat holds no slot for is paid at once or not at all
     /// ([`kind`]): once it is two epochs old, when no slot can still sync
     /// in, it gets one line if the seat was held in it (tips counted, or
-    /// counted since before the epoch began and still a seat), and is done.
+    /// still a seat whose allocation was active by the epoch, else counted
+    /// since before the epoch began), and is done. An unsealed slot with no
+    /// roots and no tips counted is nothing, unless the counts are partial
+    /// and the seat is still one active by the epoch. Each line is this
+    /// process's only if it counted the seat before the line fell due (the
+    /// epoch ended, the settlement closed, or for no slot the next epoch
+    /// ended); else the process before logged it, and it is marked logged,
+    /// so a restart logs no seat-epoch twice.
     pub fn rewards(&mut self, filter: &[u8], slots: &[SlotRead], now: u64) -> Vec<SeatLog> {
         let current = self.current_epoch();
         let length = quil_types::consensus::epoch_length_frames();
@@ -813,25 +837,45 @@ impl SeatCertificates {
             }
             let counts = seat.epochs.get(&epoch).copied().unwrap_or_default();
             let complete = seat.first_global > 0 && seat.first_global <= epoch * length;
-            let held = counts.frames > 0 || (seat.current && complete);
+            let active = seat.active_from.map_or(complete, |from| from <= epoch);
+            let held = counts.frames > 0 || (seat.current && active);
+            // Whether this process counted the seat before GLOBAL frame
+            // `frame`, when a line fell due.
+            let first = seat.first_global;
+            let ours = |frame: u64| first > 0 && first < frame;
             let slot = slots.iter().find(|slot| slot.epoch == epoch);
-            let stage = match slot {
+            // What the read marks logged, and the line's stage if this
+            // process logs it.
+            let (bits, stage) = match slot {
                 None if epoch + 2 > current => continue,
-                None if held && logged == 0 => Some((ENDED | CLOSED, "ended")),
-                None => None,
-                Some(slot) if !slot.sealed && slot.frames == 0 && counts.frames == 0 => None,
+                None if held && logged == 0 => (
+                    ENDED | CLOSED,
+                    ours((epoch + 2) * length).then_some("ended"),
+                ),
+                None => (ENDED | CLOSED, None),
+                Some(slot)
+                    if !slot.sealed
+                        && slot.frames == 0
+                        && counts.frames == 0
+                        && (complete || !(seat.current && active)) =>
+                {
+                    (ENDED | CLOSED, None)
+                }
                 Some(slot) => match slot.outcome {
-                    Outcome::Open if logged & ENDED == 0 => Some((ENDED, "ended")),
+                    Outcome::Open if logged & ENDED == 0 => {
+                        (ENDED, ours((epoch + 1) * length).then_some("ended"))
+                    }
                     Outcome::Open => continue,
-                    _ if logged & CLOSED == 0 => Some((ENDED | CLOSED, "closed")),
+                    Outcome::Settled(frame) | Outcome::Expired(frame) if logged & CLOSED == 0 => {
+                        (ENDED | CLOSED, ours(frame).then_some("closed"))
+                    }
                     _ => continue,
                 },
             };
-            let Some((bits, stage)) = stage else {
-                seat.rewards_logged.insert(epoch, ENDED | CLOSED);
+            seat.rewards_logged.insert(epoch, logged | bits);
+            let Some(stage) = stage else {
                 continue;
             };
-            seat.rewards_logged.insert(epoch, logged | bits);
             logs.push(SeatLog::Reward {
                 filter: filter.to_vec(),
                 epoch,
@@ -840,6 +884,7 @@ impl SeatCertificates {
                 slot: slot.cloned(),
                 counts,
                 complete,
+                counted_from: seat.first_global,
                 committee,
             });
         }
@@ -951,16 +996,26 @@ pub(crate) fn low_episodes() -> Vec<(Vec<u8>, bool)> {
 }
 
 /// Update the seats from the sampler's pass at `now` (`heads`: each seat's
-/// shard with its head session generation), reading the membership of new
-/// sessions from committed state, and log what is due.
+/// shard with its head session generation; `active_from`: the first epoch
+/// each seat's allocation was active in, `None` when the registry was not
+/// read), reading the membership of new sessions from committed state, and
+/// log what is due.
 pub(crate) fn refresh(
     crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     prover_address: &[u8],
     heads: &[(Vec<u8>, u64)],
+    active_from: Option<&BTreeMap<Vec<u8>, u64>>,
     now: u64,
 ) {
     use quil_execution::global_intrinsic::handoff::{self, CommittedView};
-    let missing = lock().seats(heads, now);
+    let missing = {
+        let mut tracker = lock();
+        let missing = tracker.seats(heads, now);
+        if let Some(epochs) = active_from {
+            tracker.active_from(epochs);
+        }
+        missing
+    };
     if !missing.is_empty() {
         match CommittedView::capture(crdt) {
             Ok(view) => {
@@ -1114,6 +1169,7 @@ fn log(line: &SeatLog) {
             slot,
             counts,
             complete,
+            counted_from,
             committee,
         } => {
             let none = SlotRead {
@@ -1137,6 +1193,7 @@ fn log(line: &SeatLog) {
                 sealed = read.sealed, committee,
                 tips_seen = counts.frames, tips_signed = counts.signed,
                 expected_by_tips = proposals(counts.weight), counts_complete = complete,
+                counted_from_global_frame = *counted_from,
                 expected_proposals = proposals(read.expected), chained_roots = read.frames,
                 held = %read.held, release_at_most = %read.release_at_most,
                 outcome, closed_at_global_frame = closed_at,
@@ -1146,7 +1203,9 @@ fn log(line: &SeatLog) {
                  gained over `held`; kind=at_once is paid one issuance share at once for each of \
                  `tips_signed` GLOBAL executed (`expected_by_tips` against `expected_proposals` shows \
                  how many GLOBAL counted; outcome=no_slot when GLOBAL holds no slot for the seat), \
-                 credited in the hourly reward balance line; kind=fees_only earns fees only");
+                 credited in the hourly reward balance line; kind=fees_only earns fees only; \
+                 counts_complete=false when this process began counting inside the epoch (a \
+                 restart): tips_* then cover only its frames since `counted_from_global_frame`");
         }
         SeatLog::Credits {
             window_secs,
@@ -1640,6 +1699,7 @@ mod tests {
     fn tips_count_by_the_epoch_of_their_anchor_and_weigh_one_over_the_committee() {
         let l = epoch_length();
         let mut t = seated(T0);
+        t.observe_global(5 * l);
         let now = T0 + 600;
         // Epoch 5: one signed tip and one not; epoch 6: one signed.
         assert!(t.count(FILTER, 1, ms(T0 + 10), member(5, 4, true), 5 * l + 1, now));
@@ -1676,6 +1736,7 @@ mod tests {
         let l = epoch_length();
         let mut t = seated(T0);
         assert!(t.rewards_due(T0).is_empty(), "no GLOBAL frame observed yet");
+        t.observe_global(5 * l);
         t.observe_global(7 * l);
         assert_eq!(t.rewards_due(T0), vec![FILTER.to_vec()]);
         assert!(t.rewards_due(T0 + READ_EVERY - 1).is_empty(), "read lately");
@@ -1717,6 +1778,7 @@ mod tests {
         );
         // A closed epoch seen at once logs one line, not two.
         let mut late = seated(T0);
+        late.observe_global(7 * l - 1);
         late.observe_global(7 * l);
         let logs = late.rewards(FILTER, &closed, T0);
         assert_eq!(rewards(&logs).len(), 2);
@@ -1746,6 +1808,7 @@ mod tests {
         let logs = rewards(&t.rewards(FILTER, &[], T0));
         assert!(logs.is_empty(), "epoch 6 is done as bare");
         let mut fresh = seated(T0);
+        fresh.observe_global(6 * l);
         fresh.observe_global(7 * l);
         assert!(fresh.count(FILTER, 1, ms(T0), member(5, 4, true), 6 * l + 1, T0));
         let logs = rewards(&fresh.rewards(FILTER, &bare, T0));
@@ -1883,8 +1946,8 @@ mod tests {
             .collect();
         assert_eq!(
             complete,
-            [false, false],
-            "first seen at 6L+10, inside epoch 6"
+            [false],
+            "first seen at 6L+10, inside epoch 6; epoch 5's line fell due before"
         );
         let mut early = seated(T0);
         early.observe_global(5 * l + 10);
@@ -1902,6 +1965,169 @@ mod tests {
             [false, true],
             "first seen inside epoch 5, before epoch 6 began"
         );
+    }
+
+    /// The reward lines `t` logs for `FILTER` with no slot, as `(epoch,
+    /// counts_complete, counted_from, tips_signed)`.
+    fn no_slot_lines(t: &mut SeatCertificates) -> Vec<(u64, bool, u64, u64)> {
+        t.rewards(FILTER, &[], T0)
+            .iter()
+            .map(|log| match log {
+                SeatLog::Reward {
+                    epoch,
+                    slot: None,
+                    complete,
+                    counted_from,
+                    counts,
+                    ..
+                } => (*epoch, *complete, *counted_from, counts.signed),
+                other => panic!("not a no-slot reward line: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_at_once_epoch_a_restart_began_after_still_logs_once_marked_partial() {
+        let l = epoch_length();
+        // The registry: the seat's allocation active since epoch 3.
+        let active = BTreeMap::from([(FILTER.to_vec(), 3)]);
+        // Restarted inside epoch 6: epoch 5's tips went with the last
+        // process, and its line falls due when epoch 7 begins.
+        let mut t = seated(T0);
+        t.active_from(&active);
+        t.observe_global(6 * l + 10);
+        assert!(t.count(FILTER, 1, ms(T0), member(5, 4, true), 6 * l + 20, T0));
+        assert!(
+            no_slot_lines(&mut t).is_empty(),
+            "line_owed_before: epoch 4 fell due before this process"
+        );
+        t.observe_global(7 * l);
+        assert_eq!(
+            no_slot_lines(&mut t),
+            [(5, false, 6 * l + 10, 0)],
+            "restart_lost_line: the seat held in epoch 5 gets its line, partial"
+        );
+        assert!(no_slot_lines(&mut t).is_empty(), "once");
+        t.observe_global(8 * l);
+        assert_eq!(
+            no_slot_lines(&mut t),
+            [(6, false, 6 * l + 10, 1)],
+            "epoch 6, counted from the restart"
+        );
+        // Restarted again inside epoch 7: epoch 5's line was the last
+        // process's, epoch 6's falls due in this one.
+        let mut again = seated(T0);
+        again.active_from(&active);
+        again.observe_global(7 * l + 10);
+        assert!(
+            no_slot_lines(&mut again).is_empty(),
+            "second_restart_duplicate: epoch 5 logged again"
+        );
+        again.observe_global(8 * l);
+        assert_eq!(no_slot_lines(&mut again), [(6, false, 7 * l + 10, 0)]);
+        // An allocation active only from epoch 6 was not held in epoch 5.
+        let mut joined = seated(T0);
+        joined.active_from(&BTreeMap::from([(FILTER.to_vec(), 6)]));
+        joined.observe_global(6 * l + 10);
+        joined.observe_global(7 * l);
+        assert!(
+            no_slot_lines(&mut joined).is_empty(),
+            "joined_after_logged: a line for an epoch before the seat was active"
+        );
+        joined.observe_global(8 * l);
+        assert_eq!(no_slot_lines(&mut joined), [(6, false, 6 * l + 10, 0)]);
+        // With the registry unread, counting since inside the epoch says
+        // nothing of it: no line, as before.
+        let mut unread = seated(T0);
+        unread.observe_global(6 * l + 10);
+        unread.observe_global(7 * l);
+        assert!(no_slot_lines(&mut unread).is_empty());
+    }
+
+    #[test]
+    fn an_unsealed_slot_a_restart_began_inside_still_logs_its_line() {
+        let l = epoch_length();
+        let active = BTreeMap::from([(FILTER.to_vec(), 3)]);
+        // Epoch 6 holds an unsealed slot with no roots chained.
+        let slots = [slot(6, false, 0, 0, Outcome::Open)];
+        // Epoch 6's lines as `(epoch, stage, kind, counts_complete)`.
+        let lines = |t: &mut SeatCertificates| -> Vec<(u64, &'static str, &'static str, bool)> {
+            t.rewards(FILTER, &slots, T0)
+                .iter()
+                .filter_map(|log| match log {
+                    SeatLog::Reward {
+                        epoch: 6,
+                        stage,
+                        kind,
+                        complete,
+                        ..
+                    } => Some((6, *stage, *kind, *complete)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Restarted inside epoch 6 with no tip counted since: the seat
+        // active since epoch 3 gets epoch 6's line, partial.
+        let mut t = seated(T0);
+        t.active_from(&active);
+        t.observe_global(6 * l + 10);
+        t.observe_global(7 * l);
+        assert_eq!(
+            lines(&mut t),
+            [(6, "ended", "at_once", false)],
+            "unsealed_slot_lost: a held unsealed slot's line after a restart"
+        );
+        assert!(lines(&mut t).is_empty(), "once");
+        // Counted since before epoch 6 began, nothing seen: nothing, as
+        // before.
+        let mut whole = seated(T0);
+        whole.active_from(&active);
+        whole.observe_global(6 * l - 1);
+        whole.observe_global(7 * l);
+        assert!(lines(&mut whole).is_empty(), "complete counts saw nothing");
+        // With the registry unread, partial counts say nothing: as before.
+        let mut unread = seated(T0);
+        unread.observe_global(6 * l + 10);
+        unread.observe_global(7 * l);
+        assert!(lines(&mut unread).is_empty(), "registry unread");
+    }
+
+    #[test]
+    fn a_restart_does_not_log_again_a_slot_line_the_process_before_logged() {
+        let l = epoch_length();
+        let stages = |logs: &[SeatLog]| -> Vec<(u64, &'static str)> {
+            rewards(logs).iter().map(|r| (r.0, r.1)).collect()
+        };
+        let open = [
+            slot(5, true, 3, 100, Outcome::Open),
+            slot(6, true, 3, 100, Outcome::Open),
+        ];
+        // Restarted inside epoch 7: both epochs ended before it began, so
+        // their ended lines were the last process's.
+        let mut t = seated(T0);
+        t.observe_global(7 * l + 10);
+        assert!(
+            t.rewards(FILTER, &open, T0).is_empty(),
+            "relogged_after_restart: an ended line the process before logged"
+        );
+        // Epoch 5 settled before this process began, epoch 6 expired after.
+        let closed = [
+            slot(5, true, 3, 100, Outcome::Settled(7 * l + 5)),
+            slot(6, true, 3, 100, Outcome::Expired(7 * l + 20)),
+        ];
+        t.observe_global(7 * l + 30);
+        assert_eq!(
+            stages(&t.rewards(FILTER, &closed, T0)),
+            [(6, "closed")],
+            "closed_line_lost: only the settlement closed since logs"
+        );
+        assert!(t.rewards(FILTER, &closed, T0).is_empty(), "once");
+        // Restarted inside epoch 6: epoch 6's ended line is this process's,
+        // its counts partial; epoch 5's was the last process's.
+        let mut inside = seated(T0);
+        inside.observe_global(6 * l + 10);
+        inside.observe_global(7 * l);
+        assert_eq!(stages(&inside.rewards(FILTER, &open, T0)), [(6, "ended")]);
     }
 
     #[test]
