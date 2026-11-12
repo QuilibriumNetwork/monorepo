@@ -2218,8 +2218,10 @@ impl ProverLifecycle {
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
-    /// more than it may. Picks (`SurplusSelection::picks`) the lowest-scoring active filters when total active allocs
-    /// exceed `total_capacity` (the configured worker count). Manually-managed pins are
+    /// more than it may. Picks (`SurplusSelection::picks`) the seats of
+    /// draining workers first, then the lowest-scoring active filters, when
+    /// total active allocs exceed `total_capacity` (the configured worker
+    /// count). Manually-managed pins are
     /// protected — they're never picked as leave candidates — but
     /// they DO count toward capacity (an idle manual worker is still
     /// a worker, capable of hosting whichever filter the operator
@@ -2312,20 +2314,21 @@ impl ProverLifecycle {
             self.strategy,
             &excluded,
         );
-        // Among equal scores, a seat bound to a draining worker (one above
-        // the configured count) goes before one of a worker the node keeps,
-        // so the draining worker can stop; the score still decides first.
+        // A seat bound to a draining worker (one above the configured count)
+        // goes before any other, lowest score first, so the draining worker
+        // can stop. Shedding a kept worker's seat instead idles that worker
+        // while the draining one keeps its seat; the node is then at its
+        // count, so the idle worker cannot join and no seat is surplus, and
+        // the draining worker never stops.
         ranked.sort_by(|a, b| {
-            a.1.cmp(&b.1)
+            draining_filters
+                .contains(&b.0)
+                .cmp(&draining_filters.contains(&a.0))
+                .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| {
                     bound_filters
                         .contains(&a.0)
                         .cmp(&bound_filters.contains(&b.0))
-                })
-                .then_with(|| {
-                    draining_filters
-                        .contains(&b.0)
-                        .cmp(&draining_filters.contains(&a.0))
                 })
         });
         let eligible = ranked.len();
@@ -4244,7 +4247,7 @@ impl ProverLifecycle {
                 &pending_leave_filters,
             );
             // Over-capacity filters: allocations this prover cannot
-            // staff, worst-scoring first.
+            // staff, draining workers' seats first, then worst-scoring.
             //
             // Rank the whole held set, including unbound allocations: a
             // crash or delayed join can leave the valuable holding unstaffed.
@@ -4298,12 +4301,19 @@ impl ProverLifecycle {
                     self.strategy,
                     &excluded,
                 );
+                // As the surplus leave picks: a draining worker's seat
+                // first, then lowest score first, unbound seats first among
+                // equals.
                 ranked.sort_by(|a, b| {
-                    a.1.cmp(&b.1).then_with(|| {
-                        bound_filters
-                            .contains(&a.0)
-                            .cmp(&bound_filters.contains(&b.0))
-                    })
+                    draining_filters
+                        .contains(&b.0)
+                        .cmp(&draining_filters.contains(&a.0))
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| {
+                            bound_filters
+                                .contains(&a.0)
+                                .cmp(&bound_filters.contains(&b.0))
+                        })
                 });
                 // As in `select_excess_active_filters`, a seat whose storage
                 // renewal is under way is spared until it lands or its grace
@@ -4833,8 +4843,8 @@ impl ProverLifecycle {
                 .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT)
                 .map(|d| d.filter.clone())
                 .collect();
-            // As the surplus leave picks: lowest score first, and among equal
-            // scores a draining worker's seat first.
+            // As the surplus leave picks: a draining worker's seat first, then
+            // lowest score first.
             let mut capacity_ranked = proposer::rank_allocated_by_score_ascending(
                 &held_descriptors,
                 difficulty,
@@ -4844,11 +4854,10 @@ impl ProverLifecycle {
                 &shielded,
             );
             capacity_ranked.sort_by(|a, b| {
-                a.1.cmp(&b.1).then_with(|| {
-                    draining_filters
-                        .contains(&b.0)
-                        .cmp(&draining_filters.contains(&a.0))
-                })
+                draining_filters
+                    .contains(&b.0)
+                    .cmp(&draining_filters.contains(&a.0))
+                    .then_with(|| a.1.cmp(&b.1))
             });
             let capacity_needed = serving.saturating_sub(worker_capacity);
             let capacity_ready: Vec<Vec<u8>> = capacity_ranked
@@ -14065,11 +14074,210 @@ mod proposal_loop_tests {
         );
     }
 
+    /// After the count is lowered, the surplus leave sheds the draining
+    /// workers' seats before a seat of a worker within the count, even one
+    /// of lower reward. A kept worker's seat shed instead idles that worker
+    /// while the draining one keeps its seat; the node is then at its count,
+    /// so nothing joins or leaves again and the draining worker never stops.
+    /// Here, once the proposed leaves depart, every draining worker retires.
+    #[test]
+    fn a_lowered_count_drains_extra_workers_before_kept_seats_of_lower_reward() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // The registry holds only this prover, so every seat is on the same
+        // ring and its reward follows its shard's size; each shard has 10
+        // active provers, above the shield. Cores 1..=6, within the count,
+        // sit on small shards, and cores 7..=9, draining, on ten times
+        // larger ones, so their seats pay more.
+        let size = |core: u32| {
+            let base = if core <= 6 { 100_000 } else { 1_000_000 };
+            base + u64::from(core)
+        };
+        let seat = |core: u32| filter_bytes(0xC0 + core as u8);
+        let mut allocs: Vec<ProverAllocationInfo> = Vec::new();
+        for core in 1..=9u32 {
+            wm.add(allocated_worker(core, seat(core)));
+            allocs.push(alloc(seat(core), ProverStatus::Active, 10));
+        }
+        wm.set_configured_count(6);
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        reg.set_summaries(
+            (1..=9u32)
+                .map(|core| ProverShardSummary {
+                    total_size: size(core),
+                    ..shard_summary(seat(core), 10)
+                })
+                .collect(),
+        );
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let left = proposed_leave_filters(&actions);
+        assert_eq!(left.len(), 3, "{actions:?}");
+        let left_cores: Vec<u32> = (1..=9u32).filter(|c| left.contains(&seat(*c))).collect();
+
+        // The proposed leaves depart and their workers go idle.
+        allocs.retain(|a| !left.contains(&a.confirmation_filter));
+        reg.set_prover(prover(address, allocs));
+        for core in &left_cores {
+            wm.deallocate_worker(*core).unwrap();
+        }
+        let after = lifecycle
+            .evaluate(101, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let mut retired = wm.retired();
+        retired.sort_unstable();
+        assert_eq!(
+            retired,
+            vec![7, 8, 9],
+            "drain_stalled: the surplus leave took the seats of cores {left_cores:?}; after they \
+             departed: {after:?}"
+        );
+    }
+
+    /// At the confirm boundary, the capacity rule confirms a draining
+    /// worker's pending leave before a kept worker's of lower reward; the
+    /// kept one goes through the score rule, which rejects it with no better
+    /// shard open. The extra worker drains and the kept one keeps serving.
+    #[test]
+    fn the_capacity_rule_confirms_a_draining_seats_leave_before_a_kept_ones() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (kept_low, kept, draining) =
+            (filter_bytes(0xD1), filter_bytes(0xD2), filter_bytes(0xD3));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, kept_low.clone()));
+        wm.add(allocated_worker(2, kept.clone()));
+        wm.add(allocated_worker(3, draining.clone()));
+        wm.set_configured_count(2);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // One ring for every seat (the registry holds only this prover), so
+        // the reward follows the size: the kept seat on the small shard pays
+        // least.
+        reg.set_summaries(vec![
+            ProverShardSummary {
+                total_size: 100_000,
+                ..shard_summary(kept_low.clone(), 10)
+            },
+            shard_summary(kept.clone(), 10),
+            shard_summary(draining.clone(), 10),
+        ]);
+        let mut allocs = vec![
+            alloc(kept_low.clone(), ProverStatus::Active, 10),
+            alloc(kept, ProverStatus::Active, 10),
+            alloc(draining.clone(), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        // Whatever was proposed, decide pending leaves of the kept seat of
+        // lowest reward and of the draining seat in their confirm epoch.
+        for i in [0, 2] {
+            allocs[i].status = ProverStatus::Leaving;
+            allocs[i].leave_frame_number = 100;
+        }
+        reg.set_prover(prover(address, allocs));
+        lifecycle.set_prover_root_verified_frame(800);
+        let actions = lifecycle
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let decided = |confirm: bool| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ConfirmLeaves { filters, .. } if confirm => Some(filters),
+                    LifecycleAction::RejectLeaves { filters, .. } if !confirm => Some(filters),
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            (decided(true), decided(false)),
+            (vec![draining], vec![kept_low]),
+            "capacity_order: {actions:?}"
+        );
+    }
+
+    /// The overcapacity leave also sheds a draining worker's seat before a
+    /// kept worker's of lower reward. It proposes when the surplus leave
+    /// does not: here a manual worker's join is pending, so its seat is not
+    /// Active and the surplus leave counts no surplus, while the
+    /// overcapacity leave counts that worker against the auto-managed
+    /// capacity and sheds one seat.
+    #[test]
+    fn the_overcapacity_leave_sheds_a_draining_seat_before_a_kept_one() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // One ring for every seat (the registry holds only this prover), so
+        // the reward follows the size. Core 1 is manual with its join
+        // pending; cores 2..=6, within the count, sit on small shards, and
+        // core 7, draining, on a ten times larger one, so its seat pays
+        // more.
+        let size = |core: u32| {
+            let base = if core <= 6 { 100_000 } else { 1_000_000 };
+            base + u64::from(core)
+        };
+        let seat = |core: u32| filter_bytes(0xE0 + core as u8);
+        let mut allocs: Vec<ProverAllocationInfo> = Vec::new();
+        for core in 1..=7u32 {
+            let mut worker = allocated_worker(core, seat(core));
+            worker.manually_managed = core == 1;
+            wm.add(worker);
+            let status = if core == 1 {
+                ProverStatus::Joining
+            } else {
+                ProverStatus::Active
+            };
+            allocs.push(alloc(seat(core), status, 99));
+        }
+        wm.set_configured_count(6);
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(
+            (1..=7u32)
+                .map(|core| ProverShardSummary {
+                    total_size: size(core),
+                    ..shard_summary(seat(core), 10)
+                })
+                .collect(),
+        );
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_leave_filters(&actions),
+            vec![seat(7)],
+            "overcapacity_order: {actions:?}"
+        );
+    }
+
     /// An operator's case at scale: 48 configured, 103 seated workers, the
     /// seats of 30 draining workers on shards the shield holds. 55 seats are
     /// surplus and 73 eligible: the 25 draining seats the shield does not
-    /// hold go first among equal rewards, then 30 of the workers within the
-    /// count; every shielded seat stays, and the summary counts them.
+    /// hold go first, then 30 of the workers within the count; every
+    /// shielded seat stays, and the summary counts them.
     #[test]
     fn a_103_worker_node_configured_for_48_sheds_55_eligible_seats() {
         let address = vec![0xCDu8; 32];
