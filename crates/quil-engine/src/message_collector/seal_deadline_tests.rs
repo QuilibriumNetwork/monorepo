@@ -18,9 +18,14 @@ const LEN: usize = 650_000;
 /// of its registration for `epoch + 2`. A settlement's window ends as epoch
 /// `EPOCH + 2` begins; a seal of epoch `EPOCH + 1`'s seat an epoch later.
 fn proof(id: u32, epoch: u64, settles: bool) -> Vec<u8> {
+    sized(id, epoch, settles, LEN)
+}
+
+/// [`proof`] with `len` proof bytes.
+fn sized(id: u32, epoch: u64, settles: bool, len: usize) -> Vec<u8> {
     let mut member = [0u8; 32];
     member[..4].copy_from_slice(&id.to_be_bytes());
-    let mut bytes = vec![0u8; LEN];
+    let mut bytes = vec![0u8; len];
     bytes[..4].copy_from_slice(&id.to_be_bytes());
     let proof = StorageEpochProof {
         member,
@@ -58,6 +63,37 @@ fn global_collector() -> MessageCollector {
     let mc = MessageCollector::new();
     mc.set_class_shares();
     mc
+}
+
+/// A frame of epoch `EPOCH + 1`, before every window above ends.
+fn now() -> u64 {
+    settlement_window(EPOCH).0
+}
+
+/// A collector that has proposed `frame`, so it knows the current frame.
+fn knowing(frame: u64) -> MessageCollector {
+    let mc = global_collector();
+    mc.snapshot_for_proposal(1, 0, 0, Some(frame), &[]).unwrap();
+    mc
+}
+
+/// Fill `provenance`'s share at `rank` with `make(id)` proofs, ids from
+/// `first` on; how many it holds.
+fn fill(
+    mc: &MessageCollector,
+    rank: u64,
+    provenance: Provenance,
+    first: u32,
+    make: impl Fn(u32) -> Vec<u8>,
+) -> usize {
+    for id in first..first + 40 {
+        match mc.add_message_outcome_from(rank, make(id), provenance) {
+            SubmitOutcome::Accepted => {}
+            SubmitOutcome::Filtered(Refusal::RankFull) => return (id - first) as usize,
+            other => panic!("proof {id}: {other:?}"),
+        }
+    }
+    panic!("40 proofs did not fill the share");
 }
 
 /// The ids of the proofs in a proposal.
@@ -102,7 +138,7 @@ fn a_proposal_carries_the_proofs_due_soonest_first() {
 /// than every held one is refused for now, as before.
 #[test]
 fn a_full_share_makes_room_for_a_proof_due_sooner() {
-    let mc = global_collector();
+    let mc = knowing(now());
     let mut of = HashMap::new();
     let mut held = 0u32;
     for id in 1..=40u32 {
@@ -192,6 +228,139 @@ fn a_proof_past_its_window_makes_no_room() {
         "seal-deadline closed-room: a settlement past its window took room"
     );
     assert_eq!(mc.pending_count(1), held);
+}
+
+/// Until the collector knows the current frame (none proposed or
+/// finalized, as after a restart), a proof's own window end proves nothing:
+/// one whose window ended long ago takes no held proof's room.
+#[test]
+fn a_full_share_makes_no_room_before_the_frame_is_known() {
+    let mc = global_collector();
+    let held = fill(&mc, 1, Provenance::Prover, 1, late);
+    let outcome = mc.add_message_outcome(1, proof(101, 0, true));
+    eprintln!("REACH seal-deadline unknown-frame outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "seal-deadline unknown-frame: a proof of epoch 0 took room before the frame was known"
+    );
+    assert_eq!(
+        mc.pending_count(1),
+        held,
+        "seal-deadline unknown-frame: a held proof left before the frame was known"
+    );
+}
+
+/// Other senders' share makes room for a proof due sooner as the active
+/// provers' does.
+#[test]
+fn an_other_senders_full_share_makes_room_for_a_proof_due_sooner() {
+    let mc = knowing(now());
+    let held = fill(&mc, 1, Provenance::Other, 1, late);
+    let outcome = mc.add_message_outcome_from(1, soon(101), Provenance::Other);
+    eprintln!("REACH seal-deadline other-evict outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "seal-deadline other-evict: another sender's settlement due before every held seal was refused"
+    );
+    assert_eq!(mc.pending_count(1), held, "one seal left for it");
+}
+
+/// A full share makes room only from its own proofs: a proof due sooner
+/// than the other share's takes none of its room.
+#[test]
+fn a_full_share_takes_no_room_from_the_other_share() {
+    for (own, other) in [
+        (Provenance::Prover, Provenance::Other),
+        (Provenance::Other, Provenance::Prover),
+    ] {
+        let mc = knowing(now());
+        let held = fill(&mc, 1, own, 1, soon) + fill(&mc, 1, other, 100, late);
+        let outcome = mc.add_message_outcome_from(1, soon(200), own);
+        eprintln!("REACH seal-deadline shares-apart {own:?} outcome={outcome:?}");
+        assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+        assert_eq!(
+            mc.pending_count(1),
+            held,
+            "seal-deadline shares-apart: a {own:?} proof took room from the other share"
+        );
+    }
+}
+
+/// When the proofs due later cannot free the room a proof needs, none of
+/// them leaves.
+#[test]
+fn a_share_that_cannot_make_room_drops_nothing() {
+    let mc = knowing(now());
+    let held = fill(&mc, 1, Provenance::Prover, 1, soon);
+    assert_eq!(
+        mc.add_message_outcome(1, sized(500, EPOCH + 1, false, 1_000)),
+        SubmitOutcome::Accepted,
+        "a small seal fits beside the settlements"
+    );
+    let outcome = mc.add_message_outcome(1, soon(101));
+    eprintln!("REACH seal-deadline short outcome={outcome:?}");
+    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        mc.pending_count(1),
+        held + 1,
+        "seal-deadline short: a held seal left though its room could not take the settlement"
+    );
+}
+
+/// A shard frame header for shard `addr`, about `len` bytes.
+fn header(addr: u8, len: usize) -> Vec<u8> {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    let header = FrameHeader {
+        address: vec![addr; 32],
+        frame_number: 1,
+        global_frame_number: 99,
+        output: vec![addr; len],
+        ..Default::default()
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_FRAME_HEADER,
+            inner_bytes: header.to_canonical_bytes().unwrap(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A proof due sooner takes no held proof's room when its own rank has no
+/// room for it: that rank refuses it all the same.
+#[test]
+fn a_full_rank_makes_no_room() {
+    let mc = knowing(now());
+    let held = fill(&mc, 1, Provenance::Prover, 1, late);
+    // Rank 2 full: other messages fill their part, shard headers the rest.
+    for i in 0..70u32 {
+        let mut filler = vec![0u8; 1 << 20];
+        filler[..4].copy_from_slice(&i.to_be_bytes());
+        mc.add_message_outcome(2, filler);
+    }
+    let mut addr = 0u8;
+    for len in [1 << 20, 1 << 18, 1 << 16] {
+        loop {
+            addr += 1;
+            match mc.add_message_outcome(2, header(addr, len)) {
+                SubmitOutcome::Accepted => {}
+                SubmitOutcome::Filtered(Refusal::RankFull) => break,
+                other => panic!("header {addr}: {other:?}"),
+            }
+        }
+    }
+    let outcome = mc.add_message_outcome(2, soon(101));
+    eprintln!("REACH seal-deadline rank-room outcome={outcome:?}");
+    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        mc.pending_count(1),
+        held,
+        "seal-deadline rank-room: a held seal left for a settlement its full rank refused"
+    );
 }
 
 /// Settlements due at their window's end and seals with an epoch to spare
