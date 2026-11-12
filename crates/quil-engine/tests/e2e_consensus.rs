@@ -489,6 +489,60 @@ async fn app_consensus_cw_multi_prover_finalizes() {
     harness.shutdown().await;
 }
 
+/// A finalize vote that comes after quorum is paid for. A four-member CW
+/// committee on an instant network finalizes each frame at its quorum of
+/// three; the fourth member votes a moment later. GLOBAL pays only the
+/// signers of the certificate a member publishes with its reward proof, so
+/// some published proof must name all four members.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_finalize_vote_after_quorum_signs_the_published_reward_proof() {
+    use quil_cw_consensus::app_cert::{unverified_signers, unwrap_cert_from_header};
+    use quil_execution::global_intrinsic::frame_header::FrameHeader;
+    init_tracing();
+    const MEMBERS: usize = 4;
+    // Six frames' proofs from four members: enough for a late vote to join
+    // one of them.
+    const PROOFS: usize = 24;
+    // (committee, signers) of each published reward proof's certificate.
+    let signers = |harness: &AppShardHarness| -> Vec<Option<(usize, usize)>> {
+        harness
+            .workers
+            .iter()
+            .flat_map(|w| w.coverage_published.lock().clone())
+            .map(|bytes| {
+                let header = FrameHeader::from_canonical_bytes(&bytes).ok()?;
+                unverified_signers(unwrap_cert_from_header(
+                    &header.public_key_signature_bls48581,
+                )?)
+            })
+            .collect()
+    };
+    let harness = AppShardHarness::build_cw(MEMBERS);
+    until_progress(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(240),
+        || frames_seen(&harness) + signers(&harness).len() as u64,
+        || {
+            let seen = signers(&harness);
+            (seen.len() >= PROOFS || seen.contains(&Some((MEMBERS, MEMBERS)))).then_some(())
+        },
+    )
+    .await;
+    let seen = signers(&harness);
+    harness.shutdown().await;
+    assert!(!seen.is_empty(), "no reward proof published");
+    assert!(
+        seen.iter()
+            .all(|c| c.is_some_and(|(committee, _)| committee == MEMBERS)),
+        "a reward proof without a certificate of the {MEMBERS}-member committee: {seen:?}",
+    );
+    assert!(
+        seen.contains(&Some((MEMBERS, MEMBERS))),
+        "LATE-VOTE-UNPAID: no reward proof published to GLOBAL names all {MEMBERS} members, \
+         though each voted; (committee, signers) per proof: {seen:?}",
+    );
+}
+
 /// A legacy shard whose committee changed restarts from the head the old
 /// committee certified (public issue #664): every member of the new committee
 /// holds that head, which its registry no longer reproduces the signers of.
