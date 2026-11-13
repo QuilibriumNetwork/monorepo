@@ -22,7 +22,8 @@
 //! [`FRAMES_PER_TICK`] examined per tick, at most [`MAX_REOFFERS`] of a bundle
 //! per process, and another only after GLOBAL skips its new source frame too.
 //! A bundle past them stays uncommitted, and consumed nothing: its sender
-//! submits it again, as before.
+//! submits it again, as before. So does an operation whose bundle cannot run
+//! again, which the member warns of once per frame.
 
 use quil_execution::message_envelope::CanonicalMessageBundle;
 use quil_execution::token_intrinsic::global_commit::{self, SpendEntry};
@@ -136,13 +137,24 @@ impl RelayWatch {
     }
 }
 
+/// What [`unrelayed_bundles`] found in a skipped frame.
+#[derive(Debug, Default)]
+pub(crate) struct Unrelayed {
+    /// The bundles to offer again, in canonical encoding.
+    pub(crate) bundles: Vec<Vec<u8>>,
+    /// The operations GLOBAL has not decided that none of `bundles` carries,
+    /// by id, sorted: nothing here can commit them.
+    pub(crate) stranded: Vec<[u8; 32]>,
+}
+
 /// The bundles of `frame` to offer again, in canonical encoding: every
 /// operation of the bundle took effect in that frame, GLOBAL has not decided
 /// at least one, and no frame through `head` executed that one since. A bundle
 /// with an operation that commits on the shard itself is left alone: executing
-/// it again would apply that operation twice. So is one the frame skipped,
-/// which has no entries. `Err` when the frame cannot be read here, which a
-/// member that reached it by sync may not.
+/// it again would apply that operation twice. Its undecided operations are
+/// returned as stranded, as are those of a bundle that does not decode. A
+/// bundle the frame skipped, which has no entries, is neither. `Err` when the
+/// frame cannot be read here, which a member that reached it by sync may not.
 pub(crate) fn unrelayed_bundles(
     clock: &dyn ClockStore,
     global: &Arc<quil_hypergraph::HypergraphCrdt>,
@@ -150,10 +162,10 @@ pub(crate) fn unrelayed_bundles(
     filter: &[u8],
     frame: u64,
     head: u64,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Unrelayed> {
     let executed = frame_tx_ids(clock, filter, frame)?;
     if executed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Unrelayed::default());
     }
     let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
     let mut undecided = HashSet::new();
@@ -172,10 +184,10 @@ pub(crate) fn unrelayed_bundles(
         }
     }
     if undecided.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Unrelayed::default());
     }
     let body = clock.get_shard_clock_frame(filter, frame, false)?;
-    let mut bundles = Vec::new();
+    let (mut bundles, mut carried) = (Vec::new(), HashSet::new());
     for bundle in &body.requests {
         let Ok(canonical) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
             continue;
@@ -193,10 +205,13 @@ pub(crate) fn unrelayed_bundles(
             && ids.iter().all(|id| executed.contains(id))
             && ids.iter().any(|id| undecided.contains(id))
         {
+            carried.extend(ids);
             bundles.push(canonical);
         }
     }
-    Ok(bundles)
+    let mut stranded: Vec<[u8; 32]> = undecided.difference(&carried).copied().collect();
+    stranded.sort_unstable();
+    Ok(Unrelayed { bundles, stranded })
 }
 
 /// The operations the shard's frame `frame` took into its spend relay.

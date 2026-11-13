@@ -375,6 +375,49 @@ async fn only_a_bundle_every_operation_of_which_was_relayed_is_offered() {
     assert!(member.offered().is_empty());
 }
 
+/// A skipped spend whose bundle cannot run again, since another of its
+/// operations changed the shard itself, stays uncommitted: one warning names
+/// its frame, count and first operation, beside a bundle of the same frame
+/// that does come back, and a later tick does not repeat it.
+#[tokio::test]
+async fn a_skipped_spend_that_cannot_be_offered_again_is_warned_once() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _guard = logs.install();
+    let mut member = member(40);
+    let (first, second, lone) = (operation(1), operation(2), operation(3));
+    let mixed = bundle_of(&[first.clone(), second]);
+    let single = bundle_of(std::slice::from_ref(&lone));
+    member.frame(
+        5,
+        &[&mixed, &single],
+        &[&mixed, &single],
+        vec![entry(&first, 5), entry(&lone, 5)],
+    );
+    member.execute_header(4);
+    member.engine.maintain_committee_session().await;
+    member.execute_header(14);
+    member.engine.maintain_committee_session().await;
+    member.engine.maintain_committee_session().await;
+    assert!(!member.decided(&first));
+    assert_eq!(member.offered(), vec![single], "the lone bundle comes back");
+    let line = logs.lines_with("cannot re-offer spends GLOBAL skipped");
+    assert_eq!(
+        line.len(),
+        1,
+        "stranded_silently: frame 5's spend never commits and cannot be offered again, \
+         yet nothing says so: {line:?}"
+    );
+    assert!(line[0].contains("WARN"), "{}", line[0]);
+    assert!(line[0].contains("source_frame=5"), "{}", line[0]);
+    let tx = hex::encode(&global_commit::tx_id(&first)[..8]);
+    assert!(
+        line[0].contains("stranded=1") && line[0].contains(&format!("tx={tx}")),
+        "stranded_miscounted: only the mixed bundle's spend is stranded: {}",
+        line[0]
+    );
+}
+
 /// Each re-offer needs GLOBAL to skip the bundle's new source frame too, and
 /// stops at the cap with one warning, leaving a sender's new submission free.
 #[tokio::test]

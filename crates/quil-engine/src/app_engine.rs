@@ -9990,7 +9990,7 @@ impl AppConsensusEngine {
                  a spend GLOBAL skipped there stays uncommitted until its sender submits it again");
         }
         for frame in self.relay_watch.due() {
-            let bundles = match unrelayed_bundles(
+            let found = match unrelayed_bundles(
                 self.clock_store.as_ref(),
                 global,
                 &application,
@@ -9998,7 +9998,7 @@ impl AppConsensusEngine {
                 frame,
                 self.last_materialized_frame,
             ) {
-                Ok(bundles) => bundles,
+                Ok(found) => found,
                 Err(error) => {
                     // Another member holds it, or the next jump's pass reads it.
                     info!(filter = %filter, source_frame = frame, executed_tip = tip, error = %error,
@@ -10008,7 +10008,7 @@ impl AppConsensusEngine {
                 }
             };
             let mut retry = false;
-            for canonical in bundles {
+            for canonical in found.bundles {
                 let hash: [u8; 32] = sha3::Sha3_256::digest(&canonical).into();
                 let bundle = hex::encode(&hash[..4]);
                 if !self.relay_watch.may_reoffer(&hash) {
@@ -10039,6 +10039,14 @@ impl AppConsensusEngine {
                 }
             }
             if !retry {
+                if let Some(first) = found.stranded.first() {
+                    warn!(filter = %filter, source_frame = frame, executed_tip = tip,
+                        stranded = found.stranded.len(), tx = %hex::encode(&first[..8]),
+                        scope = "network: GLOBAL executed past every header relaying these operations",
+                        action = "they stay uncommitted and consumed nothing: their senders submit them again",
+                        "cannot re-offer spends GLOBAL skipped: their bundle also changed the shard \
+                         itself or does not decode");
+                }
                 self.relay_watch.examined(frame);
             }
         }
