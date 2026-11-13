@@ -41,6 +41,10 @@ libp2p = { version = "0.56", features = [
 # so `Behaviour::with_metrics` / `MetricsConfig` are available. Same version
 # libp2p 0.56 resolves; Cargo unifies the features onto one crate instance.
 libp2p-gossipsub = { version = "0.49", features = ["metrics"] }
+# The system resolver config read in `dns_config`: the crate and feature
+# libp2p's DNS transport uses, read here so a config that lists no
+# nameserver yet does not fail the swarm.
+hickory-resolver = { version = "0.25", default-features = false, features = ["system-config"] }
 prost = "0.13"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tracing = "0.1"
