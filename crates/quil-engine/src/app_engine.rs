@@ -21744,6 +21744,7 @@ mod tests {
     /// A finalized frame's reward proof waits for its late-vote window and
     /// goes out signed also by the member whose vote came inside it; the
     /// next frame, whose window this host does not know, goes out behind it.
+    /// One held across a host replacement keeps the host that finalized it.
     /// At most [`MAX_HELD_REWARD_PROOFS`] wait: one more sends the oldest.
     #[test]
     fn reward_proofs_wait_for_late_votes_and_keep_their_order() {
@@ -21763,6 +21764,7 @@ mod tests {
             falcon_simplex::SimplexFalconScheme,
             late_finalize::{LateFinalizes, LateVoteCensus, LATE_VOTE_WINDOW},
         };
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
         use quil_types::crypto::Signer as _;
         let keys: Vec<_> = (0..4)
             .map(|_| {
@@ -21849,24 +21851,55 @@ mod tests {
         engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW / 2, false);
         assert!(published.lock().unwrap().is_empty(), "still open");
         engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW, false);
-        let sent: Vec<(u64, Option<(usize, usize)>)> = published
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|bytes| {
-                let header =
-                    quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
-                        bytes,
+        let sent = || -> Vec<(u64, Option<(usize, usize)>)> {
+            published
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|bytes| {
+                    let header = FrameHeader::from_canonical_bytes(bytes).unwrap();
+                    (
+                        header.frame_number,
+                        unwrap_cert_from_header(&header.public_key_signature_bls48581)
+                            .and_then(unverified_signers),
                     )
-                    .unwrap();
-                (
-                    header.frame_number,
-                    unwrap_cert_from_header(&header.public_key_signature_bls48581)
-                        .and_then(unverified_signers),
-                )
-            })
-            .collect();
-        assert_eq!(sent, vec![(5, Some((4, 4))), (6, Some((4, 3)))]);
+                })
+                .collect()
+        };
+        assert_eq!(sent(), vec![(5, Some((4, 4))), (6, Some((4, 3)))]);
+
+        // Held across a host replacement, a proof keeps the host that
+        // finalized it; the new host, holding another proposal of the view,
+        // extends nothing of it.
+        published.lock().unwrap().clear();
+        let t2 = t0 + Duration::from_secs(5);
+        let replaced = quorum(proposal(7));
+        late.finalized(&replaced, t2);
+        late.vote(vote(3, &replaced.proposal), t2 + Duration::from_millis(100));
+        let replaced_cert = encode_finalization(&replaced);
+        engine.publish_reward_proof(frame(7, &replaced_cert), &replaced_cert, t2);
+        let next = host();
+        next.finalized(
+            &quorum(Proposal::new(
+                Round::new(Epoch::new(0), View::new(7)),
+                View::new(6),
+                Digest([0xEE; 32]),
+            )),
+            t2,
+        );
+        engine.late_finalizes = Some(next.clone());
+        assert_eq!(next.open_until(&replaced_cert, t2), None);
+        assert_eq!(
+            next.extend(&replaced_cert, t2 + LATE_VOTE_WINDOW),
+            None,
+            "another proposal of the view"
+        );
+        engine.release_reward_proofs(t2 + LATE_VOTE_WINDOW, false);
+        assert_eq!(
+            sent(),
+            vec![(7, Some((4, 4)))],
+            "extended by the host that finalized it"
+        );
 
         // Each from its own host, so that no frame's finalization closes
         // another's window.

@@ -605,6 +605,72 @@ mod tests {
         assert_eq!(late.open_until(&encode_finalization(&first), t0), None);
     }
 
+    /// A late signer whose index is below the certificate's signers joins it
+    /// in index order, which the release verifier accepts.
+    #[test]
+    fn a_late_signer_below_the_held_ones_joins_in_order() {
+        let c = committee();
+        let late = LateFinalizes::new(c.schemes[0].clone(), Arc::new(LateVoteCensus::new()));
+        let p = proposal(9, 4);
+        let votes: Vec<_> = (2..7).map(|m| vote(&c, m, &p)).collect();
+        let finalization =
+            AppFinalization::from_finalizes(&c.schemes[0], &votes, &Sequential).unwrap();
+        let t0 = Instant::now();
+        late.finalized(&finalization, t0);
+        late.vote(vote(&c, 0, &p), t0 + Duration::from_millis(100));
+        let extended = late
+            .extend(&encode_finalization(&finalization), t0 + LATE_VOTE_WINDOW)
+            .expect("member 0 added");
+        assert_eq!(signers(&extended, &c, 4), vec![0, 2, 3, 4, 5, 6]);
+    }
+
+    /// A certificate it cannot read, or of another proposal of a view it
+    /// holds, gets no window and no extension, and takes nothing from the
+    /// view's own certificate.
+    #[test]
+    fn an_unreadable_or_other_proposal_certificate_gets_none() {
+        let c = committee();
+        let late = LateFinalizes::new(c.schemes[0].clone(), Arc::new(LateVoteCensus::new()));
+        let p = proposal(9, 4);
+        let finalization = quorum(&c, &p);
+        let cert = encode_finalization(&finalization);
+        let t0 = Instant::now();
+        late.finalized(&finalization, t0);
+        late.vote(vote(&c, 5, &p), t0 + Duration::from_millis(100));
+        let mut trailing = cert.clone();
+        trailing.push(0);
+        let other = encode_finalization(&quorum(&c, &proposal(9, 8)));
+        for unknown in [&b"not a certificate"[..], &trailing[..], &other[..]] {
+            assert_eq!(late.open_until(unknown, t0), None);
+            assert_eq!(late.extend(unknown, t0 + LATE_VOTE_WINDOW), None);
+        }
+        let extended = late
+            .extend(&cert, t0 + LATE_VOTE_WINDOW)
+            .expect("the view's own certificate");
+        assert_eq!(signers(&extended, &c, 4), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// A view pruned while its window is open has no window left: its
+    /// certificate is published as it is.
+    #[test]
+    fn a_view_pruned_with_its_window_open_publishes_its_certificate_as_it_is() {
+        let c = committee();
+        let late = LateFinalizes::new(c.schemes[0].clone(), Arc::new(LateVoteCensus::new()));
+        let t0 = Instant::now();
+        let p = proposal(1, 1);
+        let first = quorum(&c, &p);
+        let cert = encode_finalization(&first);
+        late.finalized(&first, t0);
+        late.vote(vote(&c, 5, &p), t0);
+        assert_eq!(late.open_until(&cert, t0), Some(t0 + LATE_VOTE_WINDOW));
+        for view in 2..=(VIEWS_KEPT as u64 + 1) {
+            late.vote(vote(&c, 1, &proposal(view, 1)), t0);
+        }
+        assert_eq!(late.views(), VIEWS_KEPT);
+        assert_eq!(late.open_until(&cert, t0), None, "pruned");
+        assert_eq!(late.extend(&cert, t0 + LATE_VOTE_WINDOW), None);
+    }
+
     /// The census reports once per interval, then starts again.
     #[test]
     fn the_census_reports_hourly() {
