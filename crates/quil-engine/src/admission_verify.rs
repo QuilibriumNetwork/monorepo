@@ -26,6 +26,19 @@
 //! verifications no frame waits on stay off the first node-wide worker slot
 //! ([`verifying_for_frame`]), which frames and inline verifications share.
 //!
+//! Every shard of an application collects a submission, but one shard is
+//! designated to propose it first; the others may carry it past the routing
+//! fallback. Frames of a node's other shards waited 2-4 minutes on bundles
+//! that had reached the node minutes earlier, unverified because those
+//! shards were not designated (mainnet, 2026-11-10: 49 of 49 waits on one
+//! node). So an arrival on any shard is verified, once per node however
+//! many of its shards collect it (by digest), but an undesignated one only
+//! within half the arrival budget ([`AdmissionQueue::admit_undesignated`])
+//! and behind the designated ones: designated arrivals keep the other half,
+//! go first, and push undesignated ones out at the queue's bounds. The
+//! summary counts undesignated arrivals that no frame of this node carried
+//! within [`UNNEEDED_AFTER`]: the verification time spent for nothing.
+//!
 //! Bounds and recovery: a submission no frame waits on is dropped from the
 //! queue past its count or byte bound and offered again by the proposal that
 //! holds it or the frame that needs it; one whose verification found no
@@ -88,6 +101,17 @@ const SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
 /// one window ahead of the proposals and frames that offer theirs. Past it
 /// an arrival is not queued; a proposal or frame needing it verifies it.
 const ARRIVAL_WINDOW: Duration = Duration::from_secs(600);
+/// The share of the arrival budget an undesignated arrival leaves to the
+/// designated ones: it is admitted only while the credit left after it stays
+/// at least this share of the budget.
+const DESIGNATED_RESERVE: f64 = 0.5;
+/// An undesignated arrival no frame of this node carried within this long
+/// is counted as verified for nothing (bundles reached a node 42-528 s
+/// before the frame carrying them, mainnet 2026-11-10).
+pub const UNNEEDED_AFTER: Duration = Duration::from_secs(1800);
+/// Undesignated arrivals followed at once; past it the oldest is forgotten
+/// uncounted.
+const UNDESIGNATED_ENTRIES: usize = 4096;
 /// The proof worker admits at most this many verifications at once.
 const MAX_THREADS: usize = 64;
 
@@ -127,6 +151,9 @@ struct Item {
     job: AdmissionJob,
     /// Set for a vote-time warm-up no frame waits on yet.
     warm: Option<Warm>,
+    /// An arrival on a shard not designated to propose it, queued behind
+    /// the designated ones ([`Lane::Undesignated`]).
+    undesignated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,6 +176,16 @@ pub struct AdmissionStats {
     pub arrival_over_budget: usize,
     /// Estimated worker-seconds of the arrivals admitted.
     pub arrival_secs: u64,
+    /// Undesignated arrivals queued, and those not queued past their share
+    /// of the budget ([`AdmissionQueue::admit_undesignated`]).
+    pub undesignated_queued: usize,
+    pub undesignated_over_share: usize,
+    /// Undesignated arrivals queued that a frame of this node carried
+    /// ([`AdmissionQueue::note_needed`]), and those none carried within
+    /// [`UNNEEDED_AFTER`], with their estimated worker-seconds.
+    pub undesignated_needed: usize,
+    pub undesignated_unneeded: usize,
+    pub undesignated_unneeded_secs: u64,
 }
 
 #[derive(Default)]
@@ -176,6 +213,12 @@ struct State {
     /// Shard filter → the latest frame it materialized: warm-ups of it and
     /// earlier frames are no longer needed.
     ended: HashMap<Vec<u8>, u64>,
+    /// Undesignated arrivals queued that no frame of this node carried yet
+    /// → when they were queued and their estimated worker-seconds; and
+    /// their digests oldest first, with that time (an entry whose time no
+    /// longer matches was carried, or queued again later).
+    undesignated: HashMap<[u8; 32], (Instant, f64)>,
+    undesignated_order: VecDeque<([u8; 32], Instant)>,
 }
 
 impl State {
@@ -221,17 +264,87 @@ impl State {
             .count()
     }
 
+    /// Queued designated arrivals: right behind the warm-ups.
+    fn arrivals_queued(&self) -> usize {
+        self.queue
+            .iter()
+            .skip(self.wanted_queued() + self.warm_queued())
+            .take_while(|item| !item.undesignated)
+            .count()
+    }
+
     /// Queue `item` behind the submissions frames already wait on.
     fn queue_wanted(&mut self, mut item: Item) {
         item.warm = None;
+        item.undesignated = false;
         let at = self.wanted_queued();
         self.queue.insert(at, item);
     }
 
     /// Queue warm-up `item` behind the others, ahead of arrivals.
-    fn queue_warm(&mut self, item: Item) {
+    fn queue_warm(&mut self, mut item: Item) {
+        item.undesignated = false;
         let at = self.wanted_queued() + self.warm_queued();
         self.queue.insert(at, item);
+    }
+
+    /// Queue arrival `item`: a designated one behind the other designated
+    /// arrivals, ahead of the undesignated ones; an undesignated one last.
+    fn queue_arrival(&mut self, item: Item) {
+        if item.undesignated {
+            self.queue.push_back(item);
+        } else {
+            let at = self.wanted_queued() + self.warm_queued() + self.arrivals_queued();
+            self.queue.insert(at, item);
+        }
+    }
+
+    /// Follow undesignated arrival `digest`, queued at `now` and estimated
+    /// at `cost_secs`, until a frame of this node carries it or
+    /// [`UNNEEDED_AFTER`] passed.
+    fn follow_undesignated(&mut self, digest: [u8; 32], cost_secs: f64, now: Instant) {
+        if self.undesignated.contains_key(&digest) {
+            return;
+        }
+        while self.undesignated_order.len() >= UNDESIGNATED_ENTRIES {
+            let Some((oldest, at)) = self.undesignated_order.pop_front() else {
+                break;
+            };
+            if self.follows(&oldest, at) {
+                self.undesignated.remove(&oldest);
+            }
+        }
+        self.undesignated.insert(digest, (now, cost_secs));
+        self.undesignated_order.push_back((digest, now));
+    }
+
+    /// Whether undesignated arrival `digest` queued at `at` is still
+    /// followed: no frame carried it, and it was not queued again since.
+    fn follows(&self, digest: &[u8; 32], at: Instant) -> bool {
+        self.undesignated
+            .get(digest)
+            .is_some_and(|(queued, _)| *queued == at)
+    }
+
+    /// Count the undesignated arrivals no frame of this node carried within
+    /// [`UNNEEDED_AFTER`] of `now`.
+    fn sweep_undesignated(&mut self, now: Instant) {
+        while let Some(&(digest, at)) = self.undesignated_order.front() {
+            if now.saturating_duration_since(at) < UNNEEDED_AFTER {
+                break;
+            }
+            self.undesignated_order.pop_front();
+            if !self.follows(&digest, at) {
+                continue;
+            }
+            if let Some((_, cost)) = self.undesignated.remove(&digest) {
+                self.window.undesignated_unneeded += 1;
+                self.window.undesignated_unneeded_secs = self
+                    .window
+                    .undesignated_unneeded_secs
+                    .saturating_add(cost.round() as u64);
+            }
+        }
     }
 
     /// Whether warm-up `warm` is still worth verifying at `now`.
@@ -252,6 +365,9 @@ impl State {
             if dropped.warm.is_some() {
                 self.window.warmups_dropped += 1;
             }
+            // Not verified: an undesignated arrival dropped costs nothing,
+            // whether a frame needs it or not.
+            self.undesignated.remove(&dropped.digest);
         }
     }
 
@@ -285,8 +401,11 @@ enum Lane {
     Frame,
     /// A vote-time warm-up.
     Warm,
-    /// Everything else.
+    /// Everything else: arrivals on their designated shard, and what
+    /// proposals offer.
     Arrival,
+    /// An arrival on a shard not designated to propose it: last.
+    Undesignated,
 }
 
 /// One bounded queue of submissions whose proofs background threads verify:
@@ -344,6 +463,18 @@ impl AdmissionQueue {
     /// any credit is left, so the work admitted per window exceeds the
     /// budget by at most one arrival. False (counted) past it.
     pub fn admit_arrival(&self, cost_secs: f64, now: Instant) -> bool {
+        self.admit(cost_secs, now, true)
+    }
+
+    /// [`Self::admit_arrival`] for an arrival on a shard not designated to
+    /// propose it: admitted only while the credit left after it stays at
+    /// least [`DESIGNATED_RESERVE`] of the budget, so undesignated arrivals
+    /// never take the share designated ones keep. False (counted) past it.
+    pub fn admit_undesignated(&self, cost_secs: f64, now: Instant) -> bool {
+        self.admit(cost_secs, now, false)
+    }
+
+    fn admit(&self, cost_secs: f64, now: Instant, designated: bool) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let threads = state.target_threads.max(1) as f64;
         let capacity = threads * ARRIVAL_WINDOW.as_secs_f64();
@@ -354,13 +485,17 @@ impl AdmissionQueue {
                 .min(capacity),
         };
         state.arrival_refilled = Some(now);
-        let admitted = credit > 0.0;
+        let cost = if cost_secs.is_finite() {
+            cost_secs.max(0.0)
+        } else {
+            capacity
+        };
+        let admitted = if designated {
+            credit > 0.0
+        } else {
+            credit - cost >= capacity * DESIGNATED_RESERVE
+        };
         if admitted {
-            let cost = if cost_secs.is_finite() {
-                cost_secs.max(0.0)
-            } else {
-                capacity
-            };
             state.arrival_credit = credit - cost;
             state.window.arrival_secs = state
                 .window
@@ -368,7 +503,11 @@ impl AdmissionQueue {
                 .saturating_add(cost.round() as u64);
         } else {
             state.arrival_credit = credit;
-            state.window.arrival_over_budget += 1;
+            if designated {
+                state.window.arrival_over_budget += 1;
+            } else {
+                state.window.undesignated_over_share += 1;
+            }
         }
         Self::summarize(&mut state);
         admitted
@@ -479,6 +618,50 @@ impl AdmissionQueue {
         self.offer_in(digest, bytes, operations, job, Lane::Warm, Some(warm))
     }
 
+    /// Queue an arrival on a shard not designated to propose it
+    /// ([`Self::admit_undesignated`]), estimated at `cost_secs`: behind the
+    /// designated arrivals, and dropped first at the bounds, where it never
+    /// pushes out a designated one. It is followed until a frame of this
+    /// node carries it ([`Self::note_needed`]) or [`UNNEEDED_AFTER`]
+    /// passed. False as [`Self::offer`], and when only submissions frames
+    /// wait on, warm-ups and designated arrivals fill the queue.
+    pub fn offer_undesignated(
+        self: &Arc<Self>,
+        digest: [u8; 32],
+        bytes: usize,
+        operations: usize,
+        job: AdmissionJob,
+        cost_secs: f64,
+    ) -> bool {
+        let queued = self.offer_in(digest, bytes, operations, job, Lane::Undesignated, None);
+        if queued {
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .follow_undesignated(digest, cost_secs, Instant::now());
+        }
+        queued
+    }
+
+    /// The submission `digest` arrived on its designated shard: queued
+    /// behind the designated arrivals, an undesignated arrival of it joins
+    /// them.
+    pub fn designate(&self, digest: &[u8; 32]) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pending.contains(digest) {
+            self.promote(&mut state, *digest, Lane::Arrival, None);
+        }
+    }
+
+    /// A frame of this node carries the submission `digest`: an
+    /// undesignated arrival of it was needed (counted once).
+    pub fn note_needed(&self, digest: &[u8; 32]) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.undesignated.remove(digest).is_some() {
+            state.window.undesignated_needed += 1;
+        }
+    }
+
     /// `shard` materialized `frame`: its warm-ups of that frame and earlier
     /// are dropped, and later offers of them refused. Those the frame needs
     /// it asked for first, which moved them to the frames' lane.
@@ -527,8 +710,16 @@ impl AdmissionQueue {
         {
             let frames = state.wanted_queued();
             let warming = state.warm_queued();
-            if frames + warming < state.queue.len() {
-                // The oldest arrival goes first.
+            let arriving = state.arrivals_queued();
+            if frames + warming + arriving < state.queue.len() {
+                // The oldest undesignated arrival goes first.
+                state.drop_at(frames + warming + arriving);
+            } else if lane == Lane::Undesignated {
+                // It never pushes out what this node's shards propose.
+                state.window.dropped += 1;
+                return false;
+            } else if arriving > 0 {
+                // Then the oldest arrival.
                 state.drop_at(frames + warming);
             } else if lane != Lane::Arrival && warming > 0 {
                 // Then the oldest warm-up, for a frame or a newer warm-up.
@@ -549,6 +740,7 @@ impl AdmissionQueue {
             operations,
             job,
             warm,
+            undesignated: lane == Lane::Undesignated,
         };
         match lane {
             Lane::Frame => {
@@ -559,7 +751,11 @@ impl AdmissionQueue {
                 state.window.warmups += 1;
                 state.queue_warm(item);
             }
-            Lane::Arrival => state.queue.push_back(item),
+            Lane::Arrival => state.queue_arrival(item),
+            Lane::Undesignated => {
+                state.window.undesignated_queued += 1;
+                state.queue_arrival(item);
+            }
         }
         state.pending.insert(digest);
         state.bytes += bytes;
@@ -627,7 +823,18 @@ impl AdmissionQueue {
                     }
                 }
             }
-            Lane::Arrival => {}
+            Lane::Arrival => {
+                // Its designated shard now offers it: it joins the
+                // designated arrivals.
+                let Some(index) = index.filter(|index| state.queue[*index].undesignated) else {
+                    return;
+                };
+                if let Some(mut item) = state.queue.remove(index) {
+                    item.undesignated = false;
+                    state.queue_arrival(item);
+                }
+            }
+            Lane::Undesignated => {}
         }
     }
 
@@ -733,13 +940,17 @@ impl AdmissionQueue {
             } else if item.warm.is_some() {
                 state.queue_warm(item);
             } else {
-                state.queue.push_back(item);
+                state.queue_arrival(item);
             }
         } else if counts.busy > 0 && wanted {
             // Found no worker slot while a frame waits on it: first again.
             state.window.requeued += 1;
             state.bytes += item.bytes;
-            state.queue.push_front(Item { warm: None, ..item });
+            state.queue.push_front(Item {
+                warm: None,
+                undesignated: false,
+                ..item
+            });
         } else if counts.busy > 0 && item.attempts + 1 < MAX_ATTEMPTS {
             // Found no worker slot: try again after the rest of its lane.
             state.window.requeued += 1;
@@ -751,7 +962,7 @@ impl AdmissionQueue {
             if item.warm.is_some() {
                 state.queue_warm(item);
             } else {
-                state.queue.push_back(item);
+                state.queue_arrival(item);
             }
         } else {
             state.finish(&item.digest);
@@ -793,6 +1004,7 @@ impl AdmissionQueue {
             return;
         }
         state.summarized = Some(now);
+        state.sweep_undesignated(now);
         let window = std::mem::take(&mut state.window);
         if window == AdmissionStats::default() && state.queue.is_empty() {
             return;
@@ -820,11 +1032,20 @@ impl AdmissionQueue {
             arrival_secs = window.arrival_secs,
             arrival_budget_secs =
                 (state.target_threads.max(1) as u64).saturating_mul(ARRIVAL_WINDOW.as_secs()),
+            undesignated_queued = window.undesignated_queued,
+            undesignated_over_share = window.undesignated_over_share,
+            undesignated_needed = window.undesignated_needed,
+            undesignated_unneeded = window.undesignated_unneeded,
+            undesignated_unneeded_secs = window.undesignated_unneeded_secs,
+            unneeded_after_secs = UNNEEDED_AFTER.as_secs(),
             interval_secs = SUMMARY_INTERVAL.as_secs(),
             "confidential proof admission summary: proofs of arriving submissions verified before a frame \
              carries them, those finalized frames wait on first, then vote-time warm-ups (bounded, dropped \
-             when their proposal's time passed); dropped ones, and arrivals past the budget or needing no \
-             verification (skipped), verify when a proposal or frame needs them"
+             when their proposal's time passed), then arrivals on their designated shard, then arrivals on \
+             this node's other shards (within half the arrival budget; unneeded: no frame of this node \
+             carried them within unneeded_after_secs, worker time spent for nothing); dropped ones, and \
+             arrivals past the budget or needing no verification (skipped), verify when a proposal or frame \
+             needs them"
         );
     }
 }
@@ -934,14 +1155,16 @@ pub fn offer_frame_submission(
 /// Ordered by how far it got: across this node's shards the furthest counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ArrivalVerdict {
-    /// None of this node's shards is the one that verifies it on arrival.
-    NotDesignated,
-    /// Its designated shard's collector did not take it as new.
+    /// The collector of the shard it arrived on did not take it as new.
     NotCollected,
     /// Nothing left to verify, or it failed dispatch's checks first.
     Skipped,
     /// Admitted under the budget, but the queue did not take it.
     NotQueued,
+    /// On a shard not designated to propose it, past the share of the
+    /// arrival budget such arrivals may take
+    /// ([`AdmissionQueue::admit_undesignated`]).
+    OverShare,
     /// Past the arrival budget ([`ARRIVAL_WINDOW`]).
     OverBudget,
     /// Queued, or already verifying, on arrival.
@@ -951,10 +1174,10 @@ pub enum ArrivalVerdict {
 impl ArrivalVerdict {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::NotDesignated => "not designated",
             Self::NotCollected => "not collected",
             Self::Skipped => "skipped",
             Self::NotQueued => "not queued",
+            Self::OverShare => "undesignated, over its share",
             Self::OverBudget => "over budget",
             Self::Queued => "queued",
         }
@@ -1043,7 +1266,7 @@ pub fn arrival(digest: &[u8; 32]) -> Option<Arrival> {
 /// One line's account of the bundles a frame waits on: for each of the
 /// first [`DESCRIBED_BUNDLES`], its digest's first four bytes, how long
 /// before `now` it first reached this node and what became of it then
-/// (`9ac09df9 seen 312 s ago (not designated)`), or that it never arrived
+/// (`9ac09df9 seen 312 s ago (queued)`), or that it never arrived
 /// here (`9ac09df9 not seen arriving`); then `+N more`.
 pub fn describe_arrivals(bundles: &[([u8; 32], Option<Arrival>)], now: Instant) -> String {
     let mut parts: Vec<String> = bundles
@@ -1077,10 +1300,15 @@ pub fn describe_waiting(digests: &[[u8; 32]], now: Instant) -> String {
     describe_arrivals(&bundles, now)
 }
 
-/// Queue an arriving canonical submission's verification
-/// ([`offer_submission`], at the back) under the [`ARRIVAL_WINDOW`] budget.
-/// `sizes`: the bytes of each of its confidential operations still to
-/// verify (`ExecutionEngineManager::arrival_operations`), charged at their
+/// Queue an arriving canonical submission's verification under the
+/// [`ARRIVAL_WINDOW`] budget: at the back of the designated arrivals when
+/// the shard it arrived on is `designated` to propose it first
+/// ([`offer_submission`]), else behind them within the undesignated share
+/// ([`AdmissionQueue::offer_undesignated`]). One already queued or
+/// verifying is charged nothing, whichever of this node's shards it reaches
+/// next, and its designated shard moves it up. `sizes`: the bytes of each
+/// of its confidential operations still to verify
+/// (`ExecutionEngineManager::arrival_operations`), charged at their
 /// estimated verification time. Returns what became of it.
 pub fn offer_arrival(
     queue: &Arc<AdmissionQueue>,
@@ -1088,24 +1316,44 @@ pub fn offer_arrival(
     application: &[u8],
     canonical: &[u8],
     sizes: &[usize],
+    designated: bool,
     now: Instant,
 ) -> ArrivalVerdict {
     if sizes.is_empty() {
         queue.note_arrival_skipped();
         return ArrivalVerdict::Skipped;
     }
-    if queue.pending(&digest(canonical)) {
+    let digest = digest(canonical);
+    if queue.pending(&digest) {
+        if designated {
+            queue.designate(&digest);
+        }
         return ArrivalVerdict::Queued;
     }
     let cost: f64 = sizes
         .iter()
         .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
         .sum();
-    if !queue.admit_arrival(cost, now) {
-        return ArrivalVerdict::OverBudget;
-    }
-    if offer_submission(queue, exec, application, canonical, false) {
-        return ArrivalVerdict::Queued;
+    if designated {
+        if !queue.admit_arrival(cost, now) {
+            return ArrivalVerdict::OverBudget;
+        }
+        if offer_submission(queue, exec, application, canonical, false) {
+            return ArrivalVerdict::Queued;
+        }
+    } else {
+        if !queue.admit_undesignated(cost, now) {
+            return ArrivalVerdict::OverShare;
+        }
+        let later = quil_execution::manager::ExecutingFrame::Later;
+        if let Some((operations, digest, job)) = submission_job(exec, application, canonical, later)
+        {
+            if queue.offer_undesignated(digest, canonical.len(), operations, job, cost)
+                || queue.pending(&digest)
+            {
+                return ArrivalVerdict::Queued;
+            }
+        }
     }
     queue.refund_arrival(cost);
     ArrivalVerdict::NotQueued
@@ -1428,6 +1676,105 @@ mod tests {
         assert!(!queue.admit_arrival(1.0, start));
     }
 
+    /// Undesignated arrivals take at most the share of the budget the
+    /// designated ones leave, never overdrawing it; they queue behind the
+    /// designated arrivals, go first at the bounds and never push a
+    /// designated one out; an undesignated arrival its designated shard
+    /// offers joins the designated ones.
+    #[test]
+    fn undesignated_arrivals_leave_designated_ones_their_reserve_their_place_and_the_bounds() {
+        let queue = AdmissionQueue::new(4, 1 << 20, false);
+        let start = Instant::now();
+        let window = ARRIVAL_WINDOW.as_secs_f64();
+        let share = window * (1.0 - DESIGNATED_RESERVE);
+        let mut undesignated = 0;
+        while queue.admit_undesignated(100.0, start) {
+            undesignated += 1;
+            assert!(undesignated < 1000, "the share never ran out");
+        }
+        assert_eq!(
+            undesignated,
+            (share / 100.0).floor() as usize,
+            "designated_refused: undesignated arrivals took {undesignated} of 100 s each from a \
+             budget of {window} s, more than their share"
+        );
+        assert_eq!(queue.stats().undesignated_over_share, 1);
+        let mut designated = 0;
+        while queue.admit_arrival(100.0, start) {
+            designated += 1;
+        }
+        assert_eq!(
+            designated,
+            ((window - share) / 100.0).ceil() as usize,
+            "designated_refused: designated arrivals kept {designated} of 100 s each"
+        );
+        // Their place: designated arrivals go ahead of the undesignated.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let order = |queue: &AdmissionQueue| -> Vec<u8> {
+            queue
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .iter()
+                .map(|item| item.digest[0])
+                .collect()
+        };
+        assert!(queue.offer_undesignated([1; 32], 10, 1, job(&runs, verified()), 100.0));
+        assert!(queue.offer_undesignated([2; 32], 10, 1, job(&runs, verified()), 100.0));
+        assert!(queue.offer([3; 32], 10, 1, job(&runs, verified()), false));
+        assert_eq!(
+            order(&queue),
+            vec![3, 1, 2],
+            "designated_behind: a designated arrival queued behind undesignated ones"
+        );
+        queue.designate(&[2; 32]);
+        assert_eq!(order(&queue), vec![3, 2, 1]);
+        // The bounds: the undesignated go first, and never push out a
+        // designated arrival.
+        assert!(queue.offer([4; 32], 10, 1, job(&runs, verified()), false));
+        assert!(queue.offer([5; 32], 10, 1, job(&runs, verified()), false));
+        assert_eq!(order(&queue), vec![3, 2, 4, 5]);
+        assert!(!queue.offer_undesignated([6; 32], 10, 1, job(&runs, verified()), 100.0));
+        assert_eq!(order(&queue), vec![3, 2, 4, 5]);
+        assert_eq!(queue.stats().undesignated_queued, 2);
+    }
+
+    /// An undesignated arrival a frame of this node carries is counted as
+    /// needed, once; one no frame carried within [`UNNEEDED_AFTER`] is
+    /// counted as verified for nothing, with its estimated worker time.
+    #[test]
+    fn undesignated_arrivals_no_frame_carried_are_counted_once_their_time_passed() {
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        assert!(queue.offer_undesignated([1; 32], 10, 1, job(&runs, verified()), 120.0));
+        assert!(queue.offer_undesignated([2; 32], 10, 1, job(&runs, verified()), 80.4));
+        assert!(queue.offer([3; 32], 10, 1, job(&runs, verified()), false));
+        queue.note_needed(&[1; 32]);
+        queue.note_needed(&[1; 32]);
+        queue.note_needed(&[3; 32]);
+        assert_eq!(
+            queue.stats().undesignated_needed,
+            1,
+            "needed_uncounted: one undesignated arrival a frame carried"
+        );
+        let now = Instant::now();
+        let mut state = queue.state.lock().unwrap();
+        state.sweep_undesignated(now);
+        assert_eq!(state.window.undesignated_unneeded, 0, "not yet");
+        state.sweep_undesignated(now + UNNEEDED_AFTER);
+        assert_eq!(
+            (
+                state.window.undesignated_unneeded,
+                state.window.undesignated_unneeded_secs
+            ),
+            (1, 80),
+            "needed_uncounted: the arrival no frame carried, and only it"
+        );
+        state.sweep_undesignated(now + UNNEEDED_AFTER * 2);
+        assert_eq!(state.window.undesignated_unneeded, 1, "counted once");
+    }
+
     fn busy() -> PreverifyCounts {
         PreverifyCounts {
             operations: 1,
@@ -1645,7 +1992,7 @@ mod tests {
         let t0 = Instant::now();
         let later = t0 + Duration::from_secs(5);
         let mut log = ArrivalLog::new(3);
-        log.note([1; 32], ArrivalVerdict::NotDesignated, t0);
+        log.note([1; 32], ArrivalVerdict::OverShare, t0);
         log.note([1; 32], ArrivalVerdict::Queued, later);
         log.note([1; 32], ArrivalVerdict::NotCollected, later);
         let (at, verdict) = log.get(&[1; 32]).expect("the arrival is remembered");
@@ -1671,14 +2018,14 @@ mod tests {
         let now = Instant::now();
         note_arrival(
             [0x9a; 32],
-            ArrivalVerdict::NotDesignated,
+            ArrivalVerdict::OverShare,
             now - Duration::from_secs(312),
         );
         note_arrival([0x9b; 32], ArrivalVerdict::OverBudget, now);
         let mut digests = vec![[0x9a; 32], [0xee; 32], [0x9b; 32]];
         assert_eq!(
             describe_waiting(&digests, now),
-            "9a9a9a9a seen 312 s ago (not designated); eeeeeeee not seen arriving; \
+            "9a9a9a9a seen 312 s ago (undesignated, over its share); eeeeeeee not seen arriving; \
              9b9b9b9b seen 0 s ago (over budget)",
             "the bundles line names each arrival"
         );

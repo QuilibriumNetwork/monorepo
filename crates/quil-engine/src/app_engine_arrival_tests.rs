@@ -739,3 +739,127 @@ async fn a_submission_naming_a_root_this_node_lacks_is_collected_but_not_verifie
         "once the view holds the root, a submission citing it is collected and verified"
     );
 }
+
+/// Whether `shard` of `shards` is designated to propose `bundle` first.
+fn designated_on(shards: &[Vec<u8>], shard: &[u8], bundle: &[u8]) -> bool {
+    let digest = crate::admission_verify::digest(&canonical_app_message(bundle));
+    arrival_designated(shard, Some(shards), &digest, None)
+}
+
+/// Holds the node's admission queue thread on a job until the returned
+/// sender drops, so what arrives meanwhile stays queued.
+fn hold_admission_thread() -> std::sync::mpsc::Sender<()> {
+    let queue = crate::admission_verify::global();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let job: crate::admission_verify::AdmissionJob = Arc::new(move || {
+        let _ = held.lock().unwrap().recv();
+        quil_execution::manager::PreverifyCounts::default()
+    });
+    let blocker = [0xb1; 32];
+    assert!(queue.offer(blocker, 1, 1, job, true));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while queue.queued_ahead(&blocker).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the admission queue's thread never took the holding job"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    release
+}
+
+/// Mainnet, 2026-11-10: frames of a node's shards waited 2-4 minutes on
+/// bundles that had reached the node minutes earlier, unverified because
+/// none of its shards was designated to propose them. Such an arrival is
+/// now verified, once for the node: whichever of its shards it reaches
+/// next is charged nothing and queues nothing again.
+#[tokio::test]
+async fn an_undesignated_arrival_is_queued_once_whichever_of_this_nodes_shards_it_reaches() {
+    let shards = vec![
+        token_shard(&[false, false]),
+        token_shard(&[false, true]),
+        token_shard(&[true, false]),
+    ];
+    let bundle = (0..)
+        .map(transfer_bundle)
+        .find(|bundle| designated_on(&shards, &shards[2], bundle))
+        .unwrap();
+    if !counts_confidential(&bundle) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    note_routing_shards(&quil_execution::domains::QUIL_TOKEN, &shards);
+    let mut first = engine_on(shards[0].clone(), Arc::new(MessageCollector::new()));
+    let mut second = engine_on(shards[1].clone(), Arc::new(MessageCollector::new()));
+    let queue = crate::admission_verify::global();
+    let release = hold_admission_thread();
+    let before = queue.stats();
+    first.add_app_message(&bundle);
+    let once = queue.stats();
+    assert_eq!(
+        once.queued,
+        before.queued + 1,
+        "undesignated_not_queued: a bundle no shard of this node is designated to propose was not \
+         verified on arrival"
+    );
+    assert!(once.arrival_secs > before.arrival_secs);
+    second.add_app_message(&bundle);
+    let twice = queue.stats();
+    assert_eq!(
+        (twice.queued, twice.arrival_secs),
+        (once.queued, once.arrival_secs),
+        "charged_twice: the bundle reaching another shard of this node was queued or charged again"
+    );
+    let digest = crate::admission_verify::digest(&canonical_app_message(&bundle));
+    assert!(queue.pending(&digest));
+    assert_eq!(
+        crate::admission_verify::arrival(&digest).map(|(_, verdict)| verdict),
+        Some(crate::admission_verify::ArrivalVerdict::Queued)
+    );
+    drop(release);
+}
+
+/// Undesignated arrivals take at most their share of the arrival budget: a
+/// flood of them arriving first never refuses a bundle this node's shard
+/// is designated to propose.
+#[tokio::test]
+async fn a_designated_arrival_is_queued_however_many_undesignated_ones_arrived_first() {
+    let shards = vec![token_shard(&[false]), token_shard(&[true])];
+    let (elsewhere, own) = (&shards[0], &shards[1]);
+    if !counts_confidential(&transfer_bundle(0)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    note_routing_shards(&quil_execution::domains::QUIL_TOKEN, &shards);
+    let mut other = engine_on(elsewhere.clone(), Arc::new(MessageCollector::new()));
+    let mut proposer = engine_on(own.clone(), Arc::new(MessageCollector::new()));
+    let queue = crate::admission_verify::global();
+    let before = queue.stats().queued;
+    const FLOOD: usize = 200;
+    for bundle in (2000..)
+        .map(transfer_bundle)
+        .filter(|bundle| designated_on(&shards, own, bundle))
+        .take(FLOOD)
+    {
+        other.add_app_message(&bundle);
+    }
+    let flooded = queue.stats().queued - before;
+    assert!(
+        flooded > 0,
+        "undesignated_not_queued: none of {FLOOD} undesignated arrivals was verified on arrival"
+    );
+    let bundle = (5000..)
+        .map(transfer_bundle)
+        .find(|bundle| designated_on(&shards, own, bundle))
+        .unwrap();
+    proposer.add_app_message(&bundle);
+    let digest = crate::admission_verify::digest(&canonical_app_message(&bundle));
+    let verdict = crate::admission_verify::arrival(&digest).map(|(_, verdict)| verdict);
+    assert_eq!(
+        verdict,
+        Some(crate::admission_verify::ArrivalVerdict::Queued),
+        "designated_refused: after {flooded} of {FLOOD} undesignated arrivals were queued, the \
+         designated shard's own arrival was not"
+    );
+}

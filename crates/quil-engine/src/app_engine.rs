@@ -4433,13 +4433,15 @@ impl AppConsensusEngine {
             let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
                 continue;
             };
+            let digest = crate::admission_verify::digest(&canon);
+            // Counts an undesignated arrival of it as needed.
+            queue.note_needed(&digest);
             let pair = [(application.to_vec(), canon.clone())];
             let sizes = exec.unverified_confidential_operations_for(executing, &pair);
             if !verifies_in_background(&sizes, budget_secs) {
                 continue;
             }
             unverified.extend(sizes);
-            let digest = crate::admission_verify::digest(&canon);
             waiting.push(digest);
             restarted |= !(queue.pending(&digest) || proof_prewarm_running(&canon));
             verifying &= crate::admission_verify::offer_frame_submission(
@@ -12533,15 +12535,18 @@ impl AppConsensusEngine {
     /// Verify an arriving submission's confidential proofs now, in the
     /// background, so the proposal that carries it and the frame that
     /// executes it find the verdicts cached instead of verifying for
-    /// minutes. Only on the shard that proposes it (every shard of the
-    /// application collects a submission that may reach it past the routing
-    /// fallback), and only what may still execute: one the
-    /// collector did not take as new (`collected`: a finalized frame
-    /// consumed it, the collector holds it, or its rank is full), one that
-    /// fails dispatch's checks before native work, and one the global
+    /// minutes. On every shard of the application (each collects a
+    /// submission that may reach it past the routing fallback), once per
+    /// node, the shard that proposes it first ahead of the others
+    /// ([`crate::admission_verify::offer_arrival`]): frames of a node's
+    /// other shards waited 2-4 minutes on bundles that had reached the node
+    /// minutes before (mainnet, 2026-11-10). Only what may still execute:
+    /// one the collector did not take as new (`collected`: a finalized
+    /// frame consumed it, the collector holds it, or its rank is full), one
+    /// that fails dispatch's checks before native work, and one the global
     /// commit already decided are not queued; nor arrivals past the
-    /// admission budget ([`crate::admission_verify::offer_arrival`]). A
-    /// proposal or frame carrying any of them queues it then.
+    /// admission budget or their share of it. A proposal or frame carrying
+    /// any of them queues it then.
     fn verify_on_arrival(&self, data: &[u8], collected: bool, now: std::time::Instant) {
         let Some(exec) = self.execution_engine.as_ref() else {
             return;
@@ -12556,15 +12561,12 @@ impl AppConsensusEngine {
         }
         // Remembered for the line of a frame that later waits on its proofs.
         let digest = crate::admission_verify::digest(data);
-        if !arrival_designated(
+        let designated = arrival_designated(
             &self.filter,
             routing_shards(&self.app_address).as_deref(),
             &digest,
             quil_execution::ExecutionEngineManager::shield_source(data),
-        ) {
-            note_arrival(digest, ArrivalVerdict::NotDesignated, now);
-            return;
-        }
+        );
         let queue = crate::admission_verify::global();
         if !collected {
             queue.note_arrival_skipped();
@@ -12582,6 +12584,7 @@ impl AppConsensusEngine {
                 &self.app_address,
                 data,
                 &sizes,
+                designated,
                 now,
             ),
             Err(_) => {
@@ -15090,12 +15093,13 @@ fn routing_shards(application: &[u8]) -> Option<Vec<Vec<u8>>> {
         .cloned()
 }
 
-/// Whether shard `filter` verifies an arriving confidential bundle's proofs:
-/// whether it is the shard [`routed_selection`] has propose it first. A
-/// shield goes to the shard holding its source; another bundle to its
-/// designated shard of `shards` (the live shards as this node last listed
-/// them), and to every shard while no list is known. A shard that proposes
-/// a bundle later, past the routing fallback, queues it then.
+/// Whether shard `filter` verifies an arriving confidential bundle's proofs
+/// ahead of the other shards' arrivals: whether it is the shard
+/// [`routed_selection`] has propose it first. A shield goes to the shard
+/// holding its source; another bundle to its designated shard of `shards`
+/// (the live shards as this node last listed them), and to every shard
+/// while no list is known. The others verify it within their share of the
+/// arrival budget ([`crate::admission_verify::offer_arrival`]).
 fn arrival_designated(
     filter: &[u8],
     shards: Option<&[Vec<u8>]>,
@@ -24149,10 +24153,10 @@ mod tests {
         assert!(!verifies_in_background(&[op(177_490)], None));
     }
 
-    /// An arriving confidential bundle is verified on the shard that
-    /// proposes it first: a shield on the shard holding its source, another
-    /// bundle on its designated shard of the known list, on every shard while
-    /// none is known.
+    /// An arriving confidential bundle is verified ahead of other arrivals on
+    /// the shard that proposes it first: a shield on the shard holding its
+    /// source, another bundle on its designated shard of the known list, on
+    /// every shard while none is known.
     #[test]
     fn arriving_bundles_verify_on_their_designated_shard() {
         let app = [0x11u8; 32];
