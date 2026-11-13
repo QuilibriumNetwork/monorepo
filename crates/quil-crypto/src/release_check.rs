@@ -19,8 +19,18 @@
 //!
 //! Quorum follows the Go formula `((N-4)/2) + ((N-4) % 2)`. With
 //! N=17, that's `(13/2)+(13%2) = 6 + 1 = 7`.
+//!
+//! A binary the signatories do not verify passes when it is installed as
+//! a release, `<root>/bin/<type>/<version>/<file>`, and verifies under the
+//! release source qclient stored in that install root
+//! (`<root>/release-source.yaml`, under the trust rules of
+//! [`quil_config::release_source`]): the keys listed there sign
+//! `.dgst.sig.1..N` in their order, and its quorum of them must verify.
 
 use ed448_rust::PublicKey;
+use quil_config::release_source::{
+    load_release_source_at, owner_and_mode, Stat, RELEASE_SOURCE_FILE,
+};
 use quil_config::SIGNATORIES;
 use sha3::{Digest, Sha3_256};
 use std::path::{Path, PathBuf};
@@ -34,6 +44,9 @@ pub const SELF_CHECK_HINT: &str = "are you running this from source? (use \
 pub enum SelfCheck {
     /// The binary verified, with this many valid signatures.
     Verified(usize),
+    /// The signatories did not verify the binary, but `valid` signatures of
+    /// the release source stored in `file`, its install root's, did.
+    VerifiedBySource { valid: usize, file: PathBuf },
     /// `--signature-check=false` or `QUILIBRIUM_SIGNATURE_CHECK=false`.
     Disabled,
     /// No signature check on this platform (Windows).
@@ -41,8 +54,8 @@ pub enum SelfCheck {
 }
 
 /// The release self-check of a starting binary: verify the running executable
-/// unless `enabled` is false or the platform has no check. An error means the
-/// binary must not run.
+/// ([`verify_release`]) unless `enabled` is false or the platform has no
+/// check. An error means the binary must not run.
 pub fn self_check(enabled: bool) -> Result<SelfCheck, ReleaseCheckError> {
     if !enabled {
         return Ok(SelfCheck::Disabled);
@@ -51,7 +64,59 @@ pub fn self_check(enabled: bool) -> Result<SelfCheck, ReleaseCheckError> {
         return Ok(SelfCheck::Unavailable);
     }
     let exe = std::env::current_exe().map_err(|source| ReleaseCheckError::ExePath { source })?;
-    verify_release_signatures(&exe).map(SelfCheck::Verified)
+    verify_release(&exe, &SIGNATORIES, &owner_and_mode)
+}
+
+/// Verify the release at `exe_path` under the `official` signatories, else,
+/// when it is installed as a release, under the release source stored in
+/// its install root ([`install_source_file`]), whose files `stat` reads as
+/// `(owner uid, mode)`. A source file that breaks the trust rules fails the
+/// check.
+pub fn verify_release(
+    exe_path: &Path,
+    official: &[&str],
+    stat: Stat,
+) -> Result<SelfCheck, ReleaseCheckError> {
+    let official_err = match verify_release_signatures_with(exe_path, official) {
+        Ok(valid) => return Ok(SelfCheck::Verified(valid)),
+        Err(e) => e,
+    };
+    let Some(file) = std::fs::canonicalize(exe_path)
+        .ok()
+        .and_then(|exe| install_source_file(&exe))
+    else {
+        return Err(official_err);
+    };
+    let source = match load_release_source_at(&file, stat) {
+        Ok(Some(source)) => source,
+        Ok(None) => return Err(official_err),
+        Err(detail) => {
+            return Err(ReleaseCheckError::SourceRefused {
+                official: Box::new(official_err),
+                detail,
+            })
+        }
+    };
+    let keys: Vec<&str> = source.keys.iter().map(String::as_str).collect();
+    match verify_release_signatures_quorum(exe_path, &keys, source.quorum) {
+        Ok(valid) => Ok(SelfCheck::VerifiedBySource { valid, file }),
+        Err(under) => Err(ReleaseCheckError::NotUnderSource {
+            official: Box::new(official_err),
+            file,
+            under: Box::new(under),
+        }),
+    }
+}
+
+/// The release source file of the install root holding `exe`, a release
+/// installed as `<root>/bin/<type>/<version>/<file>` (no links), or `None`
+/// for a binary outside such a tree.
+pub fn install_source_file(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?.parent()?.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    Some(bin.parent()?.join(RELEASE_SOURCE_FILE))
 }
 
 /// Minimum number of valid signatures required to accept the release.
@@ -105,6 +170,17 @@ pub enum ReleaseCheckError {
         label: String,
         file: String,
     },
+    #[error("{official}; nor under the stored release source: {detail}")]
+    SourceRefused {
+        official: Box<ReleaseCheckError>,
+        detail: String,
+    },
+    #[error("{official}; nor under the release source in {file}: {under}")]
+    NotUnderSource {
+        official: Box<ReleaseCheckError>,
+        file: PathBuf,
+        under: Box<ReleaseCheckError>,
+    },
 }
 
 /// Verify `<exe_path>`, `<exe_path>.dgst`, and `<exe_path>.dgst.sig.*`.
@@ -118,6 +194,20 @@ pub fn verify_release_signatures(exe_path: &Path) -> Result<usize, ReleaseCheckE
 pub fn verify_release_signatures_with(
     exe_path: &Path,
     signatories_hex: &[&str],
+) -> Result<usize, ReleaseCheckError> {
+    verify_release_signatures_quorum(
+        exe_path,
+        signatories_hex,
+        quorum_required(signatories_hex.len()),
+    )
+}
+
+/// [`verify_release_signatures_with`] needing `required` valid signatures
+/// of `signatories_hex`, the i-th of which verifies `.dgst.sig.<i+1>`.
+pub fn verify_release_signatures_quorum(
+    exe_path: &Path,
+    signatories_hex: &[&str],
+    required: usize,
 ) -> Result<usize, ReleaseCheckError> {
     // A release runs through its symlink (/usr/local/bin/qclient); on macOS
     // `current_exe` returns the link. The release files sit beside, and the
@@ -198,7 +288,6 @@ pub fn verify_release_signatures_with(
         valid += 1;
     }
 
-    let required = quorum_required(total);
     if valid < required {
         return Err(ReleaseCheckError::QuorumNotMet {
             valid,
@@ -693,6 +782,146 @@ mod tests {
             result.is_err(),
             "release signed for node-2.1.0.24 passed the self-check as \
              node-2.1.0.25-linux-amd64: {result:?}"
+        );
+    }
+
+    /// A test signer with a fixed seed, and its public key (hex).
+    fn test_signer(seed: u8) -> (ed448_rust::PrivateKey, String) {
+        let sk = ed448_rust::PrivateKey::from([seed; ed448_rust::KEY_LENGTH]);
+        let pk = hex::encode(PublicKey::from(&sk).as_byte());
+        (sk, pk)
+    }
+
+    /// A node release installed under `root` as
+    /// `<root>/bin/node/1.2.3/node-1.2.3-linux-amd64`, its `.dgst` signed
+    /// by `signers` as `.dgst.sig.1..`.
+    fn installed_release(root: &Path, signers: &[&ed448_rust::PrivateKey]) -> PathBuf {
+        let file = "node-1.2.3-linux-amd64";
+        let dir = root.join("bin").join("node").join("1.2.3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(file);
+        let exe_bytes = b"a node release";
+        std::fs::write(&exe, exe_bytes).unwrap();
+        let digest: [u8; 32] = Sha3_256::digest(exe_bytes).into();
+        let dgst = format!("SHA3-256({file})= {}\n", hex::encode(digest));
+        std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+        for (i, sk) in signers.iter().enumerate() {
+            let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+            std::fs::write(append_suffix(&exe, &format!(".dgst.sig.{}", i + 1)), sig).unwrap();
+        }
+        exe
+    }
+
+    /// Store a release source trusting `key` in the install root `root`.
+    fn store_source(root: &Path, key: &str) {
+        std::fs::write(
+            root.join(RELEASE_SOURCE_FILE),
+            format!("url: https://releases.example.org\nkeys:\n- {key}\nquorum: 1\n"),
+        )
+        .unwrap();
+    }
+
+    /// Every path root-owned and writable only by root.
+    fn root_only(_: &Path) -> std::io::Result<(u32, u32)> {
+        Ok((0, 0o755))
+    }
+
+    /// Official signatories for the fixtures below.
+    fn official_signers() -> (Vec<ed448_rust::PrivateKey>, Vec<String>) {
+        (0xB0u8..0xB5).map(test_signer).unzip()
+    }
+
+    /// A node release signed by the release source stored in its install
+    /// root starts with the check on, under that source's key.
+    #[test]
+    fn a_release_signed_by_its_install_source_starts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (sk, pk) = test_signer(0xC1);
+        let exe = installed_release(&root, &[&sk]);
+        store_source(&root, &pk);
+        let (_, official) = official_signers();
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        assert!(verify_release_signatures_with(&exe, &official).is_err());
+        let checked = verify_release(&exe, &official, &root_only);
+        assert_eq!(
+            checked.as_ref().ok(),
+            Some(&SelfCheck::VerifiedBySource {
+                valid: 1,
+                file: root.join(RELEASE_SOURCE_FILE),
+            }),
+            "custom_refused: {checked:?}"
+        );
+    }
+
+    /// The release source is refused, and the release with it, when the
+    /// file or a directory above it is not root's or others can write it.
+    #[test]
+    fn an_install_source_others_can_write_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (sk, pk) = test_signer(0xC1);
+        let exe = installed_release(&root, &[&sk]);
+        store_source(&root, &pk);
+        let (_, official) = official_signers();
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let source = root.join(RELEASE_SOURCE_FILE);
+        for (what, at, owner_mode) in [
+            ("file writable by others", source.clone(), (0, 0o666)),
+            ("file owned by uid 1000", source.clone(), (1000, 0o644)),
+            ("install root group-writable", root.clone(), (0, 0o775)),
+        ] {
+            let stat = move |p: &Path| -> std::io::Result<(u32, u32)> {
+                Ok(if p == at.as_path() {
+                    owner_mode
+                } else {
+                    (0, 0o755)
+                })
+            };
+            match verify_release(&exe, &official, &stat) {
+                Ok(checked) => panic!("writable_source_started: {what}: {checked:?}"),
+                Err(e) => assert!(
+                    e.to_string().contains("writable only by root"),
+                    "writable_source_unnamed: {what}: {e}"
+                ),
+            }
+        }
+    }
+
+    /// With no release source stored, a release the signatories do not
+    /// sign is refused as before.
+    #[test]
+    fn a_custom_release_without_an_install_source_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (sk, _) = test_signer(0xC1);
+        let exe = installed_release(&root, &[&sk]);
+        let (_, official) = official_signers();
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let checked = verify_release(&exe, &official, &root_only);
+        assert!(
+            matches!(checked, Err(ReleaseCheckError::BadSignature { idx: 1, .. })),
+            "missing_source_accepted: {checked:?}"
+        );
+    }
+
+    /// An official release still starts under the signatories when a
+    /// release source naming other keys is stored beside it.
+    #[test]
+    fn an_official_release_starts_beside_an_install_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (official_sks, official) = official_signers();
+        let signers: Vec<&ed448_rust::PrivateKey> = official_sks.iter().collect();
+        let exe = installed_release(&root, &signers);
+        let (_, other) = test_signer(0xC1);
+        store_source(&root, &other);
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let checked = verify_release(&exe, &official, &root_only);
+        assert_eq!(
+            checked.as_ref().ok(),
+            Some(&SelfCheck::Verified(5)),
+            "official_refused: {checked:?}"
         );
     }
 }

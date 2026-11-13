@@ -6,6 +6,7 @@
 use clap::Subcommand;
 
 use crate::context::GlobalArgs;
+use crate::release_source::ReleaseSourceArgs;
 
 pub mod archive;
 pub mod diagnostics;
@@ -119,6 +120,8 @@ pub enum NodeCommand {
         /// Install a version older than the linked one.
         #[arg(long)]
         allow_downgrade: bool,
+        #[command(flatten)]
+        source: ReleaseSourceArgs,
     },
     /// Install a newer node version (optionally restarting the service).
     Update {
@@ -128,13 +131,25 @@ pub enum NodeCommand {
         /// Install a version older than the linked one.
         #[arg(long)]
         allow_downgrade: bool,
+        #[command(flatten)]
+        source: ReleaseSourceArgs,
     },
     /// Symlink /usr/local/bin/quilibrium-node to an installed version.
     Link { version: Option<String> },
     /// Stop the service and remove node binaries (configs preserved).
     Uninstall,
     /// Manage a cron job to auto-update the node (enable|disable|status).
-    AutoUpdate { action: String },
+    ///
+    /// `enable --release-source URL --release-key HEX` makes the job, and
+    /// every later install naming no source, install from that source,
+    /// trusting its keys alone; `enable --release-source official` returns
+    /// to the official one. The source is kept in release-source.yaml in
+    /// the install root.
+    AutoUpdate {
+        action: String,
+        #[command(flatten)]
+        source: ReleaseSourceArgs,
+    },
 }
 
 pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
@@ -152,15 +167,17 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
         NodeCommand::Install {
             version,
             allow_downgrade,
-        } => lifecycle::install(version.as_deref(), *allow_downgrade).await,
+            source,
+        } => lifecycle::install(version.as_deref(), *allow_downgrade, source).await,
         NodeCommand::Update {
             version,
             restart,
             allow_downgrade,
-        } => lifecycle::update(version.as_deref(), *restart, *allow_downgrade).await,
+            source,
+        } => lifecycle::update(version.as_deref(), *restart, *allow_downgrade, source).await,
         NodeCommand::Link { version } => lifecycle::link(version.as_deref()),
         NodeCommand::Uninstall => lifecycle::uninstall(),
-        NodeCommand::AutoUpdate { action } => lifecycle::auto_update(action),
+        NodeCommand::AutoUpdate { action, source } => lifecycle::auto_update(action, source),
     }
 }
 

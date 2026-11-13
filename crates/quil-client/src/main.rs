@@ -114,6 +114,8 @@ enum Commands {
         /// Install a version older than the linked one.
         #[arg(long)]
         allow_downgrade: bool,
+        #[command(flatten)]
+        source: quil_client::release_source::ReleaseSourceArgs,
     },
     /// Download the release signature files for the qclient binary.
     DownloadSignatures {
@@ -176,9 +178,11 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Update {
             version,
             allow_downgrade,
+            source,
         } => runtime()?.block_on(commands::release_cmds::update(
             version.as_deref(),
             *allow_downgrade,
+            source,
         )),
         Commands::DownloadSignatures { version } => runtime()?.block_on(
             commands::release_cmds::download_signatures(version.as_deref()),
@@ -193,7 +197,10 @@ fn wants_signature_check(cli: &Cli) -> bool {
 }
 
 /// The release self-check, as the node runs it at startup: verify this binary
-/// against its `.dgst` and `.dgst.sig.N` files, failing closed.
+/// against its `.dgst` and `.dgst.sig.N` files, failing closed. A binary
+/// the official signatories do not verify passes when the release source
+/// stored in its install root does, so the auto-update job runs the
+/// qclient it installed.
 fn signature_check(cli: &Cli) -> anyhow::Result<()> {
     use quil_crypto::release_check::{self_check, SelfCheck, SELF_CHECK_HINT};
     match self_check(wants_signature_check(cli)) {
@@ -202,13 +209,20 @@ fn signature_check(cli: &Cli) -> anyhow::Result<()> {
             total_signatories = quil_config::SIGNATORIES.len(),
             "signature check passed"
         ),
+        Ok(SelfCheck::VerifiedBySource { valid, file }) => tracing::info!(
+            valid_signatures = valid,
+            release_source = %file.display(),
+            "signature check passed under the stored release source"
+        ),
         Ok(SelfCheck::Unavailable) => {
             tracing::info!("signature check not available for windows yet, skipping")
         }
         Ok(SelfCheck::Disabled) => tracing::info!("signature check disabled, skipping"),
         Err(e) => anyhow::bail!(
             "signature check failed: {e} — {SELF_CHECK_HINT}; a release keeps its .dgst and \
-             .dgst.sig.N files beside it, which 'qclient download-signatures' fetches"
+             .dgst.sig.N files beside it, which 'qclient download-signatures' fetches for an \
+             official release; a release from another source starts only under the source \
+             stored with 'qclient node auto-update enable --release-source'"
         ),
     }
     Ok(())
@@ -300,6 +314,53 @@ mod tests {
         ] {
             assert!(super::wants_signature_check(&parse(args)), "{args:?}");
         }
+    }
+
+    /// Each command that installs releases takes the release source flags;
+    /// a key needs a source.
+    #[test]
+    fn release_source_flags_parse_where_releases_install() {
+        use clap::Parser;
+        use quil_client::commands::node::NodeCommand;
+        let key = "ab".repeat(57);
+        let flags = [
+            "--release-source",
+            "https://releases.example.org",
+            "--release-key",
+            key.as_str(),
+            "--release-quorum",
+            "1",
+        ];
+        for cmd in [
+            &["update"][..],
+            &["node", "install"],
+            &["node", "update", "--restart"],
+            &["node", "auto-update", "enable"],
+        ] {
+            let mut args = vec!["qclient"];
+            args.extend_from_slice(cmd);
+            args.extend_from_slice(&flags);
+            let cli = super::Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+            let source = match cli.command {
+                super::Commands::Update { source, .. } => source,
+                super::Commands::Node {
+                    command:
+                        NodeCommand::Install { source, .. }
+                        | NodeCommand::Update { source, .. }
+                        | NodeCommand::AutoUpdate { source, .. },
+                } => source,
+                other => panic!("{cmd:?} parsed as {other:?}"),
+            };
+            let named = source.named().unwrap();
+            assert!(
+                named
+                    .as_ref()
+                    .is_some_and(|s| s.is_custom() && s.keys() == [key.as_str()]),
+                "source_flags_lost: {cmd:?} named {named:?}"
+            );
+        }
+        let keyless = ["qclient", "node", "update", "--release-key", key.as_str()];
+        assert!(super::Cli::try_parse_from(keyless).is_err());
     }
 
     /// `-v` parses before or after the subcommand and is off unless given.

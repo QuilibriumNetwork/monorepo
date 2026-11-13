@@ -119,6 +119,13 @@ impl InstallLayout {
         self.root.join(".auto-update.lock")
     }
 
+    /// `<root>/release-source.yaml`, the release source `node auto-update
+    /// enable --release-source` stores.
+    pub fn release_source_path(&self) -> PathBuf {
+        self.root
+            .join(quil_config::release_source::RELEASE_SOURCE_FILE)
+    }
+
     /// The line naming the layout in use.
     pub fn notice(&self) -> String {
         if self.kept_var_install {
@@ -177,6 +184,11 @@ pub fn node_data_path() -> PathBuf {
 /// [`InstallLayout::update_lock_path`] of this host.
 pub fn update_lock_path() -> PathBuf {
     install_layout().update_lock_path()
+}
+
+/// [`InstallLayout::release_source_path`] of this host.
+pub fn release_source_path() -> PathBuf {
+    install_layout().release_source_path()
 }
 
 /// `client/utils/client.go` — `/usr/local/bin/qclient`.
