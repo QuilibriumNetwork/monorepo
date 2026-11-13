@@ -2682,6 +2682,8 @@ impl MessageCollector {
         if message.verified && !verified {
             self.absorb_unverified(&mut message, provenance);
         }
+        // What it names now: the copies it absorbed may have added signers.
+        let signers = message.shard.as_ref().map(|shard| shard.signers);
 
         // File nothing below the newest finalized frame: retention counts
         // finalized frames from the rank a message is filed at, and a submit

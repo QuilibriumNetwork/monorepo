@@ -477,10 +477,22 @@ impl MessageCollector {
         };
         union.verified = true;
         let union_key = union.hash;
+        let signers = union.shard.as_ref().map(|s| s.signers);
         if buffer.replace(&key, union) {
             // Under the buffers' lock, as admission checks the claims: no
             // shield of a coin the held copy claimed may come in between.
             self.shield_claims.lock().unwrap().rekey(&key, union_key);
+            // A copy then adds something only with more signers than the
+            // union, as after any verified copy.
+            if let Some(signers) = signers {
+                let mut tips = self.verified_tips.lock().unwrap();
+                if let Some(tip) = tips
+                    .get_mut(&shard.address)
+                    .filter(|tip| tip.frame == shard.frame)
+                {
+                    tip.signers = tip.signers.max(signers);
+                }
+            }
             drop(buffers);
             self.intake.note(Intake::Accepted, Instant::now());
             let added = added.len() as u64;
