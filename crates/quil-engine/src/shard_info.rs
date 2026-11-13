@@ -240,6 +240,13 @@ pub fn compute_shard_reward(
 /// expired Joining allocs leak into `in_candidates → is_alloc` and
 /// the server reports `IsAllocated=true` for shards the user has
 /// long since timed out of.
+///
+/// A shard the registry shows split away (a descendant holds live
+/// allocations) is no row unless this prover is allocated to it: a regular
+/// node's grid never flips, so the view it serves from its own store while
+/// the archives are unreachable still names those parents, with no prover
+/// serving them, and each read as a shard at halt risk (2026-11-13). Their
+/// data still counts in the world's size.
 pub fn build_shard_entries<F>(
     shards: &[ShardInfo],
     get_sizes: &F,
@@ -254,6 +261,13 @@ where
 {
     let mut world_bytes = BigInt::zero();
     let mut entries = Vec::new();
+    let live_filters: Vec<Vec<u8>> = prover_registry
+        .get_prover_shard_summaries(frame_number)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(crate::provers::lifecycle::has_live_allocation)
+        .map(|summary| summary.filter)
+        .collect();
 
     for shard_info in shards {
         let shard_key = &shard_info.shard_key;
@@ -295,6 +309,9 @@ where
             }
 
             if !include_all && !is_alloc {
+                continue;
+            }
+            if !is_alloc && crate::provers::lifecycle::is_split_parent(&bp, &live_filters) {
                 continue;
             }
 
@@ -2014,6 +2031,184 @@ mod tests {
                     "ring={ring} shards={shards}: estimate != minted/8"
                 );
             }
+        }
+    }
+
+    /// A registry whose provers all serve `live`, as summarized at any
+    /// frame; a filter they left reports none.
+    struct SplitRegistry {
+        live: Vec<u8>,
+    }
+
+    impl ProverRegistry for SplitRegistry {
+        fn get_reward_ring_estimate(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: u64,
+        ) -> QResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
+            Ok(None)
+        }
+        fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn get_active_provers(&self, filter: &[u8], _: u64) -> QResult<Vec<ProverInfo>> {
+            self.get_provers(filter)
+        }
+        fn get_prover_count(&self, filter: &[u8]) -> QResult<usize> {
+            Ok(self.get_provers(filter)?.len())
+        }
+        fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
+            if filter != self.live.as_slice() {
+                return Ok(vec![]);
+            }
+            Ok((0..4u8)
+                .map(|i| ProverInfo {
+                    public_key: vec![i; 74],
+                    address: vec![i; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![ProverAllocationInfo {
+                        status: ProverStatus::Active,
+                        confirmation_filter: filter.to_vec(),
+                        rejection_filter: vec![],
+                        join_frame_number: 1,
+                        leave_frame_number: 0,
+                        pause_frame_number: 0,
+                        resume_frame_number: 0,
+                        kick_frame_number: 0,
+                        join_confirm_frame_number: 2,
+                        join_reject_frame_number: 0,
+                        leave_confirm_frame_number: 0,
+                        leave_reject_frame_number: 0,
+                        last_active_frame_number: 100,
+                        last_signed_frame_number: 0,
+                        epoch: 0,
+                        ring: 0,
+                        vertex_address: vec![],
+                    }],
+                    available_storage: 1 << 30,
+                    seniority: 0,
+                    delegate_address: vec![],
+                })
+                .collect())
+        }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> {
+            Ok(vec![])
+        }
+        fn get_prover_shard_summaries(&self, _: u64) -> QResult<Vec<ProverShardSummary>> {
+            Ok(vec![ProverShardSummary {
+                filter: self.live.clone(),
+                status_counts: std::iter::once((ProverStatus::Active, 4)).collect(),
+                total_size: 0,
+            }])
+        }
+    }
+
+    /// The rows `registry` gives application `app`'s root, which this
+    /// node's own store holds data for, as its grid shows it, to a prover
+    /// allocated to `allocated`.
+    fn root_rows(
+        app: [u8; 32],
+        registry: &SplitRegistry,
+        allocated: &HashSet<Vec<u8>>,
+        include_all: bool,
+    ) -> (Vec<ShardEntry>, BigInt) {
+        let mut shard_key = vec![0u8; 3];
+        shard_key.extend_from_slice(&app);
+        let shards = [ShardInfo {
+            shard_key,
+            prefix: vec![],
+            size: vec![],
+            data_shards: 0,
+            commitment: vec![],
+        }];
+        let get_sizes = |_: &[u8], _: &ShardInfo| -> QResult<Vec<ShardSizeEntry>> {
+            Ok(vec![ShardSizeEntry {
+                prefix: vec![],
+                size: vec![0x10, 0x00],
+                data_shards: 1,
+                materialized_frame: 0,
+                latest_frame: 0,
+            }])
+        };
+        build_shard_entries(
+            &shards,
+            &get_sizes,
+            allocated,
+            &[0x77; 32],
+            include_all,
+            registry,
+            123,
+        )
+    }
+
+    /// A regular node's grid never flips, so the shard info it serves from
+    /// its own store, while the archives are unreachable, named the parents
+    /// the network split away: no prover serves them, and each read as a
+    /// shard at halt risk ("13/13 tracked shards" while a node was offline,
+    /// 2026-11-13). A split-away parent is no shard row; its data still
+    /// counts in the world's size.
+    #[test]
+    fn a_split_away_parent_is_no_shard_row() {
+        let app = [0x31u8; 32];
+        let registry = SplitRegistry {
+            live: quil_forest::encode_shard_bit_path(&app, &[false]),
+        };
+        let (rows, world) = root_rows(app, &registry, &HashSet::new(), true);
+        assert!(!world.is_zero(), "the parent's data counts in the world");
+        let parent: Vec<_> = rows
+            .iter()
+            .filter(|row| row.filter == app.to_vec())
+            .map(|row| row.prover_counts)
+            .collect();
+        assert!(
+            parent.is_empty(),
+            "split_parent_row: the split-away parent is a shard row with provers {parent:?}"
+        );
+    }
+
+    /// A shard with no live descendant, or merged back so that it holds
+    /// the live allocations itself, stays a row with its provers.
+    #[test]
+    fn a_shard_without_a_live_descendant_stays_a_row() {
+        let app = [0x32u8; 32];
+        for live in [app.to_vec(), [0x33u8; 32].to_vec()] {
+            let registry = SplitRegistry { live: live.clone() };
+            let (rows, _) = root_rows(app, &registry, &HashSet::new(), true);
+            assert_eq!(
+                rows.iter().filter(|row| row.filter == app.to_vec()).count(),
+                1,
+                "row_dropped: a shard whose provers serve {} is a row",
+                hex::encode(&live)
+            );
+        }
+    }
+
+    /// A split leaves this prover's allocation on the parent until its
+    /// leave completes, two epochs later. Until then the parent stays a
+    /// row, in the allocated view and the full one, so the reward lookup
+    /// still finds it.
+    #[test]
+    fn an_allocated_split_parent_stays_a_row() {
+        let app = [0x34u8; 32];
+        let registry = SplitRegistry {
+            live: quil_forest::encode_shard_bit_path(&app, &[false]),
+        };
+        let allocated: HashSet<Vec<u8>> = std::iter::once(app.to_vec()).collect();
+        for include_all in [true, false] {
+            let (rows, _) = root_rows(app, &registry, &allocated, include_all);
+            assert_eq!(
+                rows.iter().filter(|row| row.filter == app.to_vec()).count(),
+                1,
+                "owned_split_row: an allocated split parent is no row, include_all {include_all}"
+            );
         }
     }
 }
