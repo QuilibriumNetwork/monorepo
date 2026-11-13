@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct P2PConfig {
     #[serde(default)]
@@ -95,6 +95,76 @@ fn default_stream_listen() -> String {
     "/ip4/0.0.0.0/tcp/8340".into()
 }
 
+/// Every setting but the peer key, which is the node's network identity
+/// and shows only whether it is set: a config printed with `{:?}` (a log
+/// line, a panic, an error chain) must not carry it.
+impl std::fmt::Debug for P2PConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured, so a new field fails to compile until it is listed.
+        let Self {
+            d_lo,
+            history_length,
+            history_gossip,
+            gossip_factor,
+            heartbeat_initial_delay_ms,
+            heartbeat_interval_ms,
+            fanout_ttl_ms,
+            prune_backoff_ms,
+            unsubscribe_backoff_ms,
+            iwant_followup_time_ms,
+            idont_want_message_threshold,
+            bootstrap_peers,
+            listen_multiaddr,
+            stream_listen_multiaddr,
+            additional_listen_multiaddrs,
+            announce_listen_multiaddr,
+            announce_stream_listen_multiaddr,
+            peer_priv_key,
+            network,
+            direct_peers,
+            disable_onion_routing,
+            stream_max_connections,
+            stream_max_connections_per_source,
+        } = self;
+        let peer_priv_key = if peer_priv_key.is_empty() {
+            "unset"
+        } else {
+            "redacted"
+        };
+        f.debug_struct("P2PConfig")
+            .field("d_lo", d_lo)
+            .field("history_length", history_length)
+            .field("history_gossip", history_gossip)
+            .field("gossip_factor", gossip_factor)
+            .field("heartbeat_initial_delay_ms", heartbeat_initial_delay_ms)
+            .field("heartbeat_interval_ms", heartbeat_interval_ms)
+            .field("fanout_ttl_ms", fanout_ttl_ms)
+            .field("prune_backoff_ms", prune_backoff_ms)
+            .field("unsubscribe_backoff_ms", unsubscribe_backoff_ms)
+            .field("iwant_followup_time_ms", iwant_followup_time_ms)
+            .field("idont_want_message_threshold", idont_want_message_threshold)
+            .field("bootstrap_peers", bootstrap_peers)
+            .field("listen_multiaddr", listen_multiaddr)
+            .field("stream_listen_multiaddr", stream_listen_multiaddr)
+            .field("additional_listen_multiaddrs", additional_listen_multiaddrs)
+            .field("announce_listen_multiaddr", announce_listen_multiaddr)
+            .field(
+                "announce_stream_listen_multiaddr",
+                announce_stream_listen_multiaddr,
+            )
+            .field("peer_priv_key", &peer_priv_key)
+            .field("network", network)
+            .field("direct_peers", direct_peers)
+            .field("disable_onion_routing", disable_onion_routing)
+            .field("stream_max_connections", stream_max_connections)
+            .field(
+                "stream_max_connections_per_source",
+                stream_max_connections_per_source,
+            )
+            .finish()
+    }
+}
+
 impl Default for P2PConfig {
     fn default() -> Self {
         serde_yaml::from_str("{}").unwrap()
@@ -147,6 +217,14 @@ pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> O
 }
 
 impl P2PConfig {
+    /// Whether onion links and the exit may dial a peer's loopback, private
+    /// or otherwise non-public address: only off mainnet, where devnets run
+    /// on one host or network. On mainnet a peer's advertised address could
+    /// otherwise point a relay at services on its own host or network.
+    pub fn onion_dials_private_addresses(&self) -> bool {
+        self.network != 0
+    }
+
     /// Apply defaults for all P2P and BlossomSub parameters.
     pub fn apply_defaults(&mut self) {
         // BlossomSub mesh parameters
@@ -237,6 +315,23 @@ mod tests {
         assert!(
             shown.contains("stream_listen_multiaddr"),
             "Debug no longer shows the other settings: {shown}"
+        );
+    }
+
+    /// Onion links and the exit dial private addresses only off mainnet.
+    #[test]
+    fn onion_dials_take_private_addresses_only_off_mainnet() {
+        let on = |network: u8| {
+            P2PConfig {
+                network,
+                ..P2PConfig::default()
+            }
+            .onion_dials_private_addresses()
+        };
+        assert!(!on(0), "mainnet onion dials take private addresses");
+        assert!(
+            on(1) && on(99),
+            "devnet onion dials refuse private addresses"
         );
     }
 }

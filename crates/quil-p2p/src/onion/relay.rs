@@ -103,6 +103,8 @@ pub struct OnionRelay {
     cells_forwarded: AtomicU64,
     /// Total bytes relayed (metric).
     bytes_relayed: AtomicU64,
+    /// EXTENDs refused for naming this relay itself.
+    direct_loops: super::DirectLoops,
 }
 
 impl OnionRelay {
@@ -116,6 +118,7 @@ impl OnionRelay {
             peer_validator: std::sync::RwLock::new(None),
             cells_forwarded: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
+            direct_loops: super::DirectLoops::default(),
         }
     }
 
@@ -135,14 +138,18 @@ impl OnionRelay {
         *self.peer_validator.write().unwrap() = Some(validator);
     }
 
-    /// True if `peer` is a permitted next hop: not this relay itself, and a valid
-    /// in-network routing peer (when a validator is installed).
+    /// Whether `peer` is this relay itself: a circuit extended to it would
+    /// loop straight back (`A -> B -> B`).
+    fn is_self(&self, peer: &[u8]) -> bool {
+        !peer.is_empty() && *self.self_peer_id.read().unwrap() == peer
+    }
+
+    /// True if `peer` is a permitted next hop: a valid in-network routing peer
+    /// (when a validator is installed). [`is_self`](Self::is_self) is checked
+    /// before it.
     fn next_hop_allowed(&self, peer: &[u8]) -> bool {
         if peer.is_empty() {
             return false;
-        }
-        if *self.self_peer_id.read().unwrap() == peer {
-            return false; // DEFENSE 2: no self-connection
         }
         match &*self.peer_validator.read().unwrap() {
             Some(v) => v(peer), // DEFENSE 1: must be an in-network peer
@@ -340,11 +347,24 @@ impl OnionRelay {
                     Some(x) => x,
                     None => return RelayAction::None,
                 };
-                // DEFENSE: refuse to extend to ourselves or a non-network peer.
+                // DEFENSE 2: no direct loop. A circuit through this relay
+                // never continues to this relay (`A -> B -> B`); a peer seen
+                // earlier in the circuit (`A -> B -> C -> A`) is not ours to
+                // know.
+                if self.is_self(next_peer) {
+                    if let Some(refused) = self.direct_loops.refuse(super::unix_secs()) {
+                        tracing::warn!(
+                            refused,
+                            interval_secs = super::DIRECT_LOOP_WARN_INTERVAL_SECS,
+                            "onion relay refused to extend circuits to itself (a direct loop); \
+                             their originators built them, nothing to do on this node"
+                        );
+                    }
+                    return RelayAction::None;
+                }
+                // DEFENSE 1: the next hop must be an in-network routing peer.
                 if !self.next_hop_allowed(next_peer) {
-                    tracing::debug!(
-                        "onion EXTEND rejected: next hop is self or not a network peer"
-                    );
+                    tracing::debug!("onion EXTEND rejected: next hop is not a network peer");
                     return RelayAction::None;
                 }
                 let down_circ = self.next_down_circ.fetch_add(1, Ordering::Relaxed);

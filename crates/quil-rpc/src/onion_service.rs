@@ -77,6 +77,21 @@ struct Inner {
 #[derive(Clone)]
 pub struct OnionTransport {
     inner: Arc<Inner>,
+    /// Whether a link may be dialed at a loopback, private or otherwise
+    /// non-public address (devnets); see [`onion_dial_addr`].
+    private_addresses: bool,
+}
+
+/// The socket address an onion dial uses among a peer's advertised stream
+/// multiaddrs: the first public one, or the first at all with
+/// `private_addresses`. A peer's PeerInfo names its addresses itself, so on
+/// mainnet a loopback or private one would point the dialing relay or exit
+/// at services on its own host or network.
+pub(crate) fn onion_dial_addr(addrs: &[String], private_addresses: bool) -> Option<String> {
+    addrs
+        .iter()
+        .filter(|ma| private_addresses || quil_p2p::node::is_routable_multiaddr(ma))
+        .find_map(|ma| multiaddr_to_socket_addr(ma))
 }
 
 impl OnionTransport {
@@ -110,7 +125,20 @@ impl OnionTransport {
                 falcon_signing_key,
                 on_receive: RwLock::new(None),
             }),
+            private_addresses: false,
         }
+    }
+
+    /// Lets links be dialed at loopback, private and other non-public
+    /// addresses (off by default): for devnets, never mainnet.
+    pub fn with_private_addresses(mut self, private_addresses: bool) -> Self {
+        self.private_addresses = private_addresses;
+        self
+    }
+
+    /// Whether links may be dialed at non-public addresses.
+    pub fn dials_private_addresses(&self) -> bool {
+        self.private_addresses
     }
 
     /// True iff `peer_id` is known and advertises the routing capability.
@@ -215,12 +243,13 @@ impl Transport for OnionTransport {
             None => return false, // server-only transport, no dialer
         };
         // DEFENSE 1: only dial a validated in-network routing peer, and use its
-        // advertised stream multiaddr (never an arbitrary address).
+        // advertised stream multiaddr (never an arbitrary address), a public
+        // one unless private addresses are allowed.
         let addrs = match (self.inner.peer_lookup)(peer_id) {
             Some(a) => a,
             None => return false,
         };
-        let socket_addr = match addrs.iter().find_map(|ma| multiaddr_to_socket_addr(ma)) {
+        let socket_addr = match onion_dial_addr(&addrs, self.private_addresses) {
             Some(sa) => sa,
             None => return false,
         };
@@ -544,7 +573,8 @@ mod tests {
                 peer_of(&dialer_key).to_bytes(),
                 routing_lookup_allowing(vec![addr]),
                 dialer_key,
-            );
+            )
+            .with_private_addresses(true);
             let connected = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 dialer.ensure_connected(&hop),
@@ -589,6 +619,41 @@ mod tests {
         if connected || filed {
             panic!("VULNERABLE: an onion link was opened to the private address {addr}");
         }
+    }
+
+    /// An onion dial takes the first public address a peer advertises,
+    /// skipping loopback, private, shared, stacked and DNS ones, and takes
+    /// those only where private addresses are allowed.
+    #[test]
+    fn an_onion_dial_takes_a_public_address_unless_private_ones_are_allowed() {
+        let addrs = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let local = addrs(&[
+            "/ip4/127.0.0.1/tcp/8340",
+            "/ip4/10.0.0.1/tcp/8340",
+            "/ip4/100.64.0.1/tcp/8340",
+            "/ip6/::1/tcp/8340",
+            "/ip4/1.1.1.1/tcp/8340/ip4/127.0.0.1/tcp/8340",
+            "/dns4/localhost/tcp/8340",
+        ]);
+        assert_eq!(
+            onion_dial_addr(&local, false),
+            None,
+            "an onion dial took a private address"
+        );
+        assert_eq!(
+            onion_dial_addr(&local, true).as_deref(),
+            Some("127.0.0.1:8340")
+        );
+        let mixed = [local, addrs(&["/ip4/1.1.1.1/tcp/8340"])].concat();
+        assert_eq!(
+            onion_dial_addr(&mixed, false).as_deref(),
+            Some("1.1.1.1:8340")
+        );
+        let v6 = addrs(&["/ip6/2606:4700::1111/tcp/8340"]);
+        assert_eq!(
+            onion_dial_addr(&v6, false).as_deref(),
+            Some("[2606:4700::1111]:8340")
+        );
     }
 
     #[test]

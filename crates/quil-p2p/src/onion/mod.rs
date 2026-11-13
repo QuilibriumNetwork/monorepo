@@ -250,11 +250,69 @@ pub const MAX_CELL_SIZE: usize = 65536;
 /// Circuit identifier.
 pub type CircuitId = u32;
 
+/// Seconds between warnings that circuits were refused for a direct loop.
+pub const DIRECT_LOOP_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Circuits refused because they looped straight back to this node: a relay
+/// asked to extend to itself (`A -> B -> B`) or an exit asked to proxy to
+/// itself (`A -> B -> C -> C`). Any originator can send these, so they are
+/// warned about at most once per [`DIRECT_LOOP_WARN_INTERVAL_SECS`], with a
+/// count and no peer.
+#[derive(Debug, Default)]
+pub struct DirectLoops {
+    /// Refusals since the last warning.
+    refused: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the last warning (0: none yet).
+    warned: std::sync::atomic::AtomicU64,
+}
+
+impl DirectLoops {
+    /// Counts a refusal at `now` (Unix seconds). Returns the refusals since
+    /// the last warning when one is due: the first, then at most once per
+    /// [`DIRECT_LOOP_WARN_INTERVAL_SECS`].
+    pub fn refuse(&self, now: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.refused.fetch_add(1, Relaxed);
+        let last = self.warned.load(Relaxed);
+        if last != 0 && now < last + DIRECT_LOOP_WARN_INTERVAL_SECS {
+            return None;
+        }
+        self.warned
+            .compare_exchange(last, now.max(1), Relaxed, Relaxed)
+            .ok()?;
+        Some(self.refused.swap(0, Relaxed))
+    }
+}
+
+/// Unix seconds now (0 before the epoch).
+pub(crate) fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::relay::OnionRelay;
     use super::router::encrypt_layer;
     use super::*;
+
+    /// Direct-loop refusals warn at the first, then at most once a minute
+    /// with the refusals since.
+    #[test]
+    fn direct_loops_warn_first_then_once_a_minute_with_a_count() {
+        let loops = DirectLoops::default();
+        let within = "a refusal within the minute warned";
+        assert_eq!(loops.refuse(1_000), Some(1), "the first refusal warns");
+        assert_eq!(loops.refuse(1_001), None, "{within}");
+        assert_eq!(loops.refuse(1_059), None, "{within}");
+        assert_eq!(
+            loops.refuse(1_060),
+            Some(3),
+            "a minute on, with the refusals since"
+        );
+        assert_eq!(loops.refuse(1_061), None, "{within}");
+    }
 
     /// In-memory [`Transport`] that captures the registered callback and records
     /// every outbound cell — enough to prove the relay-forward coupling.
