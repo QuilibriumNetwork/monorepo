@@ -568,6 +568,43 @@ impl FinalizedRecords {
         }
     }
 
+    /// Drop the records above `fence` of a fenced session, which a member at
+    /// or below the fence never applied: each that extends the frame
+    /// `fenced` names, or a dropped one, and each whose certificate claims a
+    /// generation other than `generation`, the session authorized from the
+    /// fence. Its own records stay: its first frame names its genesis.
+    /// Returns how many were dropped.
+    pub(crate) fn discard_unapplied_above(
+        &self,
+        fence: u64,
+        fenced: &[u8; 32],
+        generation: u64,
+    ) -> usize {
+        let Ok(records) = self.load_files_above(fence) else {
+            return 0;
+        };
+        let mut discarded: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::from([fenced.to_vec()]);
+        let mut dropped = 0;
+        for (path, (_, bytes, cert, _)) in records {
+            let Some(header) = decode_app_frame(&bytes).and_then(|frame| frame.header) else {
+                continue;
+            };
+            let foreign = discarded.contains(&header.parent_selector)
+                || cert.as_deref().is_some_and(|cert| {
+                    quil_cw_consensus::app_cert::unverified_finalization_epoch(cert)
+                        != Some(generation)
+                });
+            if foreign && std::fs::remove_file(path).is_ok() {
+                dropped += 1;
+                if let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) {
+                    discarded.insert(selector.to_vec());
+                }
+            }
+        }
+        dropped
+    }
+
     /// Drop records of frames anchored before GLOBAL frame `activation`: a
     /// committee-handoff flag day discarded that history, and every session
     /// frame anchors at or after it. Returns how many were dropped.
@@ -3984,6 +4021,96 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A member at a fence that never applied the frame after it kept the
+    /// fenced session's finalized records past the fence, and replayed them
+    /// into its successor at every start (devnet r6, 2026-11-11). They go:
+    /// each that extends the fenced frame or a dropped one, or whose
+    /// certificate claims another generation. The successor's own stay.
+    #[test]
+    fn a_fenced_sessions_records_past_the_fence_go_and_the_successors_stay() {
+        use quil_cw_consensus::_codec::Encode as _;
+        use quil_cw_consensus::_consensus::{
+            simplex::types::Proposal,
+            types::{Epoch, Round, View},
+        };
+        let certificate = |generation: u64| {
+            Proposal::new(
+                Round::new(Epoch::new(generation), View::new(5)),
+                View::new(0),
+                quil_cw_consensus::_crypto::sha256::Digest([0; 32]),
+            )
+            .encode()
+            .to_vec()
+        };
+        let directory = test_directory("unapplied-records");
+        let records = FinalizedRecords::open(directory.clone()).unwrap();
+        let fenced = finalized_test_frame(10);
+        let digest = |frame: &AppShardFrame| {
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap()
+        };
+        let extending = |number: u64, parent: &AppShardFrame| {
+            let mut frame = finalized_test_frame(number);
+            frame.header.as_mut().unwrap().parent_selector = digest(parent).to_vec();
+            frame
+        };
+        // The fenced session's past it: the refused frame 11, which extends
+        // the fenced frame whatever generation its certificate claims; a
+        // frame 12 certified for generation 1, linked to none held; and an
+        // implied frame 13 extending that one.
+        let refused = extending(11, &fenced);
+        let mut stray = finalized_test_frame(12);
+        stray.header.as_mut().unwrap().parent_selector = vec![0x77; 32];
+        let implied = extending(13, &stray);
+        records
+            .persist(11, &certificate(2), false, &encode_app_frame(&refused))
+            .unwrap();
+        records
+            .persist(12, &certificate(1), false, &encode_app_frame(&stray))
+            .unwrap();
+        records
+            .persist_implied(13, false, &encode_app_frame(&implied))
+            .unwrap();
+        // The successor's own, generation 2: its first frame names its
+        // genesis, the next extends that one. A record below the fence stays.
+        let mut first = finalized_test_frame(11);
+        first.header.as_mut().unwrap().output = vec![0xa1; 32];
+        first.header.as_mut().unwrap().parent_selector = vec![0x9e; 32];
+        let own_next = extending(12, &first);
+        records
+            .persist(11, &certificate(2), false, &encode_app_frame(&first))
+            .unwrap();
+        records
+            .persist(12, &certificate(2), false, &encode_app_frame(&own_next))
+            .unwrap();
+        let below = encode_app_frame(&finalized_test_frame(9));
+        records.persist(9, &certificate(1), true, &below).unwrap();
+        assert_eq!(records.load_above(10).unwrap().len(), 5, "SETUP");
+
+        let dropped = records.discard_unapplied_above(10, &digest(&fenced), 2);
+        let left: Vec<(u64, Vec<u8>)> = records
+            .load_above(0)
+            .unwrap()
+            .into_iter()
+            .map(|(number, bytes, _, _)| (number, bytes))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                (9, encode_app_frame(&finalized_test_frame(9))),
+                (11, encode_app_frame(&first)),
+                (12, encode_app_frame(&own_next)),
+            ],
+            "REPLAY: the fenced session's records past the fence stayed, or the successor's went"
+        );
+        assert_eq!(dropped, 3);
+        assert_eq!(
+            records.discard_unapplied_above(10, &digest(&fenced), 2),
+            0,
+            "once"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A body a member delivered under a certified digest this node did not
     /// verify can claim any frame number. Its record must not replace the
     /// honest record of that number the engine has not materialized yet, or
@@ -6069,6 +6196,94 @@ mod tests {
         );
         quil_types::consensus::set_required_anchor_epoch_for_thread(None);
         quil_execution::config_replay::set_config_replay_frame_for_thread(None);
+    }
+
+    /// Under the process default, which is mainnet's, sync accepts a frame
+    /// whose fee vote lies outside the bounds when it is anchored at the GLOBAL
+    /// frame before the bound frame, and refuses it anchored at the bound
+    /// frame; a vote inside the bounds passes at both.
+    #[test]
+    fn the_fee_vote_bound_starts_at_the_mainnet_frame_by_default() {
+        use quil_types::store::ClockStore as _;
+        const BOUND: u64 = 1_097_280;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        for number in [BOUND - 1, BOUND] {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        }
+        let validator = BlsAppFrameValidator::new(
+            Arc::new(crate::test_support::TestProverRegistry::default()),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(clock.clone());
+        let frame = |anchor: u64, vote: u64| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: vec![1; 32],
+                frame_number: 7,
+                rank: 43,
+                parent_selector: vec![7; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                global_frame_number: anchor,
+                timestamp: 1_000,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+                0,
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
+            );
+            AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            }
+        };
+        for vote in [90, 100, 110] {
+            for anchor in [BOUND - 1, BOUND] {
+                assert!(
+                    validator
+                        .validate_linked_without_storage(&frame(anchor, vote))
+                        .unwrap(),
+                    "vote {vote} anchored at {anchor}"
+                );
+            }
+        }
+        for vote in [0, 89, 111, u64::MAX] {
+            assert!(
+                validator
+                    .validate_linked_without_storage(&frame(BOUND - 1, vote))
+                    .unwrap(),
+                "vote {vote} before the bound frame"
+            );
+            let refused = validator
+                .validate_linked_without_storage(&frame(BOUND, vote))
+                .expect_err("sync accepted a frame voting out of bounds at the bound frame")
+                .to_string();
+            assert!(refused.contains("fee multiplier vote"), "{refused}");
+        }
     }
 
     /// A voter whose latest GLOBAL frame is in the required-anchor epoch

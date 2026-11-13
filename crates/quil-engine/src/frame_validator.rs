@@ -1451,6 +1451,18 @@ impl BlsAppFrameValidator {
         require_signature: bool,
         verify_storage: bool,
     ) -> Result<bool> {
+        self.validate_checked(frame, require_signature, verify_storage, true)
+    }
+
+    /// [`Self::validate_with_mode`]; `bound_fee_vote` false skips only the
+    /// fee vote bound ([`Self::validate_fee_fence_evidence`]).
+    fn validate_checked(
+        &self,
+        frame: &AppShardFrame,
+        require_signature: bool,
+        verify_storage: bool,
+        bound_fee_vote: bool,
+    ) -> Result<bool> {
         let header = frame
             .header
             .as_ref()
@@ -1481,11 +1493,13 @@ impl BlsAppFrameValidator {
         // leader chose: refuse one outside the bounds every leader computes
         // (a vote of zero would make those writes free). Judged by the anchor,
         // so every replica and archive decides alike.
-        crate::fees::check_fee_vote(
-            header.frame_number,
-            header.global_frame_number,
-            header.fee_multiplier_vote,
-        )?;
+        if bound_fee_vote {
+            crate::fees::check_fee_vote(
+                header.frame_number,
+                header.global_frame_number,
+                header.fee_multiplier_vote,
+            )?;
+        }
 
         // 1. Verify the deterministic app output. The global chain supplies
         // the storage beacon; app frames perform no VDF verification.
@@ -1936,6 +1950,24 @@ impl BlsAppFrameValidator {
     /// before starting consensus, and every sync anchor is that same head.
     pub fn validate_certified_without_storage(&self, frame: &AppShardFrame) -> Result<bool> {
         self.validate_with_mode(frame, true, false)
+    }
+
+    /// Whether `frame` is fee vote fence evidence GLOBAL can take
+    /// (`quil_execution::global_intrinsic::handoff::fee_fence`): it votes out
+    /// of bounds at its anchor, and its certificate, structure and output
+    /// validate as a certified frame's do but for that vote. Its possession
+    /// proof is not checked: GLOBAL never executes the frame.
+    pub fn validate_fee_fence_evidence(&self, frame: &AppShardFrame) -> Result<bool> {
+        let Some(header) = frame.header.as_ref() else {
+            return Ok(false);
+        };
+        if !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+            header.global_frame_number,
+            header.fee_multiplier_vote,
+        ) {
+            return Ok(false);
+        }
+        self.validate_checked(frame, true, false, false)
     }
 
     /// The same for a frame final only through its certified child, which the

@@ -2452,11 +2452,12 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         }
 
-        let checks = extract_shard_frame_checks(&message.data);
+        let carried = carried_headers(&message.data);
         // A shard frame header decodes with bytes appended or a field in a
         // second encoding, which would make a copy of a header a distinct
-        // message. Every node encodes headers canonically.
-        if let Some(c) = checks.iter().find(|c| !c.canonical) {
+        // message. Every node encodes headers canonically, fee vote fence
+        // headers too, which are held as no shard frame.
+        if let Some((c, _)) = carried.iter().find(|(c, _)| !c.canonical) {
             tracing::debug!(
                 address = %hex::encode(&c.address),
                 frame_number = c.frame_number,
@@ -2465,6 +2466,11 @@ impl MessageCollector {
             self.intake.note(Intake::RefusedInvalid, Instant::now());
             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
         }
+        let checks: Vec<ShardFrameCheck> = carried
+            .into_iter()
+            .filter(|(_, evidence)| !evidence)
+            .map(|(check, _)| check)
+            .collect();
 
         // Reject addresses outside the known current shard set before spending
         // certificate-verification work. Missing attestations affect rewards,
@@ -3838,7 +3844,38 @@ struct ShardFrameCheck {
     canonical: bool,
 }
 
+/// The shard frames `data` carries. A header voting out of bounds at its
+/// anchor is not one: GLOBAL never executes its frame and takes it only as
+/// the fence of its session
+/// (`quil_execution::global_intrinsic::handoff::fee_fence`). Held as a shard
+/// frame, the session's next frame, which extends it, would supersede it, and
+/// the session would stall unfenced; it is validated like any other GLOBAL
+/// message instead.
 fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
+    carried_headers(data)
+        .into_iter()
+        .filter(|(_, evidence)| !evidence)
+        .map(|(check, _)| check)
+        .collect()
+}
+
+/// The shard and frame of each header voting out of bounds at its anchor
+/// that `data` carries: fee vote fence evidence
+/// (`quil_execution::global_intrinsic::handoff::fee_fence`), which
+/// [`extract_shard_frame_checks`] leaves out. A GLOBAL proposal carries one
+/// copy of each: every copy fences the same session, and each further copy
+/// costs every archive a certificate verification before it is refused.
+pub(crate) fn fee_fence_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+    carried_headers(data)
+        .into_iter()
+        .filter(|(_, evidence)| *evidence)
+        .map(|(c, _)| (c.address, c.frame_number))
+        .collect()
+}
+
+/// Each shard `FrameHeader` with an address that `data` carries, and whether
+/// it votes out of bounds at its anchor (fee vote fence evidence).
+fn carried_headers(data: &[u8]) -> Vec<(ShardFrameCheck, bool)> {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
 
@@ -3851,16 +3888,23 @@ fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
         if req.inner_type_prefix == TYPE_FRAME_HEADER {
             if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
                 if !fh.address.is_empty() {
+                    let evidence = quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                        fh.global_frame_number,
+                        fh.fee_multiplier_vote as u64,
+                    );
                     let canonical = fh
                         .to_canonical_bytes()
                         .is_ok_and(|bytes| bytes == req.inner_bytes);
-                    out.push(ShardFrameCheck {
-                        address: fh.address,
-                        frame_number: fh.frame_number,
-                        global_frame_number: fh.global_frame_number,
-                        has_attestation: !fh.storage_attestation_root.is_empty(),
-                        canonical,
-                    });
+                    out.push((
+                        ShardFrameCheck {
+                            address: fh.address,
+                            frame_number: fh.frame_number,
+                            global_frame_number: fh.global_frame_number,
+                            has_attestation: !fh.storage_attestation_root.is_empty(),
+                            canonical,
+                        },
+                        evidence,
+                    ));
                 }
             }
         }

@@ -1928,6 +1928,18 @@ pub enum FenceRewind {
     Untouched,
     /// The shard was rewound to this fence frame.
     Rewound(u64),
+    /// A head at or below the fence, which never applied a frame past it:
+    /// the fenced session's frames past it that the clock store held
+    /// (`dropped`, from the fence up) were deleted
+    /// ([`drop_unapplied_past_fence`]). Its finalized records past the fence
+    /// that are not `generation`'s, or extend the frame `fenced` names, are
+    /// the fenced session's too, and go as well.
+    Unapplied {
+        fence: u64,
+        fenced: [u8; 32],
+        generation: u64,
+        dropped: u64,
+    },
     /// Discarded frames past the fence that cannot be rewound here. `error`
     /// is the rewind's own refusal when it ran, which is still the result.
     Unrewindable {
@@ -1947,7 +1959,9 @@ impl FenceRewind {
                 from_cursor: fence.local_head,
                 head: None,
             }),
-            FenceRewind::Untouched | FenceRewind::Rewound(_) => None,
+            FenceRewind::Untouched | FenceRewind::Rewound(_) | FenceRewind::Unapplied { .. } => {
+                None
+            }
         }
     }
 }
@@ -1965,8 +1979,83 @@ pub fn rewind_past_fence(
         FenceRewind::Unrewindable {
             error: Some(error), ..
         } => Err(error),
-        FenceRewind::Untouched | FenceRewind::Unrewindable { error: None, .. } => Ok(None),
+        FenceRewind::Untouched
+        | FenceRewind::Unapplied { .. }
+        | FenceRewind::Unrewindable { error: None, .. } => Ok(None),
     }
+}
+
+/// Whether `header`, a frame past `checkpoint` that `session` was
+/// authorized from, is the session's own: its first frame names the
+/// session's genesis, and each certified one carries the session's
+/// generation. One that extends the checkpoint frame, or carries another
+/// generation's certificate or none, is not.
+fn own_frame_past(
+    session: &Session,
+    checkpoint: &Checkpoint,
+    header: &quil_types::proto::global::FrameHeader,
+) -> bool {
+    if header.frame_number == checkpoint.frame + 1 {
+        return header.parent_selector == session.genesis;
+    }
+    certified_generation(header) == Some(session.generation)
+}
+
+/// The generation the certificate a frame header carries claims, unverified.
+fn certified_generation(header: &quil_types::proto::global::FrameHeader) -> Option<u64> {
+    header
+        .public_key_signature_bls48581
+        .as_ref()
+        .and_then(|sig| quil_cw_consensus::app_cert::unwrap_cert_from_header(&sig.signature))
+        .and_then(quil_cw_consensus::app_cert::unverified_finalization_epoch)
+}
+
+/// [`fence_rewind`] of a member whose head is at or below `checkpoint`, a
+/// fence: it never applied a frame past it, but may hold some. One that
+/// refused the frame after the fence (a fee vote out of bounds) kept the
+/// frames the fenced session finalized on top of it in its clock store,
+/// which its start reads as its head and refuses, and their finalized
+/// records, which it replays into the successor at every start: it retried
+/// every 10 s and never resumed. Frames past the fence whose lowest is not
+/// this session's ([`own_frame_past`]) are the fenced session's, which
+/// GLOBAL discarded: deleted, the head back at the fence frame. A member
+/// that holds no frame at the fence keeps its frames for the shard sync.
+fn drop_unapplied_past_fence(
+    clock: &dyn ClockStore,
+    session: &Session,
+    checkpoint: &Checkpoint,
+) -> Result<FenceRewind> {
+    let unapplied = |dropped: u64| FenceRewind::Unapplied {
+        fence: checkpoint.frame,
+        fenced: checkpoint.digest,
+        generation: session.generation,
+        dropped,
+    };
+    let held = |number: u64| {
+        clock
+            .get_shard_clock_frame(&session.filter, number, false)
+            .ok()
+            .and_then(|frame| frame.header)
+    };
+    let Some(stored) = clock
+        .get_latest_shard_clock_frame(&session.filter)
+        .ok()
+        .and_then(|frame| frame.header)
+        .map(|header| header.frame_number)
+        .filter(|&stored| stored > checkpoint.frame)
+    else {
+        return Ok(unapplied(0));
+    };
+    if held(checkpoint.frame).is_none() {
+        return Ok(unapplied(0));
+    }
+    let lowest = (checkpoint.frame + 1..=stored).find_map(held);
+    if lowest.is_some_and(|header| own_frame_past(session, checkpoint, &header)) {
+        return Ok(unapplied(0));
+    }
+    clock.set_latest_shard_clock_frame_number(&session.filter, checkpoint.frame)?;
+    clock.delete_shard_clock_frame_range(&session.filter, checkpoint.frame + 1, stored + 1)?;
+    Ok(unapplied(stored - checkpoint.frame))
 }
 
 /// A member whose session GLOBAL authorized from a fenced same-filter
@@ -2060,7 +2149,7 @@ pub fn fence_rewind_held(
             continue;
         }
         if cursor <= checkpoint.frame {
-            return Ok(FenceRewind::Untouched);
+            return drop_unapplied_past_fence(clock, session, &checkpoint);
         }
         // Past the fence is this session's own chain once GLOBAL has executed
         // the session's frames past it and the local frame at that tip is the
@@ -4555,6 +4644,17 @@ mod successor_tests {
         txn.commit().unwrap();
     }
 
+    /// Whether `outcome` is a pass at the fence (frame 3) by a member of
+    /// `session` that holds nothing past it to drop, so that nothing is
+    /// rewound or deleted. At or below a fence that is `Unapplied` with
+    /// nothing dropped rather than `Untouched`: the start then also drops
+    /// the fenced session's finalized records past the fence, which a start
+    /// stopped after its frames went may still hold.
+    fn nothing_past_the_fence(outcome: &FenceRewind, session: &Session) -> bool {
+        matches!(outcome, FenceRewind::Unapplied { fence: 3, generation, dropped: 0, .. }
+            if *generation == session.generation)
+    }
+
     fn past_fence() -> PastFence {
         past_fence_due(
             3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames(),
@@ -4673,6 +4773,83 @@ mod successor_tests {
                 ))
                 .unwrap()
         }
+    }
+
+    // A member that refused the frame after a fence (a fee vote out of
+    // bounds; devnet r6, 2026-11-11) never applied it: its cursor stayed at
+    // the fence, but its clock store kept the frames the fenced session
+    // finalized on top of it. Its start read the highest as its head and
+    // refused it ("outside the terminal checkpoint: above its frame") every
+    // 10 s to the run's end. They go, the head back at the fence frame; the
+    // session's own frame past the fence stays.
+    #[test]
+    fn a_member_that_never_applied_a_frame_past_a_fence_drops_the_fenced_sessions_frames() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        let at_fence = crdt();
+        at_fence
+            .commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&past.filter, 3))
+            .unwrap();
+        // The refused frame 4 never reached its clock store; the frames the
+        // fenced session finalized on top of it did.
+        past.clock
+            .delete_shard_clock_frame_range(&past.filter, 4, 5)
+            .unwrap();
+        for (number, output) in [(5, 0x55), (6, 0x66)] {
+            store_header(
+                &past.clock,
+                quil_types::proto::global::FrameHeader {
+                    address: past.filter.clone(),
+                    frame_number: number,
+                    rank: number + 2,
+                    output: vec![output; 32],
+                    parent_selector: vec![output - 0x11; 32],
+                    ..Default::default()
+                },
+            );
+        }
+        let head = || {
+            past.clock
+                .get_latest_shard_clock_frame(&past.filter)
+                .unwrap()
+                .header
+                .unwrap()
+                .frame_number
+        };
+        assert_eq!(head(), 6, "SETUP");
+
+        fence_rewind(&past.global, &at_fence, &past.clock, &past.successor).unwrap();
+        assert_eq!(
+            head(),
+            3,
+            "REFUSER: the fenced session's frames past the fence stayed this member's head"
+        );
+        for number in [5, 6] {
+            assert!(
+                past.clock
+                    .get_shard_clock_frame(&past.filter, number, false)
+                    .is_err(),
+                "frame {number} of the fenced session is deleted"
+            );
+        }
+        assert_eq!(at_fence.read_frame_cursor(&cursor_key).unwrap(), 3);
+        successor_state_matches(&past.global, &at_fence, &past.clock, &past.successor).unwrap();
+
+        store_header(
+            &past.clock,
+            quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(),
+                frame_number: 4,
+                rank: 7,
+                output: vec![0x45; 32],
+                parent_selector: past.successor.genesis.to_vec(),
+                global_frame_number: past.due,
+                ..Default::default()
+            },
+        );
+        fence_rewind(&past.global, &at_fence, &past.clock, &past.successor).unwrap();
+        assert_eq!(head(), 4, "the session's own frame past the fence went");
     }
 
     // A member still holding the fenced predecessor's frames once the
@@ -5074,7 +5251,8 @@ mod successor_tests {
     // committed, rather than a refusal for good (an operator's node: "local
     // frame 5779 does not extend frame 5778" for 6.5 hours, nothing owed).
     // Nothing is rewound locally; the rebase drops the frames past the
-    // fence, and the anchor's replay leaves a member the successor accepts.
+    // fence, and the anchor's replay leaves a member the successor accepts,
+    // at the fence with nothing past it to drop ([`nothing_past_the_fence`]).
     // Behind GLOBAL's executed tip it is re-anchored at that tip; a head
     // GLOBAL's executed tip vouches for stays untouched whatever lies below.
     #[test]
@@ -5189,10 +5367,12 @@ mod successor_tests {
         );
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
         past.shard.checkpoint_frame_cursor(3, &cursor_key).unwrap();
-        assert!(matches!(
-            fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
-            FenceRewind::Untouched
-        ));
+        let outcome =
+            fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(
+            nothing_past_the_fence(&outcome, &past.successor),
+            "{outcome:?}"
+        );
         successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
 
         // Behind GLOBAL's executed tip: re-anchored at that tip.
@@ -5322,6 +5502,7 @@ mod successor_tests {
         successor: Session,
         roots: [[u8; 32]; 4],
         frame: u64,
+        sealed: bool,
     }
 
     fn location(byte: u8) -> quil_hypergraph::Location {
@@ -5474,6 +5655,7 @@ mod successor_tests {
             successor,
             roots,
             frame: due,
+            sealed,
         }
     }
 
@@ -5591,13 +5773,16 @@ mod successor_tests {
             );
             successor_state_matches(&self.global, &self.shard, &self.clock, &self.successor)
                 .unwrap();
-            assert!(
-                matches!(
-                    fence_rewind(&self.global, &self.shard, &self.clock, &self.successor).unwrap(),
-                    FenceRewind::Untouched
-                ),
-                "once"
-            );
+            // Once: past a sealed checkpoint nothing is left to rewind; at a
+            // fence nothing is left to drop either.
+            let outcome =
+                fence_rewind(&self.global, &self.shard, &self.clock, &self.successor).unwrap();
+            let once = if self.sealed {
+                matches!(outcome, FenceRewind::Untouched)
+            } else {
+                nothing_past_the_fence(&outcome, &self.successor)
+            };
+            assert!(once, "once, sealed {}: {outcome:?}", self.sealed);
         }
 
         /// The member's state, cursor and frames past the checkpoint stay.
@@ -5635,7 +5820,8 @@ mod successor_tests {
 
     // The same past a predecessor fenced at its tip: refused before as frames
     // that differ from the fenced frame, the member stayed blocked, and no
-    // re-anchor followed.
+    // re-anchor followed. Rewound, it is at the fence with nothing past it
+    // to drop ([`nothing_past_the_fence`]).
     #[test]
     fn frames_of_a_session_ended_at_its_base_are_rewound_to_a_fenced_checkpoint() {
         let ended = ended_at_base(false);
@@ -6396,7 +6582,8 @@ mod successor_tests {
     // the successor has executed nothing is the fence, its base. Once the
     // shard sync has installed that frame's pre-state, the rebase drops the
     // discarded frames and moves head and cursor below the anchor; the
-    // anchor's replay then leaves a member the successor accepts.
+    // anchor's replay then leaves a member the successor accepts, at the
+    // fence with nothing past it to drop ([`nothing_past_the_fence`]).
     #[test]
     fn a_head_past_a_fence_without_its_frames_is_reanchored_at_the_fence() {
         use quil_types::store::ClockStore as _;
@@ -6497,10 +6684,12 @@ mod successor_tests {
         );
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
         past.shard.checkpoint_frame_cursor(3, &cursor_key).unwrap();
-        assert!(matches!(
-            fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
-            FenceRewind::Untouched
-        ));
+        let outcome =
+            fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(
+            nothing_past_the_fence(&outcome, &past.successor),
+            "{outcome:?}"
+        );
         successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
     }
 

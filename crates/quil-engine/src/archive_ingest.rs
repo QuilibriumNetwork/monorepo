@@ -148,6 +148,9 @@ pub struct ArchiveAppShardIngest {
     owed_warned: Option<Instant>,
     /// Frames peers asked this archive for that it does not serve.
     missing_frame_reports: Option<tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>>,
+    /// Where the headers of certified frames refused for their fee vote go
+    /// ([`Self::with_fee_fence_offers`]).
+    fee_fence_offers: Option<FeeFenceOffers>,
     /// Reported frames found not to be owed, and since when: such a report
     /// is not looked into again for [`NOT_OWED_TTL`]; at most [`MAX_NOT_OWED`].
     not_owed: HashMap<(Vec<u8>, u64), Instant>,
@@ -492,6 +495,7 @@ impl ArchiveAppShardIngest {
             owed_bodies: HashMap::new(),
             owed_warned: None,
             missing_frame_reports: None,
+            fee_fence_offers: None,
             not_owed: HashMap::new(),
             validator: Arc::new(
                 BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
@@ -696,6 +700,14 @@ impl ArchiveAppShardIngest {
         self
     }
 
+    /// Where to offer GLOBAL the header of a certified frame this archive
+    /// refuses for its fee vote, as its session's fence evidence
+    /// ([`FeeFenceOffers`]).
+    pub fn with_fee_fence_offers(mut self, offers: FeeFenceOffers) -> Self {
+        self.fee_fence_offers = Some(offers);
+        self
+    }
+
     /// Where [`Self::prefetch_through`] asks for frames. The fetcher serves
     /// these only when no request from [`Self::with_gap_fetch`] is waiting.
     pub fn with_prefetch(mut self, requests: tokio::sync::mpsc::Sender<(Vec<u8>, u64)>) -> Self {
@@ -741,6 +753,7 @@ impl ArchiveAppShardIngest {
             has_forest: self.hypergraph.has_forest(),
             clock_store: self.clock_store.clone(),
             hypergraph: self.hypergraph.clone(),
+            fee_fence_offers: self.fee_fence_offers.clone(),
         }
     }
 
@@ -2976,6 +2989,82 @@ pub struct ArchiveFrameVerifier {
     /// GLOBAL state frames verify against, whose executed frame tells a frame
     /// that waits for execution from one that is refused.
     hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+    /// [`ArchiveAppShardIngest::with_fee_fence_offers`].
+    fee_fence_offers: Option<FeeFenceOffers>,
+}
+
+/// How many offered frames [`FeeFenceOffers`] remembers.
+const FEE_FENCE_OFFERS_KEPT: usize = 64;
+
+/// Where an archive offers GLOBAL the header of a certified frame it
+/// refuses for its fee vote: its session's fence evidence
+/// (`quil_execution::global_intrinsic::handoff::fee_fence`), once per frame.
+/// Every archive refuses such a frame's body, and GLOBAL leaders hold its
+/// descendants back for that body, so a header no member submitted (its
+/// members withheld it, or refused the frame) halted the shard's GLOBAL
+/// inclusion for every member, with no bound (devnet r6, 2026-11-12). The
+/// archives hold the header from ingest. Whether one offers it decides
+/// only that GLOBAL sees it: GLOBAL fences from a frame that carries it,
+/// which every archive validates and executes alike.
+#[derive(Clone)]
+pub struct FeeFenceOffers {
+    offer: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    offered: Arc<std::sync::Mutex<std::collections::VecDeque<OfferedFrame>>>,
+}
+
+/// A frame [`FeeFenceOffers`] offered: its shard, number and output digest.
+type OfferedFrame = (Vec<u8>, u64, [u8; 32]);
+
+impl FeeFenceOffers {
+    /// Offers that hand each header's canonical bytes to `offer`.
+    pub fn new(offer: Arc<dyn Fn(Vec<u8>) + Send + Sync>) -> Self {
+        Self {
+            offer,
+            offered: Default::default(),
+        }
+    }
+
+    /// The key [`Self::offer_once`] remembers `frame` by.
+    fn key(frame: &AppShardFrame) -> Option<OfferedFrame> {
+        let header = frame.header.as_ref()?;
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()?;
+        Some((header.address.clone(), header.frame_number, digest))
+    }
+
+    /// Whether `frame`'s header was offered.
+    fn offered(&self, frame: &AppShardFrame) -> bool {
+        Self::key(frame).is_some_and(|key| {
+            self.offered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key)
+        })
+    }
+
+    /// Offer `frame`'s header unless it was offered already. True when
+    /// offered now.
+    fn offer_once(&self, frame: &AppShardFrame) -> bool {
+        let Some(key) = Self::key(frame) else {
+            return false;
+        };
+        {
+            let mut offered = self.offered.lock().unwrap_or_else(|e| e.into_inner());
+            if offered.contains(&key) {
+                return false;
+            }
+            offered.push_back(key);
+            if offered.len() > FEE_FENCE_OFFERS_KEPT {
+                offered.pop_front();
+            }
+        }
+        match crate::app_handoff::canonical_header(frame) {
+            Ok(bytes) => {
+                (self.offer)(bytes);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// What [`ArchiveFrameVerifier::check`] found.
@@ -3064,6 +3153,36 @@ impl ArchiveFrameVerifier {
         }
     }
 
+    /// Offer GLOBAL a refused certified `frame`'s header when it is fee vote
+    /// fence evidence ([`FeeFenceOffers`]), once.
+    fn offer_fee_fence(&self, frame: &AppShardFrame) {
+        let Some(offers) = self.fee_fence_offers.as_ref() else {
+            return;
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        if !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+            header.global_frame_number,
+            header.fee_multiplier_vote,
+        ) || offers.offered(frame)
+            || !matches!(self.validator.validate_fee_fence_evidence(frame), Ok(true))
+        {
+            return;
+        }
+        if offers.offer_once(frame) {
+            info!(
+                frame = header.frame_number,
+                address = %hex::encode(&header.address),
+                anchor = header.global_frame_number,
+                fee_vote = header.fee_multiplier_vote,
+                "archive ingest: offered GLOBAL a refused certified frame voting out of bounds \
+                 as its session's fence; GLOBAL fences the session at its executed tip unless \
+                 it executed a descendant first"
+            );
+        }
+    }
+
     /// Whether `frame` may be admitted, waits for GLOBAL execution to reach
     /// its anchor, or is refused (logged).
     pub fn check(&self, frame: &AppShardFrame) -> FrameCheck {
@@ -3135,6 +3254,9 @@ impl ArchiveFrameVerifier {
                     error = %e,
                     "archive ingest: shard frame validation FAILED — rejecting"
                 );
+                if certified {
+                    self.offer_fee_fence(frame);
+                }
                 return FrameCheck::Refused;
             }
         }

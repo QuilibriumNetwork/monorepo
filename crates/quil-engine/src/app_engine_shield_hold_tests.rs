@@ -1230,3 +1230,42 @@ async fn a_frame_anchored_before_the_owner_gate_waits_for_its_shield_in_the_back
          the frame's anchor"
     );
 }
+
+/// A leader proposes the vote its fee window and the frame cadence give,
+/// kept inside the bounds members enforce from the fee vote bound frame,
+/// judged by the frame's anchor, and as computed before it (the process
+/// default, mainnet's). No node records votes into its window today; one that
+/// did would compute votes out of the bounds.
+#[tokio::test]
+async fn a_leader_keeps_its_fee_vote_inside_the_bounds_from_the_bound_frame() {
+    const BOUND: u64 = 1_097_280;
+    let rig = rig(half(false), Proofs::Unconfigured);
+    let leader = &rig.leader;
+    let now = 1_800_000_000_000i64;
+    let on_target = now - i64::try_from(quil_types::consensus::ideal_frame_time_ms()).unwrap();
+    assert_eq!(leader.proposal_fee_vote(BOUND, now, on_target), 100);
+    leader
+        .fee_manager
+        .add_frame_fee_vote(&leader.filter, 1, 1_000)
+        .unwrap();
+    assert_eq!(leader.proposal_fee_vote(BOUND - 1, now, on_target), 1_000);
+    assert_eq!(
+        leader.proposal_fee_vote(BOUND, now, on_target),
+        110,
+        "a leader proposed a vote out of bounds at the bound frame"
+    );
+    leader
+        .fee_manager
+        .rewind_to_frame(&leader.filter, 0)
+        .unwrap();
+    leader
+        .fee_manager
+        .add_frame_fee_vote(&leader.filter, 2, 0)
+        .unwrap();
+    assert_eq!(leader.proposal_fee_vote(BOUND - 1, now, on_target), 0);
+    assert_eq!(
+        leader.proposal_fee_vote(BOUND, now, on_target),
+        90,
+        "a leader proposed a vote out of bounds at the bound frame"
+    );
+}

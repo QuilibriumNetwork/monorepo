@@ -274,99 +274,23 @@ pub fn compute_fee_multiplier_vote(
 // Fee vote bounds
 // =====================================================================
 
-/// Lowest `fee_multiplier_vote` an app-shard frame may carry from
-/// [`MAINNET_FEE_VOTE_BOUND_FRAME`]: [`DEFAULT_FEE_MULTIPLIER`] lowered by
-/// `MAX_ADJUSTMENT_PERCENT`. No node records frame votes into the sliding
-/// window, so [`compute_fee_multiplier_vote`] always starts from the default
-/// and moves it at most that far: an honest vote is 90 to 110. Recording
-/// votes would let the base drift, and must revise these bounds first.
-pub const MIN_FEE_MULTIPLIER_VOTE: u64 =
-    DEFAULT_FEE_MULTIPLIER * (100 - MAX_ADJUSTMENT_PERCENT as u64) / 100;
+// The bounds and the frame they apply from live with GLOBAL execution, which
+// refuses a header out of bounds too (`quil_execution::fee_vote`).
+pub use quil_execution::fee_vote::{
+    check_fee_vote, fee_vote_bounded_at, fee_vote_in_bounds, init_fee_vote_bound_frame,
+    MAX_FEE_MULTIPLIER_VOTE, MIN_FEE_MULTIPLIER_VOTE,
+};
 
-/// Highest `fee_multiplier_vote` an app-shard frame may carry from
-/// [`MAINNET_FEE_VOTE_BOUND_FRAME`]; see [`MIN_FEE_MULTIPLIER_VOTE`].
-pub const MAX_FEE_MULTIPLIER_VOTE: u64 =
-    DEFAULT_FEE_MULTIPLIER * (100 + MAX_ADJUSTMENT_PERCENT as u64) / 100;
+#[cfg(test)]
+pub use quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread;
 
-/// From this GLOBAL frame, members refuse an app-shard frame whose fee vote
-/// lies outside [`MIN_FEE_MULTIPLIER_VOTE`]..=[`MAX_FEE_MULTIPLIER_VOTE`],
-/// and a leader keeps its own vote inside them. The frame prices its
-/// application writes at its vote, so a leader voting zero would let them
-/// commit without payment. Validation and sync judge a frame by its anchored
-/// GLOBAL frame; a voter also by its own latest GLOBAL frame, so an older
-/// anchor does not evade the bounds. A validation change: a member on an
-/// older build still votes for such a frame and executes it, so archives and
-/// most members of every committee must run a build carrying it before the
-/// frame. Not scheduled on mainnet until a release carrying it is adopted;
-/// `QUIL_FEE_VOTE_BOUND_FRAME` elsewhere, never by default.
-pub const MAINNET_FEE_VOTE_BOUND_FRAME: Option<u64> = None;
-
-static FEE_VOTE_BOUND_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-thread_local! {
-    static FEE_VOTE_BOUND_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-fn fee_vote_bound_frame_for(network: u8, setting: Option<&str>) -> u64 {
-    if network == 0 {
-        return MAINNET_FEE_VOTE_BOUND_FRAME.unwrap_or(u64::MAX);
-    }
-    setting
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(u64::MAX)
-}
-
-/// Fix this process's fee vote bound frame from its network, and return it.
-/// Called at startup before any shard engine runs; the first call decides.
-pub fn init_fee_vote_bound_frame(network: u8) -> u64 {
-    *FEE_VOTE_BOUND_FRAME.get_or_init(|| {
-        fee_vote_bound_frame_for(
-            network,
-            std::env::var("QUIL_FEE_VOTE_BOUND_FRAME").ok().as_deref(),
-        )
-    })
-}
-
-/// The frame fixed by [`init_fee_vote_bound_frame`]; the mainnet frame in a
-/// process that never called it. `u64::MAX`: never.
-pub fn fee_vote_bound_frame() -> u64 {
-    if let Some(frame) = FEE_VOTE_BOUND_OVERRIDE.with(|cell| cell.get()) {
-        return frame;
-    }
-    FEE_VOTE_BOUND_FRAME
-        .get()
-        .copied()
-        .unwrap_or_else(|| fee_vote_bound_frame_for(0, None))
-}
-
-/// Set the fee vote bound frame for the calling thread only (tests).
-/// `Some(u64::MAX)` disables it; `None` restores the process setting.
-pub fn set_fee_vote_bound_frame_for_thread(frame: Option<u64>) {
-    FEE_VOTE_BOUND_OVERRIDE.with(|cell| cell.set(frame));
-}
-
-/// Whether frame votes are bounded at GLOBAL frame `global_frame`.
-pub fn fee_vote_bounded_at(global_frame: u64) -> bool {
-    let from = fee_vote_bound_frame();
-    from != u64::MAX && global_frame >= from
-}
-
-/// Whether `vote` lies inside the bounds every leader computes.
-pub fn fee_vote_in_bounds(vote: u64) -> bool {
-    (MIN_FEE_MULTIPLIER_VOTE..=MAX_FEE_MULTIPLIER_VOTE).contains(&vote)
-}
-
-/// Refuse app-shard frame `frame_number`, anchored at `global_frame`, when
-/// its `vote` is out of bounds there.
-pub fn check_fee_vote(frame_number: u64, global_frame: u64, vote: u64) -> Result<()> {
-    if fee_vote_bounded_at(global_frame) && !fee_vote_in_bounds(vote) {
-        return Err(QuilError::InvalidArgument(format!(
-            "app shard frame {frame_number}: fee multiplier vote {vote} outside \
-             {MIN_FEE_MULTIPLIER_VOTE}..={MAX_FEE_MULTIPLIER_VOTE} (anchor {global_frame})"
-        )));
-    }
-    Ok(())
-}
+// The bounds are the votes `compute_fee_multiplier_vote` can return:
+// `DEFAULT_FEE_MULTIPLIER` moved by at most `MAX_ADJUSTMENT_PERCENT`.
+const _: () = assert!(
+    MIN_FEE_MULTIPLIER_VOTE == DEFAULT_FEE_MULTIPLIER * (100 - MAX_ADJUSTMENT_PERCENT as u64) / 100
+        && MAX_FEE_MULTIPLIER_VOTE
+            == DEFAULT_FEE_MULTIPLIER * (100 + MAX_ADJUSTMENT_PERCENT as u64) / 100
+);
 
 /// The vote a leader proposes in a frame anchored at `global_frame`: its
 /// computed `vote`, kept inside the bounds where they apply.
@@ -647,15 +571,6 @@ mod tests {
         }
         assert!(check_fee_vote(1, 10, 0).is_err());
         assert!(check_fee_vote(1, 9, 0).is_ok(), "before the bound frame");
-        set_fee_vote_bound_frame_for_thread(Some(u64::MAX));
-        assert!(!fee_vote_bounded_at(u64::MAX), "never");
         set_fee_vote_bound_frame_for_thread(None);
-        assert_eq!(
-            fee_vote_bound_frame_for(0, Some("5")),
-            u64::MAX,
-            "mainnet: None"
-        );
-        assert_eq!(fee_vote_bound_frame_for(1, Some("5")), 5);
-        assert_eq!(fee_vote_bound_frame_for(1, None), u64::MAX);
     }
 }

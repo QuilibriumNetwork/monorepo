@@ -1095,6 +1095,7 @@ pub(crate) async fn start(
     // direct BlossomSub publish on GLOBAL_PROVER (which fails on
     // non-archive nodes — they don't subscribe to that bitmask).
     let _ = prover_message_transport_cell.set(prover_message_transport.clone());
+    let fee_fence_transport = prover_message_transport.clone();
 
     let prover_pipeline = Arc::new(quil_engine::prover_pipeline::ProverPipeline {
         lifecycle: prover_lifecycle.clone(),
@@ -1805,6 +1806,10 @@ pub(crate) async fn start(
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         )
         .with_gap_fetch(gap_tx)
+        .with_fee_fence_offers(fee_fence_offers(
+            fee_fence_transport.clone(),
+            detached_spawner.clone(),
+        ))
         .with_prefetch(prefetch_tx)
         .with_missing_frame_reports(frame_miss_rx)
         .sequenced();
@@ -2083,6 +2088,48 @@ pub(crate) async fn start(
     crdt.close_snapshots();
 
     Ok(reason)
+}
+
+/// An archive's fee vote fence offers
+/// ([`quil_engine::archive_ingest::FeeFenceOffers`]): each header goes to
+/// the archives as a member's finalized header does.
+fn fee_fence_offers(
+    transport: Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
+    spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+) -> quil_engine::archive_ingest::FeeFenceOffers {
+    quil_engine::archive_ingest::FeeFenceOffers::new(Arc::new(move |header: Vec<u8>| {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let request = match CanonicalMessageRequest::wrap(header) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, "fee vote fence offer: header does not wrap; not offered");
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let bundle = match (CanonicalMessageBundle {
+            requests: vec![Some(request)],
+            timestamp,
+        })
+        .to_canonical_bytes()
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                warn!(%error, "fee vote fence offer: bundle does not encode; not offered");
+                return;
+            }
+        };
+        let transport = transport.clone();
+        spawner.detach("fee-fence-offer", async move {
+            if let Err(error) = transport.publish_prover_bundle(bundle).await {
+                warn!(%error, "fee vote fence offer: no archive took it; GLOBAL fences the session only once some proposal carries the header");
+            }
+            Ok(())
+        });
+    }))
 }
 
 #[cfg(test)]
