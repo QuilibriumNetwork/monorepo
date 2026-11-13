@@ -29,7 +29,8 @@ portable path, the reference the native builds must cross-verify against.
 (less RDRAND, RDSEED and SHA, emitted only by intrinsics the backend never uses);
 quil-node, qclient and the amount-proof worker refuse to start on a CPU that
 lacks any of them (`cpu::required_cpu_features_missing`) rather than die with
-SIGILL mid-proof.
+SIGILL mid-proof. On Linux quil-node checks before its allocator initialises
+(`cpu::write_unsupported_cpu_message`): jemalloc gets the same CFLAGS.
 
 The raw ABI is unsafe and uses process-global key state. Callers must serialize
 all native contexts using `NATIVE_STATE` for their entire lifetime, including
