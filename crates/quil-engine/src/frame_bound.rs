@@ -1,23 +1,25 @@
 //! Bounds on what a received application shard frame carries (request
-//! bundles, their requests and storage openings), on the requests of a
-//! message bundle submitted to a shard and on the bundles and requests of
-//! a GLOBAL frame received over gossip, counted from the encoding before
-//! it is decoded.
+//! bundles, their requests and storage openings) and takes to decode, on
+//! the requests of a message bundle submitted to a shard and on the
+//! bundles and requests of a GLOBAL frame received over gossip, counted
+//! from the encoding before it is decoded.
 //!
 //! [`check_frame`] walks a frame's protobuf encoding without allocating
 //! and refuses one carrying more than [`MAX_APP_FRAME_ITEMS`] bundles and
-//! requests or [`MAX_APP_FRAME_OPENINGS`] storage openings;
+//! requests or [`MAX_APP_FRAME_OPENINGS`] storage openings, or whose
+//! decode would take more than [`MAX_APP_FRAME_DECODED`] bytes;
 //! [`check_bundle`] refuses a submitted bundle that could not fit a frame.
 //!
 //! A leader proposes at most [`MAX_APP_FRAME_ITEMS`] bundles and requests
 //! and defers the rest ([`FrameItemBudget`]); members refuse a proposal
 //! past either bound, as followers and archives refuse the frame.
 
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use quil_cw_consensus::handoff::MAX_MEMBERS;
 use quil_types::consensus::STORAGE_QUERIES_PER_LEAF;
+use quil_types::decode_cost::{CostRefusal, DecodeCost};
 use quil_types::proto::global::AppShardFrame;
 use tracing::warn;
 
@@ -43,6 +45,21 @@ pub const MAX_APP_FRAME_ITEMS: usize = 16_384;
 /// count too is at most 8,192.
 pub const MAX_APP_FRAME_OPENINGS: usize = MAX_MEMBERS * STORAGE_QUERIES_PER_LEAF as usize;
 
+/// The heap one application shard frame's decode may take: 64 MiB, four
+/// times the 16 MiB a message carries over the transport. Every repeated
+/// field counts, nested ones included: an element of one takes a slot of
+/// its struct's size however few bytes encode it (two for an empty one),
+/// and a `Vec` holds at least four slots. A frame at
+/// [`MAX_APP_FRAME_ITEMS`] and [`MAX_APP_FRAME_OPENINGS`] of the requests
+/// and openings nodes write, filling the transport's 16 MiB, is within it.
+pub const MAX_APP_FRAME_DECODED: u64 = 64 << 20;
+
+/// What decoding an application shard frame takes ([`check_frame`]).
+static APP_FRAME_COST: LazyLock<DecodeCost> = LazyLock::new(|| {
+    DecodeCost::of("quilibrium.node.global.pb.AppShardFrame")
+        .expect("the embedded descriptors hold the application shard frame")
+});
+
 /// What a frame or bundle carries, counted from its encoding.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameItems {
@@ -67,6 +84,9 @@ pub enum FrameRefusal {
     /// More bundles and requests than [`MAX_APP_FRAME_ITEMS`], or more
     /// storage openings than [`MAX_APP_FRAME_OPENINGS`].
     TooMany(FrameItems),
+    /// A decode taking more than [`MAX_APP_FRAME_DECODED`]: at least
+    /// `decoded` bytes.
+    TooLarge { items: FrameItems, decoded: u64 },
 }
 
 impl FrameRefusal {
@@ -74,7 +94,7 @@ impl FrameRefusal {
     fn counted(&self) -> FrameItems {
         match self {
             Self::Malformed => FrameItems::default(),
-            Self::TooMany(items) => *items,
+            Self::TooMany(items) | Self::TooLarge { items, .. } => *items,
         }
     }
 }
@@ -90,13 +110,19 @@ impl std::fmt::Display for FrameRefusal {
                 items.total(),
                 items.openings
             ),
+            Self::TooLarge { decoded, .. } => write!(
+                f,
+                "a decode of at least {decoded} bytes, past the \
+                 {MAX_APP_FRAME_DECODED} a frame may take"
+            ),
         }
     }
 }
 
 /// Counts the bundles, requests and storage openings the application
-/// shard frame `data` carries, without allocating, and refuses it past
-/// [`MAX_APP_FRAME_ITEMS`] or [`MAX_APP_FRAME_OPENINGS`], or malformed.
+/// shard frame `data` carries and the heap its decode takes, without
+/// allocating, and refuses it past [`MAX_APP_FRAME_ITEMS`],
+/// [`MAX_APP_FRAME_OPENINGS`] or [`MAX_APP_FRAME_DECODED`], or malformed.
 /// Every occurrence of a field is counted, as the decoder merges them.
 pub fn check_frame(data: &[u8]) -> Result<FrameItems, FrameRefusal> {
     let mut items = FrameItems::default();
@@ -136,7 +162,11 @@ pub fn check_frame(data: &[u8]) -> Result<FrameItems, FrameRefusal> {
     if items.total() > MAX_APP_FRAME_ITEMS || items.openings > MAX_APP_FRAME_OPENINGS {
         return Err(FrameRefusal::TooMany(items));
     }
-    Ok(items)
+    match APP_FRAME_COST.bytes(data, MAX_APP_FRAME_DECODED) {
+        Ok(_) => Ok(items),
+        Err(CostRefusal::Malformed) => Err(FrameRefusal::Malformed),
+        Err(CostRefusal::Over(decoded)) => Err(FrameRefusal::TooLarge { items, decoded }),
+    }
 }
 
 /// Whether the application shard frame `data` from `source` is within the
@@ -420,6 +450,7 @@ fn note_refused(
         openings = counted.openings,
         limit = MAX_APP_FRAME_ITEMS,
         openings_limit = MAX_APP_FRAME_OPENINGS,
+        decoded_limit = MAX_APP_FRAME_DECODED,
         refused_since_last_line = refused,
         reason = %refusal,
         check = "the peer's build and what it publishes on the shard's topics; \
@@ -512,9 +543,18 @@ impl<'a> WireReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_alloc::peak_by;
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    use quil_types::proto::application::{Path, TraversalProof, TraversalSubProof};
+    use quil_types::proto::compute::{
+        CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation, ExecutionResult,
+        StateTransition,
+    };
+    use quil_types::proto::global::message_request::Request;
     use quil_types::proto::global::{
-        FrameHeader, MessageBundle, MessageRequest, StorageAttestation, StorageOpening,
+        ConfirmLeafRoots, FrameHeader, LeafRootEntry, MessageBundle, MessageRequest, ProverConfirm,
+        ProverJoin, ProverKick, ProverSeniorityMerge, SeniorityMerge, ShardSplit,
+        StorageAttestation, StorageOpening,
     };
 
     /// An encoded frame with a header, a storage attestation and `bundles`.
@@ -904,5 +944,442 @@ mod tests {
             before + 2,
             "a malformed frame is not logged"
         );
+    }
+
+    /// A frame carrying `request` as its only request.
+    fn frame_with(request: Request) -> AppShardFrame {
+        AppShardFrame {
+            requests: vec![MessageBundle {
+                requests: vec![MessageRequest {
+                    request: Some(request),
+                    timestamp: 0,
+                }],
+                timestamp: 5,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A confirmation carrying `leaf_roots`.
+    fn confirm(leaf_roots: Vec<ConfirmLeafRoots>) -> Request {
+        Request::Confirm(ProverConfirm {
+            leaf_roots,
+            ..Default::default()
+        })
+    }
+
+    /// A kick whose traversal proof carries `sub_proofs`.
+    fn kick(sub_proofs: Vec<TraversalSubProof>) -> Request {
+        Request::Kick(ProverKick {
+            traversal_proof: Some(TraversalProof {
+                sub_proofs,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Frames each filling one repeated field, nested ones above all, with
+    /// `n` of its cheapest elements (empty ones), within the item and
+    /// opening bounds; by field.
+    fn nested_shapes(n: usize) -> Vec<(&'static str, AppShardFrame)> {
+        let entry = |prefix: Vec<u32>| LeafRootEntry {
+            prefix,
+            ..Default::default()
+        };
+        let roots = |entries: Vec<LeafRootEntry>| ConfirmLeafRoots {
+            entries,
+            ..Default::default()
+        };
+        let paths = |paths: Vec<Path>| TraversalSubProof {
+            paths,
+            ..Default::default()
+        };
+        vec![
+            (
+                "header.state_roots",
+                AppShardFrame {
+                    header: Some(FrameHeader {
+                        state_roots: vec![Vec::new(); n],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "openings.path_commits",
+                AppShardFrame {
+                    storage_attestation: Some(StorageAttestation {
+                        openings: vec![StorageOpening {
+                            path_commits: vec![Vec::new(); n],
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bundle.requests",
+                AppShardFrame {
+                    requests: vec![MessageBundle {
+                        requests: vec![MessageRequest::default(); n.min(MAX_APP_FRAME_ITEMS - 1)],
+                        timestamp: 5,
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "join.filters",
+                frame_with(Request::Join(ProverJoin {
+                    filters: vec![Vec::new(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "join.merge_targets",
+                frame_with(Request::Join(ProverJoin {
+                    merge_targets: vec![SeniorityMerge::default(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "seniority.merge_targets",
+                frame_with(Request::SeniorityMerge(ProverSeniorityMerge {
+                    merge_targets: vec![SeniorityMerge::default(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "confirm.leaf_roots",
+                frame_with(confirm(vec![ConfirmLeafRoots::default(); n])),
+            ),
+            (
+                "leaf_roots.entries",
+                frame_with(confirm(vec![roots(vec![LeafRootEntry::default(); n])])),
+            ),
+            (
+                "leaf_roots(1_entry)",
+                frame_with(confirm(vec![roots(vec![LeafRootEntry::default()]); n])),
+            ),
+            (
+                "entries.prefix",
+                frame_with(confirm(vec![roots(vec![entry(vec![0; n])])])),
+            ),
+            (
+                "entries(1_prefix)",
+                frame_with(confirm(vec![roots(vec![entry(vec![0]); n])])),
+            ),
+            (
+                "kick.sub_proofs",
+                frame_with(kick(vec![TraversalSubProof::default(); n])),
+            ),
+            (
+                "sub_proofs.paths",
+                frame_with(kick(vec![paths(vec![Path::default(); n])])),
+            ),
+            (
+                "paths.indices",
+                frame_with(kick(vec![paths(vec![Path {
+                    indices: vec![0; n],
+                }])])),
+            ),
+            (
+                "execute.operations",
+                frame_with(Request::CodeExecute(CodeExecute {
+                    execute_operations: vec![ExecuteOperation::default(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "finalize.results",
+                frame_with(Request::CodeFinalize(CodeFinalize {
+                    results: vec![ExecutionResult::default(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "finalize.state_changes",
+                frame_with(Request::CodeFinalize(CodeFinalize {
+                    state_changes: vec![StateTransition::default(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "deploy.input_types",
+                frame_with(Request::CodeDeploy(CodeDeployment {
+                    input_types: vec![String::new(); n],
+                    ..Default::default()
+                })),
+            ),
+            (
+                "split.proposed_shards",
+                frame_with(Request::ShardSplit(ShardSplit {
+                    proposed_shards: vec![Vec::new(); n],
+                    ..Default::default()
+                })),
+            ),
+        ]
+    }
+
+    /// The heap decoding `data` takes at its most, on this thread.
+    fn decode_heap(data: &[u8]) -> u64 {
+        let (decoded, heap) = peak_by(|| <AppShardFrame as prost::Message>::decode(data).map(drop));
+        assert!(decoded.is_ok());
+        u64::try_from(heap).unwrap()
+    }
+
+    /// What each nested repeated field decodes to per byte of the frame,
+    /// filled with 65,536 empty elements and with one more (where its
+    /// `Vec` doubles). A figure for the record; it bounds nothing.
+    #[test]
+    fn measures_what_nested_fields_decode_to() {
+        let mut ratios: Vec<(&str, Vec<f64>)> = Vec::new();
+        for (round, n) in [1 << 16, (1 << 16) + 1].into_iter().enumerate() {
+            for (at, (field, frame)) in nested_shapes(n).into_iter().enumerate() {
+                let data = prost::Message::encode_to_vec(&frame);
+                drop(frame);
+                let heap = decode_heap(&data);
+                println!(
+                    "DECODE-DETAIL field={field} elements={n} wire={} heap={heap}",
+                    data.len()
+                );
+                if round == 0 {
+                    ratios.push((field, Vec::new()));
+                }
+                ratios[at].1.push(heap as f64 / data.len() as f64);
+            }
+        }
+        // At most eight lines of 300 characters reach the record.
+        println!("DECODE-AMPLIFICATION heap per frame byte, 65,536 / 65,537 elements:");
+        let mut line = String::new();
+        for (field, ratio) in &ratios {
+            line.push_str(&format!(" {field}={:.1}/{:.1}", ratio[0], ratio[1]));
+            if line.len() > 220 {
+                println!("DECODE-AMPLIFICATION{line}");
+                line.clear();
+            }
+        }
+        if !line.is_empty() {
+            println!("DECODE-AMPLIFICATION{line}");
+        }
+        let (field, worst) = ratios
+            .iter()
+            .map(|(field, ratio)| (*field, ratio[0].max(ratio[1])))
+            .fold(
+                ("", 0.0),
+                |worst, next| if next.1 > worst.1 { next } else { worst },
+            );
+        println!(
+            "DECODE-AMPLIFICATION worst {field}: {worst:.1} bytes a frame byte, \
+             a 16 MiB frame decoding to {:.0} MiB",
+            worst * 16.0
+        );
+    }
+
+    /// A frame within the item and opening bounds whose one request
+    /// carries 524,288 leaf roots of one empty entry each: four bytes of
+    /// the frame an element, which decode to a 48-byte slot and a `Vec` of
+    /// four 56-byte entries. Refused before it is decoded.
+    #[test]
+    fn a_frame_decoding_far_past_its_bytes_is_refused_unread() {
+        let frame = frame_with(confirm(vec![
+            ConfirmLeafRoots {
+                entries: vec![LeafRootEntry::default()],
+                ..Default::default()
+            };
+            1 << 19
+        ]));
+        let data = prost::Message::encode_to_vec(&frame);
+        drop(frame);
+        let heap = decode_heap(&data);
+        assert!(heap > 64 << 20, "{} bytes decoded to {heap}", data.len());
+        // The walk's own state is set up before the measurement.
+        let _ = check_frame(&[]);
+        let before = refused_here();
+        let (admitted, held) = peak_by(|| decode_frame("test", &data).is_some());
+        assert!(
+            !admitted,
+            "NESTED-BOUND: a frame of {} bytes decoding to {heap} was admitted",
+            data.len()
+        );
+        assert_eq!(refused_here(), before + 1);
+        assert!(
+            held < 1 << 20,
+            "NESTED-BOUND: refusing it held {held} bytes"
+        );
+    }
+
+    /// The heap the walk counts for each nested field's frame is at least
+    /// what its decode takes, and not far past it: at a `Vec`'s first
+    /// element, its fourth and fifth, and past a doubling.
+    #[test]
+    fn the_counted_heap_bounds_what_each_nested_field_decodes_to() {
+        for n in [1, 4, 5, 1_000, 4_097] {
+            for (field, frame) in nested_shapes(n) {
+                let data = prost::Message::encode_to_vec(&frame);
+                let counted = APP_FRAME_COST.bytes(&data, u64::MAX).unwrap();
+                let heap = decode_heap(&data);
+                assert!(
+                    heap <= counted,
+                    "COST-BOUND: {field}, {n} elements, decoded to {heap} bytes, counted {counted}"
+                );
+                assert!(
+                    counted <= 3 * heap + (64 << 10),
+                    "COST-TIGHT: {field}, {n} elements, counted {counted} bytes for {heap}"
+                );
+            }
+        }
+    }
+
+    /// A frame of the requests and openings nodes write, at
+    /// [`MAX_APP_FRAME_ITEMS`] and [`MAX_APP_FRAME_OPENINGS`], filled to
+    /// the transport's 16 MiB with a storage proof: admitted, and decoded.
+    #[test]
+    fn admits_an_honest_frame_at_every_bound() {
+        let signature = || {
+            Some(quil_types::proto::keys::Bls48581AddressedSignature {
+                signature: vec![1; 74],
+                address: vec![2; 32],
+            })
+        };
+        let confirmation = MessageRequest {
+            request: Some(Request::Confirm(ProverConfirm {
+                frame_number: 9,
+                public_key_signature_bls48581: signature(),
+                filters: vec![vec![3; 35]],
+                leaf_roots: vec![ConfirmLeafRoots {
+                    filter: vec![3; 35],
+                    entries: vec![
+                        LeafRootEntry {
+                            prefix: vec![1, 2, 3],
+                            leaf_root: vec![4; 74],
+                            num_blocks: 64,
+                        };
+                        2
+                    ],
+                }],
+                ..Default::default()
+            })),
+            timestamp: 1,
+        };
+        let opening = StorageOpening {
+            shard_id: vec![5; 35],
+            epoch: 3,
+            member_id: vec![6; 32],
+            query: 1,
+            leaf_root: vec![4; 74],
+            num_blocks: 64,
+            path_commits: vec![vec![7; 74]; 3],
+            path_proofs: vec![vec![8; 74]; 3],
+            commitment: vec![9; 74],
+            value: vec![10; 32],
+            proof: vec![11; 74],
+        };
+        let mut requests = vec![confirmation; MAX_APP_FRAME_ITEMS - 2];
+        requests.push(MessageRequest {
+            request: Some(Request::StorageEpochProof(Vec::new())),
+            timestamp: 1,
+        });
+        let mut frame = AppShardFrame {
+            header: Some(FrameHeader {
+                address: vec![7; 32],
+                frame_number: 9,
+                output: vec![12; 516],
+                state_roots: vec![vec![1; 74]; 4],
+                prover: vec![13; 32],
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle {
+                requests,
+                timestamp: 5,
+            }],
+            storage_attestation: Some(StorageAttestation {
+                openings: vec![opening; MAX_APP_FRAME_OPENINGS],
+            }),
+        };
+        // The proof fills the frame to 64 KiB under the transport's 16 MiB.
+        let room = (16 << 20) - (64 << 10) - prost::Message::encoded_len(&frame) - 8;
+        if let Some(Request::StorageEpochProof(proof)) =
+            &mut frame.requests[0].requests[MAX_APP_FRAME_ITEMS - 2].request
+        {
+            *proof = vec![14; room];
+        }
+        let data = prost::Message::encode_to_vec(&frame);
+        drop(frame);
+        assert!(data.len() <= 16 << 20, "{}", data.len());
+        assert!(data.len() > (16 << 20) - (128 << 10), "{}", data.len());
+        let _ = check_frame(&[]);
+        let walked = Instant::now();
+        let items = check_frame(&data);
+        let walked = walked.elapsed();
+        assert_eq!(
+            items.map(|items| (items.total(), items.openings)),
+            Ok((MAX_APP_FRAME_ITEMS, MAX_APP_FRAME_OPENINGS)),
+            "HONEST-REFUSED: a frame of {} bytes at every bound",
+            data.len()
+        );
+        let counted = APP_FRAME_COST.bytes(&data, u64::MAX).unwrap();
+        let decoded = Instant::now();
+        let heap = decode_heap(&data);
+        let decoded = decoded.elapsed();
+        // Times of a test build beside other tests: their ratio, roughly.
+        println!(
+            "HONEST-FRAME wire={} counted={counted} heap={heap} limit={MAX_APP_FRAME_DECODED} \
+             walk_ms={} decode_ms={}",
+            data.len(),
+            walked.as_millis(),
+            decoded.as_millis()
+        );
+        assert!(
+            heap <= counted,
+            "COST-BOUND: decoded to {heap}, counted {counted}"
+        );
+        let before = refused_here();
+        assert!(decode_frame("test", &data).is_some());
+        assert_eq!(refused_here(), before);
+    }
+
+    /// A frame of the most leaf roots of one empty entry each the bound
+    /// admits is admitted and decodes; one root more is refused unread,
+    /// with what was counted.
+    #[test]
+    fn refuses_a_frame_one_root_past_the_decoded_bound() {
+        let frame = |roots: usize| {
+            prost::Message::encode_to_vec(&frame_with(confirm(vec![
+                ConfirmLeafRoots {
+                    entries: vec![LeafRootEntry::default()],
+                    ..Default::default()
+                };
+                roots
+            ])))
+        };
+        let mut low = 1;
+        let mut high = 1 << 19;
+        // The most roots a frame admitted carries.
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if check_frame(&frame(mid)).is_ok() {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let at = APP_FRAME_COST.bytes(&frame(low), u64::MAX).unwrap();
+        assert!(at <= MAX_APP_FRAME_DECODED);
+        let past = frame(high);
+        let counted = APP_FRAME_COST.bytes(&past, u64::MAX).unwrap();
+        assert!(counted > MAX_APP_FRAME_DECODED);
+        match check_frame(&past) {
+            Err(FrameRefusal::TooLarge { items, decoded }) => {
+                assert_eq!((items.bundles, items.requests), (1, 1));
+                assert!(decoded > MAX_APP_FRAME_DECODED && decoded <= counted);
+            }
+            other => panic!("DECODED-BOUND: {other:?}"),
+        }
+        let before = refused_here();
+        assert!(decode_frame("test", &past).is_none());
+        assert_eq!(refused_here(), before + 1);
+        assert!(decode_frame("test", &frame(low)).is_some());
+        assert_eq!(refused_here(), before + 1);
     }
 }

@@ -412,7 +412,10 @@ pub fn validator_global_frame() -> TopicValidator {
         }
         match crate::frame_bound::admit_global_frame("global frame topic", data) {
             Ok(_) => {}
-            Err(crate::frame_bound::FrameRefusal::TooMany(_)) => {
+            Err(
+                crate::frame_bound::FrameRefusal::TooMany(_)
+                | crate::frame_bound::FrameRefusal::TooLarge { .. },
+            ) => {
                 return Reject("frame_past_gossip_bound");
             }
             Err(crate::frame_bound::FrameRefusal::Malformed) => {

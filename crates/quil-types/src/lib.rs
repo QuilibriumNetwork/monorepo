@@ -1,5 +1,6 @@
 pub mod consensus;
 pub mod crypto;
+pub mod decode_cost;
 pub mod error;
 pub mod execution;
 pub mod lifecycle;
