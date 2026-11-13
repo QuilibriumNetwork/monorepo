@@ -254,23 +254,26 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
     worker_retention(global, filter, member).unwrap_or(true)
 }
 
-/// Of `filters`, those whose head session counts `member` and is not closed:
-/// the sessions this prover's workers are there to host.
+/// Of `filters`, those whose head session counts `member` and is not closed,
+/// each with that session's id: the sessions this prover's workers are there
+/// to host.
 pub fn member_sessions(
     global: &Arc<HypergraphCrdt>,
     filters: &[Vec<u8>],
     member: &[u8],
-) -> Result<std::collections::HashSet<Vec<u8>>> {
+) -> Result<std::collections::HashMap<Vec<u8>, [u8; 32]>> {
     let view = CommittedView::capture(global)?;
-    let mut counted = std::collections::HashSet::new();
+    let mut counted = std::collections::HashMap::new();
     for filter in filters {
         let Some(session) = handoff::head(&view, filter)? else {
             continue;
         };
-        if session.members.iter().any(|key| key == member)
-            && !matches!(handoff::status(&view, &session.id()?)?, Status::Closed(_))
-        {
-            counted.insert(filter.clone());
+        if !session.members.iter().any(|key| key == member) {
+            continue;
+        }
+        let id = session.id()?;
+        if !matches!(handoff::status(&view, &id)?, Status::Closed(_)) {
+            counted.insert(filter.clone(), id);
         }
     }
     Ok(counted)

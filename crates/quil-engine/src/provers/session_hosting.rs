@@ -28,6 +28,21 @@
 //! worker's current state lifts it, so a restart that fixed the worker
 //! renews the seat. A seat not yet seated owes no hosting and renews.
 //!
+//! A member seat whose worker was seen hosting, before the restart, the
+//! session that counts it now skips that wait ([`SessionHosting::resume`];
+//! the observation is kept in the store, `hosted_sessions`): its run counts
+//! from the last frame the worker was seen hosting, as if the node had kept
+//! running. Observations are saved every `hosted_sessions::save_step`
+//! frames (10 on mainnet), so a resumed run may count from up to 9 frames
+//! before the worker last hosted, and is due that much sooner. The
+//! observation counts only for the same worker and session, and only when
+//! the seat's first observation after the start is at most a settle period
+//! after it: the run is then due no sooner than an epoch less a settle
+//! period after the start. A seat not bound to a worker yet keeps its
+//! observation until then. A seat whose session ended or that lapsed while
+//! the node was down, rebound to another worker, or down longer waits as
+//! before.
+//!
 //! Only this node's own observations count, and only against its own seats.
 //! A standalone worker that does not answer its report request, or that the
 //! node holds no connection to, hosts nothing (2026-10-21: provers silent in
@@ -99,6 +114,8 @@
 use std::collections::{HashMap, HashSet};
 
 use quil_types::proto::node::WorkerExecution;
+
+use super::hosted_sessions::Hosted;
 
 /// A report older than this says nothing about the worker now. Engines
 /// refresh their report on every state change and start attempt, and a
@@ -356,8 +373,8 @@ pub(crate) enum VoteEvent {
 /// Per seat (by filter), how long its bound worker has not hosted the
 /// session that counts this prover, or has hosted it without voting; and
 /// the workers held back from new seats for silence. In memory: after a
-/// restart, see [`settle_frames`]; silence is counted afresh and no worker
-/// is held back.
+/// restart, see [`settle_frames`] and [`Self::resume`]; silence is counted
+/// afresh and no worker is held back.
 #[derive(Debug, Default)]
 pub(crate) struct SessionHosting {
     unhosted: HashMap<Vec<u8>, Unhosted>,
@@ -368,6 +385,16 @@ pub(crate) struct SessionHosting {
     started: Option<u64>,
     /// Whether renewals waiting for the settle period have been reported.
     settling_reported: bool,
+    /// Hosting observations saved before this process started, by seat,
+    /// until each seat's first observation here ([`Self::resume`]).
+    restored: HashMap<Vec<u8>, Hosted>,
+    /// Member seats whose worker hosted, until this node stopped, the
+    /// session that counts them: the worker, and the GLOBAL frame it was
+    /// last seen hosting.
+    hosted_until_stop: HashMap<Vec<u8>, (u32, u64)>,
+    /// Runs begun from [`Self::hosted_until_stop`] instead of the settle
+    /// period, for the caller to report ([`Self::take_resumed`]).
+    resumed: Vec<(Vec<u8>, Unhosted)>,
 }
 
 impl SessionHosting {
@@ -396,6 +423,7 @@ impl SessionHosting {
             self.unhosted.remove(filter);
         }
         if hosting.able(seat) {
+            self.hosted_until_stop.remove(filter);
             return self.unhosted.remove(filter).filter(|run| run.withheld);
         }
         if seat != Seat::Member
@@ -416,21 +444,79 @@ impl SessionHosting {
                 run.blocker = blocker;
             }
             None if seat == Seat::Member || (from_start && seat == Seat::Lapsed) => {
-                self.unhosted.insert(
-                    filter.to_vec(),
-                    Unhosted {
-                        core_id,
-                        since: frame,
-                        state,
-                        blocker,
-                        from_start,
-                        withheld: false,
-                    },
-                );
+                // Its worker hosted this session until the node stopped.
+                let hosted_until = if from_start && seat == Seat::Member {
+                    self.hosted_until_stop
+                        .remove(filter)
+                        .filter(|(core, _)| *core == core_id)
+                        .map(|(_, hosted)| hosted)
+                } else {
+                    None
+                };
+                let run = Unhosted {
+                    core_id,
+                    since: hosted_until.unwrap_or(frame),
+                    state,
+                    blocker,
+                    from_start: from_start && hosted_until.is_none(),
+                    withheld: false,
+                };
+                if hosted_until.is_some() {
+                    self.resumed.push((filter.to_vec(), run.clone()));
+                }
+                self.unhosted.insert(filter.to_vec(), run);
             }
             None => {}
         }
         None
+    }
+
+    /// The hosting observations saved before this process started
+    /// (`hosted_sessions`), each checked at its seat's first observation.
+    pub fn restore(&mut self, seats: HashMap<Vec<u8>, Hosted>) {
+        self.restored = seats;
+    }
+
+    /// Forget the restored observations that can no longer spare a seat at
+    /// GLOBAL `frame` ([`Self::resume`]): over a settle period old. Until
+    /// then a seat keeps its own while no worker is bound to it, so a worker
+    /// bound to it a few frames after the start still resumes.
+    pub fn expire_restored(&mut self, frame: u64, epoch_frames: u64) {
+        let settle = settle_frames(epoch_frames);
+        self.restored
+            .retain(|_, before| frame <= before.frame.saturating_add(settle));
+    }
+
+    /// Check `filter`'s restored observation, if any, at the seat's first
+    /// observation since the start, at GLOBAL `frame`, bound to worker
+    /// `core_id` and counted by the session `session` (`None`: no session
+    /// counts it). Only the same worker, seen hosting the same session at
+    /// most a settle period before `frame`, spares the seat the settle
+    /// period: [`Self::observe`] then counts a run of it from that frame.
+    /// Call before [`Self::observe`].
+    pub fn resume(
+        &mut self,
+        frame: u64,
+        epoch_frames: u64,
+        filter: &[u8],
+        core_id: u32,
+        session: Option<&[u8; 32]>,
+    ) {
+        let Some(before) = self.restored.remove(filter) else {
+            return;
+        };
+        let fresh = before.frame <= frame && frame - before.frame <= settle_frames(epoch_frames);
+        if fresh && before.core_id == core_id && session == Some(&before.session) {
+            self.hosted_until_stop
+                .insert(filter.to_vec(), (core_id, before.frame));
+        }
+    }
+
+    /// The runs begun since the last call from a seat whose worker hosted
+    /// its session until this node stopped, instead of waiting out the
+    /// settle period, by seat.
+    pub fn take_resumed(&mut self) -> Vec<(Vec<u8>, Unhosted)> {
+        std::mem::take(&mut self.resumed)
     }
 
     /// What `observed`, classified from `report` at `now_ms`, means once the
@@ -644,9 +730,12 @@ impl SessionHosting {
 
     /// Forget seats no worker is bound to any more, but for a run withheld for
     /// silence while its worker's hold lasts: a worker released from the seat
-    /// may be bound to it again while it is being left.
+    /// may be bound to it again while it is being left. Restored observations
+    /// expire by age instead ([`Self::expire_restored`]).
     pub fn retain_bound(&mut self, bound: &HashSet<Vec<u8>>) {
         self.unhosted.retain(|filter, _| bound.contains(filter));
+        self.hosted_until_stop
+            .retain(|filter, _| bound.contains(filter));
         let held_back = &self.held_back;
         self.unvoted.retain(|filter, run| {
             bound.contains(filter)
@@ -2154,5 +2243,101 @@ mod tests {
         assert!(hosting
             .withhold(&late, settled + EPOCH, EPOCH, None)
             .is_some());
+    }
+
+    /// After a restart, a member seat whose worker hosted the session that
+    /// counts it until the node stopped, at most a settle period before its
+    /// first observation here, skips the settle period: its run counts from
+    /// that frame and withholds an epoch after it. A stale observation, a
+    /// session that changed, another worker or a lapsed seat waits as before.
+    #[test]
+    fn a_seat_hosted_until_a_restart_skips_the_settle_period_unless_stale() {
+        let settle = settle_frames(EPOCH);
+        let start = 1_000;
+        let [fresh, edge, stale, moved, rebound, lapsed, unbound, future] =
+            [1u8, 2, 3, 4, 5, 6, 7, 8].map(|b| vec![b; 32]);
+        let hosted = |core_id: u32, b: u8, frame: u64| Hosted {
+            core_id,
+            session: [b; 32],
+            frame,
+        };
+        let mut hosting = SessionHosting::default();
+        hosting.restore(HashMap::from([
+            (fresh.clone(), hosted(1, 1, start - 5)),
+            (edge.clone(), hosted(2, 2, start - settle)),
+            (stale.clone(), hosted(3, 3, start - settle - 1)),
+            (moved.clone(), hosted(4, 4, start - 5)),
+            (rebound.clone(), hosted(5, 5, start - 5)),
+            (lapsed.clone(), hosted(6, 6, start - 5)),
+            (unbound.clone(), hosted(7, 7, start - 5)),
+            (future.clone(), hosted(8, 8, start + 1)),
+        ]));
+        for (filter, core_id, session, seat) in [
+            (&fresh, 1, Some([1; 32]), Seat::Member),
+            (&edge, 2, Some([2; 32]), Seat::Member),
+            (&stale, 3, Some([3; 32]), Seat::Member),
+            // The session ended while the node was down; a new one counts it.
+            (&moved, 4, Some([9; 32]), Seat::Member),
+            (&rebound, 50, Some([5; 32]), Seat::Member),
+            (&lapsed, 6, None, Seat::Lapsed),
+            (&future, 8, Some([8; 32]), Seat::Member),
+        ] {
+            hosting.resume(start, EPOCH, filter, core_id, session.as_ref());
+            hosting.observe(start, EPOCH, filter, core_id, seat, absent());
+        }
+        for filter in [&fresh, &edge] {
+            assert!(
+                hosting.withhold(filter, start, EPOCH, None).is_none(),
+                "settle_hold_not_skipped: {}",
+                filter[0]
+            );
+        }
+        for filter in [&stale, &moved, &rebound, &lapsed, &future] {
+            assert_eq!(
+                hosting.withhold(filter, start, EPOCH, None),
+                Some(Hold::Settling {
+                    until: start + settle
+                }),
+                "stale_record_skipped_the_hold: {}",
+                filter[0]
+            );
+        }
+        // No worker is bound to `unbound` at the first evaluation; one is
+        // three frames later.
+        let seen = [&fresh, &edge, &stale, &moved, &rebound, &lapsed, &future];
+        let bound: HashSet<Vec<u8>> = seen.into_iter().cloned().collect();
+        hosting.retain_bound(&bound);
+        hosting.expire_restored(start, EPOCH);
+        hosting.resume(start + 3, EPOCH, &unbound, 7, Some(&[7; 32]));
+        hosting.observe(start + 3, EPOCH, &unbound, 7, Seat::Member, absent());
+        assert!(
+            hosting.withhold(&unbound, start + 3, EPOCH, None).is_none(),
+            "unbound_seat_record_dropped: a seat bound after the first evaluation resumes"
+        );
+        let mut resumed: Vec<(u8, u64)> = hosting
+            .take_resumed()
+            .into_iter()
+            .map(|(filter, run)| (filter[0], run.since))
+            .collect();
+        resumed.sort_unstable();
+        assert_eq!(
+            resumed,
+            vec![(1, start - 5), (2, start - settle), (7, start - 5)]
+        );
+        assert!(hosting.take_resumed().is_empty(), "reported once");
+
+        // A restored observation expires once it can spare no seat.
+        let mut expiring = SessionHosting::default();
+        expiring.restore(HashMap::from([(fresh.clone(), hosted(1, 1, start))]));
+        expiring.expire_restored(start + settle, EPOCH);
+        assert_eq!(expiring.restored.len(), 1);
+        expiring.expire_restored(start + settle + 1, EPOCH);
+        assert!(expiring.restored.is_empty());
+        assert!(hosting
+            .withhold(&fresh, start - 5 + EPOCH - 1, EPOCH, None)
+            .is_none());
+        let due = withheld(hosting.withhold(&fresh, start - 5 + EPOCH, EPOCH, None))
+            .expect("withheld an epoch after the last hosted frame");
+        assert!(due.first && !due.run.from_start && due.run.since == start - 5);
     }
 }

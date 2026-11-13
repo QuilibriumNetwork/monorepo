@@ -209,6 +209,89 @@ fn confirm_encoding_plan(
         .collect()
 }
 
+/// What [`ProverPipeline::request_noted_snapshots`] did at one GLOBAL frame.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NotedSnapshots {
+    /// The epoch the snapshots register.
+    pub epoch: u64,
+    /// Seats whose snapshot was requested.
+    pub requested: Vec<Vec<u8>>,
+    /// Seats whose worker store or GLOBAL snapshot record is not available
+    /// yet, or whose request failed.
+    pub waiting: Vec<Vec<u8>>,
+}
+
+/// Request, for `epoch`, the storage snapshot of each `noted` seat from the
+/// store of the worker holding it (`store`), with the shards a split or merge
+/// creates from it (`confirm_encoding_plan`) and their GLOBAL snapshot records
+/// (`sources`), as a renewal's preparation does. A seat whose worker store
+/// does not resolve is never encoded from another store: it waits, as does
+/// one GLOBAL has no snapshot record of yet.
+fn request_noted<S>(
+    noted: &[Vec<u8>],
+    changes: &[quil_types::store::PendingShardChange],
+    epoch: u64,
+    store: impl Fn(&[u8]) -> Option<S>,
+    sources: impl Fn(&[Vec<u8>]) -> Vec<SnapshotSources>,
+    mut request: impl FnMut(&S, &[Vec<u8>], &[SnapshotSources]) -> Result<()>,
+) -> NotedSnapshots {
+    let mut done = NotedSnapshots {
+        epoch,
+        ..Default::default()
+    };
+    for (filter, targets) in confirm_encoding_plan(noted, changes, epoch) {
+        let Some(held) = store(&filter) else {
+            done.waiting.push(filter);
+            continue;
+        };
+        let encoded: Vec<Vec<u8>> = std::iter::once(filter.clone()).chain(targets).collect();
+        let snapshots = sources(&encoded);
+        if !snapshots.iter().any(|(shard, _)| *shard == filter) {
+            done.waiting.push(filter);
+            continue;
+        }
+        match request(&held, &encoded, &snapshots) {
+            Ok(()) => done.requested.push(filter),
+            Err(error) => {
+                warn!(epoch, filter = %hex::encode(&filter), %error, scope = "local",
+                    "storage snapshot noted encoding before this start not requested; its renewal asks \
+                     again when prepared");
+                done.waiting.push(filter);
+            }
+        }
+    }
+    done
+}
+
+/// The GLOBAL frame now, projected from the stored head `head`, stamped
+/// `head_unix_ms`, at its ideal frame time: for startup work before any
+/// frame arrives. `None` without a head or when it is older than a settle
+/// period (`crate::provers::session_hosting::settle_frames`): a node back
+/// from longer downtime waits for a current frame.
+pub fn startup_frame(head: u64, head_unix_ms: u64, now_unix_ms: u64) -> Option<u64> {
+    if head == 0 {
+        return None;
+    }
+    let frame_ms = quil_types::consensus::ideal_frame_time_ms_at(head).max(1);
+    let settle = crate::provers::session_hosting::settle_frames(
+        quil_types::consensus::epoch_length_frames(),
+    );
+    let age = now_unix_ms.saturating_sub(head_unix_ms);
+    (age <= settle.saturating_mul(frame_ms)).then(|| head.saturating_add(age / frame_ms))
+}
+
+/// How long after the registry load startup asks again for noted snapshots
+/// still waiting for their worker's store or GLOBAL's record: a settle
+/// period at the ideal frame time.
+pub fn noted_snapshot_window() -> std::time::Duration {
+    let settle = crate::provers::session_hosting::settle_frames(
+        quil_types::consensus::epoch_length_frames(),
+    );
+    std::time::Duration::from_millis(
+        settle.saturating_mul(quil_types::consensus::ideal_frame_time_ms()),
+    )
+}
+
 type LeafRoots = Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>;
 
 /// One filter's confirm preparation: its leaf roots, or why the standalone
@@ -2218,6 +2301,64 @@ impl ProverPipeline {
             frame_number,
         );
         Ok(())
+    }
+
+    /// Request, at GLOBAL `frame_number`, the storage snapshots of the seats
+    /// this node noted encoding before a restart for the epoch a renewal now
+    /// registers (`ProverLifecycle::noted_snapshot_encodes`), from the store
+    /// of each seat's thread worker. Called once the prover registry is
+    /// loaded, so an encode a restart stopped resumes then, not at the
+    /// seat's first renewal, which waits for a GLOBAL frame and may wait the
+    /// settle period. A seat whose worker store is not open yet or that a
+    /// standalone worker holds waits; its renewal asks as before.
+    pub fn request_noted_snapshots(&self, frame_number: u64) -> NotedSnapshots {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+        let noted = self.lifecycle.noted_snapshot_encodes(frame_number);
+        if noted.is_empty() {
+            return NotedSnapshots {
+                epoch,
+                ..Default::default()
+            };
+        }
+        let (Some(resolve), Some(_)) = (
+            self.storage_for_filter.as_ref(),
+            self.storage_snapshot.as_ref(),
+        ) else {
+            return NotedSnapshots {
+                epoch,
+                waiting: noted,
+                ..Default::default()
+            };
+        };
+        let changes = match self.pending_shard_changes.as_ref() {
+            Some(pending) if frame_number >= quil_execution::global_intrinsic::leaf_root_registration::pre_registration_frame() => pending(),
+            _ => Vec::new(),
+        };
+        let stopped =
+            stopped_store_filters(&self.worker_manager.range_workers().unwrap_or_default());
+        request_noted(
+            &noted,
+            &changes,
+            epoch,
+            |filter| {
+                if stopped.contains(filter) {
+                    None
+                } else {
+                    resolve(filter)
+                }
+            },
+            |encoded| self.snapshot_sources(encoded, &changes, epoch),
+            |(crdt, replicas), encoded, snapshots| {
+                crate::app_shard_metadata::request_storage_snapshots(
+                    crdt,
+                    replicas,
+                    encoded,
+                    &self.prover_address,
+                    epoch,
+                    snapshots,
+                )
+            },
+        )
     }
 
     /// Each of `filters`' storage snapshot sources for `epoch` that GLOBAL has
@@ -4747,5 +4888,211 @@ mod tests {
             (1, 35, 30)
         );
         assert!(!summary.labels_kept, "one seat's labels are not kept");
+    }
+
+    /// After a restart, the seats noted encoding for the epoch a renewal now
+    /// registers are requested at the registry load, from their worker's
+    /// store with their GLOBAL snapshot record; one whose store is not open
+    /// or that GLOBAL has not recorded waits. An encoded seat, a frame before
+    /// the snapshot frame, past the grace frame or in the next epoch, and a
+    /// stale stored head request nothing.
+    #[test]
+    fn a_restart_requests_the_snapshots_noted_encoding_at_load() {
+        use crate::provers::lifecycle::ProverLifecycle;
+        use std::sync::Arc;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let lifecycle = || {
+            let wm = Arc::new(crate::test_support::TestWorkerManager::new());
+            let reg = Arc::new(crate::test_support::TestProverRegistry::new());
+            let allocator = Arc::new(crate::worker_allocator::WorkerAllocator::new(
+                wm,
+                reg,
+                vec![0xCD; 32],
+            ));
+            ProverLifecycle::new(
+                vec![0xCD; 32],
+                allocator,
+                Arc::new(crate::halt_state::HaltState::new()),
+                crate::current_frame::CurrentFrame::new(),
+                crate::provers::proposer::Strategy::RewardGreedy,
+            )
+        };
+        let epoch = 2;
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace = snapshot + quil_types::consensus::storage_snapshot_grace();
+        let [encoding, unopened, unrecorded, encoded] =
+            [0xE1u8, 0xE2, 0xE3, 0xE4].map(|b| vec![b; 32]);
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let before = lifecycle();
+        before.configure_leave_decision_store(db.clone()).unwrap();
+        before.note_renewal_storage(
+            snapshot + 2,
+            std::slice::from_ref(&encoded),
+            &[encoding.clone(), unopened.clone(), unrecorded.clone()],
+        );
+        let restarted = lifecycle();
+        restarted.configure_leave_decision_store(db).unwrap();
+
+        // The registry loads with the stored head three frames old.
+        let frame_ms = quil_types::consensus::ideal_frame_time_ms_at(snapshot + 2);
+        let now = 1_000_000_000;
+        let at_load = super::startup_frame(snapshot + 2, now - 3 * frame_ms, now)
+            .expect("a current stored head projects the frame now");
+        assert_eq!(at_load, snapshot + 5);
+        let noted = restarted.noted_snapshot_encodes(at_load);
+        assert_eq!(
+            noted,
+            vec![encoding.clone(), unopened.clone(), unrecorded.clone()],
+            "noted_encode_not_requested_at_load"
+        );
+        let mut asked: Vec<(u8, Vec<Vec<u8>>)> = Vec::new();
+        let done = super::request_noted(
+            &noted,
+            &[],
+            epoch,
+            |filter| (filter != unopened.as_slice()).then_some(filter[0]),
+            |shards| {
+                shards
+                    .iter()
+                    .filter(|shard| **shard != unrecorded)
+                    .map(|shard| (shard.clone(), Vec::new()))
+                    .collect()
+            },
+            |store, shards, _| {
+                asked.push((*store, shards.to_vec()));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            done,
+            super::NotedSnapshots {
+                epoch,
+                requested: vec![encoding.clone()],
+                waiting: vec![unopened.clone(), unrecorded.clone()],
+            },
+            "noted_encode_not_requested_at_load"
+        );
+        assert_eq!(asked, vec![(0xE1, vec![encoding.clone()])]);
+
+        for frame in [
+            snapshot - 1,
+            grace,
+            quil_types::consensus::storage_snapshot_frame(epoch + 1) + 5,
+        ] {
+            assert!(
+                restarted.noted_snapshot_encodes(frame).is_empty(),
+                "requested at {frame}"
+            );
+        }
+        let settle = crate::provers::session_hosting::settle_frames(
+            quil_types::consensus::epoch_length_frames(),
+        );
+        assert_eq!(
+            super::startup_frame(snapshot + 2, now - settle * frame_ms, now),
+            Some(snapshot + 2 + settle)
+        );
+        assert_eq!(
+            super::startup_frame(snapshot + 2, now - (settle + 1) * frame_ms, now),
+            None,
+            "stale_head_projected"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// At the registry load, the pipeline asks no worker store without its
+    /// resolver of worker stores or GLOBAL's snapshot records, and never the
+    /// store of a worker held stopped: those seats wait for their renewal.
+    #[test]
+    fn noted_snapshots_wait_without_a_resolver_records_or_a_running_store() {
+        use crate::provers::lifecycle::ProverLifecycle;
+        use std::sync::{Arc, Mutex};
+        type Resolve = Arc<
+            dyn Fn(
+                    &[u8],
+                ) -> Option<(
+                    Arc<quil_hypergraph::HypergraphCrdt>,
+                    quil_store::replica_store::ReplicaStore,
+                )> + Send
+                + Sync,
+        >;
+        type Records = Arc<
+            dyn Fn(&[u8], u64) -> Option<quil_types::consensus::StorageSnapshotRoots> + Send + Sync,
+        >;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 2;
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        let (stopped_core, running_core) = (9_411, 9_412);
+        let [stopped, running] = [0xD1u8, 0xD2].map(|b| vec![b; 32]);
+        let wm = Arc::new(crate::test_support::TestWorkerManager::new());
+        wm.add_with_filter(stopped_core, stopped.clone());
+        wm.add_with_filter(running_core, running.clone());
+        let allocator = Arc::new(crate::worker_allocator::WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(crate::test_support::TestProverRegistry::new()),
+            vec![0xCD; 32],
+        ));
+        let lifecycle = Arc::new(ProverLifecycle::new(
+            vec![0xCD; 32],
+            allocator,
+            Arc::new(crate::halt_state::HaltState::new()),
+            crate::current_frame::CurrentFrame::new(),
+            crate::provers::proposer::Strategy::RewardGreedy,
+        ));
+        lifecycle.note_renewal_storage(snapshot + 2, &[], &[stopped.clone(), running.clone()]);
+        let asked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let pipeline = |resolver: bool, records: bool| {
+            let seen = asked.clone();
+            let resolve: Resolve = Arc::new(move |filter: &[u8]| {
+                seen.lock().unwrap().push(filter.to_vec());
+                None
+            });
+            let recorded: Records = Arc::new(|_: &[u8], _: u64| None);
+            super::ProverPipeline {
+                lifecycle: lifecycle.clone(),
+                worker_manager: wm.clone(),
+                frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+                key_manager: Arc::new(crate::test_support::TestKeyManager::new(
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                bls_pubkey: Vec::new(),
+                prover_address: [0xCD; 32],
+                multisig_ed448_seeds: Vec::new(),
+                delegate_address: Vec::new(),
+                transport: Arc::new(crate::test_support::TestProverMessageTransport::new()),
+                hypergraph: None,
+                replica_store: None,
+                storage_for_filter: resolver.then_some(resolve),
+                remote_storage_confirm: None,
+                pending_shard_changes: None,
+                storage_snapshot: records.then_some(recorded),
+                local_message_collector: None,
+                current_frame: None,
+            }
+        };
+        let role = quil_forest::StoreRole::Worker(stopped_core);
+        quil_forest::storage_health::hold_store(role);
+        let at = snapshot + 5;
+        let waiting = super::NotedSnapshots {
+            epoch,
+            requested: Vec::new(),
+            waiting: vec![stopped.clone(), running.clone()],
+        };
+        assert_eq!(pipeline(false, true).request_noted_snapshots(at), waiting);
+        assert_eq!(pipeline(true, false).request_noted_snapshots(at), waiting);
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "asked without the records"
+        );
+        assert_eq!(pipeline(true, true).request_noted_snapshots(at), waiting);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![running.clone()],
+            "stopped_store_asked: only the running worker's store is asked"
+        );
+        let early = pipeline(true, true).request_noted_snapshots(snapshot - 1);
+        assert!(early.requested.is_empty() && early.waiting.is_empty());
+        quil_forest::storage_health::release_store(role);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 }

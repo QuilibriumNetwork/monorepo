@@ -45,6 +45,89 @@ pub(crate) mod worker_manager;
 /// process arms its forced-exit watchdog.
 const WORKER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How often startup asks again for noted snapshots still waiting.
+const NOTED_SNAPSHOT_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Request the storage snapshots noted encoding before this start
+/// (`ProverPipeline::request_noted_snapshots`) at the frame projected from
+/// the stored GLOBAL head, and again as worker stores open, for at most
+/// `noted_snapshot_window`; after that each seat's renewal asks as before.
+/// Nothing is requested when the stored head is older than a settle period.
+async fn request_noted_snapshots(
+    pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
+    clock: Arc<quil_store::RocksClockStore>,
+    token: tokio_util::sync::CancellationToken,
+) {
+    let deadline =
+        tokio::time::Instant::now() + quil_engine::prover_pipeline::noted_snapshot_window();
+    let mut requested = std::collections::HashSet::new();
+    loop {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let head = clock
+            .get_latest_global_frame()
+            .ok()
+            .and_then(|stored| stored.header);
+        let Some(frame) = head.as_ref().and_then(|header| {
+            quil_engine::prover_pipeline::startup_frame(
+                header.frame_number,
+                u64::try_from(header.timestamp).unwrap_or(0),
+                now_ms,
+            )
+        }) else {
+            let reason = if head.is_some() {
+                "the stored GLOBAL head is older than a settle period"
+            } else {
+                "no stored GLOBAL head"
+            };
+            info!(head = head.map_or(0, |header| header.frame_number), reason,
+                requested = requested.len(), scope = "local",
+                "storage snapshots noted encoding before this start are not requested at the registry \
+                 load: each remaining seat's renewal asks for its snapshot as before");
+            return;
+        };
+        let asking = pipeline.clone();
+        let done = match tokio::task::spawn_blocking(move || asking.request_noted_snapshots(frame))
+            .await
+        {
+            Ok(done) => done,
+            Err(error) => {
+                warn!(frame, %error, scope = "local",
+                    "storage snapshot requests noted before this start failed: each seat's renewal asks \
+                     for its snapshot as before");
+                return;
+            }
+        };
+        let new: Vec<String> = done
+            .requested
+            .iter()
+            .filter(|filter| requested.insert((*filter).clone()))
+            .map(hex::encode)
+            .collect();
+        if !new.is_empty() {
+            info!(frame, epoch = done.epoch, seats = ?new, waiting = done.waiting.len(), scope = "local",
+                reason = "noted encoding before this start",
+                "storage snapshots requested at the registry load: their encodes resume now, not at each \
+                 seat's first renewal after the start");
+        }
+        if done.waiting.is_empty() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            info!(frame, epoch = done.epoch, seats = ?done.waiting.iter().map(hex::encode).collect::<Vec<_>>(),
+                scope = "local",
+                "storage snapshots noted encoding before this start still wait for their worker's store \
+                 or GLOBAL's snapshot record: each seat's renewal asks for its snapshot as before");
+            return;
+        }
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(NOTED_SNAPSHOT_RETRY) => {}
+        }
+    }
+}
+
 /// Whether this node takes part in GLOBAL consensus: archives, and on a
 /// localnet every node. Any other node proposes no GLOBAL frames.
 pub(crate) fn global_consensus_participant(archive_mode: bool, network: u8) -> bool {
@@ -1191,6 +1274,27 @@ pub(crate) async fn start(
         local_message_collector: Some(message_collector.clone()),
         current_frame: Some(current_frame.clone()),
     });
+
+    // Storage snapshots this node noted encoding before a restart are
+    // requested once the prover registry holds GLOBAL's snapshot records,
+    // each as its worker's store opens, not first at the seat's renewal.
+    if !archive_mode {
+        let pipeline = prover_pipeline.clone();
+        let registry = prover_registry.clone();
+        let clock = clock_store.clone();
+        sup.spawn_startup_task("noted-snapshot-requests", move |token| async move {
+            if archive_sync::await_registry_load(
+                &registry,
+                &token,
+                "storage snapshot requests noted before the restart",
+            )
+            .await
+            {
+                request_noted_snapshots(pipeline, clock, token).await;
+            }
+            Ok(())
+        });
+    }
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /
     // ShardMergeEligible events and submits signed canonical messages
