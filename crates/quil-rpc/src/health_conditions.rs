@@ -65,8 +65,9 @@ pub const CLEAR_HOLD_MS: u64 = 60_000;
 /// A cadence sampled longer ago than this is not fresh.
 const CADENCE_FRESH_SECS: u64 = 90;
 /// How long a GLOBAL state sync leaves committed GLOBAL state unreadable at
-/// most when all is well (its installs take about 80 s); longer is a
-/// warning.
+/// most when all is well; longer is a warning. A regular node's routine
+/// prover tree pull installs in seconds and takes a few minutes at most
+/// with its fetch, so this is several times the slowest one.
 pub const GLOBAL_SYNC_EXPECTED_MS: u64 = 10 * 60_000;
 /// Frames a prover op takes to land at most: every node refuses one older.
 pub const PROVER_OP_MARGIN_FRAMES: u64 =
@@ -133,6 +134,11 @@ pub const WAIT_KINDS: [ConditionKind; 3] = [
     ConditionKind::ProverOpsWaitForEpoch,
     ConditionKind::ShieldsNotAdmitted,
 ];
+
+/// The expected waits raised only once they overrun, as a warning dated
+/// from their start: a regular node installs the prover tree it pulls from
+/// an archive every few minutes, in seconds, which is routine.
+pub const RAISED_ON_OVERRUN: [ConditionKind; 1] = [ConditionKind::GlobalStateSyncInstalling];
 
 /// The frames left in the epoch when a prover op signed at `head` may land
 /// after it, where every node refuses it: at most
@@ -553,6 +559,9 @@ pub enum Transition {
         /// Evidence for this node's log that is not served, such as the
         /// labels of unreachable GLOBAL provers.
         log_evidence: Option<String>,
+        /// From its start: 0, except for one of [`RAISED_ON_OVERRUN`],
+        /// which starts once it overran.
+        duration_ms: u64,
     },
     Lasting {
         condition: HealthCondition,
@@ -619,6 +628,8 @@ pub struct HealthRegistry {
     /// When each judged worker without an advance was first judged.
     worker_first_seen: HashMap<(u32, Vec<u8>), u64>,
     current: BTreeMap<i32, Current>,
+    /// When each wait of [`RAISED_ON_OVERRUN`] not yet raised started.
+    unraised_since: BTreeMap<i32, u64>,
     sources: Vec<ConditionSource>,
 }
 
@@ -1785,6 +1796,11 @@ impl HealthRegistry {
             affected + shards.len() as u32
         };
         if affected == 0 {
+            // Only an observed end resets a pending start: an unreadable
+            // sample tells nothing.
+            if tracked > 0 {
+                self.unraised_since.remove(&key);
+            }
             let current = self.current.get_mut(&key)?;
             let clear_since = *current.clear_since_ms.get_or_insert(now_ms);
             // Without fresh observations nothing holds it open.
@@ -1860,14 +1876,29 @@ impl HealthRegistry {
             }
             return None;
         }
+        // A routine wait is raised only once it overruns, dated from its
+        // start.
+        let since_ms = if RAISED_ON_OVERRUN.contains(&kind) {
+            *self.unraised_since.entry(key).or_insert(now_ms)
+        } else {
+            now_ms
+        };
+        let overran =
+            expected_ms(kind).is_some_and(|expected| now_ms.saturating_sub(since_ms) >= expected);
+        if RAISED_ON_OVERRUN.contains(&kind) {
+            if !overran {
+                return None;
+            }
+            self.unraised_since.remove(&key);
+        }
         let current = Current {
-            since_ms: now_ms,
+            since_ms,
             last_logged_ms: now_ms,
             clear_since_ms: None,
             clear_spells: 0,
             unserved_ms: 0,
-            overran: false,
-            condition: condition(now_ms, false),
+            overran,
+            condition: condition(since_ms, overran),
             log_evidence: log_evidence.clone(),
         };
         let started = current.condition.clone();
@@ -1875,6 +1906,7 @@ impl HealthRegistry {
         Some(Transition::Started {
             condition: started,
             log_evidence,
+            duration_ms: now_ms.saturating_sub(since_ms),
         })
     }
 
@@ -2318,12 +2350,26 @@ macro_rules! at_severity {
 }
 
 /// Log one transition as one structured line, at the condition's severity:
-/// an expected wait starts as info, and warns once it overruns.
+/// an expected wait starts as info, and warns once it overruns; one of
+/// [`RAISED_ON_OVERRUN`] starts only then, in one line with its duration.
 pub fn log_transition(transition: &Transition) {
     match transition {
+        // Raised once it overran: a start that reads as the overrun.
         Transition::Started {
             condition: c,
             log_evidence,
+            duration_ms,
+        } if *duration_ms > 0 => {
+            warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
+                affected = c.affected, tracked = c.tracked, duration_secs = duration_ms / 1000,
+                expected_secs = c.wait.as_ref().map_or(0, |w| w.expected_secs),
+                evidence = log_evidence.as_deref(), action = action_text(c.action),
+                text = %log_text(c), "health condition started: overran its expected wait");
+        }
+        Transition::Started {
+            condition: c,
+            log_evidence,
+            ..
         } => {
             at_severity!(c.severity, condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
@@ -3079,10 +3125,16 @@ mod tests {
     /// Observe a GLOBAL state sync `installing` at `secs` and judge; the
     /// transitions to log.
     fn sync_at(reg: &mut HealthRegistry, secs: u64, installing: bool) -> Vec<Transition> {
+        sync_read_at(reg, secs, Some(installing))
+    }
+
+    /// Observe a GLOBAL state sync read at `secs` (`None`: unreadable) and
+    /// judge; the transitions to log.
+    fn sync_read_at(reg: &mut HealthRegistry, secs: u64, read: Option<bool>) -> Vec<Transition> {
         let now = T0 + secs * 1000;
         reg.observe_global(
             GlobalObservation {
-                sync_installing: Some(installing),
+                sync_installing: read,
                 ..at_head(700)
             },
             now,
@@ -3090,65 +3142,92 @@ mod tests {
         reg.evaluate(now, &|_: &[u8]| None)
     }
 
-    /// A GLOBAL state sync's install is an info condition of this node that
-    /// names the event ending it, and ends after the clear hold once the
-    /// last chunk is in. An unreadable sync state establishes nothing.
+    /// The lines `f` logs on this thread, each as its fields by name, with
+    /// its `message` and `level`.
+    fn logged(f: impl FnOnce()) -> Vec<BTreeMap<String, String>> {
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Default)]
+        struct Lines(Mutex<Vec<BTreeMap<String, String>>>);
+        struct Fields<'a>(&'a mut BTreeMap<String, String>);
+        impl Visit for Fields<'_> {
+            // A str field as its text, unquoted, as the node's log writes it.
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        impl Subscriber for Lines {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut line = BTreeMap::new();
+                line.insert("level".into(), event.metadata().level().to_string());
+                event.record(&mut Fields(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let dispatch = tracing::Dispatch::new(Lines::default());
+        tracing::dispatcher::with_default(&dispatch, f);
+        let lines = dispatch
+            .downcast_ref::<Lines>()
+            .expect("the capturing subscriber");
+        let taken = std::mem::take(&mut *lines.0.lock().unwrap());
+        taken
+    }
+
+    /// A routine GLOBAL state sync install raises no condition: a pull
+    /// every 5 minutes for an hour, each installing for 30 s, and one
+    /// install just within its expected time, serve and log nothing while
+    /// the sync state stays tracked. An unreadable sync state tracks
+    /// nothing.
     #[test]
-    fn a_global_state_sync_install_is_an_expected_wait() {
+    fn a_routine_global_sync_install_raises_no_condition() {
         let kind = ConditionKind::GlobalStateSyncInstalling;
         let mut reg = HealthRegistry::default();
-        assert!(sync_at(&mut reg, 0, false).is_empty());
-        assert_eq!(source_of(&reg, kind), (T0, 1));
-        let started = sync_at(&mut reg, 15, true);
-        assert!(
-            matches!(started.as_slice(), [Transition::Started { .. }]),
-            "{started:?}"
-        );
-        let c = current(&reg, kind).expect("installing");
-        assert_eq!(c.severity, ConditionSeverity::Info as i32);
-        assert_eq!(c.scope, ConditionScope::ThisNode as i32);
-        assert_eq!(c.action, ConditionAction::WaitForGlobalSync as i32);
-        assert_eq!(c.wait.map(|w| w.expected_secs), Some(600));
-        assert_eq!(
-            notice_text(&c),
-            "GLOBAL state sync installing: committed shard heads show again once its last \
-             chunk is in."
-        );
-        for secs in [30, 45, 60, 75, 90] {
-            assert!(sync_at(&mut reg, secs, true).is_empty());
+        let mut lines = Vec::new();
+        for secs in (0..3600).step_by(15) {
+            lines.extend(sync_at(&mut reg, secs, secs % 300 < 30));
+            assert!(current(&reg, kind).is_none(), "routine_raised at {secs}s");
         }
-        // The last chunk is in: gone from the report, ended after the hold.
-        assert!(sync_at(&mut reg, 105, false).is_empty());
-        assert!(current(&reg, kind).is_none());
-        let mut ended = Vec::new();
-        for secs in [120, 135, 150, 165] {
-            ended.extend(sync_at(&mut reg, secs, false));
+        for secs in (3600..=3600 + 585).step_by(15) {
+            lines.extend(sync_at(&mut reg, secs, true));
         }
-        assert!(
-            matches!(
-                ended.as_slice(),
-                [Transition::Ended {
-                    unobserved: false,
-                    ..
-                }]
-            ),
-            "{ended:?}"
-        );
-        assert_eq!(ended_reason(kind), "GLOBAL state installed");
+        lines.extend(sync_at(&mut reg, 3600 + 600, false));
+        assert!(lines.is_empty(), "routine_raised: {lines:?}");
+        assert!(current(&reg, kind).is_none(), "routine_raised");
+        assert_eq!(source_of(&reg, kind), (T0 + 4_200_000, 1));
         let mut unread = HealthRegistry::default();
         unread.refresh_waits(at_head(700), T0);
         assert!(current(&unread, kind).is_none());
         assert_eq!(source_of(&unread, kind), (0, 0));
     }
 
-    /// An expected wait lasting past its expected time warns once, then
-    /// repeats every 10 minutes; before that it logs nothing while it
-    /// lasts.
+    /// A GLOBAL state sync install past its expected time is raised then:
+    /// a warning of this node dated from the install's start, naming the
+    /// event ending it, repeated every 10 minutes, and ended after the
+    /// clear hold once the last chunk is in, its end line carrying the
+    /// whole duration.
     #[test]
-    fn an_expected_wait_warns_once_it_overruns() {
+    fn an_overrun_global_sync_install_is_raised_and_ends() {
+        let kind = ConditionKind::GlobalStateSyncInstalling;
         let mut reg = HealthRegistry::default();
         let mut shape = Vec::new();
-        for secs in (0..=1800).step_by(15) {
+        for secs in (0..=1500).step_by(15) {
             for t in sync_at(&mut reg, secs, true) {
                 let name = match t {
                     Transition::Started { .. } => "started",
@@ -3161,6 +3240,139 @@ mod tests {
         }
         assert_eq!(
             shape,
+            [(600, "started"), (1200, "lasting")],
+            "not_raised_on_overrun"
+        );
+        let c = current(&reg, kind).expect("not_raised_on_overrun");
+        assert_eq!(c.since_unix_ms, T0, "raised_dated_late");
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(c.scope, ConditionScope::ThisNode as i32);
+        assert_eq!(c.action, ConditionAction::WaitForGlobalSync as i32);
+        assert_eq!(c.wait.map(|w| w.expected_secs), Some(600));
+        assert_eq!(
+            notice_text(&c),
+            "GLOBAL state sync installing >10m: committed GLOBAL state stays unreadable until \
+             its last chunk is in."
+        );
+        // A node before this change serves it as info from the start.
+        let info = HealthCondition {
+            severity: ConditionSeverity::Info as i32,
+            ..c
+        };
+        assert_eq!(
+            notice_text(&info),
+            "GLOBAL state sync installing: committed shard heads show again once its last \
+             chunk is in."
+        );
+        // The last chunk is in: gone from the report, ended after the hold.
+        assert!(sync_at(&mut reg, 1515, false).is_empty());
+        assert!(current(&reg, kind).is_none());
+        let mut ended = Vec::new();
+        for secs in [1530, 1545, 1560, 1575, 1590] {
+            ended.extend(sync_at(&mut reg, secs, false));
+        }
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    duration_ms: 1_575_000,
+                    clear_ms: 60_000,
+                    unobserved: false,
+                    ..
+                }]
+            ),
+            "overrun_not_ended: {ended:?}"
+        );
+        assert_eq!(ended_reason(kind), "GLOBAL state installed");
+        // Raised again only once a later install overruns.
+        for secs in (1605..1605 + 600).step_by(15) {
+            assert!(sync_at(&mut reg, secs, true).is_empty());
+        }
+        assert!(matches!(
+            sync_at(&mut reg, 1605 + 600, true).as_slice(),
+            [Transition::Started { .. }]
+        ));
+    }
+
+    /// An unreadable sync state tells nothing of the install: only an
+    /// observed end resets its pending start, so an install read between
+    /// failed reads is still raised once it overran, dated from its start.
+    #[test]
+    fn an_unreadable_sync_sample_keeps_the_install_start() {
+        let kind = ConditionKind::GlobalStateSyncInstalling;
+        let mut reg = HealthRegistry::default();
+        let mut shape = Vec::new();
+        for secs in (0..=600).step_by(15) {
+            let read = (secs % 30 == 0).then_some(true);
+            for t in sync_read_at(&mut reg, secs, read) {
+                let name = match t {
+                    Transition::Started { .. } => "started",
+                    Transition::Overran { .. } => "overran",
+                    Transition::Lasting { .. } => "lasting",
+                    Transition::Ended { .. } => "ended",
+                };
+                shape.push((secs, name));
+            }
+        }
+        assert_eq!(shape, [(600, "started")], "unread_reset_start");
+        let c = current(&reg, kind).expect("unread_reset_start");
+        assert_eq!(c.since_unix_ms, T0, "unread_reset_start");
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+    }
+
+    /// An install raised once it overran logs its start as the overrun, in
+    /// one warning with its duration, as every overrun wait does.
+    #[test]
+    fn an_overrun_global_sync_install_logs_its_start_as_an_overrun() {
+        let kind = ConditionKind::GlobalStateSyncInstalling;
+        let mut reg = HealthRegistry::default();
+        let mut transitions = Vec::new();
+        for secs in (0..=600).step_by(15) {
+            transitions.extend(sync_at(&mut reg, secs, true));
+        }
+        let lines = logged(|| transitions.iter().for_each(log_transition));
+        let overran: Vec<_> = lines
+            .iter()
+            .filter(|l| l["message"].contains("overran its expected wait"))
+            .collect();
+        assert_eq!(overran.len(), 1, "overrun_line_missing: {lines:?}");
+        let line = overran[0];
+        assert_eq!(line["level"], "WARN");
+        assert_eq!(line["condition"], kind_label(kind as i32));
+        assert_eq!(line["duration_secs"], "600");
+        assert_eq!(line["expected_secs"], "600");
+        assert!(line["message"].starts_with("health condition started"));
+        assert_eq!(lines.len(), 1, "one line: {lines:?}");
+    }
+
+    /// Prover ops held at an epoch's end past their expected time warn
+    /// once, then repeat every 10 minutes; before that the wait is info and
+    /// logs nothing while it lasts.
+    #[test]
+    fn an_expected_wait_warns_once_it_overruns() {
+        let kind = ConditionKind::ProverOpsWaitForEpoch;
+        let mut reg = HealthRegistry::default();
+        let mut shape = Vec::new();
+        for secs in (0..=1800).step_by(15) {
+            for t in reg.refresh_waits(at_head(712), T0 + secs * 1000) {
+                let name = match t {
+                    Transition::Started { .. } => "started",
+                    Transition::Overran { .. } => "overran",
+                    Transition::Lasting { .. } => "lasting",
+                    Transition::Ended { .. } => "ended",
+                };
+                shape.push((secs, name));
+            }
+            let severity = current(&reg, kind).map(|c| c.severity);
+            let expected = if secs < 600 {
+                ConditionSeverity::Info
+            } else {
+                ConditionSeverity::Warning
+            };
+            assert_eq!(severity, Some(expected as i32), "at {secs}s");
+        }
+        assert_eq!(
+            shape,
             [
                 (0, "started"),
                 (600, "overran"),
@@ -3168,30 +3380,12 @@ mod tests {
                 (1800, "lasting")
             ]
         );
-        let c = current(&reg, ConditionKind::GlobalStateSyncInstalling).unwrap();
+        let c = current(&reg, kind).unwrap();
         assert_eq!(c.since_unix_ms, T0);
-    }
-
-    /// A wait past its expected time is a warning and says so; it started
-    /// as info.
-    #[test]
-    fn an_overrun_wait_is_a_warning() {
-        let kind = ConditionKind::GlobalStateSyncInstalling;
-        let mut reg = HealthRegistry::default();
-        sync_at(&mut reg, 0, true);
-        assert_eq!(
-            current(&reg, kind).map(|c| c.severity),
-            Some(ConditionSeverity::Info as i32)
-        );
-        for secs in (15..=1500).step_by(15) {
-            sync_at(&mut reg, secs, true);
-        }
-        let c = current(&reg, kind).expect("still installing");
-        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
         assert_eq!(
             notice_text(&c),
-            "GLOBAL state sync installing >10m: committed GLOBAL state stays unreadable until \
-             its last chunk is in."
+            "Prover ops waited >10m for the next epoch at frame 720; the GLOBAL head stays at \
+             712."
         );
     }
 
