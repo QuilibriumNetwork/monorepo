@@ -36,6 +36,7 @@ use quil_types::proto::global::AppShardFrame;
 
 use crate::app_engine::{compute_requests_root, materialize_app_shard_requests};
 use crate::frame_validator::BlsAppFrameValidator;
+use crate::leader_provider::ShardBodyNeed;
 
 pub struct ArchiveAppShardIngest {
     /// Shared with the gap fetch, which prepares a fetched frame's historical
@@ -111,6 +112,13 @@ pub struct ArchiveAppShardIngest {
     /// The frame a GLOBAL frame waits on per address, since when, and whether
     /// its header-only materialization was refused and logged.
     missing_since: HashMap<Vec<u8>, (u64, Instant, bool)>,
+    /// Per address, frames above the cursor whose held copy was another frame
+    /// than the one GLOBAL sequences at that number ([`Self::carried_chain`]):
+    /// frame → the identity its certified headers name. A copy of another
+    /// identity is refused until the cursor passes the frame
+    /// ([`Self::refuses_sibling`]), so the gap fetch asks the next endpoint,
+    /// not this archive's own store, for the one GLOBAL carried.
+    carried: HashMap<Vec<u8>, BTreeMap<u64, [u8; 32]>>,
     /// How long a provably empty frame's body is sought before the frame is
     /// materialized from its certified header ([`EMPTY_FRAME_BODY_GRACE`]).
     empty_body_grace: Duration,
@@ -192,6 +200,13 @@ const MAX_STORED_RUNS_PER_SHARD: usize = 1024;
 /// Headers proposals could not carry that wait for the ingest to look into
 /// them ([`HeldBodies::frames_held`]), one per shard.
 const MAX_WANTED_SHARDS: usize = 4096;
+/// Held copies outside the buffer whose identity [`HeldBodies`] remembers
+/// per shard, the highest, about 80 bytes each, where GLOBAL carries a
+/// shard's recent header; every buffered copy is remembered besides, as
+/// sequenced ingest checks the chain the carried headers name down the
+/// buffer. A header whose chain reaches a copy forgotten below is not
+/// proposed or voted for.
+const MAX_HELD_COPIES_PER_SHARD: usize = 2 * MAX_BUFFERED_FRAMES_PER_SHARD;
 /// Frames of one shard asked for at once while a GLOBAL frame waits on it.
 /// Asked one at a time, each only once the one before it arrived, an archive
 /// behind by thousands of frames per shard recovered about one frame a second:
@@ -533,6 +548,7 @@ impl ArchiveAppShardIngest {
             execution_deferrals: crate::execution_deferral::DeferralLog::new("archive ingest"),
             sequenced: false,
             missing_since: HashMap::new(),
+            carried: HashMap::new(),
             empty_body_grace: EMPTY_FRAME_BODY_GRACE,
             slow_materialization: SLOW_MATERIALIZATION,
             #[cfg(test)]
@@ -1238,10 +1254,17 @@ impl ArchiveAppShardIngest {
                 authenticated.push((below, parent));
             }
         }
+        let cursor = self.last_materialized.get(address).copied().unwrap_or(0);
         for (number, frame) in authenticated {
+            if self.refuses_sibling(&frame) {
+                continue;
+            }
             match self.store_body(&frame) {
                 Some(digest) => self.remember_stored(address, number, digest),
                 None => self.forget_stored(address, number),
+            }
+            if number > cursor {
+                self.held_bodies.note_copy(address, number, &frame, false);
             }
             self.buffered
                 .entry(address.to_vec())
@@ -1254,6 +1277,7 @@ impl ArchiveAppShardIngest {
         if buffered.len() > MAX_BUFFERED_FRAMES_PER_SHARD {
             if let Some(farthest) = buffered.keys().max().copied() {
                 buffered.remove(&farthest);
+                self.held_bodies.unbuffer_copy(address, farthest);
                 self.unhold(address, farthest);
             }
         }
@@ -1356,6 +1380,9 @@ impl ArchiveAppShardIngest {
     /// Frame `number` of `address` may no longer be held: the next walk of
     /// [`Self::held_through`] starts below it, unless it still is.
     fn unhold(&mut self, address: &[u8], number: u64) {
+        if !self.holds_body(address, number) {
+            self.held_bodies.forget_copy(address, number);
+        }
         if self
             .held_run_end
             .get(address)
@@ -1431,8 +1458,11 @@ impl ArchiveAppShardIngest {
             }
             if let Some(last) = self.stored_run_end(address, next) {
                 through = last;
-            } else if self.body_held(address, next) || self.committed_held(address, next).is_some()
-            {
+            } else if self.body_held(address, next) {
+                through = next;
+            } else if let Some(frame) = self.committed_held(address, next) {
+                // Sequenced ingest takes it without checking its identity.
+                self.held_bodies.note_copy(address, next, &frame, true);
                 through = next;
             } else {
                 break;
@@ -2415,6 +2445,12 @@ impl ArchiveAppShardIngest {
         vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
         global_frame: Option<u64>,
     ) -> quil_types::error::Result<bool> {
+        let (carried, broken) = if vouched.is_empty() {
+            (HashMap::new(), None)
+        } else {
+            let last = self.materialized_height(address)?;
+            self.carried_chain(address, last, vouched, global_frame)
+        };
         let reached = loop {
             let last = self.materialized_height(address)?;
             if last >= through {
@@ -2423,13 +2459,28 @@ impl ArchiveAppShardIngest {
             let Some(next) = last.checked_add(1) else {
                 break true;
             };
+            // Below a dropped copy no certified header names: which frame
+            // belongs there is known once the carried one arrives.
+            if broken.is_some_and(|broken| next < broken) && !carried.contains_key(&next) {
+                break false;
+            }
             // `rebuilt`: rebuilt from its header, and whether whole.
             let buffered = self
                 .buffered
                 .get(address)
                 .and_then(|m| m.get(&next))
                 .cloned();
-            let (frame, rebuilt) = match buffered.or_else(|| self.read_back_stored(address, next)) {
+            let held = buffered.or_else(|| self.read_back_stored(address, next));
+            let held = match (held, carried.get(&next)) {
+                (Some(frame), Some(&identity))
+                    if frame.header.as_ref().and_then(frame_identity) != Some(identity) =>
+                {
+                    self.drop_sibling(address, next, identity);
+                    None
+                }
+                (held, _) => held,
+            };
+            let (frame, rebuilt) = match held {
                 Some(f) => (f, None),
                 None => match self.committed_held(address, next) {
                     Some(frame) => {
@@ -2618,8 +2669,114 @@ impl ArchiveAppShardIngest {
                 self.buffered.remove(address);
             }
         }
+        if let Some(carried) = self.carried.get_mut(address) {
+            carried.retain(|&f, _| f > last);
+            if carried.is_empty() {
+                self.carried.remove(address);
+            }
+        }
         self.publish_held(address);
         Ok(reached)
+    }
+
+    /// The identity each frame of `address` above `last` must have to be the
+    /// one GLOBAL sequences: each certified header in `vouched` names its own
+    /// and its parent's (`parent_selector`), and a buffered copy of the
+    /// identity named names its parent in turn, down the buffer
+    /// ([`walk_carried_chain`], which GLOBAL voters walk too): archives
+    /// materialize the frames GLOBAL carries, whatever copy each holds at a
+    /// number. A buffered copy of another identity is dropped and asked for
+    /// again ([`Self::drop_sibling`]). Returns the identities, and the highest
+    /// frame whose dropped copy left the frames below it unnamed.
+    fn carried_chain(
+        &mut self,
+        address: &[u8],
+        last: u64,
+        vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+        global_frame: Option<u64>,
+    ) -> (HashMap<u64, [u8; 32]>, Option<u64>) {
+        let headers: ChainHeaders = vouched
+            .iter()
+            .filter(|(&number, header)| {
+                number > last && header.address == address && header.frame_number == number
+            })
+            .map(|(&number, header)| {
+                let parent = <[u8; 32]>::try_from(header.parent_selector.as_slice()).ok();
+                (number, (frame_identity(header), parent))
+            })
+            .collect();
+        let mut carried = HashMap::new();
+        let mut broken = None;
+        walk_carried_chain(last, &headers, |number, identity, has_header| {
+            carried.insert(number, identity);
+            let copy = self
+                .buffered
+                .get(address)
+                .and_then(|m| m.get(&number))
+                .and_then(|frame| frame.header.as_ref())
+                .map(|copy| ChainCopy {
+                    identity: frame_identity(copy),
+                    parent: <[u8; 32]>::try_from(copy.parent_selector.as_slice()).ok(),
+                    buffered: true,
+                });
+            if copy.is_none_or(|copy| copy.identity != Some(identity)) {
+                if copy.is_some() {
+                    self.drop_sibling(address, number, identity);
+                }
+                // Dropped now or before: asked for until the carried
+                // frame arrives.
+                if self
+                    .carried
+                    .get(address)
+                    .is_some_and(|carried| carried.contains_key(&number))
+                {
+                    self.request_frames(
+                        address,
+                        number..=number,
+                        true,
+                        true,
+                        global_frame,
+                        GLOBAL_WAIT_RETRY_INTERVAL,
+                    );
+                    if !has_header {
+                        broken = broken.max(Some(number));
+                    }
+                }
+            }
+            copy
+        });
+        (carried, broken)
+    }
+
+    /// Drop the held copy of frame `number` of `address`, another frame than
+    /// the one with `identity` that GLOBAL sequences there, and refuse such
+    /// copies until the cursor passes it ([`Self::refuses_sibling`]).
+    fn drop_sibling(&mut self, address: &[u8], number: u64, identity: [u8; 32]) {
+        if let Some(buffered) = self.buffered.get_mut(address) {
+            buffered.remove(&number);
+        }
+        self.held_bodies.unbuffer_copy(address, number);
+        self.forget_stored(address, number);
+        self.carried
+            .entry(address.to_vec())
+            .or_default()
+            .insert(number, identity);
+        warn!(address = %hex::encode(address), frame = number, carried = %hex::encode(identity),
+            "archive holds another frame of a shard than the one the GLOBAL chain carries at that number; it \
+             drops its copy and asks for the carried frame");
+    }
+
+    /// Whether `frame` is another frame than the one GLOBAL sequences at its
+    /// number, found so when this archive's copy was dropped
+    /// ([`Self::carried`]).
+    fn refuses_sibling(&self, frame: &AppShardFrame) -> bool {
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        self.carried
+            .get(&header.address)
+            .and_then(|carried| carried.get(&header.frame_number))
+            .is_some_and(|&identity| frame_identity(header) != Some(identity))
     }
 
     /// Ask for the frames of `address` that a GLOBAL frame after the executing
@@ -2712,6 +2869,47 @@ impl ArchiveAppShardIngest {
             );
         }
         Ok(false)
+    }
+
+    /// Ask at once for the frames of `address` that materializing it through
+    /// `through` needs and this archive lacks, for a shard header a GLOBAL
+    /// proposal carries that GLOBAL execution would vouch for (the caller
+    /// checks it) and whose bodies this voter lacks: on the gap queue, again every [`GLOBAL_WAIT_RETRY_INTERVAL`], up
+    /// to [`GAP_WINDOW`] frames, for any shard, as a finalized GLOBAL frame
+    /// asks. The vote waits for them within the adapter's 20 s patience; the
+    /// retry pass ([`Self::look_into_wanted`]) runs every 30 s and asks only
+    /// for shards this archive holds frames of, so a voter missing a new or
+    /// stopped shard's frames declined its header for good. Publishing the
+    /// shard makes the ingest take its frames ([`TrackedShards::tracks`]).
+    /// Returns how many frames were asked for.
+    pub fn ask_for_vote(
+        &mut self,
+        address: &[u8],
+        through: u64,
+        empty: bool,
+    ) -> quil_types::error::Result<usize> {
+        let last = self.materialized_height(address)?;
+        let held = self.held_through(address, last);
+        self.held_bodies.publish(address, last, held);
+        if through <= held || (empty && through == held + 1) {
+            return Ok(0);
+        }
+        let number = held + 1;
+        let upto = through.min(number.saturating_add(GAP_WINDOW - 1));
+        // A stored run above counts as held, as in `holds_bodies_through`.
+        let upto = self
+            .stored_runs
+            .get(address)
+            .and_then(|runs| runs.range(number..).next())
+            .map_or(upto, |(&first, _)| upto.min(first.saturating_sub(1)));
+        Ok(self.request_frames(
+            address,
+            number..=upto,
+            true,
+            false,
+            None,
+            GLOBAL_WAIT_RETRY_INTERVAL,
+        ))
     }
 
     /// Ask for each frame of `frames` neither buffered nor held, unless it was
@@ -3407,6 +3605,21 @@ struct HeldBodiesInner {
     beyond_bound: HashMap<Vec<u8>, Instant>,
     /// Headers a proposal could not carry, per shard: (frame, empty).
     wanted: HashMap<Vec<u8>, (u64, bool)>,
+    /// Per shard, the copies held above the cursor by frame
+    /// ([`HeldBodies::note_copy`]).
+    copies: HashMap<Vec<u8>, BTreeMap<u64, HeldCopy>>,
+}
+
+/// The identity of a copy held above a shard's cursor ([`HeldBodies`]), the
+/// identity its parent has, whether it is held as the frame GLOBAL
+/// committed there, and whether it is buffered
+/// ([`ArchiveAppShardIngest::buffered`]).
+#[derive(Clone, Copy, Debug)]
+struct HeldCopy {
+    identity: [u8; 32],
+    parent: Option<[u8; 32]>,
+    committed: bool,
+    buffered: bool,
 }
 
 /// A shard's cursor, the highest frame through which every body above it is
@@ -3468,6 +3681,107 @@ impl HeldBodies {
         None
     }
 
+    /// [`Self::frames_held`] for a GLOBAL proposal's header `need`, held as
+    /// the frame the header names ([`Self::held_for_vote`]): a leader does
+    /// not propose a header whose frame, or a parent below it, this archive
+    /// holds as another frame, as its own voter would decline it.
+    pub fn frames_held_for(&self, need: &ShardBodyNeed) -> Option<u64> {
+        if self.other_copy(need).is_some() {
+            return None;
+        }
+        self.frames_held(&need.address, need.frame_number, need.empty)
+    }
+
+    /// [`Self::frames_held`] for a GLOBAL voter: the same answer, recording
+    /// nothing, and only while the bodies held are the frames the header
+    /// `need` names ([`Self::other_copy`]). A proposal's headers are not
+    /// verified when the voter checks them, so a leader's forged header must
+    /// not fill the wanted list, mark a shard behind or refused, or end its
+    /// beyond-bound warning; the voter asks for what it lacks only once
+    /// execution would vouch for the header
+    /// ([`ArchiveAppShardIngest::ask_for_vote`]).
+    ///
+    /// Sequenced ingest materializes at each number only the frame the
+    /// carried header names, and down the buffered chain the parent each
+    /// such frame names; it drops another copy there and waits for the
+    /// named one. Answered by number only, a voter holding another frame at
+    /// that number voted, and a frame finalized that no archive could
+    /// execute.
+    pub fn held_for_vote(&self, need: &ShardBodyNeed) -> Option<u64> {
+        let inner = self.lock();
+        let run = inner.runs.get(&need.address)?;
+        let through = need.frame_number;
+        if !(through <= run.through || (need.empty && through == run.through + 1)) {
+            return None;
+        }
+        other_copy_in(run, inner.copies.get(&need.address), need)
+            .is_none()
+            .then(|| through.saturating_sub(run.cursor))
+    }
+
+    /// The first frame, from `need`'s down, at which this archive holds a
+    /// body of another frame than the one `need`'s header names there, or
+    /// the parent the buffered chain names: the frames sequenced ingest
+    /// would drop and wait for ([`ArchiveAppShardIngest::carried_chain`]).
+    pub fn other_copy(&self, need: &ShardBodyNeed) -> Option<HeldMismatch> {
+        let inner = self.lock();
+        let run = inner.runs.get(&need.address)?;
+        other_copy_in(run, inner.copies.get(&need.address), need)
+    }
+
+    /// Remember the identity of `frame`, held at `number` of `address` above
+    /// the cursor; `committed`: held as the frame GLOBAL committed there,
+    /// which sequenced ingest takes without checking its identity
+    /// ([`ArchiveAppShardIngest::committed_held`]); otherwise it is buffered
+    /// ([`Self::unbuffer_copy`]). Past [`MAX_HELD_COPIES_PER_SHARD`] copies
+    /// outside the buffer the lowest of them is forgotten.
+    fn note_copy(&self, address: &[u8], number: u64, frame: &AppShardFrame, committed: bool) {
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        let mut inner = self.lock();
+        let Some(identity) = frame_identity(header) else {
+            if let Some(copies) = inner.copies.get_mut(address) {
+                copies.remove(&number);
+            }
+            return;
+        };
+        let copies = inner.copies.entry(address.to_vec()).or_default();
+        copies.insert(
+            number,
+            HeldCopy {
+                identity,
+                parent: <[u8; 32]>::try_from(header.parent_selector.as_slice()).ok(),
+                committed,
+                buffered: !committed,
+            },
+        );
+        bound_copies(copies);
+    }
+
+    /// Frame `number` of `address` left the buffer; its copy, if still held,
+    /// is remembered within [`MAX_HELD_COPIES_PER_SHARD`].
+    fn unbuffer_copy(&self, address: &[u8], number: u64) {
+        let mut inner = self.lock();
+        if let Some(copies) = inner.copies.get_mut(address) {
+            if let Some(copy) = copies.get_mut(&number) {
+                copy.buffered = false;
+            }
+            bound_copies(copies);
+        }
+    }
+
+    /// Frame `number` of `address` is no longer held.
+    fn forget_copy(&self, address: &[u8], number: u64) {
+        let mut inner = self.lock();
+        if let Some(copies) = inner.copies.get_mut(address) {
+            copies.remove(&number);
+            if copies.is_empty() {
+                inner.copies.remove(address);
+            }
+        }
+    }
+
     /// `address`'s frames ran past [`MAX_STORED_BODIES_PER_SHARD`] above its
     /// `cursor`, to `farthest`: warned once, until a header of its can be
     /// proposed again ([`Self::frames_held`]), which logs the end.
@@ -3493,6 +3807,12 @@ impl HeldBodies {
 
     fn publish(&self, address: &[u8], cursor: u64, through: u64) {
         let mut inner = self.lock();
+        if let Some(copies) = inner.copies.get_mut(address) {
+            *copies = copies.split_off(&cursor.saturating_add(1));
+            if copies.is_empty() {
+                inner.copies.remove(address);
+            }
+        }
         match inner.runs.get_mut(address) {
             Some(run) => {
                 run.cursor = cursor;
@@ -3520,6 +3840,130 @@ impl HeldBodies {
         inner.runs.clear();
         inner.wanted.clear();
         inner.beyond_bound.clear();
+        inner.copies.clear();
+    }
+}
+
+/// Where a GLOBAL proposal's shard header and the copies an archive holds
+/// below it disagree ([`HeldBodies::other_copy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldMismatch {
+    /// The copy held at this frame is another frame than the one named.
+    Other(u64),
+    /// A copy is held at this frame, whose identity is no longer
+    /// remembered ([`MAX_HELD_COPIES_PER_SHARD`]).
+    Unknown(u64),
+}
+
+/// [`HeldBodies::other_copy`] over one shard's run and remembered copies,
+/// at the frames sequenced ingest checks ([`walk_carried_chain`]). A copy
+/// of another identity there is a mismatch, as is a held copy whose
+/// identity is no longer remembered; the frame GLOBAL committed is taken
+/// unchecked, as sequenced ingest takes it.
+fn other_copy_in(
+    run: &HeldRun,
+    copies: Option<&BTreeMap<u64, HeldCopy>>,
+    need: &ShardBodyNeed,
+) -> Option<HeldMismatch> {
+    let headers = BTreeMap::from([(need.frame_number, (need.selector, need.parent))]);
+    let mut mismatch = None;
+    walk_carried_chain(run.cursor, &headers, |number, named, _| {
+        if mismatch.is_some() || number > run.through {
+            return None;
+        }
+        let Some(copy) = copies.and_then(|copies| copies.get(&number)) else {
+            mismatch = Some(HeldMismatch::Unknown(number));
+            return None;
+        };
+        if copy.committed {
+            return None;
+        }
+        if copy.identity != named {
+            mismatch = Some(HeldMismatch::Other(number));
+        }
+        Some(ChainCopy {
+            identity: Some(copy.identity),
+            parent: copy.parent,
+            buffered: copy.buffered,
+        })
+    });
+    mismatch
+}
+
+/// Within [`MAX_HELD_COPIES_PER_SHARD`] copies outside the buffer, forget
+/// the lowest of them; buffered copies are all kept, as sequenced ingest
+/// checks the chain down the buffer ([`walk_carried_chain`]).
+fn bound_copies(copies: &mut BTreeMap<u64, HeldCopy>) {
+    let mut unbuffered = copies.values().filter(|copy| !copy.buffered).count();
+    while unbuffered > MAX_HELD_COPIES_PER_SHARD {
+        let Some(lowest) = copies
+            .iter()
+            .find(|(_, copy)| !copy.buffered)
+            .map(|(&number, _)| number)
+        else {
+            break;
+        };
+        copies.remove(&lowest);
+        unbuffered -= 1;
+    }
+}
+
+/// The carried headers of one shard a walk starts from
+/// ([`walk_carried_chain`]), by frame number: the identity each names for
+/// its own frame and for its parent.
+type ChainHeaders = BTreeMap<u64, (Option<[u8; 32]>, Option<[u8; 32]>)>;
+
+/// A copy of a shard frame held where a walk down a carried chain looks
+/// ([`walk_carried_chain`]): its identity, its parent's, and whether it is
+/// buffered.
+#[derive(Clone, Copy, Debug)]
+struct ChainCopy {
+    identity: Option<[u8; 32]>,
+    parent: Option<[u8; 32]>,
+    buffered: bool,
+}
+
+/// Walk, top down, the frames of a shard above `last` that sequenced ingest
+/// checks for the carried `headers` (by frame number: the identity and the
+/// parent each names): each header names its own frame and its parent, and
+/// a buffered copy of the frame named names its parent in turn. `visit` is
+/// called at each frame named, with the identity named there and whether a
+/// header is at it, and returns the copy held there, if any. Below a frame
+/// that neither a header nor a buffered copy of the frame named names a
+/// parent for, the walk resumes at the next header below.
+///
+/// One walk for both sides: sequenced ingest drops a copy it reaches of
+/// another identity and waits for the named one
+/// ([`ArchiveAppShardIngest::carried_chain`]), so a GLOBAL voter or leader
+/// counting a header as held ([`HeldBodies::other_copy`]) must check every
+/// copy it reaches. Walked down remembered copies instead, a voter whose
+/// remembered copies had gaps over buffered ones voted for a header whose
+/// execution waited.
+fn walk_carried_chain(
+    last: u64,
+    headers: &ChainHeaders,
+    mut visit: impl FnMut(u64, [u8; 32], bool) -> Option<ChainCopy>,
+) {
+    let mut named = None;
+    let mut number = headers.keys().next_back().copied().unwrap_or(0);
+    while number > last {
+        let header = headers.get(&number);
+        if let Some(&(identity, _)) = header {
+            named = identity;
+        }
+        let Some(identity) = named else {
+            // Nothing names this frame: resume at the next header below.
+            number = headers.range(..number).next_back().map_or(0, |(&n, _)| n);
+            continue;
+        };
+        let copy = visit(number, identity, header.is_some());
+        named = match header {
+            Some(&(_, parent)) => parent,
+            None => copy
+                .filter(|copy| copy.buffered && copy.identity == Some(identity))
+                .and_then(|copy| copy.parent),
+        };
+        number -= 1;
     }
 }
 
@@ -3850,6 +4294,12 @@ pub fn admit_fetched(
             continue;
         }
         match verifier.check(&frame) {
+            // Not the frame GLOBAL sequences there: the next endpoint is asked.
+            FrameCheck::Admit { .. } if lock().refuses_sibling(&frame) => {
+                if index == 0 {
+                    return FetchedFrames::Refused;
+                }
+            }
             FrameCheck::Admit { certified } => lock().admit_verified(frame, certified),
             FrameCheck::AwaitExecution { anchor, executed } => {
                 lock().await_execution(address, number, anchor, executed);
@@ -3864,9 +4314,15 @@ pub fn admit_fetched(
     outcome
 }
 
+/// A shard frame's identity, `Poseidon(output)`: what its certificate signs
+/// and what its child names as `parent_selector`.
+fn frame_identity(header: &quil_types::proto::global::FrameHeader) -> Option<[u8; 32]> {
+    quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()
+}
+
 /// The `requests_root` of a frame with no requests: zero bytes, 32 on the
 /// forest path and 64 on the legacy one ([`compute_requests_root`]).
-pub(crate) fn requests_root_is_empty(root: &[u8]) -> bool {
+pub fn requests_root_is_empty(root: &[u8]) -> bool {
     matches!(root.len(), 32 | 64) && root.iter().all(|&byte| byte == 0)
 }
 
@@ -3973,7 +4429,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quil_types::proto::global::FrameHeader;
 
@@ -4139,6 +4595,38 @@ mod tests {
             requests: Vec::new(),
             storage_attestation: None,
         }
+    }
+
+    /// An archive ingest holding frames 1 and 2 of `filter`'s [`chain`] and,
+    /// at 3, another frame than the chain's, with the chain's frame 3: the
+    /// frame a GLOBAL proposal's header names there. Each header carries a
+    /// requests root and state roots, as a proposal's does.
+    pub(crate) fn ingest_holding_another_frame(
+        filter: &[u8],
+    ) -> (ArchiveAppShardIngest, AppShardFrame) {
+        let mut frames = chain(filter, 3);
+        for frame in &mut frames {
+            let header = frame.header.as_mut().unwrap();
+            header.requests_root = vec![0x01; 32];
+            header.state_roots = vec![vec![0; 32]; 4];
+        }
+        let mut other = frames[2].clone();
+        other.header.as_mut().unwrap().output = vec![0xb3; 32];
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in [&frames[0], &frames[1], &other] {
+            ingest.admit(filter, frame.clone(), true);
+        }
+        (ingest, frames[2].clone())
+    }
+
+    /// Admit `frame` of `filter` to `ingest`, certified.
+    pub(crate) fn admit_certified(
+        ingest: &mut ArchiveAppShardIngest,
+        filter: &[u8],
+        frame: AppShardFrame,
+    ) {
+        ingest.admit(filter, frame, true);
     }
 
     /// Frames `1..=to` of one shard, each naming the one before it.
@@ -5453,6 +5941,518 @@ mod tests {
         ingest.lock().unwrap().retry_pending();
         assert_eq!(held.frames_held(&unknown, 1, true), Some(1));
         assert_eq!(held.frames_held(&unknown, 1, false), None);
+    }
+
+    /// A voter's need for frame `frame_number` of `address`, naming no
+    /// identity: answered by number.
+    fn vote_need(address: &[u8], frame_number: u64, empty: bool) -> ShardBodyNeed {
+        ShardBodyNeed {
+            address: address.to_vec(),
+            frame_number,
+            empty,
+            vote: true,
+            ..Default::default()
+        }
+    }
+
+    /// A need for `header`'s bodies, naming its identity and its parent's.
+    fn header_need(header: &FrameHeader, vote: bool) -> ShardBodyNeed {
+        ShardBodyNeed {
+            vote,
+            ..ShardBodyNeed::for_vote(header)
+        }
+    }
+
+    /// A body counts as held for a GLOBAL proposal's header only as the
+    /// frame the header names, and below it as the parents the held chain
+    /// names: sequenced ingest drops another copy there and waits for the
+    /// named frame. An archive holding another frame at the header's number,
+    /// at its parent's, or further down the held chain, neither votes for
+    /// the header nor proposes it, and says where; one whose copy there it
+    /// no longer remembers neither. The leader's check records nothing then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_counts_as_held_only_as_the_frame_the_header_names() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let identity = |output: &[u8]| quil_crypto::poseidon::hash_bytes_to_32(output).unwrap();
+        let header = |frame: &AppShardFrame| frame.header.clone().unwrap();
+        // Another certified frame 2, and a frame 3 naming it.
+        let mut other2 = frames[1].clone();
+        other2.header.as_mut().unwrap().output = vec![0xb2; 32];
+        let mut other3 = frames[2].clone();
+        other3.header.as_mut().unwrap().output = vec![0xb3; 32];
+        other3.header.as_mut().unwrap().parent_selector = identity(&[0xb2; 32]).to_vec();
+
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in &frames[..3] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        let held = ingest.held_bodies();
+        for vote in [true, false] {
+            let need = header_need(&header(&frames[2]), vote);
+            assert_eq!(held.other_copy(&need), None);
+            let answer = if vote {
+                held.held_for_vote(&need)
+            } else {
+                held.frames_held_for(&need)
+            };
+            assert_eq!(answer, Some(3), "the named chain is held (vote: {vote})");
+        }
+        assert_eq!(
+            held.held_for_vote(&header_need(&header(&frames[3]), true)),
+            None,
+            "frame 4 is not held"
+        );
+        let mut empty4 = header(&frames[3]);
+        empty4.requests_root = vec![0; 32];
+        assert_eq!(
+            held.held_for_vote(&header_need(&empty4, true)),
+            Some(4),
+            "a provably empty header on the held chain stands in for its body"
+        );
+
+        let sibling = header_need(&header(&other3), true);
+        assert_eq!(
+            held.held_for_vote(&sibling),
+            None,
+            "held_by_number: sibling_body_voted: a voter holding another frame 3 voted"
+        );
+        assert_eq!(held.other_copy(&sibling), Some(HeldMismatch::Other(3)));
+        let mut on_other = empty4.clone();
+        on_other.parent_selector = identity(&[0xb3; 32]).to_vec();
+        assert_eq!(
+            held.other_copy(&header_need(&on_other, true)),
+            Some(HeldMismatch::Other(3)),
+            "held_parent_unchecked: the header's parent is checked too"
+        );
+        assert_eq!(
+            held.frames_held_for(&header_need(&header(&other3), false)),
+            None,
+            "leader_by_number: a leader holding another frame 3 proposes no header naming its own"
+        );
+        assert!(
+            !held.lock().wanted.contains_key(&filter),
+            "a leader's check of a header naming another frame records nothing"
+        );
+
+        // Down the held chain: the archive holds another frame 2 under the
+        // named frame 3.
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, other2.clone(), true);
+        ingest.admit(&filter, frames[2].clone(), true);
+        let held = ingest.held_bodies();
+        let named = header_need(&header(&frames[2]), true);
+        assert_eq!(
+            held.held_for_vote(&named),
+            None,
+            "held_parent_unchecked: frame 3's parent is held as another frame"
+        );
+        assert_eq!(held.other_copy(&named), Some(HeldMismatch::Other(2)));
+        let mut empty3 = header(&frames[2]);
+        empty3.frame_number = 4;
+        empty3.output = vec![0x44; 32];
+        empty3.requests_root = vec![0; 32];
+        empty3.parent_selector = identity(&frames[2].header.as_ref().unwrap().output).to_vec();
+        assert_eq!(
+            held.other_copy(&header_need(&empty3, true)),
+            Some(HeldMismatch::Other(2)),
+            "held_chain_unwalked: the chain is followed down the held copies"
+        );
+        assert_eq!(
+            held.held_for_vote(&vote_need(&filter, 3, false)),
+            Some(3),
+            "a need naming no identity is answered by number"
+        );
+    }
+
+    /// The identities of held copies are remembered for every buffered
+    /// frame and the highest [`MAX_HELD_COPIES_PER_SHARD`] others above the
+    /// cursor, so a shard far ahead of it costs a bounded record; a header
+    /// whose frame is held as a copy forgotten in between is not counted as
+    /// held, while one at the head of the shard still is. Materializing
+    /// forgets the copies below the cursor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_copies_are_remembered_in_a_bounded_window() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let window = MAX_BUFFERED_FRAMES_PER_SHARD as u64;
+        let to = 4 * window;
+        let frames = chain(&filter, to);
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in &frames {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        let held = ingest.held_bodies();
+        let copies = held.lock().copies.get(&filter).map_or(0, BTreeMap::len);
+        assert_eq!(
+            copies,
+            MAX_BUFFERED_FRAMES_PER_SHARD + MAX_HELD_COPIES_PER_SHARD,
+            "held_copies_unbounded: {copies} copies remembered"
+        );
+        let need = |number: u64| {
+            ShardBodyNeed::for_vote(frames[number as usize - 1].header.as_ref().unwrap())
+        };
+        assert_eq!(held.held_for_vote(&need(to)), Some(to), "the head is held");
+        assert_eq!(
+            held.held_for_vote(&need(window)),
+            Some(window),
+            "the buffer is held"
+        );
+        assert_eq!(
+            held.other_copy(&need(window + 10)),
+            Some(HeldMismatch::Unknown(window + 10)),
+            "a copy forgotten in between is not counted as held"
+        );
+        assert!(ingest.materialize_through(&filter, 2).unwrap());
+        assert!(
+            held.lock().copies[&filter].keys().all(|&number| number > 2),
+            "held_copies_kept: copies at or below the cursor are forgotten"
+        );
+    }
+
+    /// Sequenced ingest checks, below a carried header and its parent, every
+    /// buffered copy down the chain the header names, and the first copy
+    /// held below them, buffered or stored; it drops one of another frame
+    /// and waits for the named one. A voter checks exactly those copies:
+    /// buffered ones are remembered while buffered, so a shard whose cursor
+    /// advanced with more frames held above it than copies are remembered
+    /// still has the buffered copies a header's chain runs through checked,
+    /// and a copy the walk reaches whose identity is forgotten is not
+    /// counted as held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voter_checks_the_buffered_chain_execution_checks() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let window = MAX_BUFFERED_FRAMES_PER_SHARD as u64;
+        let first = 2 * window;
+        let cursor = 8;
+        let named = first + cursor;
+        let frames = chain(&filter, 4 * window + 8);
+        // Another certified frame at the lowest number of the buffer's
+        // upper run; the chain's frame above names its own.
+        let mut other = frames[first as usize].clone();
+        other.header.as_mut().unwrap().output = vec![0xa5; 32];
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in &frames[..first as usize] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        assert!(ingest.materialize_through(&filter, cursor).unwrap());
+        // The buffer takes the next `cursor` frames, above the frames that
+        // left it stored; the rest are stored too.
+        ingest.admit(&filter, other.clone(), true);
+        for frame in &frames[first as usize + 1..first as usize + 130] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        assert!(ingest.buffered[&filter].contains_key(&(first + 1)));
+        assert!(ingest.buffered[&filter].contains_key(&named));
+        let header = frames[named as usize - 1].header.clone().unwrap();
+        let held = ingest.held_bodies();
+        let need = header_need(&header, true);
+        assert_eq!(
+            held.held_for_vote(&need),
+            None,
+            "unchecked_chain_voted: a voter voted for a header whose buffered chain execution drops a copy of"
+        );
+        assert_eq!(
+            held.other_copy(&need),
+            Some(HeldMismatch::Other(first + 1)),
+            "buffered_copy_forgotten: the buffered copy the chain runs through is checked"
+        );
+        assert_eq!(held.frames_held_for(&header_need(&header, false)), None);
+        // Execution drops that copy.
+        let vouched = HashMap::from([(named, header.clone())]);
+        ingest.carried_chain(&filter, cursor, &vouched, None);
+        assert!(
+            !ingest.buffered[&filter].contains_key(&(first + 1)),
+            "sequenced ingest drops the copy the voter checked"
+        );
+        // With the named frame, the chain is held: the walk ends at the
+        // stored copy below the buffer's upper run, as execution's does.
+        ingest.admit(&filter, frames[first as usize].clone(), true);
+        assert_eq!(held.held_for_vote(&need), Some(named - cursor));
+
+        // Frames past the remembered copies: the stored copy below that run
+        // is forgotten, and execution still checks it.
+        for frame in &frames[first as usize + 130..] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        assert_eq!(
+            held.held_for_vote(&need),
+            None,
+            "unremembered_copy_voted: a copy execution checks, whose identity is forgotten, counted as held"
+        );
+        assert_eq!(held.other_copy(&need), Some(HeldMismatch::Unknown(first)));
+    }
+
+    /// A new session's first frame names the session's genesis, not the
+    /// sealed session's last frame below it, which is held as the frame
+    /// GLOBAL committed there and sequenced without checking its identity
+    /// ([`ArchiveAppShardIngest::committed_held`]). A voter and a leader
+    /// count such a header as held, as execution does; checked as another
+    /// frame, every voter declined each new session's first header.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_over_the_sealed_last_frame_global_committed_is_held() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let mut frames = chain(&filter, 4);
+        frames[3].header.as_mut().unwrap().parent_selector = vec![0x5e; 32];
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock)).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        ingest.admit(&filter, frames[2].clone(), false);
+        ingest.admit(&filter, frames[3].clone(), true);
+        assert!(ingest.is_held(&filter, 3), "no certified frame links to it");
+        let header = frames[3].header.clone().unwrap();
+        let held = ingest.held_bodies();
+        assert_eq!(
+            held.other_copy(&header_need(&header, true)),
+            None,
+            "committed_copy_checked: the frame GLOBAL committed is checked against the header's parent"
+        );
+        assert_eq!(held.held_for_vote(&header_need(&header, true)), Some(4));
+        assert_eq!(held.frames_held_for(&header_need(&header, false)), Some(4));
+        let vouched = HashMap::from([(4, header)]);
+        assert!(
+            ingest
+                .materialize_through_vouched(&filter, 4, &vouched, 1)
+                .unwrap(),
+            "sequenced ingest takes it too"
+        );
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// A GLOBAL voter's body check answers as a leader's does and records
+    /// nothing: the proposal's headers are not verified yet, so a leader's
+    /// forged header can neither fill the wanted list nor mark a shard
+    /// behind or refused. A leader's check of the same header records it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voters_body_check_records_nothing() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let forged = vec![0x43; 32];
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in chain(&filter, 3) {
+            ingest.admit(&filter, frame, true);
+        }
+        let held = ingest.held_bodies();
+        assert_eq!(held.held_for_vote(&vote_need(&filter, 3, false)), Some(3));
+        assert_eq!(
+            held.held_for_vote(&vote_need(&filter, 4, true)),
+            Some(4),
+            "a provably empty header stands in for its own body"
+        );
+        assert_eq!(held.held_for_vote(&vote_need(&filter, 4, false)), None);
+        assert_eq!(held.held_for_vote(&vote_need(&filter, 900, false)), None);
+        assert_eq!(held.held_for_vote(&vote_need(&forged, 7, false)), None);
+        {
+            let inner = held.lock();
+            assert!(
+                inner.wanted.is_empty(),
+                "vote_check_recorded: a voter's check filled the wanted list: {:?}",
+                inner.wanted.keys().map(hex::encode).collect::<Vec<_>>()
+            );
+            assert!(
+                !inner.runs[&filter].refused,
+                "vote_check_recorded: a voter's check marked the shard refused"
+            );
+        }
+        assert_eq!(held.frames_held(&filter, 900, false), None);
+        let inner = held.lock();
+        assert!(
+            inner.wanted.contains_key(&filter) && inner.runs[&filter].refused,
+            "a leader's check records as before"
+        );
+    }
+
+    /// A voter lacking the bodies of a header execution vouches for asks for them
+    /// at once on the gap queue, also for a shard it holds no frame of (a new
+    /// or stopped shard). The retry pass asks only every 30 s and only for
+    /// shards it holds frames of, past the 20 s vote patience, so such a
+    /// voter declined the header for good. Asking publishes the shard, so the
+    /// ingest takes its frames.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voter_asks_at_once_for_a_shard_it_holds_no_frame_of() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let new = vec![0x44; 32];
+        let (gap, mut gaps) = tokio::sync::mpsc::channel(64);
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(64);
+        let (ingest, _) = fixture();
+        let mut ingest = ingest
+            .with_gap_fetch(gap)
+            .with_prefetch(prefetch)
+            .sequenced();
+        for frame in chain(&filter, 3) {
+            ingest.admit(&filter, frame, true);
+        }
+        assert_eq!(ingest.ask_for_vote(&filter, 3, false).unwrap(), 0);
+        assert_eq!(ingest.ask_for_vote(&filter, 4, true).unwrap(), 0);
+        assert_eq!(
+            ingest.ask_for_vote(&new, 3, false).unwrap(),
+            3,
+            "vote_fetch_slow: a voter asks at once for a shard it holds no frame of"
+        );
+        let mut asked = Vec::new();
+        while let Ok(request) = gaps.try_recv() {
+            asked.push(request);
+        }
+        assert_eq!(
+            asked,
+            vec![(new.clone(), 1), (new.clone(), 2), (new.clone(), 3)],
+            "vote_fetch_slow: a voter lacking a new shard's bodies asks for them at once on the gap queue"
+        );
+        assert!(prefetches.try_recv().is_err());
+        assert_eq!(
+            ingest.held_bodies().cursor(&new),
+            Some(0),
+            "the shard is published, so its frames are taken"
+        );
+        assert_eq!(
+            ingest.ask_for_vote(&new, 3, false).unwrap(),
+            0,
+            "asked within the retry interval: not again"
+        );
+        assert_eq!(ingest.ask_for_vote(&filter, 5, false).unwrap(), 2);
+        assert_eq!(gaps.try_recv().unwrap(), (filter.clone(), 4));
+        assert_eq!(gaps.try_recv().unwrap(), (filter.clone(), 5));
+    }
+
+    /// A voter asks for at most [`GAP_WINDOW`] frames of a shard per header,
+    /// as a finalized GLOBAL frame does, so a header far ahead of what this
+    /// archive holds cannot flood the gap queue; and it does not ask for the
+    /// frames of a stored run above what it holds, which count as held
+    /// ([`ArchiveAppShardIngest::holds_bodies_through`]).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voters_ask_stops_at_the_gap_window_and_at_a_stored_run() {
+        let far = vec![0x45; 32];
+        let stored = vec![0x46; 32];
+        let (gap, mut gaps) = tokio::sync::mpsc::channel(256);
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.with_gap_fetch(gap).sequenced();
+        let mut drain = || {
+            let mut asked = Vec::new();
+            while let Ok((address, number)) = gaps.try_recv() {
+                asked.push((address[0], number));
+            }
+            asked
+        };
+
+        assert_eq!(
+            ingest.ask_for_vote(&far, 100, false).unwrap(),
+            GAP_WINDOW as usize,
+            "vote_ask_unwindowed: a header 100 frames ahead asks for {GAP_WINDOW} frames only"
+        );
+        assert_eq!(
+            drain(),
+            (1..=GAP_WINDOW)
+                .map(|number| (0x45, number))
+                .collect::<Vec<_>>()
+        );
+
+        for number in 10..=20 {
+            ingest.remember_stored_run(&stored, number);
+        }
+        assert_eq!(
+            ingest.stored_runs[&stored].iter().collect::<Vec<_>>(),
+            vec![(&10, &20)],
+            "setup: frames 10 to 20 are one stored run"
+        );
+        assert_eq!(
+            ingest.ask_for_vote(&stored, 15, false).unwrap(),
+            9,
+            "vote_ask_into_run: frames a stored run holds are not asked for"
+        );
+        assert_eq!(
+            drain(),
+            (1..=9).map(|number| (0x46, number)).collect::<Vec<_>>()
+        );
+    }
+
+    /// GLOBAL sequences the frames its certified headers name, by identity:
+    /// at each number an archive materializes only the frame the carried
+    /// header names, and down the buffer the parent each such frame names.
+    /// A buffered copy that is not the carried frame, nor the parent the
+    /// carried chain names down the buffer, is dropped, asked for again and
+    /// refused when it comes back; the frames below a dropped parent wait
+    /// for the carried one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_archive_materializes_only_the_shard_frames_global_carried() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let mut other2 = frames[1].clone();
+        other2.header.as_mut().unwrap().output = vec![0xb2; 32];
+        let mut other3 = frames[2].clone();
+        let header = other3.header.as_mut().unwrap();
+        header.output = vec![0xb3; 32];
+        header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&[0xb2; 32])
+            .unwrap()
+            .to_vec();
+        let (gap, mut gaps) = tokio::sync::mpsc::channel(64);
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.with_gap_fetch(gap).sequenced();
+        let buffered = |ingest: &ArchiveAppShardIngest| {
+            let mut numbers: Vec<u64> = ingest
+                .buffered
+                .get(&filter)
+                .map_or(Vec::new(), |m| m.keys().copied().collect());
+            numbers.sort();
+            numbers
+        };
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, other2.clone(), true);
+        ingest.admit(&filter, other3.clone(), true);
+        assert_eq!(
+            buffered(&ingest),
+            vec![1, 2, 3],
+            "setup: the other branch is held"
+        );
+        let vouched = HashMap::from([(3, frames[2].header.clone().unwrap())]);
+
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 3, &vouched, 0)
+                .unwrap()
+                && ingest.materialized_height(&filter).unwrap() == 0,
+            "carried_sibling: frames GLOBAL did not carry must not be materialized"
+        );
+        assert_eq!(buffered(&ingest), vec![1], "both other frames are dropped");
+        let mut asked = Vec::new();
+        while let Ok((address, number)) = gaps.try_recv() {
+            assert_eq!(address, filter);
+            asked.push(number);
+        }
+        assert_eq!(
+            asked,
+            vec![3, 2],
+            "the carried frames are asked for at once"
+        );
+
+        ingest.admit(&filter, other2, true);
+        ingest.admit(&filter, other3, true);
+        assert_eq!(
+            buffered(&ingest),
+            vec![1],
+            "carried_admitted: a dropped frame must be refused when it comes back"
+        );
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 3, &vouched, 0)
+                .unwrap()
+                && ingest.materialized_height(&filter).unwrap() == 0,
+            "carried_sibling: frames below a dropped copy wait for the carried one"
+        );
+
+        ingest.admit(&filter, frames[2].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        assert!(ingest
+            .materialize_through_vouched(&filter, 3, &vouched, 0)
+            .unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
 
     /// Archives that hold different bodies execute the same GLOBAL frame

@@ -239,6 +239,17 @@ enum Deferral<'a> {
     /// The parent descends from a finalization reported without its body
     /// ([`GlobalSeamProposer::await_unheld_parent`]).
     UnheldParent { finalized_view: u64 },
+    /// The proposal carries a shard header whose application frame bodies
+    /// this archive does not hold
+    /// ([`crate::frame_materializer::GlobalParentExecutor::unheld_shard_body`]):
+    /// the first such, what asking for its bodies did (`None`: not asked),
+    /// and how many the proposal carries.
+    ShardBody {
+        address: &'a [u8],
+        frame: u64,
+        ask: Option<crate::leader_provider::ShardBodyAsk>,
+        unheld: usize,
+    },
     /// The capture found a source in use ([`quil_execution::source_busy`]).
     BusySource {
         parent: u64,
@@ -340,6 +351,55 @@ impl GlobalSeamProposer {
                     "the parent descends from the frame finalized at view {finalized_view}, whose body this node does not hold"
                 );
                 wait.check = "expected: it ends when that body arrives or the archive poller publishes the frame, at most 10 s after its finalization";
+            }
+            Deferral::ShardBody {
+                address,
+                frame,
+                ask,
+                unheld,
+            } => {
+                use crate::leader_provider::ShardBodyAsk;
+                let others = match unheld.saturating_sub(1) {
+                    0 => String::new(),
+                    more => format!(" ({more} more of its shard headers too)"),
+                };
+                let (asked, check) = match ask {
+                    // A refused header does not hold the vote
+                    // (`first_unheld_shard_body`), so it is not named here.
+                    None | Some(ShardBodyAsk::Refused | ShardBodyAsk::RefusedBefore) => (
+                        String::new(),
+                        "the leader proposed a shard header whose body this archive did not receive in time; check this archive's application frame ingest and gap fetch lines for that shard",
+                    ),
+                    Some(ShardBodyAsk::Asked) => (
+                        "; asked for it at once".to_string(),
+                        "the body this archive asked for did not arrive in time; check this archive's application frame ingest and gap fetch lines for that shard",
+                    ),
+                    Some(ShardBodyAsk::UnheldAnchor { anchor }) => (
+                        format!("; not asked for yet: the header anchors to GLOBAL frame {anchor}, which this archive's clock lacks"),
+                        "this archive could not judge the header before its anchor arrived; check its GLOBAL frame sync",
+                    ),
+                    Some(ShardBodyAsk::Unavailable) => (
+                        "; not asked for yet: its certificate cannot be checked (state or prover registry unavailable)".to_string(),
+                        "this archive could not judge the header's certificate; check its prover registry and state sync",
+                    ),
+                    Some(ShardBodyAsk::IngestUnavailable) => (
+                        "; not asked for: this archive's application frame ingest could not take the ask".to_string(),
+                        "this archive's application frame ingest stayed in use or unreadable; check its sequenced ingest and materialization lines",
+                    ),
+                    Some(ShardBodyAsk::OtherFrame { frame: other }) => (
+                        format!("; at frame {other} it holds another frame of the shard than the one the header's chain names"),
+                        "this archive votes once it holds the frame the header names; check the shard's frames at that number in this archive's ingest lines",
+                    ),
+                    Some(ShardBodyAsk::UnknownFrame { frame: other }) => (
+                        format!("; at frame {other} it holds a body whose identity it no longer remembers"),
+                        "this archive's frames of the shard ran far past its cursor; it judges the header again once GLOBAL sequences the shard closer to it",
+                    ),
+                };
+                wait.cause = format!(
+                    "the proposal carries shard {} frame {frame}{others}, and this archive lacks an application frame body executing it needs{asked}",
+                    hex::encode(address)
+                );
+                wait.check = check;
             }
             Deferral::BusySource { parent, error } => {
                 wait.cause = error.to_string();
@@ -1036,6 +1096,26 @@ impl GlobalProposer for GlobalSeamProposer {
         }
         if self.yield_to_publication(executor, context.view, number) {
             return Err(self.defer_vote(context.view, Deferral::Publication));
+        }
+        // Vote only for shard headers whose bodies this archive holds, as the
+        // leader proposes only those (`unheld_shard_body`): a frame finalized
+        // with a body no archive holds can never publish, and every proposal
+        // and vote after it waits for that. The body check asks for what it
+        // lacks once execution would vouch for each header; the vote waits for
+        // it within the patience, then declines, naming why. A header
+        // execution refuses does not hold the vote: no archive waits for its
+        // bodies. Checked after the waits for this node's own publication, so
+        // a voter behind on it names that wait.
+        if let Some(unheld) = executor.unheld_shard_body(&frame) {
+            return Err(self.defer_vote(
+                context.view,
+                Deferral::ShardBody {
+                    address: &unheld.need.address,
+                    frame: unheld.need.frame_number,
+                    ask: unheld.ask,
+                    unheld: unheld.unheld,
+                },
+            ));
         }
         let Some(blocks) = self.block_store.as_ref() else {
             return Ok(false);
