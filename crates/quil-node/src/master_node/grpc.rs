@@ -4032,17 +4032,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         } else {
             None
         };
-        let onion_transport = match onion_dialer_falcon.clone() {
-            Some(sk) => quil_rpc::onion_service::OnionTransport::new_with_dialer(
-                peer_id.to_bytes(),
-                onion_peer_lookup.clone(),
-                sk,
-            ),
-            None => quil_rpc::onion_service::OnionTransport::new(
-                peer_id.to_bytes(),
-                onion_peer_lookup.clone(),
-            ),
-        };
+        let onion_transport = onion_link(
+            &config.p2p,
+            peer_id.to_bytes(),
+            onion_peer_lookup.clone(),
+            onion_dialer_falcon.clone(),
+        );
 
         // Activate the unified onion node: install the CREATE/forward/EXTEND/
         // backward dispatcher on the transport, keyed by this node's sntrup761
@@ -4091,13 +4086,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     let (exit_handler, exit_proxy): (quil_p2p::onion::OnData, _) =
                         match onion_dialer_falcon.clone() {
                             Some(seed) => {
-                                let allowed: std::collections::HashSet<String> =
-                                    ONION_EXIT_METHODS.iter().map(|s| s.to_string()).collect();
-                                let proxy = quil_rpc::onion_exit::OnionExitProxy::new(
-                                    seed,
-                                    onion_peer_lookup.clone(),
-                                    allowed,
-                                );
+                                let proxy =
+                                    onion_exit(&config.p2p, seed, onion_peer_lookup.clone());
                                 (proxy.clone().into_on_data(), Some(proxy))
                             }
                             None => {
@@ -4629,6 +4619,40 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     Ok(())
 }
 
+/// This node's onion link transport, dialing peers only with `dialer`. On
+/// mainnet a link is dialed only at a peer's public address: its PeerInfo
+/// names the address, so a loopback or private one would point this node
+/// at services on its own host or network.
+fn onion_link(
+    p2p: &quil_config::P2PConfig,
+    self_peer_id: Vec<u8>,
+    lookup: quil_rpc::onion_service::PeerRoutingLookup,
+    dialer: Option<Vec<u8>>,
+) -> quil_rpc::onion_service::OnionTransport {
+    match dialer {
+        Some(key) => {
+            quil_rpc::onion_service::OnionTransport::new_with_dialer(self_peer_id, lookup, key)
+        }
+        None => quil_rpc::onion_service::OnionTransport::new(self_peer_id, lookup),
+    }
+    .with_private_addresses(p2p.onion_dials_private_addresses())
+}
+
+/// This node's onion exit, dialing with `key` the [`ONION_EXIT_METHODS`]
+/// of a peer at its public address only on mainnet, as [`onion_link`].
+fn onion_exit(
+    p2p: &quil_config::P2PConfig,
+    key: Vec<u8>,
+    lookup: quil_rpc::onion_service::PeerRoutingLookup,
+) -> Arc<quil_rpc::onion_exit::OnionExitProxy> {
+    quil_rpc::onion_exit::OnionExitProxy::with_private_addresses(
+        key,
+        lookup,
+        ONION_EXIT_METHODS.iter().map(|s| s.to_string()).collect(),
+        p2p.onion_dials_private_addresses(),
+    )
+}
+
 /// The only methods anonymous onion circuits reach through this node's exit.
 /// The exit dials with this node's identity, which other operators may
 /// allowlist for diagnostics, so the diagnostics service is never one.
@@ -4988,6 +5012,32 @@ mod handshake_timeout_tests {
 
 #[cfg(test)]
 mod onion_exit_tests {
+    /// The node's onion links and exit dial a peer's private addresses only
+    /// off mainnet: the setting comes from the node's network, never a
+    /// constant.
+    #[test]
+    fn the_onion_link_and_exit_dial_private_addresses_only_off_mainnet() {
+        let lookup: quil_rpc::onion_service::PeerRoutingLookup =
+            std::sync::Arc::new(|_: &[u8]| None);
+        for (network, private) in [(0, false), (1, true)] {
+            let p2p = quil_config::P2PConfig {
+                network,
+                ..quil_config::P2PConfig::default()
+            };
+            let key = quil_p2p::generate_falcon_signing_key();
+            let link = |dialer| super::onion_link(&p2p, b"me".to_vec(), lookup.clone(), dialer);
+            assert_eq!(
+                [
+                    link(Some(key.clone())).dials_private_addresses(),
+                    link(None).dials_private_addresses(),
+                    super::onion_exit(&p2p, key, lookup.clone()).dials_private_addresses(),
+                ],
+                [private; 3],
+                "network {network}: [dialing link, server-only link, exit]"
+            );
+        }
+    }
+
     /// Anonymous circuits leave through the exit under this node's
     /// identity: they reach the four listed reads, never diagnostics.
     #[test]

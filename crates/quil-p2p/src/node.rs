@@ -2318,6 +2318,13 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
     has_ip
 }
 
+/// [`is_routable`] for a multiaddr in text form, as peers advertise their
+/// stream addresses; one that does not parse is not routable.
+pub fn is_routable_multiaddr(addr: &str) -> bool {
+    addr.parse::<Multiaddr>()
+        .is_ok_and(|addr| is_routable(&addr))
+}
+
 /// Whether `ip` is a globally routable IPv4 address.
 fn ipv4_routable(ip: std::net::Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();

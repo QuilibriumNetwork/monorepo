@@ -32,8 +32,7 @@ use std::time::Duration;
 use bytes::{Buf, BufMut};
 
 use crate::archive_client::QuilPqNoiseConnector;
-use crate::onion_service::PeerRoutingLookup;
-use quil_engine::worker_node::multiaddr_to_socket_addr;
+use crate::onion_service::{onion_dial_addr, PeerRoutingLookup};
 use quil_p2p::onion::node::OnionReplyHandle;
 use quil_p2p::onion::OnData;
 
@@ -116,6 +115,13 @@ pub struct OnionExitProxy {
     /// Unix seconds of the last such warning (0: none yet).
     unbound_warned: AtomicU64,
     inflight: Arc<tokio::sync::Semaphore>,
+    /// Whether a target may be dialed at a loopback, private or otherwise
+    /// non-public address (devnets); see [`onion_dial_addr`].
+    private_addresses: bool,
+    /// The peer this exit dials as, which no request may target.
+    self_peer: Option<quil_p2p::PeerId>,
+    /// Requests refused for targeting this exit itself.
+    direct_loops: quil_p2p::onion::DirectLoops,
 }
 
 impl OnionExitProxy {
@@ -124,6 +130,21 @@ impl OnionExitProxy {
         peer_lookup: PeerRoutingLookup,
         allowed_methods: HashSet<String>,
     ) -> Arc<Self> {
+        Self::with_private_addresses(falcon_signing_key, peer_lookup, allowed_methods, false)
+    }
+
+    /// [`new`](Self::new), letting targets be dialed at loopback, private and
+    /// other non-public addresses when `private_addresses` (devnets, never
+    /// mainnet).
+    pub fn with_private_addresses(
+        falcon_signing_key: Vec<u8>,
+        peer_lookup: PeerRoutingLookup,
+        allowed_methods: HashSet<String>,
+        private_addresses: bool,
+    ) -> Arc<Self> {
+        let self_peer = quil_p2p::Keypair::falcon_from_bytes(&falcon_signing_key)
+            .ok()
+            .map(|key| key.public().to_peer_id());
         Arc::new(Self {
             falcon_signing_key,
             peer_lookup,
@@ -132,7 +153,15 @@ impl OnionExitProxy {
             unbound_dropped: AtomicU64::new(0),
             unbound_warned: AtomicU64::new(0),
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXIT_RPCS)),
+            private_addresses,
+            self_peer,
+            direct_loops: quil_p2p::onion::DirectLoops::default(),
         })
+    }
+
+    /// Whether targets may be dialed at non-public addresses.
+    pub fn dials_private_addresses(&self) -> bool {
+        self.private_addresses
     }
 
     /// Install the reply handle (from `OnionNode::reply_handle()`) so responses
@@ -203,11 +232,33 @@ impl OnionExitProxy {
         let (target_peer, method, body) =
             parse_onion_rpc(&payload).ok_or_else(|| "malformed onion rpc request".to_string())?;
 
+        // DEFENSE 2: no direct loop. A circuit ending here never continues to
+        // this node (`A -> B -> C -> C`), which the dial's identity pin would
+        // otherwise admit.
+        if self.is_self(&target_peer) {
+            if let Some(refused) = self.direct_loops.refuse(unix_secs()) {
+                tracing::warn!(
+                    refused,
+                    interval_secs = quil_p2p::onion::DIRECT_LOOP_WARN_INTERVAL_SECS,
+                    "onion exit refused requests to itself (a direct loop); their \
+                     originators sent them, nothing to do on this node"
+                );
+            }
+            return Err("target is this exit (a direct loop)".to_string());
+        }
+
         // AUTHORIZATION: only allow-listed methods may be proxied anonymously.
         if !self.allowed_methods.contains(&method) {
             return Err(format!("method not authorized for onion proxy: {method}"));
         }
         self.dial_and_call(&target_peer, &method, body).await
+    }
+
+    /// Whether `target_peer` names the peer this exit dials as.
+    fn is_self(&self, target_peer: &[u8]) -> bool {
+        self.self_peer.is_some_and(|me| {
+            quil_p2p::PeerId::from_bytes(target_peer).is_ok_and(|target| target == me)
+        })
     }
 
     async fn dial_and_call(
@@ -221,13 +272,12 @@ impl OnionExitProxy {
         let expected = quil_p2p::PeerId::from_bytes(target_peer)
             .map_err(|e| format!("target peer id: {e}"))?;
         // DEFENSE 1: the target must be an in-network routing peer; use its
-        // advertised stream multiaddr, never an arbitrary address.
+        // advertised stream multiaddr, never an arbitrary address, and a
+        // public one unless private addresses are allowed.
         let addrs = (self.peer_lookup)(target_peer)
             .ok_or_else(|| "target is not an in-network routing peer".to_string())?;
-        let socket_addr = addrs
-            .iter()
-            .find_map(|ma| multiaddr_to_socket_addr(ma))
-            .ok_or_else(|| "target has no dialable stream multiaddr".to_string())?;
+        let socket_addr = onion_dial_addr(&addrs, self.private_addresses)
+            .ok_or_else(|| "target has no dialable public stream multiaddr".to_string())?;
 
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{socket_addr}"))
             .map_err(|e| e.to_string())?
@@ -391,10 +441,11 @@ mod tests {
         ] {
             let addr = crate::onion_service::onion_server_as(answering).await;
             let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![addr.clone()]));
-            let proxy = OnionExitProxy::new(
+            let proxy = OnionExitProxy::with_private_addresses(
                 quil_p2p::generate_falcon_signing_key(),
                 lookup,
                 HashSet::from([method.to_string()]),
+                true,
             );
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -412,6 +463,61 @@ mod tests {
             if !sent && reached {
                 panic!("the target was refused at its own address: {outcome:?}");
             }
+        }
+    }
+
+    /// The exit sends a proxied request only to a public address: a target
+    /// advertising a loopback or private stream address is refused before
+    /// any dial, even when it answers there as itself, so no circuit can
+    /// reach services on the exit's own host or network.
+    #[tokio::test]
+    async fn the_exit_never_sends_a_request_to_a_private_address() {
+        let target_key = quil_p2p::generate_falcon_signing_key();
+        let target = crate::onion_service::peer_of(&target_key).to_bytes();
+        let method = "/quilibrium.node.global.pb.OnionService/Unserved";
+        let addr = crate::onion_service::onion_server_as(target_key).await;
+        let advertised = addr.clone();
+        let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![advertised.clone()]));
+        let proxy = OnionExitProxy::new(
+            quil_p2p::generate_falcon_signing_key(),
+            lookup,
+            HashSet::from([method.to_string()]),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.process(build_onion_rpc(&target, method, b"x")),
+        )
+        .await
+        .expect("the request ends");
+        let refused = matches!(&outcome, Err(error) if error.starts_with("target "));
+        if !refused {
+            panic!(
+                "VULNERABLE: the onion exit sent a request to the private address {addr}: \
+                 {outcome:?}"
+            );
+        }
+    }
+
+    /// The exit never proxies a request to itself: a circuit ending
+    /// `A -> B -> C -> C` is a direct loop, refused before any lookup or
+    /// dial, even where the exit answers at its advertised address.
+    #[tokio::test]
+    async fn the_exit_never_sends_a_request_to_itself() {
+        let exit_key = quil_p2p::generate_falcon_signing_key();
+        let exit = crate::onion_service::peer_of(&exit_key).to_bytes();
+        let method = "/quilibrium.node.global.pb.OnionService/Unserved";
+        let addr = crate::onion_service::onion_server_as(exit_key.clone()).await;
+        let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![addr.clone()]));
+        let proxy = OnionExitProxy::new(exit_key, lookup, HashSet::from([method.to_string()]));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.process(build_onion_rpc(&exit, method, b"x")),
+        )
+        .await
+        .expect("the request ends");
+        let refused = matches!(&outcome, Err(error) if error.contains("direct loop"));
+        if !refused {
+            panic!("VULNERABLE: the onion exit sent a request to itself: {outcome:?}");
         }
     }
 
