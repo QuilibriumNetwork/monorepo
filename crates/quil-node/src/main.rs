@@ -858,6 +858,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         config_replay_frame = config_replay_from,
         "deploys onto deployed applications refused and updates signed over the metadata they replace"
     );
+    let compute_domain_from =
+        quil_execution::compute_domain::init_compute_domain_frame(args.network);
+    info!(
+        compute_domain_frame = %if compute_domain_from == u64::MAX { "never".to_string() } else { compute_domain_from.to_string() },
+        "compute ops refused outside the application they are routed to"
+    );
     let seal_drain_from =
         quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
     info!(

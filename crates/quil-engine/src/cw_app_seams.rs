@@ -1351,6 +1351,30 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.cross_domain_compute_now(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                anchor = header.global_frame_number,
+                latest_global = latest,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: anchored before the compute domain frame, it runs a \
+                 compute op naming another application"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "frame runs a cross-domain compute op",
+                format!(
+                    "frame {}, anchor {}, latest GLOBAL frame {latest}",
+                    header.frame_number, header.global_frame_number
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 view,
@@ -5234,6 +5258,306 @@ mod tests {
             "sync judges by the anchor"
         );
         crate::fees::set_fee_vote_bound_frame_for_thread(None);
+    }
+
+    /// From the compute domain frame, execution refuses a CodeExecute naming
+    /// an application other than the one its shard serves, judged by the
+    /// frame's GLOBAL anchor; one anchored before the frame still runs it.
+    /// A voter whose latest GLOBAL frame has reached the domain frame
+    /// refuses a proposal anchored before it that carries such an op, so a
+    /// leader cannot run one by citing an older anchor it holds. It votes
+    /// for one anchored at the domain frame (execution refuses the op
+    /// there), for one whose ops name the shard's own application, and for
+    /// any before the domain frame.
+    #[test]
+    fn a_stale_anchor_does_not_run_a_cross_domain_compute_op() {
+        use quil_types::store::ClockStore as _;
+        // The test-network setting; nextest runs each test in its own process.
+        std::env::set_var("QUIL_COMPUTE_DOMAIN_FRAME", "100");
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put_global(99);
+        let filter = vec![1; 32];
+        let validator = Arc::new(
+            BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone()),
+        );
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            validator.clone(),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| Ok(()))),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
+        // A free CodeExecute naming `domain`, as the shard's one bundle.
+        let execute = |domain: [u8; 32]| {
+            use quil_execution::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest,
+            };
+            let inner = quil_execution::compute_intrinsic::CodeExecute {
+                proof_of_payment: vec![vec![0u8; 57]],
+                domain,
+                rendezvous: [0x44; 32],
+                execute_operations: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            crate::consensus_wire::decode_app_message_bundle(&bundle).unwrap()
+        };
+        // A frame of shard `filter` anchored at `anchor`, carrying that op.
+        let frame = |anchor: u64, domain: [u8; 32]| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 7,
+                rank: 43,
+                parent_selector: vec![7; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                global_frame_number: anchor,
+                timestamp: 1_000,
+                fee_multiplier_vote: 100,
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(anchor, &[anchor as u8; 516]),
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+                0,
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
+            );
+            AppShardFrame {
+                header: Some(header),
+                requests: vec![execute(domain)],
+                ..Default::default()
+            }
+        };
+        let votes_for = |frame: &AppShardFrame| {
+            proposer.verify(
+                43,
+                digest_from_identity([7; 32]),
+                app_frame_digest(frame).unwrap(),
+                Some(encode_app_frame(frame)),
+            )
+        };
+        let own = [1u8; 32];
+        let foreign = [2u8; 32];
+
+        assert!(
+            votes_for(&frame(99, foreign)),
+            "voter refused before the domain frame"
+        );
+
+        // This voter has reached the domain frame; the leader cites 99.
+        put_global(100);
+        assert!(
+            !votes_for(&frame(99, foreign)),
+            "a stale anchor ran a cross-domain op after the domain frame"
+        );
+        liveness.settle(Step::Verify, 43, false);
+        assert_eq!(
+            liveness
+                .decisions()
+                .refused
+                .get("frame runs a cross-domain compute op"),
+            Some(&1)
+        );
+        assert!(
+            votes_for(&frame(99, own)),
+            "voter refused an op naming the shard's own application"
+        );
+        assert!(
+            votes_for(&frame(100, foreign)),
+            "voter refused a frame anchored at the domain frame"
+        );
+    }
+
+    /// The voter's cross-domain check, past the domain frame for a proposal
+    /// anchored before it, on each kind of compute op: a CodeDeployment
+    /// naming another application, a deploy or execute into the compute base
+    /// domain (system-managed), and ops naming the shard's own application,
+    /// which pass. A sub-shard, whose filter is longer than its application's
+    /// address, is judged by that application. A shard the compute engine
+    /// does not run (a token or hypergraph application) is not judged: its
+    /// engine ignores these ops on both sides of the frame. Without a route
+    /// every shard is judged.
+    #[test]
+    fn a_voter_judges_each_compute_op_by_the_shard_it_runs_on() {
+        use quil_execution::compute_intrinsic::{CodeDeployment, CodeExecute};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::store::ClockStore as _;
+        // The test-network setting; nextest runs each test in its own process.
+        std::env::set_var("QUIL_COMPUTE_DOMAIN_FRAME", "100");
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let latest = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: 100,
+                output: vec![100; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&latest, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let voter = |route: Option<crate::frame_validator::ComputeRoute>| {
+            let validator = BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone());
+            match route {
+                Some(route) => validator.with_compute_route(route),
+                None => validator,
+            }
+        };
+        // A frame of shard `shard` anchored before the domain frame, carrying
+        // one bundle of `inner`.
+        let frame = |shard: [u8; 32], inner: Vec<u8>| {
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    address: shard.to_vec(),
+                    frame_number: 7,
+                    global_frame_number: 99,
+                    ..Default::default()
+                }),
+                requests: vec![crate::consensus_wire::decode_app_message_bundle(&bundle).unwrap()],
+                ..Default::default()
+            }
+        };
+        let execute = |domain: [u8; 32]| {
+            CodeExecute {
+                proof_of_payment: vec![vec![0u8; 57]],
+                domain,
+                rendezvous: [0x44; 32],
+                execute_operations: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let deploy = |domain: [u8; 32]| {
+            CodeDeployment {
+                circuit: vec![0xAA; 16],
+                input_types: Vec::new(),
+                output_types: Vec::new(),
+                domain,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let app = [1u8; 32];
+        let foreign = [2u8; 32];
+        let base = quil_execution::domains::COMPUTE;
+        let compute = voter(Some(Arc::new(|_: &[u8]| true)));
+
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(app, deploy(foreign)))
+                .is_some(),
+            "voter passed a cross-domain deploy at a stale anchor"
+        );
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(base, deploy(base)))
+                .is_some(),
+            "voter passed a compute base deploy written at a stale anchor"
+        );
+        assert!(
+            compute
+                .cross_domain_compute_now(&frame(base, execute(base)))
+                .is_some(),
+            "voter passed an execute into the compute base domain at a stale anchor"
+        );
+        for inner in [execute(app), deploy(app)] {
+            assert!(
+                compute
+                    .cross_domain_compute_now(&frame(app, inner))
+                    .is_none(),
+                "voter refused an op naming the shard's own application"
+            );
+        }
+        // A sub-shard's filter extends its application's address.
+        let sub_shard = |inner: Vec<u8>| {
+            let mut shard_frame = frame(app, inner);
+            if let Some(header) = shard_frame.header.as_mut() {
+                header.address.extend_from_slice(&[0x05, 0x80]);
+            }
+            shard_frame
+        };
+        for inner in [execute(app), deploy(app)] {
+            assert!(
+                compute
+                    .cross_domain_compute_now(&sub_shard(inner))
+                    .is_none(),
+                "voter refused an op naming its sub-shard's application"
+            );
+        }
+        assert!(
+            compute
+                .cross_domain_compute_now(&sub_shard(execute(foreign)))
+                .is_some(),
+            "voter passed a cross-domain execute on a sub-shard"
+        );
+        assert!(
+            voter(Some(Arc::new(|_: &[u8]| false)))
+                .cross_domain_compute_now(&frame(app, execute(foreign)))
+                .is_none(),
+            "voter refused a compute op on a shard the compute engine does not run"
+        );
+        assert!(
+            voter(None)
+                .cross_domain_compute_now(&frame(app, execute(foreign)))
+                .is_some(),
+            "voter without a route passed a cross-domain execute"
+        );
     }
 
     /// From the config replay frame, an owner's update signs the metadata

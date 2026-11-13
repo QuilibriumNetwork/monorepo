@@ -1396,6 +1396,82 @@ impl AppLeaderProvider {
     fn committee_anchor_gfn(&self) -> u64 {
         self.resolve_global_anchor().0
     }
+
+    /// Which of `canonical`, the bundles of a proposal anchored at `anchor`,
+    /// it keeps; `None` keeps them all. While [`leader_drops_cross_domain`]
+    /// holds and this shard runs on the compute engine, a bundle carrying a
+    /// compute op naming another application
+    /// ([`quil_execution::compute_domain::crosses_domain`]) is left out and
+    /// leaves the mempool for good (`raw(index)` is its collected message):
+    /// voters that reached the compute domain frame refuse a proposal
+    /// carrying it, and no frame anchored at or after that frame runs it.
+    /// The route is resolved once per proposal, only when a bundle crosses.
+    fn cross_domain_keep(
+        &self,
+        frame_number: u64,
+        anchor: u64,
+        canonical: &[Vec<u8>],
+        raw: impl Fn(usize) -> Vec<u8>,
+    ) -> Option<Vec<bool>> {
+        let manager = self.execution_engine.as_ref()?;
+        let latest = self
+            .global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header.map(|header| header.frame_number))
+            .unwrap_or(0);
+        if !leader_drops_cross_domain(anchor, latest) {
+            return None;
+        }
+        let keep: Vec<bool> = canonical
+            .iter()
+            .map(|canon| !quil_execution::compute_domain::crosses_domain(&self.app_address, canon))
+            .collect();
+        if keep.iter().all(|keep| *keep) || !manager.routes_to_compute(&self.app_address) {
+            return None;
+        }
+        let dropped: Vec<Vec<u8>> = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, keep)| !**keep)
+            .map(|(index, _)| raw(index))
+            .collect();
+        info!(
+            filter = %hex::encode(&self.filter),
+            frame = frame_number,
+            anchor,
+            latest_global = latest,
+            dropped = dropped.len(),
+            scope = "a submitter",
+            action = "none here: no frame can run them once the compute domain frame is reached",
+            "dropping bundles with a compute op naming another application: voters at the \
+             compute domain frame refuse a proposal carrying one"
+        );
+        self.mempool.mark_skipped(&dropped);
+        Some(keep)
+    }
+}
+
+/// How many GLOBAL frames before the compute domain frame a leader starts
+/// leaving out cross-domain compute ops ([`leader_drops_cross_domain`]). A
+/// voter refuses them once its own latest GLOBAL frame reaches the domain
+/// frame, whatever anchor the proposal names, so a voter up to this many
+/// frames ahead of the leader no longer refuses its proposal. A voter
+/// further ahead still does: that view fails and a later leader proposes,
+/// a bounded stall. A wider lead drops more ops that the domain frame is
+/// about to refuse.
+const LEADER_DROP_LEAD: u64 = 2;
+
+/// Whether a leader anchoring a proposal at `anchor`, its latest GLOBAL frame
+/// `latest`, leaves out bundles a voter refuses from the compute domain frame
+/// ([`quil_execution::compute_domain`]): the anchor is before that frame (or
+/// names none, as a voter judges it), and `latest` is within
+/// [`LEADER_DROP_LEAD`] frames of it. From an anchor at the domain frame,
+/// execution refuses the op itself.
+pub(crate) fn leader_drops_cross_domain(anchor: u64, latest: u64) -> bool {
+    use quil_execution::compute_domain::compute_domain_guarded_at;
+    (anchor == 0 || !compute_domain_guarded_at(anchor))
+        && compute_domain_guarded_at(latest.saturating_add(LEADER_DROP_LEAD))
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -1810,6 +1886,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     &mut origins,
                 );
             }
+        }
+        // A compute op naming another application, in a frame anchored before
+        // the compute domain frame, is refused by voters that reached it, and
+        // from it no frame runs the op: drop the bundle for good rather than
+        // have the proposal refused.
+        let crossing =
+            self.cross_domain_keep(frame_number, anchor_gfn, &canonical_requests, |index| {
+                raw_messages[origins[index]].clone()
+            });
+        if let Some(keep) = crossing {
+            retain_kept(
+                &keep,
+                &mut request_bundles,
+                &mut canonical_requests,
+                &mut origins,
+            );
         }
         // Each confidential bundle is proposed by one designated shard of the
         // application, chosen by its hash over the live shards, instead of by
@@ -6220,6 +6312,11 @@ impl AppConsensusEngine {
         }
         if let Some(source) = &self.historical_committee_source {
             validator = validator.with_historical_committee_source(source.clone());
+        }
+        if let Some(manager) = &self.execution_engine {
+            let manager = manager.clone();
+            validator = validator
+                .with_compute_route(Arc::new(move |address| manager.routes_to_compute(address)));
         }
         let validator = Arc::new(validator);
         self.app_frame_validator = Some(validator.clone());
@@ -30821,6 +30918,10 @@ mod relay_tests;
 #[cfg(test)]
 #[path = "app_engine_shield_hold_tests.rs"]
 mod shield_hold_tests;
+
+#[cfg(test)]
+#[path = "app_engine_compute_domain_tests.rs"]
+mod compute_domain_tests;
 
 #[cfg(test)]
 #[path = "app_engine_cited_frame_fetch_tests.rs"]

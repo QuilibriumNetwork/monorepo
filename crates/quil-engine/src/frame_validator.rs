@@ -830,7 +830,14 @@ pub struct BlsAppFrameValidator {
     /// today's registry cannot reproduce it (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
     historical_committees: crate::historical_committee::HistoricalCommittees,
+    /// Whether execution here routes a shard's messages to the compute
+    /// engine ([`quil_execution::ExecutionEngineManager::routes_to_compute`]).
+    compute_route: Option<ComputeRoute>,
 }
+
+/// Whether this node's execution routes a message addressed to a shard to
+/// the compute engine.
+pub type ComputeRoute = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 impl BlsAppFrameValidator {
     pub fn new(
@@ -849,6 +856,7 @@ impl BlsAppFrameValidator {
             global_anchor_source: None,
             historical_committee_source: None,
             historical_committees: Default::default(),
+            compute_route: None,
         }
     }
 
@@ -1114,6 +1122,13 @@ impl BlsAppFrameValidator {
         self
     }
 
+    /// Judge compute ops only on shards `route` sends to the compute engine
+    /// ([`Self::cross_domain_compute_now`]).
+    pub fn with_compute_route(mut self, route: ComputeRoute) -> Self {
+        self.compute_route = Some(route);
+        self
+    }
+
     pub fn with_storage_history_source(
         mut self,
         source: crate::storage_history::GlobalVertexProofSource,
@@ -1183,6 +1198,47 @@ impl BlsAppFrameValidator {
             .iter()
             .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
             .any(|bytes| carries_configuration_op(&bytes))
+            .then_some(latest)
+    }
+
+    /// This node's latest GLOBAL frame, when it has reached the compute
+    /// domain frame ([`quil_execution::compute_domain`]) while `frame` is
+    /// anchored before it (or names no anchor) and carries a compute op
+    /// naming a domain other than its application's: execution, judged by
+    /// the anchor, would run that op, which it refuses from the domain
+    /// frame. A voter refuses such a proposal, so no leader runs the op by
+    /// citing an older anchor. Only a shard the compute engine executes is
+    /// judged ([`Self::with_compute_route`]; without a route, every shard
+    /// is). `None` otherwise, and without a clock.
+    ///
+    /// A frame naming no anchor is judged as before the domain frame, while
+    /// execution judges it by its own number. On mainnet no such frame gets
+    /// here once the domain frame is reached: from the required-anchor
+    /// epoch, which the domain frame follows, a voter refuses it first
+    /// ([`Self::unanchored_after_activation`]).
+    pub fn cross_domain_compute_now(&self, frame: &AppShardFrame) -> Option<u64> {
+        use quil_execution::compute_domain::{compute_domain_guarded_at, crosses_domain};
+        let header = frame.header.as_ref()?;
+        let anchor = header.global_frame_number;
+        if anchor != 0 && compute_domain_guarded_at(anchor) {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        if !compute_domain_guarded_at(latest) {
+            return None;
+        }
+        if self
+            .compute_route
+            .as_ref()
+            .is_some_and(|routes| !routes(&header.address))
+        {
+            return None;
+        }
+        frame
+            .requests
+            .iter()
+            .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
+            .any(|bytes| crosses_domain(&header.address, &bytes))
             .then_some(latest)
     }
 
