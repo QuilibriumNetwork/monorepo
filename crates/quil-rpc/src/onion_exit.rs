@@ -415,6 +415,61 @@ mod tests {
         }
     }
 
+    /// The exit sends a proxied request only to a public address: a target
+    /// advertising a loopback or private stream address is refused before
+    /// any dial, even when it answers there as itself, so no circuit can
+    /// reach services on the exit's own host or network.
+    #[tokio::test]
+    async fn the_exit_never_sends_a_request_to_a_private_address() {
+        let target_key = quil_p2p::generate_falcon_signing_key();
+        let target = crate::onion_service::peer_of(&target_key).to_bytes();
+        let method = "/quilibrium.node.global.pb.OnionService/Unserved";
+        let addr = crate::onion_service::onion_server_as(target_key).await;
+        let advertised = addr.clone();
+        let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![advertised.clone()]));
+        let proxy = OnionExitProxy::new(
+            quil_p2p::generate_falcon_signing_key(),
+            lookup,
+            HashSet::from([method.to_string()]),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.process(build_onion_rpc(&target, method, b"x")),
+        )
+        .await
+        .expect("the request ends");
+        let refused = matches!(&outcome, Err(error) if error.starts_with("target "));
+        if !refused {
+            panic!(
+                "VULNERABLE: the onion exit sent a request to the private address {addr}: \
+                 {outcome:?}"
+            );
+        }
+    }
+
+    /// The exit never proxies a request to itself: a circuit ending
+    /// `A -> B -> C -> C` is a direct loop, refused before any lookup or
+    /// dial, even where the exit answers at its advertised address.
+    #[tokio::test]
+    async fn the_exit_never_sends_a_request_to_itself() {
+        let exit_key = quil_p2p::generate_falcon_signing_key();
+        let exit = crate::onion_service::peer_of(&exit_key).to_bytes();
+        let method = "/quilibrium.node.global.pb.OnionService/Unserved";
+        let addr = crate::onion_service::onion_server_as(exit_key.clone()).await;
+        let lookup: PeerRoutingLookup = Arc::new(move |_: &[u8]| Some(vec![addr.clone()]));
+        let proxy = OnionExitProxy::new(exit_key, lookup, HashSet::from([method.to_string()]));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.process(build_onion_rpc(&exit, method, b"x")),
+        )
+        .await
+        .expect("the request ends");
+        let refused = matches!(&outcome, Err(error) if error.contains("direct loop"));
+        if !refused {
+            panic!("VULNERABLE: the onion exit sent a request to itself: {outcome:?}");
+        }
+    }
+
     #[test]
     fn reply_framing() {
         assert_eq!(ok_reply(b"resp"), [&[STATUS_OK][..], b"resp"].concat());

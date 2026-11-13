@@ -564,6 +564,33 @@ mod tests {
         }
     }
 
+    /// An onion link is opened only to a public address: a routing peer
+    /// advertising a loopback or private stream address is not dialed, even
+    /// when it answers there as itself, so no peer can point a relay at
+    /// services on the relay's own host or network.
+    #[tokio::test]
+    async fn an_onion_link_is_never_opened_to_a_private_address() {
+        let hop_key = quil_p2p::generate_falcon_signing_key();
+        let hop = peer_of(&hop_key).to_bytes();
+        let addr = onion_server_as(hop_key).await;
+        let dialer_key = quil_p2p::generate_falcon_signing_key();
+        let dialer = OnionTransport::new_with_dialer(
+            peer_of(&dialer_key).to_bytes(),
+            routing_lookup_allowing(vec![addr.clone()]),
+            dialer_key,
+        );
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dialer.ensure_connected(&hop),
+        )
+        .await
+        .expect("the dial ends");
+        let filed = dialer.inner.client_streams.read().contains_key(&hop);
+        if connected || filed {
+            panic!("VULNERABLE: an onion link was opened to the private address {addr}");
+        }
+    }
+
     #[test]
     fn self_peer_id_is_exposed() {
         let t = OnionTransport::new(b"me".to_vec(), routing_lookup_allowing(vec![]));

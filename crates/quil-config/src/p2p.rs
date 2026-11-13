@@ -217,3 +217,26 @@ impl P2PConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config printed with `{:?}` (a log line, a panic, an error chain)
+    /// never shows the p2p peer key, which is the node's network identity.
+    #[test]
+    fn the_peer_key_never_reaches_debug_output() {
+        let config = P2PConfig {
+            peer_priv_key: "5eed".repeat(16),
+            ..P2PConfig::default()
+        };
+        let shown = format!("{config:?}");
+        if shown.contains(&config.peer_priv_key) {
+            panic!("VULNERABLE: the p2p peer key is printed by Debug");
+        }
+        assert!(
+            shown.contains("stream_listen_multiaddr"),
+            "Debug no longer shows the other settings: {shown}"
+        );
+    }
+}

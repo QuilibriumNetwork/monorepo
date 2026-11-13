@@ -542,6 +542,41 @@ mod tests {
         ));
     }
 
+    /// A relay never extends a circuit to itself (`A -> B -> B`), even when
+    /// it passes as a network peer, and the refused circuit can still be
+    /// extended to another peer: one seen earlier in the circuit
+    /// (`A -> B -> C -> A`) is not this relay's to know or refuse.
+    #[tokio::test]
+    async fn a_relay_never_extends_a_circuit_to_itself() {
+        let relay = OnionRelay::new();
+        relay.set_self_peer_id(b"me".to_vec());
+        relay.set_peer_validator(std::sync::Arc::new(|_: &[u8]| true));
+        let secret = b"hop-secret-32-bytes-long!!!!!!!";
+        relay
+            .register_with_peers(1, 0, secret.to_vec(), b"up".to_vec(), Vec::new())
+            .await;
+        let eph = vec![0u8; crate::onion::ONION_PUBLIC_KEY_LEN];
+        let ct = vec![0u8; crate::onion::ONION_CIPHERTEXT_LEN];
+        let extend = |next: &[u8]| {
+            let inner = cell::build_relay_inner(
+                cell::RCMD_EXTEND,
+                &cell::build_extend_data(next, &eph, &ct),
+            );
+            encrypt_layer(secret, LAYER_FORWARD, &inner).unwrap()
+        };
+        let looped = relay.handle_relay_forward(b"up", 1, &extend(b"me")).await;
+        if looped != RelayAction::None {
+            panic!("VULNERABLE: the relay extended a circuit to itself: {looped:?}");
+        }
+        match relay
+            .handle_relay_forward(b"up", 1, &extend(b"origin"))
+            .await
+        {
+            RelayAction::Forward { peer, .. } => assert_eq!(peer, b"origin"),
+            other => panic!("the circuit no longer extends to another peer: {other:?}"),
+        }
+    }
+
     /// Regression: idle circuits are torn down (entry dropped → hop key
     /// zeroized) by the expiry sweep.
     #[tokio::test]
