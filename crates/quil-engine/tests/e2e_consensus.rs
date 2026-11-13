@@ -1227,6 +1227,125 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     );
 }
 
+/// A regular node planned a join at lifecycle frame F while the GLOBAL head
+/// was F+85 (its head knowledge jumped right after), and signed it at the
+/// head. Its workers' reservation must run from the signed frame: the next
+/// pass, at F+86, keeps them reserved and out of the lifecycle's free pool,
+/// so no second join for them is planned while the first can still land. A
+/// registry synced past the join's inclusion window without it frees them.
+#[tokio::test]
+async fn a_join_planned_behind_the_head_keeps_its_workers_reserved_from_its_signing() {
+    use quil_engine::prover_message_transport::ProverMessageTransport;
+    use quil_engine::prover_pipeline::ProverPipeline;
+    use quil_engine::worker::{WorkerInfo, WorkerManager, WorkerView};
+    use quil_engine::worker_allocator::{WorkerAllocator, PROPOSAL_TIMEOUT_FRAMES};
+
+    const PLANNED: u64 = 1_071_569;
+    const SIGNED: u64 = PLANNED + 85;
+    const WORKERS: [u32; 3] = [1, 5, 6];
+
+    let prover = TestProver::generate();
+    let transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    transport.set_head_header(gpb::GlobalFrameHeader {
+        frame_number: SIGNED,
+        difficulty: 100_000,
+        output: vec![0u8; 516],
+        ..Default::default()
+    });
+    let wm = Arc::new(quil_engine::test_support::TestWorkerManager::new());
+    for core_id in WORKERS {
+        wm.add(WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 1_000_000,
+            total_storage: 1_000_000,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+    }
+    let wm_dyn: Arc<dyn WorkerManager> = wm.clone();
+    let allocator = Arc::new(WorkerAllocator::new(
+        wm_dyn.clone(),
+        Arc::new(TestProverRegistry::new()) as Arc<dyn ProverRegistry>,
+        prover.address.clone(),
+    ));
+    let lifecycle = Arc::new(quil_engine::provers::lifecycle::ProverLifecycle::new(
+        prover.address.clone(),
+        allocator.clone(),
+        Arc::new(quil_engine::halt_state::HaltState::new()),
+        quil_engine::current_frame::CurrentFrame::new(),
+        quil_engine::provers::proposer::Strategy::RewardGreedy,
+    ));
+    // A regular node's registry shows a landed join only after a sync.
+    lifecycle.hold_gone_shard_leaves_for_sync();
+    let mut prover_address = [0u8; 32];
+    let copy_len = prover.address.len().min(32);
+    prover_address[..copy_len].copy_from_slice(&prover.address[..copy_len]);
+    let pipeline = ProverPipeline {
+        lifecycle,
+        worker_manager: wm_dyn,
+        frame_prover: Arc::new(StubFrameProver) as Arc<dyn FrameProver>,
+        key_manager: Arc::new(quil_engine::test_support::TestKeyManager::new(
+            prover.bls_signer.private_key().to_vec(),
+            prover.bls_pubkey.clone(),
+        )),
+        bls_pubkey: prover.bls_pubkey.clone(),
+        prover_address,
+        multisig_ed448_seeds: vec![],
+        delegate_address: vec![],
+        transport: transport.clone() as Arc<dyn ProverMessageTransport>,
+        hypergraph: None,
+        replica_store: None,
+        storage_for_filter: None,
+        remote_storage_confirm: None,
+        pending_shard_changes: None,
+        storage_snapshot: None,
+        local_message_collector: None,
+        current_frame: None,
+    };
+
+    let filters: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i; 32]).collect();
+    pipeline
+        .submit_join(filters, &WORKERS, PLANNED)
+        .await
+        .expect("submit_join");
+    assert_eq!(transport.drain_outbound().len(), 1, "one ProverJoin");
+
+    let next_pass = SIGNED + 1;
+    allocator.on_new_frame(next_pass).expect("allocator pass");
+    let workers = wm.range_workers().expect("workers");
+    let freed: Vec<u32> = WorkerView::from_workers(workers.clone())
+        .free_auto()
+        .map(|w| w.core_id)
+        .collect();
+    assert!(
+        freed.is_empty(),
+        "reservation_freed_early: workers {freed:?} free for a second join at frame {next_pass}, \
+         one frame after their join was signed at {SIGNED} (planned at {PLANNED}); pending frames {:?}",
+        workers
+            .iter()
+            .map(|w| (w.core_id, w.pending_filter_frame))
+            .collect::<Vec<_>>()
+    );
+
+    // A registry synced from past the join's inclusion window shows no
+    // allocation: the reservation ends at the proposal timeout, counted
+    // from the signed frame.
+    let past_inclusion =
+        SIGNED + quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW + 1;
+    allocator.note_registry_sync_begun(1, past_inclusion);
+    allocator.note_registry_synced(1);
+    let timed_out = SIGNED + PROPOSAL_TIMEOUT_FRAMES + 1;
+    allocator.on_new_frame(timed_out).expect("allocator pass");
+    let freed = WorkerView::snapshot(wm.as_ref()).free_auto().count();
+    assert_eq!(
+        freed,
+        WORKERS.len(),
+        "a join absent from a registry synced past its inclusion window frees its workers at frame {timed_out}"
+    );
+}
+
 // =====================================================================
 // Tier 2 — adversarial tests (real BLS verifier)
 // =====================================================================

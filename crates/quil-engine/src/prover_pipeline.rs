@@ -2137,13 +2137,17 @@ impl ProverPipeline {
         self.lifecycle.record_join_attempt(lifecycle_frame);
 
         // Persist the pending frame on each worker so reconcile can tell
-        // "proposal in flight" from "orphaned". Uses `lifecycle_frame`
-        // (not `frame_number`) — the timestamp matches the cooldown
-        // timer on WorkerAllocator.
+        // "proposal in flight" from "orphaned". The reservation follows the
+        // join as signed: GLOBAL includes it from `frame_number` through
+        // `JOIN_FRESHNESS_WINDOW` frames later, and the proposal timeout,
+        // the registry-sync hold and the bind claim all count from it. A
+        // node that planned at a frame far behind the head (its head
+        // knowledge jumped) freed the workers on the next pass and joined
+        // them again elsewhere while the first join landed.
         for &core_id in worker_ids {
             let _ = self
                 .worker_manager
-                .set_pending_filter_frame(core_id, lifecycle_frame);
+                .set_pending_filter_frame(core_id, frame_number);
         }
 
         Ok(())
