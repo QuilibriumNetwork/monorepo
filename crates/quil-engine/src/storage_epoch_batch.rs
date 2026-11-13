@@ -38,9 +38,13 @@
 //! first attempt does too. A settlement sent alone goes again every
 //! [`SETTLEMENT_RESEND_FRAMES`] GLOBAL frames until its slot shows it
 //! settled: an archive drops a submission no frame carried after that many.
-//! The node proves a settlement sent alone at once, beside any collection
-//! waiting for its seat, and sends it again as the proof it made of it
-//! before ([`reuse_settlement_proof`]), so archives hold one copy. A proof
+//! The node proves a settlement sent alone within [`SETTLEMENT_GATHER`],
+//! beside any collection waiting for its seat, in one proof with the
+//! member's other settlements of its epoch sent alone then (in proofs of
+//! half as many seats after each [`BATCHED_SETTLEMENT_SENDS`] sends, and
+//! never in a message over [`SETTLEMENT_MESSAGE_BYTES`]), and
+//! sends the same settlements again as the proof it made of them before
+//! ([`reuse_settlement_proof`]), so archives hold one copy. A proof
 //! carrying seals carries no settlement that already went out
 //! ([`claim_settlements`]): GLOBAL refuses a proof whole when one of its
 //! seats settles an epoch already settled.
@@ -123,6 +127,46 @@ fn memory_leaf_limit(configured: usize, all_native: bool, constrained: bool) -> 
 
 /// What a proof's STARK takes of its message, at most (about 0.75–1 MB).
 const STARK_ALLOWANCE: usize = 5 << 18;
+
+/// Proving memory ([`proving_bytes`]) one proof of a member's settlements
+/// takes at most on persistent storage's schedule: settlements go in one
+/// proof up to it, and one larger than it goes alone.
+const SETTLEMENT_PROOF_BYTES: u64 = 2 << 30;
+
+/// Sends of a settlement in proofs of one size beside others, after which
+/// its proofs hold half as many seats ([`halve_settlement_proofs`]): GLOBAL
+/// refuses a proof whole when one of its seats fails and tells the node
+/// nothing, and a slot still owed looks the same whether its proof was
+/// refused or not yet carried. So a seat that keeps its proofs from landing
+/// holds each half of its peers back this many resends
+/// ([`SETTLEMENT_RESEND_FRAMES`] each, about ten minutes on mainnet), and
+/// while GLOBAL is merely behind, each step only doubles the member's
+/// proofs. A proof that fails to prove sends its seats alone at once
+/// ([`stop_batching`]).
+const BATCHED_SETTLEMENT_SENDS: u32 = 6;
+
+/// Bytes of a message carrying settlements proved together, at most: the
+/// 1 MiB archives assume of a storage epoch proof. A larger one is not
+/// sent: its seats are proved again as halves. One seat's proof is sent
+/// whatever its size, as before.
+const SETTLEMENT_MESSAGE_BYTES: usize = 1 << 20;
+
+/// [`SETTLEMENT_MESSAGE_BYTES`], or a test's own bound.
+fn settlement_message_bytes() -> usize {
+    #[cfg(test)]
+    {
+        let bytes = tests::MESSAGE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            return bytes;
+        }
+    }
+    SETTLEMENT_MESSAGE_BYTES
+}
+
+/// How long the node gathers a member's settlements sent alone before
+/// proving them together: its workers send them at the same GLOBAL frame
+/// ([`settlement_due`]).
+const SETTLEMENT_GATHER: Duration = Duration::from_secs(3);
 
 /// Bytes of a proof's message its seats' parts (frames and bindings) may
 /// take: a GLOBAL proposal carries epoch proofs only up to
@@ -1012,10 +1056,10 @@ fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<Settle
     (out, claimed)
 }
 
-/// The proof this node made of a settlement sent alone: the digest of the
-/// part it proves, the proof, and the times it went again.
+/// The proof this node made of settlements sent alone: the digest of the
+/// parts it proves, in order, the proof, and the times it went again.
 struct SettlementProof {
-    part: [u8; 32],
+    parts: [u8; 32],
     bytes: Arc<Vec<u8>>,
     resends: u32,
 }
@@ -1025,65 +1069,94 @@ fn settlement_proofs() -> &'static Mutex<HashMap<SettlementKey, SettlementProof>
     PROOFS.get_or_init(Default::default)
 }
 
-fn part_digest(seat: &PreparedSeat) -> [u8; 32] {
+fn parts_digest(seats: &[PreparedSeat]) -> [u8; 32] {
     use sha3::Digest;
-    sha3::Sha3_256::digest(seat.to_bytes()).into()
+    let mut h = sha3::Sha3_256::new();
+    for seat in seats {
+        let bytes = seat.to_bytes();
+        h.update((bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    }
+    h.finalize().into()
 }
 
-/// Keep `bytes`, the proof of `seat`, a settlement sent alone, to send again
+/// Keep `bytes`, the proof of settlements sent alone whose parts digest to
+/// `parts` ([`parts_digest`]), under each of their `keys`, to send again
 /// unchanged ([`reuse_settlement_proof`]).
-fn keep_settlement_proof(seat: &PreparedSeat, bytes: &[u8]) {
+fn keep_settlement_proof(parts: [u8; 32], keys: &[SettlementKey], bytes: &[u8]) {
+    let Some(epoch) = keys.iter().map(|(_, _, epoch)| *epoch).max() else {
+        return;
+    };
     let Ok(mut proofs) = settlement_proofs().lock() else {
         return;
     };
-    let epoch = seat.part.epoch;
     proofs.retain(|(_, _, e), _| e.saturating_add(1) >= epoch);
-    proofs.insert(
-        (seat.member, seat.part.shard_filter.clone(), epoch),
-        SettlementProof {
-            part: part_digest(seat),
-            bytes: Arc::new(bytes.to_vec()),
-            resends: 0,
-        },
-    );
+    let bytes = Arc::new(bytes.to_vec());
+    for key in keys {
+        proofs.insert(
+            key.clone(),
+            SettlementProof {
+                parts,
+                bytes: bytes.clone(),
+                resends: 0,
+            },
+        );
+    }
 }
 
-/// The proof this node made of `seat`, a settlement sent alone again from
-/// the same part, and the times it has now gone again: the same bytes, so
-/// archives and GLOBAL's leader hold one copy, and nothing is proved again.
-/// `None` when none was made of this part.
-fn reuse_settlement_proof(seat: &PreparedSeat) -> Option<(Arc<Vec<u8>>, u32)> {
+/// The proof this node made of `seats`, settlements sent alone again from
+/// the same parts together, and the times it has now gone again: the same
+/// bytes, so archives and GLOBAL's leader hold one copy, and nothing is
+/// proved again. `None` when none was made of exactly these parts.
+fn reuse_settlement_proof(seats: &[PreparedSeat]) -> Option<(Arc<Vec<u8>>, u32)> {
+    let parts = parts_digest(seats);
     let mut proofs = settlement_proofs().lock().ok()?;
-    let proof = proofs.get_mut(&(seat.member, seat.part.shard_filter.clone(), seat.part.epoch))?;
-    if proof.part != part_digest(seat) {
+    let key = |seat: &PreparedSeat| (seat.member, seat.part.shard_filter.clone(), seat.part.epoch);
+    if !seats.iter().all(|seat| {
+        proofs
+            .get(&key(seat))
+            .is_some_and(|proof| proof.parts == parts)
+    }) {
         return None;
     }
-    proof.resends = proof.resends.saturating_add(1);
-    Some((proof.bytes.clone(), proof.resends))
+    let mut reused = None;
+    for seat in seats {
+        if let Some(proof) = proofs.get_mut(&key(seat)) {
+            proof.resends = proof.resends.saturating_add(1);
+            reused = Some((proof.bytes.clone(), proof.resends));
+        }
+    }
+    reused
 }
 
-/// Send `seats`, one settlement sent alone again from the same part, as the
-/// proof made of it before ([`reuse_settlement_proof`]). False when there is
-/// none, or its window has closed (the proving path drops it and logs why).
+/// Send `seats`, settlements sent alone again from the same parts, as the
+/// proof made of them before ([`reuse_settlement_proof`]). False when there
+/// is none, or a window has closed (the proving path drops it and logs why).
 fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
-    let [seat] = seats else {
-        return false;
-    };
-    if crate::storage_snapshot::settlement_closed(seat.part.epoch, 0) {
+    if seats
+        .iter()
+        .any(|seat| crate::storage_snapshot::settlement_closed(seat.part.epoch, 0))
+    {
         return false;
     }
-    let Some((bytes, resends)) = reuse_settlement_proof(seat) else {
+    let Some((bytes, resends)) = reuse_settlement_proof(seats) else {
         return false;
     };
     if let Ok(mut sent) = settlements_sent().lock() {
-        sent.insert(
-            (seat.member, seat.part.shard_filter.clone(), seat.part.epoch),
-            Instant::now(),
-        );
+        for seat in seats {
+            sent.insert(
+                (seat.member, seat.part.shard_filter.clone(), seat.part.epoch),
+                Instant::now(),
+            );
+        }
     }
-    tracing::debug!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
-        epoch = seat.part.epoch, resends, bytes = bytes.len(),
-        "storage settlement sent again alone, as the proof made before");
+    let shards: Vec<String> = seats
+        .iter()
+        .map(|seat| hex::encode(&seat.part.shard_filter))
+        .collect();
+    tracing::debug!(member = %seats.first().map(|seat| hex::encode(seat.member)).unwrap_or_default(),
+        ?shards, resends, bytes = bytes.len(),
+        "storage settlements sent again alone, as the proof made before");
     publish(bytes.to_vec());
     true
 }
@@ -1199,9 +1272,26 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Split `seats` into the proofs to make: each solo seat alone, the others in
-/// chunks of at most `leaves` sealed leaves and `bytes` of parts, each shard
-/// once, in order.
+/// Whether `seat` settles only, on persistent storage's schedule: such parts
+/// prove beside each other only, up to [`SETTLEMENT_PROOF_BYTES`].
+fn settles_only_persistent(seat: &PreparedSeat) -> bool {
+    seat.part.settles
+        && !seat.part.seals
+        && quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch)
+}
+
+/// Split `seats` into the proofs to make: each solo part alone but a
+/// settlement on persistent storage's schedule, the others in chunks of at
+/// most `leaves` sealed leaves and `bytes` of parts, each shard once and one
+/// epoch each, by epoch and otherwise in order. A proof is
+/// refused whole once its earliest seat's window ends, so a seat of a later
+/// epoch never rides in it (mainnet, 2026-11-09: a 15-seat proof sent with
+/// no frames left). On persistent storage's schedule a part that seals and
+/// settles proves alone, and settlements prove beside each other only, up
+/// to [`SETTLEMENT_PROOF_BYTES`] of proving memory and as many seats as
+/// each may share a proof with ([`proof_seats`]): one STARK carries them,
+/// where alone each took about 0.66 MB of GLOBAL's 4 MiB a frame (mainnet,
+/// 2026-11-09).
 fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<PreparedSeat>> {
     let constrained = crate::storage_jobs::constrained_memory();
     let native = |seat: &PreparedSeat| {
@@ -1225,14 +1315,19 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
     let mut open: Vec<PreparedSeat> = Vec::new();
     let (mut weight, mut size) = (0, 0);
     // A large native seal can be sent independently of its small settlement.
-    let seats = seats.into_iter().flat_map(|seat| {
-        if seat.part.seals && seat.part.settles && seat.part_bytes() > bytes {
-            let (seal, settle) = seat.halves();
-            [seal, settle].into_iter().flatten().collect::<Vec<_>>()
-        } else {
-            vec![seat]
-        }
-    });
+    let mut seats: Vec<PreparedSeat> = seats
+        .into_iter()
+        .flat_map(|seat| {
+            if seat.part.seals && seat.part.settles && seat.part_bytes() > bytes {
+                let (seal, settle) = seat.halves();
+                [seal, settle].into_iter().flatten().collect::<Vec<_>>()
+            } else {
+                vec![seat]
+            }
+        })
+        .collect();
+    // The parts that may share a proof side by side, in order otherwise.
+    seats.sort_by_key(|seat| (seat.part.epoch, settles_only_persistent(seat)));
     for seat in seats {
         let part = seat.part_bytes();
         if part > limit(native(&seat)) {
@@ -1240,23 +1335,43 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
                 "storage proof part exceeds message budget");
             continue;
         }
-        if seat.solo
-            || (seat.part.settles
+        let settling = settles_only_persistent(&seat);
+        if (seat.solo && !settling)
+            || (seat.part.seals
+                && seat.part.settles
                 && quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch))
         {
-            // Keep persistent settlement AIRs seat-sized, matching worker
-            // preparation and allowing independent memory-admitted proofs.
+            // A part that seals and settles keeps its persistent settlement
+            // AIR seat-sized, a memory-admitted proof of its own.
             out.push(vec![seat]);
             continue;
         }
-        let repeated = open
-            .iter()
-            .any(|held| held.part.shard_filter == seat.part.shard_filter);
+        let apart = open.iter().any(|held| {
+            held.part.shard_filter == seat.part.shard_filter
+                || held.part.epoch != seat.part.epoch
+                || settles_only_persistent(held) != settling
+        });
         let all_native = native(&seat) && open.iter().all(&native);
         let budget = limit(all_native);
         let leaf_limit = memory_leaf_limit(leaves, all_native, constrained);
+        let over_memory = settling
+            && !open.is_empty()
+            && !proving_bytes(open.iter().chain([&seat]))
+                .is_ok_and(|bytes| bytes <= SETTLEMENT_PROOF_BYTES);
+        let over_count = settling
+            && open.len()
+                >= open
+                    .iter()
+                    .chain([&seat])
+                    .map(proof_seats)
+                    .min()
+                    .unwrap_or(usize::MAX);
         if !open.is_empty()
-            && (repeated || weight + seat.weight() > leaf_limit || size + part > budget)
+            && (apart
+                || over_memory
+                || over_count
+                || weight + seat.weight() > leaf_limit
+                || size + part > budget)
         {
             out.push(std::mem::take(&mut open));
             (weight, size) = (0, 0);
@@ -1271,9 +1386,27 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
     out
 }
 
+/// Proving memory a proof of several settlements takes per seat beyond
+/// [`SETTLEMENT_PROOF_BASE_BYTES`] ([`proving_bytes`]). Proofs of 1, 4, 12
+/// and 24 mainnet seats (26 frames, 4 held leaves of 2^24 nodes each) peaked
+/// at 133, 408, 1,089 and 2,098 MB of RSS, about 86 MB a seat plus 46 MB,
+/// where their AIR estimate was 145, 378, 802 and 1,536 MB (median of 3
+/// runs each, 2026-11-12). This and the base hold 5 to 6% above them.
+const SETTLEMENT_SEAT_PROVING_BYTES: u64 = 86 << 20;
+
+/// What a proof of several settlements takes besides its seats
+/// ([`SETTLEMENT_SEAT_PROVING_BYTES`]).
+const SETTLEMENT_PROOF_BASE_BYTES: u64 = 64 << 20;
+
 /// Peak admission for the actual proof dimensions. Native persistent seals
-/// do not enter the legacy AIR; settlement frames still do.
-pub(crate) fn proving_bytes(seats: &[PreparedSeat]) -> Result<u64> {
+/// do not enter the legacy AIR; settlement frames still do. A proof of
+/// several settlements takes more than its AIR estimate, up to 1.37 times it
+/// at 12 and 24 seats: it reserves the larger of the measured model
+/// ([`SETTLEMENT_SEAT_PROVING_BYTES`] a seat) and one and a half times the
+/// estimate, for seats heavier than those measured. One seat's estimate is
+/// above what it takes, and stands.
+pub(crate) fn proving_bytes<'a>(seats: impl IntoIterator<Item = &'a PreparedSeat>) -> Result<u64> {
+    let seats: Vec<&PreparedSeat> = seats.into_iter().collect();
     let member = seats
         .first()
         .map(|s| s.member)
@@ -1303,7 +1436,18 @@ pub(crate) fn proving_bytes(seats: &[PreparedSeat]) -> Result<u64> {
     } else {
         16 << 20
     };
-    Ok(native.saturating_add(traces))
+    let estimate = native.saturating_add(traces);
+    if seats.len() < 2
+        || !seats
+            .iter()
+            .all(|seat| seat.part.settles && !seat.part.seals)
+    {
+        return Ok(estimate);
+    }
+    let measured = SETTLEMENT_SEAT_PROVING_BYTES
+        .saturating_mul(seats.len() as u64)
+        .saturating_add(SETTLEMENT_PROOF_BASE_BYTES);
+    Ok(measured.max(estimate.saturating_mul(3) / 2))
 }
 
 /// One proof over `seats` (one member's, distinct shards), as GLOBAL takes it.
@@ -1391,12 +1535,171 @@ fn collections() -> &'static Mutex<HashMap<[u8; 32], Collection>> {
     COLLECTIONS.get_or_init(Default::default)
 }
 
+/// A member's settlements sent alone, gathered for [`SETTLEMENT_GATHER`] to
+/// prove together.
+struct SettlementGather {
+    parts: Vec<PreparedSeat>,
+    publish: Publish,
+}
+
+fn settlement_gathers() -> &'static Mutex<HashMap<[u8; 32], SettlementGather>> {
+    static GATHERS: OnceLock<Mutex<HashMap<[u8; 32], SettlementGather>>> = OnceLock::new();
+    GATHERS.get_or_init(Default::default)
+}
+
+/// How a settlement goes in proofs beside the member's others: the most
+/// seats such a proof may hold, and its sends in proofs of that size.
+#[derive(Debug, Clone, Copy)]
+struct Batching {
+    seats: usize,
+    sends: u32,
+}
+
+fn batching() -> &'static Mutex<HashMap<SettlementKey, Batching>> {
+    static BATCHING: OnceLock<Mutex<HashMap<SettlementKey, Batching>>> = OnceLock::new();
+    BATCHING.get_or_init(Default::default)
+}
+
+fn settlement_key(seat: &PreparedSeat) -> SettlementKey {
+    (seat.member, seat.part.shard_filter.clone(), seat.part.epoch)
+}
+
+/// The most seats a proof carrying `seat`'s settlement may hold
+/// ([`halve_settlement_proofs`]); no bound until one is set.
+fn proof_seats(seat: &PreparedSeat) -> usize {
+    batching()
+        .lock()
+        .ok()
+        .and_then(|batching| batching.get(&settlement_key(seat)).map(|b| b.seats))
+        .unwrap_or(usize::MAX)
+}
+
+/// Prove each of `keys`' settlements, `seats` of them proved together, in
+/// proofs of at most half as many seats from now on: a proof of them was
+/// larger than a message may be ([`SETTLEMENT_MESSAGE_BYTES`]), or went out
+/// [`BATCHED_SETTLEMENT_SENDS`] times and none of them shows settled yet.
+fn halve_settlement_proofs(keys: &[SettlementKey], seats: usize) {
+    let half = seats.div_ceil(2).max(1);
+    if let Ok(mut batching) = batching().lock() {
+        for key in keys {
+            let entry = batching.entry(key.clone()).or_insert(Batching {
+                seats: usize::MAX,
+                sends: 0,
+            });
+            entry.seats = entry.seats.min(half);
+            entry.sends = 0;
+        }
+    }
+}
+
+/// Prove each of `keys`' settlements in a proof of its own from now on: a
+/// proof of them together failed, so one of them may fail every proof it
+/// is in.
+fn stop_batching(keys: &[SettlementKey]) {
+    if let Ok(mut batching) = batching().lock() {
+        for key in keys {
+            batching.insert(key.clone(), Batching { seats: 1, sends: 0 });
+        }
+    }
+}
+
+/// The proofs to make of a member's settlements sent alone together: those
+/// on persistent storage's schedule that may still share a proof
+/// ([`proof_seats`]) in [`chunks`], one epoch each, ordered by epoch and
+/// shard so that sent again unchanged they make the same proof
+/// ([`reuse_settlement_proof`]); the others one each, as before persistent
+/// storage. Counts each send in a proof beside others, and halves a group
+/// once it went out [`BATCHED_SETTLEMENT_SENDS`] times.
+fn settlement_proofs_to_make(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSeat>> {
+    parts.sort_by(|a, b| {
+        (a.part.epoch, &a.part.shard_filter).cmp(&(b.part.epoch, &b.part.shard_filter))
+    });
+    let newest = parts.iter().map(|seat| seat.part.epoch).max().unwrap_or(0);
+    let (together, apart): (Vec<PreparedSeat>, Vec<PreparedSeat>) = parts
+        .into_iter()
+        .partition(|seat| settles_only_persistent(seat) && proof_seats(seat) > 1);
+    let mut proofs = chunks(together, chunk_leaves(), chunk_bytes());
+    let mut halve = Vec::new();
+    if let Ok(mut batching) = batching().lock() {
+        batching.retain(|(_, _, e), _| e.saturating_add(1) >= newest);
+        for proof in proofs.iter().filter(|proof| proof.len() > 1) {
+            let mut due = false;
+            for seat in proof {
+                let entry = batching.entry(settlement_key(seat)).or_insert(Batching {
+                    seats: usize::MAX,
+                    sends: 0,
+                });
+                entry.sends = entry.sends.saturating_add(1);
+                due |= entry.sends >= BATCHED_SETTLEMENT_SENDS;
+            }
+            if due {
+                halve.push((
+                    proof.iter().map(settlement_key).collect::<Vec<_>>(),
+                    proof.len(),
+                ));
+            }
+        }
+    }
+    for (keys, seats) in halve {
+        halve_settlement_proofs(&keys, seats);
+    }
+    proofs.extend(apart.into_iter().map(|seat| vec![seat]));
+    proofs
+}
+
+/// Gather `seat`, a settlement sent alone, with the member's others sent
+/// within [`SETTLEMENT_GATHER`], then prove them
+/// ([`settlement_proofs_to_make`]): at a settlement window's opening every
+/// seat of every member falls owed, and each settlement proved alone took
+/// about 0.66 MB of GLOBAL's 4 MiB a frame, so archives refused them for 10
+/// to 25 minutes (mainnet, 2026-11-09). A part sent again replaces the one
+/// gathered for its seat.
+fn gather_settlement(seat: PreparedSeat, publish: Publish) {
+    let member = seat.member;
+    let start = {
+        let Ok(mut gathers) = settlement_gathers().lock() else {
+            prove_and_publish(vec![seat], publish);
+            return;
+        };
+        let start = !gathers.contains_key(&member);
+        let gather = gathers.entry(member).or_insert_with(|| SettlementGather {
+            parts: Vec::new(),
+            publish: publish.clone(),
+        });
+        gather.publish = publish;
+        gather.parts.retain(|part| {
+            part.part.shard_filter != seat.part.shard_filter || part.part.epoch != seat.part.epoch
+        });
+        gather.parts.push(seat);
+        start
+    };
+    if start {
+        std::thread::Builder::new()
+            .name("settle-gather".into())
+            .spawn(move || {
+                std::thread::sleep(SETTLEMENT_GATHER);
+                let Some(gather) = settlement_gathers()
+                    .lock()
+                    .ok()
+                    .and_then(|mut gathers| gathers.remove(&member))
+                else {
+                    return;
+                };
+                for proof in settlement_proofs_to_make(gather.parts) {
+                    prove_and_publish(proof, gather.publish.clone());
+                }
+            })
+            .expect("spawn a storage settlement gather thread");
+    }
+}
+
 /// Take a worker's `message` about a seat's part, proving the member's
 /// collection with `publish` as its destination once it is due. A part sent
 /// again replaces the one collected for its shard; a solo part is proved
 /// alone at once, replacing any collected copy. A settlement sent alone is
-/// proved at once even while a collection waits for its seat's part, which
-/// then goes without it ([`claim_settlements`]).
+/// proved within [`SETTLEMENT_GATHER`], with the member's other settlements
+/// sent alone then ([`gather_settlement`]), even while a collection waits
+/// for its seat's part, which then goes without it ([`claim_settlements`]).
 pub fn deliver(message: SeatMessage, publish: Publish) {
     let (member, start) = {
         let Ok(mut collections) = collections().lock() else {
@@ -1404,19 +1707,22 @@ pub fn deliver(message: SeatMessage, publish: Publish) {
         };
         match message {
             SeatMessage::Part(seat) if seat.solo => {
+                if seat.part.settles && !seat.part.seals {
+                    drop(collections);
+                    gather_settlement(seat, publish);
+                    return;
+                }
                 let key = seat.key();
-                let settles_alone = seat.part.settles && !seat.part.seals;
-                if !settles_alone
-                    && collections
-                        .get(&seat.member)
-                        .is_some_and(|c| c.announced.iter().any(|k| k.overlaps(&key)))
+                if collections
+                    .get(&seat.member)
+                    .is_some_and(|c| c.announced.iter().any(|k| k.overlaps(&key)))
                 {
                     // Its first part has not been proved yet: that proof
                     // covers it.
                     return;
                 }
                 drop(collections);
-                if !settles_alone && recently_proved(&seat) {
+                if recently_proved(&seat) {
                     tracing::debug!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
                         "storage epoch proof part retried while its proof may still be on its way; dropped");
                     return;
@@ -1617,7 +1923,11 @@ fn persistent_schedule(seats: &[PreparedSeat]) -> bool {
 /// [`SETTLEMENT_LANE`], others in `crate::storage_jobs::EPOCH_PROOF_LANE`,
 /// one proof at a time each. On persistent storage's schedule each
 /// member, shard and epoch gets a lane of its own, so independent chunks
-/// run side by side while overlapping parts keep one lane.
+/// run side by side while overlapping parts keep one lane; settlements
+/// alone take one lane per member and epoch, since proofs of different sets
+/// of them share seats ([`settlement_proofs_to_make`]), and two proofs
+/// carrying one seat's settlement at once make GLOBAL refuse one of them
+/// whole, with every other seat in it.
 fn proof_lane(seats: &[PreparedSeat], alone: bool, persistent: bool) -> Vec<u8> {
     let mut lane = if alone {
         SETTLEMENT_LANE.to_vec()
@@ -1625,6 +1935,19 @@ fn proof_lane(seats: &[PreparedSeat], alone: bool, persistent: bool) -> Vec<u8> 
         crate::storage_jobs::EPOCH_PROOF_LANE.to_vec()
     };
     if !persistent {
+        return lane;
+    }
+    if alone {
+        let mut epochs: Vec<([u8; 32], u64)> = seats
+            .iter()
+            .map(|seat| (seat.member, seat.part.epoch))
+            .collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        for (member, epoch) in epochs {
+            lane.extend_from_slice(&member);
+            lane.extend_from_slice(&epoch.to_be_bytes());
+        }
         return lane;
     }
     for seat in seats {
@@ -1694,11 +2017,7 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
         if seats.is_empty() {
             return Ok(());
         }
-        let kept = if alone && seats.len() == 1 {
-            seats.clone()
-        } else {
-            Vec::new()
-        };
+        let kept = alone.then(|| parts_digest(&seats));
         let started = Instant::now();
         let member = seats
             .first()
@@ -1728,14 +2047,31 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
             started,
             finished: false,
         };
+        // Settlements proved together, kept to prove again as halves should
+        // their message be too large to send.
+        let together =
+            (count > 1 && seats.iter().all(settles_only_persistent)).then(|| seats.clone());
         let proof = prove(seats);
         watch.finish();
         match proof {
+            Ok(bytes) if together.is_some() && bytes.len() > settlement_message_bytes() => {
+                release_settlements(&claimed);
+                halve_settlement_proofs(&proved, count);
+                let mut first = together.unwrap_or_default();
+                let second = first.split_off(count.div_ceil(2));
+                info!(member, seats = count, bytes = bytes.len(), most = settlement_message_bytes(),
+                    seconds = started.elapsed().as_secs_f64(), shards = ?shards,
+                    "storage settlements proved together exceed the size archives assume of a proof's message; \
+                     not sent, proved again as two halves");
+                prove_and_publish(first, publish.clone());
+                prove_and_publish(second, publish);
+                Ok(())
+            }
             Ok(bytes) => {
                 info!(member, seats = count, sealed_leaves = sealed, bytes = bytes.len(),
                     seconds = started.elapsed().as_secs_f64(), shards = ?shards, "submitting storage epoch proof");
-                if let [seat] = kept.as_slice() {
-                    keep_settlement_proof(seat, &bytes);
+                if let Some(parts) = kept {
+                    keep_settlement_proof(parts, &proved, &bytes);
                 }
                 publish(bytes);
                 // Its workers' retry clocks run from now (in this process:
@@ -1747,6 +2083,9 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
             }
             Err(error) => {
                 release_settlements(&claimed);
+                if alone && count > 1 {
+                    stop_batching(&proved);
+                }
                 warn!(member, seats = count, %error, shards = ?shards,
                     "storage epoch proof over the collected seats failed; their workers send each again alone");
                 Err(error)
@@ -1856,31 +2195,291 @@ mod tests {
         );
     }
 
-    /// A part splits into its seal and its settlement, each a part that
-    /// says only its own half, and the two join back into the part.
-    #[test]
-    fn persistent_settlements_are_independent_chunks_and_reserve_actual_air_memory() {
-        let mut parts = Vec::new();
-        for shard in [11, 12] {
-            let (_, part) = sealing_and_settling(shard).halves();
-            let mut part = part.unwrap();
-            part.solo = false;
-            part.part.epoch = 1500;
-            part.claim.settle_epoch = 1500;
-            parts.push(part);
-        }
-        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
-        let grouped = chunks(parts.clone(), usize::MAX, usize::MAX);
-        assert_eq!(grouped.len(), 2);
-        assert!(grouped.iter().all(|part| part.len() == 1));
-        assert!(proving_bytes(&grouped[0]).unwrap() > 0);
-        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
-        assert_eq!(chunks(parts, usize::MAX, usize::MAX).len(), 1);
-        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+    /// The settling half of a part sealing and settling `shard`, settling
+    /// `epoch`.
+    fn settling(shard: u8, epoch: u64, solo: bool) -> PreparedSeat {
+        let (_, part) = sealing_and_settling(shard).halves();
+        let mut part = part.unwrap();
+        part.solo = solo;
+        part.part.epoch = epoch;
+        part.claim.settle_epoch = epoch;
+        part
     }
 
-    /// Two settling parts of different shards at epoch 1500, each its own
-    /// chunk, as `chunks` gives them once persistent storage holds.
+    /// Once persistent storage holds, a member's settlements of one epoch go
+    /// in one proof, collected or sent alone: each alone took about 0.66 MB
+    /// of GLOBAL's 4 MiB a frame, and at a settlement window's opening
+    /// archives refused them for 10 to 25 minutes (mainnet, 2026-11-09). A
+    /// part that seals and settles still proves alone, and a settlement of
+    /// another epoch apart. The proof reserves its AIR's estimate.
+    #[test]
+    fn due_settlements_of_one_epoch_share_a_proof_once_persistent_storage_holds() {
+        let mut joint = sealing_and_settling(15);
+        joint.part.epoch = 1500;
+        joint.claim.settle_epoch = 1500;
+        joint.claim.seal_epoch = 1502;
+        let parts = vec![
+            settling(11, 1500, false),
+            settling(12, 1500, true),
+            settling(13, 1501, true),
+            settling(14, 1500, true),
+            joint,
+        ];
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let grouped = chunks(parts, 24, chunk_bytes());
+        let estimate = grouped
+            .iter()
+            .map(|proof| proving_bytes(&proof[..]))
+            .collect::<Vec<_>>();
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        let shards: Vec<Vec<u8>> = grouped
+            .iter()
+            .map(|proof| proof.iter().map(|seat| seat.part.shard_filter[0]).collect())
+            .collect();
+        assert_eq!(
+            shards,
+            vec![vec![15], vec![11, 12, 14], vec![13]],
+            "settlements_seat_sized: a member's due settlements of one epoch took a proof each"
+        );
+        assert!(estimate
+            .iter()
+            .all(|bytes| bytes.as_ref().is_ok_and(|&b| b > 0)));
+    }
+
+    /// A proof carries one epoch's parts: GLOBAL refuses it whole once its
+    /// earliest seat's window ends, and a 15-seat proof mixing two epochs
+    /// went out with no frames left (mainnet, 2026-11-09).
+    #[test]
+    fn a_collection_proves_each_epochs_parts_apart() {
+        let mut parts = Vec::new();
+        for (shard, epoch) in [(21, 5), (22, 6), (23, 5)] {
+            let mut part = sealing_and_settling(shard);
+            part.part.epoch = epoch;
+            part.claim.settle_epoch = epoch;
+            part.claim.seal_epoch = epoch + 2;
+            parts.push(part);
+        }
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        let grouped = chunks(parts, 24, chunk_bytes());
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        let epochs: Vec<Vec<(u8, u64)>> = grouped
+            .iter()
+            .map(|proof| {
+                proof
+                    .iter()
+                    .map(|seat| (seat.part.shard_filter[0], seat.part.epoch))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            epochs,
+            vec![vec![(21, 5), (23, 5)], vec![(22, 6)]],
+            "epochs_mixed: one proof carried parts of two epochs"
+        );
+    }
+
+    /// A settlement proof stays within [`SETTLEMENT_PROOF_BYTES`] of proving
+    /// memory: one that alone needs more proves alone, and the others share
+    /// a proof beside it.
+    #[test]
+    fn a_settlement_proof_stays_within_its_proving_memory() {
+        let mut heavy = settling(31, 1500, true);
+        let frame = heavy.claim.frames[0].clone();
+        heavy.claim.frames = vec![frame; 4000];
+        heavy.claim.held = (0..16u8)
+            .map(|i| HeldLeaf {
+                leaf_id: vec![31, i],
+                n: 1 << 29,
+                comm_r: [4; 32],
+            })
+            .collect();
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let alone = proving_bytes([&heavy]);
+        let grouped = chunks(
+            vec![settling(32, 1500, true), heavy, settling(33, 1500, true)],
+            24,
+            chunk_bytes(),
+        );
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        assert!(
+            alone.unwrap() > SETTLEMENT_PROOF_BYTES,
+            "the heavy seat's settlement fits the cap: the test proves nothing"
+        );
+        let shards: Vec<Vec<u8>> = grouped
+            .iter()
+            .map(|proof| proof.iter().map(|seat| seat.part.shard_filter[0]).collect())
+            .collect();
+        assert_eq!(
+            shards,
+            vec![vec![32], vec![31], vec![33]],
+            "settlement_over_memory: a settlement proof took more than its proving memory"
+        );
+    }
+
+    /// Settlements sent alone together prove together, one epoch each, in
+    /// the same order whatever order they came in (so that sent again they
+    /// make the same proof). Once a group went out
+    /// [`BATCHED_SETTLEMENT_SENDS`] times its proofs hold half as many
+    /// seats, down to one each: GLOBAL tells the node nothing of a refused
+    /// proof, so a seat that fails every proof holds each half of its peers
+    /// back for a bounded count, and while GLOBAL is only behind the
+    /// member's proofs double, rather than all going alone in one send. One
+    /// whose proof with others failed goes alone at once.
+    #[test]
+    fn settlements_sent_alone_together_halve_after_a_bounded_count() {
+        let parts = |member: u8| {
+            [
+                (41, 1500),
+                (42, 1501),
+                (43, 1500),
+                (44, 1500),
+                (45, 1500),
+                (46, 1500),
+            ]
+            .into_iter()
+            .map(|(shard, epoch)| {
+                let mut part = settling(shard, epoch, true);
+                part.member = [member; 32];
+                part
+            })
+            .collect::<Vec<_>>()
+        };
+        let made = |parts: Vec<PreparedSeat>| -> Vec<Vec<u8>> {
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+            let proofs = settlement_proofs_to_make(parts);
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+            proofs
+                .iter()
+                .map(|proof| proof.iter().map(|seat| seat.part.shard_filter[0]).collect())
+                .collect()
+        };
+        let whole = vec![vec![41, 43, 44, 45, 46], vec![42]];
+        let mut reversed = parts(0xa1);
+        reversed.reverse();
+        assert_eq!(made(reversed), whole);
+        for _ in 1..BATCHED_SETTLEMENT_SENDS {
+            assert_eq!(made(parts(0xa1)), whole);
+        }
+        let halved = made(parts(0xa1));
+        assert!(
+            halved.len() > whole.len(),
+            "batched_without_end: a group kept going whole past its count: {halved:?}"
+        );
+        assert_eq!(
+            halved,
+            vec![vec![41, 43, 44], vec![45, 46], vec![42]],
+            "went_alone_at_count: a group past its count was not halved"
+        );
+        for _ in 1..BATCHED_SETTLEMENT_SENDS {
+            assert_eq!(made(parts(0xa1)), halved);
+        }
+        assert_eq!(
+            made(parts(0xa1)),
+            vec![vec![41, 43], vec![44], vec![42], vec![45], vec![46]],
+            "each half halves again after its own count, down to one seat"
+        );
+
+        assert_eq!(made(parts(0xa2)), whole);
+        let failed = parts(0xa2)
+            .iter()
+            .filter(|seat| seat.part.epoch == 1500)
+            .map(settlement_key)
+            .collect::<Vec<_>>();
+        stop_batching(&failed);
+        assert_eq!(
+            made(parts(0xa2)),
+            vec![vec![42], vec![41], vec![43], vec![44], vec![45], vec![46]],
+            "a group whose proof failed goes alone at once"
+        );
+    }
+
+    /// A seat GLOBAL refuses holds its clean peers back only while their
+    /// proofs halve ([`BATCHED_SETTLEMENT_SENDS`] sends each, one every
+    /// [`SETTLEMENT_RESEND_FRAMES`]): GLOBAL refuses a proof whole and tells
+    /// the node nothing, so a clean peer lands only once it goes without
+    /// the bad seat, at worst alone. For the largest mainnet member's 109
+    /// seats every settlement goes alone within its window, sent from its
+    /// latest start ([`crate::storage_snapshot::seal_retry_frames`] into the
+    /// window), before the closing frames ([`settle_closing_frames`]).
+    #[test]
+    fn a_refused_seat_holds_its_peers_back_less_than_their_window() {
+        let parts = || {
+            (0..109u8)
+                .map(|shard| {
+                    let mut part = settling(shard, 1500, true);
+                    part.member = [0xb7; 32];
+                    part
+                })
+                .collect::<Vec<_>>()
+        };
+        let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(1500);
+        let room = (until - from)
+            .saturating_sub(settle_closing_frames())
+            .saturating_sub(crate::storage_snapshot::seal_retry_frames());
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let mut sends = 0u64;
+        let mut largest = 0;
+        loop {
+            let proofs = settlement_proofs_to_make(parts());
+            largest = largest.max(proofs.iter().map(Vec::len).max().unwrap_or(0));
+            if proofs.iter().all(|proof| proof.len() == 1)
+                || sends * SETTLEMENT_RESEND_FRAMES > room
+            {
+                break;
+            }
+            sends += 1;
+        }
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        assert!(
+            largest > 16,
+            "the settlements went in groups of {largest} at most: the test proves nothing"
+        );
+        assert!(
+            sends * SETTLEMENT_RESEND_FRAMES <= room,
+            "seat_held_too_long: settlements still went beside others after {sends} sends \
+             ({} frames), past the {room} frames their window leaves",
+            sends * SETTLEMENT_RESEND_FRAMES
+        );
+    }
+
+    /// Settlements a member's workers send alone at once are gathered and
+    /// proved in one proof.
+    #[test]
+    fn settlements_sent_alone_at_once_are_gathered_into_one_proof() {
+        let member = [0x6a; 32];
+        let publish: Publish = Arc::new(|_| {});
+        let parts: Vec<PreparedSeat> = [51, 52]
+            .into_iter()
+            .map(|shard| {
+                let mut part = settling(shard, 1500, true);
+                part.member = member;
+                part
+            })
+            .collect();
+        for part in &parts {
+            deliver(SeatMessage::Part(part.clone()), publish.clone());
+        }
+        let deadline = Instant::now() + SETTLEMENT_GATHER + Duration::from_secs(30);
+        while !parts.iter().all(recently_proved) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            parts.iter().all(recently_proved),
+            "the gathered settlements were not proved"
+        );
+        let batching = batching().lock().unwrap();
+        for part in &parts {
+            // Counted as sent together, then alone after a failed proof of
+            // them both (these parts are not real; [`stop_batching`]).
+            assert!(
+                batching.contains_key(&(member, part.part.shard_filter.clone(), 1500)),
+                "settlements_apart: settlements sent alone at once took a proof each"
+            );
+        }
+    }
+
+    /// Two settling parts of different shards at epoch 1500, each in a
+    /// chunk of its own.
     fn settling_chunks() -> Vec<Vec<PreparedSeat>> {
         [11, 12]
             .into_iter()
@@ -2275,10 +2874,10 @@ mod tests {
     }
 
     /// A settlement sent alone (a retry, or near its window's end) is proved
-    /// at once, while a collection still waits for its seat's slow part (a
-    /// seal relabelling): the collection waits up to 1800 s, and GLOBAL
-    /// withholds the storage share of the member whose roots go unproven by
-    /// the window's end.
+    /// within [`SETTLEMENT_GATHER`], while a collection still waits for its
+    /// seat's slow part (a seal relabelling): the collection waits up to
+    /// 1800 s, and GLOBAL withholds the storage share of the member whose
+    /// roots go unproven by the window's end.
     #[test]
     fn a_settlement_sent_alone_is_proved_at_once_beside_a_waiting_collection() {
         let member = [0x61; 32];
@@ -2301,6 +2900,10 @@ mod tests {
         let mut alone = seat(1, 0, true);
         alone.member = member;
         deliver(SeatMessage::Part(alone.clone()), publish.clone());
+        let deadline = Instant::now() + SETTLEMENT_GATHER + Duration::from_secs(30);
+        while !recently_proved(&alone) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
             recently_proved(&alone),
             "the settlement sent alone waited for its seat's slow part in the member's collection"
@@ -2370,10 +2973,20 @@ mod tests {
         assert_eq!((settles(&out), claimed.len()), (0, 0));
     }
 
+    /// Keep `bytes` as the proof of `seats`, as proving them does.
+    fn keep(seats: &[PreparedSeat], bytes: &[u8]) {
+        let keys: Vec<SettlementKey> = seats
+            .iter()
+            .map(|seat| (seat.member, seat.part.shard_filter.clone(), seat.part.epoch))
+            .collect();
+        keep_settlement_proof(parts_digest(seats), &keys, bytes);
+    }
+
     /// A settlement sent alone again from the same part goes as the proof
     /// made of it before: archives and GLOBAL's leader hold one copy while
     /// one waits (on mainnet each send was proved anew, 2026-11-08), and
     /// nothing is proved again. A part from other inputs is proved anew.
+    /// Settlements proved together go again as their proof only together.
     #[test]
     fn a_settlement_sent_alone_again_carries_the_proof_made_before() {
         let mut joint = sealing_and_settling(0x92);
@@ -2381,22 +2994,42 @@ mod tests {
         let (_, alone) = joint.halves();
         let mut alone = alone.unwrap();
         alone.solo = true;
+        let alone = [alone];
         assert!(
             reuse_settlement_proof(&alone).is_none(),
             "nothing proved yet"
         );
-        keep_settlement_proof(&alone, b"the first proof");
+        keep(&alone, b"the first proof");
         let (bytes, resends) = reuse_settlement_proof(&alone).expect(
             "the settlement sent alone again was reproved: new bytes archives cannot deduplicate",
         );
         assert_eq!((bytes.as_slice(), resends), (&b"the first proof"[..], 1));
         assert_eq!(reuse_settlement_proof(&alone).map(|(_, n)| n), Some(2));
         let mut other = alone.clone();
-        other.part.frames.clear();
-        other.claim.frames.clear();
+        other[0].part.frames.clear();
+        other[0].claim.frames.clear();
         assert!(
             reuse_settlement_proof(&other).is_none(),
             "a part from other inputs went as another part's proof"
+        );
+
+        let mut together = vec![alone[0].clone()];
+        let mut second = alone[0].clone();
+        second.part.shard_filter = vec![0x93];
+        together.push(second);
+        keep(&together, b"the proof of both");
+        assert_eq!(
+            reuse_settlement_proof(&together).map(|(bytes, _)| bytes.to_vec()),
+            Some(b"the proof of both".to_vec())
+        );
+        assert!(
+            reuse_settlement_proof(&together[..1]).is_none(),
+            "one of two settlements proved together went as the proof of both"
+        );
+        together.reverse();
+        assert!(
+            reuse_settlement_proof(&together).is_none(),
+            "another proof's order went as its bytes"
         );
     }
 
@@ -2693,5 +3326,323 @@ mod tests {
                 "unsealed_outcome_wrong: {outcome}"
             );
         }
+    }
+
+    /// A test's bound on a message of settlements proved together
+    /// ([`settlement_message_bytes`]); 0 keeps [`SETTLEMENT_MESSAGE_BYTES`].
+    pub(super) static MESSAGE_BYTES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// A settlement alone on `filter`, settling `epoch`, that proves:
+    /// `held` leaves of `n` nodes each (a power of two), opened at `frames`
+    /// frames. Every replica node is zero, so each opening's path is the
+    /// zero tree's levels, computed in `log2(n)` steps; proving costs what
+    /// it costs for any replica of that size.
+    fn provable_settlement(
+        member: [u8; 32],
+        filter: Vec<u8>,
+        epoch: u64,
+        frames: usize,
+        held: usize,
+        n: u64,
+    ) -> PreparedSeat {
+        use quil_crypto::storage_hash::{self as hash, Domain};
+        use quil_crypto::storage_proof::{tree_depth, zero_commitment, Tree};
+        let mut level = hash::ZERO;
+        let mut path = Vec::with_capacity(tree_depth(n));
+        for _ in 0..tree_depth(n) {
+            path.push(hash::to_bytes(&level));
+            level = hash::compress(&level, &level, Domain::Node);
+        }
+        let comm_r = zero_commitment(Tree::Replica, n).expect("a zero tree of n nodes");
+        let opening = epoch_proof::Opened {
+            value: hash::to_bytes(&hash::ZERO),
+            path,
+        };
+        let per_frame =
+            vec![opening; held * quil_types::consensus::STORAGE_QUERIES_PER_LEAF as usize];
+        let held: Vec<HeldLeaf> = (0..held)
+            .map(|i| HeldLeaf {
+                leaf_id: [&filter[..], &(i as u32).to_be_bytes()].concat(),
+                n,
+                comm_r,
+            })
+            .collect();
+        let frames: Vec<epoch_proof::CommittedFrame> = (0..frames as u64)
+            .map(|j| epoch_proof::CommittedFrame {
+                frame_number: epoch * 720 + 3 * j,
+                rho_n: [j as u8 ^ 0x5a; 32],
+                root: epoch_proof::openings_root(epoch * 720 + 3 * j, &per_frame)
+                    .expect("a root of zero openings"),
+            })
+            .collect();
+        let opened = per_frame
+            .iter()
+            .cycle()
+            .take(per_frame.len() * frames.len())
+            .cloned()
+            .collect();
+        PreparedSeat {
+            member,
+            part: SeatProof {
+                shard_filter: filter,
+                epoch,
+                settles: true,
+                frames: frames.clone(),
+                ..Default::default()
+            },
+            claim: SeatClaim {
+                seal_epoch: epoch + 2,
+                settle_epoch: epoch,
+                held,
+                frames,
+                ..Default::default()
+            },
+            witness: SeatWitness {
+                certificates: Vec::new(),
+                seals: Vec::new(),
+                opened,
+            },
+            solo: true,
+        }
+    }
+
+    /// Settlements proved together never go out in a message larger than
+    /// archives assume of a proof ([`SETTLEMENT_MESSAGE_BYTES`]): a group
+    /// whose message would be is proved again as halves, each settlement
+    /// still goes out once, and the halves are kept for the next send.
+    #[test]
+    fn settlements_proved_together_never_make_a_message_over_its_bound() {
+        let member = [0x7c; 32];
+        let seats: Vec<PreparedSeat> = (0..4u8)
+            .map(|i| provable_settlement(member, vec![0x70 + i; 35], 1500, 4, 2, 1 << 10))
+            .collect();
+        let one = prove(vec![seats[0].clone()])
+            .expect("one settlement proves")
+            .len();
+        let all = prove(seats.clone()).expect("four settlements prove").len();
+        assert!(
+            all > one + 1,
+            "four settlements proved together make no larger a message than one: the test proves nothing"
+        );
+        let bound = (one + all) / 2;
+        MESSAGE_BYTES.store(bound, std::sync::atomic::Ordering::Relaxed);
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let publish: Publish = {
+            let sent = sent.clone();
+            Arc::new(move |bytes| sent.lock().unwrap().push(bytes))
+        };
+        prove_and_publish(seats.clone(), publish);
+        let settled = || {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .flat_map(|bytes| settlements_in(bytes.as_slice()))
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while settled() < seats.len() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        MESSAGE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let sent = sent.lock().unwrap().clone();
+        for bytes in &sent {
+            let carried = settlements_in(bytes).len();
+            assert!(
+                carried < 2 || bytes.len() <= bound,
+                "settlement_message_over_cap: {carried} settlements went out in {} bytes, over {bound}",
+                bytes.len()
+            );
+        }
+        let mut keys: Vec<SettlementKey> = sent
+            .iter()
+            .flat_map(|bytes| settlements_in(bytes.as_slice()))
+            .collect();
+        keys.sort();
+        let mut want: Vec<SettlementKey> = seats.iter().map(settlement_key).collect();
+        want.sort();
+        assert_eq!(keys, want, "each settlement goes out once");
+        assert!(
+            seats.iter().all(|seat| proof_seats(seat) <= 2),
+            "a group too large to send is proved as halves next time too"
+        );
+    }
+
+    /// A member's settlements alone of one epoch prove in one lane, one
+    /// proof at a time, whichever of them each proof carries: a group and a
+    /// later proof of one of its seats never prove side by side, and GLOBAL
+    /// refuses a proof whole when a seat in it already settled.
+    #[test]
+    fn a_members_settlements_alone_of_one_epoch_prove_in_one_lane() {
+        let member = [0x5d; 32];
+        let alone = |shard: u8, epoch: u64| {
+            let mut part = settling(shard, epoch, true);
+            part.member = member;
+            part
+        };
+        let group = proof_lane(&[alone(1, 1500), alone(2, 1500)], true, true);
+        let one = proof_lane(&[alone(2, 1500)], true, true);
+        assert_eq!(
+            group, one,
+            "lanes_by_set: a group and a later proof of one of its seats proved side by side"
+        );
+        assert_eq!(one, proof_lane(&[alone(3, 1500)], true, true));
+        assert_ne!(
+            one,
+            proof_lane(&[alone(2, 1501)], true, true),
+            "another epoch's settlements wait for none of these"
+        );
+        let mut other = alone(2, 1500);
+        other.member = [0x5e; 32];
+        assert_ne!(
+            one,
+            proof_lane(&[other], true, true),
+            "nor another member's"
+        );
+        assert!(one.starts_with(SETTLEMENT_LANE));
+    }
+
+    /// Frames, held leaves and nodes a leaf of the seat a mainnet node
+    /// prepared (2026-11-12): a 169,219-byte part, proved alone into a
+    /// 692,872-byte message.
+    const MAINNET_FRAMES: usize = 26;
+    const MAINNET_HELD: usize = 4;
+    const MAINNET_NODES: u64 = 1 << 24;
+
+    /// The `i`th of `member`'s settlements of mainnet's size, at epoch 1500.
+    fn mainnet_settlement(member: [u8; 32], i: usize) -> PreparedSeat {
+        let mut filter = vec![0x11; 33];
+        filter.extend_from_slice(&(i as u16).to_be_bytes());
+        provable_settlement(
+            member,
+            filter,
+            1500,
+            MAINNET_FRAMES,
+            MAINNET_HELD,
+            MAINNET_NODES,
+        )
+    }
+
+    /// A proof of a member's settlements reserves at least the memory it
+    /// was measured to take at mainnet's size
+    /// ([`measure_settlements_proved_together_at_mainnet_size`], median
+    /// peak RSS of 3 runs, 2026-11-12): proved together, 24 seats took
+    /// 2,098 MB where their AIR estimate was 1,536 MB, so the cap on a
+    /// group's memory bound 37% late and the node admitted proofs beside
+    /// it that its memory did not hold.
+    #[test]
+    fn a_settlement_proof_reserves_what_it_was_measured_to_take() {
+        let member = [0x3f; 32];
+        let seats: Vec<PreparedSeat> = (0..24).map(|i| mainnet_settlement(member, i)).collect();
+        for (k, peak) in [
+            (1, 132_600_000u64),
+            (4, 407_900_000),
+            (12, 1_089_000_000),
+            (24, 2_100_000_000),
+        ] {
+            let reserved = proving_bytes(&seats[..k]).expect("an estimate");
+            assert!(
+                reserved >= peak,
+                "settlement_under_reserved: {k} settlements reserve {reserved} bytes, \
+                 measured to take {peak}"
+            );
+        }
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let grouped = chunks(seats, chunk_leaves(), chunk_bytes());
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        let sizes: Vec<usize> = grouped.iter().map(Vec::len).collect();
+        assert!(
+            sizes.len() > 1,
+            "settlement_under_reserved: 24 settlements went in one proof, over its memory"
+        );
+        assert!(
+            // The 1.5x estimate margin caps a group at 19 mainnet-size seats under 2 GiB.
+            sizes[0] >= 18,
+            "settlements_split_small: the reservation's margin cut a group to {sizes:?}"
+        );
+    }
+
+    /// Reads `field` (in kB) of this process's `/proc/self/status`, in bytes.
+    fn status_bytes(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    let rest = line.strip_prefix(field)?.strip_prefix(':')?;
+                    rest.trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
+            })
+            .map_or(0, |kb| kb * 1024)
+    }
+
+    /// What a member's settlements proved together cost at mainnet's size,
+    /// against one alone: the message's bytes, seconds proving and
+    /// verifying, the process's peak RSS while proving (VmHWM, reset just
+    /// before) and the memory admission reserves ([`proving_bytes`]). A seat
+    /// is the one a mainnet node prepared (2026-11-12): 26 frames, 4 held
+    /// leaves of 2^24 nodes, a 169,219-byte part, proved alone into a
+    /// 692,872-byte message. Runs only with `QUIL_SETTLE_MEASURE` set to the
+    /// seats to prove, or `max` for the first proof [`chunks`] makes of the
+    /// largest mainnet member's 109 seats; prints one `SETTLE-MEASURE` line.
+    #[test]
+    fn measure_settlements_proved_together_at_mainnet_size() {
+        let Ok(want) = std::env::var("QUIL_SETTLE_MEASURE") else {
+            println!("SETTLE-MEASURE skipped: QUIL_SETTLE_MEASURE is not set");
+            return;
+        };
+        let member = [0x3e; 32];
+        let seat = |i: usize| mainnet_settlement(member, i);
+        let seats: Vec<PreparedSeat> = if want == "max" {
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+            let first = chunks((0..109).map(seat).collect(), chunk_leaves(), chunk_bytes())
+                .into_iter()
+                .next()
+                .expect("a proof");
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+            first
+        } else {
+            let k: usize = want
+                .parse()
+                .expect("QUIL_SETTLE_MEASURE: a seat count or max");
+            (0..k).map(seat).collect()
+        };
+        let k = seats.len();
+        let part_bytes: usize = seats.iter().map(PreparedSeat::part_bytes).sum();
+        let worker_bytes: usize = seats.iter().map(|seat| seat.to_bytes().len()).sum();
+        let estimate = proving_bytes(&seats).expect("an estimate");
+        let claim = EpochClaim {
+            member,
+            seats: seats.iter().map(|seat| seat.claim.clone()).collect(),
+        };
+        let base_rss = status_bytes("VmRSS");
+        let reset = std::fs::write("/proc/self/clear_refs", "5").is_ok();
+        let started = Instant::now();
+        let message = prove(seats).expect("the settlements prove");
+        let prove_ms = started.elapsed().as_millis();
+        let peak_rss = status_bytes("VmHWM");
+        let proof = StorageEpochProof::from_canonical_bytes(&message).expect("a message");
+        let started = Instant::now();
+        claim.verify(&proof.proof).expect("the proof verifies");
+        let verify_ms = started.elapsed().as_millis();
+        println!(
+            "SETTLE-MEASURE k={k} frames={MAINNET_FRAMES} held={MAINNET_HELD} nodes={MAINNET_NODES} message_bytes={} \
+             stark_bytes={} part_bytes={part_bytes} worker_part_bytes={worker_bytes} \
+             message_per_seat={} prove_ms={prove_ms} verify_ms={verify_ms} peak_rss_bytes={peak_rss} \
+             base_rss_bytes={base_rss} rss_reset={reset} estimate_bytes={estimate} \
+             over_message_bound={} due_encoding_bytes={} due_cap_bytes={} cpus={}",
+            message.len(),
+            proof.proof.len(),
+            message.len() / k,
+            message.len() > SETTLEMENT_MESSAGE_BYTES,
+            // What work due now on one such leaf reserves, ordered beside
+            // this proof's reservation (`crate::storage_snapshot::persistent`).
+            quil_crypto::storage_proof::encoding_owned_with_labels_bytes(MAINNET_NODES),
+            MAINNET_NODES * 32,
+            std::thread::available_parallelism().map_or(0, usize::from),
+        );
     }
 }

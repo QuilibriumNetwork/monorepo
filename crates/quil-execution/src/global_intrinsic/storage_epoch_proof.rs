@@ -1145,4 +1145,294 @@ mod tests {
             "no seat"
         );
     }
+
+    /// The settlements of several seats, of one epoch or two, go in one
+    /// proof, settling only, that GLOBAL's check verifies: a member's due
+    /// settlements need not take a STARK each. This verifier and the
+    /// message format are those of the releases archives run.
+    #[test]
+    fn settlements_of_several_seats_prove_and_verify_in_one_proof() {
+        use quil_crypto::storage_proof::{MerkleTree, Tree, CAP_HEIGHT};
+        let replica = |n: usize, seed: u32| -> Vec<u8> {
+            (0..n * 8)
+                .map(|i| {
+                    ((i as u32).wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B))
+                        .rotate_left(seed % 31)
+                        & 0x3FFF_FFFF
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        let member = [0x45u8; 32];
+        // Each seat: the epoch it settles and its held leaves' node counts.
+        let layout: [(u64, &[usize]); 3] = [(7, &[300]), (7, &[40, 90]), (8, &[120])];
+        let replicas: Vec<Vec<Vec<u8>>> = layout
+            .iter()
+            .enumerate()
+            .map(|(s, (_, leaves))| {
+                leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| replica(n, (s * 4 + i + 1) as u32))
+                    .collect()
+            })
+            .collect();
+        let caps: Vec<Vec<quil_crypto::storage_proof::MerkleCap>> = replicas
+            .iter()
+            .map(|seat| {
+                seat.iter()
+                    .map(|nodes| MerkleTree::from_nodes(nodes).unwrap().cap(CAP_HEIGHT))
+                    .collect()
+            })
+            .collect();
+        let mut claim = EpochClaim {
+            member,
+            seats: Vec::new(),
+        };
+        let mut witnesses = Vec::new();
+        let mut parts = Vec::new();
+        for (s, (epoch, _)) in layout.iter().enumerate() {
+            let held: Vec<HeldLeaf> = caps[s]
+                .iter()
+                .enumerate()
+                .map(|(i, cap)| HeldLeaf {
+                    leaf_id: vec![s as u8, i as u8, 0x45],
+                    n: cap.n,
+                    comm_r: cap.commitment(Tree::Replica),
+                })
+                .collect();
+            let stored: Vec<HeldReplica> = replicas[s]
+                .iter()
+                .zip(&caps[s])
+                .map(|(replica, cap)| HeldReplica { replica, cap })
+                .collect();
+            let frames: Vec<CommittedFrame> = (0..3u64)
+                .map(|j| {
+                    let rho_n = [(s as u8) * 16 + j as u8 + 1; 32];
+                    let frame_number = 100 * s as u64 + j;
+                    let opened = frame_openings(&member, *epoch, &held, &stored, &rho_n).unwrap();
+                    CommittedFrame {
+                        frame_number,
+                        rho_n,
+                        root: openings_root(frame_number, &opened).unwrap(),
+                    }
+                })
+                .collect();
+            let seat = SeatClaim {
+                settle_epoch: *epoch,
+                held,
+                frames: frames.clone(),
+                ..Default::default()
+            };
+            witnesses.push(prepare(&member, &seat, &[], &stored).unwrap());
+            claim.seats.push(seat);
+            parts.push(SeatProof {
+                shard_filter: vec![s as u8 + 1; 35],
+                epoch: *epoch,
+                settles: true,
+                frames,
+                ..Default::default()
+            });
+        }
+        let proof = prove(&claim, &witnesses).unwrap();
+        assert_eq!(
+            claim.verify(&proof),
+            Ok(()),
+            "settlements_together_refused: one proof of several seats' settlements did not verify"
+        );
+        let message = StorageEpochProof {
+            member,
+            seats: parts,
+            proof: proof.clone(),
+        };
+        let read = StorageEpochProof::from_canonical_bytes(&message.to_canonical_bytes()).unwrap();
+        assert_eq!(read.seats, message.seats, "settlements_together_misread");
+        let mut swapped = claim.clone();
+        swapped.seats[0].frames[0].root = swapped.seats[1].frames[0].root;
+        assert!(
+            swapped.verify(&proof).is_err(),
+            "settlements_together_unbound: a root of another seat verified"
+        );
+    }
+
+    /// GLOBAL's check against committed state accepts one proof of a
+    /// member's settlements of several seats and settles each of them; a
+    /// tampered proof is refused, and so is one carrying a seat already
+    /// settled, whole. A node proves a member's due settlements together on
+    /// this, and halves its groups because of the last.
+    #[test]
+    fn a_proof_of_several_seats_settlements_checks_against_state() {
+        use crate::global_intrinsic::{leaf_id_bytes, materialize, storage_seat};
+        use quil_crypto::storage_proof::{registration_root, MerkleTree, Tree, CAP_HEIGHT};
+        let replica = |n: usize, seed: u32| -> Vec<u8> {
+            (0..n * 8)
+                .map(|i| {
+                    ((i as u32).wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B))
+                        .rotate_left(seed % 31)
+                        & 0x3FFF_FFFF
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        let state = crate::hypergraph_state::HypergraphState::new(std::sync::Arc::new(
+            quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+            ),
+        ));
+        let va_disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
+        let length = quil_types::consensus::epoch_length_frames();
+        let member = [0x46u8; 32];
+        let epoch = 7;
+        let registered_at = (epoch - 1) * length + 5;
+        // Each seat's held leaves' node counts.
+        let layout: [&[usize]; 3] = [&[300], &[40, 90], &[120]];
+        let replicas: Vec<Vec<Vec<u8>>> = layout
+            .iter()
+            .enumerate()
+            .map(|(s, leaves)| {
+                leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| replica(n, (s * 4 + i + 1) as u32))
+                    .collect()
+            })
+            .collect();
+        let caps: Vec<Vec<quil_crypto::storage_proof::MerkleCap>> = replicas
+            .iter()
+            .map(|seat| {
+                seat.iter()
+                    .map(|nodes| MerkleTree::from_nodes(nodes).unwrap().cap(CAP_HEIGHT))
+                    .collect()
+            })
+            .collect();
+        let mut claim = EpochClaim {
+            member,
+            seats: Vec::new(),
+        };
+        let mut witnesses = Vec::new();
+        let mut parts = Vec::new();
+        for s in 0..layout.len() {
+            let filter = vec![s as u8 + 1; 35];
+            let prefixes: Vec<Vec<u32>> = (0..caps[s].len() as u32).map(|i| vec![i]).collect();
+            let held: Vec<HeldLeaf> = prefixes
+                .iter()
+                .zip(&caps[s])
+                .map(|(prefix, cap)| HeldLeaf {
+                    leaf_id: leaf_id_bytes(&filter, prefix),
+                    n: cap.n,
+                    comm_r: cap.commitment(Tree::Replica),
+                })
+                .collect();
+            for (prefix, leaf) in prefixes.iter().zip(&held) {
+                let registration = materialize::create_leaf_root_vertex_tree(
+                    &member,
+                    &filter,
+                    prefix,
+                    epoch,
+                    &registration_root(&[1; 32], &[2; 32], &leaf.comm_r),
+                    leaf.n,
+                    registered_at,
+                )
+                .unwrap();
+                state
+                    .set(
+                        &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..],
+                        &materialize::leaf_root_address(&member, &leaf.leaf_id).unwrap(),
+                        &va_disc,
+                        registered_at,
+                        crate::prover_registry::vertex_tree_to_blob(&registration),
+                    )
+                    .unwrap();
+            }
+            let stored: Vec<HeldReplica> = replicas[s]
+                .iter()
+                .zip(&caps[s])
+                .map(|(replica, cap)| HeldReplica { replica, cap })
+                .collect();
+            let mut seat = storage_seat::Seat::new(member, filter.clone());
+            seat.register(epoch, &prefixes, registered_at);
+            assert!(seat.seal(epoch, registered_at + 2));
+            let mut frames = Vec::new();
+            for j in 0..3u64 {
+                let rho_n = [(s as u8) * 16 + j as u8 + 1; 32];
+                let frame_number = 100 * s as u64 + j + 1;
+                let beacon = epoch * length + 10 + 5 * j;
+                let opened = frame_openings(&member, epoch, &held, &stored, &rho_n).unwrap();
+                let root = openings_root(frame_number, &opened).unwrap();
+                assert!(seat.commit(epoch, frame_number, beacon, beacon + 2, &rho_n, &root));
+                frames.push(CommittedFrame {
+                    frame_number,
+                    rho_n,
+                    root,
+                });
+            }
+            storage_seat::write(&state, epoch * length + 30, &seat).unwrap();
+            let seat_claim = SeatClaim {
+                seal_epoch: epoch + 2,
+                settle_epoch: epoch,
+                held,
+                frames: frames.clone(),
+                ..Default::default()
+            };
+            witnesses.push(prepare(&member, &seat_claim, &[], &stored).unwrap());
+            claim.seats.push(seat_claim);
+            parts.push(SeatProof {
+                shard_filter: filter,
+                epoch,
+                settles: true,
+                frames,
+                ..Default::default()
+            });
+        }
+        let proof = StorageEpochProof {
+            member,
+            seats: parts,
+            proof: prove(&claim, &witnesses).unwrap(),
+        };
+        let (from, _) = storage_seat::settlement_window(epoch);
+        let bits = |_: &[u8]| -> Option<Vec<bool>> { None };
+        let context = SealContext {
+            changes: &[],
+            bits: &bits,
+        };
+        let check_at = |proof: &StorageEpochProof| {
+            check(
+                from,
+                proof,
+                &state,
+                |_| Ok(Vec::new()),
+                |frame| Ok(frame as i64 * 1_000),
+                &context,
+            )
+        };
+        let mut tampered = proof.clone();
+        tampered.proof[100] ^= 1;
+        assert!(
+            check_at(&tampered).is_err(),
+            "tampered_group_accepted: GLOBAL accepted a tampered proof of several seats"
+        );
+        let settled = check_at(&proof)
+            .unwrap_or_else(|error| {
+                panic!("group_settlement_refused: GLOBAL refused the seats' proof: {error}")
+            })
+            .expect("not applied in this frame before");
+        assert_eq!(settled.len(), layout.len());
+        for (settlement, part) in settled.iter().zip(&proof.seats) {
+            assert_eq!(settlement.seat.filter, part.shard_filter);
+            assert_eq!(
+                settlement.seat.slot(epoch).unwrap().outcome,
+                storage_seat::Outcome::Settled(from)
+            );
+        }
+        storage_seat::write(&state, from, &settled[1].seat).unwrap();
+        let refused = match check_at(&proof) {
+            Ok(_) => panic!("a proof carrying a settled seat was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            refused.contains(REFUSED_DUPLICATE),
+            "refused for its settled seat: {refused}"
+        );
+    }
 }
