@@ -396,7 +396,10 @@ pub fn validator_global_prover() -> TopicValidator {
 /// `GlobalFrame` canonical-bytes blob with the 4-byte
 /// `GLOBAL_FRAME_TYPE = 0x030E` prefix; we round-trip through the
 /// canonical decoder so partially-truncated frames are dropped before
-/// they reach the queue.
+/// they reach the queue. A frame carrying more bundles or requests than a
+/// GLOBAL frame followed over gossip may is refused first, unread
+/// ([`crate::frame_bound::admit_global_frame`]): decoding it would build a
+/// request for every four bytes of its body.
 pub fn validator_global_frame() -> TopicValidator {
     use ValidationOutcome::{Accept, Reject};
     Arc::new(|data: &[u8]| -> ValidationOutcome {
@@ -406,6 +409,15 @@ pub fn validator_global_frame() -> TopicValidator {
         let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
         if tp != crate::consensus_wire::GLOBAL_FRAME_TYPE {
             return Reject("frame_bad_type");
+        }
+        match crate::frame_bound::admit_global_frame("global frame topic", data) {
+            Ok(_) => {}
+            Err(crate::frame_bound::FrameRefusal::TooMany(_)) => {
+                return Reject("frame_past_gossip_bound");
+            }
+            Err(crate::frame_bound::FrameRefusal::Malformed) => {
+                return Reject("frame_decode_failed");
+            }
         }
         if crate::consensus_wire::decode_global_frame(data).is_ok() {
             Accept
@@ -728,5 +740,71 @@ mod tests {
         r.register_validator(bitmasks::GLOBAL_FRAME.to_vec(), validator_global_frame());
         r.register_validator(bitmasks::GLOBAL_PROVER.to_vec(), validator_global_prover());
         assert_eq!(r.validator_count(), 2);
+    }
+
+    /// Requests a GLOBAL frame followed over gossip may carry, and
+    /// bundles: the receive loop drops a decoded frame past either
+    /// (quil-node's message loop).
+    const GOSSIP_GLOBAL_LIMIT: usize = 65_536;
+
+    /// A GLOBAL frame of `bundles` bundles of `requests` zero-length
+    /// requests each, with a default header: four wire bytes per request.
+    fn global_frame_of(bundles: usize, requests: usize) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader;
+        let header = GlobalFrameHeader::default().to_canonical_bytes().unwrap();
+        let mut bundle = TYPE_MESSAGE_BUNDLE.to_be_bytes().to_vec();
+        bundle.extend_from_slice(&(requests as u32).to_be_bytes());
+        bundle.resize(bundle.len() + 4 * requests, 0);
+        bundle.extend_from_slice(&1i64.to_be_bytes());
+        let mut frame = crate::consensus_wire::GLOBAL_FRAME_TYPE
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&(bundles as u32).to_be_bytes());
+        for _ in 0..bundles {
+            frame.extend_from_slice(&(bundle.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&bundle);
+        }
+        frame
+    }
+
+    /// A gossiped GLOBAL frame of zero-length requests decodes into one
+    /// `MessageRequest` per four wire bytes. The topic's validator, which
+    /// the receive loop runs on every GLOBAL_FRAME message before the
+    /// frame's certificate is checked, refuses a frame carrying more
+    /// requests than the loop follows over gossip before decoding it, so
+    /// the heap a frame costs stays bounded however large it is.
+    #[test]
+    fn global_frames_past_the_gossip_bound_are_refused_before_decoding() {
+        use quil_types::proto::global::{MessageBundle, MessageRequest};
+        let r = MessageRouter::new();
+        r.register_validator(bitmasks::GLOBAL_FRAME.to_vec(), validator_global_frame());
+        let frame = global_frame_of(1, 2 * GOSSIP_GLOBAL_LIMIT);
+        let started = std::time::Instant::now();
+        let decoded = crate::consensus_wire::decode_global_frame(&frame).unwrap();
+        let decode_ms = started.elapsed().as_millis();
+        let requests: usize = decoded.requests.iter().map(|b| b.requests.len()).sum();
+        let heap = decoded.requests.capacity() * std::mem::size_of::<MessageBundle>()
+            + decoded
+                .requests
+                .iter()
+                .map(|b| b.requests.capacity() * std::mem::size_of::<MessageRequest>())
+                .sum::<usize>();
+        eprintln!(
+            "DECODE-MEASURE wire_bytes={} requests={requests} decoded_heap_at_least={heap} \
+             per_wire_byte={:.1} size_of_request={} decode_ms={decode_ms}",
+            frame.len(),
+            heap as f64 / frame.len() as f64,
+            std::mem::size_of::<MessageRequest>(),
+        );
+        drop(decoded);
+        let outcome = r.route(bitmasks::GLOBAL_FRAME, &frame);
+        assert!(
+            !matches!(outcome, RouteOutcome::Accepted) || requests <= GOSSIP_GLOBAL_LIMIT,
+            "GLOBAL-FRAME-AMPLIFY: the GLOBAL_FRAME validator decoded and accepted {requests} \
+             requests (bound {GOSSIP_GLOBAL_LIMIT}) from {} wire bytes, at least {heap} heap bytes",
+            frame.len()
+        );
     }
 }
