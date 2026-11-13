@@ -109,7 +109,7 @@ fn restore_local_workers(
 /// `NoPeersSubscribedToTopic` is transient during gossip mesh startup; other
 /// publish errors require a different recovery path and must not be retried by
 /// the CW outbox.
-fn retryable_cw_publish_failure(error: &str, attempt: u32) -> bool {
+pub(super) fn retryable_cw_publish_failure(error: &str, attempt: u32) -> bool {
     error.contains("NoPeersSubscribedToTopic") && attempt < 8
 }
 
@@ -1341,21 +1341,7 @@ pub(crate) fn init(
                                                 }
                                                 p2p.note_direct_fallback();
                                             }
-                                            for attempt in 1..=8u32 {
-                                                match p2p.publish(topic.clone(), payload.clone()).await {
-                                                    Ok(()) => break,
-                                                    Err(e) if retryable_cw_publish_failure(&e.to_string(), attempt) => {
-                                                        let delay = std::time::Duration::from_millis(250u64.saturating_mul(1u64 << (attempt - 1)));
-                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, ?delay, error = %e,
-                                                            "shard CW publish has no subscribed peers — retrying");
-                                                        tokio::time::sleep(delay).await;
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, error = %e, "shard cw publish failed");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            super::cw_publish::publish_shard_cw(&p2p, core_id, &filter, topic, payload).await;
                                             Ok(())
                                         });
                                     }

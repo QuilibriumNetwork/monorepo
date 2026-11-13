@@ -17,6 +17,7 @@ pub(crate) mod archive_sync;
 mod committee_builds;
 mod committee_peer_policy;
 pub(crate) mod consensus_intake;
+mod cw_publish;
 pub(crate) mod direct_delivery;
 mod disk_writes;
 mod drain_raise_watch;
