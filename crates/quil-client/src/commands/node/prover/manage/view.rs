@@ -706,12 +706,23 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
     // As in Allocations: the table renderer reserves one detail row, the
-    // cursor block takes the rest from the bottom of the table's area.
+    // cursor block takes the rest from the bottom of the table's area,
+    // the panel's notes the rows over it.
     let avail_detail = available_detail_lines(m, &sorted_avail, avail_inner);
+    let avail_notes = notes_block(
+        available_notes(m, &sorted_avail, avail_inner.width),
+        avail_inner.width,
+        notes_limit(
+            avail_inner.width,
+            avail_inner.height.saturating_sub(avail_detail.len() as u16),
+            2,
+        ),
+    );
     let avail_table = Rect {
         height: avail_inner
             .height
-            .saturating_sub(avail_detail.len().saturating_sub(1) as u16),
+            .saturating_sub(avail_detail.len().saturating_sub(1) as u16)
+            .saturating_sub(avail_notes.len() as u16),
         ..avail_inner
     };
     let mut avail_lines = render_avail_panel(m, &sorted_avail, avail_table, Some(&avail_widths));
@@ -724,6 +735,27 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         Paragraph::new(avail_lines).scroll((0, horizontal)),
         avail_inner,
     );
+    if !avail_notes.is_empty() {
+        let notes_h = avail_notes.len() as u16;
+        let below = avail_detail.len() as u16;
+        f.render_widget(
+            Paragraph::new(avail_notes),
+            Rect::new(
+                avail_inner.x,
+                avail_inner.y + avail_inner.height - below - notes_h,
+                avail_inner.width,
+                notes_h,
+            ),
+        );
+        render_notes_rule(
+            f,
+            chunks[2],
+            avail_inner,
+            usize::from(notes_h),
+            usize::from(below),
+            avail_border,
+        );
+    }
     if !avail_detail.is_empty() {
         let detail_h = avail_detail.len() as u16;
         f.render_widget(
@@ -748,11 +780,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         chunks[2],
         m.avail_offset,
         sorted_avail.len(),
-        usize::from(
-            avail_table
-                .height
-                .saturating_sub(1 + detail_rows + u16::from(m.shard_error.is_some())),
-        ),
+        usize::from(avail_table.height.saturating_sub(1 + detail_rows)),
         horizontal,
         m.horizontal_limits[1],
     );
@@ -833,6 +861,19 @@ fn severity_color(severity: NoticeSeverity) -> Color {
         NoticeSeverity::Info => PRIMARY,
         NoticeSeverity::Warning => WARNING,
         NoticeSeverity::Error => ERROR,
+    }
+}
+
+/// What a notice of `severity` starts with after its time when colors are
+/// off, so its severity reads without them, as warning cells carry `!`:
+/// `! ` for a warning, `!! ` for an error; nothing for info or with
+/// colors on.
+fn severity_mark(m: &Model, severity: NoticeSeverity) -> &'static str {
+    match severity {
+        _ if m.color_coding => "",
+        NoticeSeverity::Info => "",
+        NoticeSeverity::Warning => "! ",
+        NoticeSeverity::Error => "!! ",
     }
 }
 
@@ -2207,31 +2248,12 @@ fn allocation_detail_lines(m: &Model, sorted: &[AllocationRow], area: Rect) -> V
     cursor_detail(allocation_detail(m, row), area.width, area.height, 2)
 }
 
-/// The detail lines a panel `width` by `height` inside its borders pins
-/// to its bottom, under content whose first `keep` lines (a table's
-/// header and the rows it must show) the detail never displaces: none in
-/// a panel of `keep` lines or fewer, else at most half the panel, a
-/// longer detail ending in a marker. Every panel follows the Allocations
-/// panel's rule, `keep` 2 for a table that scrolls.
-fn fit_detail(
-    mut lines: Vec<Line<'static>>,
-    width: u16,
-    height: u16,
-    keep: u16,
-) -> Vec<Line<'static>> {
-    let limit = detail_limit(width, height, keep);
-    if limit == 0 {
-        return vec![];
-    }
-    if lines.len() > limit {
-        lines.truncate(limit);
-        lines[limit - 1] = enlarge_marker(width);
-    }
-    lines
-}
-
-/// The rows [`fit_detail`] gives a detail in a panel `width` by `height`
-/// inside its borders under `keep` lines it never displaces.
+/// The rows a detail pinned to the bottom of a panel `width` by `height`
+/// inside its borders takes at most, under content whose first `keep`
+/// lines (a table's header and the rows it must show) it never
+/// displaces: none in a panel of `keep` lines or fewer, else at most
+/// half the panel. Every panel follows the Allocations panel's rule,
+/// `keep` 2 for a table that scrolls.
 fn detail_limit(width: u16, height: u16, keep: u16) -> usize {
     if height <= keep || width == 0 {
         return 0;
@@ -2306,11 +2328,11 @@ fn cursor_detail(detail: Line<'static>, width: u16, height: u16, keep: u16) -> V
     }
 }
 
-/// The `├─ cursor ─┤` rule `width` columns wide, borders included: the
+/// The `├─ <label> ─┤` rule `width` columns wide, borders included: the
 /// panel's `border` style, the label dim.
-fn cursor_rule(width: u16, border: Style) -> Line<'static> {
+fn panel_rule(width: u16, label: &str, border: Style) -> Line<'static> {
     let inner = usize::from(width.saturating_sub(2));
-    let label = format!(" {CURSOR_LABEL} ");
+    let label = format!(" {label} ");
     let label_width = printed_width(&label);
     if inner < label_width + 2 {
         return Line::from(Span::styled(format!("├{}┤", "─".repeat(inner)), border));
@@ -2326,14 +2348,79 @@ fn cursor_rule(width: u16, border: Style) -> Line<'static> {
 /// [`cursor_detail`] takes at the bottom of `inner`, across the panel's
 /// `outer` area and its borders; a block of one row has no rule.
 fn render_cursor_rule(f: &mut Frame, outer: Rect, inner: Rect, rows: usize, border: Style) {
-    if rows < 2 || rows > usize::from(inner.height) {
+    render_rule(f, outer, inner, rows, 0, CURSOR_LABEL, border);
+}
+
+/// Draws the `label` rule over the first of a block's `rows` lines that
+/// ends `below` lines above the bottom of `inner`, across the panel's
+/// `outer` area and its borders; a block of one row has no rule.
+fn render_rule(
+    f: &mut Frame,
+    outer: Rect,
+    inner: Rect,
+    rows: usize,
+    below: usize,
+    label: &str,
+    border: Style,
+) {
+    if rows < 2 || rows + below > usize::from(inner.height) {
         return;
     }
-    let y = inner.y + inner.height - rows as u16;
+    let y = inner.y + inner.height - (rows + below) as u16;
     f.render_widget(
-        Paragraph::new(cursor_rule(outer.width, border)),
+        Paragraph::new(panel_rule(outer.width, label, border)),
         Rect::new(outer.x, y, outer.width, 1),
     );
+}
+
+/// The label of the rule over a panel's notes: lines about the panel as
+/// a whole, told apart from its rows and from the cursor row's detail.
+const NOTES_LABEL: &str = "notes";
+
+/// The rows a notes block may take in a panel `width` by `height` inside
+/// its borders under `keep` lines it never displaces: the rows
+/// [`detail_limit`] gives a detail, and one for the rule.
+fn notes_limit(width: u16, height: u16, keep: u16) -> usize {
+    match detail_limit(width, height, keep) {
+        0 => 0,
+        rows => (rows + 1).min(usize::from(height - keep)),
+    }
+}
+
+/// A panel's `notes` lines, `width` wide, as the block it pins to its
+/// bottom or over its cursor block, in at most `rows` rows. With two or
+/// more the first is left blank for the `├─ notes ─┤` rule
+/// [`render_notes_rule`] draws over it and the borders, the notes under
+/// it ending in the enlarge marker when they do not fit; with one, the
+/// notes have no rule. No notes, no block.
+fn notes_block(notes: Vec<Line<'static>>, width: u16, rows: usize) -> Vec<Line<'static>> {
+    if notes.is_empty() || rows == 0 {
+        return vec![];
+    }
+    if rows == 1 {
+        return fit_lines(notes, width, 1);
+    }
+    let mut lines = vec![Line::default()];
+    lines.extend(fit_lines(
+        notes,
+        width,
+        u16::try_from(rows - 1).unwrap_or(u16::MAX),
+    ));
+    lines
+}
+
+/// Draws the notes rule over the first of the `rows` lines a
+/// [`notes_block`] takes, `below` lines (a cursor block's) above the
+/// bottom of `inner`, across the panel's `outer` area and its borders.
+fn render_notes_rule(
+    f: &mut Frame,
+    outer: Rect,
+    inner: Rect,
+    rows: usize,
+    below: usize,
+    border: Style,
+) {
+    render_rule(f, outer, inner, rows, below, NOTES_LABEL, border);
 }
 
 /// A panel's `lines` in `height` lines `width` wide inside its borders:
@@ -2362,9 +2449,9 @@ fn enlarge_marker(width: u16) -> Line<'static> {
     .unwrap_or_default()
 }
 
-/// A panel's `height` lines: `content` from the top and `detail` (from
-/// [`fit_detail`]) on the last lines, blank lines between; content past
-/// the room the detail leaves is cut.
+/// A panel's `height` lines: `content` from the top and `detail` (a
+/// [`cursor_detail`] or [`notes_block`]) on the last lines, blank lines
+/// between; content past the room the detail leaves is cut.
 fn pin_detail(
     mut content: Vec<Line<'static>>,
     detail: Vec<Line<'static>>,
@@ -2890,6 +2977,21 @@ fn available_detail_lines(m: &Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     cursor_detail(available_detail(m, row), area.width, area.height, keep)
 }
 
+/// The Available panel's notes, `width` wide: a failed shard read while
+/// the rows shown are cached ones.
+fn available_notes(m: &Model, sorted: &[ShardRow], width: u16) -> Vec<Line<'static>> {
+    match &m.shard_error {
+        Some(error) if !sorted.is_empty() => wrap_message(
+            Line::from(Span::styled(
+                format!("{error} (showing cached shards)"),
+                Style::new().fg(Color::Yellow),
+            )),
+            width,
+        ),
+        _ => Vec::new(),
+    }
+}
+
 /// The peer materialization's detail; it takes the warning color only for a
 /// shard the node lists as trailing.
 fn peer_materialization_detail(materialized: u64, latest: u64, flagged: bool) -> Line<'static> {
@@ -2976,14 +3078,7 @@ fn render_avail_panel(
             i == 1,
         ));
     }
-    let mut lines = Vec::new();
-    if let Some(error) = &m.shard_error {
-        lines.push(Line::from(Span::styled(
-            format!("{error} (showing cached shards)"),
-            Style::new().fg(Color::Yellow),
-        )));
-    }
-    lines.push(Line::from(hdr_spans));
+    let mut lines = vec![Line::from(hdr_spans)];
 
     let detail_rows = usize::from(height >= 3);
     let visible = height.saturating_sub(lines.len() + detail_rows).max(1);
@@ -3301,13 +3396,18 @@ fn shard_message(m: &Model) -> Option<Line<'static>> {
     } else {
         return None;
     };
-    let color = match shard_severity(m) {
+    let severity = shard_severity(m);
+    let color = match severity {
         NoticeSeverity::Info => HELP,
         NoticeSeverity::Warning => Color::Yellow,
         NoticeSeverity::Error => ERROR,
     };
     Some(Line::from(Span::styled(
-        format!("{}{message}", message_timestamp(m.shard_message_time)),
+        format!(
+            "{}{}{message}",
+            message_timestamp(m.shard_message_time),
+            severity_mark(m, severity)
+        ),
         Style::new().fg(color),
     )))
 }
@@ -3415,8 +3515,9 @@ fn node_condition_notices(m: &Model) -> Vec<(NoticeSeverity, String)> {
             (
                 severity,
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     message_timestamp(Some(since)),
+                    severity_mark(m, severity),
                     quil_rpc::health_conditions::notice_text(c)
                 ),
             )
@@ -3463,17 +3564,16 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
     }
     for (key, severity, text) in condition_notices(m) {
         if severity >= m.notice_minimum {
+            // Shown as a warning unless an error, its mark as its color.
+            let shown = severity.max(NoticeSeverity::Warning);
             lines.extend(wrap_message(
                 Line::from(Span::styled(
                     format!(
-                        "{}{text}",
-                        message_timestamp(m.notice_since.get(key).copied())
+                        "{}{}{text}",
+                        message_timestamp(m.notice_since.get(key).copied()),
+                        severity_mark(m, shown)
                     ),
-                    Style::new().fg(if severity == NoticeSeverity::Error {
-                        ERROR
-                    } else {
-                        WARNING
-                    }),
+                    Style::new().fg(severity_color(shown)),
                 )),
                 width,
             ));
@@ -3517,9 +3617,14 @@ fn status_line(m: &Model) -> Line<'static> {
     } else {
         SUCCESS
     };
+    let mark = if m.status_is_error {
+        severity_mark(m, NoticeSeverity::Error)
+    } else {
+        ""
+    };
     Line::from(Span::styled(
         format!(
-            "{}{}",
+            "{}{mark}{}",
             message_timestamp(m.status_message_time),
             m.status_msg
         ),
@@ -4185,6 +4290,13 @@ fn notice_entry(line: &Line<'static>) -> Option<String> {
     } else {
         (message_timestamp(None), text.as_str())
     };
+    // The word names the severity the colorless mark would.
+    let mark = match severity {
+        "ERROR" => "!! ",
+        "WARN" => "! ",
+        _ => "",
+    };
+    let body = body.strip_prefix(mark).unwrap_or(body);
     Some(format!("{stamp}{severity} {body}"))
 }
 
@@ -4396,7 +4508,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, the quorum share a Reward window uses while none of the seat's certificates is counted, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, the quorum share a Reward window uses while none of the seat's certificates is counted, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata. A panel's notes, lines about the panel rather than a row (Available Shards' cached rows, the Claim status, Shield plan and Transfers footers), sit under a `├─ notes ─┤` rule above the cursor block"),
         kv("Restart cost", "What restarting the node now costs the seat, from data the node holds. `ok`; `costs this seat's storage share this epoch` when its running storage encode, delayed by the work a restart loses and the start-up (`adds N min`), would end past the renewal's grace frame (`N min to grace`); `stops this shard` when its committee has no spare voter (margin: voters in recent views minus quorum); `cost unknown; no GLOBAL frame seen yet`. Absent on older nodes"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
@@ -4438,6 +4550,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`blue` / `purple`: rank or normal mode"),
         item("`yellow`: delay"),
         item("`red`: blocked/error"),
+        item("`!` / `!!` after a notice's time: a warning / an error with colors off; `--render --notices` names them `WARN` / `ERROR` instead"),
         sec("Measurements and forecasts"),
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
         kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; `T` is theoretical, none proves earned credits"),
@@ -5534,7 +5647,8 @@ mod tests {
             sources: Vec::new(),
         });
         let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
-        let expected = format!("{stamp}Global head unchanged >120s.");
+        // Colors off: `!!` after the time marks the error.
+        let expected = format!("{stamp}!! Global head unchanged >120s.");
         assert!(notices(&m).contains(&expected), "{}", notices(&m));
         assert_eq!(
             provers_notice_summary(&m).map(|(_, severity)| severity),
@@ -5767,7 +5881,7 @@ mod tests {
         let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
         assert!(
             notices(&m).contains(&format!(
-                "{stamp}Local app frames unchanged >60s: 1/2 allocations."
+                "{stamp}! Local app frames unchanged >60s: 1/2 allocations."
             )),
             "{}",
             notices(&m)
@@ -8801,34 +8915,39 @@ mod tests {
         assert_eq!(m.help_offset, 0);
     }
 
-    /// Every panel's detail follows the Allocations rule: none in a
-    /// panel of `keep` lines or fewer, else at most half the panel and
-    /// never the kept lines, a longer detail ending in the marker; the
-    /// detail lands on the panel's last lines under its content.
+    /// A panel's notes follow the Allocations rule for a detail and add
+    /// a row for their `notes` rule: none in a panel of `keep` lines or
+    /// fewer, else at most half the panel and the rule, never the kept
+    /// lines, a longer block ending in the marker, one row without the
+    /// rule; the block lands on the panel's last lines under its content.
     #[test]
-    fn panel_detail_fits_by_the_allocations_rule_and_keeps_to_the_bottom() {
-        let detail = || {
+    fn panel_notes_fit_by_the_allocations_rule_and_keep_to_the_bottom() {
+        let notes = || {
             (0..6)
                 .map(|i| Line::from(format!("d{i}")))
                 .collect::<Vec<_>>()
         };
         let text = |lines: &[Line<'static>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
-        assert!(fit_detail(detail(), 40, 2, 2).is_empty());
-        assert!(fit_detail(detail(), 40, 3, 3).is_empty());
-        assert!(fit_detail(detail(), 0, 20, 2).is_empty());
+        let block = |width: u16, height: u16, keep: u16| {
+            text(&notes_block(
+                notes(),
+                width,
+                notes_limit(width, height, keep),
+            ))
+        };
+        assert!(block(40, 2, 2).is_empty());
+        assert!(block(40, 3, 3).is_empty());
+        assert!(block(0, 20, 2).is_empty());
+        assert!(notes_block(Vec::new(), 40, 5).is_empty());
+        assert_eq!(block(40, 3, 2), ["… enlarge panel for details"]);
+        assert_eq!(block(40, 4, 3), ["… enlarge panel for details"]);
         assert_eq!(
-            text(&fit_detail(detail(), 40, 3, 2)),
-            ["… enlarge panel for details"]
+            block(40, 8, 2),
+            ["", "d0", "d1", "d2", "… enlarge panel for details"],
+            "no notes rule row"
         );
-        assert_eq!(
-            text(&fit_detail(detail(), 40, 4, 3)),
-            ["… enlarge panel for details"]
-        );
-        assert_eq!(
-            text(&fit_detail(detail(), 40, 8, 2)),
-            ["d0", "d1", "d2", "… enlarge panel for details"]
-        );
-        assert_eq!(text(&fit_detail(detail(), 40, 20, 2)).len(), 6);
+        assert_eq!(block(40, 20, 2).len(), 7);
+        assert_eq!(block(40, 20, 2)[0], "");
         let content = vec![Line::from("h"), Line::from("r")];
         assert_eq!(
             text(&pin_detail(content.clone(), vec![Line::from("d")], 5)),
@@ -9912,6 +10031,50 @@ mod cursor_rule_tests {
         assert_eq!(borders(&lines(&frame(&mut m, width, 50))), before);
     }
 
+    /// The Available panel's note on its cached rows sits under a
+    /// `├─ notes ─┤` rule right above the cursor block, the table's header
+    /// on the panel's first line, at 80x24 and wider.
+    #[test]
+    fn available_notes_sit_under_a_rule_above_the_cursor_block() {
+        let mut m = model();
+        m.compact_actions = true;
+        m.show_key_rows = false;
+        m.shard_error = Some("Shard fetch timed out".into());
+        point(&mut m, '2', '3');
+        for (width, height) in [(80, 24), (120, 40)] {
+            // Allocations at its least, so Available has the rows.
+            m.panel_boundary_offsets = [-10, 0];
+            let text = lines(&frame(&mut m, width, height));
+            let all = text.join("\n");
+            let top = text
+                .iter()
+                .position(|l| l.starts_with('╭') && l.contains("Available Shards"))
+                .unwrap_or_else(|| panic!("no Available panel\n{all}"));
+            let bottom = top
+                + 1
+                + text[top + 1..]
+                    .iter()
+                    .position(|l| l.starts_with('╰'))
+                    .unwrap();
+            let rule = |label: &str| {
+                (top + 1..bottom).find(|&i| {
+                    text[i].starts_with(&format!("├─ {label} ─")) && text[i].ends_with('┤')
+                })
+            };
+            let notes = rule("notes").unwrap_or_else(|| panic!("no notes rule\n{all}"));
+            assert!(
+                text[notes + 1].contains("Shard fetch timed out (showing cached shards)"),
+                "{all}"
+            );
+            assert_eq!(rule("cursor"), Some(notes + 2), "{all}");
+            assert!(text[top + 1].contains("Filter"), "{all}");
+            assert!(
+                !text[top + 1..notes].iter().any(|l| l.contains("cached")),
+                "{all}"
+            );
+        }
+    }
+
     /// With one row left for it, the detail follows a dim `cursor:` label
     /// on that row instead of a rule; one too long for it is the marker.
     #[test]
@@ -10171,5 +10334,117 @@ mod reward_share_tests {
             title.contains("Credited [Q/d 60m/24h] 36.0/-"),
             "rewards: {title}"
         );
+    }
+}
+
+#[cfg(test)]
+mod severity_mark_tests {
+    use super::tests::{node_condition, node_report};
+    use super::*;
+
+    /// A model with an error, a warning and an info condition from the
+    /// node, every level shown.
+    fn model() -> Model {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.show_key_rows = false;
+        m.notice_minimum = NoticeSeverity::Info;
+        m.last_fetch_success = Some(std::time::Instant::now());
+        node_report(
+            &mut m,
+            vec![
+                node_condition(
+                    ConditionKind::GlobalHeadUnchanged,
+                    ConditionSeverity::Error,
+                    &[],
+                    1,
+                ),
+                node_condition(
+                    ConditionKind::LocalAppFramesUnchanged,
+                    ConditionSeverity::Warning,
+                    &[(&[0xaa], 1)],
+                    2,
+                ),
+                node_condition(
+                    ConditionKind::GlobalStateSyncInstalling,
+                    ConditionSeverity::Info,
+                    &[],
+                    1,
+                ),
+            ],
+            &[],
+        );
+        m
+    }
+
+    /// The rendered line holding `needle`.
+    fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} in\n{text}"))
+    }
+
+    /// With colors off a notice's severity reads from a mark after its
+    /// time, `!` for a warning and `!!` for an error, on both tabs at
+    /// 80x24 and wider; info, and every notice with colors on, carry none,
+    /// and `--render --notices` names the severity once, as a word.
+    #[test]
+    fn colorless_notices_carry_their_severity_mark() {
+        let mut m = model();
+        for (width, height) in [(80, 24), (120, 40)] {
+            m.color_coding = false;
+            let text = render_text(&mut m, width, height);
+            assert!(
+                line_with(&text, "Global head unchanged").contains(" UTC] !! Global head"),
+                "no severity mark\n{text}"
+            );
+            assert!(
+                line_with(&text, "Local app frames unchanged").contains(" UTC] ! Local app frames"),
+                "no severity mark\n{text}"
+            );
+            assert!(
+                line_with(&text, "GLOBAL state sync").contains(" UTC] GLOBAL state sync"),
+                "{text}"
+            );
+            m.color_coding = true;
+            let text = render_text(&mut m, width, height);
+            assert!(!text.contains(" UTC] !"), "{text}");
+        }
+        m.color_coding = false;
+        let notices = notice_text(&mut m);
+        assert!(
+            line_with(&notices, "Global head unchanged").contains(" UTC] ERROR Global head"),
+            "severity mark in notices\n{notices}"
+        );
+        assert!(
+            line_with(&notices, "Local app frames unchanged")
+                .contains(" UTC] WARN Local app frames"),
+            "severity mark in notices\n{notices}"
+        );
+        assert!(
+            !notices.contains('!'),
+            "severity mark in notices\n{notices}"
+        );
+    }
+
+    /// The Coins tab's notices carry the same marks: a failed reward read
+    /// is a warning.
+    #[test]
+    fn colorless_coins_notices_carry_their_severity_mark() {
+        let mut m = model();
+        m.reward_loaded = true;
+        m.reward_error = Some("timed out".into());
+        coins::open(&mut m);
+        for (width, height) in [(80, 24), (120, 40)] {
+            m.color_coding = false;
+            let text = render_text(&mut m, width, height);
+            assert!(
+                line_with(&text, "Reward: read failed").contains(" UTC] ! Reward: read failed"),
+                "no severity mark\n{text}"
+            );
+            m.color_coding = true;
+            let text = render_text(&mut m, width, height);
+            assert!(!text.contains(" UTC] !"), "{text}");
+        }
     }
 }

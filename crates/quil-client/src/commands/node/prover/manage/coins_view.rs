@@ -343,10 +343,15 @@ pub(super) fn notice_lines(m: &mut Model, width: u16) -> Vec<Line<'static>> {
         } else {
             String::new()
         };
+        let mark = if notice.success {
+            ""
+        } else {
+            severity_mark(m, notice.severity)
+        };
         lines.extend(wrap_message(
             Line::from(Span::styled(
                 format!(
-                    "{}{marker}{}",
+                    "{}{mark}{marker}{}",
                     message_timestamp(m.coins.notice_since.get(notice.key).copied()),
                     notice.text
                 ),
@@ -544,17 +549,41 @@ fn keep_in_view(
 /// Rows the panel scrolls: first shown, total and shown.
 type Scroll = Option<(usize, usize, usize)>;
 
-/// A panel's `notes` with no rows above them, pinned to its last lines
-/// as a detail under rows is; a panel too short for them ends in the
-/// enlarge marker.
-fn pinned_notes(notes: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
-    pin_detail(Vec::new(), fit_lines(notes, width, height), height)
+/// A middle panel's lines and the rows its notes block takes at their
+/// bottom, the `notes` rule's included; 0 with no notes or no rule.
+type Body = (Vec<Line<'static>>, usize);
+
+/// A panel's `notes` with no rows above them, under their `notes` rule
+/// on its last lines, as under rows; notes exactly as tall as the panel
+/// keep every line without the rule, and a panel too short for them ends
+/// in the enlarge marker.
+fn pinned_notes(notes: Vec<Line<'static>>, width: u16, height: u16) -> Body {
+    if notes.len() == usize::from(height) {
+        return (notes, 0);
+    }
+    let block = notes_block(notes, width, usize::from(height));
+    let taken = block.len();
+    (pin_detail(Vec::new(), block, height), taken)
+}
+
+/// `rows`, then the panel's `notes` under their rule on its last lines,
+/// in the rows [`notes_limit`] leaves under `keep` lines.
+fn pinned_under(
+    rows: Vec<Line<'static>>,
+    notes: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+    keep: u16,
+) -> Body {
+    let block = notes_block(notes, width, notes_limit(width, height, keep));
+    let taken = block.len();
+    (pin_detail(rows, block, height), taken)
 }
 
 /// The Claim status panel in `height` rows: a mint or claim under way and
 /// the authorizations saved for a claim. The reward's amount, frame and
 /// state are its Balances row's, ‹M› the `Reward claimable` notice's.
-fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
+fn claim_lines(m: &Model, width: u16, height: u16) -> Body {
     let mut lines = Vec::new();
     if super::super::mint::running(m) {
         lines = wrap_message(
@@ -572,13 +601,14 @@ fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
         );
     }
     let rest = usize::from(height).saturating_sub(lines.len());
-    lines.extend(saved_lines(m, width, rest));
-    lines
+    let (saved, notes) = saved_lines(m, width, rest);
+    lines.extend(saved);
+    (lines, notes)
 }
 
 /// The authorizations `token mint` saved, newest first, one row each with
 /// the Claim status cursor, in `rows` lines.
-fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
+fn saved_lines(m: &Model, width: u16, rows: usize) -> Body {
     let help = Style::new().fg(HELP);
     let saved = &m.coins.mint.saved;
     if saved.is_empty() {
@@ -634,20 +664,16 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
     ))];
     let height = u16::try_from(rows).unwrap_or(u16::MAX);
-    let note = fit_detail(
-        wrap_message(
-            Line::from(Span::styled(
-                "State: this node reports no authorization status; ‹C› checks for the finalized \
-                 witness before it claims.",
-                help,
-            )),
-            width,
-        ),
+    let note = wrap_message(
+        Line::from(Span::styled(
+            "State: this node reports no authorization status; ‹C› checks for the finalized \
+             witness before it claims.",
+            help,
+        )),
         width,
-        height,
-        2,
     );
-    let visible = rows.saturating_sub(1 + note.len()).max(1);
+    let shown = notes_block(note.clone(), width, notes_limit(width, height, 2)).len();
+    let visible = rows.saturating_sub(1 + shown).max(1);
     let focused = m.coins.focus == CoinsFocus::Middle;
     let first = m.coins.mint.cursor.saturating_sub(visible - 1);
     for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
@@ -664,12 +690,13 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
             style,
         )));
     }
-    pin_detail(lines, note, height)
+    pinned_under(lines, note, width, height, 2)
 }
 
-/// The middle panel's title and lines: a confirmation while one is open;
-/// else the selected Balances row's panel ([`Middle`]).
-fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+/// The middle panel's title, lines, the rows of its notes block and
+/// scroll: a confirmation while one is open; else the selected Balances
+/// row's panel ([`Middle`]).
+fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Body, Scroll) {
     match &m.coins.transfer.dialog {
         Some(TransferDialog::Form(form)) => {
             let title = if form.pending {
@@ -677,20 +704,27 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             } else {
                 "Transfer"
             };
-            return (title.into(), form_lines(form, width, m.mask_private), None);
+            return (
+                title.into(),
+                (form_lines(form, width, m.mask_private), 0),
+                None,
+            );
         }
         Some(TransferDialog::Confirm(preview)) => {
             let title = format!("Confirm {}", preview.kind.name().to_lowercase());
             let lines = transfer_confirm_lines(preview, width, m.mask_private);
-            return (title, lines, None);
+            return (title, (lines, 0), None);
         }
         Some(TransferDialog::Preparing(_)) => {
             return (
                 Middle::Transfers.title().into(),
-                vec![Line::from(Span::styled(
-                    format!("{} Checking the inputs and quoting the fee…", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} Checking the inputs and quoting the fee…", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -703,7 +737,7 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
                 MintStage::Claim { .. } => "Confirm claim",
             };
             let lines = mint_confirm_lines(preview, width, m.mask_private);
-            return (title.into(), lines, None);
+            return (title.into(), (lines, 0), None);
         }
         Some(MintDialog::Preparing(_, claim)) => {
             let text = if *claim {
@@ -713,10 +747,13 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             };
             return (
                 Middle::Claim.title().into(),
-                vec![Line::from(Span::styled(
-                    format!("{} {text}", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} {text}", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -750,7 +787,7 @@ fn escrow_label(m: &Model, address: &[u8; 32]) -> String {
 
 /// The Transfers panel: one row per pending transfer this wallet can act
 /// on, under the panel's cursor, in `height` rows.
-fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
+fn transfer_lines(m: &Model, width: u16, height: u16) -> Body {
     let help = Style::new().fg(HELP);
     let transfers = &m.coins.transfer;
     let note =
@@ -823,12 +860,13 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
         )
     };
     // The read's time is the shielded row's `As of`.
-    let footer = fit_detail(note(actions.into(), help), width, height, 2);
+    let footer = note(actions.into(), help);
     let mut lines = vec![Line::from(Span::styled(
         line(headers),
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
     ))];
-    let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
+    let shown = notes_block(footer.clone(), width, notes_limit(width, height, 2)).len();
+    let visible = usize::from(height).saturating_sub(1 + shown).max(1);
     let focused = m.coins.focus == CoinsFocus::Middle;
     let first = transfers.cursor.saturating_sub(visible - 1);
     for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
@@ -845,7 +883,7 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
             style,
         )));
     }
-    pin_detail(lines, footer, height)
+    pinned_under(lines, footer, width, height, 2)
 }
 
 /// A long address by its ends and length; the form and confirmation keep
@@ -1056,22 +1094,25 @@ fn transfer_confirm_lines(preview: &TransferPreview, width: u16, mask: bool) -> 
 
 /// The Shield plan panel's title and lines: the confirmation while it is
 /// open, else one row per `token shield-all` batch and its footer.
-fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Body, Scroll) {
     match &m.coins.shield.dialog {
         Some(Dialog::Confirm(preview)) => {
             return (
                 "Confirm shield".into(),
-                confirm_lines(preview, width, height, m.mask_private),
+                (confirm_lines(preview, width, height, m.mask_private), 0),
                 None,
             );
         }
         Some(Dialog::Preparing(_)) => {
             return (
                 "Shield plan".into(),
-                vec![Line::from(Span::styled(
-                    format!("{} Reading coins and quoting fees…", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} Reading coins and quoting fees…", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -1081,7 +1122,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     // Before a read or with no key, the legacy row's `loading`,
     // `unavailable` or `no key` says why there is no plan.
     let Some((Some(snapshot), _, _)) = &m.coins.legacy.answer else {
-        return ("Shield plan".into(), Vec::new(), None);
+        return ("Shield plan".into(), (Vec::new(), 0), None);
     };
     let mut footer = Vec::new();
     if let Some((frame, left)) = coins::shields_open_at(m) {
@@ -1106,11 +1147,14 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     footer.push(Line::from(Span::styled(summary, help)));
     let rows = &snapshot.batches;
     let count = rows.len();
-    // The footer keeps to the panel's bottom, under batch rows or alone.
-    if count > 0 {
-        footer = fit_detail(footer, width, height, 2);
-    }
-    let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
+    // The footer keeps to the panel's bottom under its `notes` rule,
+    // under batch rows or alone.
+    let shown = if count > 0 {
+        notes_block(footer.clone(), width, notes_limit(width, height, 2)).len()
+    } else {
+        0
+    };
+    let visible = usize::from(height).saturating_sub(1 + shown).max(1);
     m.coins.plan_cursor = m.coins.plan_cursor.min(count.saturating_sub(1));
     m.coins.plan_offset = clamp_offset(m.coins.plan_offset, m.coins.plan_cursor, visible, count);
     let mut lines = Vec::new();
@@ -1159,13 +1203,13 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
             )));
         }
     }
-    let lines = if count > 0 {
-        pin_detail(lines, footer, height)
+    let body = if count > 0 {
+        pinned_under(lines, footer, width, height, 2)
     } else {
         pinned_notes(footer, width, height)
     };
     let scroll = (count > visible).then_some((m.coins.plan_offset, count, visible));
-    ("Shield plan".into(), lines, scroll)
+    ("Shield plan".into(), body, scroll)
 }
 
 /// The mint confirmation: the stage and its exact inputs; `mask` hides the
@@ -1491,7 +1535,7 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     });
     render_cursor_rule(f, chunks[1], inner, detail_rows, border);
     let plan_area = chunks[2];
-    let (title, lines, scroll) = middle_lines(
+    let (title, (lines, notes), scroll) = middle_lines(
         m,
         plan_area.width.saturating_sub(2),
         plan_area.height.saturating_sub(2),
@@ -1502,13 +1546,16 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
             m.coins.transfer.dialog,
             Some(TransferDialog::Confirm(_) | TransferDialog::Form(_))
         );
-    let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
+    let focused = dialog || m.coins.focus == CoinsFocus::Middle;
+    let block = bordered(title, focused);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
     f.render_widget(
         Paragraph::new(fit_lines(lines, inner.width, inner.height)),
         inner,
     );
+    let border = Style::new().fg(if focused { PRIMARY } else { DIM });
+    render_notes_rule(f, plan_area, inner, notes, 0, border);
     if let Some((offset, total, visible)) = scroll {
         render_scroll_hint(f, plan_area, offset, total, visible, 0, 0);
     }
@@ -1949,7 +1996,8 @@ mod coins_render_tests {
     }
 
     /// With the reward row selected the Claim status's note keeps to the
-    /// panel's last lines, blank lines above it, at every size.
+    /// panel's last lines under its `notes` rule, blank lines above it, at
+    /// every size.
     #[test]
     fn the_claim_status_note_keeps_to_the_bottom() {
         let mut m = loaded();
@@ -1963,7 +2011,9 @@ mod coins_render_tests {
             assert!(note[0].starts_with("Saved authorizations: none"), "{text}");
             assert!(claim.len() > note.len(), "{text}");
             assert_eq!(claim[claim.len() - note.len()..], note[..], "{text}");
-            assert!(claim[claim.len() - note.len() - 1].is_empty(), "{text}");
+            let rule = &claim[claim.len() - note.len() - 1];
+            assert!(is_notes_rule(rule), "no notes rule\n{text}");
+            assert!(claim[claim.len() - note.len() - 2].is_empty(), "{text}");
         }
     }
 
@@ -2093,7 +2143,8 @@ mod coins_render_tests {
     }
 
     /// A first read under way shows as the row's `reading` and its
-    /// progress notice; the Transfers panel keeps only its actions note.
+    /// progress notice; the Transfers panel keeps only its actions note
+    /// under its `notes` rule.
     #[test]
     fn a_first_read_shows_in_the_row_and_its_notice_only() {
         let mut m = loaded();
@@ -2103,8 +2154,9 @@ mod coins_render_tests {
         m.coins.transfer.reading = Some(Instant::now());
         let text = render_text(&mut m, 120, 50);
         let transfers = non_blank(&panel_inner(&text, "Transfers"));
-        assert_eq!(transfers.len(), 1, "{text}");
-        assert!(transfers[0].starts_with("‹T› transfers"), "{text}");
+        assert_eq!(transfers.len(), 2, "{text}");
+        assert!(is_notes_rule(&transfers[0]), "{text}");
+        assert!(transfers[1].starts_with("‹T› transfers"), "{text}");
         let notices = panel_inner(&text, "Notifications").join(" ");
         assert!(
             notices.contains("Shielded coins: reading the coins and pending transfers"),
@@ -3126,6 +3178,41 @@ mod coins_render_tests {
         m
     }
 
+    /// A middle panel's notes sit under a `├─ notes ─┤` rule on its last
+    /// lines at 80x24 and wider: the Shield plan's footer under its batch
+    /// rows, the Transfers note with no rows.
+    #[test]
+    fn middle_panel_notes_sit_under_a_notes_rule() {
+        let mut m = with_rows();
+        m.show_key_rows = false;
+        let rule = |inner: &[String], notes: usize, text: &str| {
+            let line = &inner[inner.len() - notes - 1];
+            assert!(is_notes_rule(line), "no notes rule\n{text}");
+        };
+        for (width, height) in [(80, 24), (120, 40)] {
+            m.coins.cursor = 1;
+            let text = render_text(&mut m, width, height);
+            let plan = panel_inner(&text, "Shield plan");
+            assert_eq!(
+                plan.last().map(String::as_str),
+                Some("Batches: 2 of ≤96 coins; 1 coins on no live shard"),
+                "{text}"
+            );
+            rule(&plan, 1, &text);
+            assert!(plan[0].starts_with("Batch"), "{text}");
+            assert!(plan[1].starts_with("1/2"), "{text}");
+            m.coins.cursor = 2;
+            let text = render_text(&mut m, width, height);
+            let transfers = panel_inner(&text, "Transfers");
+            assert_eq!(
+                transfers.last().map(String::as_str),
+                Some("‹T› transfers, ‹P› makes a pending transfer, ‹J› merges coins."),
+                "{text}"
+            );
+            rule(&transfers, 1, &text);
+        }
+    }
+
     /// In a Balances panel taller than its content the cursor row's
     /// detail fills its last lines, as Allocations does, the rows at the
     /// top.
@@ -3266,7 +3353,7 @@ mod coins_render_tests {
             ];
         }
         for height in [2u16, 3] {
-            let (_, lines, _) = plan_lines(&mut m, 100, height);
+            let (_, (lines, _), _) = plan_lines(&mut m, 100, height);
             let lines: Vec<String> = lines.iter().map(Line::to_string).collect();
             assert_eq!(lines.len(), usize::from(height), "{lines:?}");
             assert!(lines[0].starts_with("Batch"), "{lines:?}");
@@ -3284,6 +3371,7 @@ mod coins_render_tests {
     fn claim_text(m: &Model, width: u16) -> Vec<String> {
         non_blank(
             &claim_lines(m, width - 2, 200)
+                .0
                 .iter()
                 .map(|line| line.to_string().trim().to_string())
                 .collect::<Vec<_>>(),
@@ -3295,6 +3383,19 @@ mod coins_render_tests {
             .iter()
             .filter(|line| !line.is_empty())
             .cloned()
+            .collect()
+    }
+
+    /// Whether a trimmed panel line is its `├─ notes ─┤` rule.
+    fn is_notes_rule(line: &str) -> bool {
+        line.starts_with("├─ notes ─") && line.ends_with('┤')
+    }
+
+    /// A panel's lines with text, its `notes` rule left out.
+    fn note_text(lines: &[String]) -> Vec<String> {
+        non_blank(lines)
+            .into_iter()
+            .filter(|line| !is_notes_rule(line))
             .collect()
     }
 
@@ -3315,7 +3416,7 @@ mod coins_render_tests {
         for show in [false, true] {
             m.show_key_rows = show;
             let text = render_text(&mut m, 80, 24);
-            let claim = non_blank(&panel_inner(&text, "Claim status"));
+            let claim = note_text(&panel_inner(&text, "Claim status"));
             if !show || claim.len() >= want.len() {
                 assert!(claim.len() >= want.len(), "{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
@@ -3395,6 +3496,29 @@ mod coins_render_tests {
         assert_eq!(claim[shown], "… enlarge panel for details", "{text}");
     }
 
+    /// A Claim status exactly as tall as its note keeps every note line
+    /// without the `notes` rule, never the rule over the enlarge marker.
+    #[test]
+    fn a_claim_status_as_tall_as_its_note_drops_the_rule() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        let want = claim_text(&m, 80);
+        assert!(want.len() > 1, "{want:?}");
+        let mut seen = false;
+        for lower in (-8..=0).rev() {
+            m.coins.edges = [0, lower];
+            let text = render_text(&mut m, 80, 24);
+            let claim = panel_inner(&text, "Claim status");
+            if claim.len() == want.len() {
+                assert_eq!(claim, want, "rule over the enlarge marker\n{text}");
+                seen = true;
+            }
+        }
+        assert!(seen, "no Claim status {} lines tall", want.len());
+    }
+
     /// Balances' moved lower edge takes Notifications' spare lines before
     /// the middle panel's: at 80x24 with the edges [1, 0] (a live
     /// `coinsPanelEdges`) the Claim status keeps every line, and while
@@ -3428,7 +3552,7 @@ mod coins_render_tests {
             // The live case, and any split that leaves the middle panel
             // the Claim status's lines.
             if upper <= 1 || middle >= want.len() {
-                let claim = non_blank(&panel_inner(&text, "Claim status"));
+                let claim = note_text(&panel_inner(&text, "Claim status"));
                 assert!(claim.len() >= want.len(), "edges [{upper}, 0]\n{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
             }
