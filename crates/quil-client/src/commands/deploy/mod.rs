@@ -179,15 +179,17 @@ impl DeployCtx {
     /// from the config replay frame, the digest of the application's metadata
     /// vertex as the node holds it (`vertex` when already read); before it,
     /// nothing. Within [`SIGNING_BINDING_MARGIN_FRAMES`] of the frame it
-    /// refuses, as nodes may judge the update either way.
+    /// refuses, as nodes may judge the update either way. On mainnet the
+    /// update is signed unbound only while this host's clock shows the
+    /// frame cannot have come ([`mainnet_binds_update`]).
     pub(super) async fn update_binding(
         &self,
         client: &mut NodeServiceClient<Channel>,
         domain: &[u8],
         vertex: Option<&[u8]>,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        let from =
-            quil_execution::config_replay::init_config_replay_frame(self.node_config.p2p.network);
+        let network = self.node_config.p2p.network;
+        let from = quil_execution::config_replay::init_config_replay_frame(network);
         let head = client
             .get_node_info(tonic::Request::new(
                 quil_types::proto::node::GetNodeInfoRequest::default(),
@@ -196,7 +198,15 @@ impl DeployCtx {
             .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
             .into_inner()
             .last_global_head_frame;
-        if !binds_update(head, from)? {
+        let binds = if network == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+            mainnet_binds_update(head, from, now)?
+        } else {
+            binds_update(head, from)?
+        };
+        if !binds {
             return Ok(None);
         }
         let vertex = match vertex {
@@ -339,10 +349,18 @@ const SIGNING_BINDING_MARGIN_FRAMES: u64 =
 
 /// Whether an update signed at GLOBAL head `head` binds the metadata vertex
 /// it replaces, for config replay frame `from`; an error within
-/// [`SIGNING_BINDING_MARGIN_FRAMES`] of the frame.
+/// [`SIGNING_BINDING_MARGIN_FRAMES`] of the frame, and when the node
+/// reports no GLOBAL head: a node that has not synced cannot say which
+/// side of the frame the network is on.
 fn binds_update(head: u64, from: u64) -> anyhow::Result<bool> {
     if from == 0 || head >= from.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) {
         return Ok(true);
+    }
+    if head == 0 {
+        anyhow::bail!(
+            "updates sign the state they replace from GLOBAL frame {from}, and the node \
+             reports no GLOBAL head yet, so nothing was sent; retry once it has synced"
+        );
     }
     if head.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) < from {
         return Ok(false);
@@ -352,6 +370,46 @@ fn binds_update(head: u64, from: u64) -> anyhow::Result<bool> {
          an update signed now may be judged either way, so nothing was sent; retry after \
          frame {}",
         from.saturating_add(SIGNING_BINDING_MARGIN_FRAMES)
+    )
+}
+
+/// A mainnet GLOBAL frame the head had not passed at a time (Unix seconds):
+/// frame 1,074,300 was the head at 2026-11-13 23:24:06 UTC; the frame
+/// here leaves room above it.
+const MAINNET_HEAD_CEILING_AT: (u64, u64) = (1_794_612_246, 1_076_000);
+
+/// The highest frame the mainnet GLOBAL head can have reached at `now`
+/// (Unix seconds), one frame per [`FASTEST_FRAME_SECS`] at most.
+fn mainnet_head_ceiling(now: u64) -> u64 {
+    let (at, frame) = MAINNET_HEAD_CEILING_AT;
+    frame.saturating_add(now.saturating_sub(at) / FASTEST_FRAME_SECS)
+}
+
+/// [`binds_update`] on mainnet, where this host's clock bounds the head the
+/// node reports: an update is signed unbound only while the clock shows the
+/// head cannot be within [`SIGNING_BINDING_MARGIN_FRAMES`] of `from`, and
+/// then a head above what the clock allows means the clock is behind. Past
+/// that, the head decides as in [`binds_update`], however high it is: a
+/// node reporting a head before the frame is behind the network, and
+/// nothing is sent.
+fn mainnet_binds_update(head: u64, from: u64, now: u64) -> anyhow::Result<bool> {
+    let ceiling = mainnet_head_ceiling(now);
+    if ceiling.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) < from {
+        if head > ceiling.saturating_add(SIGNING_BINDING_MARGIN_FRAMES) {
+            anyhow::bail!(
+                "the node reports GLOBAL head {head}, past the highest frame this host's \
+                 clock allows ({ceiling}): set the clock right; nothing was sent"
+            );
+        }
+        return Ok(false);
+    }
+    if binds_update(head, from)? {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "updates sign the state they replace from GLOBAL frame {from}, which the network may \
+         have reached by now, and the node reports GLOBAL head {head}: it is behind, so \
+         nothing was sent; retry once it has synced"
     )
 }
 
@@ -404,6 +462,67 @@ mod tests {
             assert!(
                 unbound.is_err(),
                 "UNBOUND-AT-HEAD-ZERO: from {from}: {unbound:?}"
+            );
+        }
+    }
+
+    /// On mainnet an update is signed unbound only while the clock shows
+    /// the head cannot be near the frame; later, a node reporting a head
+    /// before it is behind and nothing is signed.
+    #[test]
+    fn a_mainnet_update_is_unbound_only_while_the_clock_rules_out_the_frame() {
+        use super::{
+            mainnet_binds_update, mainnet_head_ceiling, FASTEST_FRAME_SECS,
+            MAINNET_HEAD_CEILING_AT, SIGNING_BINDING_MARGIN_FRAMES as MARGIN,
+        };
+        let from = quil_execution::config_replay::MAINNET_CONFIG_REPLAY_FRAME;
+        let (at, frame) = MAINNET_HEAD_CEILING_AT;
+        assert!(frame + MARGIN < from, "the ceiling starts before the frame");
+        assert_eq!(mainnet_head_ceiling(at), frame);
+        assert_eq!(
+            mainnet_head_ceiling(at + 10 * FASTEST_FRAME_SECS),
+            frame + 10
+        );
+        // While the clock rules the frame out, any head the node reports
+        // up to the ceiling signs unbound.
+        for head in [0, frame - 1_000, frame + MARGIN] {
+            assert!(!mainnet_binds_update(head, from, at).unwrap());
+        }
+        // A head above what the clock allows: the clock is behind.
+        assert!(mainnet_binds_update(frame + MARGIN + 1, from, at).is_err());
+        // Once the clock allows the frame, a head before it is behind.
+        let later = at + (from - frame) * FASTEST_FRAME_SECS;
+        for head in [0, frame, from - MARGIN - 1] {
+            let unbound = mainnet_binds_update(head, from, later);
+            eprintln!("REACH mainnet-clock head={head} result={unbound:?}");
+            assert!(
+                unbound.is_err(),
+                "UNBOUND-PAST-CLOCK: head {head}: {unbound:?}"
+            );
+        }
+        assert!(mainnet_binds_update(from + MARGIN, from, later).unwrap());
+    }
+
+    /// Once the clock allows the frame, the head the node reports decides,
+    /// however far above the clock's ceiling: a network that runs faster
+    /// than the fastest frame time still gets updates signed bound.
+    #[test]
+    fn a_mainnet_head_past_the_frame_binds_above_the_clock_ceiling() {
+        use super::{
+            mainnet_binds_update, mainnet_head_ceiling, FASTEST_FRAME_SECS,
+            MAINNET_HEAD_CEILING_AT, SIGNING_BINDING_MARGIN_FRAMES as MARGIN,
+        };
+        let from = quil_execution::config_replay::MAINNET_CONFIG_REPLAY_FRAME;
+        let (at, frame) = MAINNET_HEAD_CEILING_AT;
+        let later = at + (from - frame) * FASTEST_FRAME_SECS;
+        for now in [later, later + 86_400] {
+            let ceiling = mainnet_head_ceiling(now);
+            let head = ceiling + 100 * MARGIN;
+            let bound = mainnet_binds_update(head, from, now);
+            eprintln!("REACH clock-past-frame ceiling={ceiling} head={head} result={bound:?}");
+            assert!(
+                matches!(bound, Ok(true)),
+                "CLOCK-REFUSAL-PAST-FRAME: head {head}: {bound:?}"
             );
         }
     }
