@@ -138,23 +138,69 @@ fn owned_filters(
     address: &[u8],
     frame_number: u64,
 ) -> std::collections::HashSet<Vec<u8>> {
-    let Ok(Some(info)) = registry.get_prover_info(address) else {
-        return std::collections::HashSet::new();
-    };
+    match registry.get_prover_info(address) {
+        Ok(Some(info)) => owned_filters_of(&info, frame_number),
+        _ => std::collections::HashSet::new(),
+    }
+}
+
+/// [`owned_filters`] of one registry read.
+fn owned_filters_of(
+    info: &quil_types::consensus::ProverInfo,
+    frame_number: u64,
+) -> std::collections::HashSet<Vec<u8>> {
     info.allocations
         .iter()
-        .filter(|a| {
-            // Same predicate as `GetNodeInfo`. `ExpiredEpoch` is an Active
-            // data-shard allocation that missed this epoch's re-confirm: not
-            // live, but not lost either — it comes back the moment the prover
-            // re-registers. `status` shows it as `re-confirm!`, so dropping it
-            // here would put the two surfaces back into disagreement over
-            // exactly the allocation the operator most needs to act on.
-            let eff = a.effective_status(frame_number);
-            eff.is_live() || eff == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-        })
+        .filter(|a| owned(a, frame_number))
         .map(|a| a.confirmation_filter.clone())
         .collect()
+}
+
+/// Whether the prover owns allocation `a` at `frame_number`.
+fn owned(a: &quil_types::consensus::ProverAllocationInfo, frame_number: u64) -> bool {
+    // Same predicate as `GetNodeInfo`. `ExpiredEpoch` is an Active
+    // data-shard allocation that missed this epoch's re-confirm: not
+    // live, but not lost either — it comes back the moment the prover
+    // re-registers. `status` shows it as `re-confirm!`, so dropping it
+    // here would put the two surfaces back into disagreement over
+    // exactly the allocation the operator most needs to act on.
+    let eff = a.effective_status(frame_number);
+    eff.is_live() || eff == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+}
+
+/// The first epoch each of the prover's owned allocations was active in, by
+/// filter: the epoch after its join confirmed (`EffectiveStatus` defers
+/// activation to that boundary), 0 for one confirmed before the field was
+/// recorded, and never (`u64::MAX`) for one still joining. Where a filter has
+/// more than one, the earliest. Empty for a prover the registry lacks
+/// (`info` `None`).
+fn seat_active_epochs(
+    info: Option<&quil_types::consensus::ProverInfo>,
+    frame_number: u64,
+) -> std::collections::BTreeMap<Vec<u8>, u64> {
+    use quil_types::consensus::{epoch_for_frame, ProverStatus};
+    let mut epochs = std::collections::BTreeMap::new();
+    let Some(info) = info else {
+        return epochs;
+    };
+    for a in &info.allocations {
+        // The same allocations as `owned_filters`.
+        if !owned(a, frame_number) {
+            continue;
+        }
+        let from = match a.status {
+            ProverStatus::Joining => u64::MAX,
+            _ if a.join_confirm_frame_number > 0 => {
+                epoch_for_frame(a.join_confirm_frame_number) + 1
+            }
+            _ => 0,
+        };
+        epochs
+            .entry(a.confirmation_filter.clone())
+            .and_modify(|e: &mut u64| *e = (*e).min(from))
+            .or_insert(from);
+    }
+    epochs
 }
 
 pub(crate) struct GrpcArgs {
@@ -3674,11 +3720,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 tokio::task::spawn_blocking(move || {
                     let now = super::frame_observations::unix_seconds();
                     let mut filters = std::collections::BTreeSet::new();
-                    filters.extend(owned_filters(
+                    // One registry read serves the owned filters and the
+                    // seats' first active epochs (`None` when unreadable).
+                    let frame = head.effective();
+                    let info = quil_types::consensus::ProverRegistry::get_prover_info(
                         registry.as_ref(),
                         &prover_address,
-                        head.effective(),
-                    ));
+                    );
+                    if let Ok(Some(info)) = &info {
+                        filters.extend(owned_filters_of(info, frame));
+                    }
+                    let active_from = info
+                        .as_ref()
+                        .ok()
+                        .map(|info| seat_active_epochs(info.as_ref(), frame));
                     filters.extend(
                         quil_engine::worker::WorkerView::snapshot(wm.as_ref())
                             .all
@@ -3766,6 +3821,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             &committed,
                             &prover_address,
                             &seat_heads,
+                            active_from.as_ref(),
                             now,
                         );
                     }
@@ -6033,7 +6089,7 @@ mod active_prover_tests {
 
 #[cfg(test)]
 mod owned_filter_tests {
-    use super::{health_allocations, owned_filters};
+    use super::{health_allocations, owned_filters, seat_active_epochs};
     use quil_types::consensus::{
         EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverRegistry, ProverShardSummary,
         ProverStatus,
@@ -6168,6 +6224,38 @@ mod owned_filter_tests {
         let owned = owned_filters(&reg, &ADDRESS, 200);
         assert_eq!(owned.len(), 1, "the prover's own allocation went missing");
         assert!(owned.contains(&FILTER.to_vec()));
+    }
+
+    /// A seat is active from the epoch after its join confirmed, a legacy
+    /// one (no confirm frame) from the start, a joining one not yet; dead
+    /// allocations are not seats.
+    #[test]
+    fn a_seat_is_active_from_the_epoch_after_its_join_confirmed() {
+        let l = quil_types::consensus::epoch_length_frames();
+        let mut confirmed = allocation(&FILTER, ProverStatus::Active, 3 * l);
+        confirmed.join_confirm_frame_number = 3 * l + 5;
+        confirmed.epoch = 6;
+        let reg = registry(vec![
+            confirmed,
+            allocation(&[8; 4], ProverStatus::Active, 100),
+            allocation(&[9; 4], ProverStatus::Joining, 6 * l),
+            allocation(&[5; 4], ProverStatus::Kicked, 100),
+        ]);
+        let expected = std::collections::BTreeMap::from([
+            (FILTER.to_vec(), 4),
+            (vec![8; 4], 0),
+            (vec![9; 4], u64::MAX),
+        ]);
+        let info = reg.get_prover_info(&ADDRESS).unwrap();
+        assert_eq!(
+            seat_active_epochs(info.as_ref(), 6 * l + 1),
+            expected,
+            "active_epoch_wrong"
+        );
+        assert!(
+            seat_active_epochs(None, 6 * l + 1).is_empty(),
+            "a prover the registry lacks holds no seat"
+        );
     }
 
     /// Terminal, historic, unknown, and expired Joining/Leaving slots are not owned.
