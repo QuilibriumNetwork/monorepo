@@ -103,6 +103,9 @@ enum RecoveryFailure {
   RECOVERY_FAILURE_PROOF_VERIFICATION = 8;
   // This worker's shard engine did not answer the recovery in time.
   RECOVERY_FAILURE_ENGINE_BUSY = 9;
+  // A shard frame anchors to a GLOBAL frame this node's clock store does
+  // not hold: its GLOBAL view is behind, or has a hole the backfill fills.
+  RECOVERY_FAILURE_ANCHOR_FRAME_MISSING = 10;
 }
 
 message FailureCount {

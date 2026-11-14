@@ -61,7 +61,7 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 ];
 
 /// Every class [`failure_class`] gives a failed recovery attempt.
-pub const FAILURE_CLASSES: [&str; 9] = [
+pub const FAILURE_CLASSES: [&str; 10] = [
     NO_ARCHIVE,
     GLOBAL_SYNC,
     "connect",
@@ -71,6 +71,7 @@ pub const FAILURE_CLASSES: [&str; 9] = [
     "other",
     PROOF_VERIFICATION,
     ENGINE_BUSY,
+    ANCHOR_FRAME_MISSING,
 ];
 
 /// A worker's execution report with its store's state: a worker whose own
@@ -833,6 +834,35 @@ pub(crate) const PROOF_VERIFICATION: &str = "proof_verification";
 /// time ([`ENGINE_TIMEOUTS`]): this node's, busy with other work.
 pub(crate) const ENGINE_BUSY: &str = "engine_busy";
 
+/// The class of an attempt whose shard frame anchors to a GLOBAL frame
+/// this node's clock store does not hold ([`anchor_frame_unavailable`]):
+/// this node's GLOBAL view is behind that frame, or has a hole there that
+/// its GLOBAL frame-record backfill fills from the archives.
+pub(crate) const ANCHOR_FRAME_MISSING: &str = "anchor_frame_missing";
+
+/// What a shard frame's validation names before the number of a GLOBAL
+/// frame it found no local copy of, followed by " unavailable" ("storage
+/// frame: anchored global frame 120 unavailable for ρ_N (latest local
+/// global frame: 118)", "storage attestation: global frame 120
+/// unavailable: ..."), as `prover_tree_syncer::refuses_frame` groups them.
+const ANCHOR_FRAME_TEXTS: [&str; 2] = [
+    "anchored global frame ",
+    "storage attestation: global frame ",
+];
+
+/// Whether `error` names a GLOBAL frame a shard frame anchors to as
+/// unavailable: one of [`ANCHOR_FRAME_TEXTS`], the frame's number, then
+/// "unavailable".
+fn anchor_frame_unavailable(error: &str) -> bool {
+    ANCHOR_FRAME_TEXTS.iter().any(|text| {
+        error.match_indices(text).any(|(at, _)| {
+            let rest = &error[at + text.len()..];
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            digits > 0 && rest[digits..].starts_with(" unavailable")
+        })
+    })
+}
+
 /// Why an attempt that waited out this node's GLOBAL state sync within its
 /// budget (`prover_tree_syncer::waiting_out_global_sync`) installed
 /// nothing.
@@ -1294,13 +1324,18 @@ fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: In
 /// their proofs reported 24 peers' streaks of up to 908 "replay_mismatch"
 /// failures, and guidance promising a re-anchor (2026-10-31).
 /// "replay_mismatch" names only frames that do not apply to this worker's
-/// lineage: a pre-state, link, session or shard mismatch.
+/// lineage: a pre-state, link, session or shard mismatch. A missing anchor
+/// frame is matched before the texts that name an archive or a link, which
+/// a replay's error wraps it in: as "other", it told operators only to
+/// report it (2026-11-13).
 pub fn failure_class(error: &str) -> &'static str {
     use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
     if error.contains(GLOBAL_SYNC_IN_PROGRESS) || error.contains(GLOBAL_SYNC_STILL_INSTALLING) {
         GLOBAL_SYNC
     } else if waits_for_proof_verification(error) {
         PROOF_VERIFICATION
+    } else if anchor_frame_unavailable(error) {
+        ANCHOR_FRAME_MISSING
     } else if error.contains("no archive known")
         || error.contains("discovered an archive")
         || error.contains("archive discovery")
@@ -1391,6 +1426,13 @@ pub(crate) fn failure_guidance(class: &str) -> (&'static str, &'static str) {
             persists, check this worker's 'verifying inline' and stall lines"),
         "archive_state" => ("archive", "no archive supplied the shard state this worker needs; \
             it retries; report it with this line if it persists"),
+        ANCHOR_FRAME_MISSING => ("this node", "this node's clock store lacks the GLOBAL frame the \
+            shard frame anchors to; compare that frame with this node's latest GLOBAL frame (named \
+            in the error as its latest local global frame, when it names one, else this node's GLOBAL \
+            head): when the latest is below it, this node's GLOBAL view is behind and catches up; when \
+            above, the GLOBAL frame-record backfill fills the hole from the archives ('GLOBAL frame records missing below the head' \
+            lines); it retries; if it persists, check this node's outbound reach to the archives on \
+            port 8340 and 'record-only backfill could not fill every height' warns"),
         _ => ("this node", "report it with this line if it persists"),
     }
 }
@@ -2339,6 +2381,71 @@ mod tests {
         assert_eq!(scope, "this node");
         assert!(action.contains("expected wait, no action"), "{action}");
         assert!(!action.contains("report it"), "{action}");
+    }
+
+    /// A shard frame anchored to a GLOBAL frame this node's clock store
+    /// lacks is its own class, also inside a replay's error that names its
+    /// parent: classed "other", its guidance told operators only to report
+    /// it (2026-11-13). The guidance names the backfill and the archives'
+    /// port, and attempts are counted under the class.
+    #[tokio::test]
+    async fn a_missing_anchor_frame_is_its_own_class() {
+        let anchor = "storage frame: anchored global frame 120 unavailable for ρ_N \
+            (latest local global frame: 118)";
+        for error in [
+            format!("crypto error: {anchor}"),
+            format!(
+                "invalid argument: archive replay frame 9: crypto error: {anchor} (it names \
+                 parent 0a0b0c0d, its own certificate none; local frame 8 digest 0c0d0e0f; \
+                 session genesis it may name none)"
+            ),
+            "invalid argument: FrameHeader: anchored global frame 120 unavailable — cannot \
+                recompute output"
+                .into(),
+            "crypto error: storage attestation: global frame 120 unavailable: not found".into(),
+            "execution unavailable: archive replay of frame 9: crypto error: storage \
+                attestation: global frame 120 unavailable: not found"
+                .into(),
+        ] {
+            assert_eq!(
+                failure_class(&error),
+                "anchor_frame_missing",
+                "anchor_unclassed: {error}"
+            );
+        }
+        // Only the anchor frame's own unavailability: another word after
+        // its number, or "unavailable" elsewhere, is not this class.
+        for error in [
+            "crypto error: storage frame: anchored global frame 120 output mismatch; \
+                proof worker unavailable",
+            "execution unavailable: anchored global frame of the parent is unknown",
+        ] {
+            assert_ne!(failure_class(error), "anchor_frame_missing", "{error}");
+        }
+        let (scope, action) = failure_guidance("anchor_frame_missing");
+        assert_eq!(scope, "this node");
+        for text in [
+            "backfill",
+            "archives on port 8340",
+            "when it names one, else this node's GLOBAL head",
+        ] {
+            assert!(action.contains(text), "{text}: {action}");
+        }
+        let worker = SharedWorkerExecution::default();
+        for _ in 0..3 {
+            let _ = worker
+                .recovering(&[9; 32], async {
+                    Err(quil_types::error::QuilError::Crypto(anchor.into()))
+                })
+                .await;
+        }
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!(r.consecutive_failures, 3);
+        let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
+        assert_eq!(
+            classes,
+            BTreeMap::from([("anchor_frame_missing".into(), 3)])
+        );
     }
 
     /// An attempt that waited for this node's GLOBAL state sync is recorded

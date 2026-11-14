@@ -3409,6 +3409,11 @@ pub struct AppConsensusEngine {
     /// The authorized committee session the running `cw_handle` was built for.
     /// `None` on the legacy registry-committee path.
     cw_session: Option<quil_cw_consensus::handoff::Session>,
+    /// Failed reads of `cw_session`'s state from committed GLOBAL state by
+    /// [`Self::observe_consensus_phase`], other than this node's GLOBAL
+    /// state sync withholding it: logged at the first, at most every ten
+    /// minutes while they last, and at the read that ends them.
+    session_state_reads: std::sync::Mutex<crate::worker_execution::FailureStreak>,
     /// The committee keys of the running `cw_handle`, sorted: block ingress
     /// stores bodies only from them ([`Self::admits_block_sender`]).
     cw_members: Vec<Vec<u8>>,
@@ -3694,6 +3699,7 @@ impl AppConsensusEngine {
             cw_discarded_through_epoch: None,
             cw_committee_fp: None,
             cw_session: None,
+            session_state_reads: Default::default(),
             cw_members: Vec::new(),
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
@@ -10466,8 +10472,26 @@ impl AppConsensusEngine {
                 })
                 .transpose();
             match closing {
-                Ok(closing) => closing.unwrap_or(false),
-                Err(_) => {
+                Ok(closing) => {
+                    self.note_session_state_read(None);
+                    closing.unwrap_or(false)
+                }
+                // This node's GLOBAL state sync withholds committed GLOBAL
+                // state until its last chunk installs: an expected wait, not
+                // an unknown state. Read as one, every allocation of a node
+                // mid GLOBAL sync reported "session state unavailable"
+                // (2026-11-13).
+                Err(error)
+                    if quil_execution::global_intrinsic::handoff::global_sync_in_progress(
+                        &error,
+                    ) =>
+                {
+                    self.execution
+                        .state("waiting", "awaiting GLOBAL state sync");
+                    return;
+                }
+                Err(error) => {
+                    self.note_session_state_read(Some(&error));
                     self.execution.state("unknown", "session state unavailable");
                     return;
                 }
@@ -10477,6 +10501,44 @@ impl AppConsensusEngine {
         };
         self.execution
             .consensus_phase(ready, closing, session_id, sealed_id);
+    }
+
+    /// Log a failed read of this worker's session state from committed
+    /// GLOBAL state (`Some`), bounded, or a read that ended a logged run of
+    /// them (`None`).
+    fn note_session_state_read(&self, error: Option<&QuilError>) {
+        use crate::worker_execution::StreakLog;
+        let now = std::time::Instant::now();
+        let logged = {
+            let mut reads = self
+                .session_state_reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match error {
+                Some(_) => reads.failed("session_state", now, 1),
+                None => reads.succeeded(now),
+            }
+        };
+        match (logged, error) {
+            (Some(StreakLog::Failing { failures, duration }), Some(error)) => {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter), %error, failures,
+                    failing_secs = duration.as_secs(),
+                    "worker health cannot read its committee session's state from committed \
+                     GLOBAL state and reads unknown until a read succeeds; report it with this \
+                     line if it persists");
+            }
+            (Some(StreakLog::Ended { failures, duration }), _) => {
+                info!(
+                    core_id = self.core_id,
+                    filter = hex::encode(&self.filter),
+                    failures,
+                    failing_secs = duration.as_secs(),
+                    "worker health reads its committee session's state from committed GLOBAL \
+                     state again"
+                );
+            }
+            _ => {}
+        }
     }
 
     /// One batch of `session`'s outgoing-history walk through `through`, and
@@ -26783,6 +26845,87 @@ mod tests {
             error.to_string(),
             format!("execution unavailable: {GLOBAL_SYNC_IN_PROGRESS}")
         );
+    }
+
+    /// An engine whose worker serves the head session of
+    /// [`engine_with_sessions_from_seven`], its shard data staged, and
+    /// GLOBAL's state.
+    fn engine_serving_its_head_session(
+    ) -> (AppConsensusEngine, Arc<quil_hypergraph::HypergraphCrdt>) {
+        use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+        let (mut engine, _, _, global) = engine_with_sessions_from_seven(0x43, None);
+        let view = CommittedView::capture(&global).unwrap();
+        engine.cw_session = handoff::head(&view, &engine.filter).unwrap();
+        drop(view);
+        assert!(engine.cw_session.is_some());
+        engine
+            .data_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        (engine, global)
+    }
+
+    /// The phase and reason this worker's record gives once the engine
+    /// observed its consensus phase.
+    fn observed_phase(engine: &AppConsensusEngine) -> (String, String) {
+        engine.observe_consensus_phase();
+        let record = engine.execution.snapshot();
+        (record.state, record.blocker)
+    }
+
+    /// A worker's session state read from committed GLOBAL state that this
+    /// node's GLOBAL state sync withholds while it installs reads as that
+    /// wait, not as an unknown state: so read, every allocation of a regular
+    /// node mid GLOBAL sync reported "unknown / session state unavailable"
+    /// (2026-11-13).
+    #[tokio::test]
+    async fn a_global_sync_install_reads_as_its_wait_in_the_consensus_phase() {
+        use crate::outage::test_logs::CapturedLogs;
+        let (engine, global) = engine_serving_its_head_session();
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        assert_eq!(observed_phase(&engine), ("serving".into(), String::new()));
+        begin_global_sync(&global);
+        assert_eq!(
+            observed_phase(&engine),
+            ("waiting".into(), "awaiting GLOBAL state sync".into()),
+            "sync_wait_unlabelled"
+        );
+        assert!(
+            logs.lines_with("cannot read its committee session's state")
+                .is_empty(),
+            "a GLOBAL sync install is a wait, no failed read"
+        );
+    }
+
+    /// Any other failed read of a worker's session state from committed
+    /// GLOBAL state reads unknown, logged once with its error, not on every
+    /// observation, and the read that ends it is logged too: the failed
+    /// read's error was dropped (2026-11-13).
+    #[tokio::test]
+    async fn a_failed_session_state_read_is_logged_once_and_its_end() {
+        use crate::outage::test_logs::CapturedLogs;
+        let (mut engine, global) = engine_serving_its_head_session();
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        engine.global_hypergraph = None;
+        for _ in 0..3 {
+            assert_eq!(
+                observed_phase(&engine),
+                ("unknown".into(), "session state unavailable".into())
+            );
+        }
+        let failed = logs.lines_with("cannot read its committee session's state");
+        assert_eq!(failed.len(), 1, "read_failure_unlogged: {failed:?}");
+        assert!(
+            failed[0].contains("GLOBAL state unavailable") && failed[0].contains("failures=1"),
+            "{}",
+            failed[0]
+        );
+        engine.global_hypergraph = Some(global);
+        assert_eq!(observed_phase(&engine), ("serving".into(), String::new()));
+        let ended = logs.lines_with("committed GLOBAL state again");
+        assert_eq!(ended.len(), 1, "read_end_unlogged: {ended:?}");
+        assert!(ended[0].contains("failures=3"), "{}", ended[0]);
     }
 
     /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without
