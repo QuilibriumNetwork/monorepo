@@ -296,7 +296,7 @@ where
         retries += 1;
         super::output::err_detail(format!(
             "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
-            status.message(),
+            crate::util::status_text(&status),
             SCAN_READ_RETRY_DELAY.as_secs()
         ));
         tokio::time::sleep(SCAN_READ_RETRY_DELAY).await;
@@ -768,8 +768,8 @@ fn scan_stopped(
 ) -> anyhow::Error {
     let outlived = outlived_snapshot(&error, elapsed);
     let reason = match error.downcast_ref::<tonic::Status>() {
-        Some(status) => status.message().to_string(),
-        None => format!("{error:#}"),
+        Some(status) => crate::util::status_text(status),
+        None => crate::util::remote_text(&format!("{error:#}")),
     };
     anyhow::Error::new(ScanStopped {
         what,
@@ -3321,7 +3321,7 @@ impl RecipientWallet {
             Err(status) => {
                 super::output::detail(format!(
                     "Escrows past their refund frame rank as pending: no GLOBAL head ({}).",
-                    status.message()
+                    crate::util::status_text(&status)
                 ));
                 0
             }

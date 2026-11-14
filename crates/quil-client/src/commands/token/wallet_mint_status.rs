@@ -95,7 +95,11 @@ fn status_lines(
             lines.push(if status.reason.is_empty() {
                 format!("State: {}.", state_label(state))
             } else {
-                format!("State: {}: {}.", state_label(state), status.reason)
+                format!(
+                    "State: {}: {}.",
+                    state_label(state),
+                    crate::util::remote_text(&status.reason)
+                )
             });
             if status.found {
                 let (earliest, latest) = (status.inclusion_frame_earliest, status.inclusion_frame);
@@ -154,7 +158,7 @@ async fn report(
                 tonic::Code::Unimplemented | tonic::Code::Unavailable
             ) =>
         {
-            Reported::Not(status.message().to_string())
+            Reported::Not(crate::util::status_text(&status))
         }
         Err(status) => anyhow::bail!("mint authorization status: {status}"),
     };

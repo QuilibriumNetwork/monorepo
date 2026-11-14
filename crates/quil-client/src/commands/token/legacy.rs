@@ -577,7 +577,7 @@ async fn list_owner(
             Err(status) if status.code() == tonic::Code::Unimplemented => {
                 anyhow::bail!("the node asked cannot list legacy coins; upgrade it")
             }
-            Err(status) => anyhow::bail!("legacy coins: {}", status.message()),
+            Err(status) => anyhow::bail!("legacy coins: {}", crate::util::status_text(&status)),
         };
         *pages += 1;
         for coin in &page.coins {
@@ -1067,7 +1067,7 @@ async fn global_head(client: &Client) -> Result<u64, String> {
             0 => Err("the node reports no GLOBAL head yet".into()),
             frame => Ok(frame),
         },
-        Err(status) => Err(format!("node info: {}", status.message())),
+        Err(status) => Err(format!("node info: {}", crate::util::status_text(&status))),
     }
 }
 
@@ -1126,7 +1126,7 @@ pub(crate) async fn app_shards(
         .clone()
         .get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true })
         .await
-        .map_err(|e| anyhow::anyhow!("shard list: {}", e.message()))?
+        .map_err(|e| anyhow::anyhow!("shard list: {}", crate::util::status_text(&e)))?
         .into_inner()
         .shards;
     Ok(shards

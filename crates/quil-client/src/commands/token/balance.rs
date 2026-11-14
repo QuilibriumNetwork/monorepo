@@ -190,11 +190,12 @@ pub(crate) fn quil_brief(units: u128) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// A refusal's own message rather than tonic's whole status dump.
+/// A refusal's own message rather than tonic's whole status dump, as
+/// [`crate::util::remote_text`]: the node's text reaches the terminal.
 pub(super) fn reason(error: &anyhow::Error) -> String {
     match error.downcast_ref::<tonic::Status>() {
-        Some(status) => status.message().to_string(),
-        None => format!("{error:#}"),
+        Some(status) => crate::util::status_text(status),
+        None => crate::util::remote_text(&format!("{error:#}")),
     }
 }
 
