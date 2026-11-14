@@ -20,8 +20,8 @@
 //! - `ProverLeave::filterLen[i] <= 64`
 //! - `ProverPause/Resume::filterLen <= 64`
 //! - `sigLen <= 118` for all three — i.e. the signature payload
-//! must fit in a single-signer envelope; no aggregation on
-//! filter ops.
+//!   must fit in a single-signer envelope; no aggregation on
+//!   filter ops.
 
 use quil_types::error::{QuilError, Result};
 

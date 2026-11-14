@@ -7,7 +7,7 @@
 //!
 //! - Which QCT3 operations produce proof-bound QUIL fees on the producer domain.
 //! - Which message types **consume** a single fee, based on the boolean
-//! toggles in `Policy`.
+//!   toggles in `Policy`.
 //!
 //! Exported helpers:
 //!
@@ -17,7 +17,7 @@
 //! - [`needs_one_fee`] — per-request boolean predicate
 //! - [`pop_fee`] — pop next fee (zero on underflow, matching Go)
 //! - [`default_fee_market`] — the mainnet policy used by all three app
-//! engines (token, compute, hypergraph)
+//!   engines (token, compute, hypergraph)
 
 use num_bigint::BigInt;
 use num_traits::Zero;

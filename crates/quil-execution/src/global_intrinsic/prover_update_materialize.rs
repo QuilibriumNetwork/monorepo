@@ -44,7 +44,7 @@ pub fn prover_update_domain() -> Result<[u8; 32]> {
 /// Address)` under `vertex_adds`.
 /// 5. `poseidon(prover.PublicKey) == Address` (address binds to pubkey).
 /// 6. BLS48-581 G1 signature verifies over `DelegateAddress` with
-/// domain `PROVER_UPDATE`.
+///    domain `PROVER_UPDATE`.
 pub fn validate_prover_update(
     op: &ProverUpdate,
     state: &HypergraphState,
@@ -138,7 +138,7 @@ pub fn validate_prover_update(
 ///
 /// Steps:
 /// 1. Decode prover address from the addressed signature; compute the
-/// reward address `poseidon(QUIL_TOKEN || proverAddress)`.
+///    reward address `poseidon(QUIL_TOKEN || proverAddress)`.
 /// 2. Load the prover vertex; confirm `poseidon(PublicKey) ==
 /// proverAddress` (defense-in-depth).
 /// 3. Load (or create) the reward vertex.

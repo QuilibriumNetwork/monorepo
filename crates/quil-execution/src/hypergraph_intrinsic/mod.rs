@@ -3,9 +3,9 @@
 //!
 //! Contains:
 //! - `canonical`: length-prefixed binary serialization (byte-compatible
-//! with Go `protobufs/hypergraph.go` ToCanonicalBytes/FromCanonicalBytes).
+//!   with Go `protobufs/hypergraph.go` ToCanonicalBytes/FromCanonicalBytes).
 //! - `types`: Rust representations of the five hypergraph messages plus
-//! the aggregate-signature envelope.
+//!   the aggregate-signature envelope.
 
 pub mod auth;
 pub mod canonical;

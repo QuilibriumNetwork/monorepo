@@ -8,8 +8,8 @@
 //! - `class_field_key` — point lookup for a class's field by name.
 //! - `max_order` — determines the key width (single/double/triple byte).
 //! - `TYPE_HASH_*` — hard-coded Poseidon type hashes observed from
-//! mainnet on 2026-04-11. Replace with computed values once Poseidon
-//! is ported.
+//!   mainnet on 2026-04-11. Replace with computed values once Poseidon
+//!   is ported.
 //!
 //! Source: see `GLOBAL_RDF_SCHEMA` at
 //! `node/execution/intrinsics/global/global_intrinsic.go:44-161`.

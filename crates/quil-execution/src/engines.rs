@@ -2828,9 +2828,9 @@ impl HypergraphExecutionEngine {
     /// and Ed448-verify the op's signature. Behavior by resolver state:
     ///
     /// - `None` (no resolver configured): logs a warning and accepts.
-    /// Existing system-shard gate is still enforced upstream.
+    ///   Existing system-shard gate is still enforced upstream.
     /// - `Some` but `write_public_key(domain) == None`: rejects.
-    /// An op against an undeployed hypergraph is always invalid.
+    ///   An op against an undeployed hypergraph is always invalid.
     /// - `Some` and key resolves: rejects on signature mismatch.
     fn verify_op_authority(&self, msg: &hg_dispatch::DispatchedMessage) -> Result<()> {
         use crate::hypergraph_intrinsic::auth::{verify_op_signature, OpForAuth};

@@ -10,10 +10,10 @@
 //!
 //! What's NOT ported here (needs cross-crate service wiring):
 //! - `prove` — requires `quil-crypto` signer + `VerifiableEncryptor`,
-//! neither of which have a clean trait bound on the execution side yet.
+//!   neither of which have a clean trait bound on the execution side yet.
 //! - `verify` — same dependency story plus an Ed448 key-manager trait.
 //! - `materialize` — requires the hypergraph state bridge
-//! (`HypergraphCrdt` lazy-tree integration).
+//!   (`HypergraphCrdt` lazy-tree integration).
 //!
 //! The intrinsic dispatcher will import these pure helpers
 //! and compose them with service traits it gets from the engine.

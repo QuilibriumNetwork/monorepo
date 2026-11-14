@@ -2901,13 +2901,13 @@ impl ExecutionEngineManager {
     /// (execution_manager.go:357-549):
     /// - `0xff*32` (GLOBAL) → global engine.
     /// - a base domain (COMPUTE / HYPERGRAPH_BASE / TOKEN_BASE /
-    /// QUIL_TOKEN) → that engine directly.
+    ///   QUIL_TOKEN) → that engine directly.
     /// - any other address is a DEPLOYED app: read its base type-domain
-    /// from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
-    /// (written at deploy by `init_metadata_vertex`), and route by it.
+    ///   from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
+    ///   (written at deploy by `init_metadata_vertex`), and route by it.
     /// - no metadata / unknown type-domain → error (Go errors "no
-    /// execution engine found"; we do NOT silently default to
-    /// hypergraph — that was the prior bug that mis-routed everything).
+    ///   execution engine found"; we do NOT silently default to
+    ///   hypergraph — that was the prior bug that mis-routed everything).
     fn select_engine(&self, address: &[u8]) -> Result<String> {
         if address.len() < 32 {
             return Err(QuilError::InvalidArgument("address too short".into()));

@@ -380,12 +380,12 @@ pub struct ProverJoinValidation {
 ///
 /// Checks:
 /// 1. BLS sig over `concat(filters) || frame_number_be_u64` with domain
-/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
+///    `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
 /// 2. Proof-of-possession: BLS sig over pubkey with ASCII domain
-/// `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
-/// poseidon hash — matches `global_prover_join.go:1093`).
+///    `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
+///    poseidon hash — matches `global_prover_join.go:1093`).
 /// 3. Each merge target's signature over pubkey with Ed448 context
-/// `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
+///    `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
 ///
 /// Go skips merge-sig verification when the merge's spent-vertex
 /// already exists in the hypergraph (replay guard). This port takes
@@ -553,10 +553,10 @@ where
 /// look up two tombstone vertices in the global domain:
 ///
 /// - `spent_seniority_merge_address(target_pubkey)` —
-/// PROVER_SENIORITY_MERGE was already consumed.
+///   PROVER_SENIORITY_MERGE was already consumed.
 /// - `spent_join_merge_address(target_pubkey)` —
-/// PROVER_JOIN_MERGE consumed the same target during a
-/// ProverJoin's merge_targets list.
+///   PROVER_JOIN_MERGE consumed the same target during a
+///   ProverJoin's merge_targets list.
 ///
 /// Finding EITHER marker means the merge target has already been
 /// claimed by some prover; allowing the current op would split the
@@ -898,9 +898,9 @@ pub fn validate_confirm_epoch(signed_frame: u64, inclusion_frame: u64) -> Result
 /// - Join confirm (status=0): `epoch_for_frame(frame) == epoch_for_frame(JoinFrameNumber)+1`.
 /// - Leave confirm (status=3): `epoch_for_frame(frame) == epoch_for_frame(LeaveFrameNumber)+1`.
 /// - Re-confirm (status=1): a data shard registering its NEXT epoch — allowed
-/// iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
-/// frame_epoch+1; rejects the empty/global filter and a double re-confirm that
-/// already registered ahead).
+///   iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
+///   frame_epoch+1; rejects the empty/global filter and a double re-confirm that
+///   already registered ahead).
 pub fn validate_confirm_timing(
     frame_number: u64,
     allocation_tree: &quil_tries::VectorCommitmentTree,
@@ -1224,7 +1224,7 @@ fn validate_shard_op_frame(op: &str, signed_frame: u64, inclusion_frame: u64) ->
 /// Go's `ShardSplitOp.Verify` at `global_shard_split.go:53-133`:
 /// - shard_address 32–63 bytes
 /// - proposed_shards has 2–8 entries, each of parent_len+1 or
-/// parent_len+2 and prefixed by shard_address
+///   parent_len+2 and prefixed by shard_address
 /// - the signature over [`shard_op_signing_payload`]
 ///
 /// From the shard op binding epoch also: signed at most
@@ -1324,7 +1324,7 @@ pub fn verify_shard_split(
 /// Go's `ShardMergeOp.Verify` at `global_shard_merge.go:51-125`:
 /// - parent_address 32 bytes
 /// - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
-/// and each prefixed by parent_address
+///   and each prefixed by parent_address
 /// - the signature over [`shard_op_signing_payload`]
 ///
 /// From the shard op binding epoch also: freshness and the cutover as for a
@@ -1427,9 +1427,9 @@ pub fn verify_shard_merge(
 /// - addressed signature present, address 32 bytes
 /// - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
 /// - each merge-target signs `pubKeyBytes` with its own `key_type` under
-/// the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
+///   the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
 /// - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
-/// domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
+///   domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
 /// - address-binding: `poseidon(pubKeyBytes) == sig.address`
 ///
 /// NOT checked here (requires hypergraph state): the spent markers and

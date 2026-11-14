@@ -715,7 +715,7 @@ fn build_shard_update_context_with_rings(
 ///
 /// Sort order (descending priority):
 /// 1. `JoinFrameNumber` ascending (fallback to `JoinConfirmFrameNumber`
-/// if Join is 0 and Confirm is set).
+///    if Join is 0 and Confirm is set).
 /// 2. `Seniority` descending.
 /// 3. Address bytes ascending.
 ///
@@ -810,20 +810,20 @@ pub fn validate_prover_shard_update(
 /// Arguments:
 /// - `frame_header`: the header being applied.
 /// - `current_frame_number`: the consensus-engine frame that contains
-/// this header (= `frame_header.frame_number + 1`).
+///   this header (= `frame_header.frame_number + 1`).
 /// - `state`: the hypergraph changeset.
 /// - `prover_registry`: used only in `build_shard_update_context`
-/// (via `active_provers` the caller supplies).
+///   (via `active_provers` the caller supplies).
 /// - `frame_prover`: used only in `build_shard_update_context` (via
-/// `participant_bitmask` the caller supplies).
+///   `participant_bitmask` the caller supplies).
 /// - `reward_issuance`: per-ring reward calculator.
 /// - `world_state_size`: `Hypergraph.GetSize(nil, nil)` — the full
-/// state size passed to the issuance calculator as `worldSize`.
+///   state size passed to the issuance calculator as `worldSize`.
 /// - `active_provers`, `participant_bitmask`, `shard_metadata`: the
-/// precomputed inputs (see `build_shard_update_context`).
-/// Recompute + persist the shard's per-allocation reward ring from the current
-/// active committee, using a STABLE ordering: `JoinFrameNumber` ascending, then
-/// address ascending — both IMMUTABLE committed fields. Rank → `ring =
+///   precomputed inputs (see `build_shard_update_context`).
+///   Recompute + persist the shard's per-allocation reward ring from the current
+///   active committee, using a STABLE ordering: `JoinFrameNumber` ascending, then
+///   address ascending — both IMMUTABLE committed fields. Rank → `ring =
 /// floor(rank / RING_GROUP_SIZE)`.
 ///
 /// Because the ordering keys never change for a given prover, the assignment is
