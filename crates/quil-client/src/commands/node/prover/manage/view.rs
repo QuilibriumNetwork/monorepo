@@ -4520,7 +4520,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
         sec(COINS_HELP_SECTION),
-        note("This node's claimable rewards, legacy coins (as `qclient token legacy` lists them) and shielded coins, the shield action, the reward mint and transfers. The middle panel follows the Balances row under the cursor: Claim status for `reward`, Shield plan for `legacy`, Transfers for `shielded`. ‹h› on this tab opens the help here."),
+        note("This node's claimable rewards, legacy coins (as `qclient token legacy` lists them) and shielded coins, the shield action, the reward mint and transfers. The middle panel follows the Balances row under the cursor: Claim status for `reward`, Shield plan for `legacy`, Transfers for `shielded`; ‹H› shows History there instead. ‹h› on this tab opens the help here."),
         kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
         item("`reward`: the claimable reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh"),
         item("`legacy`: Coins `U/T` counts the U unshielded of the T listed legacy coins, `0` once none is unshielded; Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count and the read's pages and duration; the Shield plan beside it gives the `qclient token shield-all` plan and when shields open"),
@@ -4549,12 +4549,17 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹T› / ‹P›", "Transfer / pending transfer, with the shielded row or the Transfers panel selected: a form takes the recipient (pasted), the amount in Q and, for a pending transfer, the refund frame (empty: the GLOBAL head plus about a day). Every key is text there; ‹tab› moves between fields, ‹enter› checks them and quotes the fee, ‹esc› cancels, ‹Ctrl+C› quits"),
         kv("‹A› / ‹R›", "In the Transfers panel: accept the incoming pending transfer under its cursor, or refund an outgoing one once its refund frame passes (`qclient token accept` / `reject`)"),
         kv("‹J›", "Merge coins, with the shielded row or the Transfers panel selected: a wallet scan selects the coins `qclient token merge all` would take, then confirm"),
+        kv("History", "On ‹H›: the wallet actions the private action log recorded (shields, mints, claims and transfer actions run here or by qclient token, as qclient token history lists them), one row each, newest first; the cursor row's detail gives its start to the second, its duration, the recipient (by its ends) or escrow, a shield's batches and the error. Coins received and actions run elsewhere, or with the log off, are not there. Read on each ‹H› that opens it and again when an action ends; a render never reads it. Its columns:"),
+        item("When (UTC): the action's first record, to the minute; Action: `shield`, `mint`, `claim`, `transfer`, `pending transfer`, `accept`, `refund` or `merge`; Via: `cli` or `manager`, the program that ran it"),
+        item("Amount [Q] and Fee [Q]: a shield's submitted batches summed, a mint's minted amount, a transfer action's amount, and the fee paid or quoted; `-`: none recorded"),
+        item("Outcome: `ok`: the run ended without an error (without a wait that means submitted; qclient token inclusion checks inclusion); `failed` (`yellow`, or `failed!` with colors off), the detail says why; `requoted`: a mint whose fee quote changed, nothing was proved; `no outcome`: stopped before its end, or still running"),
+        kv("‹H›", "Show History in the middle panel and focus it; again, give the middle panel back to the Balances row. Not while an action's confirmation, form or preparation holds the panel"),
         kv("Transfer confirmations", "Each names the action, the amount to the base unit, the quoted fee, the `--max-fee` cap and, last, the recipient in full; ‹y› proves it here and submits it to this node, any other key cancels. A transfer's fee is quoted again before submission, as the CLI does. One action runs at a time, shields and mints included"),
         kv("Transfer notices", "`Shielded coins: reading …`; `<action>: proving and submitting <60s` / `>60s`; `submitted; finalized inclusion is not yet confirmed`. A refusal or failure (`red`) says why. `Pending transfers incoming: ‹A› …` and `Pending transfers of yours unclaimed past their refund frame: ‹R› …` (`◆`) name the condition and its key; the Transfers panel gives the transfers, their amounts and refund frames. `Action log: not written (…)` (`yellow`), as for shields; the action runs on"),
         kv("‹r›", "Read legacy coins now, with the legacy row or the Shield plan selected; one read at a time"),
         kv("‹[/]› / ‹{/}›", "Move the focused panel's upper edge up/down / its lower edge up/down; every panel keeps 3 rows. The Coins tab's edges are kept between runs apart from the Provers tab's"),
-        kv("‹tab›", "Move between Balances, the middle panel (Claim status, Shield plan or Transfers) and Notifications"),
-        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan, Claim status or Transfers cursor; scroll Notifications when it is focused"),
+        kv("‹tab›", "Move between Balances, the middle panel (Claim status, Shield plan, Transfers or History) and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan, Claim status, Transfers or History cursor; scroll Notifications when it is focused"),
         HelpItem::Blank,
     ]
 }
@@ -8334,6 +8339,27 @@ mod tests {
                 "mode `{value}` is not listed under Mode"
             );
         }
+        // The History panel's values, under its entry.
+        let history = values(COINS_HELP_SECTION, "History");
+        let outcomes = [
+            crate::commands::token::history::Outcome::Ok,
+            crate::commands::token::history::Outcome::Failed,
+            crate::commands::token::history::Outcome::Requoted,
+            crate::commands::token::history::Outcome::Unrecorded,
+        ];
+        for value in outcomes.iter().map(|outcome| outcome.word()).chain([
+            "failed!",
+            "cli",
+            "manager",
+            "claim",
+            "pending transfer",
+            "-",
+        ]) {
+            assert!(
+                history.iter().any(|v| v == value),
+                "History value `{value}` is not listed under History"
+            );
+        }
         let global = values("Top header KPIs", "Global");
         for label in GLOBAL_FIELD_NAMES
             .iter()
@@ -8405,6 +8431,7 @@ mod tests {
             "Shield notices",
             "Mint notices",
             "Transfers",
+            "History",
             "Transfer confirmations",
             "Transfer notices",
             "Logs",

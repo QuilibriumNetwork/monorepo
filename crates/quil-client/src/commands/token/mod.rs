@@ -18,6 +18,7 @@ mod account;
 pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
+pub(crate) mod history;
 mod info;
 pub(crate) mod legacy;
 pub(crate) mod output;
@@ -472,6 +473,20 @@ pub enum TokenCommand {
     Balance,
     /// Lists all coins under control of the managing account.
     Coins,
+    /// Lists the wallet actions this client recorded in its private action
+    /// log, newest first: shields, mints, claims and transfer actions run
+    /// by `qclient token` or the node manager.
+    ///
+    /// Read from wallet/actions.jsonl in the node config directory; no node
+    /// is asked and no key is read. Coins received and actions run by
+    /// another client, or with the log off, are not in it. `ok` is the
+    /// run's own end: without --wait, submitted, not yet included (`token
+    /// inclusion` checks). `-v` adds each failure's recorded error.
+    History {
+        /// Show the newest N actions (0: all).
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+    },
     /// Lists legacy (pre-2.1) coins, their unshielded total and shield readiness.
     ///
     /// Identities: the node config (--config, repeatable after `legacy`;
@@ -828,6 +843,7 @@ impl TokenCommand {
             | TokenCommand::Info { .. }
             | TokenCommand::Balance
             | TokenCommand::Coins
+            | TokenCommand::History { .. }
             | TokenCommand::Legacy(_)
             | TokenCommand::ConfidentialAddress => false,
             #[cfg(feature = "confidential-tokens")]
@@ -1142,7 +1158,7 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
     let tc = TokenCtx::load(global, &args.common)?;
     if !matches!(
         args.command,
-        TokenCommand::Account | TokenCommand::Info { .. }
+        TokenCommand::Account | TokenCommand::Info { .. } | TokenCommand::History { .. }
     ) {
         tc.require_keys()?;
     }
@@ -1556,6 +1572,8 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     match &args.command {
         TokenCommand::Account => account::run(&tc),
         TokenCommand::Info { domain } => info::run(tc, domain).await,
+        // The private action log, read back: no key and no node.
+        TokenCommand::History { limit } => history::run(&tc.config_dir, *limit),
         TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run_loaded(tc, &application, listing).await
