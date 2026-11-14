@@ -2,6 +2,7 @@ mod autonat_health;
 mod autonat_servers;
 pub mod blossomsub_behaviour;
 pub mod direct;
+mod dns_config;
 pub mod ed448_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;

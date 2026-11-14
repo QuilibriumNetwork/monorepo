@@ -6697,6 +6697,7 @@ dependencies = [
  "ed448-rust",
  "futures",
  "hex 0.4.3",
+ "hickory-resolver",
  "libp2p",
  "libp2p-gossipsub",
  "libp2p-identity",

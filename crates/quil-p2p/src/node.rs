@@ -76,6 +76,9 @@ pub struct P2PNode {
     /// signing keypair's public key. `None` falls back to the host's
     /// own peer ID.
     pubsub_from_peer_id: Option<PeerId>,
+    /// The resolver config `start()` builds the DNS transport from: the
+    /// system's, with a bounded wait (tests inject a reader).
+    dns: crate::dns_config::DnsSource,
 }
 
 /// Parse operator-configured multiaddr strings into `(PeerId, Multiaddr)`
@@ -223,7 +226,15 @@ impl P2PNode {
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
             pubsub_signing_keypair: None,
             pubsub_from_peer_id: None,
+            dns: crate::dns_config::DnsSource::system(),
         })
+    }
+
+    /// Replaces the resolver config source `start()` reads.
+    #[cfg(test)]
+    pub(crate) fn with_dns_source(mut self, dns: crate::dns_config::DnsSource) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// Construct a P2P node for a standalone worker process.
@@ -385,6 +396,10 @@ impl P2PNode {
             cfg.set_max_num_streams(65536);
             cfg
         };
+        // A host can start the node before its resolver config lists a
+        // nameserver (boot race): wait a bounded time, then start without
+        // DNS resolution rather than exit. See `crate::dns_config`.
+        let (dns_config, dns_opts) = self.dns.config().await;
         let mut swarm = SwarmBuilder::with_existing_identity(self.keypair)
             .with_tokio()
             .with_tcp(
@@ -400,8 +415,7 @@ impl P2PNode {
             )
             .map_err(|e| QuilError::P2p(format!("tcp: {}", e)))?
             .with_quic()
-            .with_dns()
-            .map_err(|e| QuilError::P2p(format!("dns: {}", e)))?
+            .with_dns_config(dns_config, dns_opts)
             .with_behaviour(|key| {
                 let local_peer_id = PeerId::from_public_key(&key.public());
 
