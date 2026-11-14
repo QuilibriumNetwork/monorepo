@@ -4,13 +4,13 @@
 //! BOTH metric families of the p2p stack:
 //!
 //! - **`blossomsub_*`** — the vendored gossipsub fork's full metrics module
-//! (mesh peer counts, graft/prune inclusion+churn events, per-bitmask
-//! sent/recv/published message counts and bytes, validation results, score
-//! histograms, penalties, IWANT, heartbeat duration). Those are registered
-//! by `blossomsub::Behaviour::new_with_metrics` into a `blossomsub`-prefixed
-//! sub-registry (see `blossomsub_behaviour.rs`).
+//!   (mesh peer counts, graft/prune inclusion+churn events, per-bitmask
+//!   sent/recv/published message counts and bytes, validation results, score
+//!   histograms, penalties, IWANT, heartbeat duration). Those are registered
+//!   by `blossomsub::Behaviour::new_with_metrics` into a `blossomsub`-prefixed
+//!   sub-registry (see `blossomsub_behaviour.rs`).
 //! - **`libp2p_*`** — swarm-level connection metrics defined here and
-//! recorded by the swarm event loop in `node.rs`.
+//!   recorded by the swarm event loop in `node.rs`.
 //!
 //! The registry is exposed through `P2PHandle::render_metrics()`, which the
 //! node bridges into its unified metrics exposition (HTTP `/metrics`, gRPC

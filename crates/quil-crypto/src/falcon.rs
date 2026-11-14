@@ -131,17 +131,17 @@ pub fn falcon_public_from_signing_key(signing_key: &[u8]) -> Option<Vec<u8>> {
 /// aggregate, so the "aggregate" is a **concatenation**:
 ///
 /// * [`aggregate`](FalconKeyConstructor::aggregate): `signature` = the member
-/// signatures concatenated in bitmask order (666 B each); `public_key` = the
-/// member public keys concatenated (897 B each), in the SAME order.
+///   signatures concatenated in bitmask order (666 B each); `public_key` = the
+///   member public keys concatenated (897 B each), in the SAME order.
 /// * [`aggregate_public_keys`](FalconKeyConstructor::aggregate_public_keys):
-/// the member public keys concatenated. Because the committee reconstructs
-/// the exact same ordered concatenation, `bind_aggregate_pubkey_to_committee`'s
-/// `reconstructed == transmitted` equality check keeps working unchanged.
+///   the member public keys concatenated. Because the committee reconstructs
+///   the exact same ordered concatenation, `bind_aggregate_pubkey_to_committee`'s
+///   `reconstructed == transmitted` equality check keeps working unchanged.
 /// * QC/TC verification uses
-/// [`verify_multi_pubkey_multi_message_raw`](FalconKeyConstructor::verify_multi_pubkey_multi_message_raw):
-/// split the concatenated signature into 666-byte components and verify each
-/// member's signature against its own message (all equal for a QC, distinct
-/// for a TC) — i.e. N independent Falcon verifies instead of one pairing.
+///   [`verify_multi_pubkey_multi_message_raw`](FalconKeyConstructor::verify_multi_pubkey_multi_message_raw):
+///   split the concatenated signature into 666-byte components and verify each
+///   member's signature against its own message (all equal for a QC, distinct
+///   for a TC) — i.e. N independent Falcon verifies instead of one pairing.
 pub struct FalconKeyConstructor;
 
 impl BlsConstructor for FalconKeyConstructor {

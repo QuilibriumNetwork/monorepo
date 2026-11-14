@@ -4,19 +4,19 @@
 //! # Architecture (the shape the node needs)
 //!
 //! * **Level 1 — 256 global trees.** Keyed by app address; the tree index is
-//! the first address byte (`0..=255`). Each leaf holds an [`AppEntry`]:
-//! the app's current tree root, total leaf count, total leaf size, and
-//! intrinsic-specific metadata. **Every node holds all 256.**
+//!   the first address byte (`0..=255`). Each leaf holds an [`AppEntry`]:
+//!   the app's current tree root, total leaf count, total leaf size, and
+//!   intrinsic-specific metadata. **Every node holds all 256.**
 //! * **Level 2 — per-app "shard-commitment" tree.** One leaf per shard, a
-//! [`ShardEntry`] holding the shard's commitment (the rollup of its
-//! Level-3 phase roots), leaf count and total size. Splits/merges as the
-//! app subdivides. **Held by any prover under that app.**
+//!   [`ShardEntry`] holding the shard's commitment (the rollup of its
+//!   Level-3 phase roots), leaf count and total size. Splits/merges as the
+//!   app subdivides. **Held by any prover under that app.**
 //! * **Level 3 — per-shard state tree(s).** The actual state leaves. The CRDT
-//! keeps four *phase* trees per shard (vertex/hyperedge × adds/removes) for
-//! OR-set merge semantics, so a shard is four JMT instances tagged by
-//! [`Phase`]; their four roots are the header `state_roots` and roll up
-//! (via [`rollup_phase_roots`]) into the Level-2 [`ShardEntry`]. **Held by
-//! that shard's provers.** Archives hold all three levels.
+//!   keeps four *phase* trees per shard (vertex/hyperedge × adds/removes) for
+//!   OR-set merge semantics, so a shard is four JMT instances tagged by
+//!   [`Phase`]; their four roots are the header `state_roots` and roll up
+//!   (via [`rollup_phase_roots`]) into the Level-2 [`ShardEntry`]. **Held by
+//!   that shard's provers.** Archives hold all three levels.
 //!
 //! Every tree in the forest is an *independent* JMT instance, so a party
 //! holds exactly the trees relevant to its role. All trees share one RocksDB;
@@ -626,9 +626,9 @@ pub fn shard_bit_path_from_prefix(prefix: &[u32]) -> Option<Vec<bool>> {
 /// bytes (see the sharding-encoding reconciliation):
 /// - **QUIL genesis**: `[i]`, `i ∈ 0..64` — an *unshifted* 6-bit index (`assign_child_index(_, 64)` = top 6 bits = `i`).
 /// - **Dynamic split** (`compute_proposed_shards`): a filter suffix byte cast
-/// `b as u32` — the child index *shifted into the high bits*: binary `0x80=128`,
-/// quaternary `{0x40,0x80,0xC0}={64,128,192}`, octal `{0x20..0xE0}` in a
-/// leading byte followed by a `0x00` padding byte.
+///   `b as u32` — the child index *shifted into the high bits*: binary `0x80=128`,
+///   quaternary `{0x40,0x80,0xC0}={64,128,192}`, octal `{0x20..0xE0}` in a
+///   leading byte followed by a `0x00` padding byte.
 ///
 /// Both are ultimately "the top-k address bits select the shard". This resolves
 /// them uniformly by looking at each level's COMPLETE sibling set: a level with

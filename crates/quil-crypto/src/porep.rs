@@ -6,16 +6,16 @@
 //! — which together make the batch both sound and non-replayable:
 //!
 //! - Each opening's evaluation-domain index is **recomputed by the verifier**
-//! from the frame's global-VDF output `ρ_N` and the member id
-//! ([`derive_challenge_index`]); it is never trusted from the wire. So a
-//! prover cannot open at a self-chosen easy point, and a proof produced for
-//! frame `N` cannot be replayed at frame `N+1`: a different `ρ_N` yields a
-//! different index, and the carried proof no longer matches.
+//!   from the frame's global-VDF output `ρ_N` and the member id
+//!   ([`derive_challenge_index`]); it is never trusted from the wire. So a
+//!   prover cannot open at a self-chosen easy point, and a proof produced for
+//!   frame `N` cannot be replayed at frame `N+1`: a different `ρ_N` yields a
+//!   different index, and the carried proof no longer matches.
 //! - The random-linear-combination scalar `γ` is bound to the **entire**
-//! transcript — frame number, `ρ_N`, the committee bitmask, and every
-//! `(member, query, commitment, index, value, proof)` — so the prover cannot
-//! adapt proofs after seeing `γ` (the standard small-exponents-batch
-//! requirement that, if violated, makes the aggregate forgeable).
+//!   transcript — frame number, `ρ_N`, the committee bitmask, and every
+//!   `(member, query, commitment, index, value, proof)` — so the prover cannot
+//!   adapt proofs after seeing `γ` (the standard small-exponents-batch
+//!   requirement that, if violated, makes the aggregate forgeable).
 //!
 //! The challenge selects an evaluation-domain index within the challenged
 //! leaf's polynomial (sector = one ≤1 GB logical-shard leaf; per the storage
@@ -508,14 +508,14 @@ pub fn verify_frame_storage_attestation_proto(
 /// against a leaf the member actually **registered** for the **current epoch**:
 ///
 /// - `lookup(member_id, leaf_id)` returns the member's registered
-/// `(leaf_root, num_blocks, epoch)` for that leaf, or `None`. `leaf_id` is the
-/// opening's `shard_id` (which the producer sets to `leaf_id_bytes(filter,
+///   `(leaf_root, num_blocks, epoch)` for that leaf, or `None`. `leaf_id` is the
+///   opening's `shard_id` (which the producer sets to `leaf_id_bytes(filter,
 /// prefix)`), so a member can only open leaves it registered.
 /// - The registered `leaf_root` and `num_blocks` must match the opening (a
-/// prover can't open a self-chosen junk leaf), and both the registered and
-/// the opening's `epoch` must equal `active_epoch` (a stale-epoch root —
-/// never re-registered this epoch — is rejected, matching the epoch-bound
-/// allocation semantics).
+///   prover can't open a self-chosen junk leaf), and both the registered and
+///   the opening's `epoch` must equal `active_epoch` (a stale-epoch root —
+///   never re-registered this epoch — is rejected, matching the epoch-bound
+///   allocation semantics).
 ///
 /// Returns `true` iff all cross-checks pass AND the possession batch verifies.
 pub fn verify_frame_storage_attestation_registered<F>(

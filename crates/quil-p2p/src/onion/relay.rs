@@ -2,10 +2,10 @@
 //!
 //! A relay:
 //! 1. Accepts CREATE cells, runs the forward-secret sntrup761 KEM-ntor handshake
-//! ([`handle_create_cell`](OnionRelay::handle_create_cell)), and registers the
-//! circuit hop.
+//!    ([`handle_create_cell`](OnionRelay::handle_create_cell)), and registers the
+//!    circuit hop.
 //! 2. Forwards RELAY cells one AES-256-GCM layer at a time, tunnels EXTEND, and
-//! relays backward cells toward the originator.
+//!    relays backward cells toward the originator.
 //!
 //! DEFENSE — circuits are keyed by `(upstream_peer, upstream_circ_id)`, NOT the
 //! circuit id alone. A downstream id is allocated by THIS relay from a private

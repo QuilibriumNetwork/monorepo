@@ -6,13 +6,13 @@
 //! whole thing.
 //!
 //! - On `ensure_root_loaded`, reads only the root node via the
-//! by-path index (`HypergraphStore::get_node_by_path(&[])`).
+//!   by-path index (`HypergraphStore::get_node_by_path(&[])`).
 //! - During `insert`, walks the tree lazily — child branches are
-//! pulled from the store one slot at a time as the walker
-//! descends, never materializing untouched subtrees.
+//!   pulled from the store one slot at a time as the walker
+//!   descends, never materializing untouched subtrees.
 //! - During `commit`, persists each touched node individually via
-//! the dual by-key + by-path index (per-node format —
-//! `crate::serialize::serialize_node_solo`).
+//!   the dual by-key + by-path index (per-node format —
+//!   `crate::serialize::serialize_node_solo`).
 //!
 //! Mutating ops stage changes in an in-memory working set; `commit`
 //! flushes them through the caller-supplied `txn` and resets the

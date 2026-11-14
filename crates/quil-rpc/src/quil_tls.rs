@@ -4,13 +4,13 @@
 //! The scheme works around Go's x509 lacking native Ed448 support:
 //!
 //! 1. Derive an Ed25519 seed deterministically:
-//! `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
+//!    `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
 //! 2. Generate an Ed25519 keypair from that seed.
 //! 3. Cross-sign the Ed25519 public key with the Ed448 private key:
-//! `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
+//!    `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
 //! 4. Self-sign an x509 cert with the Ed25519 key, embedding
-//! `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
-//! cert's single SAN DNS name.
+//!    `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
+//!    cert's single SAN DNS name.
 //!
 //! On the receiving side, peers parse the DNS name back into the Ed448 pubkey
 //! + signature, verify the cross-sig, and re-derive the libp2p peer ID.
@@ -277,12 +277,12 @@ use rustls::{ServerConfig, SignatureScheme};
 ///
 /// 1. Parse the presented end-entity cert.
 /// 2. Extract the cert's Ed25519 public key from its
-/// `SubjectPublicKeyInfo`.
+///    `SubjectPublicKeyInfo`.
 /// 3. Pull the single SAN DNS name and decode it as
-/// `hex(ed448_pub_57 || xsign_114)`.
+///    `hex(ed448_pub_57 || xsign_114)`.
 /// 4. Verify the Ed448 signature `xsign` over the message
-/// `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
-/// public key.
+///    `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
+///    public key.
 ///
 /// Any failure rejects the handshake. Per-peer authorization
 /// (membership in prover/signer registries, whitelist, etc.) is still

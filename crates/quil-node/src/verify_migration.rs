@@ -7,18 +7,18 @@
 //! and validators and confirms acceptance:
 //!
 //! - **Tries**: load the global prover-shard hypergraph trees and recompute
-//! the root commitment, then compare it to the `prover_tree_commitment`
-//! committed in the latest global frame header. A match proves the trie
-//! nodes + vertex data migrated correctly AND load into the usable lazy
-//! tree (this mirrors the live check in `worker_node.rs`).
+//!   the root commitment, then compare it to the `prover_tree_commitment`
+//!   committed in the latest global frame header. A match proves the trie
+//!   nodes + vertex data migrated correctly AND load into the usable lazy
+//!   tree (this mirrors the live check in `worker_node.rs`).
 //! - **Frame**: run `BlsGlobalFrameValidator` over the latest global frame
-//! (VDF + committee-bound BLS aggregate) — i.e. would the node accept it.
+//!   (VDF + committee-bound BLS aggregate) — i.e. would the node accept it.
 //! - **QC / TC**: run the committee-aware `ConsensusValidator` over the
-//! latest stored quorum / timeout certificate (the migration translated
-//! these canonical→proto; this confirms they verify against the
-//! committee reconstructed from the migrated prover registry).
+//!   latest stored quorum / timeout certificate (the migration translated
+//!   these canonical→proto; this confirms they verify against the
+//!   committee reconstructed from the migrated prover registry).
 //! - **Certified state**: reconstruct the latest `GlobalProposal` from its
-//! components and verify its embedded QC.
+//!   components and verify its embedded QC.
 //!
 //! Each category reports PASS / SKIP (no data) / FAIL; any FAIL exits
 //! non-zero.

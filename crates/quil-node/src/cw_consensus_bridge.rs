@@ -3,11 +3,11 @@
 //! channels to the existing `:8340` transport:
 //!
 //! - outbound: [`Cw8340Transport`] (`GlobalConsensusTransport`) tags each
-//! simplex message with its channel and fans it out via the existing
-//! `DirectGlobalConsensusPublisher`;
+//!   simplex message with its channel and fans it out via the existing
+//!   `DirectGlobalConsensusPublisher`;
 //! - inbound: [`CwInboundRouter`] demuxes a `:8340` message (by its channel
-//! bitmask) into the engine's matching inbound channel, resolving the sender
-//! to its committee Falcon key.
+//!   bitmask) into the engine's matching inbound channel, resolving the sender
+//!   to its committee Falcon key.
 //!
 //! [`start_cw_global_consensus`] is called at the GLOBAL activation site, and
 //! the receive loop hands inbound consensus messages to

@@ -7,11 +7,11 @@
 //! `H(member_id ‖ shard)` for a registration from the stable replica key
 //! epoch on ([`replica_key`]):
 //! - the graph (each node's parents) is **fixed** and key-independent — DRSample
-//! back-edges within a layer + a bipartite expander from the prior layer;
+//!   back-edges within a layer + a bipartite expander from the prior layer;
 //! - the labels are keyed, so two members get replicas that differ in every node
-//! (the per-member uniqueness the Sybil argument needs);
+//!   (the per-member uniqueness the Sybil argument needs);
 //! - it is **decodable** (regenerate `labels_L` from the key, XOR back), so the
-//! storage is *useful* — a member can serve the real data.
+//!   storage is *useful* — a member can serve the real data.
 //!
 //! SECURITY NOTE (load-bearing): the depth-robust graph distribution and
 //! parameters ARE the regen-on-demand resistance. This is a CLEAN-ROOM

@@ -9,13 +9,13 @@
 //!
 //! Building blocks (both battle-hardened; we invent no protocol crypto):
 //! * **[`clatter`]** — pure-Rust implementation of the PQNoise framework
-//! (Angel/Dowling/Hülsing/Schwabe, CCS'22). It owns the handshake state
-//! machine, transcript hashing, and the `pqxx` pattern (mutual auth via
-//! static KEM keys + forward secrecy via ephemeral KEM).
+//!   (Angel/Dowling/Hülsing/Schwabe, CCS'22). It owns the handshake state
+//!   machine, transcript hashing, and the `pqxx` pattern (mutual auth via
+//!   static KEM keys + forward secrecy via ephemeral KEM).
 //! * **Streamlined NTRU Prime (sntrup761)** via `quil-sntrup761`
-//! — the NTRU-family KEM deployed in OpenSSH (`sntrup761x25519`) at internet
-//! scale. Pure NTRU, **non-hybrid**, non-NIST-standardized. Supplied to
-//! clatter through its `Kem` trait ([`Sntrup761`]).
+//!   — the NTRU-family KEM deployed in OpenSSH (`sntrup761x25519`) at internet
+//!   scale. Pure NTRU, **non-hybrid**, non-NIST-standardized. Supplied to
+//!   clatter through its `Kem` trait ([`Sntrup761`]).
 //!
 //! **Identity binding.** clatter's `pqxx` authenticates possession of the
 //! static KEM keys but knows nothing of Quilibrium peer identities (Ed448 /

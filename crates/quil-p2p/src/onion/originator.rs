@@ -5,13 +5,13 @@
 //!
 //! Circuit construction:
 //! - [`create_circuit`](OnionOriginator::create_circuit) establishes the first
-//! hop with a direct CREATE (the originator has a transport link to it).
+//!   hop with a direct CREATE (the originator has a transport link to it).
 //! - [`extend_circuit`](OnionOriginator::extend_circuit) adds each further hop by
-//! tunnelling a CREATE through the already-built prefix: an EXTEND relay-command
-//! targets the current last hop, which issues the CREATE to the new hop and
-//! relays the CREATED back (wrapped, one layer per hop) as EXTENDED.
+//!   tunnelling a CREATE through the already-built prefix: an EXTEND relay-command
+//!   targets the current last hop, which issues the CREATE to the new hop and
+//!   relays the CREATED back (wrapped, one layer per hop) as EXTENDED.
 //! - [`send_message`](OnionOriginator::send_message) onion-wraps a payload so the
-//! exit hop recovers it in cleartext.
+//!   exit hop recovers it in cleartext.
 //!
 //! Differences from Go (consistent with the rest of the Rust onion stack):
 //! per-hop key agreement is sntrup761 KEM (not X448 NTOR), CREATED is verified

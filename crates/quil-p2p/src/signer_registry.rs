@@ -37,7 +37,7 @@ pub const KEY_REGISTRY_DOMAIN: &[u8] = b"KEY_REGISTRY";
 /// `node/explorer/main.go:2943-2985`):
 ///
 /// 1. **identity_to_prover** — the Ed448 *identity* key signs
-/// `KEY_REGISTRY ‖ prover_pubkey_bytes`:
+///    `KEY_REGISTRY ‖ prover_pubkey_bytes`:
 /// ```go
 /// identityMsg := slices.Concat(keyRegistryDomain, keyRegistry.ProverKey.KeyValue)
 /// ValidateSignature(KeyTypeEd448, IdentityKey.KeyValue, identityMsg,
@@ -49,7 +49,7 @@ pub const KEY_REGISTRY_DOMAIN: &[u8] = b"KEY_REGISTRY";
 /// [`quil_crypto::ed448_verify`].
 ///
 /// 2. **prover_to_identity** — the BLS48-581 *prover* key signs the
-/// Ed448 identity pubkey bytes under the `KEY_REGISTRY` domain:
+///    Ed448 identity pubkey bytes under the `KEY_REGISTRY` domain:
 /// ```go
 /// ValidateSignature(KeyTypeBLS48581G1, ProverKey.KeyValue,
 /// IdentityKey.KeyValue, ProverToIdentity.Signature,

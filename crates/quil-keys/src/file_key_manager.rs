@@ -506,12 +506,12 @@ impl FileKeyManager {
     ///
     /// Key formats match what qclient/Go expects:
     /// - key_type=1 (X448): 57-byte seed → 57-byte Ed448-shaped pubkey
-    /// (X448 isn't yet used by qclient read paths; Ed448 shape
-    /// is adequate for storage and future port).
+    ///   (X448 isn't yet used by qclient read paths; Ed448 shape
+    ///   is adequate for storage and future port).
     /// - key_type=4 (Decaf448): 56-byte scalar → 56-byte compressed
-    /// Decaf448 point. Go qclient's `Concat(vk.Public(), sk.Public())`
-    /// produces a 112-byte token-address prefix that Rust's
-    /// `GetTokensByAccount` validates against.
+    ///   Decaf448 point. Go qclient's `Concat(vk.Public(), sk.Public())`
+    ///   produces a 112-byte token-address prefix that Rust's
+    ///   `GetTokensByAccount` validates against.
     pub fn create_agreement_key(&self, key_id: &str, key_type: u8) -> Result<()> {
         use ed448_goldilocks_plus::{DecafPoint, Scalar};
         use rand::RngCore;
