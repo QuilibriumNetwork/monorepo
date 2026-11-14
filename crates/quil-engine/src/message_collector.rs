@@ -17,6 +17,8 @@ use quil_execution::manager::ShieldClaim;
 mod cert_union;
 #[cfg(test)]
 mod seal_deadline_tests;
+#[cfg(test)]
+mod seat_density_tests;
 pub(crate) use cert_union::order_copies_by_signers;
 pub use cert_union::{session_committees, Committee, CommitteeSource};
 
@@ -82,6 +84,15 @@ struct CollectedMessage {
     /// For a storage epoch proof: the GLOBAL frame from which execution
     /// refuses it ([`storage_window_end`]). `None` for anything else.
     window_end: Option<u64>,
+    /// The seals and settlements its storage epoch proofs carry, a seat
+    /// that seals and settles counting twice ([`denser`]).
+    seat_halves: usize,
+    /// The member each of its storage epoch proofs names, if they name one.
+    member: Option<[u8; 32]>,
+    /// That member delivered it as an active prover: its sender is one, and
+    /// the sender's authenticated identity names that member
+    /// ([`MessageCollector::set_sender_member`]).
+    own: bool,
 }
 
 impl CollectedMessage {
@@ -117,6 +128,9 @@ impl CollectedMessage {
             capacity: kinds.capacity,
             prover: true,
             window_end: kinds.window_end,
+            seat_halves: kinds.seat_halves,
+            member: kinds.member,
+            own: false,
         }
     }
 
@@ -137,6 +151,15 @@ impl CollectedMessage {
     /// proofs within [`SEAL_BYTES_HELD`] or [`OTHER_SEAL_BYTES_HELD`].
     fn held_seal(&self) -> bool {
         self.seal && !self.proof && self.capacity.is_none()
+    }
+
+    /// The member whose proofs due at one frame this one may ride ahead of
+    /// by its seats per byte ([`denser`]): a proof its member delivered as
+    /// an active prover ([`Self::own`]), of at least
+    /// [`SEAT_DENSITY_MIN_BYTES`].
+    fn density_member(&self) -> Option<[u8; 32]> {
+        self.member
+            .filter(|_| self.own && self.data.len() >= SEAT_DENSITY_MIN_BYTES)
     }
 }
 
@@ -185,6 +208,11 @@ struct StorageKinds {
     /// The earliest end of a well-formed proof's window
     /// ([`storage_window_end`]).
     window_end: Option<u64>,
+    /// The seals and settlements its well-formed proofs carry.
+    seat_halves: usize,
+    /// The member each well-formed proof that is not a capacity message
+    /// names, if they all name one.
+    member: Option<[u8; 32]>,
 }
 
 /// The GLOBAL frame from which execution refuses `proof`: the end of its
@@ -219,6 +247,8 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
         epoch_proof: false,
         capacity: None,
         window_end: None,
+        seat_halves: 0,
+        member: None,
     };
     let Ok(bundle) =
         quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data)
@@ -237,7 +267,17 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
         if let Some(end) = storage_window_end(&proof) {
             kinds.window_end = Some(kinds.window_end.map_or(end, |held| held.min(end)));
         }
+        kinds.seat_halves += proof
+            .seats
+            .iter()
+            .map(|seat| usize::from(seat.seals) + usize::from(seat.settles))
+            .sum::<usize>();
         if !capacity_message(&proof) {
+            kinds.member = match kinds.member {
+                _ if !kinds.epoch_proof => Some(proof.member),
+                Some(member) if member == proof.member => Some(member),
+                _ => None,
+            };
             kinds.epoch_proof = true;
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
@@ -559,6 +599,27 @@ fn evict_later_seals(
     }
     evicted
 }
+
+/// How much more densely `a` carries seats than `b`: the seals and
+/// settlements of each held storage epoch proof per byte, `a`'s over `b`'s
+/// (cross-multiplied, so exact). A proof of one seat is about the size of
+/// one of several (one STARK carries them), so at an equal window end a
+/// proposal takes first, of the proofs that may ride ahead by their seats
+/// per byte ([`CollectedMessage::density_member`]), those carrying more
+/// ([`MessageCollector::snapshot_for_proposal`]).
+fn denser(a: &CollectedMessage, b: &CollectedMessage) -> std::cmp::Ordering {
+    let a_density = (a.seat_halves as u128) * (b.data.len() as u128);
+    let b_density = (b.seat_halves as u128) * (a.data.len() as u128);
+    a_density.cmp(&b_density)
+}
+
+/// The least a held storage epoch proof weighs, as a bundle, for its seats
+/// per byte to count ([`CollectedMessage::density_member`]); a lighter one
+/// rides in arrival order. Members' proofs weigh about 0.5–1.6 MB, one seat
+/// or many (a settlement about 0.65 MB): half the lightest of those keeps
+/// each counted, and a proof that rides ahead by its seats per byte takes
+/// at least this much of its frame's storage proof budget.
+const SEAT_DENSITY_MIN_BYTES: usize = 256 << 10;
 
 /// A share of a rank a refused message was over ([`RankBuffer::over_share`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,8 +1039,9 @@ impl RankBuffer {
         closed
     }
 
-    /// Count the held storage epoch proof with `key` as an active prover's.
-    fn promote_seal(&mut self, key: &[u8; 32]) {
+    /// Count the held storage epoch proof with `key` as an active prover's,
+    /// and as its member's own if `own` ([`CollectedMessage::own`]).
+    fn promote_seal(&mut self, key: &[u8; 32], own: bool) {
         let Some(&arrival) = self.seen.get(key) else {
             return;
         };
@@ -989,6 +1051,7 @@ impl RankBuffer {
         self.shares.remove(message);
         self.shares.seal_ends.remove(arrival, message);
         message.prover = true;
+        message.own |= own;
         self.shares.add(message);
         self.shares.seal_ends.add(arrival, message);
     }
@@ -1668,7 +1731,13 @@ pub struct MessageCollector {
     /// Whether a held message's proofs failed to verify here, for the
     /// shield claims ([`Self::set_rejected_proofs`]).
     rejected_proofs: RwLock<Option<RejectedProofs>>,
+    /// The member an authenticated sender is ([`Self::set_sender_member`]).
+    sender_member: std::sync::OnceLock<SenderMember>,
 }
+
+/// The member (prover address) an authenticated sender's identity names, if
+/// any ([`MessageCollector::set_sender_member`]).
+type SenderMember = Box<dyn Fn(&[u8]) -> Option<[u8; 32]> + Send + Sync>;
 
 /// How often submits refused for a full rank buffer are logged while they
 /// continue: every submit path (peer messages, gRPC, the node's own ops)
@@ -2096,7 +2165,21 @@ impl MessageCollector {
             union: Default::default(),
             shield_claims: std::sync::Mutex::new(ShieldClaims::default()),
             rejected_proofs: RwLock::new(None),
+            sender_member: std::sync::OnceLock::new(),
         }
+    }
+
+    /// How the node names the member (prover address) a sender is, by the
+    /// sender's authenticated identity (a TLS client key or a gossip signer):
+    /// a held storage epoch proof that sender delivered as an active prover,
+    /// naming that member, is its member's own ([`CollectedMessage::own`]).
+    /// Without it, or for a sender it names no member, no proof is, and none
+    /// rides ahead of others due at the same frame by its seats per byte.
+    pub fn set_sender_member(
+        &self,
+        member: impl Fn(&[u8]) -> Option<[u8; 32]> + Send + Sync + 'static,
+    ) {
+        let _ = self.sender_member.set(Box::new(member));
     }
 
     /// The gate the node admits shard-frame verification tasks through, so a
@@ -2474,6 +2557,15 @@ impl MessageCollector {
             parts.share = capacity_share(&parts.member, sender);
         }
         message.prover = provenance == Provenance::Prover;
+        // A storage epoch proof its own member delivered as an active
+        // prover, by the sender's authenticated identity: only such a proof
+        // may ride ahead of others due at the same frame by its seats per
+        // byte ([`CollectedMessage::density_member`]).
+        if let (Sender::Peer(peer), Some(member)) = (sender, message.member) {
+            if message.prover && message.held_seal() {
+                message.own = self.sender_member.get().and_then(|of| of(peer)) == Some(member);
+            }
+        }
         // Already included in a finalized frame → never re-accept. This
         // is what stops a message from re-entering the mempool after it
         // has been consumed by a committed frame. The archive already has
@@ -2986,8 +3078,11 @@ impl MessageCollector {
     /// guaranteed half of it and other messages (joins, leaves, kicks,
     /// settlements) the other half; either takes what the other leaves. Other
     /// messages go newest rank first, storage epoch proofs after them by the
-    /// end of their window, soonest first, then oldest first, and none past
-    /// its window ([`SEAL_BYTES_HELD`]). Shard proofs go a shard at a time, the
+    /// end of their window, soonest first, and none past its window
+    /// ([`SEAL_BYTES_HELD`]); of those due together, each member's first
+    /// that may ride ahead first, by its seats per byte
+    /// ([`CollectedMessage::density_member`]), then the rest oldest first.
+    /// Shard proofs go a shard at a time, the
     /// shards whose proofs rode a finalized frame longest ago first and those
     /// `consumed` by an executed ancestor last, each with the candidates its
     /// leader would examine ([`select_shard_tips`]). Taken in arrival order
@@ -3063,12 +3158,56 @@ impl MessageCollector {
             }
         }
         // Storage epoch proofs go after the other messages, active provers'
-        // first, each by its window's end, soonest first, then oldest first:
-        // a proof due sooner rides ahead of those with frames to spare, and
-        // the collector holds no more of them than its frames carry before
-        // they age out ([`SEAL_BYTES_HELD`]), so each one accepted rides in
-        // turn. Taken newest first, those that later arrivals passed aged out.
-        seals.sort_unstable_by_key(|c| (!c.2.prover, c.2.window_end.unwrap_or(u64::MAX), c.0, c.1));
+        // first, each by its window's end, soonest first: a proof due sooner
+        // rides ahead of those with frames to spare, and the collector holds
+        // no more of them than its frames carry before they age out
+        // ([`SEAL_BYTES_HELD`]), so each one accepted rides in turn. Taken
+        // newest first, those that later arrivals passed aged out. At an
+        // equal window end, the oldest proof each member delivered itself as
+        // an active prover, of at least [`SEAT_DENSITY_MIN_BYTES`]
+        // ([`CollectedMessage::density_member`]), goes first, those carrying
+        // more seats per byte first ([`denser`]); then the rest, oldest
+        // first: at most one proof per member and window end moves ahead of
+        // the others: one pass over them before the sort.
+        let mut firsts: HashMap<(bool, u64, [u8; 32]), (u64, u64)> = HashMap::new();
+        for &(rank, arrival, m) in &seals {
+            if let Some(member) = m.density_member() {
+                let end = m.window_end.unwrap_or(u64::MAX);
+                let first = firsts
+                    .entry((m.prover, end, member))
+                    .or_insert((rank, arrival));
+                *first = (*first).min((rank, arrival));
+            }
+        }
+        let first_own = |c: &Candidate| {
+            c.2.density_member().is_some_and(|member| {
+                let end = c.2.window_end.unwrap_or(u64::MAX);
+                firsts.get(&(c.2.prover, end, member)) == Some(&(c.0, c.1))
+            })
+        };
+        let mut seals: Vec<(Candidate, bool)> = seals
+            .into_iter()
+            .map(|c| {
+                let first = first_own(&c);
+                (c, first)
+            })
+            .collect();
+        seals.sort_unstable_by(|(a, a_first), (b, b_first)| {
+            let key = |c: &Candidate, first: bool| {
+                (!c.2.prover, c.2.window_end.unwrap_or(u64::MAX), !first)
+            };
+            key(a, *a_first)
+                .cmp(&key(b, *b_first))
+                .then_with(|| {
+                    if *a_first {
+                        denser(b.2, a.2)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+        });
+        let seals = seals.into_iter().map(|(c, _)| c);
         others.extend(seals);
         for candidates in shards.values_mut() {
             cert_union::most_signers_first(candidates);
@@ -3475,7 +3614,7 @@ impl MessageCollector {
             );
             return SubmitOutcome::Filtered(Refusal::RankFull);
         }
-        buffer.promote_seal(&message.hash);
+        buffer.promote_seal(&message.hash, message.own);
         SubmitOutcome::Duplicate
     }
 

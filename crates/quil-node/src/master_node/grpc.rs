@@ -1923,6 +1923,21 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         })
     };
 
+    // The member a sender is, for the collector's held storage epoch proofs:
+    // this node's own address for its own identity, else the prover address
+    // of its verified KeyRegistry binding.
+    {
+        let self_peer = peer_id.to_bytes();
+        let sr = signer_registry.clone();
+        message_collector.set_sender_member(move |peer| {
+            if peer == self_peer.as_slice() {
+                return Some(prover_address);
+            }
+            let key = sr.prover_key_for_peer_id(peer)?;
+            quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&key).ok()
+        });
+    }
+
     // SECURITY: an empty listener means LOCALHOST (quil-config's
     // DEFAULT_LISTEN_GRPC_MULTIADDR), not 0.0.0.0. This NodeService exposes
     // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
