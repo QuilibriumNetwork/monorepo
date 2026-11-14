@@ -37,9 +37,12 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// runs as. A user who may not give the replacement that owner gets a
 /// `PermissionDenied` error naming the file and its owner, and the file
 /// is left as it was. A symbolic link at `path` is followed, so its target
-/// is replaced and the link kept. On failure the temporary file is
-/// removed.
+/// is replaced and the link kept, when root, the user this runs as or the
+/// owner of what it names owns it; so is a link to a directory on the way
+/// (`check_links`). On failure the temporary file is removed.
 pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    check_links(path)?;
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -57,6 +60,51 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         return Err(e);
     }
     sync_parent_dir(&target);
+    Ok(())
+}
+
+/// Refuse `path` when a symbolic link on it, the file itself or a directory
+/// on the way, is owned by a user other than root, the user this runs as
+/// and the owner of what it names: a user who may write a directory could
+/// otherwise point a file that a root run replaces at any file of root's
+/// (the rule Linux applies to links in shared directories,
+/// `fs.protected_symlinks`). A link of the user this runs as only leads
+/// where that user may write.
+#[cfg(unix)]
+fn check_links(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        let link = match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => meta,
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // A link naming nothing is not followed to anything here; the write
+        // fails at it.
+        let named = match std::fs::metadata(&prefix) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if link.uid() != 0 && link.uid() != euid && link.uid() != named.uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is a link of uid {} to a file of uid {}, which is not followed: \
+                     replace the link with what it names, or have its owner own the \
+                     link; nothing was written",
+                    prefix.display(),
+                    link.uid(),
+                    named.uid()
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -477,6 +525,63 @@ mod tests {
         assert_eq!(owner(&theirs), (NOBODY, NOBODY));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A link of the user this runs as is followed, also to a directory
+    /// another user owns: here `nobody`, through its own link, writes into
+    /// a directory of root's that it may write.
+    #[test]
+    fn a_users_own_link_is_followed() {
+        if let Ok(path) = std::env::var(OWN_LINK) {
+            // The child, run as `nobody`.
+            let written = write_private_file(Path::new(&path), b"theirs");
+            eprintln!("REACH own-link written={written:?}");
+            written.expect("OWN-LINK-REFUSED: nobody's own link was not followed");
+            return;
+        }
+        use std::os::unix::fs::{chown, lchown, symlink};
+        let dir = tempdir("own-link");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can run the test as another user");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        set_mode(&dir, 0o755);
+        let shared = dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        set_mode(&shared, 0o777);
+        let node = dir.join("node");
+        std::fs::create_dir(&node).unwrap();
+        chown(&node, Some(NOBODY), Some(NOBODY)).unwrap();
+        let configs = node.join("configs");
+        symlink(&shared, &configs).unwrap();
+        lchown(&configs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let status = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("private_files::tests::a_users_own_link_is_followed")
+                .arg("--nocapture")
+                .env(OWN_LINK, configs.join("keys.yml"))
+                .uid(NOBODY)
+                .gid(NOBODY)
+                .status()
+                .expect("run the test as nobody")
+        };
+        let read = std::fs::read(shared.join("keys.yml"));
+        eprintln!(
+            "REACH own-link child_ok={} read={:?}",
+            status.success(),
+            read.as_deref().ok()
+        );
+        assert!(
+            status.success(),
+            "OWN-LINK-REFUSED: the write as nobody through its own link failed"
+        );
+        assert_eq!(read.unwrap(), b"theirs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const OWN_LINK: &str = "QUIL_CONFIG_TEST_OWN_LINK";
 
     /// New directories, parents included, are owner-only; an existing one
     /// keeps its mode.
