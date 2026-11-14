@@ -4,6 +4,8 @@
 
 use std::time::{Instant, SystemTime};
 
+use crate::commands::token::history;
+
 use super::super::mint::{
     Dialog as MintDialog, Preview as MintPreview, Stage as MintStage, Status as MintStatus,
 };
@@ -12,7 +14,7 @@ use super::super::transfer::{
     Dialog as TransferDialog, Form as TransferForm, Kind as TransferKind,
     Preview as TransferPreview,
 };
-use super::coins::{self, CoinsFocus, Middle, ATTENTION};
+use super::coins::{self, CoinsFocus, HistoryRead, Middle, ATTENTION};
 use super::*;
 
 const COLUMNS: [&str; 5] = ["Kind", "Coins", "Amount [Q]", "State", "As of"];
@@ -667,6 +669,213 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
     pin_detail(lines, note, height)
 }
 
+/// The History panel's columns.
+const HISTORY_COLUMNS: [&str; 6] = [
+    "When (UTC)",
+    "Action",
+    "Via",
+    "Amount [Q]",
+    "Fee [Q]",
+    "Outcome",
+];
+
+/// A recorded address in the History detail, as the wallet shows it
+/// elsewhere: a recipient by its ends and length, an escrow as the
+/// Transfers panel shows one; hidden in a render.
+fn history_party(m: &Model, party: &history::Party) -> String {
+    let (label, address) = match party {
+        history::Party::Recipient(address) => ("to", address),
+        history::Party::Escrow(address) => ("escrow", address),
+    };
+    let shown = if m.mask_private {
+        "hidden".to_string()
+    } else if !address.is_ascii() {
+        "unreadable".to_string()
+    } else if let history::Party::Recipient(_) = party {
+        address_text(address)
+    } else if m.compact_actions {
+        format!("…{}", &address[address.len().saturating_sub(6)..])
+    } else {
+        format!("0x{address}")
+    };
+    format!("{label} {shown}")
+}
+
+/// The History cursor row's detail: what its cells leave out. In a render
+/// an error is its fixed class reason, as the operator log names it.
+fn history_detail(m: &Model, action: &history::Action) -> String {
+    let (date, time) = history::utc(action.at);
+    let mut parts = vec![if action.started {
+        format!("Started {date} {time} UTC")
+    } else {
+        format!("First record {date} {time} UTC, no start recorded")
+    }];
+    if let Some(took) = action.duration_s {
+        parts.push(format!("took {took}s"));
+    }
+    if let Some(party) = &action.party {
+        parts.push(history_party(m, party));
+    }
+    match action.batches {
+        Some((submitted, Some(planned))) => {
+            parts.push(format!("{submitted} of {planned} batches submitted"));
+        }
+        Some((submitted, None)) => parts.push(format!("{submitted} batches submitted")),
+        None => {}
+    }
+    match (&action.outcome, &action.error) {
+        (history::Outcome::Failed, Some(error)) if m.mask_private => {
+            let reason = crate::commands::token::action_log::error_class(error).1;
+            parts.push(format!("failed: {reason}"));
+        }
+        (history::Outcome::Failed, Some(error)) => parts.push(format!("failed: {error}")),
+        (history::Outcome::Requoted, _) => {
+            parts.push("the fee quote changed; nothing was proved".into());
+        }
+        (history::Outcome::Unrecorded, _) => {
+            parts.push("no outcome recorded: stopped before its end, or still running".into());
+        }
+        _ => {}
+    }
+    format!("{}.", parts.join("; "))
+}
+
+/// The History panel's cells of `action`; its amounts are hidden in a
+/// render.
+fn history_cells(m: &Model, action: &history::Action) -> [Cell; 6] {
+    let amount = |units: Option<u128>| match units {
+        _ if m.mask_private => plain("hidden"),
+        Some(units) => plain(fixed_amount(units)),
+        None => plain("-"),
+    };
+    let outcome = match &action.outcome {
+        history::Outcome::Failed if m.color_coding => ("failed".to_string(), Some(WARNING)),
+        history::Outcome::Failed => plain("failed!"),
+        outcome => plain(outcome.word()),
+    };
+    [
+        plain(history::utc_minute(action.at)),
+        plain(action.name()),
+        plain(action.source.as_deref().unwrap_or("-")),
+        amount(action.amount),
+        amount(action.fee),
+        outcome,
+    ]
+}
+
+/// The History panel in `height` rows `width` wide: one row per recorded
+/// action, newest first, under the panel's cursor, the cursor row's detail
+/// pinned to the bottom; else the panel's state. With the lines, the rows
+/// it scrolls and the rows of the detail, whose first the cursor rule
+/// takes.
+fn history_lines(m: &Model, width: u16, height: u16) -> (Vec<Line<'static>>, Scroll, usize) {
+    let help = Style::new().fg(HELP);
+    let note = |text: String, style: Style| {
+        let lines = wrap_message(Line::from(Span::styled(text, style)), width);
+        (pinned_notes(lines, width, height), None, 0)
+    };
+    let history = match &m.coins.history.read {
+        None => {
+            let text = format!("{} Reading the action log…", spinner(m));
+            let line = Line::from(Span::styled(text, Style::new().fg(PRIMARY)));
+            return (vec![line], None, 0);
+        }
+        Some(HistoryRead::Off) => {
+            return note(
+                "History: the action log is off (--no-action-log, or noActionLog: true in the \
+                 qclient config), or this is a render, which never reads it."
+                    .into(),
+                help,
+            );
+        }
+        Some(HistoryRead::Failed(why)) => {
+            return note(
+                format!("History: unavailable, the action log could not be read ({why})."),
+                Style::new().fg(WARNING),
+            );
+        }
+        Some(HistoryRead::Read(history)) if history.actions.is_empty() => {
+            return note(
+                "History: no wallet actions recorded yet. Shields, mints, claims and transfer \
+                 actions run here or by `qclient token` are."
+                    .into(),
+                help,
+            );
+        }
+        Some(HistoryRead::Read(history)) => history,
+    };
+    let cells: Vec<[Cell; 6]> = history
+        .actions
+        .iter()
+        .map(|action| history_cells(m, action))
+        .collect();
+    let mut widths = HISTORY_COLUMNS.map(|name| name.chars().count());
+    for row in &cells {
+        for (width, (text, _)) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text.chars().count());
+        }
+    }
+    // Amounts align right, words left.
+    let pad = |column: usize, text: &str, width: usize| match column {
+        3 | 4 => format!("{text:>width$}  "),
+        _ => format!("{text:<width$}  "),
+    };
+    let bold = Style::new().fg(TEXT).add_modifier(Modifier::BOLD);
+    let header: Vec<Span<'static>> = HISTORY_COLUMNS
+        .iter()
+        .zip(widths)
+        .enumerate()
+        .map(|(column, (name, width))| Span::styled(pad(column, name, width), bold))
+        .collect();
+    let skipped = match history.unreadable {
+        0 => None,
+        1 => Some("1 line of the action log was unreadable and skipped.".to_string()),
+        n => Some(format!(
+            "{n} lines of the action log were unreadable and skipped."
+        )),
+    };
+    let notes = skipped
+        .map(|text| wrap_message(Line::from(Span::styled(text, help)), width))
+        .unwrap_or_default();
+    let cursor = m.coins.history.cursor.min(cells.len() - 1);
+    let detail = Line::from(Span::styled(
+        history_detail(m, &history.actions[cursor]),
+        help,
+    ));
+    let detail = cursor_detail(detail, width, height, 2);
+    let total = cells.len();
+    let visible = usize::from(height)
+        .saturating_sub(1 + notes.len() + detail.len())
+        .max(1);
+    let first = cursor.saturating_sub(visible - 1);
+    let focused = m.coins.focus == CoinsFocus::Middle;
+    let mut lines = vec![Line::from(header)];
+    for (i, row) in cells.into_iter().enumerate().skip(first).take(visible) {
+        let background = (i == cursor).then_some(if focused {
+            CURSOR_BG
+        } else {
+            INACTIVE_CURSOR_BG
+        });
+        let spans: Vec<Span<'static>> = row
+            .into_iter()
+            .zip(widths)
+            .enumerate()
+            .map(|(column, ((text, color), width))| {
+                let mut style = Style::new().fg(color.unwrap_or(TEXT));
+                if let Some(background) = background {
+                    style = style.bg(background);
+                }
+                Span::styled(pad(column, &text, width), style)
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+    lines.extend(notes);
+    let rule = detail.len();
+    let scroll = (total > visible).then_some((first, total, visible));
+    (pin_detail(lines, detail, height), scroll, rule)
+}
+
 /// The middle panel's title and lines: a confirmation while one is open;
 /// else the selected Balances row's panel ([`Middle`]).
 fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
@@ -732,6 +941,10 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             (Middle::Transfers.title().into(), lines, None)
         }
         Middle::ShieldPlan => plan_lines(m, width, height),
+        Middle::History => {
+            let (lines, scroll, _) = history_lines(m, width, height);
+            (Middle::History.title().into(), lines, scroll)
+        }
     }
 }
 
@@ -1400,6 +1613,7 @@ fn ui_key_rows_esc(m: &Model, width: u16, esc: Option<&str>) -> Vec<Line<'static
         ("A", "accept"),
         ("R", "refund"),
         ("J", "merge"),
+        ("H", "history"),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -1491,24 +1705,32 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     });
     render_cursor_rule(f, chunks[1], inner, detail_rows, border);
     let plan_area = chunks[2];
-    let (title, lines, scroll) = middle_lines(
-        m,
-        plan_area.width.saturating_sub(2),
-        plan_area.height.saturating_sub(2),
-    );
+    let width = plan_area.width.saturating_sub(2);
+    let height = plan_area.height.saturating_sub(2);
+    // The History cursor row's detail sits under the cursor rule.
+    let (title, lines, scroll, rule) = if coins::middle(m) == Middle::History {
+        let (lines, scroll, rule) = history_lines(m, width, height);
+        (Middle::History.title().to_string(), lines, scroll, rule)
+    } else {
+        let (title, lines, scroll) = middle_lines(m, width, height);
+        (title, lines, scroll, 0)
+    };
     let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)))
         || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)))
         || matches!(
             m.coins.transfer.dialog,
             Some(TransferDialog::Confirm(_) | TransferDialog::Form(_))
         );
-    let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
+    let focused = dialog || m.coins.focus == CoinsFocus::Middle;
+    let block = bordered(title, focused);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
     f.render_widget(
         Paragraph::new(fit_lines(lines, inner.width, inner.height)),
         inner,
     );
+    let border = Style::new().fg(if focused { PRIMARY } else { DIM });
+    render_cursor_rule(f, plan_area, inner, rule, border);
     if let Some((offset, total, visible)) = scroll {
         render_scroll_hint(f, plan_area, offset, total, visible, 0, 0);
     }
@@ -3433,5 +3655,140 @@ mod coins_render_tests {
                 assert_eq!(claim[..want.len()], want[..], "{text}");
             }
         }
+    }
+
+    /// A transfer by the manager and a failed merge by the CLI, as the
+    /// action log records them.
+    fn two_actions() -> coins::HistoryRead {
+        use crate::commands::token::history::{parse, record_line as rec};
+        const T: u64 = 1_763_000_000;
+        let quil = u128::from(crate::util::UNITS_PER_QUIL);
+        let transfer = format!(
+            r#"{{"recipient":"0x{}","amount":"{}","fee":"{}"}}"#,
+            "c3".repeat(60),
+            quil * 2,
+            quil / 1000
+        );
+        let failed = r#"{"outcome":"failed","error":"plan changed at 10.1.2.3"}"#;
+        let log = [
+            rec(T, "transfer", "start", "manager", &transfer),
+            rec(
+                T + 30,
+                "transfer",
+                "outcome",
+                "manager",
+                r#"{"outcome":"ok","duration_s":30}"#,
+            ),
+            rec(T + 100, "merge", "start", "cli", r#"{"fee":"8"}"#),
+            rec(T + 101, "merge", "outcome", "cli", failed),
+        ];
+        coins::HistoryRead::Read(parse(&log.join("\n")))
+    }
+
+    /// The History panel: one row per action, newest first, a failure
+    /// marked, the cursor row's detail under the cursor rule (the
+    /// recipient by its ends, the error); a render hides the amounts, the
+    /// recipient and the error's text. Its states draw as notes.
+    #[test]
+    fn the_history_panel_lists_actions_newest_first() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut m = loaded();
+        m.color_coding = false;
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Char('H')));
+        let text = render_text(&mut m, 120, 40);
+        let panel = panel_inner(&text, "History");
+        assert!(panel[0].contains("Reading the action log"), "{text}");
+        coins::apply_history(&mut m, two_actions());
+        let text = render_text(&mut m, 120, 40);
+        let panel = panel_inner(&text, "History");
+        assert!(panel[0].starts_with("When (UTC)") && panel[0].contains("Outcome"));
+        let merge = &panel[1];
+        assert!(merge.starts_with("2025-11-13 02:15  merge"), "{text}");
+        assert!(merge.contains("cli") && merge.contains("failed!"), "{text}");
+        let transfer = &panel[2];
+        assert!(transfer.contains("transfer  manager"), "{text}");
+        assert!(transfer.contains("2.00000") && transfer.contains("0.00100"));
+        assert!(transfer.ends_with("ok"), "{text}");
+        assert_eq!(text.matches("─ cursor ─").count(), 2, "{text}");
+        assert!(text.contains("failed: plan changed at 10.1.2.3"), "{text}");
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("took 30s"), "{text}");
+        assert!(
+            text.contains("to 0xc3c3c3c3c3c3…c3c3c3c3c3c3 (60 bytes)"),
+            "{text}"
+        );
+        // A render: amounts, the recipient and the error's text hidden.
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("to hidden"), "{text}");
+        assert!(
+            !text.contains("2.00000") && !text.contains("c3c3"),
+            "{text}"
+        );
+        m.coins.history.cursor = 0;
+        let text = render_text(&mut m, 120, 40);
+        assert!(
+            text.contains("failed: the coins changed since the confirmation"),
+            "{text}"
+        );
+        assert!(!text.contains("10.1.2.3"), "{text}");
+        m.mask_private = false;
+        for (read, note) in [
+            (coins::HistoryRead::Off, "History: the action log is off"),
+            (
+                coins::HistoryRead::Failed("wallet/actions.jsonl is not a regular file".into()),
+                "could not be read (wallet/actions.jsonl is not a regular file)",
+            ),
+            (
+                coins::HistoryRead::Read(Default::default()),
+                "History: no wallet actions recorded yet.",
+            ),
+        ] {
+            coins::apply_history(&mut m, read);
+            let text = render_text(&mut m, 120, 40);
+            let panel = panel_inner(&text, "History").join(" ");
+            assert!(panel.contains(note), "{text}");
+            assert_eq!(text.matches("─ cursor ─").count(), 1, "{text}");
+        }
+        // ‹H› again: the Balances row's panel.
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Char('H')));
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("╭ Claim status"), "{text}");
+    }
+
+    /// An action's last report reads the log again while History is open,
+    /// and only then.
+    #[test]
+    fn an_ended_action_reads_the_history_again() {
+        use super::super::super::msg::Msg;
+        use super::super::super::transfer::Progress;
+        use super::super::super::update::{apply_msg, Cmd};
+        let mut m = loaded();
+        let done = || Msg::Transfer(Progress::Done(Ok(())));
+        assert!(apply_msg(&mut m, done()).is_empty());
+        coins::handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('H')),
+        );
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let note = Msg::Transfer(Progress::Note("proving".into()));
+        assert!(apply_msg(&mut m, note).is_empty());
+        assert!(matches!(
+            apply_msg(&mut m, done()).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let mint = Msg::Mint(super::super::super::mint::Progress::Done(Ok(())));
+        assert!(matches!(
+            apply_msg(&mut m, mint).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let shield = Msg::Shield(super::super::super::shield::Progress::Done(Ok(())));
+        assert!(matches!(
+            apply_msg(&mut m, shield).as_slice(),
+            [Cmd::ReadHistory]
+        ));
     }
 }

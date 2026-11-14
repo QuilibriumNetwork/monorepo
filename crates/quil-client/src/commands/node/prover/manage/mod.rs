@@ -384,6 +384,8 @@ async fn render(
                 }
                 Cmd::FetchShielded => |msg| matches!(msg, Msg::Shielded(_)),
                 Cmd::TransferPrepare(_) => |msg| matches!(msg, Msg::TransferPreview(_)),
+                // A render's log is off: it answers so, reading nothing.
+                Cmd::ReadHistory => |msg| matches!(msg, Msg::History(_)),
                 other => {
                     dropped.push(other);
                     continue;
@@ -558,6 +560,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::FetchShielded => "shielded coins read",
         Cmd::TransferPrepare(_) => "transfer reads and quote",
         Cmd::TransferRun(_) => "transfer action",
+        Cmd::ReadHistory => "action log read",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -722,6 +725,17 @@ fn spawn_action(
             let token = refresh.token.clone();
             tokio::spawn(async move {
                 let _ = tx.send(actions::transfer_prepare(token, kind).await);
+            });
+        }
+        Cmd::ReadHistory => {
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let read = move || coins::read_history_log(log.as_ref());
+                let read = match tokio::task::spawn_blocking(read).await {
+                    Ok(read) => read,
+                    Err(e) => coins::HistoryRead::Failed(e.to_string()),
+                };
+                let _ = tx.send(Msg::History(read));
             });
         }
         Cmd::TransferRun(preview) => {
