@@ -643,4 +643,119 @@ mod tests {
         }
         assert!(padded_data == result);
     }
+
+    /// A proof of `data` and the matching recovery request.
+    fn recovery_of(data: &[u8]) -> VerencDecrypt {
+        let mut chunk = data.to_vec();
+        chunk.resize(56, 0);
+        let proof = new_verenc_proof(chunk);
+        let compressed = verenc_compress(VerencProof {
+            blinding_pubkey: proof.blinding_pubkey.clone(),
+            encryption_key: proof.encryption_key,
+            statement: proof.statement.clone(),
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        });
+        VerencDecrypt {
+            blinding_pubkey: proof.blinding_pubkey,
+            decryption_key: proof.decryption_key,
+            statement: proof.statement,
+            ciphertexts: compressed,
+        }
+    }
+
+    #[test]
+    fn a_failed_recovery_returns_no_bytes() {
+        let mut request = recovery_of(b"hello");
+        request.decryption_key = recovery_of(b"other").decryption_key;
+        let result = verenc_recover(request);
+        assert!(
+            result.is_empty(),
+            "a failed recovery returned {} bytes",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_too_few_ciphertexts() {
+        let request = recovery_of(b"hello");
+        let mut few_ctexts = request.clone();
+        few_ctexts.ciphertexts.ctexts.clear();
+        let mut few_aux = request;
+        few_aux.ciphertexts.aux.clear();
+        for short in [few_ctexts, few_aux] {
+            let result = std::panic::catch_unwind(|| verenc_recover(short));
+            assert!(
+                matches!(&result, Ok(bytes) if bytes.is_empty()),
+                "recovery of a short ciphertext list did not refuse it"
+            );
+        }
+    }
+
+    /// A proof of a one-byte witness, as `verenc_verify` and
+    /// `verenc_compress` take it.
+    fn proof() -> VerencProof {
+        let mut chunk = vec![0u8; 56];
+        chunk[0] = 1;
+        let proof = new_verenc_proof(chunk);
+        VerencProof {
+            blinding_pubkey: proof.blinding_pubkey,
+            encryption_key: proof.encryption_key,
+            statement: proof.statement,
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        }
+    }
+
+    #[test]
+    fn verification_refuses_a_short_polynomial_commitment() {
+        let mut short = proof();
+        assert!(verenc_verify(short.clone()), "the untouched proof fails");
+        short.polycom.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_verify(short));
+        assert!(
+            matches!(result, Ok(false)),
+            "verification of a short polynomial commitment did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_a_short_challenge() {
+        let mut short = proof();
+        assert!(short.challenge.len() > 16, "the challenge is already short");
+        short.challenge.truncate(16);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of a short challenge did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_ciphertexts() {
+        let mut short = proof();
+        assert!(!short.ctexts.is_empty(), "the proof has no ciphertexts");
+        short.ctexts.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few ciphertexts did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_shares() {
+        let mut short = proof();
+        assert!(!short.shares_rands.is_empty(), "the proof has no shares");
+        short.shares_rands.pop();
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few shares did not refuse it"
+        );
+    }
 }

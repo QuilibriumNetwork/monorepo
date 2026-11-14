@@ -5074,4 +5074,127 @@ mod tests {
 
         eprintln!("All resized key shares validated successfully!");
     }
+
+    /// Key shares as a resize (`resize_round2`) leaves them: valid shares
+    /// with no party data, so they cannot run the DKLs23 rounds. Built
+    /// from `rekey_from_secret` shares, which do carry party data, with
+    /// it removed.
+    fn shares_without_party_data() -> Vec<Vec<u8>> {
+        let mut secret = vec![0u8; 32];
+        secret[31] = 1;
+        let rekey = rekey_from_secret(&secret, 2, 3, EllipticCurve::Secp256k1);
+        assert!(rekey.success, "rekey failed: {:?}", rekey.error_message);
+        rekey
+            .key_shares
+            .iter()
+            .map(|share| {
+                let mut key: KeyShareData = deserialize_state(share).unwrap();
+                assert!(key.party_data.is_some(), "rekey share lacks party data");
+                key.party_data = None;
+                serialize_state(&key).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn signing_refuses_a_key_share_without_party_data() {
+        init();
+        let shares = shares_without_party_data();
+        let sign = sign_init(&shares[0], &[0x42u8; 32], &[1, 2]);
+        assert!(sign.success, "sign_init failed: {:?}", sign.error_message);
+
+        let round1 = sign_round1(&sign.session_state);
+        assert!(
+            !round1.success,
+            "signing ran on a key share without party data"
+        );
+        let error = round1.error_message.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    #[test]
+    fn refresh_refuses_a_key_share_without_party_data() {
+        init();
+        let shares = shares_without_party_data();
+        let refresh = refresh_init(&shares[0], 1);
+        assert!(
+            refresh.success,
+            "refresh_init failed: {:?}",
+            refresh.error_message
+        );
+
+        let round1 = refresh_round1(&refresh.session_state);
+        assert!(
+            !round1.success,
+            "refresh ran on a key share without party data"
+        );
+        let error = round1.error_message.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    /// A signing session on a key share without party data, at `round`
+    /// as if the earlier rounds had run.
+    fn signing_at_round(round: u32) -> Vec<u8> {
+        let shares = shares_without_party_data();
+        let sign = sign_init(&shares[0], &[0x42u8; 32], &[1, 2]);
+        assert!(sign.success, "sign_init failed: {:?}", sign.error_message);
+        let mut state: SignSessionState = deserialize_state(&sign.session_state).unwrap();
+        state.round = round;
+        serialize_state(&state).unwrap()
+    }
+
+    /// A refresh session on a key share without party data, at `round`
+    /// as if the earlier rounds had run.
+    fn refresh_at_round(round: u32) -> Vec<u8> {
+        let shares = shares_without_party_data();
+        let refresh = refresh_init(&shares[0], 1);
+        assert!(
+            refresh.success,
+            "refresh_init failed: {:?}",
+            refresh.error_message
+        );
+        let mut state: RefreshSessionState = deserialize_state(&refresh.session_state).unwrap();
+        state.round = round;
+        serialize_state(&state).unwrap()
+    }
+
+    /// One message to party 1 from each of `from`.
+    fn messages_from(from: &[u32]) -> Vec<PartyMessage> {
+        from.iter()
+            .map(|&from_party| PartyMessage {
+                from_party,
+                to_party: 1,
+                data: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Asserts a round refused for want of party data.
+    fn assert_no_party_data(success: bool, error: Option<String>, ran: &str) {
+        assert!(!success, "{ran} ran on a key share without party data");
+        let error = error.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    #[test]
+    fn later_signing_rounds_refuse_a_key_share_without_party_data() {
+        init();
+        let round2 = sign_round2(&signing_at_round(1), &messages_from(&[2]));
+        assert_no_party_data(round2.success, round2.error_message, "sign_round2");
+        let round3 = sign_round3(&signing_at_round(2), &messages_from(&[2]));
+        assert_no_party_data(round3.success, round3.error_message, "sign_round3");
+        let last = sign_finalize(&signing_at_round(3), &messages_from(&[2]));
+        assert_no_party_data(last.success, last.error_message, "sign_finalize");
+    }
+
+    #[test]
+    fn later_refresh_rounds_refuse_a_key_share_without_party_data() {
+        init();
+        let round2 = refresh_round2(&refresh_at_round(1), &messages_from(&[2, 3]));
+        assert_no_party_data(round2.success, round2.error_message, "refresh_round2");
+        let round3 = refresh_round3(&refresh_at_round(2), &messages_from(&[2, 3]));
+        assert_no_party_data(round3.success, round3.error_message, "refresh_round3");
+        let last = refresh_finalize(&refresh_at_round(3), &messages_from(&[2, 3]));
+        assert_no_party_data(last.success, last.error_message, "refresh_finalize");
+    }
 }

@@ -873,4 +873,144 @@ mod feldman_vss_tests {
             "fragment must not verify against another dealer's commitments",
         );
     }
+
+    #[test]
+    fn mul_share_refuses_a_point_of_the_wrong_length() {
+        let gen = EdwardsPoint::generator();
+        let mut party = Feldman::new(2, 3, 1, Scalar::random(&mut OsRng), gen);
+        party.sample_polynomial(&mut OsRng).unwrap();
+        let mut point = (Scalar::random(&mut OsRng) * gen)
+            .compress()
+            .to_bytes()
+            .to_vec();
+        point.pop();
+        let result = std::panic::catch_unwind(|| party.mul_share(&point));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "mul_share did not refuse a point of the wrong length"
+        );
+    }
+
+    /// Three parties of a two-of-three DKG, each waiting for the others'
+    /// reveals.
+    fn revealing_parties() -> Vec<Feldman> {
+        let gen = EdwardsPoint::generator();
+        let mut parties: Vec<Feldman> = (1..=3)
+            .map(|id| Feldman::new(2, 3, id, Scalar::random(&mut OsRng), gen))
+            .collect();
+        for party in &mut parties {
+            party.sample_polynomial(&mut OsRng).unwrap();
+        }
+        let dealt: Vec<_> = parties
+            .iter()
+            .map(|p| {
+                (
+                    p.get_poly_frags().unwrap().clone(),
+                    p.get_commitments().unwrap(),
+                )
+            })
+            .collect();
+        let mut zkcommits = Vec::new();
+        for (i, party) in parties.iter_mut().enumerate() {
+            for (j, (frags, commitments)) in dealt.iter().enumerate() {
+                if i != j {
+                    let frag = &frags[&(i + 1)];
+                    if let Some(zkcommit) = party
+                        .set_poly_frag_for_party(j + 1, frag, commitments)
+                        .unwrap()
+                    {
+                        zkcommits.push((i + 1, zkcommit));
+                    }
+                }
+            }
+        }
+        for party in &mut parties {
+            for (from, zkcommit) in &zkcommits {
+                if *from != party.get_id() {
+                    party.receive_commitments(*from, zkcommit).unwrap();
+                }
+            }
+        }
+        parties
+    }
+
+    /// 57 bytes that decode to no point.
+    fn invalid_point() -> Vec<u8> {
+        (0u8..=255)
+            .map(|b| {
+                let mut p = vec![0u8; 57];
+                p[0] = b;
+                p
+            })
+            .find(|p| bool::from(EdwardsPoint::from_bytes(p[..].into()).is_none()))
+            .expect("every candidate decoded to a point")
+    }
+
+    #[test]
+    fn a_reveal_with_malformed_fields_is_refused() {
+        let mut parties = revealing_parties();
+        let point = || {
+            (Scalar::random(&mut OsRng) * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .to_vec()
+        };
+        let proof = || Scalar::random(&mut OsRng).to_bytes().to_vec();
+        let reveal = || FeldmanReveal {
+            point: point(),
+            random_commitment_point: point(),
+            zk_pok: proof(),
+        };
+        let short = |mut v: Vec<u8>| {
+            v.pop();
+            v
+        };
+        let cases = [
+            (
+                "a short point",
+                FeldmanReveal {
+                    point: short(point()),
+                    ..reveal()
+                },
+            ),
+            (
+                "an invalid point",
+                FeldmanReveal {
+                    point: invalid_point(),
+                    ..reveal()
+                },
+            ),
+            (
+                "a short commitment point",
+                FeldmanReveal {
+                    random_commitment_point: short(point()),
+                    ..reveal()
+                },
+            ),
+            (
+                "an invalid commitment point",
+                FeldmanReveal {
+                    random_commitment_point: invalid_point(),
+                    ..reveal()
+                },
+            ),
+            (
+                "a short proof",
+                FeldmanReveal {
+                    zk_pok: short(proof()),
+                    ..reveal()
+                },
+            ),
+        ];
+        for (what, malformed) in cases {
+            let party = &mut parties[0];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                party.recombine(2, &malformed)
+            }));
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "a reveal with {what} was not refused"
+            );
+        }
+    }
 }

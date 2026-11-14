@@ -704,4 +704,17 @@ mod tests {
             "true"
         )
     }
+
+    #[test]
+    fn decryption_refuses_a_malformed_nonce() {
+        let key = [7u8; 32];
+        let mut sealed = encrypt(b"hello", &key).unwrap();
+        // Five zero bytes; AES-GCM takes twelve.
+        sealed.initialization_vector = "AAAAAAA=".to_string();
+        let result = std::panic::catch_unwind(|| decrypt(&sealed, &key));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "decryption did not refuse a malformed nonce"
+        );
+    }
 }

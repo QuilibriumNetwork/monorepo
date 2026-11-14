@@ -755,6 +755,64 @@ mod tests {
             .unwrap();
         assert!(decode_legacy_verenc_coin(&tree).unwrap().is_none());
     }
+
+    /// A well-formed 621-byte legacy slot encrypted to a key other than
+    /// `PUBLIC_READ_KEY`, so its recovery fails.
+    fn slot_that_fails_recovery() -> Vec<u8> {
+        let mut chunk = vec![0u8; 56];
+        chunk[0] = 1;
+        let proof = verenc::new_verenc_proof(chunk);
+        let compressed = verenc::verenc_compress(verenc::VerencProof {
+            blinding_pubkey: proof.blinding_pubkey.clone(),
+            encryption_key: proof.encryption_key,
+            statement: proof.statement.clone(),
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        });
+        let mut blob = Vec::with_capacity(621);
+        for ct in &compressed.ctexts {
+            blob.extend_from_slice(&ct.c1);
+            blob.extend_from_slice(&ct.c2);
+        }
+        for aux in &compressed.aux {
+            blob.extend_from_slice(aux);
+        }
+        blob.extend_from_slice(&proof.blinding_pubkey);
+        blob.extend_from_slice(&proof.statement);
+        assert_eq!(blob.len(), 621, "not a legacy slot");
+        let recovery = parse_mpcith_verenc(&blob, &PUBLIC_READ_KEY).unwrap();
+        assert!(
+            verenc::verenc_recover(recovery).iter().all(|&b| b == 0),
+            "the slot recovered under the public read key"
+        );
+        blob
+    }
+
+    /// The migration keeps the release's behaviour for a coin whose
+    /// recovery fails: it migrates with zero value rather than aborting.
+    #[test]
+    fn a_legacy_coin_that_fails_recovery_migrates_with_zero_value() {
+        let mut tree = VectorCommitmentTree::new();
+        for slot in [1u64, 2] {
+            let blob = slot_that_fails_recovery();
+            tree.insert(&slot.to_be_bytes(), &blob, &[], &BigInt::from(blob.len()))
+                .unwrap();
+        }
+        let coin = decode_legacy_verenc_coin(&tree)
+            .expect("a failed recovery aborted the legacy migration");
+        assert_eq!(
+            coin,
+            Some(TransparentCoin {
+                owner_address: [0u8; 32],
+                amount: 0,
+            })
+        );
+        let migrated = migrate_legacy_coin(&[0x51u8; 32], &tree, &[0x33u8; 32])
+            .expect("a failed recovery aborted the legacy migration");
+        assert_eq!(migrated.map(|(_, amount, _)| amount), Some(0));
+    }
 }
 
 #[cfg(test)]

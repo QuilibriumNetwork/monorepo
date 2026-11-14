@@ -991,6 +991,56 @@ impl TripleRatchetParticipant {
         return Ok(rescaled.unwrap());
     }
 
+    /// The group key as this member's DKG ratchet holds it now.
+    #[cfg(test)]
+    pub(crate) fn dkg_group_key(&self) -> Vec<u8> {
+        self.dkg_ratchet.public_key_bytes()
+    }
+
+    /// This member's DKG id and share point, as another member passes them
+    /// to [`Self::point_verify`].
+    #[cfg(test)]
+    pub(crate) fn dkg_share(&self) -> (usize, Vec<u8>) {
+        let point = self.dkg_ratchet.get_scalar() * EdwardsPoint::generator();
+        (
+            self.dkg_ratchet.get_id(),
+            point.compress().to_bytes().to_vec(),
+        )
+    }
+
+    /// This member's public key, as the others name its channel.
+    #[cfg(test)]
+    pub(crate) fn member_key(&self) -> Vec<u8> {
+        (self.peer_key * EdwardsPoint::generator())
+            .compress()
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// `payload` sealed on this member's channel to `peer`, as its DKG
+    /// messages travel.
+    #[cfg(test)]
+    pub(crate) fn seal_dkg_message(&mut self, peer: &[u8], payload: &[u8]) -> P2PChannelEnvelope {
+        self.peer_channels
+            .get_mut(peer)
+            .unwrap()
+            .ratchet_encrypt(payload)
+            .unwrap()
+    }
+
+    /// An envelope with `header` sealed under the group header key, as a
+    /// member seals its own headers.
+    #[cfg(test)]
+    pub(crate) fn seal_header(&self, header: &[u8]) -> P2PChannelEnvelope {
+        P2PChannelEnvelope {
+            protocol_identifier: TRIPLE_RATCHET_PROTOCOL,
+            message_header: self
+                .encrypt(header, &self.current_header_key, None)
+                .unwrap(),
+            message_body: MessageCiphertext::default(),
+        }
+    }
+
     pub fn point_verify(
         &mut self,
         point: Vec<u8>,

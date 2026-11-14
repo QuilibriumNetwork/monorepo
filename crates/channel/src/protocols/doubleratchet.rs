@@ -671,6 +671,19 @@ impl DoubleRatchetParticipant {
     pub fn get_public_key(&self) -> EdwardsPoint {
         EdwardsPoint::mul_by_generator(&self.sending_ephemeral_private_key)
     }
+
+    /// An envelope whose header is `header`, sealed under this
+    /// participant's sending header key, as its correspondent can send.
+    #[cfg(test)]
+    pub(crate) fn seal_header(&self, header: &[u8]) -> P2PChannelEnvelope {
+        P2PChannelEnvelope {
+            protocol_identifier: DOUBLE_RATCHET_PROTOCOL,
+            message_header: self
+                .encrypt(header, &self.current_sending_header_key, None)
+                .unwrap(),
+            message_body: MessageCiphertext::default(),
+        }
+    }
 }
 
 /// Wipe long-lived secret key material on drop so root/chain/message
