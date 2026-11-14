@@ -378,23 +378,65 @@ const SEAL_UNRECORDED_VIEW_BEHIND: &str =
      more than a seal copy takes to land, so GLOBAL may have recorded the seal in frames \
      this view has not reached; check this worker's prover-tree sync";
 
+/// What an unrecorded seal waits on when this node's latest GLOBAL frame
+/// was stamped before the seal's first copy went out
+/// ([`record_stall_scope`]).
+const SEAL_UNRECORDED_VIEW_STALE: &str =
+    "this node's GLOBAL view, whose latest frame was stamped before the seal's first copy \
+     went out (latest_global_age_secs ago), so no frame it holds can carry the seal and \
+     GLOBAL may have recorded it in frames this node has not received; check this node's \
+     GLOBAL sync";
+
+/// How much earlier than a seal's first copy this node's latest GLOBAL
+/// frame may be stamped and still count as one the copy could land in: a
+/// margin for the stamping prover's clock against this node's.
+pub(crate) const SEAL_VIEW_STAMP_SLACK: Duration = Duration::from_secs(60);
+
+/// A GLOBAL header's stamp (Unix ms), when it has one.
+fn stamp_ms(stamp: Option<i64>) -> Option<u64> {
+    stamp
+        .and_then(|stamp| u64::try_from(stamp).ok())
+        .filter(|stamp| *stamp > 0)
+}
+
 /// Whose problem an unrecorded seal ([`SealRecord`]) is, from this member's
 /// committed view of GLOBAL at `committed_frame`: the `scope` and `action`
 /// of [`crate::outage`], and what the seal waits on, as [`stall_scope`]
 /// tells a drain's. A view trailing this node's latest GLOBAL frame by more
 /// than [`SEAL_LANDS_WITHIN`] may not reach the frame a recent copy landed
-/// in, so this worker's view lags; otherwise GLOBAL frames pass the frame a
-/// copy lands by without the seal recorded.
+/// in, so this worker's view lags. A latest frame stamped
+/// (`latest_global_stamp_ms`, Unix ms) more than [`SEAL_VIEW_STAMP_SLACK`]
+/// before the first copy went out (`first_copy_ms`) means this node's
+/// GLOBAL view lags: every frame it holds was made before the copy existed,
+/// though the view passed the frame numbers the copy lands by. A GLOBAL
+/// halt after the copy landed keeps a later stamp. Otherwise GLOBAL frames
+/// pass the frame a copy lands by without the seal recorded.
 pub(crate) fn record_stall_scope(
     committed_frame: Option<u64>,
     latest_global_frame: Option<u64>,
+    latest_global_stamp_ms: Option<i64>,
+    first_copy_ms: u64,
 ) -> (&'static str, &'static str, &'static str) {
+    let slack_ms = SEAL_VIEW_STAMP_SLACK.as_millis() as u64;
+    let stale = stamp_ms(latest_global_stamp_ms)
+        .is_some_and(|stamp| stamp.saturating_add(slack_ms) < first_copy_ms);
     match (committed_frame, latest_global_frame) {
         (Some(committed), Some(latest)) if latest > committed.saturating_add(SEAL_LANDS_WITHIN) => {
             ("local", "check", SEAL_UNRECORDED_VIEW_BEHIND)
         }
+        _ if stale => ("local", "check", SEAL_UNRECORDED_VIEW_STALE),
         _ => ("network", "report", SEAL_UNRECORDED_WAITS_ON),
     }
+}
+
+/// Seconds at `now_ms` since this node's latest GLOBAL frame was stamped
+/// (`latest_global_stamp_ms`, Unix ms), for an unrecorded seal's lines;
+/// `None` when the frame or its stamp is unknown.
+pub(crate) fn global_view_age_secs(
+    latest_global_stamp_ms: Option<i64>,
+    now_ms: u64,
+) -> Option<u64> {
+    stamp_ms(latest_global_stamp_ms).map(|stamp| now_ms.saturating_sub(stamp) / 1000)
 }
 
 /// Whether this member's published seal gets recorded while its copies
@@ -805,17 +847,77 @@ mod tests {
     /// passing that frame without the record.
     #[test]
     fn an_unrecorded_seal_names_whose_problem_it_is() {
-        let behind = record_stall_scope(Some(1_014_497), Some(1_014_585));
+        // Stamped after the first copy went out: a current view.
+        let copy = 1_000_000_000;
+        let stamp = Some(copy as i64 + 20_000);
+        let behind = record_stall_scope(Some(1_014_497), Some(1_014_585), stamp, copy);
+        println!("seal record stall judged: scope {behind:?}");
         assert_eq!((behind.0, behind.1), ("local", "check"));
         assert_eq!(behind.2, SEAL_UNRECORDED_VIEW_BEHIND);
         let edge = Some(10 + SEAL_LANDS_WITHIN);
-        assert_eq!(record_stall_scope(Some(10), edge).0, "network");
-        assert_eq!(record_stall_scope(Some(10), edge.map(|f| f + 1)).0, "local");
+        assert_eq!(record_stall_scope(Some(10), edge, stamp, copy).0, "network");
+        assert_eq!(
+            record_stall_scope(Some(10), edge.map(|f| f + 1), stamp, copy).0,
+            "local"
+        );
         for (committed, latest) in [(Some(10), Some(10)), (Some(10), None), (None, Some(90))] {
-            let scope = record_stall_scope(committed, latest);
+            let scope = record_stall_scope(committed, latest, stamp, copy);
             assert_eq!((scope.0, scope.1), ("network", "report"));
             assert_eq!(scope.2, SEAL_UNRECORDED_WAITS_ON);
         }
+    }
+
+    /// An unrecorded seal judged from a GLOBAL view whose latest frame was
+    /// stamped hours before the first copy went out is this node's view
+    /// lag, though the view passed the frame numbers the copy lands by: no
+    /// frame it holds can carry the copy. A view stamped after the copy, a
+    /// GLOBAL halt after it landed included, or within the clock slack, or
+    /// with no stamp, keeps the network report.
+    #[test]
+    fn an_unrecorded_seal_from_a_view_stamped_before_the_copy_is_local() {
+        let copy: u64 = 1_000_000_000_000;
+        let hours = 3 * 60 * 60 * 1000;
+        let old = Some(copy as i64 - hours);
+        let lagging = record_stall_scope(Some(1_032_109), Some(1_032_109), old, copy);
+        println!("seal record stall judged: scope {lagging:?}");
+        assert_eq!(
+            (lagging.0, lagging.1),
+            ("local", "check"),
+            "stale_view_not_local"
+        );
+        assert_eq!(lagging.2, SEAL_UNRECORDED_VIEW_STALE);
+        assert_eq!(
+            global_view_age_secs(old, copy + 300_000),
+            Some(3 * 60 * 60 + 300)
+        );
+        let slack = SEAL_VIEW_STAMP_SLACK.as_millis() as i64;
+        for stamp in [
+            Some(copy as i64 + 2_000),
+            Some(copy as i64 + 20_000),
+            Some(copy as i64 - slack),
+            Some(0),
+            Some(-5),
+            None,
+        ] {
+            let scope = record_stall_scope(Some(1_032_109), Some(1_032_109), stamp, copy);
+            assert_eq!(
+                (scope.0, scope.1),
+                ("network", "report"),
+                "current_view_not_network: {stamp:?}"
+            );
+            assert_eq!(scope.2, SEAL_UNRECORDED_WAITS_ON);
+        }
+        let past = Some(copy as i64 - slack - 1);
+        assert_eq!(
+            record_stall_scope(Some(10), Some(10), past, copy).0,
+            "local"
+        );
+        assert_eq!(global_view_age_secs(None, copy), None);
+        assert_eq!(
+            global_view_age_secs(Some(0), copy),
+            None,
+            "unstamped_view_aged"
+        );
     }
 
     /// A sealed member's early pull reaches no GLOBAL frame before the one
