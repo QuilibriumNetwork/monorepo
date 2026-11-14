@@ -322,10 +322,12 @@ fn check_linked_still_start(
         }
         anyhow::bail!(
             "refusing to {} the release source in {}: {} links {}, which starts only under it, \
-             so the node and qclient check would refuse it after the change; first install \
-             official releases, which start under any source ('qclient node update \
-             --release-source official --allow-downgrade' and 'qclient update \
-             --release-source official --allow-downgrade'), then run this again",
+             so the node and qclient check would refuse it after the change; first disable \
+             auto-update ('qclient node auto-update disable'), whose job would install from \
+             the stored source again, then install official releases, which start under any \
+             source ('qclient node update --release-source official --allow-downgrade' and \
+             'qclient update --release-source official --allow-downgrade'), then run this \
+             again",
             if next.is_some() { "replace" } else { "remove" },
             path.display(),
             link.display(),
@@ -975,6 +977,33 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("starts only under it"), "{e}"),
         }
         assert!(path.exists(), "the stored source is kept");
+    }
+
+    /// A refused source change names the way out in order: disable
+    /// auto-update first, whose job would otherwise install from the
+    /// stored source again and relink a release that starts only under
+    /// it, then install official releases.
+    #[cfg(unix)]
+    #[test]
+    fn a_stranding_refusal_says_to_disable_auto_update_first() {
+        let (signer, keys) = signers(&[7]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("q");
+        let path = root.join(quil_config::release_source::RELEASE_SOURCE_FILE);
+        let source = ReleaseSource::custom("https://releases.example.org", &keys, None).unwrap();
+        store_at(&path, Some(source), &root_only, &[]).unwrap();
+        let link = root.join("quilibrium-node");
+        std::os::unix::fs::symlink(installed_node(&root, &signer[0], &keys[0]), &link).unwrap();
+        let err = match store_at(&path, Some(ReleaseSource::official()), &root_only, &[link]) {
+            Ok(s) => panic!("linked_stranded: {s:?} stored"),
+            Err(e) => e.to_string(),
+        };
+        let disable = err.find("'qclient node auto-update disable'");
+        let install = err.find("'qclient node update --release-source official --allow-downgrade'");
+        assert!(
+            matches!((disable, install), (Some(d), Some(i)) if d < i),
+            "auto_update_not_disabled_first: {err}"
+        );
     }
 
     /// A source its readers would refuse (here, in a group-writable
