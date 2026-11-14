@@ -33,6 +33,8 @@ pub enum Msg {
     TransferPreview(Result<super::transfer::Preview, String>),
     /// A running transfer action's report.
     Transfer(super::transfer::Progress),
+    /// A read of the private action log for the History panel.
+    History(super::coins::HistoryRead),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     /// The node's health report: its conditions, none from a node that
     /// predates them, or why it is unavailable.

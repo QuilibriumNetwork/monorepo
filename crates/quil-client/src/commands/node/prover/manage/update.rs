@@ -44,6 +44,8 @@ pub enum Cmd {
     TransferPrepare(super::transfer::Kind),
     /// Run the confirmed transfer action.
     TransferRun(super::transfer::Preview),
+    /// Read the private action log for the Coins tab's History panel.
+    ReadHistory,
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -72,6 +74,16 @@ fn signing_wait_text(action: &str, frames_left: u64) -> String {
         "{action} waits for the next epoch to sign: this one ends in {frames_left} frames, and \
          an operation landing after it is refused."
     )
+}
+
+/// The History panel's read after an action's report: one when the action
+/// `ended`.
+fn history_after(m: &mut Model, ended: bool) -> Vec<Cmd> {
+    if ended {
+        coins::action_ended(m)
+    } else {
+        vec![]
+    }
 }
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
@@ -112,9 +124,13 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             mint::apply_preview(m, preview);
             vec![]
         }
+        // An action's last report follows its outcome record: an open
+        // History panel reads the log again.
         Msg::Mint(progress) => {
+            use mint::Progress::{Done, Requoted};
+            let ended = matches!(progress, Done(_) | Requoted(_));
             mint::apply_progress(m, progress);
-            vec![]
+            history_after(m, ended)
         }
         Msg::Shielded(read) => {
             transfer::apply_read(m, read);
@@ -125,17 +141,20 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             vec![]
         }
         Msg::Transfer(progress) => {
+            let ended = matches!(progress, transfer::Progress::Done(_));
             transfer::apply_progress(m, progress);
-            vec![]
+            history_after(m, ended)
         }
         Msg::ShieldPreview(preview) => {
             shield::apply_preview(m, preview);
             vec![]
         }
         Msg::Shield(progress) => {
+            let ended = matches!(progress, shield::Progress::Done(_));
             shield::apply_progress(m, progress);
-            vec![]
+            history_after(m, ended)
         }
+        Msg::History(read) => coins::apply_history(m, read),
         Msg::RewardRefresh(result) => {
             m.reward_loaded = true;
             m.reward_error = result.as_ref().err().cloned();
