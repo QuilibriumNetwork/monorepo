@@ -1018,13 +1018,19 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     }
 
     // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
-    // using hardcoded Ed448 public keys. Fails closed; skipped on
+    // using hardcoded Ed448 public keys, else the keys of the release
+    // source qclient stored in its install root. Fails closed; skipped on
     // Windows and when --signature-check=false.
     match release_check::self_check(args.signature_check) {
         Ok(SelfCheck::Verified(count)) => info!(
             valid_signatures = count,
             total_signatories = quil_config::SIGNATORIES.len(),
             "signature check passed"
+        ),
+        Ok(SelfCheck::VerifiedBySource { valid, file }) => info!(
+            valid_signatures = valid,
+            release_source = %file.display(),
+            "signature check passed under the stored release source"
         ),
         Ok(SelfCheck::Unavailable) => {
             info!("signature check not available for windows yet, skipping")

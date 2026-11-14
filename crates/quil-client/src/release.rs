@@ -2,9 +2,10 @@
 //!
 //! Port of `client/utils/download.go` + the signature gate in
 //! `client/cmd/root.go`. Binaries and their `.dgst` / `.dgst.sig.N` files
-//! come from `https://releases.quilibrium.com`; a release is trusted when a
-//! quorum of the [`SIGNATORIES`](quil_config::SIGNATORIES) Ed448 keys sign
-//! its digest file.
+//! come from a [`ReleaseSource`]: `https://releases.quilibrium.com`, where a
+//! release is trusted when a quorum of the
+//! [`SIGNATORIES`](quil_config::SIGNATORIES) Ed448 keys sign its digest
+//! file, or a source the operator configured, trusted by its own keys.
 //!
 //! The signed digest file starts with the label `SHA3-256(<file name>)=`,
 //! and a release verifies only under the file name its label names, so a
@@ -20,8 +21,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use quil_config::{signatory_quorum, SIGNATORIES};
+use quil_config::release_source::{owner_and_mode, Stat};
+use quil_config::SIGNATORIES;
 
+use crate::release_source::ReleaseSource;
 use crate::system;
 
 /// Time limits of a release fetch.
@@ -44,9 +47,11 @@ pub const HTTP_TIMEOUTS: HttpTimeouts = HttpTimeouts {
     total: Duration::from_secs(30 * 60),
 };
 
-/// An HTTP client enforcing `timeouts`.
-fn http_client(timeouts: HttpTimeouts) -> anyhow::Result<reqwest::Client> {
+/// An HTTP client enforcing `timeouts`; with `https_only`, it refuses any
+/// URL but `https://` ones, redirects included.
+fn http_client(timeouts: HttpTimeouts, https_only: bool) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        .https_only(https_only)
         .connect_timeout(timeouts.connect)
         .read_timeout(timeouts.read)
         .timeout(timeouts.total)
@@ -54,13 +59,18 @@ fn http_client(timeouts: HttpTimeouts) -> anyhow::Result<reqwest::Client> {
         .map_err(|e| anyhow::anyhow!("build the HTTP client: {e}"))
 }
 
-/// Fetch a URL's body as bytes, within [`HTTP_TIMEOUTS`].
-pub async fn http_get_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
-    http_get_bytes_with(HTTP_TIMEOUTS, url).await
+/// Fetch `file`'s body from `source` as bytes, within [`HTTP_TIMEOUTS`].
+async fn source_get(source: &ReleaseSource, file: &str) -> anyhow::Result<Vec<u8>> {
+    http_get_bytes_with(HTTP_TIMEOUTS, source.https_only(), &source.url(file)).await
 }
 
-/// [`http_get_bytes`] within `timeouts`.
-async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Result<Vec<u8>> {
+/// Fetch a URL's body as bytes within `timeouts`; HTTPS alone with
+/// `https_only`.
+async fn http_get_bytes_with(
+    timeouts: HttpTimeouts,
+    https_only: bool,
+    url: &str,
+) -> anyhow::Result<Vec<u8>> {
     let failed = |what: &str, e: reqwest::Error| {
         if e.is_timeout() {
             anyhow::anyhow!(
@@ -74,7 +84,7 @@ async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Resul
             anyhow::anyhow!("{what} {url}: {e}")
         }
     };
-    let resp = http_client(timeouts)?
+    let resp = http_client(timeouts, https_only)?
         .get(url)
         .send()
         .await
@@ -85,14 +95,14 @@ async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Resul
     Ok(resp.bytes().await.map_err(|e| failed("read", e))?.to_vec())
 }
 
-/// Whether a remote file exists (HEAD-ish via GET status), within
+/// Whether `file` exists at `source` (HEAD-ish via GET status), within
 /// [`HTTP_TIMEOUTS`].
-pub async fn remote_exists(url: &str) -> bool {
-    let Ok(client) = http_client(HTTP_TIMEOUTS) else {
+async fn remote_exists(source: &ReleaseSource, file: &str) -> bool {
+    let Ok(client) = http_client(HTTP_TIMEOUTS, source.https_only()) else {
         return false;
     };
     client
-        .get(url)
+        .get(source.url(file))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -144,16 +154,20 @@ mod repro_tests {
     }
 }
 
-/// Fetch the latest version string for a release type (`node` or `qclient`).
-/// The `/release` (or `/qclient-release`) endpoint's first line is a
-/// filename `type-VERSION-os-arch`; the version is the 2nd `-`-segment.
-pub async fn get_latest_version(release_type: &str) -> anyhow::Result<String> {
-    let url = if release_type == system::RELEASE_TYPE_QCLIENT {
-        format!("{}/qclient-release", system::BASE_RELEASE_URL)
+/// Fetch the latest version string for a release type (`node` or `qclient`)
+/// from `source`. The `/release` (or `/qclient-release`) endpoint's first
+/// line is a filename `type-VERSION-os-arch`; the version is the 2nd
+/// `-`-segment.
+pub async fn get_latest_version(
+    source: &ReleaseSource,
+    release_type: &str,
+) -> anyhow::Result<String> {
+    let list = if release_type == system::RELEASE_TYPE_QCLIENT {
+        "qclient-release"
     } else {
-        format!("{}/release", system::BASE_RELEASE_URL)
+        "release"
     };
-    let body = http_get_bytes(&url).await?;
+    let body = source_get(source, list).await?;
     parse_latest_version(&String::from_utf8_lossy(&body))
 }
 
@@ -280,27 +294,27 @@ pub fn release_filename(release_type: &str, version: &str) -> anyhow::Result<Str
 }
 
 /// Fetch the `.dgst` file + each present `.dgst.sig.N` signature for a
-/// release binary, writing nothing. Returns the digest bytes + the collected
-/// `(index, signature)` pairs.
+/// release binary from `source`, writing nothing. Returns the digest bytes +
+/// the collected `(index, signature)` pairs.
 pub async fn fetch_signatures(
+    source: &ReleaseSource,
     release_type: &str,
     version: &str,
 ) -> anyhow::Result<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
     let base = release_filename(release_type, version)?;
 
     // Digest file.
-    let dgst_url = format!("{}/{base}.dgst", system::BASE_RELEASE_URL);
-    let digest = http_get_bytes(&dgst_url).await?;
+    let digest = source_get(source, &format!("{base}.dgst")).await?;
     println!("Downloaded {base}.dgst");
 
-    // Signature files (1..=len(SIGNATORIES)); some may be absent.
+    // Signature files (1..=the source's signer count); some may be absent.
     let mut sigs = Vec::new();
-    for i in 1..=SIGNATORIES.len() {
-        let url = format!("{}/{base}.dgst.sig.{i}", system::BASE_RELEASE_URL);
-        if !remote_exists(&url).await {
+    for i in 1..=source.keys().len() {
+        let file = format!("{base}.dgst.sig.{i}");
+        if !remote_exists(source, &file).await {
             continue;
         }
-        if let Ok(sig) = http_get_bytes(&url).await {
+        if let Ok(sig) = source_get(source, &file).await {
             sigs.push((i, sig));
         }
     }
@@ -411,10 +425,90 @@ impl Release {
         quorum: usize,
     ) -> anyhow::Result<(PathBuf, usize)> {
         let count = self.verify_with(signatories, quorum)?;
-        write_signature_files(dest_dir, &self.base, &self.digest, &self.sigs)?;
-        let bin_path = write_atomic(dest_dir, &self.base, &self.bin, 0o755)?;
-        Ok((bin_path, count))
+        Ok((self.write(dest_dir)?, count))
     }
+
+    /// Write the release into `dest_dir`, as [`Self::install_with`] does
+    /// once it verified. Returns the installed binary path.
+    fn write(&self, dest_dir: &Path) -> anyhow::Result<PathBuf> {
+        write_signature_files(dest_dir, &self.base, &self.digest, &self.sigs)?;
+        write_atomic(dest_dir, &self.base, &self.bin, 0o755)
+    }
+}
+
+/// What a refused custom release needs, for its error.
+const START_HINT: &str = "a release the official signatories do not sign starts only under the \
+     release source stored in its install root: store its source with 'qclient node auto-update \
+     enable --release-source <URL> --release-key <HEX>', which also turns the auto-update job on \
+     ('qclient node auto-update disable' turns it off and keeps the source)";
+
+/// Fail unless the node's and qclient's startup check,
+/// [`verify_release`](quil_crypto::release_check::verify_release) itself,
+/// starts the release at `bin`, reading its install root's stored release
+/// source with `stat`.
+pub(crate) fn check_starts(bin: &Path, stat: Stat) -> anyhow::Result<()> {
+    quil_crypto::release_check::verify_release(bin, &SIGNATORIES, stat)
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "refusing {}: the node and qclient would not start it: {e}; {START_HINT}",
+                bin.file_name().unwrap_or_default().to_string_lossy()
+            )
+        })
+}
+
+/// Install a verified `release` from a custom source into `dest_dir` only
+/// if the startup check ([`check_starts`]) starts it there: it is written
+/// into a staging directory beside `dest_dir`, in the same install root,
+/// checked, moved in and checked again before the caller links it. A
+/// release the check refuses is neither linked nor written over an
+/// installed one: linked, it would stop the node at its next start and
+/// qclient at its next command; the directories made for it are removed
+/// again while empty. Returns the installed binary path.
+fn install_startable(release: &Release, dest_dir: &Path, stat: Stat) -> anyhow::Result<PathBuf> {
+    let (Some(parent), Some(version)) = (dest_dir.parent(), dest_dir.file_name()) else {
+        anyhow::bail!("invalid release directory {}", dest_dir.display());
+    };
+    // Deepest first, so each is empty once those below it are gone.
+    let made: Vec<PathBuf> = dest_dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", parent.display()))?;
+    let stage = parent.join(format!(
+        ".{}.stage-{:016x}",
+        version.to_string_lossy(),
+        rand::random::<u64>()
+    ));
+    let installed = (|| {
+        check_starts(&release.write(&stage)?, stat)?;
+        ensure_release_dir(dest_dir)?;
+        for (i, _) in &release.sigs {
+            move_into(&stage, dest_dir, &format!("{}.dgst.sig.{i}", release.base))?;
+        }
+        move_into(&stage, dest_dir, &format!("{}.dgst", release.base))?;
+        remove_stale_signatures(dest_dir, &release.base, &release.sigs)?;
+        let bin = move_into(&stage, dest_dir, &release.base)?;
+        check_starts(&bin, stat)?;
+        Ok(bin)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    if installed.is_err() {
+        for dir in &made {
+            let _ = std::fs::remove_dir(dir); // fails, and keeps it, unless empty
+        }
+    }
+    installed
+}
+
+/// Move `name` from `from` into `to` by rename; returns its new path.
+fn move_into(from: &Path, to: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let dest = to.join(name);
+    std::fs::rename(from.join(name), &dest)
+        .map_err(|e| anyhow::anyhow!("move into {}: {e} (root required)", dest.display()))?;
+    Ok(dest)
 }
 
 /// Write a verified release's `.dgst` and `.dgst.sig.N` files into
@@ -430,17 +524,33 @@ pub fn write_signature_files(
     if base.is_empty() || base.starts_with('.') || base.contains('/') {
         anyhow::bail!("invalid release file name {base:?}");
     }
-    std::fs::create_dir_all(dest_dir)
-        .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dest_dir.display()))?;
-    let meta = std::fs::symlink_metadata(dest_dir)
-        .map_err(|e| anyhow::anyhow!("stat {}: {e}", dest_dir.display()))?;
-    if !meta.is_dir() {
-        anyhow::bail!("{} is not a directory", dest_dir.display());
-    }
+    ensure_release_dir(dest_dir)?;
     for (i, sig) in sigs {
         write_atomic(dest_dir, &format!("{base}.dgst.sig.{i}"), sig, 0o644)?;
     }
     write_atomic(dest_dir, &format!("{base}.dgst"), digest, 0o644)?;
+    remove_stale_signatures(dest_dir, base, sigs)
+}
+
+/// Create `dir` if absent; fail unless it is a directory, not a link.
+fn ensure_release_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dir.display()))?;
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!("{} is not a directory", dir.display());
+    }
+    Ok(())
+}
+
+/// Remove each `.dgst.sig.N` file of `base` in `dest_dir` that `sigs` does
+/// not hold, so the set beside the binary is the one that verified.
+fn remove_stale_signatures(
+    dest_dir: &Path,
+    base: &str,
+    sigs: &[(usize, Vec<u8>)],
+) -> anyhow::Result<()> {
     let kept: BTreeSet<usize> = sigs.iter().map(|(i, _)| *i).collect();
     let prefix = format!("{base}.dgst.sig.");
     for entry in std::fs::read_dir(dest_dir)? {
@@ -515,13 +625,8 @@ pub fn switch_symlink(_target: &Path, link: &Path) -> anyhow::Result<()> {
 }
 
 /// Verify an installed release binary against the `.dgst` and `.dgst.sig.N`
-/// files beside it, as [`download_and_install`] leaves them. Returns the
-/// count of valid signatures.
-pub fn verify_installed(bin_path: &Path) -> anyhow::Result<usize> {
-    verify_installed_with(bin_path, &SIGNATORIES, signatory_quorum())
-}
-
-/// [`verify_installed`] against the given signatory keys (hex) and quorum.
+/// files beside it, as [`download_and_install`] leaves them, under the given
+/// signatory keys (hex) and quorum. Returns the count of valid signatures.
 pub fn verify_installed_with(
     bin_path: &Path,
     signatories: &[&str],
@@ -577,27 +682,55 @@ pub struct Installed {
     pub fresh: bool,
 }
 
-/// Download a release binary, verify its digest + signatory quorum, install
-/// it to `<binary_path>/<type>/<version>/<file>` (0755), and symlink
-/// `symlink` to it. Shared by `qclient update` and `node install`/`update`.
-/// Install paths require root.
+/// Download a release binary from `source`, verify its digest + the
+/// source's signer quorum, install it to
+/// `<binary_path>/<type>/<version>/<file>` (0755), and symlink `symlink` to
+/// it. Shared by `qclient update` and `node install`/`update`. Install
+/// paths require root.
 ///
 /// Refuses a `version` older than the one `symlink` points to, or to
 /// replace a `symlink` naming no release version, unless `allow_downgrade`,
-/// and leaves an already linked, verified release as it is.
+/// and leaves an already linked, verified release as it is. Links a
+/// release from a custom source only if the node's and qclient's startup
+/// check starts it ([`install_startable`]).
 pub async fn download_and_install(
+    source: &ReleaseSource,
     release_type: &str,
     version: &str,
     symlink: &Path,
     allow_downgrade: bool,
 ) -> anyhow::Result<Installed> {
+    download_and_install_in(
+        source,
+        &system::binary_path(),
+        release_type,
+        version,
+        symlink,
+        allow_downgrade,
+        &owner_and_mode,
+    )
+    .await
+}
+
+/// [`download_and_install`] into the release tree `bin_root`, reading the
+/// `(owner uid, mode)` of its stored release source's files with `stat`.
+pub async fn download_and_install_in(
+    source: &ReleaseSource,
+    bin_root: &Path,
+    release_type: &str,
+    version: &str,
+    symlink: &Path,
+    allow_downgrade: bool,
+    stat: Stat<'_>,
+) -> anyhow::Result<Installed> {
     let base = release_filename(release_type, version)?;
     let installed = linked_version(symlink, release_type);
     check_downgrade(installed.as_deref(), version, allow_downgrade)?;
     check_unversioned_link(symlink, release_type, version, allow_downgrade)?;
-    let dest_dir = system::binary_path().join(release_type).join(version);
+    let dest_dir = bin_root.join(release_type).join(version);
     let current = dest_dir.join(&base);
-    if is_linked_and_verified_with(&current, symlink, &SIGNATORIES, signatory_quorum()) {
+    let keys = source.keys();
+    if is_linked_and_verified_with(&current, symlink, &keys, source.quorum()) {
         println!("{base} is already installed and linked");
         return Ok(Installed {
             path: current,
@@ -605,18 +738,25 @@ pub async fn download_and_install(
         });
     }
 
-    let bin_url = format!("{}/{base}", system::BASE_RELEASE_URL);
+    if source.is_custom() {
+        println!("Release source: {}", source.describe());
+    }
     println!("Downloading {base}...");
-    let bin = http_get_bytes(&bin_url).await?;
-    let (digest, sigs) = fetch_signatures(release_type, version).await?;
+    let bin = source_get(source, &base).await?;
+    let (digest, sigs) = fetch_signatures(source, release_type, version).await?;
     let release = Release {
         base,
         bin,
         digest,
         sigs,
     };
-    let (bin_path, count) = release.install_with(&dest_dir, &SIGNATORIES, signatory_quorum())?;
+    let count = release.verify_with(&keys, source.quorum())?;
     println!("Signature quorum met ({count} valid)");
+    let bin_path = if source.is_custom() {
+        install_startable(&release, &dest_dir, stat)?
+    } else {
+        release.write(&dest_dir)?
+    };
 
     switch_symlink(&bin_path, symlink)?;
     Ok(Installed {
@@ -648,7 +788,7 @@ mod tests {
             read: Duration::from_secs(1),
             total: Duration::from_secs(3),
         };
-        let fetch = http_get_bytes_with(timeouts, &url);
+        let fetch = http_get_bytes_with(timeouts, false, &url);
         let Ok(result) = tokio::time::timeout(Duration::from_secs(20), fetch).await else {
             panic!("GET {url} still waits on a silent server after 20 s");
         };

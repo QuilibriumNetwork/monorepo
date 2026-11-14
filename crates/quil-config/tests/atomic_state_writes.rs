@@ -85,6 +85,24 @@ const OTHER_WRITES: &[(&str, &str, &str, &str)] = &[
         "the atomic replacement's new temporary file",
     ),
     (
+        "quil-client/src/release_source.rs",
+        "write_checked",
+        "OpenOptions::new(",
+        "the release-source file's new temporary file, at mode 0644 so the node's startup check, run as another user, reads it",
+    ),
+    (
+        "quil-client/src/release_source.rs",
+        "write_checked",
+        "rename(",
+        "the release-source file's atomic replacement",
+    ),
+    (
+        "quil-client/src/release.rs",
+        "move_into",
+        "rename(",
+        "a verified release binary or signature file into its install directory",
+    ),
+    (
         "quil-client/src/commands/deploy/get.rs",
         "run",
         "fs::write(",

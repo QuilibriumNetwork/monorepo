@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::release_source::{self, ReleaseSource, ReleaseSourceArgs};
 use crate::{release, system};
 
 /// Where `download-signatures` writes: beside the running binary when it is
@@ -47,7 +48,12 @@ pub async fn download_signatures(version: Option<&str>) -> anyhow::Result<()> {
     let install_dir = system::client_data_path().join(&version);
     let dest = signature_dir(exe.as_deref(), &base, &install_dir);
     println!("Downloading signatures for qclient {version}...");
-    let (digest, sigs) = release::fetch_signatures(system::RELEASE_TYPE_QCLIENT, &version).await?;
+    let (digest, sigs) = release::fetch_signatures(
+        &ReleaseSource::official(),
+        system::RELEASE_TYPE_QCLIENT,
+        &version,
+    )
+    .await?;
     let count = release::verify_quorum(&digest, &sigs)?;
     let quorum = quil_config::signatory_quorum();
     println!("{count}/{} signatures valid (quorum {quorum})", sigs.len());
@@ -63,16 +69,25 @@ pub async fn download_signatures(version: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `qclient update [version] [--allow-downgrade]`. An older version than the
-/// linked one needs `allow_downgrade`.
-pub async fn update(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
+/// `qclient update [version] [--allow-downgrade]`, from the release source
+/// `source` names (else the stored or official one), under the update lock
+/// node installs and release source changes take. An older version than
+/// the linked one needs `allow_downgrade`.
+pub async fn update(
+    version: Option<&str>,
+    allow_downgrade: bool,
+    source: &ReleaseSourceArgs,
+) -> anyhow::Result<()> {
+    let source = release_source::active(source)?;
+    let _lock = crate::commands::node::lifecycle::lock_node_updates(&system::update_lock_path())?;
     let (os, arch) = system::system_info()?;
     let version = match version {
         Some(v) if !v.is_empty() => v.to_string(),
-        _ => release::get_latest_version(system::RELEASE_TYPE_QCLIENT).await?,
+        _ => release::get_latest_version(&source, system::RELEASE_TYPE_QCLIENT).await?,
     };
     println!("Updating qclient for {os}-{arch}, version: {version}");
     let installed = release::download_and_install(
+        &source,
         system::RELEASE_TYPE_QCLIENT,
         &version,
         &system::default_qclient_symlink_path(),

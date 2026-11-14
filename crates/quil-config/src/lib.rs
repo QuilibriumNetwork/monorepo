@@ -10,6 +10,7 @@ mod logger;
 mod p2p;
 mod private_files;
 mod proof_worker;
+pub mod release_source;
 mod signatories;
 mod unused_keys;
 mod version;
