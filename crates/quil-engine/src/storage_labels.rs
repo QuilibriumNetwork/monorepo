@@ -1363,6 +1363,7 @@ impl LabelStore {
             ready,
             staged(&dir, n),
             manifest_staged(&dir, n),
+            cap_staged(&dir, n),
             dir.join(format!("{n}.cap")),
         ] {
             let _ = fs::remove_file(path);
@@ -1501,6 +1502,7 @@ impl LabelStore {
             staged(&dir, n),
             kept_path(&dir, n),
             manifest_staged(&dir, n),
+            cap_staged(&dir, n),
             dir.join(format!("{n}.cap")),
         ]) {
             let _ = fs::remove_file(path);
@@ -2336,6 +2338,7 @@ impl Admitted<'_> {
             let _ = fs::remove_file(staged(&self.dir, self.n));
             let _ = fs::remove_file(kept_path(&self.dir, self.n));
             let _ = fs::remove_file(manifest_staged(&self.dir, self.n));
+            let _ = fs::remove_file(cap_staged(&self.dir, self.n));
             let _ = fs::remove_file(self.dir.join(format!("{}.cap", self.n)));
         }
         result
@@ -2557,11 +2560,16 @@ impl Admitted<'_> {
             quil_crypto::storage_proof::seal_cap_height(self.n),
         );
         let comm_c = cap.commitment(quil_crypto::storage_proof::Tree::Column);
+        // Each file whole or absent after a crash, and both on disk before
+        // `ready` is relied on.
         let cap_path = self.dir.join(format!("{}.cap", self.n));
-        fs::write(&cap_path, cap.to_bytes()).map_err(|e| io("write", &cap_path, e))?;
-        let staged = staged(&self.dir, self.n);
-        fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
-        fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
+        write_renamed(&cap_staged(&self.dir, self.n), &cap_path, &cap.to_bytes())
+            .map_err(|e| io("write", &cap_path, e))?;
+        write_renamed(&staged(&self.dir, self.n), ready_path, &comm_c)
+            .map_err(|e| io("write", ready_path, e))?;
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| io("sync", &self.dir, e))?;
         self.store
             .note_held(&self.dir, &self.member, &self.leaf_id, self.n);
         // Complete: `ready` stands for the layers from now on.
@@ -2617,6 +2625,21 @@ fn kept_path(dir: &Path, n: u64) -> PathBuf {
 /// Where a manifest is written before it is renamed `kept`.
 fn manifest_staged(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("{n}.kept.tmp"))
+}
+
+/// Where the column cap is written before it is renamed `cap`.
+fn cap_staged(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n}.cap.tmp"))
+}
+
+/// Write `bytes` to `staged`, synced, and rename it over `path`: a reader
+/// of `path` finds the last file whole or this one whole. The caller syncs
+/// the directory.
+fn write_renamed(staged: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(staged)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(staged, path)
 }
 
 /// Log a release of labels for free space that goes on ([`LabelStore::keep_floor`]):
@@ -2749,11 +2772,11 @@ fn params_text(params: &SdrParams) -> String {
 /// Write `manifest` as the one of the leaf's layers at `n` nodes in `dir`:
 /// to a file synced, then renamed over the last, the directory synced.
 fn write_manifest(dir: &Path, n: u64, manifest: &Manifest) -> std::io::Result<()> {
-    let staged = manifest_staged(dir, n);
-    let mut file = File::create(&staged)?;
-    file.write_all(manifest.text().as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&staged, kept_path(dir, n))?;
+    write_renamed(
+        &manifest_staged(dir, n),
+        &kept_path(dir, n),
+        manifest.text().as_bytes(),
+    )?;
     File::open(dir)?.sync_all()
 }
 
