@@ -13,8 +13,9 @@
 //! [`START_AFTER`] intervals in a row starts a slow episode: one warning,
 //! repeated every [`REPEAT`] with its duration, and one line once
 //! [`END_AFTER`] intervals in a row are under every threshold. Otherwise
-//! one summary line every [`SUMMARY_EVERY`]. The latest interval and the
-//! verdict ([`latest`]) feed the node's health report and status RPC.
+//! one summary line every [`SUMMARY_EVERY`]. The verdict and the latest
+//! interval, or while an episode holds its last slow interval, feed the
+//! node's health report and status RPC ([`latest`]).
 //! Lines name the store's role and the disk's kernel name, never a path.
 
 use std::path::Path;
@@ -480,6 +481,7 @@ pub struct IoWatch {
     last_warn: Option<Instant>,
     last_line: Option<Instant>,
     cause: Option<SlowCause>,
+    last_slow: Option<IoInterval>,
 }
 
 impl IoWatch {
@@ -494,6 +496,7 @@ impl IoWatch {
                 self.slow_run = self.slow_run.saturating_add(1);
                 let cause = interval.cause(reason);
                 self.cause = Some(cause);
+                self.last_slow = Some(*interval);
                 let first = *self.first_slow.get_or_insert(began);
                 match self.slow_since {
                     None if self.slow_run >= START_AFTER => {
@@ -527,7 +530,10 @@ impl IoWatch {
                 self.slow_run = 0;
                 self.first_slow = None;
                 match self.slow_since {
-                    None => self.summary_due(now),
+                    None => {
+                        self.last_slow = None;
+                        self.summary_due(now)
+                    }
                     Some(since) => {
                         self.ok_run = self.ok_run.saturating_add(1);
                         let ended = *self.first_ok.get_or_insert(began);
@@ -536,6 +542,7 @@ impl IoWatch {
                             self.last_warn = None;
                             self.ok_run = 0;
                             self.first_ok = None;
+                            self.last_slow = None;
                             IoAction::SlowEnd {
                                 slow: ended.saturating_duration_since(since),
                                 cause: self.cause.take().unwrap_or(SlowCause::Unknown),
@@ -569,6 +576,21 @@ impl IoWatch {
     pub fn slow_since(&self) -> Option<Instant> {
         self.slow_since
     }
+
+    /// The last slow interval of the episode that holds.
+    pub fn last_slow(&self) -> Option<IoInterval> {
+        self.slow_since.and(self.last_slow)
+    }
+
+    /// Intervals in a row under every threshold since the last slow one of
+    /// the episode that holds (it ends at [`END_AFTER`]); 0 without one.
+    pub fn ok_intervals(&self) -> u32 {
+        if self.slow_since.is_some() {
+            self.ok_run
+        } else {
+            0
+        }
+    }
 }
 
 /// The latest interval of the master store and its verdict.
@@ -577,17 +599,42 @@ pub struct StoreIoReport {
     pub interval: IoInterval,
     /// How long a slow episode has held; `None` while none does.
     pub slow_for: Option<Duration>,
+    /// The episode's last slow interval, while one holds.
+    pub last_slow: Option<IoInterval>,
+    /// Intervals in a row under every threshold since `last_slow`.
+    pub ok_intervals: u32,
     pub ended_unix_ms: u64,
 }
 
 impl StoreIoReport {
+    /// The report of `watch` once it took `latest`, which ended at `now`.
+    pub fn new(watch: &IoWatch, latest: IoInterval, now: Instant, ended_unix_ms: u64) -> Self {
+        StoreIoReport {
+            interval: latest,
+            slow_for: watch
+                .slow_since()
+                .map(|since| now.saturating_duration_since(since)),
+            last_slow: watch.last_slow(),
+            ok_intervals: watch.ok_intervals(),
+            ended_unix_ms,
+        }
+    }
+
+    /// The verdict, with the figures and reason of the episode's last slow
+    /// interval while one holds (the latest may be under every threshold
+    /// then: the episode is recovering), else of the latest interval.
     pub fn to_proto(&self) -> StoreIoHealth {
         let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let shown = match self.slow_for {
+            Some(_) => self.last_slow.unwrap_or(self.interval),
+            None => self.interval,
+        };
         let mut health = StoreIoHealth {
             slow_secs: self.slow_for.map_or(0, |d| d.as_secs()),
-            interval_secs: u32::try_from(self.interval.length.as_secs()).unwrap_or(u32::MAX),
+            interval_secs: u32::try_from(shown.length.as_secs()).unwrap_or(u32::MAX),
             ended_unix_ms: self.ended_unix_ms,
-            canary_pending_us: self.interval.pending.map_or(0, us),
+            canary_pending_us: shown.pending.map_or(0, us),
+            recovering_intervals: self.slow_for.map_or(0, |_| self.ok_intervals),
             ..Default::default()
         };
         health.set_verdict(match (self.slow_for, self.interval.measured()) {
@@ -596,17 +643,17 @@ impl StoreIoReport {
             (None, false) => StoreIoVerdict::Unspecified,
         });
         health.set_slow_reason(
-            self.interval
+            shown
                 .slow_reason()
                 .map_or(StoreIoReason::None, SlowReason::to_proto),
         );
-        if let Some(canary) = self.interval.canary {
+        if let Some(canary) = shown.canary {
             health.canary_reads = canary.reads;
             health.canary_p50_us = us(canary.p50);
             health.canary_p99_us = us(canary.p99);
             health.canary_max_us = us(canary.max);
         }
-        if let Some(disk) = self.interval.disk {
+        if let Some(disk) = shown.disk {
             health.disk_reads = Some(disk.reads);
             health.disk_writes = Some(disk.writes);
             health.disk_read_await_us = disk.read_await.map(us);
@@ -948,15 +995,14 @@ fn run_summary(
         window.intervals += 1;
         window.slow_intervals += u32::from(latest.slow_reason().is_some());
         let action = watch.observe(&latest, now);
-        let report = StoreIoReport {
-            interval: latest,
-            slow_for: watch
-                .slow_since()
-                .map(|since| now.saturating_duration_since(since)),
-            ended_unix_ms: SystemTime::now()
+        let report = StoreIoReport::new(
+            &watch,
+            latest,
+            now,
+            SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64),
-        };
+        );
         *published.lock().unwrap_or_else(PoisonError::into_inner) = Some((now, report));
         log_action(&subject, action, &latest, &mut window, now, disk_now);
         if action != IoAction::None {

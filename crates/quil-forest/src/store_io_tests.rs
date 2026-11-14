@@ -518,6 +518,8 @@ fn the_report_carries_the_latest_interval_and_verdict() {
     let report = StoreIoReport {
         interval: interval(latency(3, 120), Some(ms_n(1500)), disk(40, 25, 0, 0)),
         slow_for: Some(Duration::from_secs(185)),
+        last_slow: None,
+        ok_intervals: 0,
         ended_unix_ms: 1_700_000_000_000,
     };
     let health = report.to_proto();
@@ -552,6 +554,8 @@ fn the_report_carries_the_latest_interval_and_verdict() {
     let first = StoreIoReport {
         interval: slow(),
         slow_for: None,
+        last_slow: None,
+        ok_intervals: 0,
         ended_unix_ms: 1,
     }
     .to_proto();
@@ -563,6 +567,8 @@ fn the_report_carries_the_latest_interval_and_verdict() {
     let bare = StoreIoReport {
         interval: interval(None, None, None),
         slow_for: None,
+        last_slow: None,
+        ok_intervals: 0,
         ended_unix_ms: 1,
     }
     .to_proto();
@@ -571,6 +577,81 @@ fn the_report_carries_the_latest_interval_and_verdict() {
         (bare.disk_reads, bare.disk_read_await_us, bare.disk_busy_pct),
         (None, None, None)
     );
+}
+
+/// While an episode holds, the report shows its last slow interval's
+/// figures and reason, so its cause stays the episode's, and counts the
+/// clear intervals since; once it ends, the latest interval again.
+#[test]
+fn a_recovering_episode_reports_its_last_slow_interval() {
+    let t0 = Instant::now();
+    let at = |minute: u32| t0 + INTERVAL * minute;
+    let by_disk = interval(latency(3, 4), None, disk(40, 1, 40, 150));
+    let clear = interval(latency(1, 4), None, disk(40, 1, 40, 2));
+    let step = |watch: &mut IoWatch, latest: IoInterval, minute: u32| {
+        watch.observe(&latest, at(minute));
+        let health = StoreIoReport::new(watch, latest, at(minute), 1).to_proto();
+        (
+            health.verdict(),
+            health.slow_reason(),
+            health.disk_write_await_us,
+            health.recovering_intervals,
+            health_cause(&health),
+        )
+    };
+    use StoreIoReason::{CanaryP99, DiskWriteAwait};
+    use StoreIoVerdict::Slow;
+    let ok = StoreIoVerdict::Ok;
+    let mut watch = IoWatch::default();
+    let disk_slow = Some(150_000);
+    assert_eq!(
+        step(&mut watch, by_disk, 1),
+        (ok, DiskWriteAwait, disk_slow, 0, SlowCause::Disk),
+        "STORE-IO-RECOVERING minute 1"
+    );
+    assert_eq!(
+        step(&mut watch, by_disk, 2),
+        (Slow, DiskWriteAwait, disk_slow, 0, SlowCause::Disk),
+        "STORE-IO-RECOVERING minute 2"
+    );
+    // A clear interval: still the disk, from the last slow one.
+    assert_eq!(
+        step(&mut watch, clear, 3),
+        (Slow, DiskWriteAwait, disk_slow, 1, SlowCause::Disk),
+        "STORE-IO-RECOVERING minute 3"
+    );
+    assert_eq!(
+        step(&mut watch, interval(None, None, None), 4),
+        (Slow, DiskWriteAwait, disk_slow, 1, SlowCause::Disk),
+        "STORE-IO-RECOVERING minute 4"
+    );
+    assert_eq!(
+        step(&mut watch, clear, 5),
+        (Slow, DiskWriteAwait, disk_slow, 2, SlowCause::Disk),
+        "STORE-IO-RECOVERING minute 5"
+    );
+    // A slow interval again: its own figures, the count restarts.
+    assert_eq!(
+        step(&mut watch, slow(), 6),
+        (Slow, CanaryP99, None, 0, SlowCause::Unknown),
+        "STORE-IO-RECOVERING minute 6"
+    );
+    assert_eq!(
+        step(&mut watch, clear, 7),
+        (Slow, CanaryP99, None, 1, SlowCause::Unknown),
+        "STORE-IO-RECOVERING minute 7"
+    );
+    assert_eq!(
+        step(&mut watch, clear, 8),
+        (Slow, CanaryP99, None, 2, SlowCause::Unknown),
+        "STORE-IO-RECOVERING minute 8"
+    );
+    assert_eq!(
+        step(&mut watch, clear, 9),
+        (ok, StoreIoReason::None, Some(2_000), 0, SlowCause::Load),
+        "STORE-IO-RECOVERING minute 9"
+    );
+    assert_eq!(watch.last_slow(), None, "STORE-IO-RECOVERING ended");
 }
 
 #[test]
@@ -790,6 +871,8 @@ fn the_reported_cause_matches_the_nodes_rule() {
         let report = StoreIoReport {
             interval: latest,
             slow_for: None,
+            last_slow: None,
+            ok_intervals: 0,
             ended_unix_ms: 0,
         };
         let mut health = report.to_proto();

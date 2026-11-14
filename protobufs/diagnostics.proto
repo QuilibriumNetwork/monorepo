@@ -499,6 +499,9 @@ enum StoreIoReason {
 // The master store's latest summary interval (60 s): a canary that reads
 // one entry of the store a second at a random position, bypassing its
 // block cache, and on Linux the device under the store in /proc/diskstats.
+// While the verdict is SLOW, the interval figures and `slow_reason` are
+// those of the episode's last slow interval; `ended_unix_ms` stays the
+// latest interval's end.
 message StoreIoHealth {
   StoreIoVerdict verdict = 1;
   // How long the verdict has been SLOW; 0 while it is not.
@@ -523,6 +526,10 @@ message StoreIoHealth {
   optional uint64 disk_write_await_us = 13;
   optional uint32 disk_busy_pct = 14;
   StoreIoReason slow_reason = 15;
+  // While SLOW: intervals in a row under every threshold since the
+  // episode's last slow one (it ends at 3); 0 otherwise and from nodes
+  // that predate it.
+  uint32 recovering_intervals = 16;
 }
 
 message GetHealthReportRequest {}
