@@ -19,6 +19,7 @@ mod cert_union;
 mod seal_deadline_tests;
 pub(crate) use cert_union::order_copies_by_signers;
 pub use cert_union::{session_committees, Committee, CommitteeSource};
+use window_seats::SeatEvent;
 
 // NOTE: global consensus has NO per-frame request cap. The original
 // 100-message cap existed because a global proposal was gossiped and
@@ -71,6 +72,9 @@ struct CollectedMessage {
     /// For a storage epoch proof: the GLOBAL frame from which execution
     /// refuses it ([`storage_window_end`]). `None` for anything else.
     window_end: Option<u64>,
+    /// For a storage epoch proof the GLOBAL collector files: its seats, for
+    /// the window line ([`window_seats::seat_ids`]), read as it is filed.
+    seats: window_seats::Seats,
 }
 
 impl CollectedMessage {
@@ -105,6 +109,7 @@ impl CollectedMessage {
             capacity: kinds.capacity,
             prover: true,
             window_end: kinds.window_end,
+            seats: Default::default(),
         }
     }
 
@@ -173,6 +178,9 @@ struct StorageKinds {
     /// The earliest end of a well-formed proof's window
     /// ([`storage_window_end`]).
     window_end: Option<u64>,
+    /// If asked for, the seats of its well-formed proofs that are no
+    /// capacity messages ([`window_seats::seat_ids`]).
+    seats: window_seats::Seats,
 }
 
 /// The GLOBAL frame from which execution refuses `proof`: the end of its
@@ -198,6 +206,12 @@ fn storage_window_end(
 
 /// Read the storage epoch proofs a collected message carries.
 fn storage_kinds(data: &[u8]) -> StorageKinds {
+    storage_kinds_with(data, false)
+}
+
+/// [`storage_kinds`], with their seats if `seats`, up to the message's cap
+/// ([`window_seats::seat_ids_cap`]).
+fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
     use quil_execution::global_intrinsic::persistent_storage::capacity_message;
     use quil_execution::global_intrinsic::storage_epoch_proof::{
         StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
@@ -207,6 +221,7 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
         epoch_proof: false,
         capacity: None,
         window_end: None,
+        seats: Default::default(),
     };
     let Ok(bundle) =
         quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data)
@@ -227,6 +242,10 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
         }
         if !capacity_message(&proof) {
             kinds.epoch_proof = true;
+            if seats {
+                let cap = window_seats::seat_ids_cap(data.len());
+                window_seats::seat_ids(&proof, cap, &mut kinds.seats);
+            }
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
                 member: proof.member,
@@ -451,6 +470,9 @@ const OTHER_SEAL_BYTES_HELD: usize = quil_types::consensus::STORAGE_SEAL_BYTES_P
 /// are summarized ([`MessageCollector::prune_after_finalization`]).
 const SEALS_AGED_OUT_LOG_EVERY: Duration = Duration::from_secs(60);
 
+// The seats of storage epoch proofs by window end, logged once each ends.
+mod window_seats;
+
 /// Most held storage epoch proofs one submit drops to make room
 /// ([`evict_later_seals`]). A proof of 0.5-0.75 MB needs one or two; a share
 /// holding only smaller ones due later keeps them and refuses the proof for
@@ -475,12 +497,14 @@ const SEALS_EVICTED_PER_SUBMIT: usize = 16;
 /// ([`MessageCollector::mark_finalized`]). It reads each rank's index of
 /// held proofs by window end ([`SealEnds`]), so a submit with nothing to
 /// drop costs two lookups per rank held, and one that drops costs a lookup
-/// per proof dropped. Returns what it dropped.
+/// per proof dropped. Returns what it dropped, and adds the dropped proofs'
+/// seats to `dropped` ([`window_seats::Dropped`]).
 fn evict_later_seals(
     buffers: &mut HashMap<u64, RankBuffer>,
     message: &CollectedMessage,
     held: Seals,
     frame: u64,
+    dropped: &mut Vec<window_seats::Dropped>,
 ) -> Seals {
     let mut evicted = Seals::default();
     if frame == 0 {
@@ -543,6 +567,16 @@ fn evict_later_seals(
     for (rank, key) in victims {
         if let Some(message) = buffers.get_mut(&rank).and_then(|b| b.take(&key)) {
             evicted.count(&message);
+            let event = if message.window_end.is_some_and(|end| end <= frame) {
+                window_seats::SeatEvent::Closed
+            } else {
+                window_seats::SeatEvent::Evicted
+            };
+            dropped.push(window_seats::Dropped {
+                event,
+                prover: message.prover,
+                seats: message.seats,
+            });
         }
     }
     evicted
@@ -950,8 +984,9 @@ impl RankBuffer {
     }
 
     /// Drop the held storage epoch proofs whose window ends at or before
-    /// `frame`: no frame from it on can carry them.
-    fn take_closed_seals(&mut self, frame: u64) -> Seals {
+    /// `frame`: no frame from it on can carry them. Adds their seats to
+    /// `dropped`.
+    fn take_closed_seals(&mut self, frame: u64, dropped: &mut Vec<window_seats::Dropped>) -> Seals {
         let keys: Vec<[u8; 32]> = [true, false]
             .into_iter()
             .flat_map(|prover| self.shares.seal_ends.of(prover).range(..=(frame, u64::MAX)))
@@ -961,6 +996,11 @@ impl RankBuffer {
         for key in keys {
             if let Some(message) = self.take(&key) {
                 closed.count(&message);
+                dropped.push(window_seats::Dropped {
+                    event: window_seats::SeatEvent::Closed,
+                    prover: message.prover,
+                    seats: message.seats,
+                });
             }
         }
         closed
@@ -979,6 +1019,13 @@ impl RankBuffer {
         message.prover = true;
         self.shares.add(message);
         self.shares.seal_ends.add(arrival, message);
+    }
+
+    /// The seats read of the held message with `key` ([`window_seats`]).
+    fn held_seats(&self, key: &[u8; 32]) -> Option<&window_seats::Seats> {
+        self.messages
+            .get(self.seen.get(key)?)
+            .map(|message| &message.seats)
     }
 
     /// The bytes of the held message with `key`.
@@ -1631,6 +1678,12 @@ pub struct MessageCollector {
     /// Held storage epoch proofs that aged out without riding a frame, or
     /// were dropped for one due sooner or past their window.
     seals_aged_out: std::sync::Mutex<SealsAgedOut>,
+    /// The seats of storage epoch proofs by window end, logged once each
+    /// ends ([`window_seats`]). Locked after `buffers` when both are.
+    window_seats: std::sync::Mutex<window_seats::WindowSeats>,
+    /// The window lines logged, for tests.
+    #[cfg(test)]
+    windows_ended: std::sync::Mutex<Vec<window_seats::WindowCounts>>,
     /// The newest GLOBAL frame this node saw finalized
     /// ([`Self::note_finalized_frame`]), 0 until one
     /// ([`Self::next_seal_frame`]). A proposal's frame does not count: one
@@ -2074,6 +2127,9 @@ impl MessageCollector {
             share_full_active: std::sync::atomic::AtomicBool::new(false),
             share_full: std::sync::Mutex::new(ShareFullLog::new()),
             seals_aged_out: Default::default(),
+            window_seats: Default::default(),
+            #[cfg(test)]
+            windows_ended: Default::default(),
             finalized_frame: std::sync::atomic::AtomicU64::new(0),
             rejects_active: std::sync::atomic::AtomicBool::new(false),
             rejects: std::sync::Mutex::new(RejectLog::new()),
@@ -2670,6 +2726,16 @@ impl MessageCollector {
             .and_then(|make| make());
         #[cfg(test)]
         run_file_gap_hook();
+        // The seats it carries, for the window line ([`window_seats`]): read
+        // here, past the checks for a copy held or finalized, and kept with
+        // the message for when it leaves; it moves into a buffer.
+        let seats = if message.held_seal() && self.class_shares() {
+            message.seats = storage_kinds_with(&message.data, true).seats;
+            message.seats.clone()
+        } else {
+            Default::default()
+        };
+        let seats_prover = message.prover;
         let mut buffers = self.buffers.write().unwrap();
         // Another copy may have been verified while this one was, or a
         // finalized frame carried it meanwhile.
@@ -2746,11 +2812,13 @@ impl MessageCollector {
                     && b.bytes.saturating_add(message.data.len()) <= MAX_BYTES_PER_RANK
             });
             if over.is_some() && held_seal && rank_room {
-                let evicted =
-                    evict_later_seals(&mut buffers, &message, seals, self.next_seal_frame());
+                let mut dropped = Vec::new();
+                let frame = self.next_seal_frame();
+                let evicted = evict_later_seals(&mut buffers, &message, seals, frame, &mut dropped);
                 if evicted.total() > 0 {
                     seals = Seals::held(&buffers);
                     self.note_seals_dropped(Instant::now(), evicted, Seals::default());
+                    self.note_dropped_seats(&dropped, frame);
                     over = seals.over(&message);
                 }
             }
@@ -2769,10 +2837,12 @@ impl MessageCollector {
                     member: message.capacity.as_ref().map(|c| c.member),
                 },
             );
+            self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
             return SubmitOutcome::Filtered(Refusal::RankFull);
         }
         match buffer.add(message) {
             AddOutcome::Added => {
+                self.note_window_seats(SeatEvent::Admitted, seats_prover, &seats);
                 let now = Instant::now();
                 self.note_rank_accepting(now, rank);
                 if class != Class::Reserved || held_seal {
@@ -2794,6 +2864,7 @@ impl MessageCollector {
             }
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
             AddOutcome::Full => {
+                self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
                 self.intake.note(Intake::RefusedRankFull, Instant::now());
                 self.note_rank_full(
                     Instant::now(),
@@ -3236,6 +3307,12 @@ impl MessageCollector {
     pub fn note_finalized_frame(&self, frame: u64) {
         self.finalized_frame
             .fetch_max(frame, std::sync::atomic::Ordering::AcqRel);
+        // The window line's tally begins at the first frame seen finalized
+        // ([`window_seats::WindowSeats::begin`]).
+        let next = self.next_seal_frame();
+        if next > 0 && self.class_shares() {
+            self.window_seats.lock().unwrap().begin(next);
+        }
     }
 
     /// The next GLOBAL frame to finalize, the first that can still carry a
@@ -3281,22 +3358,92 @@ impl MessageCollector {
         let mut aged = Seals::default();
         let mut closed = Seals::default();
         let frame = self.next_seal_frame();
+        // The seats of the held proofs that age out and close, for the
+        // window line.
+        let shared = self.class_shares();
+        let mut dropped = Vec::new();
         {
             let mut buffers = self.buffers.write().unwrap();
             buffers.retain(|&r, buffer| {
                 if r < cutoff {
                     aged.add(buffer.shares.seals);
+                    if shared {
+                        dropped.extend(buffer.iter().filter(|(_, m)| m.held_seal()).map(
+                            |(_, m)| window_seats::Dropped {
+                                event: SeatEvent::AgedOut,
+                                prover: m.prover,
+                                seats: m.seats.clone(),
+                            },
+                        ));
+                    }
                 }
                 r >= cutoff
             });
             if frame > 0 {
                 for buffer in buffers.values_mut() {
-                    closed.add(buffer.take_closed_seals(frame));
+                    closed.add(buffer.take_closed_seals(frame, &mut dropped));
                 }
             }
         }
         self.note_seals_aged_out(Instant::now(), aged);
         self.note_seals_dropped(Instant::now(), Seals::default(), closed);
+        if shared {
+            self.note_dropped_seats(&dropped, frame);
+            if frame > 0 {
+                let ended = self.window_seats.lock().unwrap().ended(frame);
+                window_seats::log_ended(&ended);
+                #[cfg(test)]
+                self.windows_ended.lock().unwrap().extend(ended);
+            }
+        }
+    }
+
+    /// Note `event` for `seats` in the window line ([`window_seats`]),
+    /// `prover` if their proof came from this node or an active prover.
+    fn note_window_seats(&self, event: SeatEvent, prover: bool, seats: &window_seats::Seats) {
+        if !seats.is_empty() {
+            let frame = self.next_seal_frame();
+            self.window_seats
+                .lock()
+                .unwrap()
+                .note(event, prover, seats, frame);
+        }
+    }
+
+    /// Note the seats of held proofs that left the buffers
+    /// ([`window_seats::Dropped`]) as the next frame to finalize was `frame`.
+    fn note_dropped_seats(&self, dropped: &[window_seats::Dropped], frame: u64) {
+        if dropped.iter().all(|d| d.seats.is_empty()) {
+            return;
+        }
+        let mut tally = self.window_seats.lock().unwrap();
+        for d in dropped {
+            tally.note(d.event, d.prover, &d.seats, frame);
+        }
+    }
+
+    /// The seats of the storage epoch proofs among `raw_msgs` (with their
+    /// `keys`), a finalized frame's: a held copy's as read when it was
+    /// collected, any other's read now.
+    fn carried_seats(&self, raw_msgs: &[Vec<u8>], keys: &[[u8; 32]]) -> window_seats::Seats {
+        let mut seats = window_seats::Seats::default();
+        let mut unheld = Vec::new();
+        {
+            let buffers = self.buffers.read().unwrap();
+            for (data, key) in raw_msgs.iter().zip(keys) {
+                if !carries_storage_epoch_proof(data) {
+                    continue;
+                }
+                match buffers.values().find_map(|b| b.held_seats(key)) {
+                    Some(held) => seats.extend(held),
+                    None => unheld.push(data),
+                }
+            }
+        }
+        for data in unheld {
+            seats.extend(&storage_kinds_with(data, true).seats);
+        }
+        seats
     }
 
     /// Count held storage epoch proofs dropped for a proof whose window ends
@@ -3397,10 +3544,13 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         };
         if seals.over(message).is_some() {
-            let evicted = evict_later_seals(buffers, message, seals, self.next_seal_frame());
+            let mut dropped = Vec::new();
+            let frame = self.next_seal_frame();
+            let evicted = evict_later_seals(buffers, message, seals, frame, &mut dropped);
             if evicted.total() > 0 {
                 seals = Seals::held(buffers);
                 self.note_seals_dropped(Instant::now(), evicted, Seals::default());
+                self.note_dropped_seats(&dropped, frame);
             }
         }
         let Some(buffer) = buffers.get_mut(&rank) else {
@@ -3418,9 +3568,16 @@ impl MessageCollector {
                     member: None,
                 },
             );
+            if let Some(seats) = buffer.held_seats(&message.hash) {
+                self.note_window_seats(SeatEvent::Refused, true, seats);
+            }
             return SubmitOutcome::Filtered(Refusal::RankFull);
         }
         buffer.promote_seal(&message.hash);
+        // The held copy's seats, read when it was filed.
+        if let Some(seats) = buffer.held_seats(&message.hash) {
+            self.note_window_seats(SeatEvent::Admitted, true, seats);
+        }
         SubmitOutcome::Duplicate
     }
 
@@ -3435,7 +3592,12 @@ impl MessageCollector {
             return;
         }
         self.note_included(raw_msgs);
-        let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
+        let keys: Vec<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
+        if self.class_shares() {
+            let carried = self.carried_seats(raw_msgs, &keys);
+            self.note_window_seats(SeatEvent::Carried, false, &carried);
+        }
+        let hashes: HashSet<[u8; 32]> = keys.into_iter().collect();
         let frames: Vec<(Vec<u8>, u64)> = raw_msgs
             .iter()
             .flat_map(|m| extract_shard_frame_keys(m))
