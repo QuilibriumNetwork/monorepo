@@ -1245,29 +1245,35 @@ pub(crate) struct ShardTips {
 /// forged higher header for every shard each frame: execution skipped it, and
 /// the real proofs it had displaced never rode, so no shard was rewarded.
 /// Equal frame numbers (another member's copy of the same frame) collapse to
-/// the first verified.
+/// the verified copy whose certificate names the most signers, as GLOBAL pays
+/// each signer, then the first in arrival order.
 pub(crate) fn select_shard_tips(
     shard_frame_msgs: Vec<Vec<u8>>,
     verified: impl Fn(&[u8]) -> bool + Sync,
     verify: impl Fn(&[u8]) -> TipCheck + Sync,
 ) -> ShardTips {
     let mut out = ShardTips::default();
-    let mut shards: std::collections::HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>> =
+    type Candidates = Vec<(u64, usize, Vec<u8>)>;
+    let mut shards: std::collections::HashMap<Vec<u8>, Candidates> =
         std::collections::HashMap::new();
     for raw in shard_frame_msgs {
-        let mut keys = crate::message_collector::extract_shard_frame_keys(&raw);
-        if keys.len() == 1 {
-            let (address, frame) = keys.pop().unwrap();
-            shards.entry(address).or_default().push((frame, raw));
+        let mut copies = crate::message_collector::extract_shard_frame_copies(&raw);
+        if copies.len() == 1 {
+            let (address, frame, signers) = copies.pop().unwrap();
+            shards
+                .entry(address)
+                .or_default()
+                .push((frame, signers, raw));
         } else {
             out.kept.push(raw);
         }
     }
-    let select = |mut candidates: Vec<(u64, Vec<u8>)>, out: &mut ShardTips| {
-        // Highest first; a stable sort keeps arrival order within a height.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let select = |mut candidates: Candidates, out: &mut ShardTips| {
+        // Highest first, then most signers; a stable sort keeps arrival
+        // order within those.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         let (mut tip, mut checked) = (false, 0);
-        for (_, raw) in candidates {
+        for (_, _, raw) in candidates {
             if tip {
                 out.superseded.push(raw);
             } else if verified(&raw) {
@@ -3410,6 +3416,30 @@ mod tests {
 
     fn frame_of(raw: &[u8]) -> u64 {
         crate::message_collector::extract_shard_frame_keys(raw)[0].1
+    }
+
+    /// Of one frame's copies, the tip is the verified one naming the most
+    /// signers; a higher frame still wins, and an invalid copy gives way to
+    /// the next.
+    #[test]
+    fn equal_frames_prefer_the_copy_with_the_most_signers() {
+        use crate::message_collector::certified_shard_bundle;
+        let quorum = certified_shard_bundle(0x11, 5, 5, 0);
+        let all = certified_shard_bundle(0x11, 5, 7, 0);
+        let more = certified_shard_bundle(0x11, 5, 6, 0);
+        let (kept, superseded) = coalesce_verified(vec![quorum.clone(), all.clone(), more.clone()]);
+        assert_eq!(kept, vec![all.clone()]);
+        assert_eq!(superseded, vec![more, quorum.clone()]);
+        let higher = certified_shard_bundle(0x11, 6, 5, 0);
+        let (kept, _) = coalesce_verified(vec![all.clone(), higher.clone()]);
+        assert_eq!(kept, vec![higher]);
+        let tips = select_shard_tips(
+            vec![quorum.clone(), all.clone()],
+            |raw| raw == quorum.as_slice(),
+            |_: &[u8]| TipCheck::Invalid("certificate".into()),
+        );
+        assert_eq!(tips.kept, vec![quorum]);
+        assert_eq!(tips.invalid.len(), 1);
     }
 
     #[test]

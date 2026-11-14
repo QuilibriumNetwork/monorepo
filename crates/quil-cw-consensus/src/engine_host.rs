@@ -59,6 +59,9 @@ pub struct GlobalEngineParams {
     pub parent_fallback: Option<Arc<dyn ParentFallback>>,
     /// Tags the host's threads and every task's, for the owner's log lines.
     pub thread_tag: Option<ThreadTag>,
+    /// Keeps finalize votes that come after a view's certificate, for the
+    /// copy an application shard publishes to GLOBAL.
+    pub late_finalizes: Option<Arc<crate::late_finalize::LateFinalizes>>,
 }
 
 /// Which certified parents a leader can build on, in view numbers: the
@@ -115,6 +118,7 @@ impl GlobalEngineParams {
             liveness: None,
             parent_fallback: None,
             thread_tag: None,
+            late_finalizes: None,
         }
     }
 
@@ -192,7 +196,9 @@ where
     let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone())
         .with_liveness(params.liveness.clone());
     let relay = FalconRelay::new(sink, store.clone());
-    let reporter = FalconReporter::new(finalizer, store).with_liveness(params.liveness.clone());
+    let reporter = FalconReporter::new(finalizer, store)
+        .with_liveness(params.liveness.clone())
+        .with_late_finalizes(params.late_finalizes.clone());
     let parent_fallback = params.parent_fallback.clone();
 
     let cfg = Config {

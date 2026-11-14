@@ -2772,6 +2772,9 @@ pub fn activate_app_consensus_cw(
     // are kept until (see [`FinalizedRecords`]).
     finalized_records: Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU64>)>,
     reporting: crate::app_body_delivery::HostReporting,
+    // Keeps the finalize votes that come after each certificate, for the
+    // copy published to GLOBAL; built over `scheme`'s committee.
+    late_finalizes: Option<Arc<quil_cw_consensus::late_finalize::LateFinalizes>>,
 ) -> quil_types::error::Result<AppConsensusCwHandle> {
     // An instance that restarts from its certified local head: every legacy
     // instance, and generation zero, which continues one.
@@ -2912,6 +2915,7 @@ pub fn activate_app_consensus_cw(
         .with_leader_timeout_secs(leader_timeout_secs);
     params.liveness = session.as_ref().map(|host| host.liveness.clone());
     params.thread_tag = reporting.thread_tag;
+    params.late_finalizes = late_finalizes;
     // A leader skips nullified notarized parents too deep to execute privately.
     params.parent_fallback = private_parents
         .map(|parents| parents as Arc<dyn quil_cw_consensus::engine_host::ParentFallback>);

@@ -65,6 +65,87 @@ pub fn encode_finalization(f: &AppFinalization) -> Vec<u8> {
     f.encode().to_vec()
 }
 
+/// What [`extend_finalization`] made of the finalize votes it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extension {
+    /// Valid votes for the finalized proposal from members the certificate
+    /// lacked: each now signs it.
+    pub added: usize,
+    /// Votes whose signature does not verify, or from no member.
+    pub invalid: usize,
+    /// Votes for another proposal of the same view.
+    pub other_proposal: usize,
+    /// Votes of members the certificate, or an earlier vote, already counts.
+    pub duplicate: usize,
+}
+
+/// `finalization` signed also by the members whose finalize votes in
+/// `votes` are valid for its proposal and who did not sign it yet.
+///
+/// Simplex builds a certificate from the first quorum of votes this node
+/// verified and verifies no later finalize vote, so a member whose vote came
+/// later is left out of it, and GLOBAL pays only a certificate's signers. The
+/// result is still a certificate of the same proposal: every verifier accepts
+/// any signer set of at least a quorum ([`check_finalization`]), so no rule
+/// changes. A vote for another proposal, an invalid signature, a repeated or
+/// already counted member, or a signer outside `scheme`'s committee is left
+/// out and counted. `scheme` must be the committee that certified
+/// `finalization`.
+pub fn extend_finalization(
+    scheme: &SimplexFalconScheme,
+    finalization: &AppFinalization,
+    votes: impl IntoIterator<
+        Item = commonware_consensus::simplex::types::Finalize<SimplexFalconScheme, Sha256Digest>,
+    >,
+) -> (AppFinalization, Extension) {
+    use commonware_cryptography::certificate::{Attestation, Scheme as _};
+    use commonware_utils::{N3f1, Participant};
+    let mut extension = Extension::default();
+    let mut counted: std::collections::BTreeSet<Participant> =
+        finalization.certificate.signers.iter().collect();
+    let mut late = Vec::new();
+    for vote in votes {
+        if vote.proposal != finalization.proposal {
+            extension.other_proposal += 1;
+        } else if counted.contains(&vote.attestation.signer) {
+            extension.duplicate += 1;
+        } else if scheme.verify_finalize(&finalization.proposal, &vote.attestation) {
+            counted.insert(vote.attestation.signer);
+            late.push(vote.attestation);
+        } else {
+            extension.invalid += 1;
+        }
+    }
+    if late.is_empty() {
+        return (finalization.clone(), extension);
+    }
+    let held = finalization
+        .certificate
+        .signers
+        .iter()
+        .zip(finalization.certificate.signatures.iter())
+        .map(|(signer, signature)| Attestation::<SimplexFalconScheme> {
+            signer,
+            signature: signature.clone(),
+        });
+    let added = late.len();
+    match scheme.assemble::<_, N3f1>(held.chain(late), &commonware_parallel::Sequential) {
+        Some(certificate) => {
+            extension.added = added;
+            (
+                AppFinalization {
+                    proposal: finalization.proposal.clone(),
+                    certificate,
+                },
+                extension,
+            )
+        }
+        // Not reached for a certificate of this committee: its signers and the
+        // verified votes are distinct members of it.
+        None => (finalization.clone(), extension),
+    }
+}
+
 /// Read only the bounded proposal prefix to select a historical committee.
 /// This is an UNAUTHENTICATED lookup hint. The caller must subsequently verify
 /// the complete certificate with that committee, namespace, epoch and digest.

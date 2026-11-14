@@ -3091,6 +3091,35 @@ fn prepare_app_cw_journal(
     Ok((candidate_anchor, candidate_frame))
 }
 
+/// The most reward proofs held for their late-vote windows: past it the
+/// oldest goes out at once. A window lasts at most
+/// [`quil_cw_consensus::late_finalize::LATE_VOTE_WINDOW`], so a few frames
+/// are held at a time.
+const MAX_HELD_REWARD_PROOFS: usize = 32;
+
+/// A finalized frame's reward proof held until its late-vote window closes
+/// ([`AppConsensusEngine::publish_reward_proof`]).
+struct HeldRewardProof {
+    frame: quil_types::proto::global::AppShardFrame,
+    /// Its finalization certificate as this node holds it.
+    cert: Vec<u8>,
+    /// The host that finalized it; `None`: it goes out as it is.
+    late: Option<Arc<quil_cw_consensus::late_finalize::LateFinalizes>>,
+    /// The latest its window closes, when the engine wakes to send it; set
+    /// again when it is first in line, as its window can open after it was
+    /// held.
+    due: Option<std::time::Instant>,
+}
+
+impl HeldRewardProof {
+    /// While its window is open at `now`, the latest it closes.
+    fn open_until(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.late
+            .as_ref()
+            .and_then(|late| late.open_until(&self.cert, now))
+    }
+}
+
 /// App shard consensus engine. Owns a HotStuff event loop and
 /// processes messages for a single shard identified by `filter`.
 pub struct AppConsensusEngine {
@@ -3339,6 +3368,14 @@ pub struct AppConsensusEngine {
     /// Callback that publishes finalized FrameHeader canonical bytes
     /// on `GLOBAL_PROVER`. Optional so legacy/test paths still work.
     coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// The running consensus host's finalize votes that came after a
+    /// certificate ([`quil_cw_consensus::late_finalize`]).
+    late_finalizes: Option<Arc<quil_cw_consensus::late_finalize::LateFinalizes>>,
+    /// This shard's late finalize votes across hosts, logged hourly.
+    late_vote_census: Arc<quil_cw_consensus::late_finalize::LateVoteCensus>,
+    /// Reward proofs waiting for their late-vote windows, in finalization
+    /// order.
+    held_reward_proofs: VecDeque<HeldRewardProof>,
 
     /// This seat's storage epoch proof checks, run off the consensus
     /// thread one at a time ([`Self::request_storage_epoch_check`]).
@@ -3648,6 +3685,9 @@ impl AppConsensusEngine {
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
+            late_finalizes: None,
+            late_vote_census: Arc::new(quil_cw_consensus::late_finalize::LateVoteCensus::new()),
+            held_reward_proofs: VecDeque::new(),
             kv_db: deps.kv_db,
             cw_handle: None,
             cw_host_epoch: 0,
@@ -8636,6 +8676,18 @@ impl AppConsensusEngine {
                     break;
                 }
 
+                // The oldest held reward proof's late-vote window runs out.
+                // A notarization closes it earlier, which the upkeep below
+                // sees at the next message.
+                _ = tokio::time::sleep_until(
+                    self.held_reward_proofs
+                        .front()
+                        .and_then(|proof| proof.due)
+                        .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std),
+                ), if !self.held_reward_proofs.is_empty() => {
+                    self.release_reward_proofs(std::time::Instant::now(), false);
+                }
+
                 // A running outgoing-history walk's next batch, at its pace,
                 // when nothing above is ready. The walk ends with a start
                 // attempt: the member votes as soon as it can.
@@ -8655,6 +8707,7 @@ impl AppConsensusEngine {
             }
 
             probe::step(probe::Section::EngineUpkeep);
+            self.release_reward_proofs(std::time::Instant::now(), false);
             // Process any pending parent seal (queued by QC handler)
             if let Some(child_rank) = self.pending_seal_rank.take() {
                 self.try_seal_parent_with_child(child_rank).await;
@@ -8667,6 +8720,8 @@ impl AppConsensusEngine {
             self.execution.observe();
             self.publish_sizes();
         }
+        // What is held goes out with the votes so far.
+        self.release_reward_proofs(std::time::Instant::now(), true);
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "app consensus host stopped with an error");
@@ -11403,6 +11458,12 @@ impl AppConsensusEngine {
                 crate::worker_stall::route_this_thread(core_id)
             })),
         };
+        // A member whose finalize vote misses a certificate can still sign
+        // the copy this node publishes to GLOBAL.
+        let late_finalizes = Arc::new(quil_cw_consensus::late_finalize::LateFinalizes::new(
+            scheme.clone(),
+            self.late_vote_census.clone(),
+        ));
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -11426,7 +11487,9 @@ impl AppConsensusEngine {
             self.private_parents.clone(),
             finalized_records,
             reporting,
+            Some(late_finalizes.clone()),
         )?;
+        self.late_finalizes = Some(late_finalizes);
         if let Some(session) = session.as_ref() {
             info!(filter = %hex::encode(&self.filter), generation = session.generation,
                 base_frame = session.base_frame, members = session.members.len(),
@@ -11960,8 +12023,84 @@ impl AppConsensusEngine {
         // `public_key_signature_bls48581` is empty — verification of CW shard
         // frames checks the deterministic output, storage and committee certificate.
         // The CW frame carries the simplex finalization cert (magic-prefixed)
-        // in the sig field, as stored, so the global reward path can verify
-        // CW-finalized shard work against the shard committee.
+        // in the sig field, so the global reward path can verify CW-finalized
+        // shard work against the shard committee; the copy sent may carry
+        // more signers than the stored one (`publish_reward_proof`).
+        self.publish_reward_proof(frame, cert, std::time::Instant::now());
+    }
+
+    /// Send a finalized frame's certified header to GLOBAL as its reward
+    /// proof, in finalization order. One this engine's consensus host
+    /// finalized waits until its late-vote window closes, then goes out
+    /// signed also by the members whose finalize votes came in it: GLOBAL
+    /// pays only a certificate's signers, and the batcher built it from the
+    /// first quorum it verified ([`quil_cw_consensus::late_finalize`]). The
+    /// stored frame keeps the certificate it finalized with.
+    fn publish_reward_proof(
+        &mut self,
+        frame: quil_types::proto::global::AppShardFrame,
+        cert: &[u8],
+        now: std::time::Instant,
+    ) {
+        let late = self.late_finalizes.clone().filter(|_| !cert.is_empty());
+        let due = late.as_ref().and_then(|late| late.open_until(cert, now));
+        self.held_reward_proofs.push_back(HeldRewardProof {
+            frame,
+            cert: cert.to_vec(),
+            late,
+            due,
+        });
+        self.release_reward_proofs(now, false);
+    }
+
+    /// Send the held reward proofs, oldest first, up to the first whose
+    /// window is still open at `now`; every one when `all`, or while more
+    /// than [`MAX_HELD_REWARD_PROOFS`] are held.
+    fn release_reward_proofs(&mut self, now: std::time::Instant, all: bool) {
+        loop {
+            let over = self.held_reward_proofs.len() > MAX_HELD_REWARD_PROOFS;
+            let Some(front) = self.held_reward_proofs.front_mut() else {
+                break;
+            };
+            let open = if all || over {
+                None
+            } else {
+                front.open_until(now)
+            };
+            if let Some(until) = open {
+                // Held with no window behind an open one, its window may have
+                // opened since: the engine wakes when it closes, not at once
+                // on every turn until then.
+                front.due = Some(until);
+                break;
+            }
+            let Some(proof) = self.held_reward_proofs.pop_front() else {
+                break;
+            };
+            let extended = proof
+                .late
+                .as_ref()
+                .and_then(|late| late.extend(&proof.cert, now));
+            self.send_reward_proof(proof.frame, extended);
+        }
+    }
+
+    /// Emit `frame`'s canonical header, its certificate replaced by `cert`
+    /// when one is given.
+    fn send_reward_proof(
+        &self,
+        mut frame: quil_types::proto::global::AppShardFrame,
+        cert: Option<Vec<u8>>,
+    ) {
+        if let (Some(cert), Some(signature)) = (
+            cert,
+            frame
+                .header
+                .as_mut()
+                .and_then(|header| header.public_key_signature_bls48581.as_mut()),
+        ) {
+            signature.signature = quil_cw_consensus::app_cert::wrap_cert_for_header(&cert);
+        }
         if let Ok(canon_bytes) = crate::app_handoff::canonical_header(&frame) {
             let _ = self.event_tx.send(AppEngineEvent::ShardFrameFinalized {
                 filter: self.filter.clone(),
@@ -11971,6 +12110,40 @@ impl AppConsensusEngine {
                 cb(canon_bytes);
             }
         }
+    }
+
+    /// The hourly line on finalize votes that came after this shard's
+    /// certificates, once an hour of them is counted.
+    fn log_late_votes(&self, now: std::time::Instant) {
+        let Some((span, c)) = self.late_vote_census.take_due(now) else {
+            return;
+        };
+        info!(
+            core_id = self.core_id,
+            filter = hex::encode(&self.filter),
+            secs = span.as_secs(),
+            frames = c.frames,
+            committee = c.committee,
+            quorum = c.quorum,
+            quorum_signers = c.quorum_signers,
+            published_signers = c.published_signers,
+            added = c.added,
+            early = c.early,
+            within_250ms = c.within_250ms,
+            within_1s = c.within_1s,
+            within_2s = c.within_2s,
+            after_2s = c.after_2s,
+            invalid = c.invalid,
+            other_proposal = c.other_proposal,
+            closed_by_notarization = c.closed_by_notarization,
+            closed_by_window = c.closed_by_window,
+            window_ms = quil_cw_consensus::late_finalize::LATE_VOTE_WINDOW.as_millis() as u64,
+            "finalize votes that came after this node held a frame's certificate, by delay \
+             since it: votes inside the window (until a later view notarizes, at most \
+             window_ms) sign the copy published to GLOBAL (added), which pays its signers \
+             the frame's reward share; many after_2s votes or windows closed_by_window would \
+             credit more members with a longer window"
+        );
     }
 
     /// Handle a full frame a peer published on this shard's frame topic.
@@ -13191,6 +13364,7 @@ impl AppConsensusEngine {
         );
         self.note_gossip_refusals_quiet();
         self.report_arrivals_left();
+        self.log_late_votes(now);
     }
 
     /// Retry only previously authorized seals, in rank order, at cleanup cadence.
@@ -21569,6 +21743,293 @@ mod tests {
             events,
         );
         (engine, handle, received)
+    }
+
+    /// A finalized frame's reward proof waits for its late-vote window and
+    /// goes out signed also by the member whose vote came inside it; the
+    /// next frame, whose window this host does not know, goes out behind it.
+    /// One held across a host replacement keeps the host that finalized it.
+    /// At most [`MAX_HELD_REWARD_PROOFS`] wait: one more sends the oldest.
+    #[test]
+    fn reward_proofs_wait_for_late_votes_and_keep_their_order() {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Finalize, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::{encode_finalization, unverified_signers, unwrap_cert_from_header},
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+            late_finalize::{LateFinalizes, LateVoteCensus, LATE_VOTE_WINDOW},
+        };
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
+        use quil_types::crypto::Signer as _;
+        let keys: Vec<_> = (0..4)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let namespace = b"appshard-reward-proof";
+        let signers: Vec<_> = keys
+            .into_iter()
+            .map(|key| Generic::<Namespace>::signer(namespace, set.clone(), key).unwrap())
+            .collect();
+        let proposal = |view: u64| {
+            Proposal::new(
+                Round::new(Epoch::new(0), View::new(view)),
+                View::new(view - 1),
+                Digest([view as u8; 32]),
+            )
+        };
+        let vote = |member: usize, proposal: &Proposal<Digest>| Finalize {
+            proposal: proposal.clone(),
+            attestation: signers[member]
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal })
+                .unwrap(),
+        };
+        // Quorum of four is three.
+        let quorum = |proposal: Proposal<Digest>| {
+            let votes = (0..3).map(|member| vote(member, &proposal).attestation);
+            Finalization {
+                certificate: signers[0]
+                    .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+                    .unwrap(),
+                proposal,
+            }
+        };
+        let frame = |number: u64, cert: &[u8]| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                frame_number: number,
+                rank: number,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let host = || {
+            Arc::new(LateFinalizes::new(
+                SimplexFalconScheme::verifier(namespace, set.clone()),
+                Arc::new(LateVoteCensus::new()),
+            ))
+        };
+        let late = host();
+        engine.late_finalizes = Some(late.clone());
+        let t0 = std::time::Instant::now();
+        let first = quorum(proposal(5));
+        late.finalized(&first, t0);
+        late.vote(vote(3, &first.proposal), t0 + Duration::from_millis(300));
+        let first_cert = encode_finalization(&first);
+        engine.publish_reward_proof(frame(5, &first_cert), &first_cert, t0);
+        // Frame 6's certificate is unknown to the host: it goes out as it is,
+        // after frame 5.
+        let second_cert = encode_finalization(&quorum(proposal(6)));
+        engine.publish_reward_proof(
+            frame(6, &second_cert),
+            &second_cert,
+            t0 + Duration::from_millis(500),
+        );
+        assert!(published.lock().unwrap().is_empty(), "held for the window");
+        engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW / 2, false);
+        assert!(published.lock().unwrap().is_empty(), "still open");
+        engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW, false);
+        let sent = || -> Vec<(u64, Option<(usize, usize)>)> {
+            published
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|bytes| {
+                    let header = FrameHeader::from_canonical_bytes(bytes).unwrap();
+                    (
+                        header.frame_number,
+                        unwrap_cert_from_header(&header.public_key_signature_bls48581)
+                            .and_then(unverified_signers),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(sent(), vec![(5, Some((4, 4))), (6, Some((4, 3)))]);
+
+        // Held across a host replacement, a proof keeps the host that
+        // finalized it; the new host, holding another proposal of the view,
+        // extends nothing of it.
+        published.lock().unwrap().clear();
+        let t2 = t0 + Duration::from_secs(5);
+        let replaced = quorum(proposal(7));
+        late.finalized(&replaced, t2);
+        late.vote(vote(3, &replaced.proposal), t2 + Duration::from_millis(100));
+        let replaced_cert = encode_finalization(&replaced);
+        engine.publish_reward_proof(frame(7, &replaced_cert), &replaced_cert, t2);
+        let next = host();
+        next.finalized(
+            &quorum(Proposal::new(
+                Round::new(Epoch::new(0), View::new(7)),
+                View::new(6),
+                Digest([0xEE; 32]),
+            )),
+            t2,
+        );
+        engine.late_finalizes = Some(next.clone());
+        assert_eq!(next.open_until(&replaced_cert, t2), None);
+        assert_eq!(
+            next.extend(&replaced_cert, t2 + LATE_VOTE_WINDOW),
+            None,
+            "another proposal of the view"
+        );
+        engine.release_reward_proofs(t2 + LATE_VOTE_WINDOW, false);
+        assert_eq!(
+            sent(),
+            vec![(7, Some((4, 4)))],
+            "extended by the host that finalized it"
+        );
+
+        // Each from its own host, so that no frame's finalization closes
+        // another's window.
+        published.lock().unwrap().clear();
+        let t1 = t0 + Duration::from_secs(10);
+        for view in 10..=10 + MAX_HELD_REWARD_PROOFS as u64 {
+            let certified = quorum(proposal(view));
+            let late = host();
+            late.finalized(&certified, t1);
+            engine.late_finalizes = Some(late);
+            let cert = encode_finalization(&certified);
+            engine.publish_reward_proof(frame(view, &cert), &cert, t1);
+        }
+        assert_eq!(published.lock().unwrap().len(), 1, "the oldest went out");
+        assert_eq!(engine.held_reward_proofs.len(), MAX_HELD_REWARD_PROOFS);
+    }
+
+    /// A reward proof held with no window behind an open one, whose window
+    /// opens meanwhile, wakes the engine when that window closes once it is
+    /// first in line: with no wake time, the select loop's sleep arm fires at
+    /// once on every turn until the window closes.
+    #[test]
+    fn a_window_opened_while_held_sets_the_wake() {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::encode_finalization,
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+            late_finalize::{LateFinalizes, LateVoteCensus, LATE_VOTE_WINDOW},
+        };
+        use quil_types::crypto::Signer as _;
+        let keys: Vec<_> = (0..4)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let namespace = b"appshard-reward-wake";
+        let signers: Vec<_> = keys
+            .into_iter()
+            .map(|key| Generic::<Namespace>::signer(namespace, set.clone(), key).unwrap())
+            .collect();
+        let quorum = |view: u64| {
+            let proposal = Proposal::new(
+                Round::new(Epoch::new(0), View::new(view)),
+                View::new(view - 1),
+                Digest([view as u8; 32]),
+            );
+            let votes = (0..3).map(|member| {
+                signers[member]
+                    .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                        proposal: &proposal,
+                    })
+                    .unwrap()
+            });
+            Finalization {
+                certificate: signers[0]
+                    .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+                    .unwrap(),
+                proposal,
+            }
+        };
+        let frame = |number: u64, cert: &[u8]| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                frame_number: number,
+                rank: number,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let late = Arc::new(LateFinalizes::new(
+            SimplexFalconScheme::verifier(namespace, set.clone()),
+            Arc::new(LateVoteCensus::new()),
+        ));
+        engine.late_finalizes = Some(late.clone());
+        let ms = Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let first = quorum(5);
+        late.finalized(&first, t0);
+        let first_cert = encode_finalization(&first);
+        engine.publish_reward_proof(frame(5, &first_cert), &first_cert, t0);
+        // The host does not hold frame 6's view yet: no window to wait for,
+        // but it waits behind frame 5.
+        let second = quorum(6);
+        let second_cert = encode_finalization(&second);
+        engine.publish_reward_proof(frame(6, &second_cert), &second_cert, t0 + ms(100));
+        assert_eq!(engine.held_reward_proofs.len(), 2);
+        assert_eq!(engine.held_reward_proofs[1].due, None);
+        // Now it does, which closes frame 5's window.
+        late.finalized(&second, t0 + ms(200));
+        engine.release_reward_proofs(t0 + ms(300), false);
+        assert_eq!(published.lock().unwrap().len(), 1, "frame 5 went out");
+        assert_eq!(
+            engine.held_reward_proofs[0].due,
+            Some(t0 + ms(200) + LATE_VOTE_WINDOW),
+            "the sleep arm wakes when frame 6's window closes"
+        );
+        engine.release_reward_proofs(t0 + ms(200) + LATE_VOTE_WINDOW, false);
+        assert_eq!(published.lock().unwrap().len(), 2, "frame 6 went out");
+        assert!(engine.held_reward_proofs.is_empty());
     }
 
     /// An application submission of `size` bytes, distinct by `i`.

@@ -42,6 +42,17 @@ struct ShardFrame {
     frame: u64,
     /// The GLOBAL frame it anchors to (`global_frame_number`).
     anchor: u64,
+    /// How many members its certificate's bitmap names, unverified
+    /// ([`certificate_signers`]).
+    signers: usize,
+}
+
+/// The highest verified frame of a shard, and the most signers a verified
+/// copy of it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tip {
+    frame: u64,
+    signers: usize,
 }
 
 /// A collected message with its identity ([`message_key`]) for deduplication.
@@ -82,6 +93,7 @@ impl CollectedMessage {
                 address: c.address,
                 frame: c.frame_number,
                 anchor: c.global_frame_number,
+                signers: c.signers,
             })
         } else {
             None
@@ -1597,10 +1609,11 @@ pub struct MessageCollector {
     /// real one.
     shard_frame_verifier: RwLock<Option<ProvenanceShardFrameVerifier>>,
     verifications: std::sync::atomic::AtomicUsize,
-    /// Highest VERIFIED frame admitted per shard address. Only verified
-    /// frames move it: an unverified height would let an invalid candidate
-    /// suppress valid frames.
-    verified_tips: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Highest VERIFIED frame admitted per shard address, with the most
+    /// signers a verified copy of it carries. Only verified frames move it:
+    /// an unverified height would let an invalid candidate suppress valid
+    /// frames.
+    verified_tips: std::sync::Mutex<HashMap<Vec<u8>, Tip>>,
     /// Single-shard frames under verification now, `(address, frame)`.
     /// Members' copies of a frame differ (each certificate can carry other
     /// signers) and arrive together; a copy waits for the verdict on the
@@ -2134,15 +2147,32 @@ impl MessageCollector {
         if self.shard_frame_verifier.read().unwrap().is_none() {
             return false;
         }
-        let keys = extract_shard_frame_keys(data);
-        !keys.is_empty() && !self.superseded(&keys)
+        let checks = extract_shard_frame_checks(data);
+        let signers = match checks.as_slice() {
+            [check] => Some(check.signers),
+            _ => None,
+        };
+        let keys: Vec<(Vec<u8>, u64)> = checks
+            .into_iter()
+            .map(|c| (c.address, c.frame_number))
+            .collect();
+        !keys.is_empty() && !self.superseded(&keys, signers) && !self.carries_included(&keys)
     }
 
     /// Every frame in `keys` is at or below a verified frame of its shard.
-    fn superseded(&self, keys: &[(Vec<u8>, u64)]) -> bool {
+    /// A single shard's copy of its verified frame (`signers` is `Some`)
+    /// adds something only with more signers than the verified copy: GLOBAL
+    /// pays each signer of the certificate it carries.
+    fn superseded(&self, keys: &[(Vec<u8>, u64)], signers: Option<usize>) -> bool {
         let tips = self.verified_tips.lock().unwrap();
-        keys.iter()
-            .all(|(address, frame)| tips.get(address).is_some_and(|tip| frame <= tip))
+        keys.iter().all(|(address, frame)| {
+            tips.get(address).is_some_and(|tip| match signers {
+                Some(signers) => {
+                    *frame < tip.frame || (*frame == tip.frame && signers <= tip.signers)
+                }
+                None => *frame <= tip.frame,
+            })
+        })
     }
 
     /// A frame in `keys` is one a finalized frame carried.
@@ -2186,7 +2216,7 @@ impl MessageCollector {
                     .wait_timeout(verifying, left)
                     .unwrap(),
             );
-            if self.superseded(keys) {
+            if self.superseded(keys, Some(shard.signers)) {
                 return Err(Unclaimed::Superseded);
             }
         }
@@ -2535,12 +2565,14 @@ impl MessageCollector {
 
         // A frame at or below a verified frame of its shard adds nothing: the
         // leader carries one proof per shard, the highest. Another member's
-        // copy of the same frame lands here too.
+        // copy of the same frame lands here too, and adds something only
+        // when its certificate names more signers than the verified copy's.
         let keys: Vec<(Vec<u8>, u64)> = checks
             .iter()
             .map(|c| (c.address.clone(), c.frame_number))
             .collect();
-        if !keys.is_empty() && self.superseded(&keys) {
+        let signers = message.shard.as_ref().map(|shard| shard.signers);
+        if !keys.is_empty() && self.superseded(&keys, signers) {
             return SubmitOutcome::Duplicate;
         }
         // A shard frame a finalized frame already carried, in another bundle.
@@ -2650,6 +2682,8 @@ impl MessageCollector {
         if message.verified && !verified {
             self.absorb_unverified(&mut message, provenance);
         }
+        // What it names now: the copies it absorbed may have added signers.
+        let signers = message.shard.as_ref().map(|shard| shard.signers);
 
         // File nothing below the newest finalized frame: retention counts
         // finalized frames from the rank a message is filed at, and a submit
@@ -2673,7 +2707,7 @@ impl MessageCollector {
         let mut buffers = self.buffers.write().unwrap();
         // Another copy may have been verified while this one was, or a
         // finalized frame carried it meanwhile.
-        if (message.verified && self.superseded(&keys)) || self.carries_included(&keys) {
+        if (message.verified && self.superseded(&keys, signers)) || self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
         }
         // Another copy of a storage epoch proof held since the check above,
@@ -2788,7 +2822,7 @@ impl MessageCollector {
                     }
                 }
                 if verified && !keys.is_empty() {
-                    self.supersede(&mut buffers, &keys, hash);
+                    self.supersede(&mut buffers, &keys, hash, signers);
                 }
                 SubmitOutcome::Accepted
             }
@@ -2810,20 +2844,33 @@ impl MessageCollector {
     }
 
     /// Raise the verified frame of each shard in `keys` and drop what it
-    /// supersedes: the single-shard messages of those shards at or below it,
-    /// except `keep`, the message that raised it. Found through each buffer's
-    /// shard index: reading every held message instead cost each verified
-    /// arrival time in proportion to the shard count, under the buffers' lock.
+    /// supersedes: the single-shard messages of those shards below it, or
+    /// at it with no more signers than the verified copies (`signers` of a
+    /// single-shard `keep`; a bundle of several covers its frames whatever
+    /// signs them), except `keep`, the message that raised it. Found
+    /// through each buffer's shard index: reading every held message instead
+    /// cost each verified arrival time in proportion to the shard count,
+    /// under the buffers' lock.
     fn supersede(
         &self,
         buffers: &mut HashMap<u64, RankBuffer>,
         keys: &[(Vec<u8>, u64)],
         keep: [u8; 32],
+        signers: Option<usize>,
     ) {
+        let signers = signers.unwrap_or(usize::MAX);
         let mut tips = self.verified_tips.lock().unwrap();
         for (address, frame) in keys {
-            let tip = tips.entry(address.clone()).or_insert(*frame);
-            *tip = (*tip).max(*frame);
+            let raised = Tip {
+                frame: *frame,
+                signers,
+            };
+            let tip = tips.entry(address.clone()).or_insert(raised);
+            match frame.cmp(&tip.frame) {
+                std::cmp::Ordering::Greater => *tip = raised,
+                std::cmp::Ordering::Equal => tip.signers = tip.signers.max(signers),
+                std::cmp::Ordering::Less => {}
+            }
         }
         for (address, _) in keys {
             let tip = tips[address];
@@ -2834,7 +2881,11 @@ impl MessageCollector {
                 let below: Vec<[u8; 32]> = held
                     .iter()
                     .filter(|key| {
-                        **key != keep && buffer.shard_frame(key).is_some_and(|s| s.frame <= tip)
+                        **key != keep
+                            && buffer.shard_frame(key).is_some_and(|s| {
+                                s.frame < tip.frame
+                                    || (s.frame == tip.frame && s.signers <= tip.signers)
+                            })
                     })
                     .copied()
                     .collect();
@@ -3030,9 +3081,13 @@ impl MessageCollector {
             shards
                 .into_iter()
                 .map(|(address, mut candidates)| {
-                    // Highest frame first; the stable sort keeps newer ranks first within one.
+                    // Highest frame first, and within one the copy whose
+                    // certificate names the most signers (GLOBAL pays each);
+                    // the stable sort keeps newer ranks first within those.
                     candidates.sort_by_key(|c| {
-                        std::cmp::Reverse(c.2.shard.as_ref().map_or(0, |s| s.frame))
+                        std::cmp::Reverse(
+                            c.2.shard.as_ref().map_or((0, 0), |s| (s.frame, s.signers)),
+                        )
                     });
                     let (mut picks, mut unverified) = (Vec::new(), 0);
                     for candidate in candidates {
@@ -3842,6 +3897,18 @@ struct ShardFrameCheck {
     /// The request carries the header's canonical encoding, which every
     /// node produces: nothing appended, no field in a second encoding.
     canonical: bool,
+    /// How many members its certificate's bitmap names, unverified.
+    signers: usize,
+}
+
+/// How many members the commonware finalization certificate in a shard
+/// header's signature field names, read from its bitmap and not verified; 0
+/// for any other field. It orders copies of one frame, which differ only in
+/// their certificates; only a verified copy is relied on.
+fn certificate_signers(signature: &[u8]) -> usize {
+    quil_cw_consensus::app_cert::unwrap_cert_from_header(signature)
+        .and_then(quil_cw_consensus::app_cert::unverified_signers)
+        .map_or(0, |(_, signers)| signers)
 }
 
 /// The shard frames `data` carries. A header voting out of bounds at its
@@ -3897,6 +3964,7 @@ fn carried_headers(data: &[u8]) -> Vec<(ShardFrameCheck, bool)> {
                         .is_ok_and(|bytes| bytes == req.inner_bytes);
                     out.push((
                         ShardFrameCheck {
+                            signers: certificate_signers(&fh.public_key_signature_bls48581),
                             address: fh.address,
                             frame_number: fh.frame_number,
                             global_frame_number: fh.global_frame_number,
@@ -3910,6 +3978,102 @@ fn carried_headers(data: &[u8]) -> Vec<(ShardFrameCheck, bool)> {
         }
     }
     out
+}
+
+/// Each shard frame a bundle carries: its address, frame number and how many
+/// members its certificate names (unverified, [`certificate_signers`]).
+pub(crate) fn extract_shard_frame_copies(data: &[u8]) -> Vec<(Vec<u8>, u64, usize)> {
+    extract_shard_frame_checks(data)
+        .into_iter()
+        .map(|c| (c.address, c.frame_number, c.signers))
+        .collect()
+}
+
+/// A bundle carrying one header of shard `[addr; 32]` at `frame`, whose
+/// certificate is signed by `signers` members of a seven-member committee
+/// (quorum five), from member `first` on. The signatures are real; nothing
+/// binds them to the header.
+#[cfg(test)]
+pub(crate) fn certified_shard_bundle(
+    addr: u8,
+    frame: u64,
+    signers: usize,
+    first: usize,
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{
+                scheme::Namespace,
+                types::{Finalization, Proposal, Subject},
+            },
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::{encode_finalization, wrap_cert_for_header},
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    use quil_types::crypto::Signer as _;
+    static COMMITTEE: std::sync::OnceLock<Vec<Generic<Namespace>>> = std::sync::OnceLock::new();
+    let committee = COMMITTEE.get_or_init(|| {
+        let keys: Vec<_> = (0..7)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        keys.into_iter()
+            .map(|key| {
+                Generic::<Namespace>::signer(b"appshard-collector", set.clone(), key).unwrap()
+            })
+            .collect()
+    });
+    let view = frame.max(1);
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(0), View::new(view)),
+        View::new(view - 1),
+        Digest([addr; 32]),
+    );
+    let votes = committee[first..first + signers].iter().map(|member| {
+        member
+            .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                proposal: &proposal,
+            })
+            .unwrap()
+    });
+    let certificate = committee[0]
+        .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+        .unwrap();
+    let header = FrameHeader {
+        address: vec![addr; 32],
+        frame_number: frame,
+        rank: view,
+        global_frame_number: 99,
+        public_key_signature_bls48581: wrap_cert_for_header(&encode_finalization(&Finalization {
+            proposal,
+            certificate,
+        })),
+        ..Default::default()
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_FRAME_HEADER,
+            inner_bytes: header.to_canonical_bytes().unwrap(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
 }
 
 pub fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
@@ -5249,6 +5413,78 @@ mod tests {
             .collect();
         held.sort();
         assert_eq!(held, vec![(vec![0x11; 32], 7), (vec![0x22; 32], 9)]);
+    }
+
+    /// Another member's copy of a verified frame adds the signers the held one
+    /// lacks, whatever its count, and no copy does once a finalized frame
+    /// carried the frame; each addition costs one verification, a copy naming
+    /// nobody new none.
+    #[test]
+    fn a_copy_with_more_signers_replaces_the_held_copy_until_inclusion() {
+        let mc = MessageCollector::new();
+        let (verifier, calls) = counting_verifier(|_| ShardFrameVerdict::Valid);
+        mc.set_shard_frame_verifier(verifier);
+        let verified = || calls.load(std::sync::atomic::Ordering::SeqCst);
+        let quorum = certified_shard_bundle(0x11, 5, 5, 0);
+        assert_eq!(mc.add_message_outcome(3, quorum), SubmitOutcome::Accepted);
+        // As many signers, one of them new.
+        let same = certified_shard_bundle(0x11, 5, 5, 1);
+        assert!(mc.requires_verification(&same));
+        assert_eq!(mc.add_message_outcome(3, same), SubmitOutcome::Accepted);
+        assert_eq!(verified(), 2);
+        assert_eq!(
+            extract_shard_frame_copies(&mc.collect_for_rank(3)[0])[0].2,
+            6
+        );
+        // Nobody new.
+        let fewer = certified_shard_bundle(0x11, 5, 6, 0);
+        assert!(!mc.requires_verification(&fewer));
+        assert_eq!(mc.add_message_outcome(3, fewer), SubmitOutcome::Duplicate);
+        assert_eq!(verified(), 2, "nobody new: not verified");
+        let held = mc.collect_for_rank(3);
+        // The frame rides a finalized GLOBAL frame: the window ends.
+        mc.mark_finalized(&held);
+        let all = certified_shard_bundle(0x11, 5, 7, 0);
+        assert!(!mc.requires_verification(&all));
+        assert_eq!(mc.add_message_outcome(3, all), SubmitOutcome::Duplicate);
+        assert_eq!(verified(), 2, "never verified after inclusion");
+        assert_eq!(mc.total_pending(), 0);
+        // The next frame is held as before.
+        assert_eq!(
+            mc.add_message_outcome(3, certified_shard_bundle(0x11, 6, 5, 0)),
+            SubmitOutcome::Accepted
+        );
+    }
+
+    /// A proposal copies a held copy naming more signers than the verified
+    /// one too, for its leader to try first (`select_shard_tips`); copies
+    /// keep arrival order.
+    #[test]
+    fn a_proposal_copies_a_held_copy_with_more_signers() {
+        let mc = MessageCollector::new();
+        let verifier: ShardFrameVerifier = std::sync::Arc::new(|data: &[u8]| {
+            if extract_shard_frame_copies(data)[0].2 == 7 {
+                ShardFrameVerdict::Unavailable("state".into())
+            } else {
+                ShardFrameVerdict::Valid
+            }
+        });
+        mc.set_shard_frame_verifier(verifier);
+        let quorum = certified_shard_bundle(0x11, 5, 5, 0);
+        let all = certified_shard_bundle(0x11, 5, 7, 0);
+        assert_eq!(
+            mc.add_message_outcome(3, quorum.clone()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(3, all.clone()),
+            SubmitOutcome::Accepted,
+            "held unverified: it names more signers than the verified copy"
+        );
+        let taken = mc
+            .snapshot_for_proposal(3, 1 << 20, 100, None, &[])
+            .unwrap();
+        assert_eq!(taken, vec![(quorum, true), (all, false)]);
     }
 
     #[test]

@@ -676,6 +676,58 @@ fn sca_a_verified_copy_takes_the_signers_of_unverified_ones() {
     }
 }
 
+/// A verified copy that absorbs an unverified one naming more signers than
+/// itself supersedes by the union's count: no unverified copy of the frame
+/// stays held beside it.
+#[test]
+fn sca_an_absorbed_copy_naming_more_signers_leaves_with_the_union() {
+    let (shard, mc, _, available) = one_shard(true);
+    available.store(false, Ordering::SeqCst);
+    assert_eq!(
+        submit(&mc, shard.copy(&[1, 2, 3, 4, 5, 6])),
+        SubmitOutcome::Accepted
+    );
+    available.store(true, Ordering::SeqCst);
+    assert_eq!(
+        submit(&mc, shard.copy(&[0, 1, 2, 3, 4])),
+        SubmitOutcome::Accepted
+    );
+    let unverified = mc
+        .collect_for_rank(RANK)
+        .into_iter()
+        .filter(|raw| !mc.is_verified(raw))
+        .count();
+    assert_eq!(
+        unverified, 0,
+        "an absorbed copy naming more signers stays held beside the union"
+    );
+    assert_eq!(shard.held_pays(&mc), ALL);
+}
+
+/// A union raises the count a later copy of its frame must exceed, as a
+/// verified copy naming as many signers does: one that cannot be judged now
+/// and names no more is a duplicate, not held.
+#[test]
+fn sca_a_union_raises_the_signers_a_copy_must_exceed() {
+    let (shard, mc, _, available) = one_shard(false);
+    assert_eq!(
+        submit(&mc, shard.copy(&[0, 1, 2, 3, 4])),
+        SubmitOutcome::Accepted
+    );
+    assert_eq!(
+        submit(&mc, shard.copy(&[1, 2, 3, 4, 5])),
+        SubmitOutcome::Accepted
+    );
+    assert_eq!(shard.held_pays(&mc), vec![0, 1, 2, 3, 4, 5]);
+    available.store(false, Ordering::SeqCst);
+    assert_eq!(
+        submit(&mc, shard.copy(&[0, 1, 2, 3, 4, 6])),
+        SubmitOutcome::Duplicate,
+        "a copy naming no more signers is held beside the union"
+    );
+    assert_eq!(mc.total_pending(), 1);
+}
+
 /// The verified copy with an unverified source's very bytes as its union is
 /// filed, not refused as a duplicate of that source.
 #[test]
