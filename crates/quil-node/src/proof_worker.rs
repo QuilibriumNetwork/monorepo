@@ -210,6 +210,29 @@ fn available_for_verifiers() -> Option<u64> {
         .map(|memory| limit.map_or(memory.available_bytes, |l| l.min(memory.available_bytes)))
 }
 
+/// The memory a node sizes its verifier slots from:
+/// [`available_for_verifiers`] judged by [`verifier_memory`] against the
+/// block cache an archive's store fills once open
+/// (`quil_store::effective_block_cache_bytes`).
+fn memory_for_verifiers(archive: bool) -> Option<u64> {
+    let available = available_for_verifiers()?;
+    let cache = quil_store::effective_block_cache_bytes(true) as u64;
+    Some(verifier_memory(available, cache, archive))
+}
+
+/// Of `available` bytes, those an archive's verifiers may count: less the
+/// block `cache` its store fills once open (a quarter of its memory up to
+/// 32 GiB), never below zero. Slots are sized before the stores open, while
+/// that memory still reads as available. A regular node's stores share a
+/// small cache, left in: it counts all of `available`.
+fn verifier_memory(available: u64, cache: u64, archive: bool) -> u64 {
+    if archive {
+        available.saturating_sub(cache)
+    } else {
+        available
+    }
+}
+
 /// Resolution order: `proofWorker.path`, then `QUIL_AMOUNT_WORKER_PATH`, then
 /// the running node executable itself, started in its worker mode
 /// ([`WORKER_MODE_ARG`]); the returned flag says which. The result must be an
@@ -355,7 +378,7 @@ pub(crate) fn build_node_worker_as(
 ) -> anyhow::Result<Option<WorkerVerifier>> {
     let proof = &config.proof_worker;
     if let (Some(configured), false) = (proof.max_concurrent, proof.disabled) {
-        let available = available_for_verifiers();
+        let available = memory_for_verifiers(archive);
         if let Some(admitted) = configured_over_memory(configured, archive, available) {
             tracing::warn!(
                 configured,
@@ -371,7 +394,12 @@ pub(crate) fn build_node_worker_as(
         }
     }
     let slots = if proof.max_concurrent.is_none() && !proof.disabled {
-        verifier_slots(proof, archive, process_cpus(), available_for_verifiers())
+        verifier_slots(
+            proof,
+            archive,
+            process_cpus(),
+            memory_for_verifiers(archive),
+        )
     } else {
         verifier_slots(proof, archive, None, None)
     };
@@ -719,6 +747,56 @@ mod tests {
         );
     }
 
+    /// An archive's verifiers count its available memory less the block
+    /// cache its store fills once open, never below zero; a regular node's
+    /// count all of it. The slots sized from that never fall under
+    /// [`DEFAULT_MAX_CONCURRENT`].
+    #[test]
+    fn verifier_memory_leaves_out_an_archives_block_cache_at_each_edge() {
+        const GIB: u64 = 1 << 30;
+        let cache = 8 * GIB;
+        let archive_child = ARCHIVE_CHILD_MEMORY_BYTES;
+        let regular_child = REGULAR_CHILD_MEMORY_BYTES;
+        let unset = ProofWorkerConfig::default();
+        // (available, archive bytes, archive slots, regular slots)
+        let cases = [
+            (0, 0, 2, 2),
+            (cache - 1, 0, 2, 2),
+            (cache, 0, 2, 2),
+            (cache + archive_child, archive_child, 2, 2),
+            (cache + 3 * archive_child, 3 * archive_child, 3, 2),
+            (cache + 3 * regular_child, 3 * regular_child, 6, 4),
+        ];
+        for (available, net, archive_slots, regular_slots) in cases {
+            assert_eq!(
+                verifier_memory(available, cache, true),
+                net,
+                "VERIFIER-MEMORY-COUNTS-CACHE: an archive with {available} bytes available \
+                 and a block cache of {cache}"
+            );
+            assert_eq!(
+                verifier_memory(available, cache, false),
+                available,
+                "a regular node with {available} bytes available"
+            );
+            let slots = |archive| {
+                let memory = verifier_memory(available, cache, archive);
+                verifier_slots(&unset, archive, Some(1024), Some(memory)).slots
+            };
+            assert_eq!(
+                slots(true),
+                archive_slots,
+                "VERIFIER-MEMORY-COUNTS-CACHE: archive slots with {available} bytes available"
+            );
+            assert_eq!(
+                slots(false),
+                regular_slots,
+                "regular slots with {available} bytes available"
+            );
+        }
+        assert_eq!(DEFAULT_MAX_CONCURRENT, 2, "premise: the floor above");
+    }
+
     /// An archive budgets 3 GiB of available memory per verifier slot, above
     /// the 2.73 GB a depth-32 child has been recorded holding: N × 3 GiB
     /// admits N slots, one byte less admits N − 1.
@@ -806,7 +884,9 @@ mod tests {
     #[test]
     fn an_archive_node_sizes_its_verifier_slots_to_the_machine() {
         let cpus = std::thread::available_parallelism().map_or(1, |cpus| cpus.get());
-        let available = available_for_verifiers();
+        // An archive counts its memory less the block cache its store takes.
+        let cache = quil_store::effective_block_cache_bytes(true) as u64;
+        let available = available_for_verifiers().map(|bytes| bytes.saturating_sub(cache));
         // Three slots at 3 GiB each; a literal so the test builds on the base.
         if cpus < 3 || available.is_some_and(|bytes| bytes < 9 << 30) {
             eprintln!("skipped: {cpus} CPUs and {available:?} bytes available fit two slots");
