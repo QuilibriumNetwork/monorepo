@@ -86,7 +86,7 @@ jobs:
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
@@ -96,7 +96,7 @@ jobs:
       # Every run restores the cache; only pushes to the default branch save
       # it, so this job adds one entry per lockfile or toolchain change to
       # the repository's 10 GB and pull requests never add their own.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: rust-devnet-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
