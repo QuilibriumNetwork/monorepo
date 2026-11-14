@@ -7542,6 +7542,67 @@ mod tests {
         assert_eq!(classify_session_pass(5_100, 5_050, Some(100)), Warn);
     }
 
+    /// Switch on, for this thread, the header rule the fee total test expects
+    /// at the frame it checks.
+    fn strict_headers_from_genesis() {}
+
+    /// A shard frame header without an anchor whose output its fields
+    /// reproduce, carrying `fee_total` as given.
+    fn header_with_fee_total(
+        fee_total: Vec<u8>,
+    ) -> crate::global_intrinsic::frame_header::FrameHeader {
+        let mut op = crate::global_intrinsic::frame_header::FrameHeader {
+            address: vec![1; 32],
+            frame_number: 7,
+            fee_multiplier_vote: 100,
+            fee_total,
+            ..Default::default()
+        };
+        op.output = quil_crypto::porep::deterministic_app_frame_output(
+            &op.parent_selector,
+            &op.requests_root,
+            &op.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]),
+            op.frame_number,
+            op.rank,
+            &op.prover,
+            op.difficulty,
+            op.fee_multiplier_vote as u64,
+            op.timestamp,
+            &op.storage_attestation_root,
+            op.fee_total_value(),
+            &op.settlements,
+            &op.accumulator,
+            &op.spends,
+        );
+        op
+    }
+
+    /// A shard frame header's fee total is 16 big-endian bytes, or empty for
+    /// zero. Any other length reads as zero, which is all the output binds,
+    /// so a relayer could rewrite the field of a certified header at will;
+    /// GLOBAL refuses such a header in admission, execution and vouching.
+    #[test]
+    fn a_shard_header_with_a_malformed_fee_total_is_refused() {
+        strict_headers_from_genesis();
+        let frame = 100;
+        let fee = crate::global_intrinsic::frame_header::fee_total_field(5);
+        GlobalIntrinsic::check_anchor_and_output(None, frame, &header_with_fee_total(fee))
+            .expect("harness: a header with a 16-byte fee total passes");
+        for fee_total in [vec![0x01; 17], vec![0x05; 3]] {
+            let length = fee_total.len();
+            let op = header_with_fee_total(fee_total);
+            let checked = GlobalIntrinsic::check_anchor_and_output(None, frame, &op);
+            let admitted = GlobalIntrinsic::admit_anchor_and_output(None, frame, &op);
+            eprintln!("REACH fee total of {length} bytes: check {checked:?}, admit {admitted:?}");
+            assert!(
+                checked.is_err() && admitted.is_err(),
+                "FEE-TOTAL-MALFORMED-ACCEPTED: a header with a {length}-byte fee total was \
+                 accepted (check {checked:?}, admit {admitted:?})"
+            );
+        }
+    }
+
     /// From the required-anchor epoch GLOBAL refuses a shard frame header
     /// without a GLOBAL anchor, before any verification; an anchored header
     /// and frames before the epoch are unaffected.

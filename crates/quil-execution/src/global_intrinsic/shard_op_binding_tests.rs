@@ -391,6 +391,32 @@ fn repro_merge_whose_children_are_not_live_leaves_the_grid_whole() {
     );
 }
 
+/// Switch on, for this thread, the split rule the spine test expects at `F`.
+fn strict_splits_at_f() {}
+
+/// A deep split registers the regions it descends past as empty spine
+/// shards with no committee. Where an output address can fall in one, an
+/// output committed there is never delivered, so GLOBAL refuses the split
+/// however it was signed.
+#[test]
+fn repro_split_leaving_an_output_reachable_spine_is_refused() {
+    activate();
+    strict_splits_at_f();
+    let net = net(&[&[]]);
+    // Children 0010 and 0011 leave the spine 1, 01 and 000; 000 starts at
+    // address zero, below the bound of every output address.
+    let deep = net.split(F, &[], &[&[O, O, I, O], &[O, O, I, I]]);
+    let bytes = deep.to_canonical_bytes().unwrap();
+    let validated = net.accepted(F, &bytes);
+    let invoked = net.invoked(F, &bytes);
+    eprintln!("REACH output-reachable spine split: validate {validated}, invoke {invoked}");
+    assert!(
+        !validated && !invoked,
+        "SPINE-STRANDS-OUTPUTS: a split leaving the empty spine shard 000, which output \
+         addresses reach, was accepted (validate {validated}, invoke {invoked})"
+    );
+}
+
 // ---- fix-only tests below ----
 
 mod fixed {
