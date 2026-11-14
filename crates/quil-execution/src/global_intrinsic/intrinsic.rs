@@ -3012,6 +3012,7 @@ impl GlobalIntrinsic {
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         Self::refuse_anchor_outside_window(frame_number, op)?;
         Self::verify_anchored_output(clock_store, op)
     }
@@ -3030,6 +3031,7 @@ impl GlobalIntrinsic {
         op: &super::frame_header::FrameHeader,
     ) -> Result<HeaderAdmission> {
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         Self::refuse_anchor_outside_window(frame_number, op)?;
         Self::recompute_anchored_output(clock_store, op)?;
         if crate::fee_vote::fee_vote_out_of_bounds_at(
@@ -3061,6 +3063,29 @@ impl GlobalIntrinsic {
             )));
         }
         Ok(())
+    }
+
+    /// From the strict validation epoch GLOBAL frame `frame_number` refuses
+    /// a shard frame header whose fee total is neither empty nor 16 bytes:
+    /// any other length reads as zero, and the header's output binds only
+    /// that value, so the field of a certified header could be rewritten.
+    fn refuse_malformed_fee_total(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        let length = op.fee_total.len();
+        if length == 0
+            || length == 16
+            || !quil_types::consensus::strict_validation_active(frame_number)
+        {
+            return Ok(());
+        }
+        Err(QuilError::InvalidArgument(format!(
+            "FrameHeader: shard {} frame {} carries a {length}-byte fee total \
+             (empty or 16 bytes)",
+            hex::encode(&op.address),
+            op.frame_number
+        )))
     }
 
     /// GLOBAL frame `frame_number` refuses a shard frame header anchored
@@ -3359,6 +3384,7 @@ impl GlobalIntrinsic {
                 "seal drain: header is not certified by the sealed session".into(),
             ));
         }
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         self.verify_shard_frame_output(op)?;
         super::prover_shard_update::verify_settlement_relay(op)?;
         #[cfg(feature = "confidential-tokens")]
@@ -3380,6 +3406,7 @@ impl GlobalIntrinsic {
         frame_number: u64,
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         self.verify_shard_frame_output(op)?;
         super::prover_shard_update::verify_settlement_relay(op)?;
         #[cfg(feature = "confidential-tokens")]
@@ -7582,7 +7609,9 @@ mod tests {
 
     /// Switch on, for this thread, the header rule the fee total test expects
     /// at the frame it checks.
-    fn strict_headers_from_genesis() {}
+    fn strict_headers_from_genesis() {
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(0));
+    }
 
     /// A shard frame header without an anchor whose output its fields
     /// reproduce, carrying `fee_total` as given.
@@ -7639,6 +7668,33 @@ mod tests {
                  accepted (check {checked:?}, admit {admitted:?})"
             );
         }
+    }
+
+    /// Before the strict validation epoch a malformed fee total passes as
+    /// before; from it, an empty and a 16-byte one (zero included) pass.
+    #[test]
+    fn a_malformed_fee_total_is_refused_only_from_the_strict_epoch() {
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        let malformed = header_with_fee_total(vec![0x01; 17]);
+        GlobalIntrinsic::check_anchor_and_output(None, first - 1, &malformed)
+            .expect("before the epoch a malformed fee total passes as before");
+        let refused =
+            GlobalIntrinsic::check_anchor_and_output(None, first, &malformed).unwrap_err();
+        assert!(
+            refused.to_string().contains("17-byte fee total"),
+            "{refused}"
+        );
+        for fee_total in [Vec::new(), vec![0; 16], vec![0x07; 16]] {
+            let op = header_with_fee_total(fee_total);
+            GlobalIntrinsic::check_anchor_and_output(None, first, &op)
+                .expect("from the epoch an empty or 16-byte fee total passes");
+            assert_eq!(
+                GlobalIntrinsic::admit_anchor_and_output(None, first, &op).unwrap(),
+                HeaderAdmission::Frame
+            );
+        }
+        quil_types::consensus::set_strict_validation_epoch_for_thread(None);
     }
 
     /// From the required-anchor epoch GLOBAL refuses a shard frame header
