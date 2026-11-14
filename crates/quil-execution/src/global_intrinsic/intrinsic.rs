@@ -959,7 +959,13 @@ impl GlobalIntrinsic {
                         },
                     )?;
                 }
-                Self::refuse_output_reachable_spine(frame_number, &op)?;
+                Self::refuse_output_reachable_spine(frame_number, &op).inspect_err(|e| {
+                    tracing::debug!(
+                        frame = frame_number,
+                        error = %e,
+                        "validate_message: ShardSplit refused"
+                    )
+                })?;
                 Ok(true)
             }
             TYPE_SHARD_MERGE => {
@@ -3384,22 +3390,12 @@ impl GlobalIntrinsic {
                 "seal drain: header is not certified by the sealed session".into(),
             ));
         }
-        Self::refuse_malformed_fee_total(frame_number, op)?;
-        self.verify_shard_frame_output(op)?;
-        super::prover_shard_update::verify_settlement_relay(op)?;
-        #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
-        #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(
-            frame_number,
-            op.frame_number,
-            &op.spends,
-        )?;
-        Ok(())
+        self.check_seal_certified_header(frame_number, op)
     }
 
     /// [`Self::check_drain_header`] for a header the seal certifies
     /// ([`Self::drain_certified_by_seal`]): everything but its own certificate.
+    /// Every drain header passes these checks, so they live only here.
     #[cfg_attr(not(feature = "confidential-tokens"), allow(unused_variables))]
     fn check_seal_certified_header(
         &self,
@@ -4425,7 +4421,9 @@ impl GlobalIntrinsic {
     /// a bit-path split whose spine would hold an empty shard that output
     /// addresses reach ([`materialize::output_reachable_spine`]): no
     /// committee forms there, so an output committed to it would never be
-    /// delivered. Honest proposers never descend past such a region.
+    /// delivered. Honest proposers never descend past such a region. The
+    /// caller logs the refusal: execution warns, validation only at debug,
+    /// since an older-build proposer sends the split again every frame.
     fn refuse_output_reachable_spine(
         frame_number: u64,
         op: &super::prover_ops::ShardSplit,
@@ -4444,13 +4442,6 @@ impl GlobalIntrinsic {
             .iter()
             .map(|&bit| if bit { '1' } else { '0' })
             .collect();
-        tracing::warn!(
-            frame = frame_number,
-            shard = hex::encode(&op.shard_address),
-            spine = %path,
-            "shard split refused: it leaves an empty spine shard that output addresses reach; \
-             the proposer runs a build that descends past such regions"
-        );
         Err(QuilError::InvalidArgument(format!(
             "shard split: spine shard {path} of {} is reachable by output addresses",
             hex::encode(&op.shard_address)
@@ -4534,7 +4525,14 @@ impl GlobalIntrinsic {
             &op.proposed_shards,
             bit_path_mode,
         )?;
-        Self::refuse_output_reachable_spine(frame_number, op)?;
+        Self::refuse_output_reachable_spine(frame_number, op).inspect_err(|e| {
+            tracing::warn!(
+                frame = frame_number,
+                error = %e,
+                "shard split refused: it leaves an empty spine shard that output addresses \
+                 reach; the proposer runs a build that descends past such regions"
+            )
+        })?;
 
         if let (Some(store), true) = (&self.shards_store, self.shard_metadata_writes_enabled) {
             let change = PendingShardChange {
@@ -7692,6 +7690,30 @@ mod tests {
             assert_eq!(
                 GlobalIntrinsic::admit_anchor_and_output(None, first, &op).unwrap(),
                 HeaderAdmission::Frame
+            );
+        }
+        quil_types::consensus::set_strict_validation_epoch_for_thread(None);
+    }
+
+    /// A seal's drain headers, certified by their session or by the seal,
+    /// pass `check_seal_certified_header`; from the strict validation epoch
+    /// it refuses a malformed fee total before the output check, whose
+    /// binding of the fee total that length makes meaningless.
+    #[test]
+    fn a_seal_drain_header_with_a_malformed_fee_total_is_refused() {
+        strict_headers_from_genesis();
+        let gi = GlobalIntrinsic::new(std::sync::Arc::new(crate::testing::NoopKeyManager));
+        for fee_total in [vec![0x01; 17], vec![0x05; 3]] {
+            let length = fee_total.len();
+            let checked = gi.check_seal_certified_header(100, &header_with_fee_total(fee_total));
+            eprintln!("REACH drain fee total of {length} bytes: {checked:?}");
+            let refused = checked
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains(&format!("{length}-byte fee total")));
+            assert!(
+                refused,
+                "FEE-TOTAL-DRAIN-ACCEPTED: a drain header with a {length}-byte fee total was \
+                 not refused for it ({checked:?})"
             );
         }
         quil_types::consensus::set_strict_validation_epoch_for_thread(None);
