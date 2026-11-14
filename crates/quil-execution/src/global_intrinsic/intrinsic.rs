@@ -7678,7 +7678,7 @@ mod tests {
         let first = 10 * quil_types::consensus::epoch_length_frames();
         let malformed = header_with_fee_total(vec![0x01; 17]);
         GlobalIntrinsic::check_anchor_and_output(None, first - 1, &malformed)
-            .expect("before the epoch a malformed fee total passes as before");
+            .expect("STRICT-GATE-EDGE: before the epoch a malformed fee total passes as before");
         let refused =
             GlobalIntrinsic::check_anchor_and_output(None, first, &malformed).unwrap_err();
         assert!(

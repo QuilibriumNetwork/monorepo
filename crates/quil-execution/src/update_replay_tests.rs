@@ -549,7 +549,8 @@ fn metadata_vertex_ops_apply_as_before_until_the_strict_epoch() {
         let before = at_anchor(&engine, &domain, first - 1, op(&domain));
         assert!(
             resolved_write_key(&crdt, &domain).is_none(),
-            "before the epoch the op (remove {remove}) applies as before: {before:?}"
+            "STRICT-GATE-EDGE: before the epoch the op (remove {remove}) applies as before: \
+             {before:?}"
         );
         let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
         let from = at_anchor(&engine, &domain, first, op(&domain));

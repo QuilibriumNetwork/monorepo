@@ -4589,10 +4589,16 @@ mod strict_validation_epoch_tests {
     #[test]
     fn strict_validation_starts_at_the_first_frame_of_its_epoch() {
         super::set_strict_validation_epoch_for_thread(Some(u64::MAX));
-        assert!(!super::strict_validation_active(u64::MAX - 1));
+        assert!(
+            !super::strict_validation_active(u64::MAX - 1),
+            "STRICT-GATE-EDGE: active with no epoch"
+        );
         super::set_strict_validation_epoch_for_thread(Some(10));
         let first = 10 * super::epoch_length_frames();
-        assert!(!super::strict_validation_active(first - 1));
+        assert!(
+            !super::strict_validation_active(first - 1),
+            "STRICT-GATE-EDGE: active before its epoch"
+        );
         assert!(super::strict_validation_active(first));
         super::set_strict_validation_epoch_for_thread(None);
         assert_eq!(

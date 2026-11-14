@@ -819,7 +819,8 @@ mod fixed {
         let bytes = deep.to_canonical_bytes().unwrap();
         assert!(
             before.accepted(F, &bytes) && before.invoked(F, &bytes),
-            "before the epoch a split leaving a reachable spine is taken as before"
+            "STRICT-GATE-EDGE: before the epoch a split leaving a reachable spine is taken as \
+             before"
         );
 
         quil_types::consensus::set_strict_validation_epoch_for_thread(Some(EPOCH));
