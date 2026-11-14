@@ -40,6 +40,8 @@ mod legacy_index;
 mod witness_index;
 mod worker_node;
 
+#[cfg(all(feature = "native-proof", target_os = "linux"))]
+mod cpu_guard;
 #[cfg(feature = "native-proof")]
 mod proof_worker;
 
@@ -403,8 +405,9 @@ struct Args {
 fn main() -> anyhow::Result<ExitCode> {
     // A native lattice build compiled for CPU features this host lacks dies
     // with SIGILL in its first proof: refuse before anything runs, the proof
-    // worker mode included. The error prints as one line on stderr.
-    #[cfg(feature = "native-proof")]
+    // worker mode included. The error prints as one line on stderr. Linux
+    // refuses earlier, before the allocator initialises (cpu_guard.rs).
+    #[cfg(all(feature = "native-proof", not(target_os = "linux")))]
     if let Some(message) = quil_lattice_ct::native_cpu::unsupported_cpu_message("quil-node") {
         anyhow::bail!(message);
     }

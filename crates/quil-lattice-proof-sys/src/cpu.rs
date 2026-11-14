@@ -21,19 +21,51 @@ pub fn required_cpu_features_missing() -> Vec<&'static str> {
 
 /// The startup refusal for `program`, or `None` when this CPU can run it.
 pub fn unsupported_cpu_message(program: &str) -> Option<String> {
-    let missing = required_cpu_features_missing();
-    (!missing.is_empty()).then(|| {
-        format!(
-            "{program} cannot run on this CPU: its lattice backend was compiled for \
-             CPU features this host lacks and would crash (SIGILL); run a build \
-             made for this CPU, such as the standard release; missing={} build_mode={BUILD_MODE}",
-            missing.join(",")
-        )
-    })
+    let mut message = String::new();
+    write_unsupported_cpu_message(program, |piece| message.push_str(piece)).then_some(message)
+}
+
+/// [`unsupported_cpu_message`] handed to `out` piece by piece without
+/// allocating; true when this CPU lacks a required feature. For a check that
+/// runs before the allocator may: a C allocator built with the same CFLAGS
+/// (tikv-jemalloc-sys passes them on) would itself die with SIGILL.
+pub fn write_unsupported_cpu_message(program: &str, out: impl FnMut(&str)) -> bool {
+    let missing = parse_iter(target_features()).filter(|name| !detected(name));
+    write_refusal(program, missing, out)
+}
+
+fn write_refusal<'a>(
+    program: &str,
+    missing: impl Iterator<Item = &'a str>,
+    mut out: impl FnMut(&str),
+) -> bool {
+    let mut missing = missing.peekable();
+    if missing.peek().is_none() {
+        return false;
+    }
+    out(program);
+    out(
+        " cannot run on this CPU: its lattice backend was compiled for \
+         CPU features this host lacks and would crash (SIGILL); run a build \
+         made for this CPU, such as the standard release; missing=",
+    );
+    for (i, name) in missing.enumerate() {
+        if i > 0 {
+            out(",");
+        }
+        out(name);
+    }
+    out(" build_mode=");
+    out(BUILD_MODE);
+    true
 }
 
 fn parse(list: &'static str) -> Vec<&'static str> {
-    list.split(',').filter(|name| !name.is_empty()).collect()
+    parse_iter(list).collect()
+}
+
+fn parse_iter(list: &'static str) -> impl Iterator<Item = &'static str> {
+    list.split(',').filter(|name| !name.is_empty())
 }
 
 fn missing(required: &[&'static str], has: impl Fn(&str) -> bool) -> Vec<&'static str> {
@@ -136,6 +168,25 @@ mod tests {
         assert!(missing(&required, |_| true).is_empty());
         assert_eq!(missing(&required, |_| false), required);
         assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn the_piecewise_refusal_names_the_missing_features_in_order() {
+        let write = |missing: &[&str]| {
+            let mut text = String::new();
+            let refused = write_refusal("prog", missing.iter().copied(), |p| text.push_str(p));
+            (refused, text)
+        };
+        assert_eq!(write(&[]), (false, String::new()));
+        let expected = format!(
+            "prog cannot run on this CPU: its lattice backend was compiled for CPU features \
+             this host lacks and would crash (SIGILL); run a build made for this CPU, such \
+             as the standard release; missing=avx512f,avx512bw build_mode={BUILD_MODE}"
+        );
+        let got = write(&["avx512f", "avx512bw"]);
+        assert_eq!(got, (true, expected), "refusal text differs");
+        let (_, one) = write(&["avx512f"]);
+        assert!(one.ends_with(&format!("; missing=avx512f build_mode={BUILD_MODE}")));
     }
 
     #[test]
