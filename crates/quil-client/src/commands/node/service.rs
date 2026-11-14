@@ -5,7 +5,7 @@
 //! These operations require root (invoked via `sudo`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::system;
 
@@ -79,6 +79,115 @@ fn control(action: &str) -> anyhow::Result<()> {
         anyhow::bail!("service {action} failed ({status})");
     }
     Ok(())
+}
+
+/// The command, after `sudo`, that tells whether the node service runs:
+/// `systemctl is-active` exits 0 only for an active unit; `launchctl
+/// print` fails for a job launchd has not loaded and else shows its state
+/// ([`query_shows_running`] reads its exit).
+fn running_query_argv(os: &str) -> Vec<String> {
+    if os == "darwin" {
+        vec![
+            "launchctl".into(),
+            "print".into(),
+            format!("system/{LAUNCHD_LABEL}"),
+        ]
+    } else {
+        vec![
+            "systemctl".into(),
+            "is-active".into(),
+            "--quiet".into(),
+            system::NODE_SERVICE_NAME.into(),
+        ]
+    }
+}
+
+/// The state query's exit codes that mean the service is not running:
+/// systemctl(1) gives 3 (unit is not active) and 4 (no such unit);
+/// launchctl gives 113 ("Could not find specified service") for a job
+/// launchd has not loaded.
+fn not_running_codes(os: &str) -> &'static [i32] {
+    if os == "darwin" {
+        &[113]
+    } else {
+        &[3, 4]
+    }
+}
+
+/// Whether the state query ([`running_query_argv`]), ended with exit
+/// `code` (`None`: by a signal), shows the service running. Only the
+/// codes of a stopped or unknown service ([`not_running_codes`]) mean it
+/// is not; any other failure (sudo refused, no service manager) is an
+/// error, never read as a stopped node.
+fn query_shows_running(os: &str, code: Option<i32>) -> anyhow::Result<bool> {
+    match code {
+        Some(0) => Ok(true),
+        Some(c) if not_running_codes(os).contains(&c) => Ok(false),
+        Some(c) => anyhow::bail!("service state query failed (exit {c})"),
+        None => anyhow::bail!("service state query ended by a signal"),
+    }
+}
+
+/// What `node update --restart` runs, after `sudo`, once the state query
+/// ([`running_query_argv`]) showed the service `running` or not
+/// ([`query_shows_running`]) and printed `stdout`: a restart of a running
+/// service, else nothing, so an update never starts a node its operator
+/// stopped. systemd's `try-restart` also
+/// leaves a unit stopped since the query stopped. launchd has no such
+/// verb (`kickstart -k` starts a stopped job), so only a job whose own
+/// top-level `state` is `running` is restarted; nested blocks such as
+/// endpoints carry `state` lines of their own.
+fn restart_plan(os: &str, running: bool, stdout: &str) -> Option<Vec<String>> {
+    if !running {
+        return None;
+    }
+    if os != "darwin" {
+        return Some(vec![
+            "systemctl".into(),
+            "try-restart".into(),
+            system::NODE_SERVICE_NAME.into(),
+        ]);
+    }
+    let mut depth = 0usize;
+    for line in stdout.lines().map(str::trim) {
+        if line == "}" {
+            depth = depth.saturating_sub(1);
+        } else if depth == 1 && line == "state = running" {
+            return Some(
+                std::iter::once("launchctl".to_string())
+                    .chain(launchctl_args("restart"))
+                    .collect(),
+            );
+        } else if line.ends_with('{') {
+            depth += 1;
+        }
+    }
+    None
+}
+
+/// Restart the node service if it runs (`node update --restart`, which
+/// auto-update runs); a stopped service stays stopped. Returns whether
+/// it ran.
+pub fn restart_if_running() -> anyhow::Result<bool> {
+    let os = system::os_type();
+    let query = Command::new("sudo")
+        .args(running_query_argv(os))
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| anyhow::anyhow!("run service manager: {e}"))?;
+    let running = query_shows_running(os, query.status.code())?;
+    let stdout = String::from_utf8_lossy(&query.stdout);
+    let Some(argv) = restart_plan(os, running, &stdout) else {
+        return Ok(false);
+    };
+    let status = Command::new("sudo")
+        .args(argv)
+        .status()
+        .map_err(|e| anyhow::anyhow!("run service manager: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("service restart failed ({status})");
+    }
+    Ok(true)
 }
 
 fn install() -> anyhow::Result<()> {
@@ -584,8 +693,9 @@ fn systemd_unit(user: &str, env: &Path, bin: &Path, cfg: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// Each action maps to a verb launchctl has: restart, which `node
-    /// update --restart` and auto-update use, kickstarts the job.
+    /// Each action maps to a verb launchctl has: restart (`node service
+    /// restart`, and `node update --restart` for a running job only)
+    /// kickstarts the job.
     #[test]
     fn launchctl_gets_verbs_it_has() {
         let args = |action| launchctl_args(action).join(" ");
@@ -598,6 +708,98 @@ mod tests {
         assert_eq!(args("status"), format!("list {label}"));
         assert_eq!(args("start"), format!("start {label}"));
         assert_eq!(args("stop"), format!("stop {label}"));
+    }
+
+    /// `node update --restart` restarts an active systemd unit with
+    /// try-restart, which leaves a unit stopped since the query stopped.
+    #[test]
+    fn update_restarts_an_active_unit_with_try_restart() {
+        assert_eq!(
+            running_query_argv("linux").join(" "),
+            "systemctl is-active --quiet quilibrium-node"
+        );
+        let plan = restart_plan("linux", true, "").map(|a| a.join(" "));
+        assert_eq!(
+            plan.as_deref(),
+            Some("systemctl try-restart quilibrium-node"),
+            "active_unit_not_try_restarted"
+        );
+    }
+
+    /// The state query reads as a stopped service only on the exits that
+    /// say so: systemctl(1) 3 (unit is not active) and 4 (no such unit),
+    /// launchctl 113 (job not loaded). Any other failure, such as sudo
+    /// refusing (exit 1), is an error: before, `node update --restart`
+    /// reported it as a stopped node and exited 0.
+    #[test]
+    fn update_reads_only_inactive_or_unknown_as_stopped() {
+        let read = |os, code| query_shows_running(os, code).map_err(|e| e.to_string());
+        assert_eq!(read("linux", Some(0)), Ok(true));
+        assert_eq!(read("linux", Some(3)), Ok(false));
+        assert_eq!(read("linux", Some(4)), Ok(false));
+        assert_eq!(read("darwin", Some(0)), Ok(true));
+        assert_eq!(read("darwin", Some(113)), Ok(false));
+        for (os, code) in [
+            ("linux", Some(1)),
+            ("linux", Some(113)),
+            ("darwin", Some(1)),
+            ("darwin", Some(3)),
+            ("linux", None),
+        ] {
+            assert!(
+                read(os, code).is_err(),
+                "failed_query_read_as_stopped: {os} {code:?} gave {:?}",
+                read(os, code)
+            );
+        }
+    }
+
+    /// A service the state query does not show running (a stopped unit,
+    /// a launchd job not loaded) stays stopped: auto-update runs `node
+    /// update --restart` and must not start a node its operator stopped.
+    #[test]
+    fn update_leaves_a_stopped_service_stopped() {
+        assert_eq!(
+            restart_plan("linux", false, ""),
+            None,
+            "stopped_unit_restarted"
+        );
+        assert_eq!(
+            restart_plan("darwin", false, ""),
+            None,
+            "unloaded_job_restarted"
+        );
+    }
+
+    /// launchd kickstarts only a job whose own `state` is `running`; a
+    /// nested block's `state` line does not count.
+    #[test]
+    fn update_kickstarts_only_a_running_launchd_job() {
+        let label = "com.quilibrium.quilibrium-node";
+        assert_eq!(
+            running_query_argv("darwin").join(" "),
+            format!("launchctl print system/{label}")
+        );
+        let print = |state: &str| {
+            [
+                format!("system/{label} = {{"),
+                "\tactive count = 1".into(),
+                format!("\tstate = {state}"),
+                "\tendpoints = {".into(),
+                "\t\t\"x\" = {".into(),
+                "\t\t\tstate = running".into(),
+                "\t\t}".into(),
+                "\t}".into(),
+                "}".into(),
+            ]
+            .join("\n")
+        };
+        let plan = |state: &str| restart_plan("darwin", true, &print(state)).map(|a| a.join(" "));
+        assert_eq!(
+            plan("running"),
+            Some(format!("launchctl kickstart -k system/{label}"))
+        );
+        assert_eq!(plan("not running"), None, "stopped_job_kickstarted");
     }
 
     /// The launchd daemon runs as the given user, as the systemd unit

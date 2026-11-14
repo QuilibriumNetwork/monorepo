@@ -73,8 +73,9 @@ pub async fn install(
 
 /// `node update [version] [--restart] [--allow-downgrade]` — install a newer
 /// node version from the release source `source` names (else the stored or
-/// official one) and optionally restart the service. An older version than
-/// the linked one needs `allow_downgrade`.
+/// official one) and optionally restart the service if it runs; a stopped
+/// service stays stopped. An older version than the linked one needs
+/// `allow_downgrade`.
 pub async fn update(
     version: Option<&str>,
     restart: bool,
@@ -98,10 +99,28 @@ pub async fn update(
         return Ok(());
     }
     println!("Updated node to {}", installed.path.display());
-    if restart {
-        super::service::run("restart")?;
+    let line = restart_after_update(restart, &version, super::service::restart_if_running)?;
+    if let Some(line) = line {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// The service step of `node update` after a fresh install: with
+/// `restart`, only `restart_if_running`
+/// ([`super::service::restart_if_running`]), so a stopped node stays
+/// stopped. Returns the line saying so when it did not run.
+fn restart_after_update(
+    restart: bool,
+    version: &str,
+    restart_if_running: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<String>> {
+    if restart && !restart_if_running()? {
+        return Ok(Some(format!(
+            "The node service is not running; node {version} applies at its next start"
+        )));
+    }
+    Ok(None)
 }
 
 /// `node link [version]` — point `/usr/local/bin/quilibrium-node` at an
@@ -471,6 +490,30 @@ mod tests {
             );
         }
         require_root("enable", true).unwrap();
+    }
+
+    /// `node update --restart` (auto-update's command) goes through the
+    /// running check after a fresh install, never an unconditional
+    /// restart, which starts a node its operator stopped; without
+    /// `--restart` it does not touch the service.
+    #[test]
+    fn update_restart_goes_through_the_running_check() {
+        let mut checked = 0;
+        let stopped = restart_after_update(true, "2.1.0.26", || {
+            checked += 1;
+            Ok(false)
+        });
+        let line = "The node service is not running; node 2.1.0.26 applies at its next start";
+        assert!(
+            checked == 1 && matches!(&stopped, Ok(Some(l)) if l == line),
+            "update_restart_skips_running_check: checked {checked}, {stopped:?}"
+        );
+        assert_eq!(
+            restart_after_update(true, "2.1.0.26", || Ok(true)).unwrap(),
+            None
+        );
+        let untouched = restart_after_update(false, "2.1.0.26", || panic!("service_touched"));
+        assert_eq!(untouched.unwrap(), None);
     }
 
     #[test]
