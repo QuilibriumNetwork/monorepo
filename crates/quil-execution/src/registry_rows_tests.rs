@@ -27,7 +27,7 @@ fn random_row(rng: &mut Rng) -> Vec<u8> {
             field_leaf("prover:Prover", "Status", vec![rng.below(5) as u8]),
             field_leaf("prover:Prover", "Seniority", rng.below(1000).to_be_bytes().to_vec()),
         ]),
-        2 | 3 | 4 => {
+        2..=4 => {
             let owner = if rng.below(8) == 0 { vec![9u8; 20] } else { row_address(rng.below(10)).to_vec() };
             build_sub_tree(vec![
                 type_hash_leaf(cls),
@@ -48,7 +48,7 @@ fn random_row(rng: &mut Rng) -> Vec<u8> {
                 &filters[rng.below(2) as usize],
                 &[rng.below(2) as u32],
                 epoch,
-                &vec![rng.below(250) as u8; 96],
+                &[rng.below(250) as u8; 96],
                 rng.below(9),
                 100,
             )
@@ -62,7 +62,7 @@ fn random_row(rng: &mut Rng) -> Vec<u8> {
                 &filters[rng.below(2) as usize],
                 &[rng.below(2) as u32],
                 rng.below(3),
-                &vec![rng.below(250) as u8; 74],
+                &[rng.below(250) as u8; 74],
                 rng.below(9),
                 100,
             )

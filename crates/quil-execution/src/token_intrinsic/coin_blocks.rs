@@ -75,7 +75,7 @@ fn invalid(message: &str) -> QuilError {
 /// block ids in `BLOCK_INDEX_BITS`, coins in `SUBTREE_BITS` — so a position
 /// means the same thing for the life of the application.
 pub fn shape(block_bits: u8) -> Result<Shape> {
-    if block_bits < INITIAL_BLOCK_BITS || block_bits > MAX_BLOCK_BITS {
+    if !(INITIAL_BLOCK_BITS..=MAX_BLOCK_BITS).contains(&block_bits) {
         return Err(invalid("block width outside the accumulator's range"));
     }
     Ok(Shape {
@@ -112,7 +112,7 @@ pub fn max_position() -> u64 {
 /// and hand it to a different shard. The sentinel costs one bit of index space
 /// and buys ownership that never moves.
 pub fn block_id(width: u8, path_value: u64) -> Result<u64> {
-    if width < INITIAL_BLOCK_BITS || width > MAX_BLOCK_BITS || path_value >= (1u64 << width) {
+    if !(INITIAL_BLOCK_BITS..=MAX_BLOCK_BITS).contains(&width) || path_value >= (1u64 << width) {
         return Err(invalid("block path does not fit its width"));
     }
     Ok((1u64 << width) | path_value)

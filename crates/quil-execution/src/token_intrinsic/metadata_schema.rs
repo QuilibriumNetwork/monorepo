@@ -126,7 +126,7 @@ pub fn decode_token_config_from_tree(
 
     let mint_strategy = tree
         .get(&field_key(field::MINT_STRATEGY))
-        .map(|b| super::config::decode_mint_strategy_packed(b))
+        .map(super::config::decode_mint_strategy_packed)
         .transpose()?
         .map(|s| s.to_canonical_bytes())
         .transpose()?

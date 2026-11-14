@@ -70,7 +70,7 @@ fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
             }
         }
     };
-    let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+    let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
         return DecodedRow {
             first: FirstPass::Unknown,
             allocation: None,
@@ -590,10 +590,10 @@ impl InMemoryProverRegistry {
                 None => rows.adds.get(&change.address).map(|row| &row.decoded),
             }
             .filter(|_| {
-                !change
+                change
                     .removes
                     .unwrap_or(rows.removes.get(&change.address).copied())
-                    .is_some()
+                    .is_none()
             });
             for row in [rows.effective(&change.address), new].into_iter().flatten() {
                 if matches!(row.first, FirstPass::Prover { .. }) {

@@ -108,7 +108,7 @@ impl Bls48581G2PublicKey {
     /// therefore accept any positive multiple of [`Self::KEY_VALUE_LEN`]; a
     /// single key (M = 1) is the common case.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
-        if self.key_value.is_empty() || self.key_value.len() % Self::KEY_VALUE_LEN != 0 {
+        if self.key_value.is_empty() || !self.key_value.len().is_multiple_of(Self::KEY_VALUE_LEN) {
             return Err(QuilError::InvalidArgument(
                 "BLS48581G2PublicKey: invalid key length".into(),
             ));
@@ -135,7 +135,7 @@ impl Bls48581G2PublicKey {
             "BLS48581G2PublicKey",
         )?;
         let key_value = data[cursor..].to_vec();
-        if key_value.is_empty() || key_value.len() % Self::KEY_VALUE_LEN != 0 {
+        if key_value.is_empty() || !key_value.len().is_multiple_of(Self::KEY_VALUE_LEN) {
             return Err(QuilError::InvalidArgument(
                 "BLS48581G2PublicKey: invalid key length".into(),
             ));
@@ -225,9 +225,10 @@ impl AggregateSignature {
         //                    ⇒ M × 1182 + 4 (M ≥ 1).
         // The consumer (bls_verifier / frame_prover) splits by the bitmask's
         // present-signer count; this gate is a sanity bound only.
-        let valid_qc = sig_len >= 666 && sig_len % 666 == 0 && sig_len <= Self::MAX_SIG_LEN;
+        let valid_qc =
+            sig_len >= 666 && sig_len.is_multiple_of(666) && sig_len <= Self::MAX_SIG_LEN;
         let valid_frame =
-            sig_len >= 1186 && sig_len <= Self::MAX_SIG_LEN && (sig_len - 4) % 1182 == 0;
+            (1186..=Self::MAX_SIG_LEN).contains(&sig_len) && (sig_len - 4).is_multiple_of(1182);
         if !valid_qc && !valid_frame {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid signature length {}",
@@ -240,7 +241,7 @@ impl AggregateSignature {
         // Accept a concat of M ≥ 1 wrapped keys: 4-byte type prefix + M×897.
         let valid_pubkey_len = pubkey_len == 0
             || (pubkey_len >= Self::WRAPPED_PUBKEY_UNIT
-                && (pubkey_len - 4) % Bls48581G2PublicKey::KEY_VALUE_LEN == 0);
+                && (pubkey_len - 4).is_multiple_of(Bls48581G2PublicKey::KEY_VALUE_LEN));
         if !valid_pubkey_len {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid pubkey length {}",

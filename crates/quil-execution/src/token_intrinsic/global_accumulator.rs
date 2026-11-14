@@ -320,7 +320,8 @@ fn parse_index(fields: &[Vec<u8>]) -> Result<([u8; 32], Index)> {
         .as_slice()
         .try_into()
         .map_err(|_| invalid("malformed context"))?;
-    if fields[1].len() % ENTRY_BYTES != 0 || fields[1].len() / ENTRY_BYTES > MAX_SUBTREES {
+    if !fields[1].len().is_multiple_of(ENTRY_BYTES) || fields[1].len() / ENTRY_BYTES > MAX_SUBTREES
+    {
         return Err(invalid("malformed index"));
     }
     let index = fields[1]
@@ -524,7 +525,7 @@ pub fn materialize_report(
     if index.len() > MAX_SUBTREES {
         return Err(invalid("too many subtrees for one application"));
     }
-    index.sort_by(|a, b| (a.0, pack_shard(&a.1).ok()).cmp(&(b.0, pack_shard(&b.1).ok())));
+    index.sort_by_key(|a| (a.0, pack_shard(&a.1).ok()));
     let mut entries = Vec::with_capacity(index.len() * ENTRY_BYTES);
     for (width, entry) in &index {
         let (len, bits) = pack_shard(entry)?;

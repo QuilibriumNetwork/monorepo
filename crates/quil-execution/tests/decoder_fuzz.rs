@@ -71,7 +71,7 @@ fn aggregate_sig() -> impl Strategy<Value = AggregateSignature> {
         Just(1182 * 2 + 4),
         Just(1182 * 3 + 4),
     ]
-    .prop_flat_map(|n| bytes_fixed(n));
+    .prop_flat_map(bytes_fixed);
     (
         sig_strategy,
         prop::option::of(bytes_fixed(897).prop_map(|kv| {

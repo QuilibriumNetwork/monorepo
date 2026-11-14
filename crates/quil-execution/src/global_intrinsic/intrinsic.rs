@@ -1341,7 +1341,7 @@ impl GlobalIntrinsic {
                             self.key_manager.as_ref(),
                         )
                     },
-                    |alloc_tree, fn_| materialize::materialize_prover_pause(alloc_tree, fn_),
+                    materialize::materialize_prover_pause,
                 )?;
                 self.refresh_prover_status(
                     frame_number,
@@ -1375,7 +1375,7 @@ impl GlobalIntrinsic {
                             self.key_manager.as_ref(),
                         )
                     },
-                    |alloc_tree, fn_| materialize::materialize_prover_resume(alloc_tree, fn_),
+                    materialize::materialize_prover_resume,
                 )?;
                 self.refresh_prover_status(
                     frame_number,
@@ -1398,7 +1398,7 @@ impl GlobalIntrinsic {
                         |prover_tree, _alloc_tree| {
                             verify::verify_prover_leave(&op, prover_tree, self.key_manager.as_ref())
                         },
-                        |alloc_tree, fn_| materialize::materialize_prover_leave(alloc_tree, fn_),
+                        materialize::materialize_prover_leave,
                     )?;
                 }
                 let filters: Vec<&[u8]> = op.filters.iter().map(Vec::as_slice).collect();
@@ -1654,7 +1654,7 @@ impl GlobalIntrinsic {
                                 self.key_manager.as_ref(),
                             )
                         },
-                        |alloc_tree, fn_| materialize::materialize_prover_reject(alloc_tree, fn_),
+                        materialize::materialize_prover_reject,
                     )?;
                 }
                 let filters: Vec<&[u8]> = op.filters.iter().map(Vec::as_slice).collect();
@@ -2532,7 +2532,7 @@ impl GlobalIntrinsic {
         // join-then-kick sequence and mirrors Go's
         // `hg.Get(addr, hyperedgeAddsDiscriminator)` semantics.
         let ha_disc = hyperedge_adds_discriminator()?;
-        if let Some(hyperedge_blob) = state.get(domain, &prover_address, &ha_disc)? {
+        if let Some(hyperedge_blob) = state.get(domain, prover_address, &ha_disc)? {
             if !hyperedge_blob.is_empty() {
                 let mut ext_tree = quil_tries::VectorCommitmentTree::new();
                 if let Ok(Some(root)) = quil_tries::deserialize_go_tree(&hyperedge_blob) {
@@ -2542,7 +2542,7 @@ impl GlobalIntrinsic {
                     if key.len() != 64 {
                         continue;
                     }
-                    if &key[..32] != &GLOBAL_INTRINSIC_ADDRESS[..32] {
+                    if key[..32] != GLOBAL_INTRINSIC_ADDRESS[..32] {
                         return Err(QuilError::InvalidArgument(
                             "invoke_step kick: hyperedge has non-global allocation atom".into(),
                         ));
@@ -5712,7 +5712,7 @@ impl GlobalIntrinsic {
         let Some(policy) = quil_types::consensus::committee_handoff_policy() else {
             return Ok(());
         };
-        if frame_number < policy.activation_frame || frame_number % CADENCE_FRAMES != 0 {
+        if frame_number < policy.activation_frame || !frame_number.is_multiple_of(CADENCE_FRAMES) {
             return Ok(());
         }
         let (Some(store), Some(hg)) = (self.shards_store.as_ref(), self.hypergraph.as_ref()) else {
@@ -9099,7 +9099,7 @@ mod tests {
                 .unwrap();
             let filter = vec![0x55u8; 32];
             let att = quil_types::proto::global::StorageAttestation {
-                openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 0)],
+                openings: vec![storage_opening_proto(&bad_addr, &[0x07u8; 32], 0)],
             };
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
@@ -9140,7 +9140,7 @@ mod tests {
             let member_addr = prover_address_from_pubkey(&member_pubkey).unwrap();
             let filter = vec![0x55u8; 32];
             let att = quil_types::proto::global::StorageAttestation {
-                openings: vec![storage_opening_proto(&member_addr, &vec![0x07u8; 32], 1)],
+                openings: vec![storage_opening_proto(&member_addr, &[0x07u8; 32], 1)],
             };
             // FUTURE anchor: anchor=1000 while materializing frame=7 (expected ≤ 6)
             // → out of window → hard-reject.
@@ -10024,7 +10024,7 @@ mod tests {
                     value: vec![i; 90 + i as usize],
                 })
                 .collect();
-            entries.sort_by(|a, b| a.address.cmp(&b.address));
+            entries.sort_by_key(|a| a.address);
             let leaves: Vec<(Vec<u8>, Vec<u8>)> = entries
                 .iter()
                 .map(|entry| {

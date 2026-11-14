@@ -422,10 +422,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                         "global: a presence report must be its bundle's only request".into(),
                     ));
                 }
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        validate_inner(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    validate_inner(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(())
             }
@@ -993,15 +991,15 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         // A token write to a system-managed domain would let the
         // token materialize at materialize-time write into the wrong
         // tree.
-        if _address.len() >= 32 {
-            if _address[..32] == crate::domains::GLOBAL || _address[..32] == crate::domains::COMPUTE
-            {
-                return Err(QuilError::InvalidArgument(format!(
-                    "token engine: refusing to validate message addressed to \
+        if _address.len() >= 32
+            && (_address[..32] == crate::domains::GLOBAL
+                || _address[..32] == crate::domains::COMPUTE)
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "token engine: refusing to validate message addressed to \
                      system-managed domain {}",
-                    hex::encode(&_address[..32]),
-                )));
-            }
+                hex::encode(&_address[..32]),
+            )));
         }
         if message.len() < 4 {
             return Ok(());
@@ -1057,10 +1055,8 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        validate_token_inner(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    validate_token_inner(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(())
             }
@@ -1325,141 +1321,138 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         self.config_resolver.invalidate(&derived);
                     }
                 }
-                crate::token_intrinsic::TYPE_TOKEN_UPDATE => {
-                    if _address.len() == 32 {
-                        let update =
-                            crate::token_intrinsic::TokenUpdate::from_canonical_bytes(inner_bytes)?;
-                        if !update.config.is_empty() {
-                            let new_cfg =
-                                crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(
-                                    &update.config,
-                                )?;
+                crate::token_intrinsic::TYPE_TOKEN_UPDATE if _address.len() == 32 => {
+                    let update =
+                        crate::token_intrinsic::TokenUpdate::from_canonical_bytes(inner_bytes)?;
+                    if !update.config.is_empty() {
+                        let new_cfg =
+                            crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(
+                                &update.config,
+                            )?;
 
-                            // Update gates: BLS signature on the
-                            // existing owner key, then behavior
-                            // parity + supply non-decrease. Read
-                            // prior config from the metadata vertex.
-                            let metadata_addr =
-                                crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
-                            let mut prior_cfg: Option<crate::token_intrinsic::TokenConfiguration> =
-                                None;
-                            if let Ok(Some(blob)) = state.get(_address, &metadata_addr, &va_disc) {
-                                if let Ok(root) = quil_tries::deserialize_go_tree(&blob) {
-                                    let outer = quil_tries::VectorCommitmentTree { root };
-                                    if let Some(inner_blob) = outer.get(
-                                        &crate::token_intrinsic::materialize::TOKEN_CONFIG_OUTER_KEY,
-                                    ) {
-                                        if let Ok(inner_root) =
-                                            quil_tries::deserialize_go_tree(inner_blob)
-                                        {
-                                            let inner_tree =
-                                                quil_tries::VectorCommitmentTree { root: inner_root };
-                                            if let Ok(prior) =
+                        // Update gates: BLS signature on the
+                        // existing owner key, then behavior
+                        // parity + supply non-decrease. Read
+                        // prior config from the metadata vertex.
+                        let metadata_addr = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+                        let mut prior_cfg: Option<crate::token_intrinsic::TokenConfiguration> =
+                            None;
+                        if let Ok(Some(blob)) = state.get(_address, &metadata_addr, &va_disc) {
+                            if let Ok(root) = quil_tries::deserialize_go_tree(&blob) {
+                                let outer = quil_tries::VectorCommitmentTree { root };
+                                if let Some(inner_blob) = outer.get(
+                                    &crate::token_intrinsic::materialize::TOKEN_CONFIG_OUTER_KEY,
+                                ) {
+                                    if let Ok(inner_root) =
+                                        quil_tries::deserialize_go_tree(inner_blob)
+                                    {
+                                        let inner_tree =
+                                            quil_tries::VectorCommitmentTree { root: inner_root };
+                                        if let Ok(prior) =
                                                 crate::token_intrinsic::metadata_schema::decode_token_config_from_tree(&inner_tree)
                                             {
                                                 prior_cfg = Some(prior);
                                             }
-                                        }
                                     }
                                 }
                             }
+                        }
 
-                            // BLS owner-key signature gate. Mirrors
-                            // Go's `TokenIntrinsic.Deploy` update
-                            // branch at `token_intrinsic.go:145-154`.
-                            // The signed message is the canonical-bytes
-                            // encoding of the TokenUpdate with its
-                            // signature field cleared, domain
-                            // `address || "TOKEN_UPDATE"`, followed from
-                            // the config replay frame by the digest of the
-                            // metadata vertex it replaces, so an update
-                            // applies once.
-                            let prior = prior_cfg.as_ref().ok_or_else(|| {
-                                QuilError::InvalidArgument(
-                                    "token update: prior config not found — \
+                        // BLS owner-key signature gate. Mirrors
+                        // Go's `TokenIntrinsic.Deploy` update
+                        // branch at `token_intrinsic.go:145-154`.
+                        // The signed message is the canonical-bytes
+                        // encoding of the TokenUpdate with its
+                        // signature field cleared, domain
+                        // `address || "TOKEN_UPDATE"`, followed from
+                        // the config replay frame by the digest of the
+                        // metadata vertex it replaces, so an update
+                        // applies once.
+                        let prior = prior_cfg.as_ref().ok_or_else(|| {
+                            QuilError::InvalidArgument(
+                                "token update: prior config not found — \
                                      cannot verify owner-key signature"
-                                        .into(),
-                                )
-                            })?;
-                            if prior.owner_public_key.is_empty() {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: prior config has empty owner_public_key".into(),
-                                ));
-                            }
-                            // Re-encode the update with the signature
-                            // field cleared to recover the signed
-                            // message bytes.
-                            let mut without_sig = update.clone();
-                            without_sig.public_key_signature_bls48581 = Vec::new();
-                            let signed_message = without_sig.to_canonical_bytes()?;
-                            // Post-quantum owner auth: a single FALCON signature
-                            // (no aggregation envelope — the field carries the
-                            // Falcon sig bytes directly now).
-                            if update.public_key_signature_bls48581.is_empty() {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: missing signature".into(),
-                                ));
-                            }
-                            let guarded = crate::config_replay::config_replay_guarded(context);
-                            let binding = if guarded {
-                                crate::config_replay::stored_binding(state, _address)?
-                            } else {
-                                None
-                            };
-                            let domain = crate::config_replay::update_signing_domain(
-                                _address,
-                                crate::config_replay::TOKEN_UPDATE_TAG,
-                                binding.as_deref(),
-                            );
-                            let ok = self.key_manager.validate_signature(
-                                quil_types::crypto::KeyType::Falcon512,
-                                &prior.owner_public_key,
-                                &signed_message,
-                                &update.public_key_signature_bls48581,
-                                &domain,
-                            )?;
-                            if !ok {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: signature does not verify against \
+                                    .into(),
+                            )
+                        })?;
+                        if prior.owner_public_key.is_empty() {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: prior config has empty owner_public_key".into(),
+                            ));
+                        }
+                        // Re-encode the update with the signature
+                        // field cleared to recover the signed
+                        // message bytes.
+                        let mut without_sig = update.clone();
+                        without_sig.public_key_signature_bls48581 = Vec::new();
+                        let signed_message = without_sig.to_canonical_bytes()?;
+                        // Post-quantum owner auth: a single FALCON signature
+                        // (no aggregation envelope — the field carries the
+                        // Falcon sig bytes directly now).
+                        if update.public_key_signature_bls48581.is_empty() {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: missing signature".into(),
+                            ));
+                        }
+                        let guarded = crate::config_replay::config_replay_guarded(context);
+                        let binding = if guarded {
+                            crate::config_replay::stored_binding(state, _address)?
+                        } else {
+                            None
+                        };
+                        let domain = crate::config_replay::update_signing_domain(
+                            _address,
+                            crate::config_replay::TOKEN_UPDATE_TAG,
+                            binding.as_deref(),
+                        );
+                        let ok = self.key_manager.validate_signature(
+                            quil_types::crypto::KeyType::Falcon512,
+                            &prior.owner_public_key,
+                            &signed_message,
+                            &update.public_key_signature_bls48581,
+                            &domain,
+                        )?;
+                        if !ok {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: signature does not verify against \
                                      prior config's owner public key"
-                                        .into(),
-                                ));
-                            }
-                            if prior.behavior != new_cfg.behavior {
+                                    .into(),
+                            ));
+                        }
+                        if prior.behavior != new_cfg.behavior {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: behavior cannot be updated".into(),
+                            ));
+                        }
+                        // Supply non-decrease (compare big-endian unsigned).
+                        if !prior.supply.is_empty() && !new_cfg.supply.is_empty() {
+                            use num_bigint::BigUint;
+                            let prior_sup = BigUint::from_bytes_be(&prior.supply);
+                            let new_sup = BigUint::from_bytes_be(&new_cfg.supply);
+                            if new_sup < prior_sup {
                                 return Err(QuilError::InvalidArgument(
-                                    "token update: behavior cannot be updated".into(),
+                                    "token update: supply cannot be reduced".into(),
                                 ));
-                            }
-                            // Supply non-decrease (compare big-endian unsigned).
-                            if !prior.supply.is_empty() && !new_cfg.supply.is_empty() {
-                                use num_bigint::BigUint;
-                                let prior_sup = BigUint::from_bytes_be(&prior.supply);
-                                let new_sup = BigUint::from_bytes_be(&new_cfg.supply);
-                                if new_sup < prior_sup {
-                                    return Err(QuilError::InvalidArgument(
-                                        "token update: supply cannot be reduced".into(),
-                                    ));
-                                }
-                            }
-
-                            check_post_quantum_token_config(&new_cfg)?;
-                            crate::token_intrinsic::materialize::materialize_token_deploy(
-                                state,
-                                _address,
-                                &new_cfg,
-                                _frame_number,
-                                self.inclusion_prover.as_ref(),
-                            )?;
-                            if guarded {
-                                crate::config_replay::advance_update_sequence(
-                                    state,
-                                    _address,
-                                    _frame_number,
-                                )?;
                             }
                         }
-                        self.config_resolver.invalidate(_address);
+
+                        check_post_quantum_token_config(&new_cfg)?;
+                        crate::token_intrinsic::materialize::materialize_token_deploy(
+                            state,
+                            _address,
+                            &new_cfg,
+                            _frame_number,
+                            self.inclusion_prover.as_ref(),
+                        )?;
+                        if guarded {
+                            crate::config_replay::advance_update_sequence(
+                                state,
+                                _address,
+                                _frame_number,
+                            )?;
+                        }
                     }
+                    self.config_resolver.invalidate(_address);
                 }
                 _ => {}
             }
@@ -2251,11 +2244,9 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        if crate::compute_engine::is_compute_type_prefix(r.inner_type_prefix) {
-                            crate::compute_engine::peek_compute_message_kind(&r.inner_bytes)?;
-                        }
+                for r in bundle.requests.iter().flatten() {
+                    if crate::compute_engine::is_compute_type_prefix(r.inner_type_prefix) {
+                        crate::compute_engine::peek_compute_message_kind(&r.inner_bytes)?;
                     }
                 }
                 Ok(())
@@ -2574,10 +2565,8 @@ impl ComputeExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        invoke_compute(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    invoke_compute(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
@@ -3151,10 +3140,8 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
         match kind {
             crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
                 }
                 Ok(())
             }
@@ -3227,15 +3214,13 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
             match kind {
                 crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
                     let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                    for req in &bundle.requests {
-                        if let Some(r) = req {
-                            self.process_inner_op(
-                                context,
-                                address,
-                                r.inner_type_prefix,
-                                &r.inner_bytes,
-                            )?;
-                        }
+                    for r in bundle.requests.iter().flatten() {
+                        self.process_inner_op(
+                            context,
+                            address,
+                            r.inner_type_prefix,
+                            &r.inner_bytes,
+                        )?;
                     }
                 }
                 crate::hypergraph_engine::MessageKindTopLevel::Request => {
@@ -3304,14 +3289,11 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
             Ok(crate::hypergraph_engine::MessageKindTopLevel::Bundle) => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 let mut all_addrs = Vec::new();
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        if crate::hypergraph_engine::is_hypergraph_type_prefix(r.inner_type_prefix)
-                        {
-                            if let Ok(msg) = hg_dispatch::decode_message(&r.inner_bytes) {
-                                let (_, writes) = msg.lock_addresses()?;
-                                all_addrs.extend(writes);
-                            }
+                for r in bundle.requests.iter().flatten() {
+                    if crate::hypergraph_engine::is_hypergraph_type_prefix(r.inner_type_prefix) {
+                        if let Ok(msg) = hg_dispatch::decode_message(&r.inner_bytes) {
+                            let (_, writes) = msg.lock_addresses()?;
+                            all_addrs.extend(writes);
                         }
                     }
                 }

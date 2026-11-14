@@ -189,7 +189,7 @@ pub fn verify_code_finalize(
                 "verify: invalid code finalize: state change {} targets \
                  domain {} which differs from compute app domain {}",
                 i,
-                hex::encode(&sc.domain),
+                hex::encode(sc.domain),
                 hex::encode(compute_app_domain),
             )));
         }

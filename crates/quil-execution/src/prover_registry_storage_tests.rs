@@ -877,7 +877,7 @@ fn a_branch_fork_seeds_its_registry_from_the_view_beneath_the_branch_writes() {
     let fingerprint = |registry: &SharedProverRegistry| {
         registry.read(|r| {
             let statuses: Vec<_> =
-                (1..=42u8).map(|n| r.get_prover_info(&[n; 32]).map(|p| p.status.clone())).collect();
+                (1..=42u8).map(|n| r.get_prover_info(&[n; 32]).map(|p| p.status)).collect();
             (statuses, r.distinct_provers(), r.resource_usage())
         })
     };
@@ -900,7 +900,7 @@ fn a_branch_fork_seeds_its_registry_from_the_view_beneath_the_branch_writes() {
     assert!(full.0[40].is_some());
     assert!(seeded_reads * 4 < full_reads, "{seeded_reads} reads, a full read {full_reads}");
     assert_eq!(
-        seed.read(|r| r.get_prover_info(&[1; 32]).map(|p| p.status.clone())),
+        seed.read(|r| r.get_prover_info(&[1; 32]).map(|p| p.status)),
         Some(ProverStatus::Active),
         "the seed is copied, not updated"
     );

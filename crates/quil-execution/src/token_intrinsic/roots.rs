@@ -250,7 +250,7 @@ fn collect_live_records(
         keep(key, blob)?;
     }
     // The order a key-sorted collection gave, which the folds inherit.
-    records.sort_by(|a, b| a.address.cmp(&b.address));
+    records.sort_by_key(|a| a.address);
     Ok(records)
 }
 
@@ -282,7 +282,9 @@ impl BlockSummary {
     const ENTRY: usize = 8 + 8 + NODE_BYTES;
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() % Self::ENTRY != 0 || bytes.len() / Self::ENTRY > MAX_NONEMPTY_BLOCKS {
+        if !bytes.len().is_multiple_of(Self::ENTRY)
+            || bytes.len() / Self::ENTRY > MAX_NONEMPTY_BLOCKS
+        {
             return Err(invalid());
         }
         let mut blocks = Vec::with_capacity(bytes.len() / Self::ENTRY);
@@ -923,7 +925,7 @@ fn prepare<'a>(
         let mut next_progress = REBUILD_PROGRESS_EVERY;
         let summary = block_summary_from_records(context, scope, |address| {
             reads += 1;
-            if reads % 1024 == 0 && started.elapsed() >= next_progress {
+            if reads.is_multiple_of(1024) && started.elapsed() >= next_progress {
                 tracing::warn!(
                     application = %hex::encode(application),
                     range = %range,

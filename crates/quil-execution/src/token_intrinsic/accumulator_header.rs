@@ -31,7 +31,7 @@ pub const CARRY_WINDOW_FRAMES: u64 = 8;
 pub fn header_carries(frame_number: u64, earlier: &[Vec<u8>], last: &[u8]) -> bool {
     !last.is_empty()
         && (earlier.iter().any(|digest| digest.as_slice() != last)
-            || frame_number % HEARTBEAT_FRAMES == 0)
+            || frame_number.is_multiple_of(HEARTBEAT_FRAMES))
 }
 
 #[cfg(test)]

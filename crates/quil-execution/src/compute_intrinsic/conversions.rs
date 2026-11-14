@@ -205,7 +205,7 @@ pub fn code_execute_from_proto(p: &pb::CodeExecute) -> Result<CodeExecute> {
     let ops: Vec<Vec<u8>> = p
         .execute_operations
         .iter()
-        .map(|o| execute_operation_from_proto(o))
+        .map(execute_operation_from_proto)
         .collect::<Result<Vec<_>>>()?
         .iter()
         .map(|o| o.to_canonical_bytes())
