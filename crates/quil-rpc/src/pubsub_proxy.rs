@@ -8,14 +8,14 @@
 //!
 //! Message routing model:
 //! * Master's swarm event loop already fans every received message
-//! into a `tokio::sync::broadcast::Sender<StreamGlobalMessagesResponse>`
-//! (constructed in `main.rs`). We borrow a clone of that sender so
-//! each `Subscribe` caller gets an independent receiver filtered
-//! by bitmask.
+//!   into a `tokio::sync::broadcast::Sender<StreamGlobalMessagesResponse>`
+//!   (constructed in `main.rs`). We borrow a clone of that sender so
+//!   each `Subscribe` caller gets an independent receiver filtered
+//!   by bitmask.
 //! * `PublishToBitmask` / `Publish` route through `P2PHandle.publish`.
 //! * Peer-info, signing, and reachability queries delegate to small
-//! closures handed in by `main.rs` so this crate doesn't have to
-//! depend on the Ed448 keyring directly.
+//!   closures handed in by `main.rs` so this crate doesn't have to
+//!   depend on the Ed448 keyring directly.
 
 use std::pin::Pin;
 use std::sync::Arc;

@@ -5,10 +5,10 @@
 //!
 //! Layout:
 //! * `[WORKER, WORKER_BY_CORE, core_id_be_u64]` → encoded
-//! `PersistedWorkerInfo`
+//!   `PersistedWorkerInfo`
 //! * `[WORKER, WORKER_BY_FILTER, filter…]` → 8-byte BE core_id
-//! (secondary index; lets Go-style lookups by filter resolve
-//! to the primary record)
+//!   (secondary index; lets Go-style lookups by filter resolve
+//!   to the primary record)
 //!
 //! Encoding mirrors Go's `encodeWorkerInfo` field order so a
 //! Rust-written record could in principle be read by Go and vice

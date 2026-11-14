@@ -21,17 +21,17 @@
 //! during the handshake. Two distinct checks run there, and both are
 //! required for the identity to be trustworthy:
 //! 1. **xsign cross-signature** (`verify_xsign`) — proves the cert's
-//! Ed25519 key was authorized by the Ed448 identity named in the
-//! SAN (the cert is internally well-formed). This is static and
-//! replayable on its own.
+//!    Ed25519 key was authorized by the Ed448 identity named in the
+//!    SAN (the cert is internally well-formed). This is static and
+//!    replayable on its own.
 //! 2. **proof-of-possession** (`verify_tls1x_signature`) — the TLS
-//! `CertificateVerify` check, proving the live peer on *this*
-//! connection actually holds the cert key's private half. Without
-//! it a public peer cert could be replayed by anyone.
-//! By the time a request reaches this interceptor both checks have
-//! passed, so the SAN's Ed448 → libp2p PeerID mapping is bound to a
-//! live key-holder; this interceptor only re-decodes it from the cert
-//! to attach to the request extension.
+//!    `CertificateVerify` check, proving the live peer on *this*
+//!    connection actually holds the cert key's private half. Without
+//!    it a public peer cert could be replayed by anyone.
+//!    By the time a request reaches this interceptor both checks have
+//!    passed, so the SAN's Ed448 → libp2p PeerID mapping is bound to a
+//!    live key-holder; this interceptor only re-decodes it from the cert
+//!    to attach to the request extension.
 
 use tonic::{Request, Status};
 use tracing::debug;

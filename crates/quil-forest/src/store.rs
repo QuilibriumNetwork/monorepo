@@ -508,10 +508,10 @@ impl RocksTreeStore {
     ///      has one more nibble than its parent, so deepest-first guarantees every
     ///      child's size is known before its parent (the same topological order
     ///      [`batch_size_sums`] uses) — and sum each from its children.
-    /// All writes go through `WriteBatch`es flushed every [`SEED_BATCH`] nodes. Peak
-    /// memory is one `u128`/leaf plus the internal adjacency (internals are ~1/15th
-    /// of nodes), i.e. a few GB for a ~100M-node tree — fine for an archive host, and
-    /// the trade that turns days of random I/O into minutes of sequential streaming.
+    ///      All writes go through `WriteBatch`es flushed every [`SEED_BATCH`] nodes. Peak
+    ///      memory is one `u128`/leaf plus the internal adjacency (internals are ~1/15th
+    ///      of nodes), i.e. a few GB for a ~100M-node tree — fine for an archive host, and
+    ///      the trade that turns days of random I/O into minutes of sequential streaming.
     ///
     /// Resumable at the whole-tree granularity via the root memo (mid-seed crashes
     /// re-run from scratch, but the run is now minutes). Returns the tree's total

@@ -76,16 +76,16 @@ pub struct ArchiveShardInfo {
 ///
 /// Behaviors:
 /// - Local shard_keys are deduplicated. Each `RangeAppShards` row
-/// carries one (shard_key, prefix) pair, but multiple rows can
-/// share the same 35-byte shard_key (with different prefixes); we
-/// only need one RPC per unique shard_key since the response
-/// includes every sub-shard under that L2.
+///   carries one (shard_key, prefix) pair, but multiple rows can
+///   share the same 35-byte shard_key (with different prefixes); we
+///   only need one RPC per unique shard_key since the response
+///   includes every sub-shard under that L2.
 /// - Per-shard RPC failures within a connected endpoint are logged
-/// and skipped — partial data is preferable to aborting the entire
-/// refresh (the lifecycle's "propose over what we have" contract).
+///   and skipped — partial data is preferable to aborting the entire
+///   refresh (the lifecycle's "propose over what we have" contract).
 /// - Endpoint-level transport failures rotate to the next endpoint.
-/// The first endpoint to return at least one successful per-shard
-/// result wins; the partial map is returned.
+///   The first endpoint to return at least one successful per-shard
+///   result wins; the partial map is returned.
 ///
 /// The wire filter is constructed from `shard_key[3..]` (L2, 32 bytes)
 /// concatenated with one byte per `prefix` element — matching the

@@ -15,13 +15,13 @@
 //! first guess:
 //!
 //! * **Hiding (M-LWE) is the binding constraint, not SIS.** A large `q`
-//! weakens LWE: the initial `q=2^32, rank=4` gave only **78-bit** — broken.
+//!   weakens LWE: the initial `q=2^32, rank=4` gave only **78-bit** — broken.
 //! * At **`q≈2^28, κ=λ=6`**: **M-LWE ≈ 162-bit classical / 147-bit quantum**
-//! (BKZ β≈555), clearing the 128-bit target on both. **M-SIS ≫ 128-bit**
-//! (BKZ ≫ 2000 even at a generous `2^20` extracted-witness norm) — binding
-//! and soundness are comfortable.
+//!   (BKZ β≈555), clearing the 128-bit target on both. **M-SIS ≫ 128-bit**
+//!   (BKZ ≫ 2000 even at a generous `2^20` extracted-witness norm) — binding
+//!   and soundness are comfortable.
 //! * `q=2^28` also leaves headroom above the amount arithmetic (`2^23`
-//! per-limb sum) and the soundness slack (`~2^20` extracted norm).
+//!   per-limb sum) and the soundness slack (`~2^20` extracted norm).
 
 // ── Ring ────────────────────────────────────────────────────────────────
 

@@ -9,11 +9,11 @@
 //!
 //! Authorization is enforced at TWO layers:
 //! 1. **Method allow-list** (here): only explicitly permitted method paths may be
-//! proxied through the tunnel, so anonymous circuit traffic can't reach
-//! arbitrary/sensitive RPCs. The operator configures the set.
+//!    proxied through the tunnel, so anonymous circuit traffic can't reach
+//!    arbitrary/sensitive RPCs. The operator configures the set.
 //! 2. **Target-peer auth** (there): the dial's pqnoise handshake authenticates
-//! THIS exit node's identity, so the target applies its normal per-caller RPC
-//! authorization to the exit.
+//!    THIS exit node's identity, so the target applies its normal per-caller RPC
+//!    authorization to the exit.
 //!
 //! DEFENSE 1 is also enforced: the target must be an in-network routing peer
 //! (via the same PeerInfo-cache lookup the transport uses), never an open-web

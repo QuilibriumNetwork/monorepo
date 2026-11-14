@@ -19,24 +19,24 @@
 //!
 //! ## Feature parity notes
 //! * **Late-bind signing identity.** Stock gossipsub fixes
-//! `MessageAuthenticity` at construction. We bootstrap with a throwaway
-//! signed key and rebuild the behaviour with the real key in
-//! [`set_signing_identity`](BlossomSubBehaviour::set_signing_identity)
-//! (always called before the swarm polls / before any subscribe, so no
-//! state is lost).
+//!   `MessageAuthenticity` at construction. We bootstrap with a throwaway
+//!   signed key and rebuild the behaviour with the real key in
+//!   [`set_signing_identity`](BlossomSubBehaviour::set_signing_identity)
+//!   (always called before the swarm polls / before any subscribe, so no
+//!   state is lost).
 //! * **Per-bitmask validators.** Stock gossipsub validates asynchronously via
-//! `ValidationMode` + `report_message_validation_result`. We enable
-//! `validate_messages()` and run the registered validator in `poll`,
-//! reporting Accept/Reject/Ignore before surfacing the message — so a
-//! validator still gates forwarding, matching the fork's receive-path hook.
+//!   `ValidationMode` + `report_message_validation_result`. We enable
+//!   `validate_messages()` and run the registered validator in `poll`,
+//!   reporting Accept/Reject/Ignore before surfacing the message — so a
+//!   validator still gates forwarding, matching the fork's receive-path hook.
 //! * **Composite/overlapping-bitmask mesh: dropped** (each bitmask is an
-//! exact-match topic).
+//!   exact-match topic).
 //! * **Forward filter (devnet partitions): not supported on stock gossipsub.**
-//! The methods remain (API compat) but are no-ops; installing one logs a
-//! one-time warning. Devnet bipartite-partition tests won't partition until
-//! this is re-implemented behind a wrapper hook.
+//!   The methods remain (API compat) but are no-ops; installing one logs a
+//!   one-time warning. Devnet bipartite-partition tests won't partition until
+//!   this is re-implemented behind a wrapper hook.
 //! * **`send_subscriptions_to_peer`: no-op.** Stock gossipsub re-sends
-//! subscriptions automatically when a connection is (re)established.
+//!   subscriptions automatically when a connection is (re)established.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;

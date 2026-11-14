@@ -7,14 +7,14 @@
 //!
 //! Two stores work together, and neither is a KZG trie:
 //! - **The forest** holds the *commitment* — each vertex's fields flattened
-//! into Level-3 leaves (`l3_leaf_key(id, field_key)`), so a branch commit is
-//! a hash, not a G1 multiexp. An empty value is a tombstone leaf keyed by the
-//! id (OR-set `removes` / add-side placeholder) so the phase root reflects
-//! removals.
+//!   into Level-3 leaves (`l3_leaf_key(id, field_key)`), so a branch commit is
+//!   a hash, not a G1 multiexp. An empty value is a tombstone leaf keyed by the
+//!   id (OR-set `removes` / add-side placeholder) so the phase root reflects
+//!   removals.
 //! - **The `HypergraphStore` KV keyspace** holds the per-vertex *blobs*
-//! (`save_vertex_underlying`/`load_vertex_underlying_raw`), keyed by id and
-//! RocksDB-prefix-scannable. Reads (`get_vertex_data`) and the PoRep /
-//! shard-info path navigation read from here — plain key-value, no trie.
+//!   (`save_vertex_underlying`/`load_vertex_underlying_raw`), keyed by id and
+//!   RocksDB-prefix-scannable. Reads (`get_vertex_data`) and the PoRep /
+//!   shard-info path navigation read from here — plain key-value, no trie.
 //!
 //! Mutations stage leaf deltas + blobs in memory; `commit` applies the deltas
 //! to the forest (JMT `put_value_set` is natively incremental) and persists the
@@ -1426,7 +1426,7 @@ impl HypergraphCrdt {
     /// Commit one shard/phase tree's flattened L3 leaves, staging the forest node
     /// writes + the DB head-version into `txn`, and record the version (in-memory
     /// + DB) so version-exact reads address it. Returns the new 32-byte root.
-    /// `forest` is the caller's held read guard.
+    ///   `forest` is the caller's held read guard.
     ///
     /// The commit version is this TREE's own last version + 1 (0 for a first
     /// commit) — JMT builds an incremental commit on the root at `version - 1`,

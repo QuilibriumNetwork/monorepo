@@ -272,9 +272,9 @@ pub fn fmt_mb(bytes: u64) -> String {
 /// `malloc` process-wide). This is the decisive OOM signal:
 ///
 /// - `allocated` rising over time → a TRUE live-heap leak (find it with
-/// `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
+///   `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
 /// - `allocated` flat but `resident`/`retained` high → allocator
-/// fragmentation / retained pages, NOT a leak (tune, don't chase).
+///   fragmentation / retained pages, NOT a leak (tune, don't chase).
 /// - `resident − allocated` is the overhead jemalloc holds beyond live data.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JemallocStats {
@@ -318,10 +318,10 @@ pub fn jemalloc_stats() -> Option<JemallocStats> {
 /// is how many are live right now. The class holding the most live bytes is
 /// where the memory is going:
 /// - dominant SMALL class (e.g. 48B, 4KiB) → many tiny objects leaking
-/// (a HashMap/Vec/Box accumulating entries).
+///   (a HashMap/Vec/Box accumulating entries).
 /// - dominant LARGE/huge class (e.g. 1MiB, 16MiB) → a few big buffers
-/// leaking (trees, replicas, messages, decoded frames).
-/// Cross-reference the size against suspect allocations to pin the source.
+///   leaking (trees, replicas, messages, decoded frames).
+///   Cross-reference the size against suspect allocations to pin the source.
 #[derive(Debug, Clone, Default)]
 pub struct JemallocBreakdown {
     /// Live bytes in small (bin) size classes, merged across arenas.

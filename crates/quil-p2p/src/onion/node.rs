@@ -12,10 +12,10 @@
 //! Dispatch (deterministic — every cell is link-framed):
 //! - CREATE → relay answers the handshake.
 //! - CREATED → a downstream we extended to ([`OnionRelay::is_down_circ`]) → relay
-//! wraps it back up as EXTENDED; otherwise our own first-hop reply → originator.
+//!   wraps it back up as EXTENDED; otherwise our own first-hop reply → originator.
 //! - RELAY → forward for a circuit through us ([`OnionRelay::is_forward_circ`]);
-//! else backward from our downstream ([`OnionRelay::is_down_circ`]); else a
-//! backward cell for a circuit we originated → originator peels it.
+//!   else backward from our downstream ([`OnionRelay::is_down_circ`]); else a
+//!   backward cell for a circuit we originated → originator peels it.
 //!
 //! Note: circuits are keyed by circuit id alone (not `(peer, circ)` as Tor does),
 //! so a node must not reuse a circuit id across roles simultaneously — relay
@@ -71,17 +71,17 @@ impl OnionReplyHandle {
 impl OnionNode {
     /// Build a node over `transport` and install the unified dispatcher.
     /// - `self_peer_id`: this node's own peer id — DEFENSE: circuits/EXTENDs
-    /// naming it as the next hop are rejected (no self-connection).
+    ///   naming it as the next hop are rejected (no self-connection).
     /// - `onion_secret_key`: this node's sntrup761 onion secret (the `q-onion-key`
-    /// secret half). Required to answer CREATE / act as a relay or exit; pass
-    /// `None` for an originate-only client.
+    ///   secret half). Required to answer CREATE / act as a relay or exit; pass
+    ///   `None` for an originate-only client.
     /// - `peer_validator`: DEFENSE — a next hop must pass this (an in-network
-    /// routing peer), so tunnels can't reach open-web endpoints. `None` accepts
-    /// any (test default).
+    ///   routing peer), so tunnels can't reach open-web endpoints. `None` accepts
+    ///   any (test default).
     /// - `exit_handler`: invoked as `(up_circ, payload)` when a RELAY/DATA cell
-    /// terminates here (we are the exit). Reply with [`send_reply`](Self::send_reply).
+    ///   terminates here (we are the exit). Reply with [`send_reply`](Self::send_reply).
     /// - `reply_handler`: invoked as `(entry_circ, payload)` when a reply arrives
-    /// for a circuit THIS node originated.
+    ///   for a circuit THIS node originated.
     pub fn new(
         transport: Arc<dyn Transport>,
         self_peer_id: Vec<u8>,
