@@ -88,52 +88,82 @@ fn cap_source(from_shard_anchor: bool) -> &'static str {
     }
 }
 
-/// The witness at the newest retained root at or below `cap`, with that root's
-/// frame, served without the commit lock
-/// ([`quil_hypergraph::crdt::ServedGlobalReads`]), so a GLOBAL finalization
-/// holding it while it executes a frame does not hold up a claim.
-fn witness_at_cap(
-    state: &HypergraphState,
-    clock: &dyn ClockStore,
-    receipt: &[u8; 32],
-    cap: u64,
-) -> Result<(u64, MintAuthorizationWitnessData)> {
-    witness_from(&state.crdt().served_global_reads()?, clock, receipt, cap)
+/// Why [`witness_from`] returned no witness. Only the first is a wait.
+#[derive(Debug)]
+enum NoWitness {
+    /// This node retains no global root at or below the cap.
+    NoRoot(QuilError),
+    /// The receipt could not be read at the root of GLOBAL frame `frame`.
+    Unread { frame: u64, error: QuilError },
+    /// The receipt's record or proof is over the witness limit: no claim can
+    /// cite it, however long it waits.
+    OverLimit(QuilError),
 }
 
-/// [`witness_at_cap`] over the view of `reads`.
+impl From<NoWitness> for QuilError {
+    fn from(missing: NoWitness) -> Self {
+        match missing {
+            NoWitness::NoRoot(error)
+            | NoWitness::Unread { error, .. }
+            | NoWitness::OverLimit(error) => error,
+        }
+    }
+}
+
+/// A receipt `what` of `bytes` bytes at the root of GLOBAL frame `frame`, over
+/// the witness limit: not a wait, so not `ExecutionUnavailable`.
+fn over_witness_limit(what: &str, bytes: usize, frame: u64) -> QuilError {
+    QuilError::Execution(format!(
+        "mint authorization witness: the receipt {what} at the root of GLOBAL frame {frame} is \
+         {bytes} bytes, over the witness limit of {} bytes: no claim can cite it",
+        super::reward_witness::MAX_REWARD_PROOF_BYTES
+    ))
+}
+
+/// The witness at the newest root at or below `cap` that `reads` retains, with
+/// that root's frame. Root and proof come from one view, so a root committed
+/// after it was taken is never cited.
 fn witness_from(
     reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     clock: &dyn ClockStore,
     receipt: &[u8; 32],
     cap: u64,
-) -> Result<(u64, MintAuthorizationWitnessData)> {
-    let unavailable = |message: &str| {
-        QuilError::ExecutionUnavailable(format!("mint authorization witness: {message}"))
-    };
+) -> std::result::Result<(u64, MintAuthorizationWitnessData), NoWitness> {
     // Same citation rule as the reward witness: the newest global frame whose
     // root this node retains (a syncing node rarely holds the latest root),
-    // read through the view the proof is read from.
-    let (root, header, proof) = super::reward_witness::served_vertex_at_newest_root(
-        reads,
-        clock,
-        Some(cap),
-        receipt,
-        |e| unavailable(&e.to_string()),
-    )?;
-    let Some(proof) = proof else {
-        return Ok((header.frame_number, MintAuthorizationWitnessData::default()));
+    // read through the view the proof is read from. The root and the receipt
+    // are read apart: only a missing root is a wait.
+    let (root, header) = super::reward_witness::newest_served_global_root(reads, clock, Some(cap))
+        .map_err(|e| {
+            NoWitness::NoRoot(QuilError::ExecutionUnavailable(format!(
+                "mint authorization witness: {e}"
+            )))
+        })?;
+    let frame = header.frame_number;
+    let Some(proof) = reads
+        .membership(&root, receipt)
+        .map_err(|error| NoWitness::Unread { frame, error })?
+    else {
+        return Ok((frame, MintAuthorizationWitnessData::default()));
     };
     let limit = super::reward_witness::MAX_REWARD_PROOF_BYTES;
     if proof.vertex_blob.len() > limit {
-        return Err(unavailable("receipt record exceeds witness limit"));
+        return Err(NoWitness::OverLimit(over_witness_limit(
+            "record",
+            proof.vertex_blob.len(),
+            frame,
+        )));
     }
     let proof = quil_forest::MembershipProof {
         inputs: vec![proof],
     }
     .to_bytes();
     if proof.len() > limit {
-        return Err(unavailable("membership proof exceeds witness limit"));
+        return Err(NoWitness::OverLimit(over_witness_limit(
+            "membership proof",
+            proof.len(),
+            frame,
+        )));
     }
     Ok((
         header.frame_number,
@@ -166,34 +196,60 @@ fn witness_logged(
     log: &ClaimWaitLog,
 ) -> Result<MintAuthorizationWitnessData> {
     let (cap, from_anchor) = claim_cap(clock, shard_anchor)?;
-    let result = witness_at_cap(state, clock, receipt, cap);
-    let searched = match &result {
-        Ok((_, witness)) if witness.found => None,
-        Ok((frame, _)) => Some(Some(*frame)),
-        Err(error) if error.is_execution_unavailable() => Some(None),
-        Err(_) => None,
-    };
-    if let Some(searched) = searched {
+    // Served without the commit lock
+    // ([`quil_hypergraph::crdt::ServedGlobalReads`]), so a GLOBAL finalization
+    // holding it while it executes a frame does not hold up a claim.
+    let result = witness_from(&state.crdt().served_global_reads()?, clock, receipt, cap);
+    let found = matches!(&result, Ok((_, witness)) if witness.found);
+    if !found {
         if let Some(suppressed) = log.admit(seconds_since_start()) {
-            let reason = if searched.is_some() {
-                "receipt is not in the newest retained global root at or below the cap"
-            } else {
-                "this node retains no global root at or below the cap"
+            let wait = |searched: u64, reason: &str| {
+                tracing::info!(
+                    receipt = %hex::encode(receipt),
+                    searched_frame = searched,
+                    cap,
+                    cap_source = cap_source(from_anchor),
+                    suppressed,
+                    reason,
+                    ends_when = "the authorization is included and a retained root at or below \
+                                 the cap holds it; GetMintAuthorizationStatus tells which is \
+                                 missing",
+                    "mint claim: no citable authorization yet"
+                )
             };
-            tracing::info!(
-                receipt = %hex::encode(receipt),
-                searched_frame = searched.unwrap_or(0),
-                cap,
-                cap_source = cap_source(from_anchor),
-                suppressed,
-                reason,
-                ends_when = "the authorization is included and a retained root at or below \
-                             the cap holds it; GetMintAuthorizationStatus tells which is missing",
-                "mint claim: no citable authorization yet"
-            );
+            match &result {
+                Ok((frame, _)) => wait(
+                    *frame,
+                    "receipt is not in the newest retained global root at or below the cap",
+                ),
+                Err(NoWitness::NoRoot(_)) => {
+                    wait(0, "this node retains no global root at or below the cap")
+                }
+                Err(NoWitness::Unread { frame, error }) => tracing::warn!(
+                    receipt = %hex::encode(receipt),
+                    searched_frame = frame,
+                    cap,
+                    suppressed,
+                    %error,
+                    scope = "this node",
+                    action = "a pruning between two reads clears on retry; a blob that does not \
+                              verify against its indexed root is a store defect that breaks \
+                              reward-claim witnesses too: report this line",
+                    "mint claim: the receipt could not be read at the newest retained global \
+                     root at or below the cap"
+                ),
+                Err(NoWitness::OverLimit(error)) => tracing::warn!(
+                    receipt = %hex::encode(receipt),
+                    cap,
+                    suppressed,
+                    %error,
+                    scope = "this receipt",
+                    "mint claim: the receipt can never be cited through a witness"
+                ),
+            }
         }
     }
-    result.map(|(_, witness)| witness)
+    result.map(|(_, witness)| witness).map_err(QuilError::from)
 }
 
 /// A status read slower than this logs its duration: it answers in
@@ -323,26 +379,19 @@ fn status_from(
     Ok(out)
 }
 
-/// The frame of the newest retained root at or below `cap`, and whether it
-/// holds the receipt within the witness's record limit: whether
-/// [`witness_from`] would find it over the same `reads`.
+/// The frame of the newest retained root at or below `cap`, and whether a
+/// claim finds the receipt there: [`witness_from`] over the same `reads`, so
+/// the status fails where a claim fails (a record or membership proof over
+/// the witness limit, not a wait) and finds what a claim finds.
 fn present_at_cap(
     reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     clock: &dyn ClockStore,
     receipt: &[u8; 32],
     cap: u64,
 ) -> Result<(u64, bool)> {
-    let unavailable = |message: &str| {
-        QuilError::ExecutionUnavailable(format!("mint authorization witness: {message}"))
-    };
-    let (root, header) = super::reward_witness::newest_served_global_root(reads, clock, Some(cap))
-        .map_err(|e| unavailable(&e.to_string()))?;
-    match reads.vertex_blob_at_root(&root, receipt)? {
-        Some(blob) if blob.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES => {
-            Err(unavailable("receipt record exceeds witness limit"))
-        }
-        blob => Ok((header.frame_number, blob.is_some())),
-    }
+    witness_from(reads, clock, receipt, cap)
+        .map(|(frame, witness)| (frame, witness.found))
+        .map_err(QuilError::from)
 }
 
 /// `Ok(None)` when the history asked for is not retained here.
@@ -514,10 +563,7 @@ mod tests {
             Some(value) if frame == INCLUDED_AT => value.to_vec(),
             _ => vec![frame as u8],
         };
-        let mut tree = quil_tries::VectorCommitmentTree::new();
-        tree.insert(&[0], &value, &[], &num_bigint::BigInt::from(1))
-            .unwrap();
-        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let blob = record(&value);
         let disc = vertex_adds_discriminator().unwrap();
         chain
             .state
@@ -542,6 +588,82 @@ mod tests {
             }),
             ..Default::default()
         });
+    }
+
+    /// The record of a receipt holding `value`, as [`execute`] writes it.
+    fn record(value: &[u8]) -> Vec<u8> {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0], value, &[], &num_bigint::BigInt::from(1))
+            .unwrap();
+        quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()
+    }
+
+    /// A receipt value whose record is `len` bytes: the encoding's overhead
+    /// measured, not assumed.
+    fn value_for_record(len: usize) -> Vec<u8> {
+        let overhead = record(&vec![0x42; len]).len() - len;
+        let value = vec![0x42; len - overhead];
+        assert_eq!(
+            record(&value).len(),
+            len,
+            "premise: a record of {len} bytes"
+        );
+        value
+    }
+
+    /// The bytes of the membership proof a claim at cap 14 encodes for the
+    /// receipt, built as [`witness_from`] builds it, whatever its size.
+    fn proof_len(chain: &Chain) -> usize {
+        let reads = chain.state.crdt().served_global_reads().unwrap();
+        let (root, _) = crate::token_intrinsic::reward_witness::newest_served_global_root(
+            &reads,
+            chain.clock.as_ref(),
+            Some(14),
+        )
+        .unwrap();
+        let proof = reads
+            .membership(&root, &RECEIPT)
+            .unwrap()
+            .expect("premise: the root at the cap holds the receipt");
+        quil_forest::MembershipProof {
+            inputs: vec![proof],
+        }
+        .to_bytes()
+        .len()
+    }
+
+    /// A chain whose receipt encodes a membership proof of `len` bytes, and
+    /// its record's length: the proof's overhead over its record measured on
+    /// a chain near that size.
+    fn chain_with_proof(len: usize) -> (Chain, usize) {
+        let probe = len - 1024;
+        let overhead = proof_len(&chain_with(Some(value_for_record(probe)))) - probe;
+        let record_len = len - overhead;
+        let chain = chain_with(Some(value_for_record(record_len)));
+        assert_eq!(proof_len(&chain), len, "premise: a proof of {len} bytes");
+        (chain, record_len)
+    }
+
+    /// Found, or the error's class (wait or not) and text.
+    type Answer = std::result::Result<bool, (bool, String)>;
+
+    /// The status's answer at cap 14 (Claimable or its error) and a claim's
+    /// through [`witness_logged`] (found or its error).
+    fn status_and_claim(chain: &Chain) -> (Answer, Answer) {
+        let answer = |result: Result<bool>| {
+            result.map_err(|error| (error.is_execution_unavailable(), error.to_string()))
+        };
+        let read = status(&chain.state, chain.clock.as_ref(), &RECEIPT, Some(14))
+            .map(|status| status.state == MintAuthorizationState::Claimable);
+        let claim = witness_logged(
+            &chain.state,
+            chain.clock.as_ref(),
+            &RECEIPT,
+            Some(14),
+            &ClaimWaitLog::default(),
+        )
+        .map(|witness| witness.found);
+        (answer(read), answer(claim))
     }
 
     /// A serving view taken at head 15, then frame 15 executed: header 16's
@@ -828,6 +950,58 @@ mod tests {
                 .is_err_and(|error| !error.is_execution_unavailable()),
             "MINT-OVERSIZE-AS-WAIT: the claim path reads it as a wait: {claim:?}"
         );
+    }
+
+    /// A record at the witness limit encodes a membership proof over it, and
+    /// one byte more is over it itself: no claim can cite either. The status
+    /// fails with the claim's own error, never reads Claimable.
+    #[test]
+    fn the_status_and_a_claim_agree_at_the_record_limit() {
+        let limit = super::super::reward_witness::MAX_REWARD_PROOF_BYTES;
+        for (len, over) in [(limit, "membership proof"), (limit + 1, "record")] {
+            let chain = chain_with(Some(value_for_record(len)));
+            let (status, claim) = status_and_claim(&chain);
+            assert_eq!(
+                status, claim,
+                "MINT-STATUS-CLAIM-SPLIT: a record of {len} bytes: status, then claim"
+            );
+            let Err((wait, error)) = claim else {
+                panic!("a record of {len} bytes is cited: {claim:?}");
+            };
+            assert!(!wait, "{error}");
+            assert!(
+                error.contains(&format!("receipt {over} at")) && error.contains("witness limit"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A record under the witness limit whose membership proof encodes over
+    /// it can never be cited: the status fails as the claim does. A proof
+    /// at the limit is cited, and the status reads it Claimable.
+    #[test]
+    fn the_status_and_a_claim_agree_when_only_the_proof_is_over_the_limit() {
+        let limit = super::super::reward_witness::MAX_REWARD_PROOF_BYTES;
+        for (len, cited) in [(limit, true), (limit + 1, false)] {
+            let (chain, record_len) = chain_with_proof(len);
+            assert!(
+                record_len < limit,
+                "premise: a record of {record_len} bytes"
+            );
+            let (status, claim) = status_and_claim(&chain);
+            eprintln!("REACH a proof of {len} bytes, record {record_len}: status {status:?}");
+            assert_eq!(
+                status, claim,
+                "MINT-STATUS-CLAIM-SPLIT: a proof of {len} bytes: status, then claim"
+            );
+            match claim {
+                Ok(found) => assert!(cited && found, "a proof of {len} bytes: found {found}"),
+                Err((wait, error)) => assert!(
+                    !cited && !wait && error.contains("receipt membership proof at"),
+                    "a proof of {len} bytes: {error}"
+                ),
+            }
+        }
     }
 
     #[test]

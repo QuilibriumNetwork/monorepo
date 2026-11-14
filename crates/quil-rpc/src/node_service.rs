@@ -1605,7 +1605,8 @@ impl NodeService for NodeRpcServer {
                         Status::internal(format!("mint authorization witness: {e}"))
                     }
                 })?;
-        if witness.forest_proof.len() > 32 * 1024
+        if witness.forest_proof.len()
+            > quil_execution::token_intrinsic::reward_witness::MAX_REWARD_PROOF_BYTES
             || (witness.found && witness.global_root.len() != 32)
         {
             return Err(Status::internal(
@@ -2557,7 +2558,8 @@ mod mint_authorization_witness_tests {
                 caller: std::thread::current().id(),
             }))
         };
-        let valid = server(32 * 1024, 32, false);
+        let limit = quil_execution::token_intrinsic::reward_witness::MAX_REWARD_PROOF_BYTES;
+        let valid = server(limit, 32, false);
         assert_eq!(
             valid
                 .get_mint_authorization_witness(request(31))
@@ -2574,8 +2576,8 @@ mod mint_authorization_witness_tests {
         assert!(response.found);
         assert_eq!(response.cited_frame, 19);
         assert_eq!(response.global_root, vec![2; 32]);
-        assert_eq!(response.forest_proof.len(), 32 * 1024);
-        for bad in [server(32 * 1024 + 1, 32, false), server(1, 31, false)] {
+        assert_eq!(response.forest_proof.len(), limit);
+        for bad in [server(limit + 1, 32, false), server(1, 31, false)] {
             assert_eq!(
                 bad.get_mint_authorization_witness(request(32))
                     .await
