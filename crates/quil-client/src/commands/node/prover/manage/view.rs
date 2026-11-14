@@ -1689,6 +1689,8 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
                 reward_cell(m, &a.estimated_reward, &a.filter)
             }
         }
+        // The node reports `-1` while no worker is bound: an absent value.
+        11 if a.worker_id < 0 => "-".into(),
         11 => a.worker_id.to_string(),
         12 => allocation_status_text(m, a),
         13 => a.mode().to_string(),
@@ -4397,7 +4399,7 @@ fn help_value_color(entry: &str, value: &str) -> Option<Color> {
         ("PeerState", state @ ("current" | "lag" | "unmat" | "unknown")) => {
             Some(materialization_state_color(state))
         }
-        ("Worker", "-1") => Some(ERROR),
+        ("Worker", "-") => Some(ERROR),
         ("Mode", mode @ ("a" | "m")) => Some(mode_color(mode)),
         _ => None,
     }
@@ -4513,7 +4515,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`unmat`: nothing materialized"),
         item("`unknown`: no head"),
         kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical, see Reward estimates; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
-        kv("Worker", "Core the allocation is bound to; `-1` means none is bound, `red` while the node reports the allocation without a worker"),
+        kv("Worker", "Core the allocation is bound to; `-` means none is bound, `red` while the node reports the allocation without a worker"),
         kv("Status", "Effective protocol status of the row:"),
         item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
         item("`activating`: join confirmed; it joins its committee at the next epoch boundary"),
@@ -8784,7 +8786,7 @@ mod tests {
             ("Execution", "blocked", ERROR),
             ("Execution", "sync", HELP),
             ("PeerState", "lag", WARNING),
-            ("Worker", "-1", ERROR),
+            ("Worker", "-", ERROR),
             ("Mode", "m", PRIMARY),
             ("Mode", "‹Ctrl+O›", TEXT),
             ("Colors", "green", SUCCESS),
@@ -9025,6 +9027,35 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A row with no worker bound prints `-` under Worker, as every absent
+    /// value does, never the node's `-1`; a bound row prints its core.
+    /// Every other optional column is hidden. The 80x24 Allocations panel
+    /// has room for one row, so each row renders alone.
+    #[test]
+    fn an_unassigned_worker_prints_a_dash_at_80x24() {
+        for (filter, worker, golden) in [
+            ("b2b2b2", -1, "[ ] b2b2b2 -"),
+            ("a1a1a1", 8, "[ ] a1a1a1 8"),
+        ] {
+            let mut m = Model::new();
+            m.data_loaded = true;
+            m.color_coding = false;
+            m.cached_shard_info = Some(Default::default());
+            m.hidden_columns = (2..ALLOC_COL_NAMES.len()).filter(|&c| c != 11).collect();
+            m.allocations = vec![row(filter, 1, 1, worker, "", "")];
+            let text = render_text(&mut m, 80, 24);
+            let line = text
+                .lines()
+                .find(|line| line.contains(filter))
+                .unwrap_or_else(|| panic!("no {filter} row\n{text}"))
+                .split_whitespace()
+                .filter(|word| !word.chars().all(|c| c == '│'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(line, golden, "{text}");
         }
     }
 
