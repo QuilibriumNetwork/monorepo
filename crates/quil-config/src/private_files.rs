@@ -418,6 +418,66 @@ mod tests {
 
     const FOREIGN_OWNER: &str = "QUIL_CONFIG_TEST_FOREIGN_OWNER";
 
+    /// Run as root, a link is followed only when it is root's or belongs to
+    /// the owner of what it names: one another user planted to a file or a
+    /// directory not theirs is refused and what it names left whole.
+    #[test]
+    fn a_link_to_what_its_owner_does_not_own_is_refused() {
+        use std::os::unix::fs::{chown, lchown, symlink};
+        let dir = tempdir("planted");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can give a link another owner");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let roots = dir.join("roots.conf");
+        std::fs::write(&roots, b"root's").unwrap();
+        let link = dir.join("config.yml");
+        symlink(&roots, &link).unwrap();
+        lchown(&link, Some(NOBODY), Some(NOBODY)).unwrap();
+        let written = write_private_file(&link, b"replaced");
+        eprintln!("REACH planted-link written={}", written.is_ok());
+        assert_eq!(
+            std::fs::read(&roots).unwrap(),
+            b"root's",
+            "FOREIGN-LINK-FOLLOWED: the file a planted link names was replaced"
+        );
+        let err = written.expect_err("FOREIGN-LINK-FOLLOWED: the write went through");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keys.yml"), b"root's").unwrap();
+        let node = dir.join("node");
+        std::fs::create_dir(&node).unwrap();
+        chown(&node, Some(NOBODY), Some(NOBODY)).unwrap();
+        let configs = node.join("configs");
+        symlink(&elsewhere, &configs).unwrap();
+        lchown(&configs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let written = write_private_file(&configs.join("keys.yml"), b"replaced");
+        assert_eq!(
+            std::fs::read(elsewhere.join("keys.yml")).unwrap(),
+            b"root's",
+            "FOREIGN-LINK-FOLLOWED: a file under a planted directory link was replaced"
+        );
+        assert!(
+            written.is_err(),
+            "FOREIGN-LINK-FOLLOWED: the write went through"
+        );
+
+        // A link of the owner of what it names is followed.
+        let theirs = dir.join("theirs.yml");
+        std::fs::write(&theirs, b"old").unwrap();
+        chown(&theirs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let own = dir.join("own.yml");
+        symlink(&theirs, &own).unwrap();
+        lchown(&own, Some(NOBODY), Some(NOBODY)).unwrap();
+        write_private_file(&own, b"new").unwrap();
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"new");
+        assert_eq!(owner(&theirs), (NOBODY, NOBODY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// New directories, parents included, are owner-only; an existing one
     /// keeps its mode.
     #[test]

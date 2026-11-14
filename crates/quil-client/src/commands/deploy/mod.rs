@@ -393,6 +393,21 @@ mod tests {
         assert!(binds_update(0, 0).unwrap());
     }
 
+    /// A node that reports no GLOBAL head cannot say which side of the
+    /// config replay frame the network is on: nothing is signed.
+    #[test]
+    fn a_node_reporting_no_global_head_gets_no_unbound_update() {
+        let mainnet = quil_execution::config_replay::MAINNET_CONFIG_REPLAY_FRAME;
+        for from in [1_000, mainnet] {
+            let unbound = super::binds_update(0, from);
+            eprintln!("REACH head-zero from={from} result={unbound:?}");
+            assert!(
+                unbound.is_err(),
+                "UNBOUND-AT-HEAD-ZERO: from {from}: {unbound:?}"
+            );
+        }
+    }
+
     use quil_execution::token_intrinsic::config_resolver::MintVariant;
 
     use super::*;

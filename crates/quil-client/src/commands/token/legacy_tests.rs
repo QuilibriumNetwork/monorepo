@@ -924,3 +924,50 @@ fn shields_wait_for_the_frame_of_their_kind() {
     assert_eq!(shields_closed(&conditions, true), Some((1000, 950)));
     assert_eq!(shields_closed(&[], true), None);
 }
+
+/// A node whose owner index fails with text of its choosing.
+struct Hostile;
+impl CoinWitnessProvider for Hostile {
+    fn legacy_coins(
+        &self,
+        _domain: &[u8; 32],
+        _owner: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+        Err(quil_types::error::QuilError::ExecutionUnavailable(
+            "\u{1b}[2J\u{1b}]52;c;cHduZWQ=\u{7}\nBalance: 1000 QUIL\r".into(),
+        ))
+    }
+}
+
+/// A listing a node refused shows the node's reason without the control
+/// characters it carries.
+#[tokio::test]
+async fn a_refused_listing_shows_the_reason_without_control_characters() {
+    let (hostile, stop, serving) = serve(Arc::new(Hostile)).await;
+    let identities = vec![Identity::keyed(
+        "solo".into(),
+        None,
+        key_owners(&KEY_Y).unwrap(),
+        node(&hostile),
+    )];
+    let report = list_all(
+        identities,
+        &quil_execution::domains::QUIL_TOKEN,
+        None,
+        String::new(),
+    )
+    .await;
+    let Outcome::Unavailable(reason) = &report.rows[0].outcome else {
+        panic!("the refused listing reads unavailable");
+    };
+    eprintln!("REACH legacy-refused {}", reason.escape_debug());
+    assert!(
+        !reason.chars().any(char::is_control),
+        "REMOTE-TEXT-UNFILTERED: {}",
+        reason.escape_debug()
+    );
+    assert!(reason.contains("Balance: 1000 QUIL"), "{reason}");
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}

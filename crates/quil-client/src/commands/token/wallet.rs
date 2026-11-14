@@ -10673,3 +10673,30 @@ mod shield_all_cli_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod remote_text_tests {
+    /// A scan a node stopped names the node's reason without the control
+    /// characters it carries.
+    #[test]
+    fn a_stopped_scan_names_the_reason_without_control_characters() {
+        let hostile =
+            tonic::Status::unavailable("\u{1b}[2J\u{1b}]52;c;cHduZWQ=\u{7}\nBalance: 1000 QUIL\r");
+        let stopped = super::scan_stopped(
+            "coins",
+            2,
+            10,
+            1,
+            anyhow::Error::new(hostile),
+            std::time::Duration::from_secs(3),
+        );
+        let shown = format!("{stopped:#}");
+        eprintln!("REACH scan-stopped {}", shown.escape_debug());
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "REMOTE-TEXT-UNFILTERED: {}",
+            shown.escape_debug()
+        );
+        assert!(shown.contains("Balance: 1000 QUIL"), "{shown}");
+    }
+}

@@ -2566,6 +2566,59 @@ mod mint_authorization_status_tests {
         NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider { fail }))
     }
 
+    /// A flood of status reads on a busy status worker leaves the coin
+    /// reads' own queue free: a scan waiting for a slot gets the next one.
+    #[tokio::test]
+    async fn a_status_flood_leaves_coin_reads_their_queue() {
+        let held_status = MINT_STATUS_WORKER.acquire().await.unwrap();
+        let mut held_scans = Vec::new();
+        while let Ok(permit) = COIN_SCAN_WORKERS.try_acquire() {
+            held_scans.push(permit);
+        }
+        let server = Arc::new(server(false));
+        let mut flood = tokio::task::JoinSet::new();
+        for _ in 0..MAX_COIN_READ_WAITERS + 16 {
+            let server = server.clone();
+            flood.spawn(async move {
+                server
+                    .get_mint_authorization_status(request(32))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        // Calls refused for a full queue show it full.
+        let mut refused = 0;
+        while refused < 16 {
+            let answered =
+                tokio::time::timeout(std::time::Duration::from_secs(60), flood.join_next())
+                    .await
+                    .expect("status calls past a full queue are refused at once")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(answered.unwrap_err().code(), tonic::Code::ResourceExhausted);
+            refused += 1;
+        }
+        let scan = tokio::spawn(coin_read_permit(&COIN_SCAN_WORKERS, "coin scan"));
+        for _ in 0..100 {
+            if scan.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        held_scans.pop();
+        let scanned = tokio::time::timeout(std::time::Duration::from_secs(60), scan)
+            .await
+            .expect("the scan is answered")
+            .unwrap();
+        eprintln!("REACH status-flood scan_ok={}", scanned.is_ok());
+        assert!(
+            scanned.is_ok(),
+            "STATUS-FLOOD-REFUSED-COIN-READ: {:?}",
+            scanned.err()
+        );
+        drop(held_status);
+    }
+
     #[tokio::test]
     async fn status_rpc_carries_every_field_and_classifies_failures() {
         assert_eq!(
@@ -3984,5 +4037,82 @@ mod retro_seniority_tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// While the lookup worker is busy, callers past a bounded queue are
+    /// answered busy at once rather than all waiting for it.
+    #[tokio::test]
+    async fn callers_past_the_queue_of_a_busy_lookup_are_refused() {
+        let held = RETRO_SENIORITY_WORKER.acquire().await.unwrap();
+        let server = Arc::new(NodeRpcServer::new());
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let server = server.clone();
+            calls.spawn(async move {
+                server
+                    .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                        public_keys: Vec::new(),
+                    }))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        let first = tokio::time::timeout(std::time::Duration::from_secs(60), calls.join_next())
+            .await
+            .map(|joined| joined.unwrap().unwrap().err().map(|status| status.code()));
+        eprintln!("REACH retro-queue answered={}", first.is_ok());
+        let code = first
+            .expect("RETRO-QUEUE-UNBOUNDED: 64 callers waited 60 s on a busy lookup, none refused")
+            .expect("RETRO-QUEUE-UNBOUNDED: a call ran while the worker was held");
+        assert_eq!(
+            code,
+            tonic::Code::ResourceExhausted,
+            "RETRO-QUEUE-UNBOUNDED"
+        );
+        drop(held);
+    }
+
+    /// A lookup whose call is cancelled keeps the worker until its scan
+    /// ends, so a dropped and resent request never runs beside it.
+    #[tokio::test]
+    async fn a_cancelled_lookup_keeps_the_worker_until_its_scan_ends() {
+        let server = Arc::new(NodeRpcServer::new());
+        // Distinct keys of the size a lookup reads: the first one parses
+        // the retro tables, which takes far longer than the steps below.
+        let keys: Vec<Vec<u8>> = (0..MAX_RETRO_SENIORITY_KEYS)
+            .map(|i| vec![i as u8; 57])
+            .collect();
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                        public_keys: keys,
+                    }))
+                    .await
+            })
+        };
+        while RETRO_SENIORITY_WORKER.available_permits() == 1 {
+            assert!(
+                !call.is_finished(),
+                "the lookup ended before it was seen holding the worker"
+            );
+            tokio::task::yield_now().await;
+        }
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        let free = RETRO_SENIORITY_WORKER.available_permits();
+        eprintln!("REACH retro-cancel free={free}");
+        assert_eq!(
+            free, 0,
+            "RETRO-SLOT-FREED-ON-CANCEL: the worker was free while the cancelled scan ran"
+        );
+        // Let the scan end before the runtime shuts down.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            RETRO_SENIORITY_WORKER.acquire(),
+        )
+        .await
+        .expect("the cancelled scan ends");
     }
 }
