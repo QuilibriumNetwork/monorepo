@@ -177,6 +177,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_REQUIRED_ANCHOR_EPOCH override active (localnet only)"
         );
     }
+    let strict_epoch = quil_types::consensus::init_strict_validation_epoch(network);
+    if network != 0 && strict_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = strict_epoch,
+            "QUIL_STRICT_VALIDATION_EPOCH override active (localnet only)"
+        );
+    }
     let issuance_epoch = quil_types::consensus::init_anchored_issuance_epoch(network);
     if network != 0 && issuance_epoch != u64::MAX {
         tracing::warn!(

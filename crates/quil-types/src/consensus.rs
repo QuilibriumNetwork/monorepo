@@ -800,6 +800,71 @@ pub fn set_required_anchor_epoch_for_thread(epoch: Option<u64>) {
     REQUIRED_ANCHOR_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which execution refuses three inputs no honest node
+/// makes: a hypergraph vertex write or removal at an application's
+/// metadata address (only its owner's update changes that vertex), a
+/// shard split leaving an empty spine shard that output addresses reach
+/// (no committee would deliver an output there), and a shard frame header
+/// whose fee total is neither empty nor 16 bytes (its output binds only
+/// the decoded value). Consensus-affecting: every node that executes
+/// GLOBAL or application frames must run a build with it before the epoch;
+/// an older build applies what the others refuse and its roots diverge.
+/// An application frame is judged by its certified GLOBAL anchor. Mainnet:
+/// none yet, set after a devnet crossing at measured adoption;
+/// `QUIL_STRICT_VALIDATION_EPOCH` elsewhere, never by default.
+pub const MAINNET_STRICT_VALIDATION_EPOCH: Option<u64> = None;
+
+static STRICT_VALIDATION_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STRICT_VALIDATION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn strict_validation_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STRICT_VALIDATION_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's strict validation epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_strict_validation_epoch(network: u8) -> u64 {
+    *STRICT_VALIDATION_EPOCH.get_or_init(|| {
+        strict_validation_epoch_for(
+            network,
+            std::env::var("QUIL_STRICT_VALIDATION_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_strict_validation_epoch`]; the mainnet epoch
+/// in a process that never called it. `u64::MAX` when the network has
+/// none.
+pub fn strict_validation_epoch() -> u64 {
+    if let Some(epoch) = STRICT_VALIDATION_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STRICT_VALIDATION_EPOCH.get_or_init(|| strict_validation_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` refuses the inputs
+/// [`MAINNET_STRICT_VALIDATION_EPOCH`] names.
+pub fn strict_validation_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= strict_validation_epoch()
+}
+
+/// Set the strict validation epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_strict_validation_epoch_for_thread(epoch: Option<u64>) {
+    STRICT_VALIDATION_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which GLOBAL prices a shard header's issuance at the
 /// difficulty of the GLOBAL frame it anchors to, read from GLOBAL's own clock
 /// (a header without an anchor at its own difficulty, at least the first of
@@ -4504,6 +4569,35 @@ mod required_anchor_epoch_tests {
         assert_eq!(
             super::required_anchor_epoch(),
             super::MAINNET_REQUIRED_ANCHOR_EPOCH.unwrap_or(u64::MAX)
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_validation_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_strict_validation_setting() {
+        let mainnet = super::MAINNET_STRICT_VALIDATION_EPOCH.unwrap_or(u64::MAX);
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::strict_validation_epoch_for(0, setting), mainnet);
+        }
+        assert_eq!(super::strict_validation_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::strict_validation_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::strict_validation_epoch_for(1, None), u64::MAX);
+    }
+
+    #[test]
+    fn strict_validation_starts_at_the_first_frame_of_its_epoch() {
+        super::set_strict_validation_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::strict_validation_active(u64::MAX - 1));
+        super::set_strict_validation_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::strict_validation_active(first - 1));
+        assert!(super::strict_validation_active(first));
+        super::set_strict_validation_epoch_for_thread(None);
+        assert_eq!(
+            super::strict_validation_epoch(),
+            super::MAINNET_STRICT_VALIDATION_EPOCH.unwrap_or(u64::MAX)
         );
     }
 }
