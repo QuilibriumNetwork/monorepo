@@ -232,7 +232,12 @@ impl PinnedSnapshot {
         };
         // SAFETY: the owning Arc keeps the DB at its stable address; the
         // private snapshot cannot escape and drops before that Arc.
-        let snapshot = unsafe { std::mem::transmute(snapshot) };
+        let snapshot = unsafe {
+            std::mem::transmute::<
+                rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+                rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>,
+            >(snapshot)
+        };
         let view = Arc::new(Self {
             iterators: Mutex::new(Vec::new()),
             snapshot: Mutex::new(Some(snapshot)),
@@ -298,7 +303,12 @@ impl PinnedSnapshot {
         // SAFETY: the iterator reads through the DB, which `_db` keeps alive
         // and which drops after `iterators`, and through the snapshot, which
         // `release` takes only after emptying `iterators`.
-        let iterator = unsafe { std::mem::transmute(iterator) };
+        let iterator = unsafe {
+            std::mem::transmute::<
+                rocksdb::DBRawIteratorWithThreadMode<'_, rocksdb::DB>,
+                rocksdb::DBRawIteratorWithThreadMode<'static, rocksdb::DB>,
+            >(iterator)
+        };
         Ok(ParkedIterator {
             lower: lower.to_vec(),
             upper: upper.to_vec(),

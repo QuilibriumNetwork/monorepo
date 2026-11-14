@@ -5954,12 +5954,14 @@ mod tests {
         )
         .await
         .is_err());
-        let failures = target.failures.lock().unwrap();
-        assert!(
-            failures.len() == 1 && failures[0].contains("re-anchor installation on this node: "),
-            "{failures:?}"
-        );
-        drop(failures);
+        {
+            let failures = target.failures.lock().unwrap();
+            assert!(
+                failures.len() == 1
+                    && failures[0].contains("re-anchor installation on this node: "),
+                "{failures:?}"
+            );
+        }
 
         // A sync that is not the attempt's touches nothing, lineage or not,
         // and is no failure of the re-anchor.

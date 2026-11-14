@@ -667,10 +667,7 @@ impl CommittedShardSizes {
         let mut kept = self.lock();
         drop(lock_wait);
         let first_count_wait = section("size: first count wait");
-        loop {
-            let Some(entry) = kept.get_mut(&key) else {
-                break;
-            };
+        while let Some(entry) = kept.get_mut(&key) {
             let Some(size) = entry.size.clone() else {
                 kept = self
                     .kept

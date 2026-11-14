@@ -265,7 +265,7 @@ impl CatchUp {
             frames,
             head_frames: head.saturating_sub(previous.head),
             secs: elapsed.as_secs(),
-            ms_per_frame: if frames == 0 { 0 } else { ms / frames },
+            ms_per_frame: ms.checked_div(frames).unwrap_or(0),
             in_place: self.in_place - previous.in_place,
             ingest_wait_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
             counts: counts.since(previous.counts),

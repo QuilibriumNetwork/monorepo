@@ -149,7 +149,7 @@ impl VectorCommitmentTree {
         if key.is_empty() {
             return None;
         }
-        let (polys, commits, ys, paths) = prove_recursive(self.root.as_ref()?, key, 0, prover)?;
+        let (polys, commits, ys, paths) = prove_recursive(self.root.as_ref()?, key, 0)?;
         if commits.is_empty() {
             return None;
         }
@@ -294,7 +294,7 @@ impl VectorCommitmentTree {
             if key.is_empty() {
                 continue;
             }
-            let Some((polys, commits, ys, paths)) = prove_recursive(root, key, 0, prover) else {
+            let Some((polys, commits, ys, paths)) = prove_recursive(root, key, 0) else {
                 continue;
             };
             if commits.is_empty() {
@@ -400,7 +400,6 @@ fn prove_recursive(
     node: &VectorCommitmentNode,
     key: &[u8],
     depth: usize,
-    prover: &(dyn InclusionProver + Sync),
 ) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<i32>>)> {
     match node {
         VectorCommitmentNode::Leaf(leaf) => {
@@ -443,8 +442,7 @@ fn prove_recursive(
             };
 
             let child = branch.children[idx].as_deref()?;
-            let (mut pl, mut co, mut ys, mut pa) =
-                prove_recursive(child, key, d + BRANCH_BITS, prover)?;
+            let (mut pl, mut co, mut ys, mut pa) = prove_recursive(child, key, d + BRANCH_BITS)?;
 
             let mut path: Vec<i32> = branch.prefix.clone();
             path.push(final_nibble);

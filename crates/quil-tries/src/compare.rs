@@ -121,9 +121,8 @@ fn with_prefix(
         // Both sides should share their compressed prefix when in the
         // same logical position; if they diverge the extra nibbles are
         // logged through whichever side is longer.
-        let prefix = if l.prefix == r.prefix {
-            &l.prefix
-        } else if l.prefix.len() >= r.prefix.len() {
+        // Equal prefixes have equal lengths, so they take the first arm.
+        let prefix = if l.prefix.len() >= r.prefix.len() {
             &l.prefix
         } else {
             &r.prefix
