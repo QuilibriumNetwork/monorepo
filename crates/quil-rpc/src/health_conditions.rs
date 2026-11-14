@@ -624,7 +624,9 @@ pub struct HealthRegistry {
     /// When each kind's (worker core, shard) was first judged in the state
     /// that kind holds over the base window.
     held_since: HashMap<(i32, u32, Vec<u8>), u64>,
-    shards: Vec<ShardObservation>,
+    /// Each shard's latest served row and when it was served
+    /// ([`Self::observe_shards`]).
+    shards: BTreeMap<Vec<u8>, (ShardObservation, u64)>,
     shards_seen_ms: u64,
     seats: Vec<SeatShare>,
     seats_seen_ms: u64,
@@ -1315,10 +1317,25 @@ impl HealthRegistry {
         judged
     }
 
-    /// Record one served shard info's rows.
+    /// Record one served shard info's rows. An answer may cover only some
+    /// shards (asked without `include_all`, it serves the allocated ones):
+    /// each row replaces its shard's, and the other shards' rows stand until
+    /// none was served for [`OBSERVATION_GAP_MS`].
     pub fn observe_shards(&mut self, rows: Vec<ShardObservation>, now_ms: u64) {
-        self.shards = rows;
+        self.shards
+            .retain(|_, (_, seen_ms)| now_ms.saturating_sub(*seen_ms) <= OBSERVATION_GAP_MS);
+        for row in rows {
+            self.shards.insert(row.filter.clone(), (row, now_ms));
+        }
         self.shards_seen_ms = now_ms;
+    }
+
+    /// The shards' rows served within [`OBSERVATION_GAP_MS`] of `now_ms`.
+    fn served_shards(&self, now_ms: u64) -> impl Iterator<Item = &ShardObservation> {
+        self.shards
+            .values()
+            .filter(move |(_, seen_ms)| now_ms.saturating_sub(*seen_ms) <= OBSERVATION_GAP_MS)
+            .map(|(row, _)| row)
     }
 
     /// Record this node's seats reporting a certificate share.
@@ -1385,7 +1402,7 @@ impl HealthRegistry {
             return Default::default();
         }
         let (mut halt, mut halt_tracked, mut lag, mut lag_tracked) = (Vec::new(), 0, Vec::new(), 0);
-        for shard in &self.shards {
+        for shard in self.served_shards(now_ms) {
             if let Some(serving) = shard.serving_provers {
                 halt_tracked += 1;
                 if shard.holds_data
@@ -1423,7 +1440,9 @@ impl HealthRegistry {
             return (hour, day, seats);
         }
         for worker in self.workers.iter().filter(|w| w.earning) {
-            let row = self.shards.iter().find(|s| s.filter == worker.filter);
+            let row = self
+                .served_shards(now_ms)
+                .find(|s| s.filter == worker.filter);
             if let Some((h, d)) = row.and_then(|s| s.forecast) {
                 hour += u128::from(h);
                 day += u128::from(d);
@@ -4401,6 +4420,53 @@ mod tests {
             .find(|s| s.kind == ConditionKind::ShardHaltRisk as i32)
             .unwrap();
         assert_eq!((source.observed_unix_ms, source.tracked), (0, 0));
+    }
+
+    /// An answer for the allocated shards only (`qclient node prover
+    /// shards`) refreshes their rows and leaves the other shards' standing,
+    /// rather than dropping them from the shard conditions; a row no answer
+    /// served for the gap goes: evaluations skip it at once (they run every
+    /// 15 s, answers only when asked) and the next answer drops it.
+    #[test]
+    fn a_partial_shard_answer_keeps_the_other_shards() {
+        fn halt_tracked(reg: &mut HealthRegistry, now_ms: u64) -> u32 {
+            reg.evaluate(now_ms, &no_cadence);
+            reg.snapshot()
+                .sources
+                .into_iter()
+                .find(|s| s.kind == ConditionKind::ShardHaltRisk as i32)
+                .unwrap()
+                .tracked
+        }
+        let mut reg = HealthRegistry::default();
+        reg.observe_shards(vec![shard(1, Some(1), true), shard(2, Some(9), true)], T0);
+        let partial = T0 + 1_000;
+        reg.observe_shards(vec![shard(2, Some(9), true)], partial);
+        reg.evaluate(partial, &no_cadence);
+        let c = current(&reg, ConditionKind::ShardHaltRisk);
+        assert_eq!(
+            c.map(|c| (c.affected, c.tracked)),
+            Some((1, 2)),
+            "partial_answer_replaced: shard 1 was not in the second answer"
+        );
+        assert_eq!(
+            halt_tracked(&mut reg, T0 + OBSERVATION_GAP_MS),
+            2,
+            "gap_edge_dropped: shard 1 was served exactly the gap ago"
+        );
+        let later = T0 + OBSERVATION_GAP_MS + 1;
+        assert_eq!(
+            halt_tracked(&mut reg, later),
+            1,
+            "stale_row_served: no answer served shard 1 for the gap"
+        );
+        reg.observe_shards(vec![shard(2, Some(9), true)], later);
+        assert_eq!(
+            reg.shards.len(),
+            1,
+            "stale_row_kept: an answer after the gap left shard 1's row"
+        );
+        assert_eq!(halt_tracked(&mut reg, later), 1);
     }
 
     fn reward_row(filter: u8, hour: (u64, u64), day: (u64, u64)) -> ShardRewardInfo {
