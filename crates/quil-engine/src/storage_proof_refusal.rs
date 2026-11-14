@@ -7,14 +7,17 @@
 //! (`storage_epoch_proof::REFUSED_LATE`, `REFUSED_DUPLICATE`). One info line
 //! per proof, at most [`LINES_PER_FRAME`] a frame. A proof that does not
 //! parse (a malformed binding, say) is named by the member bytes it starts
-//! with, its seats unlisted. Logging only: which proofs are accepted does
-//! not change.
+//! with, its seats unlisted. A sector's capacity precommit or certificate
+//! travels as a storage epoch proof too, but settles and seals nothing: it
+//! is named as such, by the epoch it is for. Logging only: which proofs are
+//! accepted does not change.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
+use quil_execution::global_intrinsic::persistent_storage::{capacity_message, CapacityMessage};
 use quil_execution::global_intrinsic::storage_epoch_proof::{
     StorageEpochProof, REFUSED_DUPLICATE, REFUSED_LATE, TYPE_STORAGE_EPOCH_PROOF,
 };
@@ -35,10 +38,11 @@ const REASON_CHARS: usize = 400;
 pub(crate) struct Refused {
     /// The member's prover address, first 8 bytes in hex.
     pub(crate) prover: String,
-    /// Each seat: shard filter, the epoch it settles and the one it seals.
+    /// Each seat: shard filter, the epoch it settles and the one it seals;
+    /// for a capacity message, which one and the epoch it is for.
     pub(crate) seats: String,
     pub(crate) more_seats: usize,
-    /// `duplicate`, `deadline_miss`, `malformed` or `other`.
+    /// `capacity`, `duplicate`, `deadline_miss`, `malformed` or `other`.
     pub(crate) kind: &'static str,
     pub(crate) reason: String,
 }
@@ -131,6 +135,22 @@ fn storage_proofs(raw: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn describe(proof: &StorageEpochProof, reason: &str) -> Refused {
+    if capacity_message(proof) {
+        let seats = match CapacityMessage::decode(proof) {
+            Ok(message) if message.proof.is_empty() => {
+                format!("capacity precommit for epoch {}", message.epoch)
+            }
+            Ok(message) => format!("capacity certificate for epoch {}", message.epoch),
+            Err(_) => "capacity message".into(),
+        };
+        return Refused {
+            prover: hex::encode(&proof.member[..8]),
+            seats,
+            more_seats: 0,
+            kind: "capacity",
+            reason: reason.chars().take(REASON_CHARS).collect(),
+        };
+    }
     let seats = proof
         .seats
         .iter()
@@ -177,6 +197,21 @@ pub(crate) fn note(frame: u64, raw: &[u8], reason: &str) {
             .refused(frame, raw, reason)
     };
     for refused in refused {
+        if refused.kind == "capacity" {
+            tracing::info!(
+                frame,
+                prover = %refused.prover,
+                seats = %refused.seats,
+                kind = refused.kind,
+                reason = %refused.reason,
+                scope = "peer",
+                "sector capacity message refused: a precommit or certificate of one of this \
+                 prover's sectors, which settles and seals nothing, so no settlement or seal is \
+                 lost; that sector's certification waits until GLOBAL takes one (reported once \
+                 a message)"
+            );
+            continue;
+        }
         tracing::info!(
             frame,
             prover = %refused.prover,
@@ -298,6 +333,44 @@ mod tests {
             log.refused(8, &bundle(proof(0xEE, 1)), "x").0.len(),
             1,
             "named in a later frame"
+        );
+    }
+
+    /// A refused sector capacity precommit is named as one, by the epoch it
+    /// is for, in a line that says no settlement is lost: it settles and
+    /// seals nothing. It was named as a seat sealing that epoch, in a line
+    /// saying its prover loses each settlement and seal in it.
+    #[test]
+    fn a_refused_capacity_precommit_is_named_as_one_losing_no_settlement() {
+        use quil_crypto::persistent_storage::{Certificate, Profile};
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let precommit = CapacityMessage {
+            member: [0x6A; 32],
+            epoch: 1500,
+            certificate: Certificate {
+                profile: Profile::Eleven,
+                sector: [7; 32],
+                n: 4,
+                columns: [0; 32],
+                labels: [0; 32],
+            },
+            signed_at: 1_080_020,
+            signature: vec![1; 96],
+            proof: Vec::new(),
+        }
+        .envelope()
+        .to_canonical_bytes();
+        let reason = "capacity certificate: precommit outside warmup window: epoch 1500, \
+                      current 1501, signed_at 1080020";
+        note(1_080_740, &bundle(precommit), reason);
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("sector capacity message refused")
+                && logged.contains("capacity precommit for epoch 1500")
+                && logged.contains("no settlement or seal is lost")
+                && !logged.contains("loses each settlement"),
+            "CAPACITY_KIND: a refused capacity precommit was not named as one losing no \
+             settlement: {logged}"
         );
     }
 }
