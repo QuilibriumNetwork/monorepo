@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod allocation_reasons;
 pub mod draining;
+pub(crate) mod hosted_sessions;
 pub(crate) mod leave_decisions;
 pub mod lifecycle;
 pub(crate) mod plan;

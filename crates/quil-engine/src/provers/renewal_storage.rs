@@ -58,6 +58,16 @@ struct State {
 #[derive(Default)]
 pub(crate) struct RenewalStorageNotes(Mutex<State>);
 
+/// The seats noted encoding, with the epoch each registers, for the restart
+/// verdict (`crate::restart_readiness::note_saved_encodes`).
+fn saved_encodes(seats: &HashMap<Vec<u8>, (u64, RenewalStorage)>) -> HashMap<Vec<u8>, u64> {
+    seats
+        .iter()
+        .filter(|(_, (_, storage))| *storage == RenewalStorage::Encoding)
+        .map(|(filter, (epoch, _))| (filter.clone(), *epoch))
+        .collect()
+}
+
 fn load(db: &quil_store::RocksDb, key: &[u8]) -> Result<Vec<Note>, String> {
     use quil_types::store::KvDb;
     let Some(bytes) = db.get(key).map_err(|e| e.to_string())? else {
@@ -103,6 +113,7 @@ impl RenewalStorageNotes {
             .map(|n| (n.filter, (n.epoch, n.storage)))
             .collect();
         state.store = Some((db, key));
+        crate::restart_readiness::note_saved_encodes(saved_encodes(&state.seats));
         if !state.seats.is_empty() {
             let mut seats: Vec<String> = state
                 .seats
@@ -140,8 +151,12 @@ impl RenewalStorageNotes {
         if state.seats == before {
             return;
         }
-        if let Err(error) = Self::save(&state) {
-            if state.save_warned.is_none_or(|warned| warned < epoch) {
+        match Self::save(&state) {
+            Ok(()) if state.store.is_some() => {
+                crate::restart_readiness::note_saved_encodes(saved_encodes(&state.seats));
+            }
+            Ok(()) => {}
+            Err(error) if state.save_warned.is_none_or(|warned| warned < epoch) => {
                 state.save_warned = Some(epoch);
                 warn!(epoch, %error, seats = state.seats.len(), scope = "this node",
                     action = "check this node's store (disk space, permissions)",
@@ -149,6 +164,7 @@ impl RenewalStorageNotes {
                      seat whose storage is encoding before the confirm pipeline prepares it again \
                      (warned once per epoch)");
             }
+            Err(_) => {}
         }
     }
 
@@ -178,6 +194,21 @@ impl RenewalStorageNotes {
     /// `filter`'s storage work and the epoch it registers, if noted.
     pub(crate) fn get(&self, filter: &[u8]) -> Option<(u64, RenewalStorage)> {
         self.0.lock().ok()?.seats.get(filter).copied()
+    }
+
+    /// The seats whose storage for `epoch` was last noted encoding, sorted.
+    pub(crate) fn encoding(&self, epoch: u64) -> Vec<Vec<u8>> {
+        let Ok(state) = self.0.lock() else {
+            return Vec::new();
+        };
+        let mut seats: Vec<Vec<u8>> = state
+            .seats
+            .iter()
+            .filter(|(_, noted)| **noted == (epoch, RenewalStorage::Encoding))
+            .map(|(filter, _)| filter.clone())
+            .collect();
+        seats.sort();
+        seats
     }
 }
 

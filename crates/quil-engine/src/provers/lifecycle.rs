@@ -644,6 +644,17 @@ fn renewal_grace(frame_number: u64) -> Option<(u64, u64)> {
     })
 }
 
+/// The epoch whose snapshots a node started at GLOBAL `frame_number`
+/// requests at its registry load when they were noted encoding
+/// ([`ProverLifecycle::noted_snapshot_encodes`]): the epoch a renewal then
+/// registers, from its snapshot frame until the renewal's grace frame.
+pub(crate) fn noted_encode_epoch(frame_number: u64) -> Option<u64> {
+    let (epoch, grace_frame) = renewal_grace(frame_number)?;
+    (frame_number >= quil_types::consensus::storage_snapshot_frame(epoch)
+        && frame_number < grace_frame)
+        .then_some(epoch)
+}
+
 /// Tracks the lifecycle state for this node's prover.
 pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
@@ -787,6 +798,11 @@ pub struct ProverLifecycle {
     /// epoch (`note_renewal_storage`); kept in the node's store from
     /// `configure_leave_decision_store` on, so a restart keeps them.
     renewal_storage: super::renewal_storage::RenewalStorageNotes,
+    /// Which session each bound seat's worker was last seen hosting, kept
+    /// in the node's store from `configure_leave_decision_store` on, so a
+    /// restart spares a seat that hosted until then the settle period
+    /// (`super::session_hosting::SessionHosting::resume`).
+    hosted_sessions: super::hosted_sessions::HostedSessions,
     /// Seats whose renewal a leave skipped while their storage work was
     /// under way, with the epoch they were last warned of in
     /// (`renewal_awaits_leave`).
@@ -913,6 +929,7 @@ impl ProverLifecycle {
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             leave_landing_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
+            hosted_sessions: super::hosted_sessions::HostedSessions::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
             unbound_renewals_reported: std::sync::Mutex::new(HashMap::new()),
             unlanded_leaves_reported: Default::default(),
@@ -1190,14 +1207,22 @@ impl ProverLifecycle {
     }
 
     /// Load durable rejection decisions before enabling lifecycle dispatch,
-    /// and the capacity shed's storage notes (`note_renewal_storage`): the
+    /// the capacity shed's storage notes (`note_renewal_storage`): the
     /// first shed after a restart runs before the confirm pipeline prepares
-    /// any seat again.
+    /// any seat again, and the seats' hosting records, read at each seat's
+    /// first observation (`super::session_hosting::SessionHosting::resume`).
     pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
         self.allocation_reasons
             .attach(db.clone(), &self.prover_address)?;
         self.renewal_storage
             .attach(db.clone(), &self.prover_address);
+        let hosted = self
+            .hosted_sessions
+            .attach(db.clone(), &self.prover_address);
+        self.session_hosting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restore(hosted);
         self.leave_decisions.attach(db, &self.prover_address)
     }
 
@@ -1414,6 +1439,19 @@ impl ProverLifecycle {
     ) {
         let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
         self.renewal_storage.note(epoch, encoded, encoding);
+    }
+
+    /// The seats whose storage for the epoch a renewal at `frame_number`
+    /// registers was last noted encoding (`note_renewal_storage`), restored
+    /// from before a restart, between that epoch's snapshot frame and the
+    /// renewal's grace frame: their snapshots are requested at the registry
+    /// load (`crate::prover_pipeline::ProverPipeline::request_noted_snapshots`),
+    /// not first at a renewal the settle period or a GLOBAL frame may hold.
+    pub fn noted_snapshot_encodes(&self, frame_number: u64) -> Vec<Vec<u8>> {
+        let Some(epoch) = noted_encode_epoch(frame_number) else {
+            return Vec::new();
+        };
+        self.renewal_storage.encoding(epoch)
     }
 
     /// `filter`'s storage work for the epoch a renewal at `frame_number`
@@ -3105,6 +3143,9 @@ impl ProverLifecycle {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let epoch_frames = quil_types::consensus::epoch_length_frames();
+            // Member seats whose worker hosts the session, for the record a
+            // restart reads (`hosted_sessions`).
+            let mut hosted_now: Vec<(Vec<u8>, u32, [u8; 32])> = Vec::new();
             for (core_id, filter) in &bound {
                 use super::session_hosting::{classify, Hosting, Seat};
                 let report = executions
@@ -3118,7 +3159,7 @@ impl ProverLifecycle {
                     report.unwrap_or(&Default::default()),
                     now,
                 );
-                let seat = if members.contains(filter) {
+                let seat = if members.contains_key(filter) {
                     Seat::Member
                 } else if lapsed.contains(filter.as_slice()) {
                     Seat::Lapsed
@@ -3148,6 +3189,11 @@ impl ProverLifecycle {
                     observed,
                     Hosting::Hosting | Hosting::Voting | Hosting::Silent { .. }
                 );
+                let session = members.get(filter);
+                if let Some(session) = session.filter(|_| observed.able(seat)) {
+                    hosted_now.push((filter.clone(), *core_id, *session));
+                }
+                hosting.resume(frame_number, epoch_frames, filter, *core_id, session);
                 let instance = super::session_hosting::Instance::of(report);
                 let events = hosting.observe_votes(
                     frame_number,
@@ -3189,7 +3235,26 @@ impl ProverLifecycle {
                     );
                 }
             }
+            for (filter, run) in hosting.take_resumed() {
+                tracing::info!(frame = frame_number, filter = hex::encode(&filter), core_id = run.core_id,
+                    hosted_until = run.since, frames_since = frame_number.saturating_sub(run.since),
+                    state = %run.state, blocker = %run.blocker, scope = "local",
+                    reason = "its worker hosted the session that counts it until this node stopped",
+                    "seat renewal skips the settle period after this start: its worker is not hosting yet, \
+                     and the seat is withheld only if its worker cannot host for an epoch from the frame \
+                     named, as without the restart");
+            }
             hosting.retain_bound(&worker_bound_filters);
+            hosting.expire_restored(frame_number, epoch_frames);
+            drop(hosting);
+            if membership_known {
+                self.hosted_sessions.note(
+                    frame_number,
+                    epoch_frames,
+                    &hosted_now,
+                    &worker_bound_filters,
+                );
+            }
         }
         // A worker whose seat was withheld for sending no vote takes no new
         // seats until it votes, restarts on that seat or the hold expires
@@ -8548,6 +8613,172 @@ mod proposal_loop_tests {
         lc.halt_state().mark_halted(vec![0xB5; 32]);
         assert!(evaluate(&lc, 1442));
         assert!(lc.session_hosting.lock().unwrap().held_back().is_empty());
+    }
+
+    /// A restart at a renewal boundary: five frames past the snapshot
+    /// frame, thirty before the grace frame, sixty before the epoch's end.
+    /// A seat whose worker hosted the session that counts it until the node
+    /// stopped renews at the first evaluation after the start while the
+    /// worker is still starting. Without the saved record the seat waits the
+    /// settle period, which sixty frames before the epoch's end leaves no
+    /// renewal window; a record older than a settle period at the first
+    /// observation waits too.
+    #[test]
+    fn a_seat_hosted_until_a_restart_at_a_boundary_renews_without_the_settle_period() {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB1; 32];
+        let seated = session_authority(&[(&held, vec![local.clone(), other.clone()])]);
+        let report = |state: &str| WorkerExecution {
+            state: state.into(),
+            blocker: "shard catch-up after the restart".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(),
+            ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction]| {
+            actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held)))
+        };
+        // Registered through epoch 1: it renews for epoch 2 in epoch 1.
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local.clone(),
+            ..prover(address.clone(), vec![renewing(held.clone())])
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let workers = |state: &str| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.set_execution(1, &held, report(state));
+            wm
+        };
+        let started = |wm: &Arc<ConfigurableWorkerManager>,
+                       db: Option<&Arc<quil_store::RocksDb>>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(seated.clone());
+            if let Some(db) = db {
+                lc.configure_leave_decision_store(db.clone()).unwrap();
+            }
+            lc
+        };
+        let evaluate = |lc: &ProverLifecycle, wm: &ConfigurableWorkerManager, frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 50_000, reg.as_ref(), wm).unwrap()
+        };
+        let snapshot = quil_types::consensus::storage_snapshot_frame(2);
+        let grace = snapshot + quil_types::consensus::storage_snapshot_grace();
+        let end = quil_types::consensus::epoch_length_frames() * 2;
+        let settle = crate::provers::session_hosting::settle_frames(
+            quil_types::consensus::epoch_length_frames(),
+        );
+        assert!(
+            end - 60 + settle >= end,
+            "the settle period outlasts the epoch"
+        );
+        for restart in [snapshot + 5, grace - 30, end - 60] {
+            let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+            let serving = workers("serving");
+            let before = started(&serving, Some(&db));
+            evaluate(&before, &serving, restart - 3);
+
+            let starting = workers("syncing");
+            let after = started(&starting, Some(&db));
+            let actions = evaluate(&after, &starting, restart);
+            assert!(
+                renews(&actions),
+                "settle_hold_not_skipped at {restart}: {actions:?}"
+            );
+
+            let unsaved = started(&starting, None);
+            assert!(
+                !renews(&evaluate(&unsaved, &starting, restart)),
+                "without the record the seat waits at {restart}"
+            );
+            let late = started(&starting, Some(&db));
+            assert!(
+                !renews(&evaluate(&late, &starting, restart - 3 + settle + 1)),
+                "stale_record_skipped_the_hold at {restart}"
+            );
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// After a restart, a seat the allocator binds to its worker only after
+    /// the first evaluation still skips the settle period, and its saved
+    /// record survives that evaluation for the next start.
+    #[test]
+    fn a_seat_bound_after_the_first_evaluation_after_a_restart_skips_the_settle_period() {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB2; 32];
+        let seated = session_authority(&[(&held, vec![local.clone(), other.clone()])]);
+        let report = |state: &str| WorkerExecution {
+            state: state.into(),
+            blocker: "shard catch-up after the restart".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(),
+            ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction]| {
+            actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held)))
+        };
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local.clone(),
+            ..prover(address.clone(), vec![renewing(held.clone())])
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let started = |wm: &Arc<ConfigurableWorkerManager>, db: &Arc<quil_store::RocksDb>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(seated.clone());
+            lc.configure_leave_decision_store(db.clone()).unwrap();
+            lc
+        };
+        let evaluate = |lc: &ProverLifecycle, wm: &ConfigurableWorkerManager, frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 50_000, reg.as_ref(), wm).unwrap()
+        };
+        let snapshot = quil_types::consensus::storage_snapshot_frame(2);
+        let restart = snapshot + quil_types::consensus::storage_snapshot_grace() - 30;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let serving = Arc::new(ConfigurableWorkerManager::new());
+        serving.add(allocated_worker(1, held.clone()));
+        serving.set_execution(1, &held, report("serving"));
+        evaluate(&started(&serving, &db), &serving, restart - 3);
+
+        // The first evaluation after the start sees the worker unbound.
+        let starting = Arc::new(ConfigurableWorkerManager::new());
+        starting.add(idle_worker(1));
+        let after = started(&starting, &db);
+        evaluate(&after, &starting, restart);
+        starting.add(allocated_worker(1, held.clone()));
+        starting.set_execution(1, &held, report("syncing"));
+        let again = started(&starting, &db);
+        assert!(
+            renews(&evaluate(&after, &starting, restart + 3)),
+            "unbound_seat_record_dropped: the seat bound after the first evaluation waits"
+        );
+        assert!(
+            renews(&evaluate(&again, &starting, restart + 3)),
+            "unbound_seat_record_dropped: the saved record was dropped"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     /// A seat whose renewal was withheld because its worker cannot host

@@ -68,10 +68,44 @@ impl Verdict {
     }
 }
 
+/// The seats whose snapshot encode this node noted under way and saved
+/// (`crate::provers::renewal_storage`), with the epoch each registers: a
+/// restarted node asks for those encodes again at its registry load
+/// (`crate::prover_pipeline::ProverPipeline::request_noted_snapshots`).
+static SAVED_ENCODES: Mutex<Option<HashMap<Vec<u8>, u64>>> = Mutex::new(None);
+
+/// Note the saved encoding notes, `seats` with the epoch each registers.
+pub(crate) fn note_saved_encodes(seats: HashMap<Vec<u8>, u64>) {
+    *SAVED_ENCODES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seats);
+}
+
+/// Whether a node restarted at GLOBAL `frame` asks for `filter`'s encode
+/// again at its registry load: its note is saved for the epoch whose
+/// snapshots a start then requests
+/// (`crate::provers::lifecycle::noted_encode_epoch`).
+fn resumes_at_load(filter: &[u8], frame: Option<u64>) -> bool {
+    let Some(epoch) = frame.and_then(crate::provers::lifecycle::noted_encode_epoch) else {
+        return false;
+    };
+    SAVED_ENCODES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|seats| seats.get(filter))
+        == Some(&epoch)
+}
+
 /// How long a restarted node takes before it asks for the seat's encode
-/// again: the settle hold of a seat whose worker is not yet hosting
-/// (`crate::provers::session_hosting::settle_frames`) and the sync.
-fn startup(frame: Option<u64>) -> Duration {
+/// again: the sync, which a seat whose encode is asked for at the registry
+/// load (`resumed_at_load`, [`resumes_at_load`]) waits alone; any other
+/// waits for its renewal, after the settle hold of a seat whose worker is
+/// not yet hosting (`crate::provers::session_hosting::settle_frames`).
+fn startup(frame: Option<u64>, resumed_at_load: bool) -> Duration {
+    if resumed_at_load {
+        return RESTART_SYNC;
+    }
     let frames = crate::provers::session_hosting::settle_frames(
         quil_types::consensus::epoch_length_frames(),
     );
@@ -83,16 +117,18 @@ fn startup(frame: Option<u64>) -> Duration {
 }
 
 /// The verdict from a seat's `encode` and its committee `margin`, and the
-/// time a restart adds to the encode. A committee with no spare voter stops
-/// with the member whatever the encode; else a restart costs the share when
-/// the encode, delayed by the work lost and the start-up, would end past the
+/// time a restart adds to the encode, asked for again at the registry load
+/// when `resumed_at_load`. A committee with no spare voter stops with the
+/// member whatever the encode; else a restart costs the share when the
+/// encode, delayed by the work lost and the start-up, would end past the
 /// grace frame.
 pub(crate) fn assess(
     encode: Option<EncodeState>,
     margin: Option<i64>,
     frame: Option<u64>,
+    resumed_at_load: bool,
 ) -> (Verdict, Duration) {
-    let restart = encode.map_or(Duration::ZERO, |e| e.lost + startup(frame));
+    let restart = encode.map_or(Duration::ZERO, |e| e.lost + startup(frame, resumed_at_load));
     let verdict = if margin.is_some_and(|m| m <= 0) {
         Verdict::StopsShard
     } else if let Some(e) = encode {
@@ -120,7 +156,11 @@ pub fn seat_readiness(filter: &[u8], margin: Option<i64>) -> RestartReadiness {
 /// change creates from it), and its verdict.
 pub fn shards_readiness(shards: &[Vec<u8>], margin: Option<i64>) -> (RestartReadiness, Verdict) {
     let encode = crate::storage_snapshot::seat_encode(shards);
-    let (verdict, restart) = assess(encode, margin, crate::storage_snapshot::global_frame());
+    let frame = crate::storage_snapshot::global_frame();
+    let resumed = shards
+        .first()
+        .is_some_and(|seat| resumes_at_load(seat, frame));
+    let (verdict, restart) = assess(encode, margin, frame, resumed);
     let to_u32 = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
     let readiness = RestartReadiness {
         verdict: verdict.name().into(),
@@ -191,7 +231,7 @@ mod tests {
     }
 
     fn verdict(encode: Option<EncodeState>, margin: Option<i64>) -> Verdict {
-        assess(encode, margin, Some(1)).0
+        assess(encode, margin, Some(1), false).0
     }
 
     #[test]
@@ -210,9 +250,64 @@ mod tests {
     #[test]
     fn a_restart_that_pushes_the_encode_past_grace_costs_the_share() {
         let state = encode(true, 10, 7, Some(25));
-        let (verdict, restart) = assess(Some(state), Some(3), Some(1));
+        let (verdict, restart) = assess(Some(state), Some(3), Some(1), false);
         assert_eq!(verdict, Verdict::CostsShare);
         assert!(restart > Duration::from_secs(7 * 60), "{restart:?}");
+    }
+
+    /// A seat whose encode a restarted node asks for again at its registry
+    /// load waits only the sync, not the settle hold: a restart that costs
+    /// another seat its share is ok for it.
+    #[test]
+    fn a_seat_whose_encode_resumes_at_load_costs_only_the_sync() {
+        let state = encode(true, 10, 7, Some(25));
+        assert_eq!(
+            assess(Some(state), Some(3), Some(1), false).0,
+            Verdict::CostsShare
+        );
+        assert_eq!(
+            assess(Some(state), Some(3), Some(1), true),
+            (Verdict::Ok, Duration::from_secs(7 * 60) + RESTART_SYNC),
+            "restart_cost_counts_the_settle_hold"
+        );
+    }
+
+    /// Only a seat whose encoding note is saved, for the epoch a start at
+    /// the frame requests, is asked for again at the registry load; a note
+    /// held in memory only, an encoded seat, a frame outside the snapshot
+    /// window and no GLOBAL frame are not.
+    #[test]
+    fn only_a_saved_encoding_note_in_its_window_resumes_at_load() {
+        use crate::provers::renewal_storage::RenewalStorageNotes;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 2;
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace = snapshot + quil_types::consensus::storage_snapshot_grace();
+        let [encoding, encoded, unsaved] = [0xC1u8, 0xC2, 0xC3].map(|b| vec![b; 32]);
+        let saved = RenewalStorageNotes::default();
+        saved.attach(
+            std::sync::Arc::new(quil_store::RocksDb::open_in_memory().unwrap()),
+            &[7; 32],
+        );
+        saved.note(
+            epoch,
+            std::slice::from_ref(&encoded),
+            std::slice::from_ref(&encoding),
+        );
+        RenewalStorageNotes::default().note(epoch, &[], std::slice::from_ref(&unsaved));
+        assert!(
+            !resumes_at_load(&unsaved, Some(snapshot + 5)),
+            "unsaved_note_resumes: a note held in memory is lost with the process"
+        );
+        assert!(
+            resumes_at_load(&encoding, Some(snapshot + 5)),
+            "restart_cost_counts_the_settle_hold"
+        );
+        assert!(!resumes_at_load(&encoded, Some(snapshot + 5)));
+        for frame in [Some(snapshot - 1), Some(grace), None] {
+            assert!(!resumes_at_load(&encoding, frame), "{frame:?}");
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     #[test]

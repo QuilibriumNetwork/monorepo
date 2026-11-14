@@ -1878,8 +1878,8 @@ impl WorkerAllocator {
             .unwrap_or_else(|e| e.into_inner()) = Some(global);
     }
 
-    /// Of `filters`, those whose current committee session counts `member`
-    /// ([`crate::app_handoff::member_sessions`]). Empty without authenticated
+    /// Of `filters`, those whose current committee session counts `member`,
+    /// with its id ([`crate::app_handoff::member_sessions`]). Empty without authenticated
     /// GLOBAL state or when it is unreadable: no seat is then held to
     /// hosting a session. `None` while a GLOBAL state sync withholds the
     /// committed view: membership is then unknown, not empty.
@@ -1887,7 +1887,7 @@ impl WorkerAllocator {
         &self,
         filters: &[Vec<u8>],
         member: &[u8],
-    ) -> Option<std::collections::HashSet<Vec<u8>>> {
+    ) -> Option<std::collections::HashMap<Vec<u8>, [u8; 32]>> {
         let Some(global) = self
             .session_authority
             .read()
