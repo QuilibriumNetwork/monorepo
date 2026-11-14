@@ -61,7 +61,7 @@ pub const OUTER_CONFIG_KEY: [u8; 1] = [16u8 << 2]; // 0x40
 /// `unpackAndVerifyTokenConfigurationMetadata`:
 ///
 /// 1. Load `[domain || HYPERGRAPH_METADATA_ADDRESS]` vertex data (outer
-/// tree serialized blob).
+///    tree serialized blob).
 /// 2. Deserialize as a `VectorCommitmentTree`.
 /// 3. Read key `[0x40]` → serialized inner tree bytes.
 /// 4. Deserialize the inner tree.

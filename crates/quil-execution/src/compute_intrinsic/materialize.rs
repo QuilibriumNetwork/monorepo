@@ -236,8 +236,8 @@ pub fn materialize_compute_update(
 /// - index 1: serialized DAG (op→deps map)
 /// - index 2: serialized stages (topological levels)
 /// - indices 3+: per-operation metadata (Application + identifier +
-/// stage + read/write sets — read/write sets are empty for
-/// intrinsic contexts, matching Go's `TODO(2.2)` behaviour)
+///   stage + read/write sets — read/write sets are empty for
+///   intrinsic contexts, matching Go's `TODO(2.2)` behaviour)
 ///
 /// The vertex address is `poseidon(domain || rendezvous)` and the
 /// value written to `state.set` is the serialized indexed tree (the
@@ -419,12 +419,12 @@ fn serialize_finalize_state_changes(changes: &[Vec<u8>]) -> Result<Vec<u8>> {
 /// are written:
 ///
 /// 1. **Results vertex** at `poseidon(rendezvous || "RESULTS_CODE_FINALIZE")`:
-/// a tree with index 0 = rendezvous (32 bytes), index 1 = serialized
-/// results, index 2 = serialized state-change summary.
+///    a tree with index 0 = rendezvous (32 bytes), index 1 = serialized
+///    results, index 2 = serialized state-change summary.
 /// 2. **State-changes vertex** at
-/// `poseidon(rendezvous || "STATE_CHANGES_CODE_FINALIZE")`: a tree
-/// keyed by uint16 BE index, value = canonical-bytes
-/// StateTransition.
+///    `poseidon(rendezvous || "STATE_CHANGES_CODE_FINALIZE")`: a tree
+///    keyed by uint16 BE index, value = canonical-bytes
+///    StateTransition.
 pub fn materialize_code_finalize(
     state: &HypergraphState,
     finalize: &CodeFinalize,

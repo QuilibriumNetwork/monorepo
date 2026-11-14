@@ -8,23 +8,23 @@
 //!
 //! - `prover_cache: HashMap<Vec<u8>, ProverInfo>` — address → info
 //! - `filter_cache: HashMap<Vec<u8>, Vec<Vec<u8>>>` — confirmation
-//! filter → sorted list of prover addresses with an active
-//! allocation under that filter
+//!   filter → sorted list of prover addresses with an active
+//!   allocation under that filter
 //! - `address_to_filters: HashMap<Vec<u8>, Vec<Vec<u8>>>` — reverse
-//! index from prover address to the filters it's allocated under
+//!   index from prover address to the filters it's allocated under
 //!
 //! Differences from Go:
 //!
 //! 1. We don't yet implement the `RollingFrecencyCritbitTrie` that Go
-//! uses for `FindNearestAndApproximateNeighbors`. For now we store
-//! filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
-//! ~10 K provers per filter.
+//!    uses for `FindNearestAndApproximateNeighbors`. For now we store
+//!    filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
+//!    ~10 K provers per filter.
 //! 2. We iterate the persisted blob cache
-//! (a retained hypergraph-store snapshot), not a
-//! live hypergraph iterator.
+//!    (a retained hypergraph-store snapshot), not a
+//!    live hypergraph iterator.
 //! 3. No locking — the registry is rebuilt from scratch on each
-//! `refresh()` and is read-only after that. Concurrent readers can
-//! wrap in an `Arc<RwLock<_>>` at the call site if needed.
+//!    `refresh()` and is read-only after that. Concurrent readers can
+//!    wrap in an `Arc<RwLock<_>>` at the call site if needed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -1511,14 +1511,14 @@ pub fn limit_evictions_to_shard_floor(
 /// - `Paused` → `Some(Paused)`
 /// - `Leaving` (within grace) → `Some(Leaving)`
 /// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
-/// `None` (excluded). The prover socially left the shard even
-/// though the LeaveConfirm never landed — they stopped proving
-/// when they submitted the Leave. Counting them as Active would
-/// inflate every shard's live coverage by the number of stuck
-/// leaves, which hides real halt-risk shards from the proposer
-/// and coverage monitor: a halt-risk shard (active ≤ 3) with 1+
-/// ExpiredLeaving allocations would otherwise be classified as ≥4
-/// active.
+///   `None` (excluded). The prover socially left the shard even
+///   though the LeaveConfirm never landed — they stopped proving
+///   when they submitted the Leave. Counting them as Active would
+///   inflate every shard's live coverage by the number of stuck
+///   leaves, which hides real halt-risk shards from the proposer
+///   and coverage monitor: a halt-risk shard (active ≤ 3) with 1+
+///   ExpiredLeaving allocations would otherwise be classified as ≥4
+///   active.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///

@@ -13,8 +13,8 @@
 //! Validation rules (enforced on decode):
 //!
 //! - `sig_len` is either 74 (single signer) or 590 (74 + 516 for
-//! aggregation with one prover on an upgrade path). Go:
-//! `sigLen != 74 && sigLen != (74+516)`.
+//!   aggregation with one prover on an upgrade path). Go:
+//!   `sigLen != 74 && sigLen != (74+516)`.
 //! - `addr_len` must be exactly 32. Go: `addrLen != 32`.
 
 use quil_types::error::{QuilError, Result};

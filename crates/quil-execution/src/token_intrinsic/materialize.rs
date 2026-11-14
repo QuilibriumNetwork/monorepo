@@ -127,14 +127,14 @@ pub fn create_spent_marker_tree() -> Result<quil_tries::VectorCommitmentTree> {
 ///
 /// Mirrors Go `TokenIntrinsic.Deploy` at `token_intrinsic.go:208-248`:
 /// 1. Read existing metadata vertex tree (or start a fresh one for
-/// initial deploy).
+///    initial deploy).
 /// 2. Build the inner `TokenConfigurationMetadata` tree from the
-/// `TokenConfiguration`.
+///    `TokenConfiguration`.
 /// 3. Commit the inner tree, serialize via the same Go-tree format the
-/// consensus layer reads back, insert at outer key `[0x40]` with
-/// the inner-commitment as commit metadata.
+///    consensus layer reads back, insert at outer key `[0x40]` with
+///    the inner-commitment as commit metadata.
 /// 4. Write the resulting outer tree under
-/// `(domain, HYPERGRAPH_METADATA_ADDRESS)` in vertex-adds.
+///    `(domain, HYPERGRAPH_METADATA_ADDRESS)` in vertex-adds.
 ///
 /// Returns the address of the metadata vertex that was written.
 pub fn materialize_token_deploy(
@@ -195,12 +195,12 @@ pub fn materialize_token_deploy(
 /// 3. build the RDF schema templated by `(domain, behavior)`,
 /// 4. `init_metadata_vertex(domain, empty, empty, rdf, [13]=config,
 /// TOKEN_BASE_DOMAIN, ...)` — which records the `0xff*32`
-/// type-domain so the manager can route this domain to the token
-/// engine.
-/// Returns the derived domain.
-/// Domain a token deploy derives from its configuration, without writing
-/// anything: `poseidon(TOKEN_PREFIX ‖ config content digest)`. The deploying
-/// wallet prints this so it can address the token it just created.
+///    type-domain so the manager can route this domain to the token
+///    engine.
+///    Returns the derived domain.
+///    Domain a token deploy derives from its configuration, without writing
+///    anything: `poseidon(TOKEN_PREFIX ‖ config content digest)`. The deploying
+///    wallet prints this so it can address the token it just created.
 pub fn token_deploy_domain(config: &super::config::TokenConfiguration) -> Result<[u8; 32]> {
     let config_tree = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
     let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);

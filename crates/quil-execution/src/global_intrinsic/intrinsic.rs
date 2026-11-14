@@ -6121,8 +6121,8 @@ impl GlobalIntrinsic {
     /// its `ConfirmationFilter` in committed hypergraph state.
     ///
     /// - Split: each ACTIVE prover on the parent → exactly one child, chosen
-    /// deterministically by [`reassignment::assign_child_index`] over the
-    /// prover's address (frozen-committee, consensus-identical).
+    ///   deterministically by [`reassignment::assign_child_index`] over the
+    ///   prover's address (frozen-committee, consensus-identical).
     /// - Merge: every ACTIVE prover on any child → the parent.
     ///
     /// The active set is read DIRECTLY from committed hypergraph state via the

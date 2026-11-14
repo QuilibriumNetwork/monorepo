@@ -247,18 +247,18 @@ impl HypergraphState {
     /// of Go `HypergraphState.Init` (hypergraph_state.go:531-630). Builds
     /// the `publicStateInformation` tree:
     ///   - `[0<<2]` consensus metadata sub-tree (sealed; empty for all
-    /// current intrinsics)
+    ///     current intrinsics)
     ///   - `[1<<2]` sumcheck info sub-tree (sealed; empty)
     ///   - `[2<<2]` RDF schema, raw string bytes
     /// - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
-    /// (sealed). `additional_data[13]` → key `[0x40]` is the
-    /// intrinsic's configuration tree. Indices `i+3 < 16` are
-    /// reserved and MUST be `None`.
+    ///   (sealed). `additional_data[13]` → key `[0x40]` is the
+    ///   intrinsic's configuration tree. Indices `i+3 < 16` are
+    ///   reserved and MUST be `None`.
     /// - `0xff*32` the `intrinsic_type` (base domain), raw
-    /// then writes it as a vertex at `(domain, HYPERGRAPH_METADATA_ADDRESS)`
-    /// in the vertex-adds set. `domain` must be 32 bytes. The metadata
-    /// vertex is committed before serialization so the stored blob carries
-    /// node commitments (mirroring the existing deploy materialize path).
+    ///   then writes it as a vertex at `(domain, HYPERGRAPH_METADATA_ADDRESS)`
+    ///   in the vertex-adds set. `domain` must be 32 bytes. The metadata
+    ///   vertex is committed before serialization so the stored blob carries
+    ///   node commitments (mirroring the existing deploy materialize path).
     #[allow(clippy::too_many_arguments)]
     pub fn init_metadata_vertex(
         &self,

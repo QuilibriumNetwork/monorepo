@@ -2,7 +2,7 @@
 //! `node/execution/engines/token_execution_engine.go`.
 //!
 //! - [`token_engine_capabilities`] — the four protocol IDs (token v1,
-//! Double Ratchet, Triple Ratchet, Onion Routing).
+//!   Double Ratchet, Triple Ratchet, Onion Routing).
 //! - [`request_is_token_op`] — boolean predicate for bundle routing.
 //! - [`MessageKindToken`] — the eight active token operation types.
 //! - [`get_cost_from_request`] — administrative token cost dispatch.
