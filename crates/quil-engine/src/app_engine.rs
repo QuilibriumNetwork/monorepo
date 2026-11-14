@@ -8843,10 +8843,21 @@ impl AppConsensusEngine {
 
     /// The latest GLOBAL frame this node holds a header of.
     fn latest_global_header_frame(&self) -> Option<u64> {
+        self.latest_global_header().map(|(frame, _)| frame)
+    }
+
+    /// The latest GLOBAL frame this node holds a header of, with the
+    /// header's timestamp (Unix ms).
+    fn latest_global_header(&self) -> Option<(u64, i64)> {
         self.global_anchor_store
             .get_latest_global_clock_frame()
             .ok()
-            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number))
+            .and_then(|frame| {
+                frame
+                    .header
+                    .as_ref()
+                    .map(|header| (header.frame_number, header.timestamp))
+            })
     }
 
     /// Log the transitions of a published seal without a drain waiting to
@@ -8879,19 +8890,30 @@ impl AppConsensusEngine {
             RecordStall::Began(state) => (state, true),
             RecordStall::Continues(state) => (state, false),
         };
-        let latest_global_frame = self.latest_global_header_frame();
-        let (scope, action, waits_on) =
-            crate::seal_follow::record_stall_scope(committed_frame, latest_global_frame);
+        let latest = self.latest_global_header();
+        let latest_global_frame = latest.map(|(frame, _)| frame);
+        let stamp = latest.map(|(_, stamp)| stamp);
+        let now_ms = crate::worker_execution::now_ms();
+        let first_copy_ms = now_ms.saturating_sub(state.waited_secs.saturating_mul(1000));
+        let latest_global_age_secs = crate::seal_follow::global_view_age_secs(stamp, now_ms);
+        let (scope, action, waits_on) = crate::seal_follow::record_stall_scope(
+            committed_frame,
+            latest_global_frame,
+            stamp,
+            first_copy_ms,
+        );
         if began {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
-                latest_global_frame, published_global_frame = state.published_head,
+                latest_global_frame, latest_global_age_secs,
+                published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
                 copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal not recorded: this worker's GLOBAL view passed the frame \
                  its copy lands by and has not shown the seal recorded for over 5 min");
         } else {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
-                latest_global_frame, published_global_frame = state.published_head,
+                latest_global_frame, latest_global_age_secs,
+                published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
                 copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal still not recorded");
@@ -30168,6 +30190,88 @@ mod tests {
             "prover-tree sync",
         ] {
             assert!(stalled[0].contains(field), "{field}: {}", stalled[0]);
+        }
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// The same unrecorded seal, with this worker's view at this node's
+    /// latest GLOBAL frame: stamped 2 s ago, a current view, it is reported
+    /// to the network; stamped 120 s ago, after the first copy went out 300 s
+    /// ago (GLOBAL halted since), too; stamped 3 h ago, before the seal's
+    /// first copy went out, it is this node's GLOBAL view lag, with how far
+    /// behind, as on a node whose view was hours behind and the seals on
+    /// chain.
+    #[tokio::test]
+    async fn an_unrecorded_seal_from_a_view_stamped_hours_ago_is_reported_as_local() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let hours_ms = 3 * 60 * 60 * 1000;
+        for (age_ms, lagging, tag) in [
+            (2_000, false, "current_view_not_network"),
+            (120_000, false, "after_copy_view_not_network"),
+            (hours_ms, true, "lagging_view_not_local"),
+        ] {
+            let (global, id, mut engines) = sealed_drain_committee(1);
+            execute_drain_part(&global, &id, 40, 2);
+            let logs = crate::outage::test_logs::CapturedLogs::default();
+            let _guard = logs.install();
+            let (engine, sent) = &mut engines[0];
+            engine.maintain_committee_session().await;
+            assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(engine.seal_record.waiting(), "the copy carried no drain");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            engine
+                .global_anchor_store
+                .put_global_clock_frame(
+                    &quil_types::proto::global::GlobalFrame {
+                        header: Some(quil_types::proto::global::GlobalFrameHeader {
+                            frame_number: 2,
+                            timestamp: now_ms - age_ms,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &AppNoopTxn,
+                )
+                .unwrap();
+            engine
+                .seal_record
+                .backdate(crate::seal_follow::SEAL_UNRECORDED_AFTER);
+            engine.maintain_committee_session().await;
+            let stalled = logs.lines_with("seal not recorded");
+            assert_eq!(stalled.len(), 1, "no_stall_line: {stalled:?}");
+            let line = &stalled[0];
+            println!("seal record stall judged: stamped {age_ms} ms ago");
+            assert!(line.contains("committed_frame=2"), "{line}");
+            assert!(line.contains("latest_global_frame=2"), "{line}");
+            if !lagging {
+                assert!(
+                    line.contains("scope=\"network\"") && line.contains("action=\"report\""),
+                    "{tag}: stamped {age_ms} ms ago: {line}"
+                );
+                continue;
+            }
+            assert!(
+                line.contains("scope=\"local\""),
+                "{tag}: a view stamped 3 h ago: {line}"
+            );
+            for field in ["action=\"check\"", "GLOBAL sync"] {
+                assert!(line.contains(field), "lagging_view_field {field}: {line}");
+            }
+            let age: Option<u64> = line
+                .split("latest_global_age_secs=")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|digits| digits.parse().ok());
+            assert!(
+                age.is_some_and(|age| (10_800..=10_805).contains(&age)),
+                "lagging_view_field latest_global_age_secs {age:?}: {line}"
+            );
         }
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
