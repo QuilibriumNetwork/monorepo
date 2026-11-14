@@ -454,22 +454,38 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     };
 }
 
+/// Why [`verenc_try_recover`] recovered no witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverError {
+    /// A key, point, scalar or list in the request is malformed.
+    Malformed,
+    /// The request is well formed, but no ciphertext decrypts to the
+    /// statement's witness.
+    NotRecovered,
+}
+
+/// The recovered witness bytes, or none when recovery fails for any
+/// reason ([`verenc_try_recover`] tells the reasons apart).
+pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
+    verenc_try_recover(recovery).unwrap_or_default()
+}
+
 // `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
 // casing lets the struct literal below stay field-shorthand.
 #[allow(non_snake_case)]
-pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
+pub fn verenc_try_recover(recovery: VerencDecrypt) -> Result<Vec<u8>, RecoverError> {
     let blinding_key = point_from_bytes(recovery.blinding_pubkey);
     if blinding_key.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let statement = point_from_bytes(recovery.statement);
     if statement.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     if recovery.decryption_key.len() != 56 {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let decryption_key = Scalar::from_bytes(&recovery.decryption_key.try_into().unwrap());
@@ -478,11 +494,11 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     for c in recovery.ciphertexts.ctexts {
         let c1 = point_from_bytes(c.c1);
         if c1.is_none() {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         if c.c2.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let c2 = Scalar::from_bytes(&c.c2.try_into().unwrap());
@@ -494,7 +510,7 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
 
     for c in recovery.ciphertexts.aux {
         if c.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let a = Scalar::from_bytes(&c.try_into().unwrap());
@@ -511,8 +527,12 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let (N, t, n) = RVE_PARAMS[0];
     let vparams = RDkgithParams { N, t, n };
     let ve = RDkgith::setup(&params, &vparams, pke.clone());
-    let wit_recover = ve.recover(&statement.unwrap(), &decryption_key, &ve_ct);
-    return wit_recover.to_bytes().to_vec();
+    let short = ve_ct.ctexts.len() < n || ve_ct.aux.len() < n;
+    match ve.recover(&statement.unwrap(), &decryption_key, &ve_ct) {
+        Some(witness) => Ok(witness.to_bytes().to_vec()),
+        None if short => Err(RecoverError::Malformed),
+        None => Err(RecoverError::NotRecovered),
+    }
 }
 
 pub fn chunk_data_for_verenc(data: Vec<u8>) -> Vec<Vec<u8>> {

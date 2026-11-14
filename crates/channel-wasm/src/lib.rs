@@ -152,6 +152,9 @@ fn decrypt(
     }
 
     let iv = maybe_iv.unwrap();
+    if iv.len() != 12 {
+        return Err("Decryption failed: invalid nonce length".into());
+    }
     let nonce = Nonce::from_slice(&iv);
 
     let ad = &ciphertext.associated_data;

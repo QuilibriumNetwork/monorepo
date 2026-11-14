@@ -575,7 +575,7 @@ impl DoubleRatchetParticipant {
         &self,
         header: &[u8],
     ) -> Result<(EdwardsPoint, u32, u32), Box<dyn std::error::Error>> {
-        if header.len() < 57 {
+        if header.len() < 65 {
             // 57 bytes for EdwardsPoint + 8 bytes for two u32
             return Err("Malformed header".into());
         }
@@ -642,11 +642,15 @@ impl DoubleRatchetParticipant {
         if key.len() != 32 {
             return Err(format!("Invalid key length").into());
         }
+        if ciphertext.initialization_vector.len() != 12 {
+            return Err("Invalid nonce length".into());
+        }
         let cipher = Aes256Gcm::new_from_slice(key).unwrap();
         let nonce = Nonce::from_slice(&ciphertext.initialization_vector);
 
-        let associated_data =
-            associated_data.unwrap_or_else(|| ciphertext.associated_data.as_ref().unwrap());
+        let associated_data = associated_data
+            .or(ciphertext.associated_data.as_deref())
+            .ok_or("Missing associated data")?;
 
         cipher
             .decrypt(

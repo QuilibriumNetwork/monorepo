@@ -178,6 +178,9 @@ fn decrypt_aead(ciphertext: &MessageCiphertext, key: &[u8]) -> Result<Vec<u8>, S
     let iv = BASE64_STANDARD
         .decode(&ciphertext.initialization_vector)
         .map_err(|e| format!("Invalid IV: {}", e))?;
+    if iv.len() != 12 {
+        return Err("Invalid IV length".to_string());
+    }
     let nonce = Nonce::from_slice(&iv);
 
     let associated_data = match &ciphertext.associated_data {
