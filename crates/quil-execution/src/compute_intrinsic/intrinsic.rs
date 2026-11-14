@@ -4,13 +4,11 @@
 use std::collections::{HashMap, HashSet};
 
 use num_bigint::BigInt;
-use quil_types::crypto::{BulletproofProver, KeyManager, KeyType};
+use quil_types::crypto::{KeyManager, KeyType};
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::CircuitCompiler;
 
-use super::ops::{
-    Application, CodeExecute, CodeFinalize, ExecuteOperation,
-};
+use super::ops::{Application, CodeExecute, CodeFinalize, ExecuteOperation};
 
 // =====================================================================
 // CodeDeployment
@@ -22,12 +20,37 @@ use super::ops::{
 /// (`compute_intrinsic_code_deployment.go:120-128`). The Go version
 /// only runs `compiler.ValidateCircuit` — no signature check — so this
 /// function mirrors that exactly.
-pub fn verify_code_deployment(
-    compiler: &dyn CircuitCompiler,
-    circuit: &[u8],
-) -> Result<bool> {
+pub fn verify_code_deployment(compiler: &dyn CircuitCompiler, circuit: &[u8]) -> Result<bool> {
     compiler.validate_circuit(circuit)?;
     Ok(true)
+}
+
+/// Refuse a CodeDeployment or CodeExecute whose domain is not the
+/// application the message is routed to, or is a system-managed domain.
+///
+/// Both ops write a vertex into their own `domain` field, while the
+/// engine, its fee and its shard are chosen by the routing address. An op
+/// naming another application would write that application's state from a
+/// message routed (and paid) elsewhere; the compute base domain routes to
+/// this engine itself, so a deploy there must not land in it either.
+pub fn check_op_domain(op: &str, op_domain: &[u8; 32], routing: &[u8]) -> Result<()> {
+    if routing.get(..32) != Some(&op_domain[..]) {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: domain {} is not the routing domain {}",
+            hex::encode(op_domain),
+            hex::encode(routing),
+        )));
+    }
+    if *op_domain == crate::domains::GLOBAL
+        || *op_domain == crate::domains::COMPUTE
+        || *op_domain == crate::domains::QUIL_TOKEN
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: write into system-managed domain {} rejected",
+            hex::encode(op_domain),
+        )));
+    }
+    Ok(())
 }
 
 /// Get the cost of a code deployment (proportional to circuit size).
@@ -45,9 +68,7 @@ pub fn code_deployment_address(domain: &[u8], circuit: &[u8]) -> Result<[u8; 32]
 }
 
 /// Create a code vertex tree storing the compiled circuit.
-pub fn create_code_vertex_tree(
-    circuit: &[u8],
-) -> Result<quil_tries::VectorCommitmentTree> {
+pub fn create_code_vertex_tree(circuit: &[u8]) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     tree.insert(&[0x00], circuit, &[], &BigInt::from(circuit.len() as i64))
         .map_err(|e| QuilError::Internal(format!("code tree: {}", e)))?;
@@ -125,8 +146,7 @@ pub fn verify_code_finalize(
     // 1. Must have at least one result.
     if finalize.results.is_empty() {
         return Err(QuilError::InvalidArgument(
-            "verify: invalid code finalize: no execution results provided"
-                .into(),
+            "verify: invalid code finalize: no execution results provided".into(),
         ));
     }
 
@@ -143,14 +163,13 @@ pub fn verify_code_finalize(
     //    small today; this check keeps the verify contract explicit
     //    so a future materialize refactor can't widen it.
     for (i, sc_bytes) in finalize.state_changes.iter().enumerate() {
-        let sc = super::ops::StateTransition::from_canonical_bytes(sc_bytes)
-            .map_err(|e| {
-                QuilError::InvalidArgument(format!(
-                    "verify: invalid code finalize: decoding state \
+        let sc = super::ops::StateTransition::from_canonical_bytes(sc_bytes).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "verify: invalid code finalize: decoding state \
                      change {}: {}",
-                    i, e
-                ))
-            })?;
+                i, e
+            ))
+        })?;
         if sc.domain.len() != 32 {
             return Err(QuilError::InvalidArgument(
                 "verify: invalid code finalize: invalid domain length in \
@@ -179,10 +198,12 @@ pub fn verify_code_finalize(
     // 3. Rebuild the signed message.
     let msg = code_finalize_signing_message(finalize)?;
 
-    // 4 / 5. Verify Ed448 signature with `domain || CODE_FINALIZE`.
+    // 4 / 5. Verify the FALCON (FN-DSA-512) write-key signature over the
+    // finalize, domain-separated by `domain || CODE_FINALIZE`. (Post-quantum
+    // config-management auth — replaces the Ed448 write-key signature.)
     let domain_ctx = code_finalize_domain(compute_app_domain);
     let valid = key_manager.validate_signature(
-        KeyType::Ed448,
+        KeyType::Falcon512,
         write_public_key,
         &msg,
         &finalize.proof_of_execution,
@@ -215,7 +236,8 @@ pub const MAX_OPERATIONS_LIMIT: usize = 100;
 /// compares against `make([]byte, 56)`; DECAF448 public keys are 56
 /// bytes.
 fn is_zero_payer(pk: &[u8]) -> bool {
-    pk.len() == 56 && pk.iter().all(|&b| b == 0)
+    // A no-payer (free execution) sentinel: all-zero bytes, any length.
+    pk.iter().all(|&b| b == 0)
 }
 
 /// Verify the payment proof carried in `proof_of_payment[0..2]`.
@@ -229,12 +251,46 @@ fn is_zero_payer(pk: &[u8]) -> bool {
 /// - `proof_of_payment[1]` is a DECAF448 Schnorr "simple" signature
 ///   over the `rendezvous`.
 /// - DAG validation must succeed.
-pub fn verify_code_execute(
-    execute: &CodeExecute,
-    bp: &dyn BulletproofProver,
-) -> Result<bool> {
+pub fn verify_code_execute(execute: &CodeExecute) -> Result<bool> {
+    // Reserved-address guard. `materialize_code_execute` writes a vertex at
+    // `(execute.domain, execute.rendezvous)` under the vertex-adds
+    // discriminator — and `rendezvous` is fully attacker-controlled while a
+    // zero/`is_zero_payer` payer skips the signature check below entirely. The
+    // per-domain compute config-metadata vertex (write/owner/read keys) lives
+    // at the reserved `HYPERGRAPH_METADATA_ADDRESS` ([0xFF; 32]) under the SAME
+    // discriminator, so a `rendezvous` colliding with it would OVERWRITE the
+    // deployed app's config with an execute-DAG blob — a permissionless
+    // domain-config-corruption / takeover. Reject the collision.
+    if execute.rendezvous == crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS {
+        return Err(QuilError::InvalidArgument(
+            "verify: code execute rendezvous collides with reserved metadata \
+             address"
+                .into(),
+        ));
+    }
+
+    // Reject writes into SYSTEM-MANAGED domains. `materialize_code_execute`
+    // writes a vertex at the attacker-controlled `execute.domain`, and the
+    // zero-payer path below skips the signature entirely — without this, a
+    // permissionless CodeExecute could plant an attacker-controlled vertex into
+    // GLOBAL/COMPUTE/QUIL_TOKEN (e.g. a forged `prover:Prover` or coin vertex),
+    // usurping the intrinsics that own those namespaces. Mirrors the hypergraph
+    // engine's system-domain guard (`engines.rs`).
+    if execute.domain == crate::domains::GLOBAL
+        || execute.domain == crate::domains::COMPUTE
+        || execute.domain == crate::domains::QUIL_TOKEN
+    {
+        return Err(QuilError::InvalidArgument(
+            "verify: code execute into system-managed domain rejected".into(),
+        ));
+    }
+
     // Payment proof check.
-    let payer = execute.proof_of_payment.first().map(Vec::as_slice).unwrap_or(&[]);
+    let payer = execute
+        .proof_of_payment
+        .first()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if !payer.is_empty() && !is_zero_payer(payer) {
         // When a real payer is present, proof_of_payment[1] must be
         // present and must verify against `rendezvous`.
@@ -245,9 +301,12 @@ pub fn verify_code_execute(
                     .into(),
             )
         })?;
-        if !bp.simple_verify(&execute.rendezvous, sig, payer) {
+        // Post-quantum proof-of-payment: the payer's FALCON (FN-DSA-512)
+        // signature over the rendezvous, domain-separated by the compute domain.
+        // (Replaces the decaf Schnorr `simple_verify` — no decaf in compute.)
+        if !quil_crypto::falcon_verify(payer, sig, &execute.rendezvous, &execute.domain) {
             return Err(QuilError::InvalidArgument(
-                "verify: invalid code execute: invalid signature".into(),
+                "verify: invalid code execute: invalid payment signature".into(),
             ));
         }
     }
@@ -292,9 +351,7 @@ pub struct ExecutionDagValidated {
 /// methods for intrinsic contexts return empty sets there, so the
 /// current behavior is a topological-stage assignment. We keep that
 /// topological pass here; the multiphasic re-packing is deferred.
-pub fn build_execution_dag(
-    execute_operations: &[Vec<u8>],
-) -> Result<ExecutionDagValidated> {
+pub fn build_execution_dag(execute_operations: &[Vec<u8>]) -> Result<ExecutionDagValidated> {
     // 1. Non-empty, under-limit.
     if execute_operations.is_empty() {
         return Err(QuilError::InvalidArgument(
@@ -368,7 +425,11 @@ pub fn build_execution_dag(
 
     // 4. Cycle detection via DFS with a recursion stack.
     //    Mirrors `detectCycle` in Go.
-    enum Mark { Unvisited, InProgress, Done }
+    enum Mark {
+        Unvisited,
+        InProgress,
+        Done,
+    }
     let mut state: HashMap<Vec<u8>, Mark> = HashMap::new();
     for id in &id_order {
         state.insert(id.clone(), Mark::Unvisited);
@@ -499,10 +560,7 @@ fn hex_short(b: &[u8]) -> String {
 // =====================================================================
 
 /// Get the cost of a code finalization.
-pub fn code_finalize_cost(
-    results: &[Vec<u8>],
-    state_changes: &[Vec<u8>],
-) -> BigInt {
+pub fn code_finalize_cost(results: &[Vec<u8>], state_changes: &[Vec<u8>]) -> BigInt {
     let total: usize = results.iter().map(|r| r.len()).sum::<usize>()
         + state_changes.iter().map(|s| s.len()).sum::<usize>();
     BigInt::from(total as i64)
@@ -510,18 +568,28 @@ pub fn code_finalize_cost(
 
 /// Create a state transition vertex for a finalized execution result.
 pub fn create_state_transition_vertex(
-    domain: &[u8; 32],
+    _domain: &[u8; 32],
     address: &[u8],
     old_value: &[u8],
     new_value: &[u8],
 ) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     // Index 0: old value
-    tree.insert(&[0x00], old_value, &[], &BigInt::from(old_value.len() as i64))
-        .map_err(|e| QuilError::Internal(format!("state transition: {}", e)))?;
+    tree.insert(
+        &[0x00],
+        old_value,
+        &[],
+        &BigInt::from(old_value.len() as i64),
+    )
+    .map_err(|e| QuilError::Internal(format!("state transition: {}", e)))?;
     // Index 1: new value
-    tree.insert(&[1 << 2], new_value, &[], &BigInt::from(new_value.len() as i64))
-        .map_err(|e| QuilError::Internal(format!("state transition: {}", e)))?;
+    tree.insert(
+        &[1 << 2],
+        new_value,
+        &[],
+        &BigInt::from(new_value.len() as i64),
+    )
+    .map_err(|e| QuilError::Internal(format!("state transition: {}", e)))?;
     // Index 2: address
     tree.insert(&[2 << 2], address, &[], &BigInt::from(address.len() as i64))
         .map_err(|e| QuilError::Internal(format!("state transition: {}", e)))?;
@@ -605,9 +673,8 @@ mod tests {
     #[test]
     fn state_transition_vertex_stores_values() {
         let domain = [0xAAu8; 32];
-        let tree = create_state_transition_vertex(
-            &domain, b"addr", b"old-val", b"new-val",
-        ).unwrap();
+        let tree =
+            create_state_transition_vertex(&domain, b"addr", b"old-val", b"new-val").unwrap();
         assert_eq!(tree.get(&[0x00]).unwrap(), b"old-val");
         assert_eq!(tree.get(&[1 << 2]).unwrap(), b"new-val");
         assert_eq!(tree.get(&[2 << 2]).unwrap(), b"addr");
@@ -619,13 +686,27 @@ mod tests {
 
     struct AcceptKeyManager;
     impl KeyManager for AcceptKeyManager {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
     struct RejectKeyManager;
     impl KeyManager for RejectKeyManager {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(false)
         }
     }
@@ -636,8 +717,16 @@ mod tests {
     unsafe impl Send for CapturingKeyManager {}
     unsafe impl Sync for CapturingKeyManager {}
     impl KeyManager for CapturingKeyManager {
-        fn validate_signature(&self, kt: KeyType, pk: &[u8], msg: &[u8], sig: &[u8], dom: &[u8]) -> Result<bool> {
-            *self.captured.borrow_mut() = Some((kt, pk.to_vec(), msg.to_vec(), sig.to_vec(), dom.to_vec()));
+        fn validate_signature(
+            &self,
+            kt: KeyType,
+            pk: &[u8],
+            msg: &[u8],
+            sig: &[u8],
+            dom: &[u8],
+        ) -> Result<bool> {
+            *self.captured.borrow_mut() =
+                Some((kt, pk.to_vec(), msg.to_vec(), sig.to_vec(), dom.to_vec()));
             Ok(true)
         }
     }
@@ -648,7 +737,9 @@ mod tests {
             success: true,
             output: vec![0xBB; 16],
             error: vec![],
-        }.to_canonical_bytes().unwrap()
+        }
+        .to_canonical_bytes()
+        .unwrap()
     }
     fn sample_state_change(domain: [u8; 32], address: Vec<u8>) -> Vec<u8> {
         super::super::ops::StateTransition {
@@ -657,7 +748,9 @@ mod tests {
             old_value: vec![1; 8],
             new_value: vec![2; 8],
             proof: vec![],
-        }.to_canonical_bytes().unwrap()
+        }
+        .to_canonical_bytes()
+        .unwrap()
     }
 
     fn sample_finalize() -> CodeFinalize {
@@ -727,11 +820,13 @@ mod tests {
         let f = sample_finalize();
         let domain = [0xDDu8; 32];
         let pk = vec![0xEEu8; 57];
-        let km = CapturingKeyManager { captured: std::cell::RefCell::new(None) };
+        let km = CapturingKeyManager {
+            captured: std::cell::RefCell::new(None),
+        };
         assert!(verify_code_finalize(&f, &domain, &pk, &km).unwrap());
         let cap = km.captured.borrow();
         let (kt, captured_pk, captured_msg, captured_sig, captured_dom) = cap.as_ref().unwrap();
-        assert_eq!(*kt, KeyType::Ed448);
+        assert_eq!(*kt, KeyType::Falcon512);
         assert_eq!(captured_pk, &pk);
         assert_eq!(captured_sig, &f.proof_of_execution);
         // Domain = compute_app_domain || "CODE_FINALIZE"
@@ -756,27 +851,13 @@ mod tests {
     // verify_code_execute / build_execution_dag
     // =================================================================
 
-    struct AcceptBP;
-    impl BulletproofProver for AcceptBP {
-        fn generate_range_proof(&self, _: &[Vec<u8>], _: &[u8], _: u64) -> Result<quil_types::crypto::RangeProofResult> { Err(QuilError::Internal("na".into())) }
-        fn generate_input_commitments(&self, _: &[Vec<u8>], _: &[u8]) -> Vec<u8> { vec![] }
-        fn verify_range_proof(&self, _: &[u8], _: &[u8], _: u64) -> bool { true }
-        fn sum_check(&self, _: &[Vec<u8>], _: &[Vec<u8>], _: &[Vec<u8>], _: &[Vec<u8>]) -> bool { true }
-        fn sign_hidden(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Vec<u8> { vec![] }
-        fn verify_hidden(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> bool { true }
-        fn simple_sign(&self, _: &[u8], _: &[u8]) -> Vec<u8> { vec![] }
-        fn simple_verify(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool { true }
-    }
-    struct RejectBP;
-    impl BulletproofProver for RejectBP {
-        fn generate_range_proof(&self, _: &[Vec<u8>], _: &[u8], _: u64) -> Result<quil_types::crypto::RangeProofResult> { Err(QuilError::Internal("na".into())) }
-        fn generate_input_commitments(&self, _: &[Vec<u8>], _: &[u8]) -> Vec<u8> { vec![] }
-        fn verify_range_proof(&self, _: &[u8], _: &[u8], _: u64) -> bool { false }
-        fn sum_check(&self, _: &[Vec<u8>], _: &[Vec<u8>], _: &[Vec<u8>], _: &[Vec<u8>]) -> bool { false }
-        fn sign_hidden(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Vec<u8> { vec![] }
-        fn verify_hidden(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> bool { false }
-        fn simple_sign(&self, _: &[u8], _: &[u8]) -> Vec<u8> { vec![] }
-        fn simple_verify(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool { false }
+    // A real Falcon-signed payment for `rendezvous` under `domain`.
+    fn falcon_payment(domain: &[u8; 32], rendezvous: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        use quil_crypto::FalconSigner;
+        use quil_types::crypto::Signer;
+        let s = FalconSigner::generate();
+        let sig = s.sign_with_domain(rendezvous, domain).unwrap();
+        (s.public_key().to_vec(), sig)
     }
 
     fn make_op(id: &[u8], deps: Vec<&[u8]>) -> Vec<u8> {
@@ -837,10 +918,7 @@ mod tests {
     #[test]
     fn dag_rejects_cycle() {
         // a -> b -> a
-        let ops = vec![
-            make_op(b"a", vec![b"b"]),
-            make_op(b"b", vec![b"a"]),
-        ];
+        let ops = vec![make_op(b"a", vec![b"b"]), make_op(b"b", vec![b"a"])];
         assert!(build_execution_dag(&ops).is_err());
     }
 
@@ -893,29 +971,41 @@ mod tests {
             execute_operations: vec![make_op(b"a", vec![])],
         };
         // Even RejectBP should pass — we don't call simple_verify for zero payer.
-        assert!(verify_code_execute(&execute, &RejectBP).unwrap());
+        assert!(verify_code_execute(&execute).unwrap());
     }
 
     #[test]
     fn execute_verify_real_payer_accept() {
+        let (domain, rendezvous) = ([0xAAu8; 32], [0xCCu8; 32]);
+        let (payer, sig) = falcon_payment(&domain, &rendezvous);
         let execute = CodeExecute {
-            proof_of_payment: vec![vec![0xAAu8; 56], vec![0xBBu8; 112]],
-            domain: [0xAAu8; 32],
-            rendezvous: [0xCCu8; 32],
+            proof_of_payment: vec![payer, sig],
+            domain,
+            rendezvous,
             execute_operations: vec![make_op(b"a", vec![])],
         };
-        assert!(verify_code_execute(&execute, &AcceptBP).unwrap());
+        assert!(
+            verify_code_execute(&execute).unwrap(),
+            "valid Falcon payment accepted"
+        );
     }
 
     #[test]
     fn execute_verify_real_payer_reject() {
+        let (domain, rendezvous) = ([0xAAu8; 32], [0xCCu8; 32]);
+        let (payer, _) = falcon_payment(&domain, &rendezvous);
+        // A signature over a DIFFERENT rendezvous must not verify.
+        let (_, bad_sig) = falcon_payment(&domain, &[0xDDu8; 32]);
         let execute = CodeExecute {
-            proof_of_payment: vec![vec![0xAAu8; 56], vec![0xBBu8; 112]],
-            domain: [0xAAu8; 32],
-            rendezvous: [0xCCu8; 32],
+            proof_of_payment: vec![payer, bad_sig],
+            domain,
+            rendezvous,
             execute_operations: vec![make_op(b"a", vec![])],
         };
-        assert!(verify_code_execute(&execute, &RejectBP).is_err());
+        assert!(
+            verify_code_execute(&execute).is_err(),
+            "wrong Falcon signature rejected"
+        );
     }
 
     #[test]
@@ -926,7 +1016,7 @@ mod tests {
             rendezvous: [0xBBu8; 32],
             execute_operations: vec![],
         };
-        assert!(verify_code_execute(&execute, &AcceptBP).is_err());
+        assert!(verify_code_execute(&execute).is_err());
     }
 
     #[test]
@@ -937,7 +1027,7 @@ mod tests {
             rendezvous: [0xBBu8; 32],
             execute_operations: vec![make_op(b"a", vec![b"b"]), make_op(b"b", vec![b"a"])],
         };
-        assert!(verify_code_execute(&execute, &AcceptBP).is_err());
+        assert!(verify_code_execute(&execute).is_err());
     }
 
     #[test]
@@ -950,6 +1040,6 @@ mod tests {
             rendezvous: [0xBBu8; 32],
             execute_operations: vec![make_op(b"a", vec![])],
         };
-        assert!(verify_code_execute(&execute, &AcceptBP).is_err());
+        assert!(verify_code_execute(&execute).is_err());
     }
 }

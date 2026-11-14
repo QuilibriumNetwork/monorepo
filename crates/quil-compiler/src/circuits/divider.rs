@@ -32,13 +32,7 @@ pub fn new_udivider_long(
             let zero_arr = [cc.zero_wire()];
             let one_arr = [cc.one_wire()];
             let mut q_bit = [q[i]];
-            new_mux(
-                cc,
-                &diff[diff.len() - 1..],
-                &zero_arr,
-                &one_arr,
-                &mut q_bit,
-            )?;
+            new_mux(cc, &diff[diff.len() - 1..], &zero_arr, &one_arr, &mut q_bit)?;
             q[i] = q_bit[0];
         }
 

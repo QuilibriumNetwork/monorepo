@@ -1,0 +1,5 @@
+[env]
+# librocksdb-sys 0.16 (RocksDB 8.10) uses uint64_t in headers that do not
+# include <cstdint>; libstdc++ 15 no longer provides it transitively.
+# Remove once the rocksdb crate moves past a release with that fix.
+CXXFLAGS = "-include cstdint"

@@ -23,14 +23,8 @@ pub fn register_engine_metrics() {
         "engine_frame_number",
         "Current frame number being processed"
     );
-    describe_gauge!(
-        "engine_current_rank",
-        "Current consensus rank of this node"
-    );
-    describe_gauge!(
-        "engine_difficulty",
-        "Current mining / VDF difficulty"
-    );
+    describe_gauge!("engine_current_rank", "Current consensus rank of this node");
+    describe_gauge!("engine_difficulty", "Current mining / VDF difficulty");
     describe_gauge!(
         "engine_pending_messages",
         "Number of messages waiting to be processed"
@@ -53,10 +47,7 @@ pub fn register_engine_metrics() {
         "engine_proposals_received_total",
         "Total number of proposals received from peers"
     );
-    describe_counter!(
-        "engine_votes_total",
-        "Total number of votes produced"
-    );
+    describe_counter!("engine_votes_total", "Total number of votes produced");
     describe_counter!(
         "engine_votes_received_total",
         "Total number of standalone votes received from peers"
@@ -143,13 +134,22 @@ pub fn register_engine_metrics() {
         "engine_grpc_submits_rejected_total",
         "Inbound gRPC submit_global_message calls rejected"
     );
-    describe_histogram!(
-        "engine_vdf_prove_seconds",
-        "VDF proof computation duration"
+    describe_counter!(
+        "engine_grpc_submits_duplicate_total",
+        "Inbound gRPC submit_global_message calls deduplicated (already delivered)"
     );
+    describe_histogram!("engine_vdf_prove_seconds", "VDF proof computation duration");
     describe_histogram!(
         "engine_archive_submit_seconds",
         "Round-trip duration of an outbound archive submit"
+    );
+    describe_histogram!(
+        "engine_materialize_seconds",
+        "Full frame materialization duration (verify + apply + commit)"
+    );
+    describe_histogram!(
+        "engine_sig_verify_seconds",
+        "Consensus aggregate signature verification duration"
     );
 }
 
@@ -265,6 +265,10 @@ pub fn inc_grpc_submits_accepted() {
 pub fn inc_grpc_submits_rejected() {
     counter!("engine_grpc_submits_rejected_total").increment(1);
 }
+#[inline]
+pub fn inc_grpc_submits_duplicate() {
+    counter!("engine_grpc_submits_duplicate_total").increment(1);
+}
 
 #[inline]
 pub fn record_vdf_prove_duration(seconds: f64) {
@@ -273,4 +277,12 @@ pub fn record_vdf_prove_duration(seconds: f64) {
 #[inline]
 pub fn record_archive_submit_duration(seconds: f64) {
     histogram!("engine_archive_submit_seconds").record(seconds);
+}
+#[inline]
+pub fn record_materialize_duration(seconds: f64) {
+    histogram!("engine_materialize_seconds").record(seconds);
+}
+#[inline]
+pub fn record_sig_verify_duration(seconds: f64) {
+    histogram!("engine_sig_verify_seconds").record(seconds);
 }

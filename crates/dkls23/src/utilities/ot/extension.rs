@@ -464,9 +464,7 @@ impl OTEReceiver {
     ///
     /// See [`OTSender`](super::base::OTSender) for an explanation of the outputs.
     #[must_use]
-    pub fn init_phase1<C: DklsCurve>(
-        session_id: &[u8],
-    ) -> (OTSender<C>, DLogProof<C>)
+    pub fn init_phase1<C: DklsCurve>(session_id: &[u8]) -> (OTSender<C>, DLogProof<C>)
     where
         C::Scalar: Reduce<U256> + PrimeField,
         C::AffinePoint: GroupEncoding,
@@ -983,8 +981,13 @@ mod tests {
         };
 
         // Phase 2 - Sender
-        let result_sender =
-            OTESender::init_phase2::<C>(&ot_receiver, &session_id, correlation, &vec_r, &dlog_proof);
+        let result_sender = OTESender::init_phase2::<C>(
+            &ot_receiver,
+            &session_id,
+            correlation,
+            &vec_r,
+            &dlog_proof,
+        );
         let ote_sender = match result_sender {
             Ok(s) => s,
             Err(error) => {

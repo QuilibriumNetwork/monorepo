@@ -83,8 +83,7 @@ impl RangeProof {
     /// extern crate merlin;
     /// use merlin::Transcript;
     ///
-    /// extern crate ed448_bulletproofs;
-    /// use ed448_bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
+    /// use bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
     ///
     /// # fn main() {
     /// // Generators for Pedersen commitments.  These can be selected
@@ -96,7 +95,7 @@ impl RangeProof {
     /// let bp_gens = BulletproofGens::new(64, 1);
     ///
     /// // A secret value we want to prove lies in the range [0, 2^32)
-    /// let secret_value = 1037568891u64;
+    /// let secret_value = Scalar::from(1037568891u64);
     ///
     /// // The API takes a blinding factor for the commitment.
     /// let blinding = Scalar::random(&mut thread_rng());
@@ -110,7 +109,7 @@ impl RangeProof {
     ///     &bp_gens,
     ///     &pc_gens,
     ///     &mut prover_transcript,
-    ///     secret_value,
+    ///     &secret_value,
     ///     &blinding,
     ///     32,
     /// ).expect("A real program could handle errors");
@@ -178,8 +177,7 @@ impl RangeProof {
     /// extern crate merlin;
     /// use merlin::Transcript;
     ///
-    /// extern crate ed448_bulletproofs;
-    /// use ed448_bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
+    /// use bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
     ///
     /// # fn main() {
     /// // Generators for Pedersen commitments.  These can be selected
@@ -191,7 +189,8 @@ impl RangeProof {
     /// let bp_gens = BulletproofGens::new(64, 16);
     ///
     /// // Four secret values we want to prove lie in the range [0, 2^32)
-    /// let secrets = [4242344947u64, 3718732727u64, 2255562556u64, 2526146994u64];
+    /// let secrets = [4242344947u64, 3718732727u64, 2255562556u64, 2526146994u64]
+    ///     .map(Scalar::from);
     ///
     /// // The API takes blinding factors for the commitments.
     /// let blindings: Vec<_> = (0..4).map(|_| Scalar::random(&mut thread_rng())).collect();
@@ -528,6 +527,8 @@ impl RangeProof {
     /// Deserializes the proof from a byte slice.
     ///
     /// Returns an error if the byte slice cannot be parsed into a `RangeProof`.
+    // Offsets are written index * 56 for every field, the first included.
+    #[allow(clippy::erasing_op)]
     pub fn from_bytes(slice: &[u8]) -> Result<RangeProof, ProofError> {
         // Decaf uses 56-byte elements instead of 32-byte
         if slice.len() % 56 != 0 {
@@ -652,17 +653,20 @@ mod tests {
 
         assert_eq!(power_g, delta(n, 1, &y, &z),);
     }
-    
+
     pub fn generate_little_endian_number(bit_size: usize) -> [u8; 56] {
         use self::rand::Rng;
 
         // Ensure bit_size is a power of two.
-        assert!(bit_size.is_power_of_two(), "bit_size must be a power of two");
-    
+        assert!(
+            bit_size.is_power_of_two(),
+            "bit_size must be a power of two"
+        );
+
         // Initialize the array with zeros.
         let mut bytes = [0u8; 56];
         let mut rng = rand::thread_rng();
-    
+
         // Determine how many full bytes and extra bits are needed.
         let full_bytes = bit_size / 8;
         let rem_bits = bit_size % 8;
@@ -707,7 +711,9 @@ mod tests {
             let mut rng = rand::thread_rng();
 
             // 0. Create witness data
-            let values: Vec<Scalar> = (0..m).map(|_| Scalar::from_bits(generate_little_endian_number(n))).collect();
+            let values: Vec<Scalar> = (0..m)
+                .map(|_| Scalar::from_bits(generate_little_endian_number(n)))
+                .collect();
             let blindings: Vec<Scalar> = (0..m).map(|_| Scalar::random(&mut rng)).collect();
 
             let mut transcript = Transcript::new(b"AggregatedRangeProofTest");

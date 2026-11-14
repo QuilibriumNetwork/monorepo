@@ -1,0 +1,1147 @@
+//! The verified PeerInfo records of the master's `peer_info_cache`, kept
+//! across restarts. Gossip is the cache's only other source, and regular
+//! nodes republish their PeerInfo every 30 minutes on mainnet, so a restarted
+//! node knew no peer's stream endpoints for up to that long. An archive's
+//! app-shard gap fetch then asked only other archives for a frame the shard's
+//! members held: after all four archives restarted together, GLOBAL waited
+//! 35 minutes on one such frame (2026-10-25).
+//!
+//! Every saved record is verified on load exactly as a gossiped one, and is
+//! dropped once older than [`MAX_AGE_MS`]. Gossip still replaces a restored
+//! record with a newer one (`peer_info_bounds.rs`, which also bounds and
+//! expires the cache in memory), and only a record no older than a minute
+//! passes its mesh validator.
+use std::{
+    collections::HashMap,
+    io::{BufReader, BufWriter, Read, Write},
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+pub(crate) type PeerInfoCache =
+    Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>;
+
+/// The file, in the node's configuration directory.
+pub(super) const FILE_NAME: &str = "peer-info-cache.bin";
+/// How often the records are saved; they are saved at shutdown too.
+pub(super) const SAVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Records older than this (by their signed timestamp) are neither saved nor
+/// loaded: four mainnet republish intervals.
+pub(super) const MAX_AGE_MS: i64 = 2 * 60 * 60 * 1000;
+/// At most this many records, the newest, are saved and loaded.
+pub(super) const MAX_RECORDS: usize = 4096;
+/// A record's GLOBAL head older than this is not reported as current: a
+/// live peer republishes every 30 minutes.
+pub(super) const HEAD_REPORT_MAX_AGE_MS: i64 = 60 * 60 * 1000;
+/// A signed timestamp further ahead than this is not loaded, as the
+/// gossip validator ignores one.
+const MAX_FUTURE_MS: i64 = 5 * 60 * 1000;
+const MAX_RECORD_BYTES: u64 = 256 * 1024;
+const MAX_FILE: u64 = 32 * 1024 * 1024;
+const MAGIC: &[u8; 8] = b"QPEERS01";
+
+pub(super) fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// The checks a PeerInfo passes before it is cached
+/// ([`quil_p2p::verify_peer_info`], which the mesh validator runs too):
+/// Falcon key and signature lengths (897 / 666), the peer ID bound to the
+/// signing key (without it an attacker signs with their own key but names a
+/// genesis archive's peer ID), and the Falcon signature over the record.
+pub(crate) fn verified(info: &quil_p2p::CanonicalPeerInfo) -> bool {
+    quil_p2p::verify_peer_info(info)
+}
+
+fn within_age(info: &quil_p2p::CanonicalPeerInfo, now_ms: i64) -> bool {
+    info.timestamp <= now_ms.saturating_add(MAX_FUTURE_MS)
+        && now_ms.saturating_sub(info.timestamp) <= MAX_AGE_MS
+}
+
+/// Whether `info`'s GLOBAL head is recent enough to report as current.
+pub(super) fn head_is_current(info: &quil_p2p::CanonicalPeerInfo, now_ms: i64) -> bool {
+    now_ms.saturating_sub(info.timestamp) <= HEAD_REPORT_MAX_AGE_MS
+}
+
+/// Most stream endpoints taken from one record for a shard: a node names
+/// one per worker (its announce override replacing it), so more come only
+/// from a record padded to occupy the gap fetch.
+pub(super) const MAX_ENDPOINTS_PER_MEMBER: usize = 4;
+/// Most member endpoints the gap fetch asks for one shard: twice the 32
+/// provers a shard holds before it splits.
+pub(super) const MAX_MEMBER_ENDPOINTS: usize = 64;
+
+/// A stream endpoint a shard member publishes, and the peer that must
+/// answer there: the record's signer. The gap fetch pins its dial to that
+/// peer, so a record naming another node's address cannot have that node
+/// stand in for it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct MemberEndpoint {
+    pub addr: String,
+    pub peer: quil_p2p::PeerId,
+}
+
+/// The endpoints `info` names for `filter`, at most
+/// [`MAX_ENDPOINTS_PER_MEMBER`].
+fn member_endpoints(
+    info: &quil_p2p::CanonicalPeerInfo,
+    filter: &[u8],
+    network: u8,
+) -> Vec<MemberEndpoint> {
+    let Ok(peer) = quil_p2p::PeerId::from_bytes(&info.peer_id) else {
+        return Vec::new();
+    };
+    let mut endpoints: Vec<MemberEndpoint> = info
+        .reachability
+        .iter()
+        .filter(|reach| reach.filter == filter)
+        .flat_map(|reach| reach.stream_multiaddrs.iter())
+        .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, network))
+        .map(|addr| MemberEndpoint { addr, peer })
+        .collect();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.truncate(MAX_ENDPOINTS_PER_MEMBER);
+    endpoints
+}
+
+/// Sorted, deduplicated and cut to [`MAX_MEMBER_ENDPOINTS`].
+fn bounded(mut endpoints: Vec<MemberEndpoint>) -> Vec<MemberEndpoint> {
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.truncate(MAX_MEMBER_ENDPOINTS);
+    endpoints
+}
+
+/// The stream endpoints every cached record names for the shard `filter`,
+/// whoever signed it, bounded per record and in total. Only for a registry
+/// not loaded yet ([`registered_member_endpoints`] otherwise): right after
+/// a restart, the shard's members are whom the gap fetch most needs.
+pub(super) fn shard_member_endpoints(
+    cache: &HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
+    filter: &[u8],
+    network: u8,
+) -> Vec<MemberEndpoint> {
+    bounded(
+        cache
+            .values()
+            .flat_map(|info| member_endpoints(info, filter, network))
+            .collect(),
+    )
+}
+
+/// Whether `prover` serves the shard `filter`: an allocation on it in a
+/// status that keeps the shard's data, confirmed and not yet left. A
+/// joining prover holds nothing yet.
+pub(super) fn serves(prover: &quil_types::consensus::ProverInfo, filter: &[u8]) -> bool {
+    use quil_types::consensus::ProverStatus;
+    prover.allocations.iter().any(|allocation| {
+        allocation.confirmation_filter == filter
+            && matches!(
+                allocation.status,
+                ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
+            )
+    })
+}
+
+/// The registered provers serving `filter` ([`serves`]) by peer ID, from
+/// `registry.get_provers(filter)`.
+fn registered_members(
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    filter: &[u8],
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    registry
+        .get_provers(filter)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|prover| serves(prover, filter))
+        .map(|prover| {
+            (
+                quil_p2p::peer_id_from_falcon_pubkey(&prover.public_key),
+                prover.public_key,
+            )
+        })
+        .collect()
+}
+
+/// The stream endpoints the shard `filter`'s registered members publish
+/// for it ([`registered_members`]), bounded per member and in total:
+/// whom the archive gap fetch asks first. A record whose signer serves no
+/// allocation on the shard names nothing, however it claims the filter.
+pub(super) fn registered_member_endpoints(
+    cache: &HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
+    filter: &[u8],
+    network: u8,
+    registry: &dyn quil_types::consensus::ProverRegistry,
+) -> Vec<MemberEndpoint> {
+    bounded(
+        registered_members(registry, filter)
+            .iter()
+            .filter_map(|(peer_id, public_key)| {
+                cache
+                    .get(peer_id)
+                    .filter(|info| info.public_key == *public_key)
+            })
+            .flat_map(|info| member_endpoints(info, filter, network))
+            .collect(),
+    )
+}
+
+/// A gap-fetch endpoint and the peer that must answer there: a member's
+/// ([`MemberEndpoint`]), or none for an archive, which the pool pins.
+pub(super) type GapEndpoint = (String, Option<quil_p2p::PeerId>);
+
+/// The gap fetch's open connections, one per [`GapEndpoint`].
+pub(super) type GapClients = quil_rpc::archive_client::shared::SharedConnections<
+    GapEndpoint,
+    quil_rpc::ArchiveClient,
+    quil_rpc::ArchiveClientError,
+>;
+
+/// A gap-fetch connection unused this long closes.
+const GAP_CLIENT_IDLE: Duration = Duration::from_secs(60);
+
+/// An empty [`GapClients`].
+pub(super) fn gap_clients() -> GapClients {
+    GapClients::new(GAP_CLIENT_IDLE, None, None)
+}
+
+/// The connection `clients` holds for `endpoint`, else a new one, kept
+/// there; fetches asking at once wait on one dial (up to sixteen fetches
+/// raced to dial an endpoint after its connection was dropped). A member's
+/// endpoint must answer as that member, so a record naming another node's
+/// address cannot have that node stand in for it; an archive's is dialed
+/// as the pool pins it.
+pub(super) async fn gap_fetch_client(
+    clients: &GapClients,
+    endpoint: &GapEndpoint,
+    key: &[u8],
+) -> Result<quil_rpc::archive_client::shared::Shared<quil_rpc::ArchiveClient>, String> {
+    let (addr, peer) = endpoint;
+    clients
+        .connect(endpoint, || async move {
+            match peer {
+                Some(peer) => quil_rpc::ArchiveClient::connect_peer(addr, key, *peer).await,
+                None => quil_rpc::ArchiveClient::connect_mtls(addr, key).await,
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What one gap fetch of a frame from one endpoint came to: the endpoint's
+/// answer or error, or `Err` when it did not answer within its deadline.
+pub(super) type GapAttempt = Result<
+    Result<Option<quil_types::proto::global::AppShardFrame>, String>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Fetch frame `number` of `filter` from `endpoint`, within `within`. The
+/// connection is dropped when its transport failed, or when it answered
+/// none of [`DEADLINE_FAILURES_BEFORE_REDIAL`] fetches in a row in time: an
+/// endpoint that lacks the frame yet, or answers one fetch slowly, keeps it.
+/// Dropping it on any unanswered fetch made the next fetches to that
+/// endpoint dial again; keeping it on every one left an endpoint that took
+/// fetches without answering them unasked until restart.
+///
+/// [`DEADLINE_FAILURES_BEFORE_REDIAL`]: quil_rpc::archive_client::shared::DEADLINE_FAILURES_BEFORE_REDIAL
+pub(super) async fn gap_fetch(
+    clients: &GapClients,
+    endpoint: &GapEndpoint,
+    key: &[u8],
+    filter: Vec<u8>,
+    number: u64,
+    within: Duration,
+) -> GapAttempt {
+    let class = match endpoint.1 {
+        Some(_) => "shard member gap fetches",
+        None => "archive gap fetches",
+    };
+    let deadline = tokio::time::Instant::now() + within;
+    let connect = gap_fetch_client(clients, endpoint, key);
+    let mut client = match tokio::time::timeout_at(deadline, connect).await? {
+        Ok(client) => client,
+        Err(error) => return Ok(Err(error)),
+    };
+    let fetch = client.get_app_shard_frame(filter, number);
+    let fetched = tokio::time::timeout_at(deadline, fetch).await;
+    match &fetched {
+        Ok(answer) => client.settle(answer.as_ref().map(|_| ()), class),
+        Err(_) => client.deadline_passed(class),
+    }
+    fetched.map(|answer| answer.map_err(|error| error.to_string()))
+}
+
+/// Saves the newest [`MAX_RECORDS`] records no older than [`MAX_AGE_MS`],
+/// atomically (written beside the file, then renamed). Returns how many
+/// were saved.
+pub(super) fn save(
+    cache: &PeerInfoCache,
+    path: &Path,
+    network: u8,
+    now_ms: i64,
+) -> std::io::Result<usize> {
+    let mut records: Vec<quil_p2p::CanonicalPeerInfo> = cache
+        .read()
+        .values()
+        .filter(|info| within_age(info, now_ms))
+        .cloned()
+        .collect();
+    records.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.peer_id.cmp(&b.peer_id))
+    });
+    records.truncate(MAX_RECORDS);
+    let mut encoded = Vec::with_capacity(records.len());
+    let mut total = (MAGIC.len() + 1 + 8) as u64;
+    for info in &records {
+        let bytes = quil_p2p::encode_canonical_peer_info(info, &info.public_key, &info.signature);
+        let size = 8 + bytes.len() as u64;
+        if bytes.len() as u64 > MAX_RECORD_BYTES || total + size > MAX_FILE {
+            continue;
+        }
+        total += size;
+        encoded.push(bytes);
+    }
+    let temporary = path.with_extension("pending");
+    let mut file = BufWriter::with_capacity(65536, std::fs::File::create(&temporary)?);
+    file.write_all(MAGIC)?;
+    file.write_all(&[network])?;
+    file.write_all(&(encoded.len() as u64).to_be_bytes())?;
+    for bytes in &encoded {
+        file.write_all(&(bytes.len() as u64).to_be_bytes())?;
+        file.write_all(bytes)?;
+    }
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(encoded.len())
+}
+
+/// What [`restore`] loaded, and why it dropped the rest.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Restored {
+    pub loaded: usize,
+    /// Older than [`MAX_AGE_MS`], or dated ahead of this node's clock.
+    pub stale: usize,
+    /// Undecodable, or failing the checks of [`verified`].
+    pub invalid: usize,
+    /// The cache already held the peer's record, no older.
+    pub superseded: usize,
+    /// Beyond [`MAX_RECORDS`].
+    pub over_cap: usize,
+}
+
+/// Loads the saved records into `cache`, verifying each. A record replaces
+/// the cache's record of its peer only when its timestamp is newer. An
+/// unreadable or malformed file loads nothing (`Err`).
+pub(super) fn restore(
+    cache: &PeerInfoCache,
+    path: &Path,
+    network: u8,
+    now_ms: i64,
+) -> std::io::Result<Restored> {
+    let records = read(path, network)?;
+    let mut restored = Restored::default();
+    let mut accepted = Vec::new();
+    for (index, bytes) in records.into_iter().enumerate() {
+        if index >= MAX_RECORDS {
+            restored.over_cap += 1;
+            continue;
+        }
+        let Ok(info) = quil_p2p::decode_canonical_peer_info(&bytes) else {
+            restored.invalid += 1;
+            continue;
+        };
+        if !within_age(&info, now_ms) {
+            restored.stale += 1;
+        } else if !verified(&info) {
+            restored.invalid += 1;
+        } else {
+            accepted.push(info);
+        }
+    }
+    let mut cache = cache.write();
+    for info in accepted {
+        if supersedes(cache.get(&info.peer_id), &info) {
+            cache.insert(info.peer_id.clone(), info);
+            restored.loaded += 1;
+        } else {
+            restored.superseded += 1;
+        }
+    }
+    Ok(restored)
+}
+
+fn read(path: &Path, network: u8) -> std::io::Result<Vec<Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_FILE {
+        return Err(invalid("file too large"));
+    }
+    let mut file = BufReader::with_capacity(65536, file);
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(invalid("unknown format"));
+    }
+    let mut saved_network = [0];
+    file.read_exact(&mut saved_network)?;
+    if saved_network[0] != network {
+        return Err(invalid("saved for another network"));
+    }
+    let count = read_u64(&mut file)?;
+    let mut records = Vec::new();
+    for _ in 0..count {
+        let size = read_u64(&mut file)?;
+        if size > MAX_RECORD_BYTES {
+            return Err(invalid("oversized record"));
+        }
+        let mut bytes = vec![0; size as usize];
+        file.read_exact(&mut bytes)?;
+        records.push(bytes);
+    }
+    let mut extra = [0];
+    if file.read(&mut extra)? != 0 {
+        return Err(invalid("trailing bytes"));
+    }
+    Ok(records)
+}
+
+fn invalid(reason: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid peer info cache file: {reason}"),
+    )
+}
+
+fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
+    let mut b = [0; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+/// Restores the saved records at startup and logs the outcome in one line;
+/// a missing or unreadable file leaves the cache as it is.
+pub(super) fn restore_at_startup(cache: &PeerInfoCache, path: &Path, network: u8) {
+    let started = Instant::now();
+    match restore(cache, path, network, unix_millis()) {
+        Ok(restored) => tracing::info!(
+            loaded = restored.loaded,
+            dropped_stale = restored.stale,
+            dropped_invalid = restored.invalid,
+            dropped_superseded = restored.superseded,
+            dropped_over_cap = restored.over_cap,
+            max_age_secs = MAX_AGE_MS / 1000,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer info cache restored from the last run; gossip replaces each record when its peer republishes"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => tracing::info!(
+            loaded = 0,
+            "peer info cache: no records saved by a previous run; peers' stream endpoints are known once they republish their PeerInfo"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "peer info cache file unreadable; starting with an empty cache: peers' stream endpoints are known once they republish their PeerInfo, and the file is rewritten at the next save"
+        ),
+    }
+}
+
+/// Saves the records every [`SAVE_INTERVAL`] and at shutdown. Never ends
+/// the node: a failed save is logged and retried at the next interval.
+pub(super) async fn save_until_cancelled(
+    cache: PeerInfoCache,
+    path: std::path::PathBuf,
+    network: u8,
+    token: tokio_util::sync::CancellationToken,
+) {
+    let mut interval = tokio::time::interval(SAVE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        let shutdown = tokio::select! {
+            _ = token.cancelled() => true,
+            _ = interval.tick() => false,
+        };
+        let (records, file) = (cache.clone(), path.clone());
+        let saved =
+            tokio::task::spawn_blocking(move || save(&records, &file, network, unix_millis()))
+                .await;
+        match saved {
+            Ok(Ok(count)) if shutdown => {
+                tracing::info!(records = count, "peer info cache saved at shutdown")
+            }
+            Ok(Ok(count)) => tracing::debug!(records = count, "peer info cache saved"),
+            Ok(Err(error)) => tracing::warn!(%error, shutdown,
+                "peer info cache save failed; a restart before the next save restores older records or none"),
+            Err(error) => tracing::warn!(%error, shutdown, "peer info cache save task failed"),
+        }
+        if shutdown {
+            return;
+        }
+    }
+}
+
+/// Once per filter per hour: whether to log that the gap fetch knows no
+/// member endpoint for it.
+#[derive(Default)]
+pub(super) struct HourlyNotice(parking_lot::Mutex<HashMap<Vec<u8>, Instant>>);
+
+impl HourlyNotice {
+    pub(super) fn due(&self, filter: &[u8]) -> bool {
+        const HOUR: Duration = Duration::from_secs(3600);
+        let now = Instant::now();
+        let mut last = self.0.lock();
+        if last
+            .get(filter)
+            .is_some_and(|at| now.duration_since(*at) < HOUR)
+        {
+            return false;
+        }
+        if last.len() >= 4096 {
+            last.retain(|_, at| now.duration_since(*at) < HOUR);
+        }
+        last.insert(filter.to_vec(), now);
+        true
+    }
+}
+
+/// Whether `info` replaces the record held for its peer: a peer's records
+/// are ordered by their timestamp, so a delayed copy of an older record
+/// (gossip relayed late, a restored file) never replaces a newer one.
+pub(super) fn supersedes(
+    held: Option<&quil_p2p::CanonicalPeerInfo>,
+    info: &quil_p2p::CanonicalPeerInfo,
+) -> bool {
+    held.is_none_or(|held| held.timestamp < info.timestamp)
+}
+
+/// A registered prover holding one allocation on `filter`, for tests.
+#[cfg(test)]
+pub(super) fn test_prover(
+    public_key: &[u8],
+    filter: &[u8],
+    status: quil_types::consensus::ProverStatus,
+) -> quil_types::consensus::ProverInfo {
+    quil_types::consensus::ProverInfo {
+        public_key: public_key.to_vec(),
+        address: quil_crypto::poseidon::hash_bytes_to_32(public_key)
+            .map_or_else(|_| Vec::new(), |address| address.to_vec()),
+        status: quil_types::consensus::ProverStatus::Active,
+        kick_frame_number: 0,
+        allocations: vec![quil_types::consensus::ProverAllocationInfo {
+            status,
+            confirmation_filter: filter.to_vec(),
+            rejection_filter: Vec::new(),
+            join_frame_number: 0,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            last_signed_frame_number: 0,
+            epoch: 0,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }],
+        available_storage: 0,
+        seniority: 0,
+        delegate_address: Vec::new(),
+    }
+}
+
+/// A loopback listener that completes the PQNoise handshake of every dial
+/// as the holder of a new key and keeps each connection open, until the
+/// test's runtime ends: its address and that key's peer.
+#[cfg(test)]
+pub(super) async fn pqnoise_listener() -> (String, quil_p2p::PeerId) {
+    let key = quil_p2p::generate_falcon_signing_key();
+    let peer = quil_p2p::Keypair::falcon_from_bytes(&key)
+        .unwrap()
+        .public()
+        .to_peer_id();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        use quil_rpc::pqnoise_channel::pq_server_handshake;
+        let mut open = Vec::new();
+        while let Ok((tcp, _)) = listener.accept().await {
+            open.push(pq_server_handshake(tcp, &key).await);
+        }
+    });
+    (addr, peer)
+}
+
+/// A peer that no listener answers as.
+#[cfg(test)]
+pub(super) fn another_peer() -> quil_p2p::PeerId {
+    quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+        .unwrap()
+        .public()
+        .to_peer_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::crypto::Signer as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const FILTER: [u8; 35] = [7; 35];
+    // TEST-NET-3 documentation address.
+    const STREAM: &str = "/ip4/203.0.113.7/tcp/8340";
+
+    fn signed(timestamp: i64, filter: &[u8]) -> quil_p2p::CanonicalPeerInfo {
+        let signer = quil_crypto::FalconSigner::generate();
+        let public_key = signer.public_key().to_vec();
+        let mut info = quil_p2p::CanonicalPeerInfo {
+            peer_id: quil_p2p::peer_id_from_falcon_pubkey(&public_key),
+            reachability: vec![quil_p2p::CanonicalReachability {
+                filter: filter.to_vec(),
+                pubsub_multiaddrs: vec!["/ip4/203.0.113.7/udp/8336/quic-v1".into()],
+                stream_multiaddrs: vec![STREAM.into()],
+            }],
+            timestamp,
+            version: vec![2, 1, 0],
+            patch_number: vec![25],
+            last_received_frame: 20_095,
+            last_global_head_frame: 932_137,
+            ..Default::default()
+        };
+        let payload = quil_p2p::encode_canonical_peer_info(&info, &public_key, &[]);
+        info.signature = signer.sign(&payload).unwrap();
+        info.public_key = public_key;
+        // As gossip delivers it: decoded from the wire.
+        let wire = quil_p2p::encode_canonical_peer_info(&info, &info.public_key, &info.signature);
+        let info = quil_p2p::decode_canonical_peer_info(&wire).unwrap();
+        assert!(verified(&info));
+        info
+    }
+
+    /// A delayed copy of an older record never replaces a newer one, from
+    /// gossip or from the file.
+    #[test]
+    fn only_a_newer_record_supersedes_the_held_one() {
+        let older = signed(1_000, &FILTER);
+        let mut newer = older.clone();
+        newer.timestamp = 2_000;
+        assert!(supersedes(None, &older));
+        assert!(supersedes(Some(&older), &newer));
+        assert!(!supersedes(Some(&newer), &older));
+        assert!(!supersedes(Some(&older), &older));
+    }
+
+    fn addrs(endpoints: Vec<MemberEndpoint>) -> Vec<String> {
+        endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.addr)
+            .collect()
+    }
+
+    fn cache_of(records: impl IntoIterator<Item = quil_p2p::CanonicalPeerInfo>) -> PeerInfoCache {
+        Arc::new(parking_lot::RwLock::new(
+            records
+                .into_iter()
+                .map(|info| (info.peer_id.clone(), info))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn peer_info_restored_after_restart_names_the_shard_members_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let now = 1_800_000_000_000;
+        let member = signed(now - 25 * 60 * 1000, &FILTER);
+        let running = cache_of([member.clone()]);
+        assert_eq!(
+            addrs(shard_member_endpoints(&running.read(), &FILTER, 0)),
+            vec!["203.0.113.7:8340".to_string()]
+        );
+        assert_eq!(save(&running, &path, 0, now).unwrap(), 1);
+
+        // The restarted node: an empty cache, then the saved file.
+        let restarted = cache_of([]);
+        assert!(shard_member_endpoints(&restarted.read(), &FILTER, 0).is_empty());
+        let restored = restore(&restarted, &path, 0, now + 5 * 60 * 1000).unwrap();
+        assert_eq!(
+            restored,
+            Restored {
+                loaded: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            addrs(shard_member_endpoints(&restarted.read(), &FILTER, 0)),
+            vec!["203.0.113.7:8340".to_string()]
+        );
+        let held = restarted.read().get(&member.peer_id).cloned().unwrap();
+        assert_eq!(
+            (held.signature, held.last_global_head_frame),
+            (member.signature, 932_137)
+        );
+    }
+
+    #[test]
+    fn peer_info_restore_rejects_forged_and_tampered_records_and_drops_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let now = 1_800_000_000_000;
+        let good = signed(now - 60_000, &FILTER);
+        // Another endpoint written into a signed record.
+        let mut tampered = signed(now - 60_000, &FILTER);
+        tampered.reachability[0].stream_multiaddrs = vec!["/ip4/198.51.100.9/tcp/8340".into()];
+        // Signed by its own key, naming another peer's ID.
+        let mut forged = signed(now - 60_000, &FILTER);
+        forged.peer_id = good.peer_id.clone();
+        forged.timestamp = now - 30_000;
+        let mut unsigned = signed(now - 60_000, &FILTER);
+        unsigned.signature.clear();
+        let stale = signed(now - MAX_AGE_MS - 60_000, &FILTER);
+        let ahead = signed(now + MAX_FUTURE_MS + 60_000, &FILTER);
+        // save() writes what a cache holds; build the file from records
+        // the running cache would never hold, as an attacker could.
+        let mut file = Vec::new();
+        file.extend_from_slice(MAGIC);
+        file.push(0);
+        let records = [&good, &tampered, &forged, &unsigned, &stale, &ahead];
+        file.extend_from_slice(&(records.len() as u64).to_be_bytes());
+        for info in records {
+            let bytes =
+                quil_p2p::encode_canonical_peer_info(info, &info.public_key, &info.signature);
+            file.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            file.extend_from_slice(&bytes);
+        }
+        std::fs::write(&path, &file).unwrap();
+        let cache = cache_of([]);
+        let restored = restore(&cache, &path, 0, now).unwrap();
+        assert_eq!(
+            restored,
+            Restored {
+                loaded: 1,
+                stale: 2,
+                invalid: 3,
+                ..Default::default()
+            }
+        );
+        let cache = cache.read();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&good.peer_id).unwrap().signature, good.signature);
+
+        // Saved for another network, or damaged: nothing loads.
+        assert!(restore(&cache_of([]), &path, 1, now).is_err());
+        std::fs::write(&path, &file[..file.len() - 3]).unwrap();
+        let damaged = cache_of([]);
+        assert!(restore(&damaged, &path, 0, now).is_err());
+        assert!(damaged.read().is_empty());
+    }
+
+    #[test]
+    fn peer_info_save_keeps_fresh_records_and_gossip_wins_over_restored_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let now = 1_800_000_000_000;
+        let fresh = signed(now - 10 * 60 * 1000, &FILTER);
+        let stale = signed(now - MAX_AGE_MS - 1, &FILTER);
+        assert_eq!(
+            save(&cache_of([fresh.clone(), stale]), &path, 0, now).unwrap(),
+            1
+        );
+        // The cache already holds a newer record of the peer (from gossip).
+        let mut newer = fresh.clone();
+        newer.timestamp = now;
+        newer.reachability.clear();
+        let cache = cache_of([newer]);
+        let restored = restore(&cache, &path, 0, now).unwrap();
+        assert_eq!(
+            restored,
+            Restored {
+                superseded: 1,
+                ..Default::default()
+            }
+        );
+        assert!(cache
+            .read()
+            .get(&fresh.peer_id)
+            .unwrap()
+            .reachability
+            .is_empty());
+        // Restored records are older than the head report bound only once
+        // they are an hour old.
+        assert!(head_is_current(&fresh, now));
+        assert!(!head_is_current(&fresh, now + HEAD_REPORT_MAX_AGE_MS));
+    }
+
+    /// Only the shard's registered members name endpoints, each pinned to
+    /// the record's signer; a registered prover that only joins the shard,
+    /// or serves another, names none.
+    #[test]
+    fn gap_fetch_takes_endpoints_only_from_registered_members() {
+        use quil_types::consensus::ProverStatus;
+        let now = 1_800_000_000_000;
+        let member = signed(now, &FILTER);
+        let joining = signed(now, &FILTER);
+        let elsewhere = signed(now, &FILTER);
+        let unregistered = signed(now, &FILTER);
+        let mut held = Vec::new();
+        for (index, info) in [&member, &joining, &elsewhere, &unregistered]
+            .into_iter()
+            .enumerate()
+        {
+            let mut info = info.clone();
+            info.reachability[0].stream_multiaddrs =
+                vec![format!("/ip4/203.0.113.{}/tcp/8340", 10 + index)];
+            held.push(info);
+        }
+        let cache = cache_of(held);
+        let registry = quil_engine::test_support::TestProverRegistry::with_provers(vec![
+            test_prover(&member.public_key, &FILTER, ProverStatus::Active),
+            test_prover(&joining.public_key, &FILTER, ProverStatus::Joining),
+            test_prover(&elsewhere.public_key, &[9; 35], ProverStatus::Active),
+        ]);
+        let endpoints = registered_member_endpoints(&cache.read(), &FILTER, 0, &registry);
+        assert_eq!(
+            endpoints,
+            vec![MemberEndpoint {
+                addr: "203.0.113.10:8340".into(),
+                peer: quil_p2p::PeerId::from_bytes(&member.peer_id).unwrap(),
+            }]
+        );
+        // Before the registry loads, every record names its endpoints.
+        assert_eq!(shard_member_endpoints(&cache.read(), &FILTER, 0).len(), 4);
+    }
+
+    /// The gap fetch dials a member's endpoint only as the member whose
+    /// record named it: a node there answering with another identity is
+    /// refused, and no connection to it is kept.
+    #[tokio::test]
+    async fn gap_fetch_dials_a_member_endpoint_only_as_its_member() {
+        let (addr, member) = pqnoise_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let impostor: GapEndpoint = (addr.clone(), Some(another_peer()));
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(10),
+            gap_fetch_client(&clients, &impostor, &key),
+        )
+        .await
+        .expect("the dial ends");
+        assert!(
+            dialed.is_err(),
+            "a node answering as another peer stood in for the member"
+        );
+        assert_eq!(clients.kept(), 0);
+        let endpoint: GapEndpoint = (addr, Some(member));
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(10),
+            gap_fetch_client(&clients, &endpoint, &key),
+        )
+        .await
+        .expect("the dial ends");
+        if let Err(error) = &dialed {
+            panic!("the member was refused: {error}");
+        }
+        drop(dialed);
+        let again = gap_fetch_client(&clients, &endpoint, &key).await;
+        assert!(again.is_ok_and(|client| client.kept()));
+    }
+
+    /// A PQNoise listener answering as `peer` that counts the connections
+    /// it accepted and holds every one open; gRPC calls on them never get an
+    /// answer.
+    async fn counting_listener() -> (String, quil_p2p::PeerId, Arc<AtomicUsize>) {
+        let key = quil_p2p::generate_falcon_signing_key();
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let stream = quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        (addr, peer, accepted)
+    }
+
+    /// Sixteen fetches asking at once for an endpoint whose connection was
+    /// dropped dial it once between them; each used to dial its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gap_fetches_asking_at_once_after_a_drop_dial_once() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        let first = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        first.discard();
+        drop(first);
+        let fetches = (0..16).map(|_| {
+            let (clients, endpoint, key) = (clients.clone(), endpoint.clone(), key.clone());
+            tokio::spawn(async move {
+                gap_fetch_client(&clients, &endpoint, &key)
+                    .await
+                    .map(|client| client.id())
+            })
+        });
+        let ids: Vec<u64> = futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap().unwrap())
+            .collect();
+        assert!(
+            ids.iter().all(|id| *id == ids[0]),
+            "gap fetches after a drop got different connections {ids:?}: no single flight"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "gap-fetch dials after a drop, expected one first connection and one for all sixteen: no single flight"
+        );
+    }
+
+    /// A fetch the endpoint does not answer in time keeps its connection:
+    /// the next fetch rides it rather than dialing again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gap_fetch_that_times_out_keeps_its_connection() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        // Dialed first, so that no fetch's deadline cuts the dial short.
+        drop(gap_fetch_client(&clients, &endpoint, &key).await.unwrap());
+        for number in [7, 8] {
+            let attempt = gap_fetch(
+                &clients,
+                &endpoint,
+                &key,
+                vec![7; 35],
+                number,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "gap-fetch timeout dropped the connection"
+        );
+        assert_eq!(clients.kept(), 1);
+    }
+
+    /// Fetches in a row a connection may leave unanswered before it is
+    /// dropped (`shared::DEADLINE_FAILURES_BEFORE_REDIAL`).
+    const REDIAL_AFTER: usize = 3;
+
+    /// A filter the endpoints below hold every fetch of unanswered.
+    const UNANSWERED: [u8; 35] = [7; 35];
+
+    /// Holds every frame read until the client gives up on it.
+    struct NeverAnswers;
+
+    #[tonic::async_trait]
+    impl quil_rpc::stub_services::AppShardFrameProvider for NeverAnswers {
+        async fn get_app_shard_frame(
+            &self,
+            _filter: Vec<u8>,
+            _frame_number: u64,
+        ) -> Result<Option<quil_types::proto::global::AppShardFrame>, tonic::Status> {
+            std::future::pending().await
+        }
+    }
+
+    /// A peer listener answering as its peer, counting the connections it
+    /// accepted: it refuses a frame read with an empty filter at once, and
+    /// holds every other one unanswered.
+    async fn answering_listener() -> (String, quil_p2p::PeerId, Arc<AtomicUsize>) {
+        use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let (key, streams_tx) = (key.clone(), streams_tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(stream) =
+                        quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &key).await
+                    {
+                        let _ = streams_tx.send(stream);
+                    }
+                });
+            }
+        });
+        let incoming = futures::stream::unfold(streams, |mut streams| async move {
+            let stream = streams.recv().await?;
+            Some((Ok::<_, std::io::Error>(stream), streams))
+        });
+        let frames =
+            quil_rpc::stub_services::AppShardRpcServer::with_provider(Arc::new(NeverAnswers));
+        tokio::spawn(
+            quil_rpc::pqnoise_channel::peer_server()
+                .add_service(AppShardServiceServer::new(frames))
+                .serve_with_incoming(incoming),
+        );
+        (addr, peer, accepted)
+    }
+
+    /// An endpoint that answers none of three fetches in a row in time has
+    /// its connection dropped: the next fetch dials a fresh one. It used to
+    /// be kept while fetches kept it from going idle, so an endpoint that
+    /// took requests without answering them was never asked again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_fetches_unanswered_three_times_in_a_row_dial_a_fresh_connection() {
+        let (addr, member, accepted) = counting_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        let first = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        for number in 0..REDIAL_AFTER as u64 {
+            let attempt = gap_fetch(
+                &clients,
+                &endpoint,
+                &key,
+                UNANSWERED.to_vec(),
+                number,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        eprintln!("REACH gap-redial");
+        let next = gap_fetch_client(&clients, &endpoint, &key).await.unwrap();
+        assert!(
+            !next.kept() && next.id() != first_id,
+            "unanswered_connection_kept: {REDIAL_AFTER} fetches in a row went unanswered and the next rode the same connection"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "unanswered_connection_kept: expected one fresh dial"
+        );
+    }
+
+    /// An answer between unanswered fetches starts their count again: two,
+    /// an answer and two more keep the connection; a third in a row after
+    /// the answer drops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_restarts_the_count_of_unanswered_gap_fetches() {
+        let (addr, member, accepted) = answering_listener().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let clients = gap_clients();
+        let endpoint: GapEndpoint = (addr, Some(member));
+        drop(gap_fetch_client(&clients, &endpoint, &key).await.unwrap());
+        let (clients, endpoint, key) = (&clients, &endpoint, &key);
+        let fetch = move |filter: Vec<u8>| {
+            gap_fetch(
+                clients,
+                endpoint,
+                key,
+                filter,
+                1,
+                Duration::from_millis(500),
+            )
+        };
+        for _ in 1..REDIAL_AFTER {
+            let attempt = fetch(UNANSWERED.to_vec()).await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        let answered = fetch(Vec::new()).await;
+        assert!(
+            matches!(answered, Ok(Err(_))),
+            "the listener did not refuse an empty filter: {answered:?}"
+        );
+        for _ in 1..REDIAL_AFTER {
+            let attempt = fetch(UNANSWERED.to_vec()).await;
+            assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        }
+        eprintln!("REACH gap-redial");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "answer_did_not_restart_count: the connection was dropped before {REDIAL_AFTER} unanswered fetches followed the answer"
+        );
+        let attempt = fetch(UNANSWERED.to_vec()).await;
+        assert!(attempt.is_err(), "the listener answered: {attempt:?}");
+        let next = gap_fetch_client(clients, endpoint, key).await.unwrap();
+        assert!(
+            !next.kept(),
+            "unanswered_after_answer_kept: {REDIAL_AFTER} fetches in a row after the answer went unanswered and the next rode the same connection"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn member_endpoints_are_bounded_per_record_and_per_shard() {
+        let now = 1_800_000_000_000;
+        let records: Vec<_> = (0..40)
+            .map(|record| {
+                let mut info = signed(now, &FILTER);
+                info.reachability[0].stream_multiaddrs = (0..10)
+                    .map(|i| format!("/ip4/203.0.113.{}/tcp/{}", 1 + record, 8340 + i))
+                    .collect();
+                info
+            })
+            .collect();
+        let one = shard_member_endpoints(&cache_of(records[..1].to_vec()).read(), &FILTER, 0);
+        assert_eq!(one.len(), MAX_ENDPOINTS_PER_MEMBER);
+        let all = shard_member_endpoints(&cache_of(records).read(), &FILTER, 0);
+        assert_eq!(all.len(), MAX_MEMBER_ENDPOINTS);
+    }
+
+    #[test]
+    fn hourly_notice_is_due_once_per_filter() {
+        let notice = HourlyNotice::default();
+        assert!(notice.due(b"a"));
+        assert!(!notice.due(b"a"));
+        assert!(notice.due(b"b"));
+    }
+
+    /// A record padded with endpoints for a shard used to occupy the gap
+    /// fetch for all of them, four at a time, before any archive was asked.
+    #[test]
+    fn reproduces_padded_member_record_occupying_the_gap_fetch() {
+        let now = 1_800_000_000_000;
+        // The function reads what the cache holds; an attacker signs such a
+        // record with their own key.
+        let mut padded = signed(now, &FILTER);
+        padded.reachability[0].stream_multiaddrs = (0..200)
+            .map(|i| format!("/ip4/203.0.113.{}/tcp/{}", 1 + i % 200, 8340 + i))
+            .collect();
+        let cache = cache_of([padded]);
+        let endpoints = shard_member_endpoints(&cache.read(), &FILTER, 0).len();
+        assert!(
+            endpoints <= 8,
+            "{endpoints} endpoints kept from one record for the gap fetch to try"
+        );
+    }
+}

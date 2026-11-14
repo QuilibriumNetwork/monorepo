@@ -1,21 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[repr(i32)]
-pub enum KeyManagerType {
-    #[serde(alias = "inmemory", alias = "inMemory")]
-    InMemory = 0,
-    #[serde(alias = "file")]
-    File = 1,
-}
-
-impl Default for KeyManagerType {
-    fn default() -> Self {
-        Self::File
-    }
-}
-
+/// The node's file key store (`keys.yml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyStoreFileConfig {
@@ -37,20 +22,9 @@ impl Default for KeyStoreFileConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyConfig {
-    #[serde(default, rename = "keyManagerType")]
-    pub key_store: KeyManagerType,
     #[serde(default, rename = "keyManagerFile")]
     pub key_store_file: KeyStoreFileConfig,
-}
-
-impl Default for KeyConfig {
-    fn default() -> Self {
-        Self {
-            key_store: KeyManagerType::File,
-            key_store_file: KeyStoreFileConfig::default(),
-        }
-    }
 }

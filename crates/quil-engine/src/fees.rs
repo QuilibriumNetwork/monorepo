@@ -112,9 +112,7 @@ impl DynamicFeeManager for InMemoryDynamicFeeManager {
     fn get_next_fee_multiplier(&self, filter: &[u8]) -> Result<u64> {
         let map = self.filter_data.read().unwrap();
         match map.get(filter) {
-            Some(data) if !data.votes.is_empty() => {
-                Ok(data.sum_votes / data.votes.len() as u64)
-            }
+            Some(data) if !data.votes.is_empty() => Ok(data.sum_votes / data.votes.len() as u64),
             _ => Ok(DEFAULT_FEE_MULTIPLIER),
         }
     }
@@ -187,14 +185,12 @@ impl DynamicFeeManager for InMemoryDynamicFeeManager {
 // Fee traffic adjustment — matches Go's adjustFeeForTraffic()
 // =====================================================================
 
-/// Target frame production time in milliseconds (10 seconds).
-const TARGET_FRAME_TIME_MS: i64 = 10_000;
-
 /// Maximum percentage adjustment per frame (capped at 10%).
 const MAX_ADJUSTMENT_PERCENT: i64 = 10;
 
 /// Adjust the base fee multiplier based on actual frame production
-/// timing vs the 10-second target.
+/// timing vs the GLOBAL frame interval at this process's latest GLOBAL frame
+/// ([`quil_types::consensus::ideal_frame_time_ms`], 10 seconds on mainnet).
 ///
 /// If frames are produced faster than target, the fee decreases
 /// (incentivizing more transactions). If slower, the fee increases
@@ -226,21 +222,21 @@ pub fn adjust_fee_for_traffic(
     }
 
     let time_diff = current_timestamp_ms - previous_timestamp_ms;
+    let target_frame_time_ms =
+        i64::try_from(quil_types::consensus::ideal_frame_time_ms()).unwrap_or(i64::MAX);
 
-    if time_diff < TARGET_FRAME_TIME_MS {
+    if time_diff < target_frame_time_ms {
         // Frames are faster than target → decrease fee
-        let mut percent_faster =
-            (TARGET_FRAME_TIME_MS - time_diff) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_faster = (target_frame_time_ms - time_diff) * 100 / target_frame_time_ms;
         if percent_faster > MAX_ADJUSTMENT_PERCENT {
             percent_faster = MAX_ADJUSTMENT_PERCENT;
         }
         let adjustment = base_fee * percent_faster as u64 / 100;
         let adjusted = base_fee.saturating_sub(adjustment);
         adjusted.max(1) // minimum fee is 1
-    } else if time_diff > TARGET_FRAME_TIME_MS {
+    } else if time_diff > target_frame_time_ms {
         // Frames are slower than target → increase fee
-        let mut percent_slower =
-            (time_diff - TARGET_FRAME_TIME_MS) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_slower = (time_diff - target_frame_time_ms) * 100 / target_frame_time_ms;
         if percent_slower > MAX_ADJUSTMENT_PERCENT {
             percent_slower = MAX_ADJUSTMENT_PERCENT;
         }
@@ -266,7 +262,44 @@ pub fn compute_fee_multiplier_vote(
     let base = fee_manager
         .get_next_fee_multiplier(filter)
         .unwrap_or(DEFAULT_FEE_MULTIPLIER);
-    adjust_fee_for_traffic(base, current_timestamp_ms, previous_timestamp_ms, reward_greedy)
+    adjust_fee_for_traffic(
+        base,
+        current_timestamp_ms,
+        previous_timestamp_ms,
+        reward_greedy,
+    )
+}
+
+// =====================================================================
+// Fee vote bounds
+// =====================================================================
+
+// The bounds and the frame they apply from live with GLOBAL execution, which
+// refuses a header out of bounds too (`quil_execution::fee_vote`).
+pub use quil_execution::fee_vote::{
+    check_fee_vote, fee_vote_bounded_at, fee_vote_in_bounds, init_fee_vote_bound_frame,
+    MAX_FEE_MULTIPLIER_VOTE, MIN_FEE_MULTIPLIER_VOTE,
+};
+
+#[cfg(test)]
+pub use quil_execution::fee_vote::set_fee_vote_bound_frame_for_thread;
+
+// The bounds are the votes `compute_fee_multiplier_vote` can return:
+// `DEFAULT_FEE_MULTIPLIER` moved by at most `MAX_ADJUSTMENT_PERCENT`.
+const _: () = assert!(
+    MIN_FEE_MULTIPLIER_VOTE == DEFAULT_FEE_MULTIPLIER * (100 - MAX_ADJUSTMENT_PERCENT as u64) / 100
+        && MAX_FEE_MULTIPLIER_VOTE
+            == DEFAULT_FEE_MULTIPLIER * (100 + MAX_ADJUSTMENT_PERCENT as u64) / 100
+);
+
+/// The vote a leader proposes in a frame anchored at `global_frame`: its
+/// computed `vote`, kept inside the bounds where they apply.
+pub fn proposer_fee_vote(global_frame: u64, vote: u64) -> u64 {
+    if fee_vote_bounded_at(global_frame) {
+        vote.clamp(MIN_FEE_MULTIPLIER_VOTE, MAX_FEE_MULTIPLIER_VOTE)
+    } else {
+        vote
+    }
 }
 
 #[cfg(test)]
@@ -313,10 +346,7 @@ mod tests {
         m.add_frame_fee_vote(&[0x01], 4, 400).unwrap();
         assert_eq!(m.get_average_window_size(&[0x01]).unwrap(), 3);
         assert_eq!(m.get_next_fee_multiplier(&[0x01]).unwrap(), 300);
-        assert_eq!(
-            m.get_vote_history(&[0x01]).unwrap(),
-            vec![200u64, 300, 400]
-        );
+        assert_eq!(m.get_vote_history(&[0x01]).unwrap(), vec![200u64, 300, 400]);
     }
 
     #[test]
@@ -327,10 +357,7 @@ mod tests {
         }
         let removed = m.rewind_to_frame(&[0x01], 3).unwrap();
         assert_eq!(removed, 2);
-        assert_eq!(
-            m.get_vote_history(&[0x01]).unwrap(),
-            vec![100u64, 200, 300]
-        );
+        assert_eq!(m.get_vote_history(&[0x01]).unwrap(), vec![100u64, 200, 300]);
         assert_eq!(m.get_next_fee_multiplier(&[0x01]).unwrap(), 200);
     }
 
@@ -474,7 +501,10 @@ mod tests {
         let prev_slow = 30_000i64; // 20s gap
         let rg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, true);
         let dg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, false);
-        assert_eq!(rg_slow, 550, "reward_greedy raises 500 → 550 on slow cadence");
+        assert_eq!(
+            rg_slow, 550,
+            "reward_greedy raises 500 → 550 on slow cadence"
+        );
         assert_eq!(dg_slow, 500, "data_greedy untouched on slow cadence");
     }
 
@@ -494,5 +524,53 @@ mod tests {
         let dg = compute_fee_multiplier_vote(&m, &[9], now, prev, false);
         assert_eq!(rg, dg, "strategies agree on target cadence");
         assert_eq!(rg, 750);
+    }
+
+    /// Every vote a leader computes lies inside the bounds members enforce,
+    /// whatever its strategy and the frame cadence, so the bounds never
+    /// refuse an honest proposal; a leader keeps any other vote inside them
+    /// once they apply, and leaves it as computed before.
+    #[test]
+    fn every_computed_vote_lies_inside_the_enforced_bounds() {
+        assert_eq!(
+            (MIN_FEE_MULTIPLIER_VOTE, MAX_FEE_MULTIPLIER_VOTE),
+            (90, 110)
+        );
+        let m = mgr(10);
+        let now = 1_800_000_000_000i64;
+        let target = i64::try_from(quil_types::consensus::ideal_frame_time_ms()).unwrap();
+        for gap in [
+            -2 * 60 * 60 * 1000,
+            -1,
+            0,
+            1,
+            target / 2,
+            target - 1,
+            target,
+            target + 1,
+            2 * target,
+            now - 1,
+        ] {
+            for reward_greedy in [true, false] {
+                let vote = compute_fee_multiplier_vote(&m, &[3], now, now - gap, reward_greedy);
+                assert!(fee_vote_in_bounds(vote), "gap {gap}: vote {vote}");
+            }
+        }
+        set_fee_vote_bound_frame_for_thread(Some(10));
+        assert_eq!(proposer_fee_vote(9, 0), 0, "before the bound frame");
+        for (vote, kept) in [
+            (0, 90),
+            (89, 90),
+            (90, 90),
+            (100, 100),
+            (110, 110),
+            (u64::MAX, 110),
+        ] {
+            assert_eq!(proposer_fee_vote(10, vote), kept);
+            assert!(check_fee_vote(1, 10, kept).is_ok());
+        }
+        assert!(check_fee_vote(1, 10, 0).is_err());
+        assert!(check_fee_vote(1, 9, 0).is_ok(), "before the bound frame");
+        set_fee_vote_bound_frame_for_thread(None);
     }
 }

@@ -32,13 +32,11 @@ pub struct FP {
     pub xes: i32,
 }
 
-
 impl std::fmt::Debug for FP {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "{}", self.tostring())
     }
 }
-
 
 impl std::fmt::Display for FP {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -54,16 +52,16 @@ pub const GENERALISED_MERSENNE: usize = 3;
 pub const NEGATOWER: usize = 0;
 pub const POSITOWER: usize = 1;
 
-pub const MODBITS:usize = 581; /* Number of bits in Modulus */
-pub const PM1D2: usize = 1;  /* Modulus mod 8 */
-pub const RIADZ: isize = 2;  /* Z for hash-to-point */
-pub const RIADZG2A: isize = 2;  /* G2 Z for hash-to-point */
-pub const RIADZG2B: isize = 0;  /* G2 Z for hash-to-point */
-pub const MODTYPE:usize=NOT_SPECIAL;
-pub const QNRI:usize=0; /* Fp2 QNR 2^i+sqrt(-1) */
-pub const TOWER:usize=POSITOWER; /* Tower type */
+pub const MODBITS: usize = 581; /* Number of bits in Modulus */
+pub const PM1D2: usize = 1; /* Modulus mod 8 */
+pub const RIADZ: isize = 2; /* Z for hash-to-point */
+pub const RIADZG2A: isize = 2; /* G2 Z for hash-to-point */
+pub const RIADZG2B: isize = 0; /* G2 Z for hash-to-point */
+pub const MODTYPE: usize = NOT_SPECIAL;
+pub const QNRI: usize = 0; /* Fp2 QNR 2^i+sqrt(-1) */
+pub const TOWER: usize = POSITOWER; /* Tower type */
 
-pub const FEXCESS:i32 = ((1 as i32)<<19)-1;
+pub const FEXCESS: i32 = ((1 as i32) << 19) - 1;
 pub const OMASK: Chunk = (-1) << (MODBITS % big::BASEBITS);
 pub const TBITS: usize = MODBITS % big::BASEBITS; // Number of active bits in top word
 pub const TMASK: Chunk = (1 << TBITS) - 1;
@@ -81,9 +79,10 @@ impl FP {
 
     pub fn new_int(a: isize) -> FP {
         let mut f = FP::new();
-        if a<0 {
+        if a < 0 {
             let mut m = BIG::new_ints(&rom::MODULUS);
-            m.inc(a); m.norm();
+            m.inc(a);
+            m.norm();
             f.x.copy(&m);
         } else {
             f.x.inc(a);
@@ -108,7 +107,7 @@ impl FP {
 
     pub fn new_rand(rng: &mut RAND) -> FP {
         let m = BIG::new_ints(&rom::MODULUS);
-        let w = BIG::randomnum(&m,rng);
+        let w = BIG::randomnum(&m, rng);
         FP::new_big(&w)
     }
 
@@ -195,7 +194,7 @@ impl FP {
             b.w[big::NLEN - 1] &= TMASK;
             b.w[0] += carry;
 
-            let ix=(224 / big::BASEBITS) as usize;
+            let ix = (224 / big::BASEBITS) as usize;
             b.w[ix] += carry << (224 % big::BASEBITS);
             b.norm();
             return b;
@@ -209,7 +208,7 @@ impl FP {
     }
 
     /* convert to string */
-    
+
     pub fn tostring(&self) -> String {
         self.redc().tostring()
     }
@@ -253,17 +252,18 @@ impl FP {
             return 0;
         }
         let mut sx = BIG::new_ints(&rom::MODULUS);
-        let fx=self.redc();
-        sx.sub(&fx); sx.norm();
-        BIG::comp(&fx,&sx)
+        let fx = self.redc();
+        sx.sub(&fx);
+        sx.norm();
+        BIG::comp(&fx, &sx)
     }
 
-    pub fn tobytes(&self,b: &mut [u8]) {
+    pub fn tobytes(&self, b: &mut [u8]) {
         self.redc().tobytes(b)
     }
 
     pub fn frombytes(b: &[u8]) -> FP {
-        let t=BIG::frombytes(b);
+        let t = BIG::frombytes(b);
         FP::new_big(&t)
     }
 
@@ -281,9 +281,9 @@ impl FP {
             m.fshr(1);
             let mut n = FP::new_copy(self);
             n.reduce();
-            let w=n.redc();
-            let cp=BIG::comp(&w,&m);
-            ((cp+1)&2)>>1
+            let w = n.redc();
+            let cp = BIG::comp(&w, &m);
+            ((cp + 1) & 2) >> 1
         } else {
             let mut a = FP::new_copy(self);
             a.reduce();
@@ -467,9 +467,10 @@ impl FP {
         let pr = self.x.parity();
         let mut w = BIG::new_copy(&self.x);
         self.x.fshr(1);
-        w.add(&p); w.norm();
+        w.add(&p);
+        w.norm();
         w.fshr(1);
-        self.x.cmove(&w,pr);
+        self.x.cmove(&w, pr);
     }
     /* return jacobi symbol (this/Modulus) */
     pub fn jacobi(&mut self) -> isize {
@@ -605,14 +606,14 @@ impl FP {
 
         let e = PM1D2 as isize;
 
-        n-=e+1;
-        c=((rom::MCONST as isize)+(1<<e)+1)/(1<<(e+1));
+        n -= e + 1;
+        c = ((rom::MCONST as isize) + (1 << e) + 1) / (1 << (e + 1));
 
-        let mut nd=0;
-        while c%2==0 {
-            c/=2;
-            n-=1;
-            nd+=1;
+        let mut nd = 0;
+        while c % 2 == 0 {
+            c /= 2;
+            n -= 1;
+            nd += 1;
         }
 
         let mut bw = 0;
@@ -698,9 +699,9 @@ impl FP {
             }
             r.mul(&key);
         }
-        while nd>0 {
+        while nd > 0 {
             r.sqr();
-            nd-=1;
+            nd -= 1;
         }
         r
     }
@@ -711,7 +712,7 @@ impl FP {
             self.copy(&self.fpow());
             return;
         }
-        let e=PM1D2 as usize;
+        let e = PM1D2 as usize;
         let mut m = BIG::new_ints(&rom::MODULUS);
         m.dec(1);
         m.shr(e);
@@ -722,11 +723,11 @@ impl FP {
     }
 
     /* self=1/self mod Modulus */
-    pub fn inverse(&mut self,take_hint: Option<&FP>) {
-        let e=PM1D2 as isize;
+    pub fn inverse(&mut self, take_hint: Option<&FP>) {
+        let e = PM1D2 as isize;
         self.norm();
-        let mut s=FP::new_copy(self);
-        for _ in 0..e-1 {
+        let mut s = FP::new_copy(self);
+        for _ in 0..e - 1 {
             s.sqr();
             s.mul(self);
         }
@@ -743,9 +744,9 @@ impl FP {
     }
 
     /* Test for Quadratic Residue */
-    pub fn qr(&self,give_hint: Option<&mut FP>) -> isize {
-        let e=PM1D2 as isize;
-        let mut r=FP::new_copy(self);
+    pub fn qr(&self, give_hint: Option<&mut FP>) -> isize {
+        let e = PM1D2 as isize;
+        let mut r = FP::new_copy(self);
         r.progen();
         if let Some(hint) = give_hint {
             hint.copy(&r);
@@ -753,39 +754,39 @@ impl FP {
 
         r.sqr();
         r.mul(self);
-        for _ in 0..e-1 {
+        for _ in 0..e - 1 {
             r.sqr();
         }
 
         r.isunity() as isize
     }
 
-    pub fn invsqrt(&self,i: &mut FP,s: &mut FP) -> isize {
-        let mut h=FP::new();
-        let qr=self.qr(Some(&mut h));
+    pub fn invsqrt(&self, i: &mut FP, s: &mut FP) -> isize {
+        let mut h = FP::new();
+        let qr = self.qr(Some(&mut h));
         s.copy(&self.sqrt(Some(&h)));
         i.copy(self);
         i.inverse(Some(&h));
         qr
     }
 
-// Two for the price of One  - See Hamburg https://eprint.iacr.org/2012/309.pdf
-// Calculate inverse of i and square root of s, return QR
-    pub fn tpo(mut i: &mut FP,mut s: &mut FP) -> isize {
+    // Two for the price of One  - See Hamburg https://eprint.iacr.org/2012/309.pdf
+    // Calculate inverse of i and square root of s, return QR
+    pub fn tpo(mut i: &mut FP, mut s: &mut FP) -> isize {
         let mut w = FP::new_copy(s);
         let mut t = FP::new_copy(i);
         w.mul(&i);
         t.mul(&w);
-        let qr=t.invsqrt(&mut i,&mut s);
+        let qr = t.invsqrt(&mut i, &mut s);
         i.mul(&w);
         s.mul(&i);
         qr
     }
 
     /* return sqrt(this) mod Modulus */
-    pub fn sqrt(&self,take_hint: Option<&FP>) -> FP {
-        let e=PM1D2 as isize;
-        let mut g=FP::new_copy(self);
+    pub fn sqrt(&self, take_hint: Option<&FP>) -> FP {
+        let e = PM1D2 as isize;
+        let mut g = FP::new_copy(self);
 
         if let Some(hint) = take_hint {
             g.copy(&hint);
@@ -793,33 +794,36 @@ impl FP {
             g.progen();
         }
         let m = BIG::new_ints(&rom::ROI);
-        let mut v=FP::new_big(&m);
-        let mut t=FP::new_copy(&g);
+        let mut v = FP::new_big(&m);
+        let mut t = FP::new_copy(&g);
         t.sqr();
         t.mul(self);
 
-        let mut r=FP::new_copy(self);
+        let mut r = FP::new_copy(self);
         r.mul(&g);
-        let mut b=FP::new_copy(&t);
+        let mut b = FP::new_copy(&t);
 
-        for k in (2..=e).rev()   //(int k=e;k>1;k--)
+        for k in (2..=e).rev()
+        //(int k=e;k>1;k--)
         {
-            for _ in 1..k-1 {
+            for _ in 1..k - 1 {
                 b.sqr();
             }
-            let u=!b.isunity() as isize;
-            g.copy(&r); g.mul(&v);
-            r.cmove(&g,u);
+            let u = !b.isunity() as isize;
+            g.copy(&r);
+            g.mul(&v);
+            r.cmove(&g, u);
             v.sqr();
-            g.copy(&t); g.mul(&v);
-            t.cmove(&g,u);
+            g.copy(&t);
+            g.mul(&v);
+            t.cmove(&g, u);
             b.copy(&t);
         }
-        let sgn=r.sign();
-        let mut nr=FP::new_copy(&r);
-        nr.neg(); nr.norm();
-        r.cmove(&nr,sgn);
+        let sgn = r.sign();
+        let mut nr = FP::new_copy(&r);
+        nr.neg();
+        nr.norm();
+        r.cmove(&nr, sgn);
         r
     }
-
 }

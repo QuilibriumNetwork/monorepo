@@ -18,16 +18,20 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::proto;
+use std::io;
+
 use async_trait::async_trait;
 use asynchronous_codec::{FramedRead, FramedWrite};
-use futures::io::{AsyncRead, AsyncWrite};
-use futures::{SinkExt, StreamExt};
+use futures::{
+    io::{AsyncRead, AsyncWrite},
+    SinkExt, StreamExt,
+};
 use libp2p_core::Multiaddr;
 use libp2p_identity::PeerId;
 use libp2p_request_response::{self as request_response};
 use libp2p_swarm::StreamProtocol;
-use std::io;
+
+use crate::proto;
 
 /// The protocol name used for negotiating with multistream-select.
 pub const DEFAULT_PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/libp2p/autonat/1.0.0");
@@ -104,8 +108,12 @@ impl request_response::Codec for AutoNatCodec {
     }
 }
 
+// QUILIBRIUM: the frame limit of `codec()`, which it enforces on decode, so
+// a client knows how large a request the server can still read.
+pub(crate) const MAX_MESSAGE_LEN: usize = 1024;
+
 fn codec() -> quick_protobuf_codec::Codec<proto::Message> {
-    quick_protobuf_codec::Codec::<proto::Message>::new(1024)
+    quick_protobuf_codec::Codec::<proto::Message>::new(MAX_MESSAGE_LEN)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +123,13 @@ pub struct DialRequest {
 }
 
 impl DialRequest {
+    /// QUILIBRIUM: the encoded length that the receiving `codec()` checks
+    /// against [`MAX_MESSAGE_LEN`] (its length prefix excluded).
+    pub(crate) fn encoded_len(&self) -> usize {
+        use quick_protobuf::MessageWrite as _;
+        self.clone().into_proto().get_size()
+    }
+
     pub fn from_proto(msg: proto::Message) -> Result<Self, io::Error> {
         if msg.type_pb != Some(proto::MessageType::DIAL) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid type"));

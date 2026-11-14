@@ -38,7 +38,7 @@ mod tests {
         assert_eq!(encoded[0], 0x08); // field 1 tag
         assert_eq!(encoded[1], 0x04); // Ed448 = 4
         assert_eq!(encoded[2], 0x12); // field 2 tag
-        assert_eq!(encoded[3], 57);   // 57-byte key
+        assert_eq!(encoded[3], 57); // 57-byte key
     }
 
     #[test]

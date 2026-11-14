@@ -977,7 +977,8 @@ mod tests {
         let refresh_sid = rng::get_rng().gen::<[u8; 32]>();
 
         // Phase 1
-        let mut dkg_1: Vec<Vec<<C as CurveArithmetic>::Scalar>> = Vec::with_capacity(parameters.share_count as usize);
+        let mut dkg_1: Vec<Vec<<C as CurveArithmetic>::Scalar>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             let out1 = parties[i as usize].refresh_complete_phase1();
 
@@ -987,7 +988,9 @@ mod tests {
         // Communication round 1 - Each party receives a fragment from each counterparty.
         // They also produce a fragment for themselves.
         let mut poly_fragments = vec![
-            Vec::<<C as CurveArithmetic>::Scalar>::with_capacity(parameters.share_count as usize);
+            Vec::<<C as CurveArithmetic>::Scalar>::with_capacity(
+                parameters.share_count as usize
+            );
             parameters.share_count as usize
         ];
         for row_i in dkg_1 {
@@ -1089,7 +1092,8 @@ mod tests {
         }
 
         // Phase 4
-        let mut refreshed_parties: Vec<Party<C>> = Vec::with_capacity(parameters.share_count as usize);
+        let mut refreshed_parties: Vec<Party<C>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             let result = parties[i as usize].refresh_complete_phase4(
                 &refresh_sid,
@@ -1269,7 +1273,8 @@ mod tests {
         let refresh_sid = rng::get_rng().gen::<[u8; 32]>();
 
         // Phase 1
-        let mut dkg_1: Vec<Vec<<C as CurveArithmetic>::Scalar>> = Vec::with_capacity(parameters.share_count as usize);
+        let mut dkg_1: Vec<Vec<<C as CurveArithmetic>::Scalar>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             let out1 = parties[i as usize].refresh_phase1();
 
@@ -1279,7 +1284,9 @@ mod tests {
         // Communication round 1 - Each party receives a fragment from each counterparty.
         // They also produce a fragment for themselves.
         let mut poly_fragments = vec![
-            Vec::<<C as CurveArithmetic>::Scalar>::with_capacity(parameters.share_count as usize);
+            Vec::<<C as CurveArithmetic>::Scalar>::with_capacity(
+                parameters.share_count as usize
+            );
             parameters.share_count as usize
         ];
         for row_i in dkg_1 {
@@ -1360,7 +1367,8 @@ mod tests {
         }
 
         // Phase 4
-        let mut refreshed_parties: Vec<Party<C>> = Vec::with_capacity(parameters.share_count as usize);
+        let mut refreshed_parties: Vec<Party<C>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             let result = parties[i as usize].refresh_phase4(
                 &refresh_sid,

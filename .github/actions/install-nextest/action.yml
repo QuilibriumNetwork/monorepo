@@ -1,0 +1,54 @@
+name: Install cargo-nextest
+description: |
+  Installs a pinned cargo-nextest into ~/.cargo/bin. The release binary
+  comes from GitHub release downloads (via taiki-e/install-action, which
+  checks it against its manifest's sha256); the binary is cached by
+  version, and when the release download fails on a cache miss it is
+  built from crates.io instead (checked against the crates.io index).
+  Run it after the Rust toolchain is installed.
+
+inputs:
+  version:
+    description: cargo-nextest version
+    # .nextest.toml requires at least 0.9.75.
+    default: "0.9.151"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache cargo-nextest
+      id: cache-nextest
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: cargo-nextest-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install cargo-nextest (release binary)
+      id: release
+      if: steps.cache-nextest.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest@${{ inputs.version }}
+
+    - name: Install cargo-nextest (crates.io fallback)
+      if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.release.outcome != 'success'
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+        RUSTFLAGS: ""
+      run: |
+        echo "::warning::cargo-nextest $NEXTEST_VERSION release download failed; building it from crates.io"
+        cargo install cargo-nextest --locked --version "$NEXTEST_VERSION" --force
+
+    - name: Check cargo-nextest
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+      run: |
+        NEXTEST_REPORTED="$(cargo nextest --version | head -n 1)"
+        echo "$NEXTEST_REPORTED"
+        if [[ "$NEXTEST_REPORTED" != "cargo-nextest $NEXTEST_VERSION"* ]]; then
+          echo "::error::cargo-nextest reports '$NEXTEST_REPORTED', expected $NEXTEST_VERSION"
+          exit 1
+        fi

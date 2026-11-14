@@ -25,25 +25,18 @@ pub struct Ed448PeerConnection {
 
 /// Connect to a Go node at `addr` (e.g. "192.168.1.1:8336") and
 /// perform the Ed448 noise handshake.
-pub async fn connect_ed448(
-    addr: &str,
-    ed448_seed: &[u8; 57],
-) -> Result<Ed448PeerConnection> {
+pub async fn connect_ed448(addr: &str, ed448_seed: &[u8; 57]) -> Result<Ed448PeerConnection> {
     let ed448_pubkey = ed448_identity::derive_public_key(ed448_seed);
 
     debug!(addr, "connecting to Go node");
-    let mut stream = TcpStream::connect(addr).await
+    let mut stream = TcpStream::connect(addr)
+        .await
         .map_err(|e| QuilError::P2p(format!("connect to {}: {}", addr, e)))?;
 
-    let result = ed448_noise_transport::handshake_initiator(
-        &mut stream,
-        ed448_seed,
-        &ed448_pubkey,
-    ).await?;
+    let result =
+        ed448_noise_transport::handshake_initiator(&mut stream, ed448_seed, &ed448_pubkey).await?;
 
-    let remote_peer_id = ed448_identity::peer_id_from_ed448_pubkey(
-        &result.remote_public_key,
-    );
+    let remote_peer_id = ed448_identity::peer_id_from_ed448_pubkey(&result.remote_public_key);
 
     debug!(
         addr,
@@ -66,15 +59,10 @@ pub async fn accept_ed448(
 ) -> Result<Ed448PeerConnection> {
     let ed448_pubkey = ed448_identity::derive_public_key(ed448_seed);
 
-    let result = ed448_noise_transport::handshake_responder(
-        &mut stream,
-        ed448_seed,
-        &ed448_pubkey,
-    ).await?;
+    let result =
+        ed448_noise_transport::handshake_responder(&mut stream, ed448_seed, &ed448_pubkey).await?;
 
-    let remote_peer_id = ed448_identity::peer_id_from_ed448_pubkey(
-        &result.remote_public_key,
-    );
+    let remote_peer_id = ed448_identity::peer_id_from_ed448_pubkey(&result.remote_public_key);
 
     debug!(
         remote_peer_id = hex::encode(&remote_peer_id),
@@ -144,9 +132,7 @@ mod tests {
             accept_ed448(stream, &seed_b).await
         });
 
-        let client = tokio::spawn(async move {
-            connect_ed448(&addr_str, &seed_a).await
-        });
+        let client = tokio::spawn(async move { connect_ed448(&addr_str, &seed_a).await });
 
         let server_conn = server.await.unwrap().unwrap();
         let client_conn = client.await.unwrap().unwrap();

@@ -1,9 +1,0 @@
-// -*- go -*-
-//
-// Copyright (c) 2023 Markku Rossi
-//
-// All rights reserved.
-//
-
-// Package bytes implements functions for byte slice manipulation.
-package bytes

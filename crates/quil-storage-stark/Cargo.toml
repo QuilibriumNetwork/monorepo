@@ -1,0 +1,37 @@
+[package]
+name = "quil-storage-stark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "STARK proofs of hash storage seals and possession openings (Plonky3, Poseidon2 over KoalaBear)"
+
+[dependencies]
+quil-crypto = { path = "../quil-crypto" }
+# Plonky3 needs Rust 1.93 or later.
+p3-air = "=0.8.0"
+p3-batch-stark = { version = "=0.8.0", features = ["parallel"] }
+p3-challenger = "=0.8.0"
+p3-commit = "=0.8.0"
+p3-dft = "=0.8.0"
+p3-field = "=0.8.0"
+p3-fri = "=0.8.0"
+p3-keccak = "=0.8.0"
+p3-koala-bear = "=0.8.0"
+p3-lookup = "=0.8.0"
+p3-matrix = "=0.8.0"
+p3-maybe-rayon = { version = "=0.8.0", features = ["parallel"] }
+p3-merkle-tree = "=0.8.0"
+p3-poseidon2 = "=0.8.0"
+p3-poseidon2-air = "=0.8.0"
+p3-symmetric = "=0.8.0"
+p3-uni-stark = "=0.8.0"
+p3-util = "=0.8.0"
+postcard = { version = "1", features = ["use-std"] }
+serde = "1"
+sha3 = "0.10"
+
+[dev-dependencies]
+rand = "0.8"
+
+[lints]
+workspace = true

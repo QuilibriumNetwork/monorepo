@@ -4,9 +4,9 @@
 //!
 //! Mirrors the Go node's gate at `global_consensus_engine.go`:
 //! - join proposals block while any shard is halted (so a struggling
-//!   shard doesn't get flooded with new joiners before recovery)
+//! shard doesn't get flooded with new joiners before recovery)
 //! - archive-node eviction skips entirely while any halt is active
-//!   (otherwise evictions would cascade during the halt window)
+//! (otherwise evictions would cascade during the halt window)
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -47,9 +47,11 @@ impl HaltState {
         Self::default()
     }
 
-    /// `true` iff at least one shard is currently halted. This is the
-    /// gate used by `ProverLifecycle::join_proposal_ready` and the
-    /// eviction scheduler.
+    /// `true` iff at least one shard is currently halted. Gates the
+    /// LEAVE/swap proposal path (coverage view is unreliable while halted),
+    /// `coverage_publish` (reward-proof submission), and worker production
+    /// drain. It does NOT gate JOINs — a halted shard must still be able to
+    /// attract joiners to recover.
     pub fn any_halted(&self) -> bool {
         !self.halted_shards.read().unwrap().is_empty()
     }
@@ -148,14 +150,20 @@ mod tests {
     fn halt_event(filter: Vec<u8>) -> ControlEvent {
         ControlEvent {
             event_type: ControlEventType::CoverageHalt,
-            data: ControlEventData::Coverage { filter, duration: u64::MAX },
+            data: ControlEventData::Coverage {
+                filter,
+                duration: u64::MAX,
+            },
         }
     }
 
     fn resume_event(filter: Vec<u8>) -> ControlEvent {
         ControlEvent {
             event_type: ControlEventType::CoverageResume,
-            data: ControlEventData::Coverage { filter, duration: 0 },
+            data: ControlEventData::Coverage {
+                filter,
+                duration: 0,
+            },
         }
     }
 
@@ -200,12 +208,18 @@ mod tests {
         // re-fire the channel — the boolean didn't transition.
         s.apply(&halt_event(vec![0x02]));
         let polled = tokio::time::timeout(std::time::Duration::from_millis(10), rx.changed()).await;
-        assert!(polled.is_err(), "channel should not fire when boolean is unchanged");
+        assert!(
+            polled.is_err(),
+            "channel should not fire when boolean is unchanged"
+        );
 
         // Resuming one of two leaves any_halted=true — still no fire.
         s.apply(&resume_event(vec![0x01]));
         let polled = tokio::time::timeout(std::time::Duration::from_millis(10), rx.changed()).await;
-        assert!(polled.is_err(), "channel should not fire while another halt is active");
+        assert!(
+            polled.is_err(),
+            "channel should not fire while another halt is active"
+        );
 
         // Resuming the last one transitions back to false.
         s.apply(&resume_event(vec![0x02]));
@@ -218,7 +232,10 @@ mod tests {
         let s = HaltState::new();
         let warn_event = ControlEvent {
             event_type: ControlEventType::CoverageWarn,
-            data: ControlEventData::Coverage { filter: vec![0x01], duration: 120 },
+            data: ControlEventData::Coverage {
+                filter: vec![0x01],
+                duration: 120,
+            },
         };
         assert!(!s.apply(&warn_event));
         assert!(!s.any_halted());

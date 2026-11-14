@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use prost::Message;
 
 use quil_types::error::{QuilError, Result};
@@ -160,11 +158,11 @@ fn increment_prefix(prefix: &[u8]) -> Vec<u8> {
 
 /// RocksDB-backed key registry store.
 pub struct RocksKeyStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksKeyStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 
@@ -185,10 +183,7 @@ impl RocksKeyStore {
 
     /// Get a signed X448 key by address (used by both the public API and
     /// internal iteration).
-    pub fn get_signed_x448_key_internal(
-        &self,
-        address: &[u8],
-    ) -> Result<keys::SignedX448Key> {
+    pub fn get_signed_x448_key_internal(&self, address: &[u8]) -> Result<keys::SignedX448Key> {
         let data = self.db_get(&signed_x448_key_key(address))?;
         keys::SignedX448Key::decode(data.as_slice())
             .map_err(|e| QuilError::Serialization(format!("decode signed x448 key: {}", e)))
@@ -270,11 +265,7 @@ impl RocksKeyStore {
 
     /// Collect all signed X448 keys parented by `parent_address` into the
     /// registry's `keys_by_purpose` map, updating `last_updated`.
-    fn collect_x448_keys(
-        &self,
-        parent_address: &[u8],
-        registry: &mut keys::KeyRegistry,
-    ) {
+    fn collect_x448_keys(&self, parent_address: &[u8], registry: &mut keys::KeyRegistry) {
         let prefix = {
             let mut p = vec![KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT];
             p.extend_from_slice(parent_address);
@@ -299,11 +290,7 @@ impl RocksKeyStore {
     }
 
     /// Collect all signed Decaf448 keys parented by `parent_address`.
-    fn collect_decaf448_keys(
-        &self,
-        parent_address: &[u8],
-        registry: &mut keys::KeyRegistry,
-    ) {
+    fn collect_decaf448_keys(&self, parent_address: &[u8], registry: &mut keys::KeyRegistry) {
         let prefix = {
             let mut p = vec![KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT];
             p.extend_from_slice(parent_address);
@@ -396,17 +383,15 @@ impl store::KeyStore for RocksKeyStore {
         proving_sig_of_identity: &[u8],
     ) -> Result<()> {
         // Identity -> prover: value = [proving_key_address, identity_sig_of_proving]
-        let mut id_value = Vec::with_capacity(
-            proving_key_address.len() + identity_sig_of_proving.len(),
-        );
+        let mut id_value =
+            Vec::with_capacity(proving_key_address.len() + identity_sig_of_proving.len());
         id_value.extend_from_slice(proving_key_address);
         id_value.extend_from_slice(identity_sig_of_proving);
         txn.set(&cross_signature_key(identity_key_address), &id_value)?;
 
         // Prover -> identity: value = [identity_key_address, proving_sig_of_identity]
-        let mut prov_value = Vec::with_capacity(
-            identity_key_address.len() + proving_sig_of_identity.len(),
-        );
+        let mut prov_value =
+            Vec::with_capacity(identity_key_address.len() + proving_sig_of_identity.len());
         prov_value.extend_from_slice(identity_key_address);
         prov_value.extend_from_slice(proving_sig_of_identity);
         txn.set(&cross_signature_key(proving_key_address), &prov_value)?;
@@ -414,17 +399,11 @@ impl store::KeyStore for RocksKeyStore {
         Ok(())
     }
 
-    fn get_cross_signature_by_identity_key(
-        &self,
-        identity_key_address: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn get_cross_signature_by_identity_key(&self, identity_key_address: &[u8]) -> Result<Vec<u8>> {
         self.db_get(&cross_signature_key(identity_key_address))
     }
 
-    fn get_cross_signature_by_proving_key(
-        &self,
-        proving_key_address: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn get_cross_signature_by_proving_key(&self, proving_key_address: &[u8]) -> Result<Vec<u8>> {
         self.db_get(&cross_signature_key(proving_key_address))
     }
 
@@ -445,11 +424,7 @@ impl store::KeyStore for RocksKeyStore {
 
         // Store parent-key index (marker value)
         txn.set(
-            &signed_x448_key_by_parent_key(
-                &key.parent_key_address,
-                &key.key_purpose,
-                address,
-            ),
+            &signed_x448_key_by_parent_key(&key.parent_key_address, &key.key_purpose, address),
             &[0x01],
         )?;
 
@@ -502,10 +477,7 @@ impl store::KeyStore for RocksKeyStore {
     // Key registry
     // ---------------------------------------------------------------
 
-    fn get_key_registry(
-        &self,
-        identity_key_address: &[u8],
-    ) -> Result<keys::KeyRegistry> {
+    fn get_key_registry(&self, identity_key_address: &[u8]) -> Result<keys::KeyRegistry> {
         let mut registry = keys::KeyRegistry {
             keys_by_purpose: std::collections::HashMap::new(),
             ..Default::default()
@@ -557,10 +529,7 @@ impl store::KeyStore for RocksKeyStore {
         Ok(registry)
     }
 
-    fn get_key_registry_by_prover(
-        &self,
-        prover_key_address: &[u8],
-    ) -> Result<keys::KeyRegistry> {
+    fn get_key_registry_by_prover(&self, prover_key_address: &[u8]) -> Result<keys::KeyRegistry> {
         let mut registry = keys::KeyRegistry {
             keys_by_purpose: std::collections::HashMap::new(),
             ..Default::default()
@@ -631,7 +600,7 @@ mod tests {
         let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
         // Leak so the directory persists while db is open.
         std::mem::forget(tmp);
-        RocksKeyStore::new(Arc::new(db))
+        RocksKeyStore::new(quil_forest::CoordinatedDb::new(db))
     }
 
     fn make_txn(store: &RocksKeyStore) -> Box<dyn store::Transaction> {
@@ -651,7 +620,9 @@ mod tests {
         };
 
         let txn = make_txn(&store);
-        store.put_identity_key(txn.as_ref(), &address, &key).unwrap();
+        store
+            .put_identity_key(txn.as_ref(), &address, &key)
+            .unwrap();
         txn.commit().unwrap();
 
         let got = store.get_identity_key(&address).unwrap();
@@ -722,9 +693,7 @@ mod tests {
         txn.commit().unwrap();
 
         // By identity key
-        let got_by_id = store
-            .get_cross_signature_by_identity_key(&id_addr)
-            .unwrap();
+        let got_by_id = store.get_cross_signature_by_identity_key(&id_addr).unwrap();
         assert_eq!(&got_by_id[..32], &prov_addr[..]);
         assert_eq!(&got_by_id[32..], &id_sig[..]);
 
@@ -807,14 +776,16 @@ mod tests {
         };
 
         let txn = make_txn(&store);
-        store.put_signed_x448_key(txn.as_ref(), &addr1, &key1).unwrap();
-        store.put_signed_x448_key(txn.as_ref(), &addr2, &key2).unwrap();
+        store
+            .put_signed_x448_key(txn.as_ref(), &addr1, &key1)
+            .unwrap();
+        store
+            .put_signed_x448_key(txn.as_ref(), &addr2, &key2)
+            .unwrap();
         txn.commit().unwrap();
 
         // Get all by parent (empty purpose = all)
-        let all = store
-            .get_signed_x448_keys_by_parent(&parent, "")
-            .unwrap();
+        let all = store.get_signed_x448_keys_by_parent(&parent, "").unwrap();
         assert_eq!(all.len(), 2);
 
         // Get filtered by purpose
@@ -847,7 +818,9 @@ mod tests {
             key_value: vec![0xAA; 57],
         };
         let txn = make_txn(&store);
-        store.put_identity_key(txn.as_ref(), &id_addr, &id_key).unwrap();
+        store
+            .put_identity_key(txn.as_ref(), &id_addr, &id_key)
+            .unwrap();
         txn.commit().unwrap();
 
         // Store proving key
@@ -859,7 +832,9 @@ mod tests {
             pop_signature: vec![0xDD; 74],
         };
         let txn = make_txn(&store);
-        store.put_proving_key(txn.as_ref(), &prov_addr, &prov_key).unwrap();
+        store
+            .put_proving_key(txn.as_ref(), &prov_addr, &prov_key)
+            .unwrap();
         txn.commit().unwrap();
 
         // Store cross signatures
@@ -894,7 +869,10 @@ mod tests {
 
         // Should have identity key
         assert!(registry.identity_key.is_some());
-        assert_eq!(registry.identity_key.as_ref().unwrap().key_value, id_key.key_value);
+        assert_eq!(
+            registry.identity_key.as_ref().unwrap().key_value,
+            id_key.key_value
+        );
 
         // Should have prover key
         assert!(registry.prover_key.is_some());
@@ -932,7 +910,9 @@ mod tests {
             pop_signature: vec![0xDD; 74],
         };
         let txn = make_txn(&store);
-        store.put_proving_key(txn.as_ref(), &prov_addr, &prov_key).unwrap();
+        store
+            .put_proving_key(txn.as_ref(), &prov_addr, &prov_key)
+            .unwrap();
         txn.commit().unwrap();
 
         // Store identity key
@@ -940,7 +920,9 @@ mod tests {
             key_value: vec![0xAA; 57],
         };
         let txn = make_txn(&store);
-        store.put_identity_key(txn.as_ref(), &id_addr, &id_key).unwrap();
+        store
+            .put_identity_key(txn.as_ref(), &id_addr, &id_key)
+            .unwrap();
         txn.commit().unwrap();
 
         // Store cross signatures

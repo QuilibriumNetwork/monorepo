@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package blossomsub.pb;
+
+message RPC {
+    repeated SubOpts subscriptions = 1;
+    repeated Message publish = 2;
+    ControlMessage control = 3;
+
+    message SubOpts {
+        bool subscribe = 1;
+        bytes bitmask = 2;
+    }
+}
+
+message Message {
+    bytes from = 1;
+    bytes data = 2;
+    bytes seqno = 3;
+    bytes bitmask = 4;
+    bytes signature = 5;
+    bytes key = 6;
+}
+
+message ControlMessage {
+    repeated ControlIHave ihave = 1;
+    repeated ControlIWant iwant = 2;
+    repeated ControlGraft graft = 3;
+    repeated ControlPrune prune = 4;
+    repeated ControlIDontWant idontwant = 5;
+}
+
+message ControlIHave {
+    bytes bitmask = 1;
+    repeated bytes messageIDs = 2;
+}
+
+message ControlIWant {
+    repeated bytes messageIDs = 1;
+}
+
+message ControlGraft {
+    bytes bitmask = 1;
+}
+
+message ControlPrune {
+    bytes bitmask = 1;
+    repeated PeerInfo peers = 2;
+    uint64 backoff = 3;
+}
+
+message ControlIDontWant {
+    repeated bytes messageIDs = 1;
+}
+
+message PeerInfo {
+    optional bytes peerID = 1;
+    optional bytes signedPeerRecord = 2;
+}

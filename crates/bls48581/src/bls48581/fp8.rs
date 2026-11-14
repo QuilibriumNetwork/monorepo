@@ -18,15 +18,15 @@
  */
 
 use crate::bls48581::big;
+#[allow(unused_imports)]
+use crate::bls48581::big::BIG;
 use crate::bls48581::fp;
 use crate::bls48581::fp::FP;
 use crate::bls48581::fp2::FP2;
 use crate::bls48581::fp4::FP4;
-use crate::rand::RAND;
-#[allow(unused_imports)]
-use crate::bls48581::big::BIG;
 #[allow(unused_imports)]
 use crate::bls48581::rom;
+use crate::rand::RAND;
 
 #[derive(Copy, Clone)]
 pub struct FP8 {
@@ -34,13 +34,11 @@ pub struct FP8 {
     b: FP4,
 }
 
-
 impl std::fmt::Debug for FP8 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "{}", self.tostring())
     }
 }
-
 
 impl std::fmt::Display for FP8 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -63,7 +61,7 @@ impl FP8 {
         f
     }
 
-    pub fn new_ints(a: isize,b: isize) -> FP8 {
+    pub fn new_ints(a: isize, b: isize) -> FP8 {
         let mut f = FP8::new();
         f.a.copy(&FP4::new_int(a));
         f.b.copy(&FP4::new_int(b));
@@ -99,7 +97,7 @@ impl FP8 {
     }
 
     pub fn new_rand(rng: &mut RAND) -> FP8 {
-        FP8::new_fp4s(&FP4::new_rand(rng),&FP4::new_rand(rng))
+        FP8::new_fp4s(&FP4::new_rand(rng), &FP4::new_rand(rng))
     }
 
     pub fn set_fp4s(&mut self, c: &FP4, d: &FP4) {
@@ -143,38 +141,38 @@ impl FP8 {
         if self.iszilch() {
             return 0;
         }
-        let cmp=self.b.islarger();
-        if cmp!=0 {
+        let cmp = self.b.islarger();
+        if cmp != 0 {
             return cmp;
         }
         self.a.islarger()
     }
 
-    pub fn tobytes(&self,bf: &mut [u8]) {
-        const MB:usize = 4*(big::MODBYTES as usize);
+    pub fn tobytes(&self, bf: &mut [u8]) {
+        const MB: usize = 4 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         self.b.tobytes(&mut t);
         for i in 0..MB {
-            bf[i]=t[i];
+            bf[i] = t[i];
         }
         self.a.tobytes(&mut t);
         for i in 0..MB {
-            bf[i+MB]=t[i];
+            bf[i + MB] = t[i];
         }
     }
 
     pub fn frombytes(bf: &[u8]) -> FP8 {
-        const MB:usize = 4*(big::MODBYTES as usize);
+        const MB: usize = 4 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         for i in 0..MB {
-            t[i]=bf[i];
+            t[i] = bf[i];
         }
-        let tb=FP4::frombytes(&t);
+        let tb = FP4::frombytes(&t);
         for i in 0..MB {
-            t[i]=bf[i+MB];
+            t[i] = bf[i + MB];
         }
-        let ta=FP4::frombytes(&t);
-        FP8::new_fp4s(&ta,&tb)
+        let ta = FP4::frombytes(&t);
+        FP8::new_fp4s(&ta, &tb)
     }
 
     /* test self=1 ? */
@@ -222,17 +220,17 @@ impl FP8 {
         self.b.zero();
     }
 
-    pub fn sign(&self)  -> isize {
-        let mut p1=self.a.sign();
-        let mut p2=self.b.sign();
+    pub fn sign(&self) -> isize {
+        let mut p1 = self.a.sign();
+        let mut p2 = self.b.sign();
         if fp::BIG_ENDIAN_SIGN {
-            let u=self.b.iszilch() as isize;
-	        p2^=(p1^p2)&u;
-	        return p2;
+            let u = self.b.iszilch() as isize;
+            p2 ^= (p1 ^ p2) & u;
+            return p2;
         } else {
-            let u=self.a.iszilch() as isize;
-	        p1^=(p1^p2)&u;
-	        return p1;
+            let u = self.a.iszilch() as isize;
+            p1 ^= (p1 ^ p2) & u;
+            return p1;
         }
     }
 
@@ -388,13 +386,13 @@ impl FP8 {
     }
 
     /* output to hex string */
-    
+
     pub fn tostring(&self) -> String {
         format!("[{},{}]", self.a.tostring(), self.b.tostring())
     }
 
     /* self=1/self */
-    pub fn inverse(&mut self,h:Option<&FP>) {
+    pub fn inverse(&mut self, h: Option<&FP>) {
         //self.norm();
 
         let mut t1 = FP4::new_copy(&self.a);
@@ -444,177 +442,209 @@ impl FP8 {
         self.b.times_i();
     }
 
-/* return this^e */
-/*
-    pub fn pow(&self, e: &BIG) -> FP8 {
-        let mut w = FP8::new_copy(self);
-        w.norm();
-        let mut z = BIG::new_copy(&e);
-        let mut r = FP8::new_int(1);
-        z.norm();
-        loop {
-            let bt = z.parity();
-            z.fshr(1);
-            if bt == 1 {
-                r.mul(&mut w)
-            };
-            if z.iszilch() {
-                break;
+    /* return this^e */
+    /*
+        pub fn pow(&self, e: &BIG) -> FP8 {
+            let mut w = FP8::new_copy(self);
+            w.norm();
+            let mut z = BIG::new_copy(&e);
+            let mut r = FP8::new_int(1);
+            z.norm();
+            loop {
+                let bt = z.parity();
+                z.fshr(1);
+                if bt == 1 {
+                    r.mul(&mut w)
+                };
+                if z.iszilch() {
+                    break;
+                }
+                w.sqr();
             }
-            w.sqr();
+            r.reduce();
+            return r;
         }
-        r.reduce();
-        return r;
-    }
-*/
+    */
     /* XTR xtr_a function */
-/*
-    pub fn xtr_a(&mut self, w: &FP8, y: &FP8, z: &FP8) {
-        let mut r = FP8::new_copy(w);
-        let mut t = FP8::new_copy(w);
+    /*
+        pub fn xtr_a(&mut self, w: &FP8, y: &FP8, z: &FP8) {
+            let mut r = FP8::new_copy(w);
+            let mut t = FP8::new_copy(w);
 
-        r.sub(y);
-        r.norm();
-        r.pmul(&self.a);
-        t.add(y);
-        t.norm();
-        t.pmul(&self.b);
-        t.times_i();
+            r.sub(y);
+            r.norm();
+            r.pmul(&self.a);
+            t.add(y);
+            t.norm();
+            t.pmul(&self.b);
+            t.times_i();
 
-        self.copy(&r);
-        self.add(&t);
-        self.add(z);
+            self.copy(&r);
+            self.add(&t);
+            self.add(z);
 
-        self.norm();
-    }
-*/
+            self.norm();
+        }
+    */
     /* XTR xtr_d function */
-/*
-    pub fn xtr_d(&mut self) {
-        let mut w = FP8::new_copy(self);
-        self.sqr();
-        w.conj();
-        w.dbl();
-        w.norm();
-        self.sub(&w);
-        self.reduce();
-    }
-*/
+    /*
+        pub fn xtr_d(&mut self) {
+            let mut w = FP8::new_copy(self);
+            self.sqr();
+            w.conj();
+            w.dbl();
+            w.norm();
+            self.sub(&w);
+            self.reduce();
+        }
+    */
     /* r=x^n using XTR method on traces of FP24s */
-/*
-    pub fn xtr_pow(&self, n: &BIG) -> FP8 {
-        let mut sf = FP8::new_copy(self);
-        sf.norm();
-        let mut a = FP8::new_int(3);
-        let mut b = FP8::new_copy(&sf);
-        let mut c = FP8::new_copy(&b);
-        c.xtr_d();
-        let mut t = FP8::new();
-        let mut r = FP8::new();
+    /*
+        pub fn xtr_pow(&self, n: &BIG) -> FP8 {
+            let mut sf = FP8::new_copy(self);
+            sf.norm();
+            let mut a = FP8::new_int(3);
+            let mut b = FP8::new_copy(&sf);
+            let mut c = FP8::new_copy(&b);
+            c.xtr_d();
+            let mut t = FP8::new();
+            let mut r = FP8::new();
 
-        let par = n.parity();
-        let mut v = BIG::new_copy(n);
-        v.norm();
-        v.fshr(1);
-        if par == 0 {
-            v.dec(1);
+            let par = n.parity();
+            let mut v = BIG::new_copy(n);
             v.norm();
-        }
-
-        let nb = v.nbits();
-        for i in (0..nb).rev() {
-            if v.bit(i) != 1 {
-                t.copy(&b);
-                sf.conj();
-                c.conj();
-                b.xtr_a(&a, &sf, &c);
-                sf.conj();
-                c.copy(&t);
-                c.xtr_d();
-                a.xtr_d();
-            } else {
-                t.copy(&a);
-                t.conj();
-                a.copy(&b);
-                a.xtr_d();
-                b.xtr_a(&c, &sf, &t);
-                c.xtr_d();
+            v.fshr(1);
+            if par == 0 {
+                v.dec(1);
+                v.norm();
             }
-        }
-        if par == 0 {
-            r.copy(&c)
-        } else {
-            r.copy(&b)
-        }
-        r.reduce();
-        return r;
-    }
-*/
-    /* r=ck^a.cl^n using XTR double exponentiation method on traces of FP24s. See Stam thesis. */
-/*
-    pub fn xtr_pow2(&mut self, ck: &FP8, ckml: &FP8, ckm2l: &FP8, a: &BIG, b: &BIG) -> FP8 {
-        let mut e = BIG::new_copy(a);
-        let mut d = BIG::new_copy(b);
-        let mut w = BIG::new();
-        e.norm();
-        d.norm();
 
-        let mut cu = FP8::new_copy(ck); // can probably be passed in w/o copying
-        let mut cv = FP8::new_copy(self);
-        let mut cumv = FP8::new_copy(ckml);
-        let mut cum2v = FP8::new_copy(ckm2l);
-        let mut r = FP8::new();
-        let mut t = FP8::new();
-
-        let mut f2: usize = 0;
-        while d.parity() == 0 && e.parity() == 0 {
-            d.fshr(1);
-            e.fshr(1);
-            f2 += 1;
-        }
-
-        while BIG::comp(&d, &e) != 0 {
-            if BIG::comp(&d, &e) > 0 {
-                w.copy(&e);
-                w.imul(4);
-                w.norm();
-                if BIG::comp(&d, &w) <= 0 {
-                    w.copy(&d);
-                    d.copy(&e);
-                    e.rsub(&w);
-                    e.norm();
-
-                    t.copy(&cv);
-                    t.xtr_a(&cu, &cumv, &cum2v);
-                    cum2v.copy(&cumv);
-                    cum2v.conj();
-                    cumv.copy(&cv);
-                    cv.copy(&cu);
-                    cu.copy(&t);
+            let nb = v.nbits();
+            for i in (0..nb).rev() {
+                if v.bit(i) != 1 {
+                    t.copy(&b);
+                    sf.conj();
+                    c.conj();
+                    b.xtr_a(&a, &sf, &c);
+                    sf.conj();
+                    c.copy(&t);
+                    c.xtr_d();
+                    a.xtr_d();
                 } else {
-                    if d.parity() == 0 {
-                        d.fshr(1);
-                        r.copy(&cum2v);
-                        r.conj();
-                        t.copy(&cumv);
-                        t.xtr_a(&cu, &cv, &r);
+                    t.copy(&a);
+                    t.conj();
+                    a.copy(&b);
+                    a.xtr_d();
+                    b.xtr_a(&c, &sf, &t);
+                    c.xtr_d();
+                }
+            }
+            if par == 0 {
+                r.copy(&c)
+            } else {
+                r.copy(&b)
+            }
+            r.reduce();
+            return r;
+        }
+    */
+    /* r=ck^a.cl^n using XTR double exponentiation method on traces of FP24s. See Stam thesis. */
+    /*
+        pub fn xtr_pow2(&mut self, ck: &FP8, ckml: &FP8, ckm2l: &FP8, a: &BIG, b: &BIG) -> FP8 {
+            let mut e = BIG::new_copy(a);
+            let mut d = BIG::new_copy(b);
+            let mut w = BIG::new();
+            e.norm();
+            d.norm();
+
+            let mut cu = FP8::new_copy(ck); // can probably be passed in w/o copying
+            let mut cv = FP8::new_copy(self);
+            let mut cumv = FP8::new_copy(ckml);
+            let mut cum2v = FP8::new_copy(ckm2l);
+            let mut r = FP8::new();
+            let mut t = FP8::new();
+
+            let mut f2: usize = 0;
+            while d.parity() == 0 && e.parity() == 0 {
+                d.fshr(1);
+                e.fshr(1);
+                f2 += 1;
+            }
+
+            while BIG::comp(&d, &e) != 0 {
+                if BIG::comp(&d, &e) > 0 {
+                    w.copy(&e);
+                    w.imul(4);
+                    w.norm();
+                    if BIG::comp(&d, &w) <= 0 {
+                        w.copy(&d);
+                        d.copy(&e);
+                        e.rsub(&w);
+                        e.norm();
+
+                        t.copy(&cv);
+                        t.xtr_a(&cu, &cumv, &cum2v);
                         cum2v.copy(&cumv);
-                        cum2v.xtr_d();
-                        cumv.copy(&t);
-                        cu.xtr_d();
+                        cum2v.conj();
+                        cumv.copy(&cv);
+                        cv.copy(&cu);
+                        cu.copy(&t);
                     } else {
-                        if e.parity() == 1 {
-                            d.sub(&e);
-                            d.norm();
+                        if d.parity() == 0 {
                             d.fshr(1);
-                            t.copy(&cv);
-                            t.xtr_a(&cu, &cumv, &cum2v);
-                            cu.xtr_d();
-                            cum2v.copy(&cv);
+                            r.copy(&cum2v);
+                            r.conj();
+                            t.copy(&cumv);
+                            t.xtr_a(&cu, &cv, &r);
+                            cum2v.copy(&cumv);
                             cum2v.xtr_d();
-                            cum2v.conj();
-                            cv.copy(&t);
+                            cumv.copy(&t);
+                            cu.xtr_d();
                         } else {
+                            if e.parity() == 1 {
+                                d.sub(&e);
+                                d.norm();
+                                d.fshr(1);
+                                t.copy(&cv);
+                                t.xtr_a(&cu, &cumv, &cum2v);
+                                cu.xtr_d();
+                                cum2v.copy(&cv);
+                                cum2v.xtr_d();
+                                cum2v.conj();
+                                cv.copy(&t);
+                            } else {
+                                w.copy(&d);
+                                d.copy(&e);
+                                d.fshr(1);
+                                e.copy(&w);
+                                t.copy(&cumv);
+                                t.xtr_d();
+                                cumv.copy(&cum2v);
+                                cumv.conj();
+                                cum2v.copy(&t);
+                                cum2v.conj();
+                                t.copy(&cv);
+                                t.xtr_d();
+                                cv.copy(&cu);
+                                cu.copy(&t);
+                            }
+                        }
+                    }
+                }
+                if BIG::comp(&d, &e) < 0 {
+                    w.copy(&d);
+                    w.imul(4);
+                    w.norm();
+                    if BIG::comp(&e, &w) <= 0 {
+                        e.sub(&d);
+                        e.norm();
+                        t.copy(&cv);
+                        t.xtr_a(&cu, &cumv, &cum2v);
+                        cum2v.copy(&cumv);
+                        cumv.copy(&cu);
+                        cu.copy(&t);
+                    } else {
+                        if e.parity() == 0 {
                             w.copy(&d);
                             d.copy(&e);
                             d.fshr(1);
@@ -629,79 +659,47 @@ impl FP8 {
                             t.xtr_d();
                             cv.copy(&cu);
                             cu.copy(&t);
-                        }
-                    }
-                }
-            }
-            if BIG::comp(&d, &e) < 0 {
-                w.copy(&d);
-                w.imul(4);
-                w.norm();
-                if BIG::comp(&e, &w) <= 0 {
-                    e.sub(&d);
-                    e.norm();
-                    t.copy(&cv);
-                    t.xtr_a(&cu, &cumv, &cum2v);
-                    cum2v.copy(&cumv);
-                    cumv.copy(&cu);
-                    cu.copy(&t);
-                } else {
-                    if e.parity() == 0 {
-                        w.copy(&d);
-                        d.copy(&e);
-                        d.fshr(1);
-                        e.copy(&w);
-                        t.copy(&cumv);
-                        t.xtr_d();
-                        cumv.copy(&cum2v);
-                        cumv.conj();
-                        cum2v.copy(&t);
-                        cum2v.conj();
-                        t.copy(&cv);
-                        t.xtr_d();
-                        cv.copy(&cu);
-                        cu.copy(&t);
-                    } else {
-                        if d.parity() == 1 {
-                            w.copy(&e);
-                            e.copy(&d);
-                            w.sub(&d);
-                            w.norm();
-                            d.copy(&w);
-                            d.fshr(1);
-                            t.copy(&cv);
-                            t.xtr_a(&cu, &cumv, &cum2v);
-                            cumv.conj();
-                            cum2v.copy(&cu);
-                            cum2v.xtr_d();
-                            cum2v.conj();
-                            cu.copy(&cv);
-                            cu.xtr_d();
-                            cv.copy(&t);
                         } else {
-                            d.fshr(1);
-                            r.copy(&cum2v);
-                            r.conj();
-                            t.copy(&cumv);
-                            t.xtr_a(&cu, &cv, &r);
-                            cum2v.copy(&cumv);
-                            cum2v.xtr_d();
-                            cumv.copy(&t);
-                            cu.xtr_d();
+                            if d.parity() == 1 {
+                                w.copy(&e);
+                                e.copy(&d);
+                                w.sub(&d);
+                                w.norm();
+                                d.copy(&w);
+                                d.fshr(1);
+                                t.copy(&cv);
+                                t.xtr_a(&cu, &cumv, &cum2v);
+                                cumv.conj();
+                                cum2v.copy(&cu);
+                                cum2v.xtr_d();
+                                cum2v.conj();
+                                cu.copy(&cv);
+                                cu.xtr_d();
+                                cv.copy(&t);
+                            } else {
+                                d.fshr(1);
+                                r.copy(&cum2v);
+                                r.conj();
+                                t.copy(&cumv);
+                                t.xtr_a(&cu, &cv, &r);
+                                cum2v.copy(&cumv);
+                                cum2v.xtr_d();
+                                cumv.copy(&t);
+                                cu.xtr_d();
+                            }
                         }
                     }
                 }
             }
+            r.copy(&cv);
+            r.xtr_a(&cu, &cumv, &cum2v);
+            for _ in 0..f2 {
+                r.xtr_d()
+            }
+            r = r.xtr_pow(&mut d);
+            return r;
         }
-        r.copy(&cv);
-        r.xtr_a(&cu, &cumv, &cum2v);
-        for _ in 0..f2 {
-            r.xtr_d()
-        }
-        r = r.xtr_pow(&mut d);
-        return r;
-    }
-*/
+    */
     /* this/=2 */
     pub fn div2(&mut self) {
         self.a.div2();
@@ -719,7 +717,7 @@ impl FP8 {
             self.norm();
         }
     }
-/*
+    /*
     pub fn pow(&mut self, e: &BIG) {
         let mut w = FP8::new_copy(self);
         let mut z = BIG::new_copy(&e);
@@ -739,10 +737,10 @@ impl FP8 {
         self.copy(&r);
     }*/
 
-/* */
+    /* */
 
-    pub fn qr(&mut self,h:Option<&mut FP>) -> isize {
-        let mut c=FP8::new_copy(self);
+    pub fn qr(&mut self, h: Option<&mut FP>) -> isize {
+        let mut c = FP8::new_copy(self);
         c.conj();
         c.mul(self);
         return c.geta().qr(h);
@@ -750,7 +748,7 @@ impl FP8 {
 
     // sqrt(a+ib) = sqrt(a+sqrt(a*a-n*b*b)/2)+ib/(2*sqrt(a+sqrt(a*a-n*b*b)/2))
     // returns true if this is QR
-    pub fn sqrt(&mut self,h:Option<&FP>) {
+    pub fn sqrt(&mut self, h: Option<&FP>) {
         if self.iszilch() {
             return;
         }
@@ -767,7 +765,8 @@ impl FP8 {
         s.norm();
         a.sub(&s);
 
-        s.copy(&a); s.norm();
+        s.copy(&a);
+        s.norm();
 
         s.sqrt(h);
 
@@ -776,32 +775,37 @@ impl FP8 {
         a.norm();
         a.div2();
 
+        b.copy(&self.b);
+        b.div2();
+        let qr = a.qr(Some(&mut hint));
 
-        b.copy(&self.b); b.div2();
-        let qr=a.qr(Some(&mut hint));
-
-// tweak hint - multiply old hint by Norm(1/Beta)^e where Beta is irreducible polynomial
+        // tweak hint - multiply old hint by Norm(1/Beta)^e where Beta is irreducible polynomial
         s.copy(&a);
         let mut twk = FP::new_big(&BIG::new_ints(&rom::TWK));
         twk.mul(&hint);
-        s.div_i(); s.norm();
+        s.div_i();
+        s.norm();
 
-        a.cmove(&s,1-qr);
-        hint.cmove(&twk,1-qr);
+        a.cmove(&s, 1 - qr);
+        hint.cmove(&twk, 1 - qr);
 
-        self.a.copy(&a); self.a.sqrt(Some(&hint));
-        s.copy(&a); s.inverse(Some(&hint));
+        self.a.copy(&a);
+        self.a.sqrt(Some(&hint));
+        s.copy(&a);
+        s.inverse(Some(&hint));
         s.mul(&self.a);
-        self.b.copy(&s); self.b.mul(&b);
+        self.b.copy(&s);
+        self.b.mul(&b);
         t.copy(&self.a);
 
-        self.a.cmove(&self.b,1-qr);
-        self.b.cmove(&t,1-qr);
+        self.a.cmove(&self.b, 1 - qr);
+        self.b.cmove(&t, 1 - qr);
 
-        let sgn=self.sign();
-        let mut nr=FP8::new_copy(&self);
-        nr.neg(); nr.norm();
-        self.cmove(&nr,sgn);
+        let sgn = self.sign();
+        let mut nr = FP8::new_copy(&self);
+        nr.neg();
+        nr.norm();
+        self.cmove(&nr, sgn);
     }
-/* */
+    /* */
 }

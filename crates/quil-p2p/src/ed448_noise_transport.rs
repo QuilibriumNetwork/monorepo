@@ -43,10 +43,12 @@ pub async fn handshake_initiator<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<NoiseHandshakeResult> {
     // Build snow handshake state (initiator)
     let builder = snow::Builder::new(
-        "Noise_XX_25519_ChaChaPoly_SHA256".parse()
+        "Noise_XX_25519_ChaChaPoly_SHA256"
+            .parse()
             .map_err(|_| QuilError::Crypto("invalid noise params".into()))?,
     );
-    let keypair = builder.generate_keypair()
+    let keypair = builder
+        .generate_keypair()
         .map_err(|e| QuilError::Crypto(format!("keygen failed: {}", e)))?;
     let mut hs = builder
         .local_private_key(&keypair.private)
@@ -56,30 +58,27 @@ pub async fn handshake_initiator<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = vec![0u8; MAX_NOISE_MSG_SIZE];
 
     // Message 1: initiator → responder (e)
-    let len = hs.write_message(&[], &mut buf)
+    let len = hs
+        .write_message(&[], &mut buf)
         .map_err(|e| QuilError::Crypto(format!("msg1 write: {}", e)))?;
     send_noise_msg(stream, &buf[..len]).await?;
 
     // Message 2: responder → initiator (e, ee, s, es + payload)
     let msg2 = recv_noise_msg(stream).await?;
-    let payload_len = hs.read_message(&msg2, &mut buf)
+    let payload_len = hs
+        .read_message(&msg2, &mut buf)
         .map_err(|e| QuilError::Crypto(format!("msg2 read: {}", e)))?;
 
     // Verify remote's Ed448 payload
-    let remote_static = hs.get_remote_static()
+    let remote_static = hs
+        .get_remote_static()
         .ok_or_else(|| QuilError::Crypto("no remote static key after msg2".into()))?;
-    let remote_pubkey = ed448_noise::verify_ed448_payload(
-        &buf[..payload_len],
-        remote_static,
-    )?;
+    let remote_pubkey = ed448_noise::verify_ed448_payload(&buf[..payload_len], remote_static)?;
 
     // Message 3: initiator → responder (s, se + payload)
-    let payload = ed448_noise::generate_ed448_payload(
-        ed448_seed,
-        ed448_pubkey,
-        &keypair.public,
-    )?;
-    let len = hs.write_message(&payload, &mut buf)
+    let payload = ed448_noise::generate_ed448_payload(ed448_seed, ed448_pubkey, &keypair.public)?;
+    let len = hs
+        .write_message(&payload, &mut buf)
         .map_err(|e| QuilError::Crypto(format!("msg3 write: {}", e)))?;
     send_noise_msg(stream, &buf[..len]).await?;
 
@@ -95,10 +94,12 @@ pub async fn handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
     ed448_pubkey: &[u8],
 ) -> Result<NoiseHandshakeResult> {
     let builder = snow::Builder::new(
-        "Noise_XX_25519_ChaChaPoly_SHA256".parse()
+        "Noise_XX_25519_ChaChaPoly_SHA256"
+            .parse()
             .map_err(|_| QuilError::Crypto("invalid noise params".into()))?,
     );
-    let keypair = builder.generate_keypair()
+    let keypair = builder
+        .generate_keypair()
         .map_err(|e| QuilError::Crypto(format!("keygen failed: {}", e)))?;
     let mut hs = builder
         .local_private_key(&keypair.private)
@@ -113,58 +114,59 @@ pub async fn handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|e| QuilError::Crypto(format!("msg1 read: {}", e)))?;
 
     // Message 2: responder → initiator (e, ee, s, es + payload)
-    let payload = ed448_noise::generate_ed448_payload(
-        ed448_seed,
-        ed448_pubkey,
-        &keypair.public,
-    )?;
-    let len = hs.write_message(&payload, &mut buf)
+    let payload = ed448_noise::generate_ed448_payload(ed448_seed, ed448_pubkey, &keypair.public)?;
+    let len = hs
+        .write_message(&payload, &mut buf)
         .map_err(|e| QuilError::Crypto(format!("msg2 write: {}", e)))?;
     send_noise_msg(stream, &buf[..len]).await?;
 
     // Message 3: initiator → responder (s, se + payload)
     let msg3 = recv_noise_msg(stream).await?;
-    let payload_len = hs.read_message(&msg3, &mut buf)
+    let payload_len = hs
+        .read_message(&msg3, &mut buf)
         .map_err(|e| QuilError::Crypto(format!("msg3 read: {}", e)))?;
 
-    let remote_static = hs.get_remote_static()
+    let remote_static = hs
+        .get_remote_static()
         .ok_or_else(|| QuilError::Crypto("no remote static key after msg3".into()))?;
-    let remote_pubkey = ed448_noise::verify_ed448_payload(
-        &buf[..payload_len],
-        remote_static,
-    )?;
+    let remote_pubkey = ed448_noise::verify_ed448_payload(&buf[..payload_len], remote_static)?;
 
     Ok(NoiseHandshakeResult {
         remote_public_key: remote_pubkey,
     })
 }
 
-async fn send_noise_msg<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    data: &[u8],
-) -> Result<()> {
+async fn send_noise_msg<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<()> {
     let len = data.len() as u16;
-    stream.write_all(&len.to_be_bytes()).await
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
         .map_err(|e| QuilError::P2p(format!("noise send: {}", e)))?;
-    stream.write_all(data).await
+    stream
+        .write_all(data)
+        .await
         .map_err(|e| QuilError::P2p(format!("noise send: {}", e)))?;
-    stream.flush().await
+    stream
+        .flush()
+        .await
         .map_err(|e| QuilError::P2p(format!("noise flush: {}", e)))?;
     Ok(())
 }
 
-async fn recv_noise_msg<S: AsyncRead + Unpin>(
-    stream: &mut S,
-) -> Result<Vec<u8>> {
+async fn recv_noise_msg<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; LENGTH_PREFIX];
-    stream.read_exact(&mut len_buf).await
+    stream
+        .read_exact(&mut len_buf)
+        .await
         .map_err(|e| QuilError::P2p(format!("noise recv len: {}", e)))?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len > MAX_NOISE_MSG_SIZE {
         return Err(QuilError::P2p(format!("noise msg too large: {}", len)));
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await
+    stream
+        .read_exact(&mut buf)
+        .await
         .map_err(|e| QuilError::P2p(format!("noise recv data: {}", e)))?;
     Ok(buf)
 }
@@ -187,12 +189,10 @@ mod tests {
         let pubkey_a_clone = pubkey_a.clone();
         let pubkey_b_clone = pubkey_b.clone();
 
-        let client_handle = tokio::spawn(async move {
-            handshake_initiator(&mut client, &seed_a, &pubkey_a).await
-        });
-        let server_handle = tokio::spawn(async move {
-            handshake_responder(&mut server, &seed_b, &pubkey_b).await
-        });
+        let client_handle =
+            tokio::spawn(async move { handshake_initiator(&mut client, &seed_a, &pubkey_a).await });
+        let server_handle =
+            tokio::spawn(async move { handshake_responder(&mut server, &seed_b, &pubkey_b).await });
 
         let client_result = client_handle.await.unwrap().unwrap();
         let server_result = server_handle.await.unwrap().unwrap();

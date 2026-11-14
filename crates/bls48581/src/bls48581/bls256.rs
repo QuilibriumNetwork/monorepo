@@ -18,15 +18,16 @@
  */
 use crate::bls48581::big;
 use crate::bls48581::big::BIG;
-use crate::bls48581::fp::FP;
+use crate::bls48581::dbig::DBIG;
 use crate::bls48581::ecp;
 use crate::bls48581::ecp::ECP;
-use crate::bls48581::dbig::DBIG;
 use crate::bls48581::ecp8::ECP8;
+use crate::bls48581::fp::FP;
 use crate::bls48581::fp16::FP16;
 use crate::bls48581::pair8;
 use crate::bls48581::rom;
 use crate::hmac;
+use std::sync::OnceLock;
 
 /* Boneh-Lynn-Shacham signature 256-bit API Functions */
 
@@ -35,29 +36,30 @@ pub const BGS: usize = big::MODBYTES as usize;
 pub const BLS_OK: isize = 0;
 pub const BLS_FAIL: isize = -1;
 
-// NOTE this must be accessed in unsafe mode.
-// But it is just written to once at start-up, so actually safe.
-static mut G2_TAB: [FP16; ecp::G2_TABLE] = [FP16::new(); ecp::G2_TABLE];
+/// Precomputed pairing table for the G2 generator. Filled exactly once by
+/// `init()`; every reader below goes through `expect`, so a missing `init()`
+/// is a loud panic rather than a silently zeroed table.
+static G2_TAB: OnceLock<[FP16; ecp::G2_TABLE]> = OnceLock::new();
 
-fn ceil(a: usize,b: usize) -> usize {
-    (a-1)/b+1
+fn ceil(a: usize, b: usize) -> usize {
+    (a - 1) / b + 1
 }
 
 /* output u \in F_p */
-fn hash_to_field(hash: usize,hlen: usize ,u: &mut [FP], dst: &[u8],m: &[u8],ctr: usize) {
+fn hash_to_field(hash: usize, hlen: usize, u: &mut [FP], dst: &[u8], m: &[u8], ctr: usize) {
     let q = BIG::new_ints(&rom::MODULUS);
-    let nbq=q.nbits();
-    let el = ceil(nbq+ecp::AESKEY*8,8);
+    let nbq = q.nbits();
+    let el = ceil(nbq + ecp::AESKEY * 8, 8);
 
-    let mut okm: [u8;256]=[0;256];
-    let mut fd: [u8;128]=[0;128];
+    let mut okm: [u8; 256] = [0; 256];
+    let mut fd: [u8; 128] = [0; 128];
 
-    hmac::xmd_expand(hash,hlen,&mut okm,el*ctr,&dst,&m);
+    hmac::xmd_expand(hash, hlen, &mut okm, el * ctr, &dst, &m);
     for i in 0..ctr {
         for j in 0..el {
-            fd[j]=okm[el*i+j];
+            fd[j] = okm[el * i + j];
         }
-        u[i]=FP::new_big(&DBIG::frombytes(&fd[0 .. el]).ctdmod(&q,8*el-nbq));
+        u[i] = FP::new_big(&DBIG::frombytes(&fd[0..el]).ctdmod(&q, 8 * el - nbq));
     }
 }
 
@@ -65,15 +67,12 @@ fn hash_to_field(hash: usize,hlen: usize ,u: &mut [FP], dst: &[u8],m: &[u8],ctr:
 #[allow(non_snake_case)]
 pub fn bls_hash_to_point(m: &[u8]) -> ECP {
     //let dst= String::from("BLS_SIG_ZZZG1_XMD:SHA-512_SVDW_RO_NUL_".to_ascii_uppercase());
-    let dst= "BLS_SIG_ZZZG1_XMD:SHA-512_SVDW_RO_NUL_";
-    let mut u: [FP; 2] = [
-        FP::new(),
-        FP::new(),
-    ];
-    hash_to_field(hmac::MC_SHA2,ecp::HASH_TYPE,&mut u,dst.as_bytes(),m,2);
+    let dst = "BLS_SIG_ZZZG1_XMD:SHA-512_SVDW_RO_NUL_";
+    let mut u: [FP; 2] = [FP::new(), FP::new()];
+    hash_to_field(hmac::MC_SHA2, ecp::HASH_TYPE, &mut u, dst.as_bytes(), m, 2);
 
-    let mut P=ECP::map2point(&u[0]);
-    let P1=ECP::map2point(&u[1]);
+    let mut P = ECP::map2point(&u[0]);
+    let P1 = ECP::map2point(&u[1]);
     P.add(&P1);
     P.cfp();
     P.affine();
@@ -85,42 +84,50 @@ pub fn init() -> isize {
     if g.is_infinity() {
         return BLS_FAIL;
     }
-    unsafe {
-        pair8::precomp(&mut G2_TAB, &g);
-    }
+    G2_TAB.get_or_init(|| {
+        let mut tab = [FP16::new(); ecp::G2_TABLE];
+        pair8::precomp(&mut tab, &g);
+        tab
+    });
     BLS_OK
 }
 
 /* generate key pair, private key s, public key w */
 pub fn key_pair_generate(ikm: &[u8], s: &mut [u8], w: &mut [u8]) -> isize {
-    let r = BIG::new_ints(&rom::CURVE_ORDER);   
-    let nbr=r.nbits();
-    let el = ceil(3*ceil(nbr,8),2);
+    let r = BIG::new_ints(&rom::CURVE_ORDER);
+    let nbr = r.nbits();
+    let el = ceil(3 * ceil(nbr, 8), 2);
     let g = ECP8::generator();
     let mut len: [u8; 2] = [0; 2];
-    hmac::inttobytes(el,&mut len);
-     
-    let salt="BLS-SIG-KEYGEN-SALT-";
+    hmac::inttobytes(el, &mut len);
 
-    let mut prk: [u8;64]=[0;64];
-    let mut okm: [u8;128]=[0;128];
-    let mut aikm: [u8;65]=[0;65];
-    let likm=ikm.len();
+    let salt = "BLS-SIG-KEYGEN-SALT-";
+
+    let mut prk: [u8; 64] = [0; 64];
+    let mut okm: [u8; 128] = [0; 128];
+    let mut aikm: [u8; 65] = [0; 65];
+    let likm = ikm.len();
     for i in 0..likm {
-        aikm[i]=ikm[i];
+        aikm[i] = ikm[i];
     }
-    aikm[likm]=0;
+    aikm[likm] = 0;
 
-    let hlen=ecp::HASH_TYPE;
+    let hlen = ecp::HASH_TYPE;
 
-    hmac::hkdf_extract(hmac::MC_SHA2,hlen,&mut prk,Some(&salt.as_bytes()),&aikm[0 .. likm+1]);
-    hmac::hkdf_expand(hmac::MC_SHA2,hlen,&mut okm,el,&prk[0 .. hlen],&len);
+    hmac::hkdf_extract(
+        hmac::MC_SHA2,
+        hlen,
+        &mut prk,
+        Some(&salt.as_bytes()),
+        &aikm[0..likm + 1],
+    );
+    hmac::hkdf_expand(hmac::MC_SHA2, hlen, &mut okm, el, &prk[0..hlen], &len);
 
-    let mut dx = DBIG::frombytes(&okm[0 .. el]);
-    let sc = dx.ctdmod(&r,8*el-nbr);
+    let mut dx = DBIG::frombytes(&okm[0..el]);
+    let sc = dx.ctdmod(&r, 8 * el - nbr);
     sc.tobytes(s);
-// SkToPk
-    pair8::g2mul(&g, &sc).tobytes(w,true);  // true for public key compression
+    // SkToPk
+    pair8::g2mul(&g, &sc).tobytes(w, true); // true for public key compression
     BLS_OK
 }
 
@@ -152,9 +159,13 @@ pub fn core_verify(sig: &[u8], m: &[u8], w: &[u8]) -> isize {
     // Use new multi-pairing mechanism
     let mut r = pair8::initmp();
     //    pair8::another(&mut r,&g,&d);
-    unsafe {
-        pair8::another_pc(&mut r, &G2_TAB, &d);
-    }
+    pair8::another_pc(
+        &mut r,
+        G2_TAB
+            .get()
+            .expect("bls256::init() must run before verification"),
+        &d,
+    );
     pair8::another(&mut r, &pk, &hm);
     let mut v = pair8::miller(&mut r);
 
@@ -178,27 +189,31 @@ pub fn core_msig_verify(sig: &[u8], ms: &Vec<Vec<u8>>, ws: &Vec<Vec<u8>>) -> isi
 
     let mut pks = Vec::<ECP8>::new();
     for kw in ws {
-      let pk = ECP8::frombytes(&kw);
-      if !pair8::g2member(&pk) {
-          return BLS_FAIL;
-      }
-      pks.push(pk);
+        let pk = ECP8::frombytes(&kw);
+        if !pair8::g2member(&pk) {
+            return BLS_FAIL;
+        }
+        pks.push(pk);
     }
 
     let mut hms = Vec::<ECP>::new();
     for m in ms {
-      let hm = bls_hash_to_point(m);
-      hms.push(hm);
+        let hm = bls_hash_to_point(m);
+        hms.push(hm);
     }
 
     // Use new multi-pairing mechanism
     let mut r = pair8::initmp();
     //    pair8::another(&mut r,&g,&d);
-    unsafe {
-        pair8::another_pc(&mut r, &G2_TAB, &d);
-    }
+    pair8::another_pc(
+        &mut r,
+        G2_TAB
+            .get()
+            .expect("bls256::init() must run before verification"),
+        &d,
+    );
     for (pk, hm) in pks.iter().zip(hms) {
-      pair8::another(&mut r, &pk, &hm);
+        pair8::another(&mut r, &pk, &hm);
     }
     let mut v = pair8::miller(&mut r);
 
@@ -211,4 +226,39 @@ pub fn core_msig_verify(sig: &[u8], ms: &Vec<Vec<u8>>, ws: &Vec<Vec<u8>>) -> isi
         return BLS_OK;
     }
     BLS_FAIL
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_initialization_keeps_signature_verification_valid() {
+        let mut secret = [0u8; BGS];
+        let mut public = [0u8; 585];
+        let mut signature = [0u8; 74];
+        assert_eq!(
+            key_pair_generate(&[42u8; 32], &mut secret, &mut public),
+            BLS_OK
+        );
+        assert_eq!(
+            core_sign(&mut signature, b"once initialized", &secret),
+            BLS_OK
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    assert_eq!(init(), BLS_OK);
+                    assert_eq!(
+                        core_verify(&signature, b"once initialized", &public),
+                        BLS_OK
+                    );
+                    assert_eq!(
+                        core_verify(&signature, b"different message", &public),
+                        BLS_FAIL
+                    );
+                });
+            }
+        });
+    }
 }

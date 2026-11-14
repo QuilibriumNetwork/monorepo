@@ -1,6 +1,6 @@
 //! Multiplier circuits (array + Karatsuba). Port of `circuits/circ_multiplier.go`.
 
-use super::compiler::{new_adder, new_half_adder, new_full_adder, new_subtractor, Compiler};
+use super::compiler::{new_adder, new_full_adder, new_half_adder, new_subtractor, Compiler};
 use super::gates::Gate;
 use crate::circuit::Operation;
 
@@ -31,16 +31,8 @@ pub fn new_array_multiplier(
     z: &mut [usize],
 ) -> Result<(), String> {
     let (x, y) = cc.zero_pad(x, y);
-    let x = if x.len() > z.len() {
-        &x[..z.len()]
-    } else {
-        &x
-    };
-    let y = if y.len() > z.len() {
-        &y[..z.len()]
-    } else {
-        &y
-    };
+    let x = if x.len() > z.len() { &x[..z.len()] } else { &x };
+    let y = if y.len() > z.len() { &y[..z.len()] } else { &y };
 
     // One bit multiplication is AND.
     if x.len() == 1 {
@@ -55,11 +47,7 @@ pub fn new_array_multiplier(
     // Construct Y0 sums.
     let mut sums = Vec::new();
     for (i, &xn) in x.iter().enumerate() {
-        let s = if i == 0 {
-            z[0]
-        } else {
-            cc.allocator.wire()
-        };
+        let s = if i == 0 { z[0] } else { cc.allocator.wire() };
         cc.add_gate(Gate::new(Operation::And, xn, y[0], s));
         if i != 0 {
             sums.push(s);
@@ -143,16 +131,8 @@ pub fn new_karatsuba_multiplier(
     r: &mut [usize],
 ) -> Result<(), String> {
     let (a, b) = cc.zero_pad(a, b);
-    let a = if a.len() > r.len() {
-        &a[..r.len()]
-    } else {
-        &a
-    };
-    let b = if b.len() > r.len() {
-        &b[..r.len()]
-    } else {
-        &b
-    };
+    let a = if a.len() > r.len() { &a[..r.len()] } else { &a };
+    let b = if b.len() > r.len() { &b[..r.len()] } else { &b };
 
     if a.len() <= limit {
         return new_array_multiplier(cc, a, b, r);

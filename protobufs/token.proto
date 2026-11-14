@@ -48,8 +48,12 @@ enum ProofBasisType {
   // Token accepts proof of meaningful work for minting, requires a proof of
   // meaningful work entry for the minter's address in the token's domain
   PROOF_OF_MEANINGFUL_WORK = 1;
-  // Token accepts a verkle multiproof as proof
+  // Token accepts a verkle multiproof as proof (retired with KZG)
   VERKLE_MULTIPROOF_WITH_SIGNATURE = 2;
+  // Token accepts a Merkle membership proof of a mint entitlement in the
+  // configured root, signed by the entitled key. The proof basis for custom
+  // tokens: they never mint by proof of meaningful work.
+  MERKLE_ENTITLEMENT_WITH_SIGNATURE = 3;
 }
 
 // Fee basis types
@@ -129,99 +133,26 @@ message TokenUpdate {
 }
 
 // Transaction input
-message TransactionInput {
-  bytes commitment = 1;
-  bytes signature = 2;
-  repeated bytes proofs = 3;
-}
 
 // Transaction output
-message TransactionOutput {
-  bytes frame_number = 1;
-  bytes commitment = 2;
-  RecipientBundle recipient_output = 3;
-}
 
 // Recipient bundle
-message RecipientBundle {
-  bytes one_time_key = 1;
-  bytes verification_key = 2;
-  bytes coin_balance = 3;
-  bytes mask = 4;
-  // if non-divisible
-  bytes additional_reference = 5;
-  // if non-divisible
-  bytes additional_reference_key = 6;
-}
 
 // Transaction for token transfers
-message Transaction {
-  // 32 bytes
-  bytes domain = 1;
-  repeated TransactionInput inputs = 2;
-  repeated TransactionOutput outputs = 3;
-  // Big.Int serialized
-  repeated bytes fees = 4;
-  bytes range_proof = 5;
-  // Optional TraversalProof
-  quilibrium.node.application.pb.TraversalProof traversal_proof = 6;
-}
 
 // Pending transaction input
-message PendingTransactionInput {
-  bytes commitment = 1;
-  bytes signature = 2;
-  repeated bytes proofs = 3;
-}
 
 // Pending transaction output
-message PendingTransactionOutput {
-  bytes frame_number = 1;
-  bytes commitment = 2;
-  RecipientBundle to = 3;
-  RecipientBundle refund = 4;
-  // If Expirable is set
-  uint64 expiration = 5;
-}
 
 // Pending transaction for acceptable tokens
-message PendingTransaction {
-  // 32 bytes
-  bytes domain = 1;
-  repeated PendingTransactionInput inputs = 2;
-  repeated PendingTransactionOutput outputs = 3;
-  // Big.Int serialized
-  repeated bytes fees = 4;
-  bytes range_proof = 5;
-  // Optional TraversalProof
-  quilibrium.node.application.pb.TraversalProof traversal_proof = 6;
-}
 
 // Mint transaction input
-message MintTransactionInput {
-  // Big.Int serialized
-  bytes value = 1;
-  bytes commitment = 2;
-  bytes signature = 3;
-  repeated bytes proofs = 4;
-  bytes additional_reference = 5;
-  bytes additional_reference_key = 6;
+// Canonical confidential token operation. The operation itself binds its network
+// and application; no independent routing domain is supplied by this carrier.
+message TokenOperation {
+  bytes canonical_bytes = 1;
 }
 
 // Mint transaction output
-message MintTransactionOutput {
-  bytes frame_number = 1;
-  bytes commitment = 2;
-  RecipientBundle recipient_output = 3;
-}
 
 // Mint transaction
-message MintTransaction {
-  // 32 bytes
-  bytes domain = 1;
-  repeated MintTransactionInput inputs = 2;
-  repeated MintTransactionOutput outputs = 3;
-  // Big.Int serialized
-  repeated bytes fees = 4;
-  bytes range_proof = 5;
-}

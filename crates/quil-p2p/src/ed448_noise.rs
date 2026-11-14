@@ -11,9 +11,9 @@
 //! **Wire format**:
 //! ```text
 //! NoiseHandshakePayload (protobuf):
-//!   bytes identity_key = 1;   // protobuf(PublicKey{Type:4, Data:ed448_pubkey_57})
-//!   bytes identity_sig = 2;   // ed448_sign(seed, "noise-libp2p-static-key:" || dh_pubkey)
-//!   NoiseExtensions extensions = 4;
+//!   bytes identity_key = 1; // protobuf(PublicKey{Type:4, Data:ed448_pubkey_57})
+//!   bytes identity_sig = 2; // ed448_sign(seed, "noise-libp2p-static-key:" || dh_pubkey)
+//! NoiseExtensions extensions = 4;
 //! ```
 
 use quil_types::error::{QuilError, Result};
@@ -46,7 +46,8 @@ pub fn generate_ed448_payload(
     to_sign.extend_from_slice(dh_public_key);
 
     let private_key = ed448_rust::PrivateKey::from(*ed448_seed);
-    let signature = private_key.sign(&to_sign, None)
+    let signature = private_key
+        .sign(&to_sign, None)
         .map_err(|e| QuilError::Crypto(format!("Ed448 sign failed: {:?}", e)))?;
 
     // 3. Encode as NoiseHandshakePayload protobuf
@@ -71,10 +72,7 @@ pub fn generate_ed448_payload(
 /// - `remote_dh_public`: the remote's X25519 DH public key
 ///
 /// Returns the remote's 57-byte Ed448 public key on success.
-pub fn verify_ed448_payload(
-    payload_bytes: &[u8],
-    remote_dh_public: &[u8],
-) -> Result<Vec<u8>> {
+pub fn verify_ed448_payload(payload_bytes: &[u8], remote_dh_public: &[u8]) -> Result<Vec<u8>> {
     // Decode protobuf fields
     let (identity_key, identity_sig) = decode_noise_payload(payload_bytes)?;
 
@@ -89,7 +87,8 @@ pub fn verify_ed448_payload(
     let pubkey = ed448_rust::PublicKey::try_from(ed448_pubkey.as_slice())
         .map_err(|e| QuilError::Crypto(format!("invalid Ed448 pubkey: {:?}", e)))?;
 
-    pubkey.verify(&to_verify, &identity_sig, None)
+    pubkey
+        .verify(&to_verify, &identity_sig, None)
         .map_err(|_| QuilError::Crypto("Ed448 noise signature verification failed".into()))?;
 
     Ok(ed448_pubkey)
@@ -140,7 +139,10 @@ fn decode_ed448_public_key(data: &[u8]) -> Result<Vec<u8>> {
                 cursor += len;
             }
             _ => {
-                return Err(QuilError::Crypto(format!("unexpected protobuf field {}/{}", field_number, wire_type)));
+                return Err(QuilError::Crypto(format!(
+                    "unexpected protobuf field {}/{}",
+                    field_number, wire_type
+                )));
             }
         }
     }
@@ -165,7 +167,10 @@ fn decode_noise_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let wire_type = tag & 0x07;
 
         if wire_type != 2 {
-            return Err(QuilError::Crypto(format!("unexpected wire type {}", wire_type)));
+            return Err(QuilError::Crypto(format!(
+                "unexpected wire type {}",
+                wire_type
+            )));
         }
 
         let (len, consumed) = decode_varint(&data[cursor..])?;

@@ -1,0 +1,127 @@
+name: Free runner disk
+description: |
+  Prints the runner's identity and capacity, removes preinstalled software
+  the test jobs do not use, and, when the system disk is still too small
+  for the workspace build, puts target/ on the separate /mnt disk,
+  formatting a blank local disk there first if /mnt is not mounted. Run it
+  after checkout and before the cache restore: a bind mount leaves the
+  cache key and the restored path unchanged, where CARGO_TARGET_DIR would
+  change both. Not part of the native-deps action, whose hash keys caches.
+
+inputs:
+  min-free-gib:
+    description: Free GiB on the build disk below which target/ moves to /mnt
+    # The test build's target/ grew by 51 GB on run 41587502230; the rest
+    # is margin for the cache restore and the runner's own growth.
+    default: "70"
+  min-disk-gib:
+    description: Smallest blank disk, in GiB, formatted for /mnt when it is not mounted
+    default: "100"
+  required-gib:
+    description: Free GiB for target/ below which the step warns that the build may run out of disk
+    # The build failed with 47 GiB free on run 41763967433.
+    default: "52"
+
+runs:
+  using: composite
+  steps:
+    # Printed before anything is removed or built, so a runner that dies
+    # later has still logged which machine type it was.
+    - name: runner identity and capacity
+      shell: bash
+      run: |
+        echo "vendor: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo unknown)"
+        echo "product: $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+        echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}, runner: ${RUNNER_NAME:-unknown}"
+        echo "cpus: $(nproc)"
+        free -g
+        df -h / /mnt || true
+        lsblk || true
+
+    - name: free disk space
+      shell: bash
+      run: |
+        # Nothing here runs Docker, Python, Node or Go from the runner
+        # image: toolchains come from rustup, tools from install-action.
+        sudo du -sh /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache 2>/dev/null || true
+        if command -v docker >/dev/null; then sudo docker system df || true; fi
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/*
+        if command -v docker >/dev/null; then sudo docker image prune -af || true; fi
+        df -h /
+
+    - name: place target/ on the larger disk
+      shell: bash
+      env:
+        MIN_FREE_GIB: ${{ inputs.min-free-gib }}
+        MIN_DISK_GIB: ${{ inputs.min-disk-gib }}
+        REQUIRED_GIB: ${{ inputs.required-gib }}
+      run: |
+        need=$((MIN_FREE_GIB << 30))
+        avail=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)
+        if [ "$avail" -ge "$need" ]; then
+          echo "$((avail >> 30)) GiB free; target/ stays here"
+          exit 0
+        fi
+        # Some runners (m8id.xlarge on runs 41741053030 and 41763967433)
+        # leave their local NVMe disk blank instead of mounting it on
+        # /mnt. Format the first blank whole disk that is large enough:
+        # no partitions, mounts, holders or signature of any kind, so
+        # the root disk and any disk in use are never touched.
+        if ! mountpoint -q /mnt; then
+          lsblk -po NAME,SIZE,TYPE,RO,FSTYPE,MOUNTPOINT || true
+          blank=""
+          while read -r dev type; do
+            [ "$type" = disk ] || continue
+            if [ "$(lsblk -no NAME "$dev" | wc -l)" -ne 1 ] ||
+               [ -n "$(lsblk -no MOUNTPOINT "$dev" | tr -d '[:space:]')" ] ||
+               [ "$(lsblk -dno RO "$dev")" -ne 0 ] ||
+               [ -n "$(ls -A "/sys/class/block/${dev##*/}/holders" 2>/dev/null)" ]; then
+              echo "$dev: partitioned, mounted, read-only or in use; skipped"
+              continue
+            fi
+            size=$(lsblk -dbno SIZE "$dev")
+            if [ "$size" -lt $((MIN_DISK_GIB << 30)) ]; then
+              echo "$dev: $((size >> 30)) GiB, under $MIN_DISK_GIB GiB; skipped"
+              continue
+            fi
+            # blkid exits 2 when it finds no filesystem, RAID member or
+            # partition table signature, but also when it cannot open the
+            # disk; wipefs lists the same signatures and fails on errors.
+            rc=0
+            sudo blkid -p "$dev" >/dev/null 2>&1 || rc=$?
+            if ! sigs=$(sudo wipefs -n --noheadings "$dev") ||
+               [ -n "$sigs" ] || [ "$rc" -ne 2 ]; then
+              echo "$dev: carries a signature or cannot be probed (blkid $rc); skipped"
+              continue
+            fi
+            blank=$dev
+            break
+          done < <(lsblk -dpno NAME,TYPE)
+          if [ -n "$blank" ]; then
+            echo "formatting blank disk $blank ($((size >> 30)) GiB) and mounting it on /mnt"
+            sudo mkfs.ext4 -F -q -m 0 -E nodiscard "$blank"
+            sudo mount -o noatime "$blank" /mnt
+            df -h /mnt
+          else
+            echo "/mnt is not mounted and no blank disk of $MIN_DISK_GIB GiB or more was found"
+          fi
+        fi
+        mnt=0
+        if mountpoint -q /mnt; then
+          mnt=$(df -B1 --output=avail /mnt | tail -1)
+        fi
+        if [ "$mnt" -gt "$avail" ]; then
+          sudo mkdir -p /mnt/target "$GITHUB_WORKSPACE/target"
+          sudo chown "$(id -u):$(id -g)" /mnt/target "$GITHUB_WORKSPACE/target"
+          sudo mount --bind /mnt/target "$GITHUB_WORKSPACE/target"
+          avail=$mnt
+          echo "target/ is on /mnt"
+        fi
+        df -h "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE" || true
+        if [ "$avail" -lt $((REQUIRED_GIB << 30)) ]; then
+          # A warning, not a failure: 47 GiB was too little on run 41763967433, but the exact need is unmeasured.
+          echo "::warning::$((avail >> 30)) GiB free for target/ and no larger disk; the test build failed with 47 GiB free before, so it may fail with ENOSPC"
+        fi
+        if [ "$avail" -lt "$need" ]; then
+          echo "::warning::$((avail >> 30)) GiB free for target/; the test build needs about 51 GiB and the job asks for $MIN_FREE_GIB"
+        fi

@@ -38,11 +38,7 @@ pub struct AsertDifficultyAdjuster {
 }
 
 impl AsertDifficultyAdjuster {
-    pub fn new(
-        anchor_frame_number: u64,
-        anchor_parent_time: i64,
-        anchor_difficulty: u32,
-    ) -> Self {
+    pub fn new(anchor_frame_number: u64, anchor_parent_time: i64, anchor_difficulty: u32) -> Self {
         Self {
             anchor_frame_number,
             anchor_parent_time,
@@ -66,8 +62,7 @@ impl DifficultyAdjuster for AsertDifficultyAdjuster {
         // the unsigned → signed wrap matching between languages
         // (it's legal to compute a difference through int64
         // subtraction).
-        let frame_number_delta: i64 =
-            current_frame_number as i64 - self.anchor_frame_number as i64;
+        let frame_number_delta: i64 = current_frame_number as i64 - self.anchor_frame_number as i64;
         let time_delta: i64 = current_time - self.anchor_parent_time;
 
         // Q16 exponent: -((time_delta - IDEAL * (delta + 1)) * RADIX) / HALF_LIFE.
@@ -77,8 +72,7 @@ impl DifficultyAdjuster for AsertDifficultyAdjuster {
         // `wrapping_*` to preserve Go behaviour on pathological
         // inputs. Normal mainnet inputs never approach the overflow
         // boundary.
-        let ideal_x_delta = IDEAL_FRAME_TIME
-            .wrapping_mul(frame_number_delta.wrapping_add(1));
+        let ideal_x_delta = IDEAL_FRAME_TIME.wrapping_mul(frame_number_delta.wrapping_add(1));
         let inner = time_delta.wrapping_sub(ideal_x_delta);
         let numerator = inner.wrapping_mul(RADIX).wrapping_neg();
         let exponent: i64 = numerator / HALF_LIFE;
@@ -237,8 +231,14 @@ mod tests {
         let frame = 244_201;
         let ts = 1_762_862_400_000 + IDEAL_FRAME_TIME * 2;
         let d = adj.get_next_difficulty(frame, ts);
-        assert_ne!(d, BOOTSTRAP_DIFFICULTY, "mainnet anchor must not hit bootstrap path");
-        assert_eq!(d, 80_000, "on-schedule frame should return anchor difficulty");
+        assert_ne!(
+            d, BOOTSTRAP_DIFFICULTY,
+            "mainnet anchor must not hit bootstrap path"
+        );
+        assert_eq!(
+            d, 80_000,
+            "on-schedule frame should return anchor difficulty"
+        );
     }
 
     /// Adversarial: post-halt resumption can't be used to gain an
@@ -254,13 +254,13 @@ mod tests {
     ///
     /// In practice the half-life clamp (2h) plus the `MIN_DIFFICULTY`
     /// floor (50_000) make this benign:
-    ///   - A 1800-frame halt at 10s/frame ≈ 5h of stall, 2.5 half-lives.
-    ///     Difficulty drops by ~2^2.5 ≈ 5.66× per cycle.
-    ///   - The drop is symmetric: everyone gets the lower difficulty,
-    ///     not just the attacker.
-    ///   - Even an infinite halt clamps to `MIN_DIFFICULTY = 50_000`,
-    ///     which is the protocol's hard floor — not exploitable as
-    ///     "free" compute.
+    /// - A 1800-frame halt at 10s/frame ≈ 5h of stall, 2.5 half-lives.
+    /// Difficulty drops by ~2^2.5 ≈ 5.66× per cycle.
+    /// - The drop is symmetric: everyone gets the lower difficulty,
+    /// not just the attacker.
+    /// - Even an infinite halt clamps to `MIN_DIFFICULTY = 50_000`,
+    /// which is the protocol's hard floor — not exploitable as
+    /// "free" compute.
     /// This test pins those properties so any future ASERT tweak that
     /// removes the floor or amplifies the post-halt drop will fail
     /// loudly.
@@ -269,11 +269,7 @@ mod tests {
         const MAINNET_ANCHOR_DIFF: u32 = 80_000;
         let anchor_time = 1_762_862_400_000i64;
         let anchor_frame = 244_200u64;
-        let adj = AsertDifficultyAdjuster::new(
-            anchor_frame,
-            anchor_time,
-            MAINNET_ANCHOR_DIFF,
-        );
+        let adj = AsertDifficultyAdjuster::new(anchor_frame, anchor_time, MAINNET_ANCHOR_DIFF);
 
         // Realistic worst-case halt: full DEFAULT_HALT_GRACE_FRAMES
         // (1800) at 10s/frame = 18_000 seconds = 5 hours of stall on
@@ -284,8 +280,7 @@ mod tests {
         let halt_seconds: i64 = (1800 * IDEAL_FRAME_TIME) / 1000; // 18000
         let halt_ms = halt_seconds * 1000;
         let current_frame = anchor_frame + frame_delta;
-        let on_schedule_time =
-            anchor_time + IDEAL_FRAME_TIME * (frame_delta as i64 + 1);
+        let on_schedule_time = anchor_time + IDEAL_FRAME_TIME * (frame_delta as i64 + 1);
         let post_halt_time = on_schedule_time + halt_ms;
 
         let d_post_halt = adj.get_next_difficulty(current_frame, post_halt_time);
@@ -295,7 +290,8 @@ mod tests {
         assert!(
             d_post_halt >= MIN_DIFFICULTY,
             "post-halt difficulty {} fell below floor {}",
-            d_post_halt, MIN_DIFFICULTY,
+            d_post_halt,
+            MIN_DIFFICULTY,
         );
 
         // (2) Symmetry: the lower difficulty applies to every prover
@@ -311,11 +307,8 @@ mod tests {
         //     have closed most of the gap toward `MAINNET_ANCHOR_DIFF`.
         let recovery_anchor_diff = d_post_halt as u32;
         let recovery_anchor_time = post_halt_time;
-        let recovery_adj = AsertDifficultyAdjuster::new(
-            current_frame,
-            recovery_anchor_time,
-            recovery_anchor_diff,
-        );
+        let recovery_adj =
+            AsertDifficultyAdjuster::new(current_frame, recovery_anchor_time, recovery_anchor_diff);
         // ~1 half-life later (2h), still on-schedule frame-by-frame.
         let frames_per_halflife = (HALF_LIFE / IDEAL_FRAME_TIME) as u64; // 720
         let after_halflife_frame = current_frame + frames_per_halflife;

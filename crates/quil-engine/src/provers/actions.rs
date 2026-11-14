@@ -8,12 +8,12 @@
 use quil_types::crypto::Signer;
 use quil_types::error::Result;
 
-use quil_execution::global_intrinsic::prover_join::ProverJoin;
-use quil_execution::global_intrinsic::seniority_merge::SeniorityMerge;
-use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject};
-use quil_execution::global_intrinsic::prover_filter_ops::ProverLeave;
-use quil_execution::global_intrinsic::sig_with_pop::SignatureWithPop;
 use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+use quil_execution::global_intrinsic::prover_filter_ops::ProverLeave;
+use quil_execution::global_intrinsic::prover_join::ProverJoin;
+use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject};
+use quil_execution::global_intrinsic::seniority_merge::SeniorityMerge;
+use quil_execution::global_intrinsic::sig_with_pop::SignatureWithPop;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
 /// Build a signed ProverJoin wrapped in a MessageBundle.
@@ -66,16 +66,41 @@ pub fn build_join_bundle(
     wrap_in_bundle(signed.to_canonical_bytes()?)
 }
 
-/// Build a signed ProverConfirm wrapped in a MessageBundle.
+/// Build a signed ProverConfirm wrapped in a MessageBundle (no storage
+/// leaf roots — the legacy / pre-storage-attestation path).
 pub fn build_confirm_bundle(
     filters: &[Vec<u8>],
     frame_number: u64,
     bls_signer: &dyn Signer,
     prover_address: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
-    msg.extend_from_slice(&frame_number.to_be_bytes());
+    build_confirm_bundle_with_leaf_roots(filters, frame_number, bls_signer, prover_address, &[])
+}
+
+/// Build a signed ProverConfirm carrying the prover's per-epoch storage
+/// `leaf_roots`. The signature covers `confirm_signing_message` (the
+/// multi-filter message with the leaf-root set appended), so the
+/// registered roots are authenticated. An empty `leaf_roots` slice signs
+/// + serializes byte-identically to the pre-storage-attestation confirm,
+/// so [`build_confirm_bundle`] delegates here with `&[]`. The roots are
+/// produced by `app_shard_metadata::compute_storage_confirm` (which also
+/// persists the SDR replicas). PoRep wiring E.
+pub fn build_confirm_bundle_with_leaf_roots(
+    filters: &[Vec<u8>],
+    frame_number: u64,
+    bls_signer: &dyn Signer,
+    prover_address: &[u8],
+    leaf_roots: &[quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots],
+) -> Result<Vec<u8>> {
+    // This build's release, from the confirm release frame.
+    let release =
+        quil_execution::global_intrinsic::prover_release::release_for_confirm(frame_number);
+    let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+        filters,
+        frame_number,
+        leaf_roots,
+        release.as_ref(),
+    );
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
     dp.extend_from_slice(b"PROVER_CONFIRM");
@@ -91,6 +116,8 @@ pub fn build_confirm_bundle(
             address: prover_address.to_vec(),
         }),
         filters: filters.to_vec(),
+        leaf_roots: leaf_roots.to_vec(),
+        release,
     };
 
     wrap_in_bundle(confirm.to_canonical_bytes()?)
@@ -104,7 +131,9 @@ pub fn build_reject_bundle(
     prover_address: &[u8],
 ) -> Result<Vec<u8>> {
     let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
+    for f in filters {
+        msg.extend_from_slice(f);
+    }
     msg.extend_from_slice(&frame_number.to_be_bytes());
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
@@ -182,89 +211,25 @@ pub fn build_merge_helpers(
 
     Ok(vec![SeniorityMerge {
         signature: signature.to_vec(),
-        key_type: 4, // KeyTypeEd448
+        // Ed448 seniority key. FIX: was `4` (Decaf448's value, mislabeled
+        // "KeyTypeEd448") — the verify map is Ed448-only now and Ed448 = 0.
+        key_type: quil_types::crypto::KeyType::Ed448 as u32,
         prover_public_key: ed448_pubkey_bytes,
     }])
-}
-
-/// Build a signed ShardSplit message bundle.
-/// Submitted when a shard has >32 active provers.
-pub fn build_shard_split_bundle(
-    filter: &[u8],
-    frame_number: u64,
-    bls_signer: &dyn Signer,
-    prover_address: &[u8],
-) -> Result<Vec<u8>> {
-    // Message: filter || frame_number
-    let mut msg = Vec::new();
-    msg.extend_from_slice(filter);
-    msg.extend_from_slice(&frame_number.to_be_bytes());
-
-    let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
-    dp.extend_from_slice(b"SHARD_SPLIT");
-    let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp)?;
-    let sig = bls_signer.sign_with_domain(&msg, &domain)?;
-
-    // Canonical bytes: [type_prefix][filter_len][filter][frame_number][sig_len][address][sig]
-    let mut out = Vec::new();
-    out.extend_from_slice(&0x031Eu32.to_be_bytes()); // TYPE_SHARD_SPLIT
-    out.extend_from_slice(&(filter.len() as u32).to_be_bytes());
-    out.extend_from_slice(filter);
-    out.extend_from_slice(&frame_number.to_be_bytes());
-    out.extend_from_slice(&(prover_address.len() as u32).to_be_bytes());
-    out.extend_from_slice(prover_address);
-    out.extend_from_slice(&(sig.len() as u32).to_be_bytes());
-    out.extend_from_slice(&sig);
-
-    wrap_in_bundle(out)
-}
-
-/// Build a signed ShardMerge message bundle.
-/// Submitted when adjacent shards both have <6 active provers.
-pub fn build_shard_merge_bundle(
-    filter_left: &[u8],
-    filter_right: &[u8],
-    frame_number: u64,
-    bls_signer: &dyn Signer,
-    prover_address: &[u8],
-) -> Result<Vec<u8>> {
-    let mut msg = Vec::new();
-    msg.extend_from_slice(filter_left);
-    msg.extend_from_slice(filter_right);
-    msg.extend_from_slice(&frame_number.to_be_bytes());
-
-    let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
-    dp.extend_from_slice(b"SHARD_MERGE");
-    let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp)?;
-    let sig = bls_signer.sign_with_domain(&msg, &domain)?;
-
-    let mut out = Vec::new();
-    out.extend_from_slice(&0x031Fu32.to_be_bytes()); // TYPE_SHARD_MERGE
-    out.extend_from_slice(&(filter_left.len() as u32).to_be_bytes());
-    out.extend_from_slice(filter_left);
-    out.extend_from_slice(&(filter_right.len() as u32).to_be_bytes());
-    out.extend_from_slice(filter_right);
-    out.extend_from_slice(&frame_number.to_be_bytes());
-    out.extend_from_slice(&(prover_address.len() as u32).to_be_bytes());
-    out.extend_from_slice(prover_address);
-    out.extend_from_slice(&(sig.len() as u32).to_be_bytes());
-    out.extend_from_slice(&sig);
-
-    wrap_in_bundle(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_crypto::Bls48581KeyConstructor;
+    use quil_crypto::FalconKeyConstructor;
     use quil_types::crypto::BlsConstructor;
 
     /// Decode a bundle's single inner request bytes (after stripping the
     /// CanonicalMessageRequest envelope). Asserts there is exactly one
     /// request and returns the inner payload bytes.
     fn decode_single_inner(bundle_bytes: &[u8]) -> Vec<u8> {
-        let bundle = CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
-            .expect("bundle decodes");
+        let bundle =
+            CanonicalMessageBundle::from_canonical_bytes(bundle_bytes).expect("bundle decodes");
         assert_eq!(bundle.requests.len(), 1, "exactly one request expected");
         let req = bundle.requests[0].as_ref().expect("request present");
         req.inner_bytes.clone()
@@ -272,7 +237,10 @@ mod tests {
 
     /// Generate a real BLS keypair (signer + public key bytes).
     fn bls_keypair() -> (Box<dyn Signer>, Vec<u8>) {
-        Bls48581KeyConstructor.new_key().expect("bls keypair")
+        // Consensus is now Falcon-512 (FN-DSA); the prover bundle
+        // helpers embed `SignatureWithPop`, whose decode gate requires
+        // 666-byte Falcon signatures / 897-byte keys.
+        FalconKeyConstructor.new_key().expect("falcon keypair")
     }
 
     #[test]
@@ -318,7 +286,13 @@ mod tests {
         let proof = vec![0x09u8; 32];
 
         let bytes = build_join_bundle(
-            &filters, frame_number, &pk, signer.as_ref(), &address, &proof, Vec::new(),
+            &filters,
+            frame_number,
+            &pk,
+            signer.as_ref(),
+            &address,
+            &proof,
+            Vec::new(),
         )
         .unwrap();
         let inner = decode_single_inner(&bytes);
@@ -339,7 +313,7 @@ mod tests {
         dp.extend_from_slice(b"PROVER_JOIN");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &join_message, &domain));
         // POP signature verifies over the pubkey under the POP domain.
         assert!(bls.verify_signature_raw(&pk, &sig.pop_signature, &pk, b"BLS48_POP_SK"));
@@ -350,7 +324,7 @@ mod tests {
         let (signer, pk) = bls_keypair();
         let merge = SeniorityMerge {
             signature: vec![0xAAu8; 114],
-            key_type: 4,
+            key_type: quil_types::crypto::KeyType::Ed448 as u32,
             prover_public_key: vec![0xBBu8; 57],
         };
         let bytes = build_join_bundle(
@@ -366,7 +340,10 @@ mod tests {
         let inner = decode_single_inner(&bytes);
         let join = ProverJoin::from_canonical_bytes(&inner).unwrap();
         assert_eq!(join.merge_targets.len(), 1);
-        assert_eq!(join.merge_targets[0].key_type, 4);
+        assert_eq!(
+            join.merge_targets[0].key_type,
+            quil_types::crypto::KeyType::Ed448 as u32
+        );
         assert_eq!(join.merge_targets[0].prover_public_key, vec![0xBBu8; 57]);
     }
 
@@ -391,14 +368,92 @@ mod tests {
     }
 
     #[test]
+    fn confirm_bundle_with_leaf_roots_round_trips() {
+        use quil_execution::global_intrinsic::leaf_root_registration::{
+            ConfirmLeafRoots, LeafRootEntry,
+        };
+        let (signer, _pk) = bls_keypair();
+        let filters = vec![vec![0x05u8; 32]];
+        let frame_number = 778u64;
+        let address = vec![0x42u8; 32];
+        let roots = vec![ConfirmLeafRoots {
+            filter: filters[0].clone(),
+            entries: vec![LeafRootEntry {
+                prefix: vec![0u32, 1u32],
+                leaf_root: vec![0xABu8; 64],
+                num_blocks: 3,
+            }],
+        }];
+
+        let bytes = build_confirm_bundle_with_leaf_roots(
+            &filters,
+            frame_number,
+            signer.as_ref(),
+            &address,
+            &roots,
+        )
+        .unwrap();
+        let inner = decode_single_inner(&bytes);
+        let confirm = ProverConfirm::from_canonical_bytes(&inner).expect("confirm decodes");
+        assert_eq!(confirm.filters, filters);
+        assert_eq!(confirm.leaf_roots.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].filter, filters[0]);
+        assert_eq!(confirm.leaf_roots[0].entries.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].entries[0].prefix, vec![0u32, 1u32]);
+        assert_eq!(confirm.leaf_roots[0].entries[0].num_blocks, 3);
+
+        // The signature must cover the leaf-root-bearing signing message, so a
+        // confirm whose declared roots were tampered no longer matches.
+        let sig = confirm.public_key_signature_bls48581.clone().expect("sig");
+        let signed_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &confirm.leaf_roots,
+            confirm.release.as_ref(),
+        );
+        let tampered_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &[],
+            None,
+        );
+        assert_ne!(
+            signed_msg, tampered_msg,
+            "non-empty leaf roots must change the signed message vs the legacy form"
+        );
+        assert!(!sig.signature.is_empty());
+    }
+
+    #[test]
+    fn confirm_bundle_carries_this_builds_release_only_from_the_release_frame() {
+        use quil_execution::global_intrinsic::prover_release::{
+            set_confirm_release_frame_for_thread, Release,
+        };
+        let (signer, _pk) = bls_keypair();
+        let filters = vec![vec![0x05u8; 32]];
+        let address = vec![0x42u8; 32];
+        let decode = |frame_number| {
+            let bytes =
+                build_confirm_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+            ProverConfirm::from_canonical_bytes(&decode_single_inner(&bytes))
+                .expect("confirm decodes")
+        };
+        set_confirm_release_frame_for_thread(None);
+        assert_eq!(decode(779).release, None);
+        set_confirm_release_frame_for_thread(Some(780));
+        assert_eq!(decode(779).release, None);
+        assert_eq!(decode(780).release, Some(Release::current()));
+        set_confirm_release_frame_for_thread(None);
+    }
+
+    #[test]
     fn reject_bundle_round_trips_fields() {
         let (signer, _pk) = bls_keypair();
         let filters = vec![vec![0x06u8; 32], vec![0x07u8; 32]];
         let frame_number = 4242u64;
         let address = vec![0x11u8; 32];
 
-        let bytes =
-            build_reject_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let bytes = build_reject_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
         let inner = decode_single_inner(&bytes);
         let reject = ProverReject::from_canonical_bytes(&inner).expect("reject decodes");
         assert_eq!(reject.filters, filters);
@@ -414,8 +469,7 @@ mod tests {
         let frame_number = 314u64;
         let address = vec![0x21u8; 32];
 
-        let bytes =
-            build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let bytes = build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
         let inner = decode_single_inner(&bytes);
         let leave = ProverLeave::from_canonical_bytes(&inner).expect("leave decodes");
         assert_eq!(leave.filters, filters);
@@ -447,8 +501,53 @@ mod tests {
         dp.extend_from_slice(b"PROVER_CONFIRM");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain));
+    }
+
+    #[test]
+    fn leave_signature_verifies_under_domain() {
+        // Regression: the leave signer (`build_leave_bundle`) uses a
+        // LENGTH-DELIMITED message, but `verify_prover_leave` had reused the
+        // raw-concat `multi_filter_signing_message`, so EVERY leave failed
+        // signature verification (mass `op=ProverLeave` mempool drops; leaves
+        // never accepted; coverage stuck). This asserts the signed bytes match
+        // the verifier's `prover_leave_signing_message`. Use >1 filter of
+        // differing lengths so a raw-concat reconstruction cannot coincide.
+        let (signer, pk) = bls_keypair();
+        let filters = vec![vec![0x08u8; 32], vec![0x09u8; 40], vec![0x0au8; 8]];
+        let frame_number = 777u64;
+        let address = vec![0x42u8; 32];
+
+        let bytes = build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let inner = decode_single_inner(&bytes);
+        let leave = ProverLeave::from_canonical_bytes(&inner).unwrap();
+        let sig = leave.public_key_signature_bls48581.unwrap();
+
+        // The verifier's message builder must reproduce the signed bytes.
+        let msg = quil_execution::global_intrinsic::prover_verify::prover_leave_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        let domain =
+            quil_execution::global_intrinsic::prover_verify::prover_leave_domain().unwrap();
+
+        let bls = FalconKeyConstructor;
+        assert!(
+            bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain),
+            "leave signature must verify against prover_leave_signing_message"
+        );
+
+        // And it must NOT verify against the old raw-concat form (guards
+        // against silently reverting the verifier to multi_filter).
+        let wrong = quil_execution::global_intrinsic::prover_verify::multi_filter_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        assert!(
+            !bls.verify_signature_raw(&pk, &sig.signature, &wrong, &domain),
+            "raw-concat form must not verify a length-delimited leave signature"
+        );
     }
 
     #[test]
@@ -458,7 +557,7 @@ mod tests {
         let merges = build_merge_helpers(&seed, &bls_pubkey).expect("merge helpers");
         assert_eq!(merges.len(), 1);
         let m = &merges[0];
-        assert_eq!(m.key_type, 4);
+        assert_eq!(m.key_type, quil_types::crypto::KeyType::Ed448 as u32);
         assert!(!m.signature.is_empty());
 
         // The prover_public_key must be the Ed448 public key derived
@@ -470,80 +569,7 @@ mod tests {
 
         let mut sign_input = Vec::from(b"PROVER_JOIN_MERGE" as &[u8]);
         sign_input.extend_from_slice(&bls_pubkey);
-        assert!(pub_key
-            .verify(&sign_input, &m.signature, None)
-            .is_ok());
-    }
-
-    #[test]
-    fn shard_split_bundle_has_correct_type_and_fields() {
-        let (signer, _pk) = bls_keypair();
-        let filter = vec![0x33u8; 32];
-        let frame_number = 5000u64;
-        let address = vec![0x44u8; 32];
-
-        let bytes =
-            build_shard_split_bundle(&filter, frame_number, signer.as_ref(), &address).unwrap();
-        let inner = decode_single_inner(&bytes);
-
-        // inner layout: [type 0x031E][filter_len][filter][frame#][addr_len][addr][sig_len][sig]
-        assert_eq!(&inner[0..4], &0x031Eu32.to_be_bytes());
-        let mut cur = 4usize;
-        let flen = u32::from_be_bytes(inner[cur..cur + 4].try_into().unwrap()) as usize;
-        cur += 4;
-        assert_eq!(&inner[cur..cur + flen], filter.as_slice());
-        cur += flen;
-        let fnum = u64::from_be_bytes(inner[cur..cur + 8].try_into().unwrap());
-        cur += 8;
-        assert_eq!(fnum, frame_number);
-        let alen = u32::from_be_bytes(inner[cur..cur + 4].try_into().unwrap()) as usize;
-        cur += 4;
-        assert_eq!(&inner[cur..cur + alen], address.as_slice());
-        cur += alen;
-        let slen = u32::from_be_bytes(inner[cur..cur + 4].try_into().unwrap()) as usize;
-        assert!(slen > 0, "signature must be present");
-    }
-
-    #[test]
-    fn shard_merge_bundle_has_correct_type_and_both_filters() {
-        let (signer, _pk) = bls_keypair();
-        let left = vec![0x55u8; 32];
-        let right = vec![0x66u8; 32];
-        let frame_number = 6000u64;
-        let address = vec![0x77u8; 32];
-
-        let bytes = build_shard_merge_bundle(
-            &left, &right, frame_number, signer.as_ref(), &address,
-        )
-        .unwrap();
-        let inner = decode_single_inner(&bytes);
-        assert_eq!(&inner[0..4], &0x031Fu32.to_be_bytes());
-
-        let mut cur = 4usize;
-        let llen = u32::from_be_bytes(inner[cur..cur + 4].try_into().unwrap()) as usize;
-        cur += 4;
-        assert_eq!(&inner[cur..cur + llen], left.as_slice());
-        cur += llen;
-        let rlen = u32::from_be_bytes(inner[cur..cur + 4].try_into().unwrap()) as usize;
-        cur += 4;
-        assert_eq!(&inner[cur..cur + rlen], right.as_slice());
-        cur += rlen;
-        let fnum = u64::from_be_bytes(inner[cur..cur + 8].try_into().unwrap());
-        assert_eq!(fnum, frame_number);
-    }
-
-    #[test]
-    fn shard_split_and_merge_have_distinct_type_prefixes() {
-        let (signer, _pk) = bls_keypair();
-        let split = build_shard_split_bundle(&[0x01u8; 32], 1, signer.as_ref(), &[0x02u8; 32])
-            .unwrap();
-        let merge = build_shard_merge_bundle(
-            &[0x01u8; 32], &[0x03u8; 32], 1, signer.as_ref(), &[0x02u8; 32],
-        )
-        .unwrap();
-        let split_inner = decode_single_inner(&split);
-        let merge_inner = decode_single_inner(&merge);
-        assert_ne!(&split_inner[0..4], &merge_inner[0..4]);
+        assert!(pub_key.verify(&sign_input, &m.signature, None).is_ok());
     }
 
     #[test]

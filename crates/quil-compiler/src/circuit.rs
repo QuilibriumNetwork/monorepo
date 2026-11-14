@@ -560,9 +560,8 @@ fn parse_io_arg<R: Read>(r: &mut R) -> io::Result<IOArg> {
     let bits = read_u32(r)? as Size;
     let num_compound = read_u32(r)? as usize;
 
-    let mut type_info = types::parse_type(&type_str).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("type parse: {}", e))
-    })?;
+    let mut type_info = types::parse_type(&type_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("type parse: {}", e)))?;
     type_info.bits = bits;
 
     let mut compound = Vec::with_capacity(num_compound);

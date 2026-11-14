@@ -35,3 +35,29 @@ criterion = ">=0.2"
 name = "classgroup-bench"
 harness = false
 path = "bench/bench.rs"
+
+# Cosmetic warnings in the maintained poanetwork/vdf fork. Keep
+# initialization, FFI signature and shared-mutation diagnostics enabled.
+[lints.rust]
+bare_trait_objects = "allow"
+dead_code = "allow"
+noop_method_call = "allow"
+unexpected_cfgs = "allow"
+
+# Clippy findings in code taken from poanetwork/vdf: allowed
+# here, not restyled. Unlisted lints keep their defaults.
+[lints.clippy]
+cmp_owned = "allow"
+manual_bits = "allow"
+manual_div_ceil = "allow"
+manual_range_contains = "allow"
+match_like_matches_macro = "allow"
+missing_safety_doc = "allow"
+needless_borrow = "allow"
+needless_lifetimes = "allow"
+needless_range_loop = "allow"
+needless_return = "allow"
+new_without_default = "allow"
+single_component_path_imports = "allow"
+unnecessary_cast = "allow"
+zero_ptr = "allow"
