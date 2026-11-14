@@ -360,13 +360,27 @@ fn store_chain(
             }
         }
         timing.store += started.elapsed();
-        if let Some(ref cb) = config.on_frame {
-            let started = Instant::now();
-            cb(frame);
-            timing.on_frame += started.elapsed();
-        }
+        let started = Instant::now();
+        fire_on_frame(config, frame);
+        timing.on_frame += started.elapsed();
     }
     Ok(timing)
+}
+
+/// Fire `on_frame` for `frame`, first raising the head target to the
+/// newest frame gossip has validated and stored, so a frame the tick
+/// replays behind that head never reads as the head.
+fn fire_on_frame(config: &ArchivePollerConfig, frame: &GlobalFrame) {
+    let Some(ref cb) = config.on_frame else {
+        return;
+    };
+    if let (Some(target), Some(gossip)) = (
+        config.head_target.as_ref(),
+        config.gossip_freshness.as_ref(),
+    ) {
+        target.fetch_max(gossip.head(), std::sync::atomic::Ordering::Relaxed);
+    }
+    cb(frame);
 }
 
 /// Work after a fetch slower than this is logged by step. Between two
@@ -693,7 +707,10 @@ pub struct ArchivePollerConfig {
     pub far_behind_jump: Option<FarBehindJump>,
     /// Set to the head each tick catches up to before `on_frame` fires for
     /// its frames, so `on_frame` can tell a backlog frame from the head.
-    /// Stored, not raised: each tick says what it reached for.
+    /// Stored at each tick, then raised before each frame to a newer head
+    /// gossip delivered meanwhile: one tick's fill can run for minutes
+    /// while GLOBAL moves on (18 min and 84 frames after a restart,
+    /// 2026-11-13).
     pub head_target: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
@@ -963,9 +980,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     let next = last_frame + 1;
                     match clock_store.get_global_frame(next) {
                         Ok(frame) => {
-                            if let Some(ref cb) = config.on_frame {
-                                cb(&frame);
-                            }
+                            fire_on_frame(&config, &frame);
                             last_frame = next;
                         }
                         Err(_) => {
@@ -1211,9 +1226,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 // does, so processing is identical regardless of source.
                 if config.gossip_freshness.is_some() {
                     if let Ok(frame) = clock_store.get_global_frame(fn_) {
-                        if let Some(ref cb) = config.on_frame {
-                            cb(&frame);
-                        }
+                        fire_on_frame(&config, &frame);
                         last_frame = fn_;
                         continue;
                     }
@@ -1959,6 +1972,8 @@ mod forward_fill_tests {
         /// Answer every head request whole, as a server predating
         /// `if_newer_than` does.
         legacy: bool,
+        /// Runs at each request by number, before the answer.
+        on_fetch: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     }
 
     impl FakeArchive {
@@ -1970,6 +1985,7 @@ mod forward_fill_tests {
                 block_at: None,
                 head_answers: Arc::new(std::sync::Mutex::new(Vec::new())),
                 legacy: false,
+                on_fetch: None,
             }
         }
     }
@@ -1981,6 +1997,9 @@ mod forward_fill_tests {
             frame_number: u64,
         ) -> Result<GlobalFrame, ArchiveClientError> {
             self.requests.lock().unwrap().push(frame_number);
+            if let Some(on_fetch) = self.on_fetch.as_ref() {
+                on_fetch(frame_number);
+            }
             if self.block_at == Some(frame_number) {
                 std::future::pending::<()>().await;
             }
@@ -2250,6 +2269,32 @@ mod forward_fill_tests {
         rig.poller.await.unwrap();
         assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(*rig.targets.lock().unwrap(), vec![5; 5]);
+    }
+
+    /// GLOBAL moves on while a tick replays its backlog: a frame gossip
+    /// delivers meanwhile raises the head the later frames see, so the
+    /// frame just below the tick's own target does not read as the head
+    /// (a node's prover lifecycle planned a join 84 frames behind GLOBAL
+    /// at the end of an 18-minute catch-up, 2026-11-13).
+    #[tokio::test]
+    async fn a_replayed_frame_sees_a_head_gossip_delivered_during_its_tick() {
+        let gossip = GossipFreshness::new();
+        let during = gossip.clone();
+        let mut fake = FakeArchive::serving(1..=5);
+        fake.on_fetch = Some(Arc::new(move |n| {
+            if n == 3 {
+                during.stamp(9);
+            }
+        }));
+        let rig = spawn_poller(fake, &[0], Some(gossip)).await;
+        assert!(await_head_then_stop(&rig, 5).await);
+        rig.poller.await.unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            *rig.targets.lock().unwrap(),
+            vec![5, 5, 9, 9, 9],
+            "replayed_frame_read_as_head: a frame behind the gossip head saw the tick's stale target"
+        );
     }
 
     #[tokio::test]
