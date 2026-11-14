@@ -308,8 +308,9 @@ struct Delivery {
     accepted: usize,
     /// Refusals that ask for a retry.
     retry: usize,
-    /// The first archive's refusal, `<archive>: <reason>`.
-    refusal: Option<String>,
+    /// Every refusing archive's refusal, `<archive>: <reason>`, in the
+    /// pool's order: at most one per archive ([`archive_name`]).
+    refusals: Vec<String>,
 }
 
 /// An archive refusal that asks for a retry: `RESOURCE_EXHAUSTED`, or an
@@ -465,7 +466,7 @@ fn resent(
             let (member, shards, epochs) = proof.fields();
             let (window_end, frames_left, mins_left) = proof.time_left(frame());
             warn!(member, ?shards, ?epochs, attempts = queued.attempts,
-                secs = queued.queued.elapsed().as_secs(), reason = %refusal(delivery),
+                secs = queued.queued.elapsed().as_secs(), refusals = %refusals(delivery),
                 window_end, %frames_left, %mins_left, consequence = proof.consequence(),
                 "storage epoch proof still not delivered: no archive took it in time; sending it again until its window ends");
         }
@@ -481,7 +482,7 @@ fn resent(
     let (member, shards, epochs) = proof.fields();
     if delivery.accepted == 0 {
         // A send that timed out may have landed after all.
-        warn!(member, ?shards, ?epochs, attempts = queued.attempts + 1, reason = %refusal(delivery),
+        warn!(member, ?shards, ?epochs, attempts = queued.attempts + 1, refusals = %refusals(delivery),
             "storage epoch proof refused by every archive when sent again; an earlier send may have landed — not sent again");
         return Resent::Done;
     }
@@ -537,9 +538,24 @@ fn or_unknown(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
-/// A delivery's first refusal, for log lines.
-fn refusal(delivery: &Delivery) -> &str {
-    delivery.refusal.as_deref().unwrap_or("none")
+/// A delivery's refusals, for log lines: every refusing archive with its
+/// reason, `[<archive>: <reason>; ..]`, so a refusal all archives share
+/// reads apart from one archive's.
+fn refusals(delivery: &Delivery) -> String {
+    if delivery.refusals.is_empty() {
+        return "none".to_string();
+    }
+    format!("[{}]", delivery.refusals.join("; "))
+}
+
+/// The archive at `addr` as log lines name it, without its address: the
+/// tail of the peer ID it is pinned to, else `unpinned#<place>`, `place`
+/// counting from 1 in this node's archive list.
+fn archive_name(addr: &str, place: usize) -> String {
+    match quil_rpc::archive_client::pinned_archive_peer(addr) {
+        Some(peer) => quil_rpc::diagnostics_service::peer_tail(&peer),
+        None => format!("unpinned#{place}"),
+    }
 }
 
 /// This node's latest GLOBAL frame.
@@ -605,7 +621,7 @@ async fn submit_to_archives_with(
     let mut delivery = fan_out_to_archives(archive_addrs, bytes, submit, resending_proof).await;
     if archives == 0 && proof {
         delivery.retry = 1;
-        delivery.refusal = Some("no archive known yet".to_string());
+        delivery.refusals = vec!["no archive known yet".to_string()];
     }
     (archives, delivery)
 }
@@ -828,11 +844,11 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             } else if queued {
                 warn!(member, ?shards, ?epochs, bytes, archives = archive_count,
                     deadline_secs = quil_rpc::archive_client::submit_deadline(bytes).as_secs(),
-                    reason = %refusal(&delivery), window_end, %frames_left, %mins_left,
+                    refusals = %refusals(&delivery), window_end, %frames_left, %mins_left,
                     consequence = proof.consequence(),
                     "storage epoch proof not delivered: no archive took it in time; sending it again until its window ends");
             } else if outcome.is_err() {
-                warn!(member, ?shards, ?epochs, bytes, archives = archive_count, reason = %refusal(&delivery),
+                warn!(member, ?shards, ?epochs, bytes, archives = archive_count, refusals = %refusals(&delivery),
                     "storage epoch proof refused by every archive — not sent again");
             }
         }
@@ -915,7 +931,8 @@ fn combine_publish_outcome(
 ///
 /// `submit` is a closure that takes a single `(stream_addr, payload)` and
 /// returns `Ok(stream_addr)` on success or `Err((stream_addr, reason, retry))`.
-/// Returns the successful submissions and the refusals asking for a retry.
+/// Returns the successful submissions, the refusals asking for a retry and
+/// every refusal.
 ///
 /// `resending_proof` sends to one archive after another, still all of them:
 /// concurrent uploads share this node's uplink, so a proof too large for that
@@ -957,7 +974,7 @@ where
     }
     let mut delivery = Delivery::default();
     let mut refused = Vec::new();
-    for result in results {
+    for (place, result) in results.into_iter().enumerate() {
         match result {
             Ok(Ok(addr)) => {
                 debug!(%addr, "prover message submitted via gRPC");
@@ -967,9 +984,8 @@ where
                 if retry {
                     delivery.retry += 1;
                 }
-                if delivery.refusal.is_none() {
-                    delivery.refusal = Some(format!("{addr}: {reason}"));
-                }
+                let archive = archive_name(&addr, place + 1);
+                delivery.refusals.push(format!("{archive}: {reason}"));
                 refused.push((addr, reason, retry));
             }
             Err(e) => {
@@ -1223,9 +1239,9 @@ impl StorageProofSubmission {
 mod tests {
     use super::{
         asks_for_retry, combine_publish_outcome, describe_bundle, fan_out_to_archives,
-        refusal_reason, retryable, run_retries, submit_to_archives, submit_to_archives_with,
-        ArchiveRefusals, Delivery, RetryTiming, StorageProofSubmission, SubmitRetryQueue,
-        ARCHIVE_REFUSAL_EVERY,
+        refusal_reason, refusals, retryable, run_retries, submit_to_archives,
+        submit_to_archives_with, ArchiveRefusals, Delivery, RetryTiming, StorageProofSubmission,
+        SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY,
     };
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1354,9 +1370,58 @@ mod tests {
             Delivery {
                 accepted: 1,
                 retry: 1,
-                refusal: Some("b: rank buffer full".to_string()),
+                refusals: vec![
+                    "unpinned#2: rank buffer full".to_string(),
+                    "unpinned#3: invalid".to_string(),
+                ],
             }
         );
+    }
+
+    /// When every archive refuses, the line names each with its reason, by
+    /// its pinned peer and never its address, not only the first archive.
+    #[tokio::test]
+    async fn every_refusing_archive_is_named_by_its_pinned_peer() {
+        let peer = || {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
+        let addrs: Vec<String> = (201..=204).map(|n| format!("192.0.2.{n}:8340")).collect();
+        let mut tails = Vec::new();
+        for addr in &addrs[..3] {
+            let pinned = peer();
+            quil_rpc::archive_client::pin_archive_peer(addr, pinned).unwrap();
+            tails.push(quil_rpc::diagnostics_service::peer_tail(&pinned));
+        }
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            let reason = if addr.ends_with("203:8340") {
+                "connect failed after 10000 ms: timed out"
+            } else {
+                "rank buffer full"
+            };
+            Err::<String, (String, String, bool)>((addr, reason.to_string(), true))
+        };
+        let delivery = fan_out_to_archives(addrs, vec![], submit, true).await;
+        assert_eq!((delivery.accepted, delivery.retry), (0, 4), "{delivery:?}");
+        let line = refusals(&delivery);
+        assert!(
+            !line.contains("192.0.2."),
+            "address_in_line: archives are named by peer, not address: {line}"
+        );
+        assert_eq!(
+            delivery.refusals,
+            vec![
+                format!("{}: rank buffer full", tails[0]),
+                format!("{}: rank buffer full", tails[1]),
+                format!("{}: connect failed after 10000 ms: timed out", tails[2]),
+                "unpinned#4: rank buffer full".to_string(),
+            ],
+            "each_archive_named: every refusing archive with its reason, in order"
+        );
+        assert_eq!(line, format!("[{}]", delivery.refusals.join("; ")));
+        assert_eq!(refusals(&Delivery::default()), "none");
     }
 
     #[test]
@@ -1924,7 +1989,9 @@ mod tests {
         let proof = storage_proof_bundle(1, &[(7, 1335, false, true)], 64);
         let (_, delivery) = submit_to_archives(&pool, Some(key.clone()), proof).await;
         assert_eq!((delivery.accepted, delivery.retry), (0, 1), "{delivery:?}");
-        let refusal = delivery.refusal.unwrap();
+        let [refusal] = &delivery.refusals[..] else {
+            panic!("one refusal per archive: {delivery:?}");
+        };
         assert!(refusal.contains("connect failed after "), "{refusal}");
         assert!(refusal.contains(" ms: "), "{refusal}");
         assert!(
@@ -1961,7 +2028,9 @@ mod tests {
                     if timed_out {
                         Delivery {
                             retry: 1,
-                            refusal: Some("a: submit rejected: Cancelled: Timeout expired".into()),
+                            refusals: vec![
+                                "…aB3cD9: submit rejected: Cancelled: Timeout expired".into()
+                            ],
                             ..Default::default()
                         }
                     } else {
