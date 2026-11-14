@@ -2179,13 +2179,13 @@ mod tests {
         handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
-    /// A bundle submitted to an application shard that could not fit a
-    /// frame is refused before its requests are built, and a cut one
-    /// without panic; one at the limit, or with a zero-length request,
-    /// decodes. GLOBAL's admission keeps its own rules.
+    /// A bundle submitted to an application shard that no leader proposes
+    /// is refused before its requests are built, and a cut one without
+    /// panic; the largest a leader proposes, or one with a zero-length
+    /// request, decodes. GLOBAL's admission keeps its own rules.
     #[test]
     fn app_bundles_past_the_frame_bound_are_refused() {
-        use crate::frame_bound::{refused_here, MAX_APP_FRAME_ITEMS};
+        use crate::frame_bound::{refused_here, MAX_COLLECTED_ITEMS};
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         let operation = |n: u32| {
             let mut inner = 0x0512u32.to_be_bytes().to_vec();
@@ -2200,11 +2200,11 @@ mod tests {
             .to_canonical_bytes()
             .unwrap()
         };
-        let limit = MAX_APP_FRAME_ITEMS as u32;
+        let limit = MAX_COLLECTED_ITEMS as u32;
         let at = bundle((0..limit - 1).map(operation).collect());
         assert_eq!(
             decode_app_message_bundle(&at).unwrap().requests.len(),
-            MAX_APP_FRAME_ITEMS - 1
+            MAX_COLLECTED_ITEMS - 1
         );
         let before = refused_here();
         let over = bundle((0..limit).map(operation).collect());

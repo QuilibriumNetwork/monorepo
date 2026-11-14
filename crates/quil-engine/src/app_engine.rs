@@ -2165,20 +2165,18 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // and requests a frame may carry (`frame_bound`). Of the bundles
         // every hold above left, the frame takes each, in collection order,
         // while it has room, keeping room for the coin deliveries added
-        // below (each a bundle of one request); the rest stay in the
-        // collector for a later frame, within its retention.
-        let deliveries = 2 * quil_execution::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME;
-        let fits = crate::frame_bound::FrameItemBudget::within(
-            crate::frame_bound::MAX_APP_FRAME_ITEMS - deliveries,
-        )
-        .fit(request_bundles.iter().map(|bundle| bundle.requests.len()));
+        // below (`MAX_COLLECTED_ITEMS`); the rest stay in the collector for
+        // a later frame, within its retention.
+        let fits =
+            crate::frame_bound::FrameItemBudget::within(crate::frame_bound::MAX_COLLECTED_ITEMS)
+                .fit(request_bundles.iter().map(|bundle| bundle.requests.len()));
         let deferred = fits.iter().filter(|fits| !**fits).count();
         if deferred > 0 {
             info!(
                 frame = frame_number,
                 rank,
                 deferred,
-                limit = crate::frame_bound::MAX_APP_FRAME_ITEMS,
+                limit = crate::frame_bound::MAX_COLLECTED_ITEMS,
                 action = "an expected wait: a later frame proposes them",
                 "deferring bundles past the bundles and requests a frame may carry"
             );

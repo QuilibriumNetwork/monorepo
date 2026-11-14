@@ -414,7 +414,8 @@ pub fn validator_global_frame() -> TopicValidator {
             Ok(_) => {}
             Err(
                 crate::frame_bound::FrameRefusal::TooMany(_)
-                | crate::frame_bound::FrameRefusal::TooLarge { .. },
+                | crate::frame_bound::FrameRefusal::TooLarge { .. }
+                | crate::frame_bound::FrameRefusal::Unproposable { .. },
             ) => {
                 return Reject("frame_past_gossip_bound");
             }

@@ -336,8 +336,11 @@ pub(crate) fn shard_topic(bitmask: &[u8]) -> Option<ShardTopic> {
 /// such messages. On a shard dispatch or submission topic a message must be a
 /// bundle a leader can propose ([`shard_submission_well_formed`]); anything
 /// else is ignored before the strict shard gossip epoch
-/// ([`quil_p2p::strict_shard_gossip`]) and rejected from it. Messages of
-/// other topics are accepted, as before.
+/// ([`quil_p2p::strict_shard_gossip`]) and rejected from it, but for a bundle
+/// within a frame's bound that no leader proposes
+/// ([`quil_engine::frame_bound::FrameRefusal::Unproposable`]), which releases
+/// before that bound forward: it is ignored. Messages of other topics are
+/// accepted, as before.
 pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::ValidationResult {
     shard_gossip_verdict_when(bitmask, data, quil_p2p::strict_shard_gossip())
 }
@@ -351,6 +354,15 @@ pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::Val
 /// are left to the shard's engine.
 pub(crate) fn shard_submission_well_formed(data: &[u8]) -> bool {
     quil_engine::consensus_wire::decode_app_message_bundle(data).is_ok()
+}
+
+/// Whether `data` is a bundle refused only for carrying more requests than a
+/// leader proposes ([`quil_engine::frame_bound::FrameRefusal::Unproposable`]).
+fn unproposable_submission(data: &[u8]) -> bool {
+    matches!(
+        quil_engine::frame_bound::check_bundle(data),
+        Err(quil_engine::frame_bound::FrameRefusal::Unproposable { .. })
+    )
 }
 
 /// [`shard_gossip_verdict`] with strict shard gossip `strict`.
@@ -373,7 +385,7 @@ pub(crate) fn shard_gossip_verdict_when(
         Some(ShardTopic::Dispatch | ShardTopic::Prover) => {
             if shard_submission_well_formed(data) {
                 quil_p2p::ValidationResult::Accept
-            } else if strict {
+            } else if strict && !unproposable_submission(data) {
                 quil_p2p::ValidationResult::Reject
             } else {
                 quil_p2p::ValidationResult::Ignore
@@ -518,6 +530,48 @@ mod tests {
             shard_gossip_verdict_when(&consensus, &submission(1), true),
             Ignore
         );
+    }
+
+    /// A bundle of `requests` zero-length requests.
+    fn bundle_of(requests: usize) -> Vec<u8> {
+        quil_execution::message_envelope::CanonicalMessageBundle {
+            requests: vec![None; requests],
+            timestamp: 1,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// On a shard dispatch or submission topic the mesh forwards the
+    /// largest bundle a leader proposes. One past it but within a frame's
+    /// bound, which releases before that bound forward, is dropped without
+    /// penalty even under strict shard gossip; one past a frame's bound is
+    /// rejected there.
+    #[test]
+    fn bundles_no_leader_proposes_are_ignored_at_the_mesh() {
+        use quil_engine::frame_bound::{MAX_APP_FRAME_ITEMS, MAX_COLLECTED_ITEMS};
+        let filter = [7u8; 32];
+        for topic in [
+            quil_engine::bitmasks::shard_dispatch_bitmask(&filter),
+            quil_engine::bitmasks::app_prover_bitmask(&filter),
+        ] {
+            for strict in [false, true] {
+                let verdict =
+                    |requests| shard_gossip_verdict_when(&topic, &bundle_of(requests), strict);
+                assert_eq!(verdict(MAX_COLLECTED_ITEMS - 1), Accept);
+                for requests in [MAX_COLLECTED_ITEMS, MAX_APP_FRAME_ITEMS - 1] {
+                    assert_eq!(
+                        verdict(requests),
+                        Ignore,
+                        "OLD-RELEASES-FORWARD: a bundle of {requests} requests, strict {strict}"
+                    );
+                }
+                assert_eq!(
+                    verdict(MAX_APP_FRAME_ITEMS),
+                    if strict { Reject } else { Ignore }
+                );
+            }
+        }
     }
 
     /// Class guard: every topic a node subscribes has a mesh check. Each
