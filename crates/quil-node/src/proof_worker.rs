@@ -637,6 +637,88 @@ mod tests {
         assert_eq!((slots, lines.len()), (2, 0), "two slots warned: {lines:?}");
     }
 
+    /// An archive sizes its verifier slots before its store opens, so the
+    /// memory it counts for them leaves out the block cache that store
+    /// takes once open (a quarter of its memory, up to 32 GiB): counted
+    /// twice, the children and the cache together outgrow the machine.
+    /// Wiring only: the count a node logs is its available memory, read
+    /// between `before` and `after`, less that cache, on any host.
+    #[test]
+    fn an_archive_counts_its_verifier_memory_net_of_its_block_cache() {
+        let read = || available_for_verifiers().expect("premise: this host reports its memory");
+        let before = read();
+        let cache = quil_store::effective_block_cache_bytes(true) as u64;
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join(WORKER_FILE_NAME);
+        std::fs::write(&worker, b"#!/bin/sh\ncat >/dev/null\nexit 80\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut config = quil_config::Config::default();
+        config.db.path = directory
+            .path()
+            .join("base-store")
+            .to_string_lossy()
+            .into_owned();
+        // Unset, so the node sizes its slots from the memory it counts and
+        // logs that memory whatever the host holds.
+        config.proof_worker = ProofWorkerConfig {
+            path: worker.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let logs = Recorder::default();
+        {
+            let _logging = tracing::subscriber::set_default(logs.clone());
+            build_node_worker_as(&config, true).unwrap().unwrap();
+        }
+        let after = read();
+        let counted: u64 = logs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("token proof worker configured"))
+            .find_map(|line| {
+                let field = line.split(" available_memory_bytes=").nth(1)?;
+                let field = field.strip_prefix("Some(").unwrap_or(field);
+                field
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("the configured line names the memory the slots were sized from");
+        // What else the host did between the reads moves them by at most
+        // this; a count holding the cache lies above the band by the cache.
+        let drift = before.abs_diff(after) + (256 << 20);
+        assert!(
+            cache > drift && before.min(after) > drift,
+            "premise: a block cache of {cache} and {before}..{after} available each exceed \
+             the drift of {drift}, so a count holding the cache is told apart"
+        );
+        let net = |bytes: u64| bytes.saturating_sub(cache);
+        let (low, high) = (
+            net(before.min(after)).saturating_sub(drift),
+            net(before.max(after)) + drift,
+        );
+        eprintln!(
+            "REACH archive verifier memory: counted {counted}, available {before}..{after}, \
+             block cache {cache}, expected {low}..={high}"
+        );
+        assert!(
+            counted <= high,
+            "VERIFIER-MEMORY-COUNTS-CACHE: an archive counted {counted} bytes for its verifiers \
+             with {before}..{after} available and a block cache of {cache} still to open"
+        );
+        assert!(
+            counted >= low,
+            "an archive counted {counted} bytes for its verifiers, under {low}: more than its \
+             block cache of {cache} left out of {before}..{after} available"
+        );
+    }
+
     /// An archive budgets 3 GiB of available memory per verifier slot, above
     /// the 2.73 GB a depth-32 child has been recorded holding: N × 3 GiB
     /// admits N slots, one byte less admits N − 1.

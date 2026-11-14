@@ -478,6 +478,11 @@ mod tests {
     /// As on mainnet, frame F+1's header carries the root after frame F, so
     /// headers 11..=15 name retained roots and 15 is the head.
     fn chain() -> Chain {
+        chain_with(None)
+    }
+
+    /// [`chain`], the receipt's record holding `receipt_value` when given.
+    fn chain_with(receipt_value: Option<Vec<u8>>) -> Chain {
         let directory = tempfile::tempdir().unwrap();
         let db = quil_store::RocksDb::open(directory.path()).unwrap();
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
@@ -491,21 +496,26 @@ mod tests {
             clock: Arc::new(quil_store::testing::InMemoryClockStore::new()),
         };
         for frame in 10..=14u64 {
-            execute(&chain, frame);
+            execute(&chain, frame, receipt_value.as_deref());
         }
         chain
     }
 
-    /// Execute `frame` (one vertex: the receipt at `INCLUDED_AT`) and seed
-    /// header `frame + 1` naming the root after it.
-    fn execute(chain: &Chain, frame: u64) {
+    /// Execute `frame` (one vertex: the receipt at `INCLUDED_AT`, its record
+    /// holding `receipt_value` when given) and seed header `frame + 1` naming
+    /// the root after it.
+    fn execute(chain: &Chain, frame: u64, receipt_value: Option<&[u8]>) {
         let address = if frame == INCLUDED_AT {
             RECEIPT
         } else {
             [frame as u8; 32]
         };
+        let value = match receipt_value {
+            Some(value) if frame == INCLUDED_AT => value.to_vec(),
+            _ => vec![frame as u8],
+        };
         let mut tree = quil_tries::VectorCommitmentTree::new();
-        tree.insert(&[0], &[frame as u8], &[], &num_bigint::BigInt::from(1))
+        tree.insert(&[0], &value, &[], &num_bigint::BigInt::from(1))
             .unwrap();
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
         let disc = vertex_adds_discriminator().unwrap();
@@ -539,7 +549,7 @@ mod tests {
     /// publish) but not in the view.
     fn view_then_newer_root(chain: &Chain) -> quil_hypergraph::crdt::ServedGlobalReads<'_> {
         let reads = chain.state.crdt().served_global_reads().unwrap();
-        execute(chain, 15);
+        execute(chain, 15, None);
         let (_, live) = crate::token_intrinsic::reward_witness::newest_retained_global_root(
             &chain.state,
             chain.clock.as_ref(),
@@ -787,6 +797,37 @@ mod tests {
         let lines = capture.0.lock().unwrap().clone();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("retains no global root"), "{}", lines[0]);
+    }
+
+    /// A receipt whose record exceeds the witness limit can never be cited:
+    /// the status and the claim path say so, never that the node waits for a
+    /// retained root (that wait would not end).
+    #[test]
+    fn a_receipt_over_the_witness_limit_is_named_not_reported_as_a_wait() {
+        let value = vec![0x42; super::super::reward_witness::MAX_REWARD_PROOF_BYTES + 1];
+        let chain = chain_with(Some(value));
+        let read = status(&chain.state, chain.clock.as_ref(), &RECEIPT, Some(14));
+        eprintln!(
+            "REACH oversize receipt status: {:?}",
+            read.as_ref().map(|status| status.state)
+        );
+        match &read {
+            Err(error) => {
+                assert!(!error.is_execution_unavailable(), "{error}");
+                assert!(error.to_string().contains("witness limit"), "{error}");
+            }
+            Ok(status) => panic!(
+                "MINT-OVERSIZE-AS-WAIT: a receipt over the witness limit reads as {:?}: {}",
+                status.state, status.reason
+            ),
+        }
+        let claim = witness(&chain.state, chain.clock.as_ref(), &RECEIPT, Some(14));
+        assert!(
+            claim
+                .as_ref()
+                .is_err_and(|error| !error.is_execution_unavailable()),
+            "MINT-OVERSIZE-AS-WAIT: the claim path reads it as a wait: {claim:?}"
+        );
     }
 
     #[test]

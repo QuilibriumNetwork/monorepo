@@ -6514,6 +6514,51 @@ mod tests {
         drop(kept);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// A leaf's column cap goes to disk through a file of its own, renamed
+    /// over the last, as its commitment and manifest do: never rewritten in
+    /// place, so a crash leaves the cap whole or absent, never torn. A link
+    /// at the cap's path when the labelling ends shows which: its other name
+    /// keeps its bytes unless the cap was written through it.
+    #[test]
+    fn a_column_cap_replaces_its_file_and_is_never_rewritten_in_place() {
+        let dir = temp_dir("cap-rename");
+        let outside = temp_dir("cap-rename-outside");
+        fs::create_dir_all(&outside).unwrap();
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([8u8; 32], b"cap".as_slice(), 64u64);
+        let cap_path = store.leaf_dir(9, &member, leaf).join(format!("{n}.cap"));
+        let other = outside.join("other-name");
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        let linked = std::cell::Cell::new(false);
+        let labelled = admitted
+            .label_kept(&SdrParams::default(), &|| false, &|_| {
+                if !linked.replace(true) {
+                    fs::write(&other, b"untouched").unwrap();
+                    fs::hard_link(&other, &cap_path).unwrap();
+                }
+            })
+            .unwrap();
+        assert!(linked.get(), "no layer ended");
+        assert!(matches!(
+            labelled,
+            Labelling::Labelled(Labelled { kept: true, .. })
+        ));
+        let through_link = fs::read(&other).unwrap();
+        eprintln!(
+            "REACH column cap write: other name holds {} bytes",
+            through_link.len()
+        );
+        assert_eq!(
+            through_link, b"untouched",
+            "CAP-REWRITTEN-IN-PLACE: the column cap was written into the file \
+             already at its path"
+        );
+        let cap = fs::read(&cap_path).unwrap();
+        assert!(quil_crypto::storage_proof::MerkleCap::from_bytes(&cap).is_some());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
 }
 
 #[cfg(test)]
