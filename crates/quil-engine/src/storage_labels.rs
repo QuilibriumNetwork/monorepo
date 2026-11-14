@@ -144,6 +144,35 @@ const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
 /// beside them grow by gigabytes an hour at most.
 pub const FLOOR_CHECK_EVERY: Duration = Duration::from_secs(60);
 
+/// How long the bytes of the labels kept, as [`LabelStore::space`] counts
+/// them, serve before they are counted again: a count reads every leaf's
+/// directory, too much for each health report.
+pub const KEPT_BYTES_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// What this process's labels tell of their disk ([`LabelStore::space`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LabelSpace {
+    /// The labels' filesystem; `None` where it cannot be read.
+    pub usage: Option<FsUsage>,
+    /// The bytes of the labels kept, counted at most [`KEPT_BYTES_EVERY`]
+    /// ago.
+    pub kept_bytes: u64,
+    /// Attempts refused room for a leaf's labels at its snapshot, for want
+    /// of free disk space, since this process started: a leaf tried again
+    /// counts again. A count busy or claimed elsewhere is no refusal.
+    pub snapshot_refusals: u64,
+    /// The latest leaf refused room for its labels at its snapshot: when
+    /// (Unix ms) and the free bytes it needed.
+    pub last_refusal: Option<(u64, u64)>,
+}
+
+/// Room refused for labels at a snapshot ([`LabelSpace`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct SpaceRefusals {
+    snapshot: u64,
+    last: Option<(u64, u64)>,
+}
+
 /// How often a release of labels that goes on is logged again.
 const SHORT_LOGGED_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -649,6 +678,11 @@ pub struct LabelStore {
     /// The leaves of each member's shard at its last labelling ahead in
     /// this process, by member and shard ([`Self::note_pass`]).
     passes: Arc<Mutex<Passes>>,
+    /// Room refused at the snapshot, for the health report ([`Self::space`]).
+    space_refusals: Arc<Mutex<SpaceRefusals>>,
+    /// The bytes of the labels kept and when they were counted
+    /// ([`Self::space`]).
+    kept_bytes: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 /// The leaves of each member's shard at its last labelling ahead, by
@@ -815,6 +849,44 @@ impl LabelStore {
             seen: Arc::new(Mutex::new(None)),
             held: Arc::new(Mutex::new(HashMap::new())),
             passes: Arc::new(Mutex::new(HashMap::new())),
+            space_refusals: Arc::new(Mutex::new(SpaceRefusals::default())),
+            kept_bytes: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn space_refusals(&self) -> MutexGuard<'_, SpaceRefusals> {
+        self.space_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The labels' filesystem, the bytes of the labels kept (counted again
+    /// once [`KEPT_BYTES_EVERY`] old) and the room refused for them at a
+    /// snapshot since this process started.
+    pub fn space(&self) -> LabelSpace {
+        let kept_bytes = {
+            let mut kept = self
+                .kept_bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match *kept {
+                Some((at, bytes)) if at.elapsed() < KEPT_BYTES_EVERY => bytes,
+                _ => {
+                    let bytes = self
+                        .candidates()
+                        .iter()
+                        .fold(0u64, |sum, kept| sum.saturating_add(kept.bytes));
+                    *kept = Some((Instant::now(), bytes));
+                    bytes
+                }
+            }
+        };
+        let refusals = *self.space_refusals();
+        LabelSpace {
+            usage: self.usage(),
+            kept_bytes,
+            snapshot_refusals: refusals.snapshot,
+            last_refusal: refusals.last,
         }
     }
 
@@ -1362,6 +1434,14 @@ impl LabelStore {
         stage: Stage,
         shortfall: Shortfall,
     ) {
+        if stage == Stage::Snapshot {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64);
+            let mut refusals = self.space_refusals();
+            refusals.snapshot = refusals.snapshot.saturating_add(1);
+            refusals.last = Some((at, shortfall.needed));
+        }
         let first = self
             .refused
             .lock()
@@ -4529,6 +4609,71 @@ mod tests {
                 .is_none(),
             "free space unknown"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The health report's figures of the labels' disk: their filesystem,
+    /// the bytes of the labels kept, counted again only once that count is
+    /// old, and the room refused at a snapshot with the free bytes it
+    /// needed, in every view of the store.
+    #[test]
+    fn the_labels_space_names_their_disk_kept_bytes_and_refusals() {
+        let dir = temp_dir("space");
+        let free = Arc::new(AtomicU64::new(TOTAL));
+        let store = LabelStore::with_space(dir.clone(), space(&free));
+        let (member, n) = ([7u8; 32], 3_000u64);
+        let empty = store.space();
+        assert_eq!(empty.usage.map(|usage| usage.free_bytes), Some(TOTAL));
+        assert_eq!(
+            (
+                empty.kept_bytes,
+                empty.snapshot_refusals,
+                empty.last_refusal
+            ),
+            (0, 0, None)
+        );
+
+        keep(&store, 9, &member, b"leaf", n);
+        assert_eq!(
+            store.space().kept_bytes,
+            0,
+            "a count serves until it is old"
+        );
+        let old = Instant::now().checked_sub(KEPT_BYTES_EVERY).unwrap();
+        *store.kept_bytes.lock().unwrap() = Some((old, 0));
+        let on_disk: u64 = files_under(&dir)
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&format!("{n}.")))
+            })
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum();
+        assert!(on_disk >= label_bytes(n), "{on_disk}");
+        assert_eq!(store.space().kept_bytes, on_disk);
+
+        free.store(0, Ordering::SeqCst);
+        assert!(store.admit(9, &member, b"other", n, Stage::Ahead).is_none());
+        assert_eq!(
+            store.space().last_refusal,
+            None,
+            "labelling ahead is no sector's need"
+        );
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(store
+            .admit(9, &member, b"other", n, Stage::Snapshot)
+            .is_none());
+        let view = store.for_profile(quil_types::consensus::StorageSealProfile::default());
+        let refused = store.space();
+        assert_eq!(refused.snapshot_refusals, 1);
+        let (at, needed) = refused.last_refusal.expect("a refusal at the snapshot");
+        assert!(at >= before, "{at} {before}");
+        assert_eq!(needed, disk_floor(TOTAL) + DISK_MARGIN * label_bytes(n));
+        assert_eq!(view.space().last_refusal, refused.last_refusal);
         let _ = fs::remove_dir_all(&dir);
     }
 

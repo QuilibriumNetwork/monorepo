@@ -24,7 +24,11 @@ const MAX_GRANT_SECS: u64 = 365 * 86_400;
 /// What a peer on the list gets, from `HealthReport`.
 const SHARED: &str =
     "It gets, per request: this node's release and build fingerprint, GLOBAL head \
-frame, worker count, store write state and store and disk read times; its health conditions \
+frame, worker count, store write state and store and disk read times; its stores' and storage \
+labels' disk size, free space and size on disk, and how often labels were refused disk \
+space at a snapshot since it started; its machine's Mac model and CPU vendor as numbers, core \
+counts and how often its CPU throttled for heat (no name, serial number, hostname or UUID); its \
+health conditions \
 (kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
 a slow store fsync time, the GLOBAL frames an expected wait ends at, and for GLOBAL's progress \
 its head, its recent frame rate and how many GLOBAL provers this node hears); and per worker \
@@ -395,7 +399,8 @@ mod tests {
     #[test]
     fn the_shared_text_is_reviewed_against_the_report() {
         use quil_types::proto::diagnostics::{
-            ExpectedWait, GlobalProgress, HealthCondition, HealthReport, WorkerHealth,
+            ExpectedWait, GlobalProgress, HealthCondition, HealthReport, Machine, StoreSpace,
+            WorkerHealth,
         };
         let report = HealthReport::default();
         let HealthReport {
@@ -412,6 +417,8 @@ mod tests {
             worker_capacity: _,
             store_io: _,
             health: _,
+            store_space: _,
+            machine: _,
         } = report;
         let WorkerHealth {
             core_id: _,
@@ -472,6 +479,32 @@ mod tests {
             batch_from_frame: _,
             expected_secs: _,
         } = ExpectedWait::default();
+        let StoreSpace {
+            total_bytes: _,
+            free_bytes: _,
+            store_bytes: _,
+            label_bytes: _,
+            label_total_bytes: _,
+            label_free_bytes: _,
+            snapshot_refusals: _,
+            last_refusal_unix_ms: _,
+            last_refusal_needed_bytes: _,
+        } = StoreSpace::default();
+        let Machine {
+            mac_family: _,
+            mac_major: _,
+            mac_minor: _,
+            cpu_vendor: _,
+            cpu_family: _,
+            cpu_model: _,
+            cpu_stepping: _,
+            cpus: _,
+            performance_cores: _,
+            efficiency_cores: _,
+            throttle_events: _,
+        } = Machine::default();
+        assert!(SHARED.contains("free space and size on disk"));
+        assert!(SHARED.contains("Mac model and CPU vendor as numbers, core"));
         assert!(SHARED.contains("no log text, addresses or keys"));
     }
 }

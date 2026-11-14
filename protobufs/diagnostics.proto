@@ -191,6 +191,95 @@ message HealthReport {
   // The health conditions this node detects and what it observed to judge
   // them; absent from nodes that predate it (they judge none).
   HealthConditions health = 13;
+  // The disk space of this node's stores and storage labels; absent from
+  // nodes that predate it.
+  StoreSpace store_space = 14;
+  // The machine this node runs on; absent from nodes that predate it.
+  Machine machine = 15;
+}
+
+// The machine a node runs on, read once per process: its model and CPU
+// as an enum and numbers, its cores, and how often its CPU throttled for
+// heat. No name, serial number, hostname or UUID.
+message Machine {
+  // A Mac's model from its hw.model: MacBookPro18,3 is MacBook Pro, 18, 3.
+  // Unset elsewhere; other machines' model names are free text, left out.
+  MacFamily mac_family = 1;
+  uint32 mac_major = 2;
+  uint32 mac_minor = 3;
+  // The CPU's vendor and numbers. Intel and AMD: CPUID's family, model and
+  // stepping. Apple on macOS: hw.cpufamily (the core design, e.g. an M2's)
+  // as family and hw.cpusubfamily (its tier) as model. Other ARM CPUs and
+  // Apple on Linux: the implementer as family, the part as model, and the
+  // variant and revision (0xVR) as stepping. 0 where unread.
+  CpuVendor cpu_vendor = 4;
+  uint32 cpu_family = 5;
+  uint32 cpu_model = 6;
+  uint32 cpu_stepping = 7;
+  // The logical CPUs this process may use.
+  uint32 cpus = 8;
+  // Apple silicon: its performance and efficiency cores; unset elsewhere.
+  optional uint32 performance_cores = 9;
+  optional uint32 efficiency_cores = 10;
+  // Linux on Intel CPUs: the most throttled core's thermal throttle events
+  // since boot, read with each report; unset where unread.
+  optional uint64 throttle_events = 11;
+}
+
+// A Mac's model family, from the name in its hw.model (`Machine.mac_family`).
+enum MacFamily {
+  // Not a Mac, or its model unread.
+  MAC_FAMILY_UNSPECIFIED = 0;
+  // A Mac model name this build does not know.
+  MAC_FAMILY_UNKNOWN = 1;
+  MAC_FAMILY_MACBOOK_PRO = 2;
+  MAC_FAMILY_MACBOOK_AIR = 3;
+  MAC_FAMILY_MAC_MINI = 4;
+  MAC_FAMILY_MAC_STUDIO = 5;
+  MAC_FAMILY_MAC_PRO = 6;
+  MAC_FAMILY_IMAC = 7;
+  // Apple silicon's generic name (Mac14,2), whatever the form.
+  MAC_FAMILY_MAC = 8;
+}
+
+// A CPU's vendor (`Machine.cpu_vendor`).
+enum CpuVendor {
+  // The CPU unread.
+  CPU_VENDOR_UNSPECIFIED = 0;
+  // A vendor this build does not know.
+  CPU_VENDOR_UNKNOWN = 1;
+  CPU_VENDOR_INTEL = 2;
+  CPU_VENDOR_AMD = 3;
+  CPU_VENDOR_APPLE = 4;
+  // An ARM CPU not Apple's.
+  CPU_VENDOR_ARM_OTHER = 5;
+}
+
+// The disk space of this node's stores and of the storage labels its new
+// sectors are certified from, from statvfs and the stores' own counts:
+// no directory walk per report.
+message StoreSpace {
+  // The master store's filesystem: its size and what the node may still
+  // write there; 0 when unread.
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
+  // The SST files of this process's open stores (the master's and its
+  // thread workers'), as RocksDB counts them; unset when unread.
+  optional uint64 store_bytes = 3;
+  // The storage labels this process keeps, counted at most 10 minutes
+  // ago; unset when it keeps none (a cluster's master).
+  optional uint64 label_bytes = 4;
+  // The labels' filesystem, when it is not the master store's.
+  optional uint64 label_total_bytes = 5;
+  optional uint64 label_free_bytes = 6;
+  // Attempts refused room for a leaf's labels at its snapshot, for want
+  // of free disk space, since this process started; a leaf tried again
+  // counts again.
+  uint64 snapshot_refusals = 7;
+  // The latest refusal of room for a leaf's labels at its snapshot: when,
+  // and the free bytes it needed; 0 without one.
+  uint64 last_refusal_unix_ms = 8;
+  uint64 last_refusal_needed_bytes = 9;
 }
 
 // A health condition this node detects (`HealthCondition.kind`). Readers

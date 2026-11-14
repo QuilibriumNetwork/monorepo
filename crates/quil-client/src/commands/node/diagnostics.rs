@@ -25,9 +25,9 @@ use quil_rpc::health_conditions::{
 };
 use quil_rpc::reachability::{ip_class, IpClass};
 use quil_types::proto::diagnostics::{
-    Blocker, ConditionKind, ConditionSeverity, GetHealthReportRequest, HealthConditions,
-    HealthReport, Phase, RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreIoVerdict,
-    WorkerHealth,
+    Blocker, ConditionKind, ConditionSeverity, CpuVendor, GetHealthReportRequest, HealthConditions,
+    HealthReport, MacFamily, Machine, Phase, RecoveryFailure, RecoveryPhase, StoreIoHealth,
+    StoreIoVerdict, StoreSpace, WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -67,7 +67,11 @@ pub enum DiagnosticsCommand {
     /// and the longest wait for a recovery turn. Ages are <60s or >60s
     /// before the report, on the target's clock. The Store I/O line gives
     /// the latest minute's master store canary reads and disk await, and
-    /// whether they are too slow.
+    /// whether they are too slow; the Store space line the free space of
+    /// the master store's disk, the size of the stores and of the storage
+    /// labels kept, and how often labels were refused disk space at a
+    /// snapshot since the target started; the Machine line its model, CPU,
+    /// cores and how often its CPU throttled for heat.
     Health(HealthArgs),
     /// Print the stream address (host:port) a peer publishes, for --addr.
     ///
@@ -737,6 +741,131 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
     })
 }
 
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// A span of `ms` milliseconds, coarsely: `45s`, `12m`, `5h`, `3d`.
+fn span(ms: u64) -> String {
+    match ms / 1000 {
+        secs @ 0..=119 => format!("{secs}s"),
+        secs @ 120..=7_199 => format!("{}m", secs / 60),
+        secs @ 7_200..=172_799 => format!("{}h", secs / 3600),
+        secs => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The health report's store space line at the report's time `now`;
+/// `None` from nodes that predate it. It says so when the labels' disk has
+/// less free space than the last refusal of room for labels needed.
+fn store_space_line(space: Option<&StoreSpace>, now: u64) -> Option<String> {
+    let space = space?;
+    let disk = |total: u64, free: u64| match total {
+        0 => "unread".to_string(),
+        _ => format!("{} free of {}", gib(free), gib(total)),
+    };
+    let master = disk(space.total_bytes, space.free_bytes);
+    let mut parts = vec![format!("disk {master}")];
+    if let Some(bytes) = space.store_bytes {
+        parts.push(format!("stores {}", gib(bytes)));
+    }
+    let labels_disk = space.label_total_bytes.zip(space.label_free_bytes);
+    match (space.label_bytes, labels_disk) {
+        (Some(kept), Some((total, free))) => parts.push(format!(
+            "storage labels {} on another disk, {}",
+            gib(kept),
+            disk(total, free)
+        )),
+        (Some(kept), None) => parts.push(format!("storage labels {}", gib(kept))),
+        (None, _) => {}
+    }
+    let mut line = format!("Store space: {}.", parts.join("; "));
+    if space.snapshot_refusals > 0 {
+        let last = match space.last_refusal_unix_ms {
+            0 => String::new(),
+            at => format!(", the last {} ago", span(now.saturating_sub(at))),
+        };
+        let _ = write!(
+            line,
+            " Storage labels refused disk space at a snapshot {} times since this node \
+             started{last}.",
+            space.snapshot_refusals
+        );
+    }
+    let (total, free) = labels_disk.unwrap_or((space.total_bytes, space.free_bytes));
+    let needed = space.last_refusal_needed_bytes;
+    if total > 0 && needed > free {
+        let _ = write!(
+            line,
+            " Free space is under the {} the last refusal needed: free disk space on \
+             this node or give its storage labels a larger disk.",
+            gib(needed)
+        );
+    }
+    Some(line)
+}
+
+/// A Mac's model as its hw.model reads (`MacBookPro18,3`); `None` from
+/// other machines.
+fn mac_model_text(machine: &Machine) -> Option<String> {
+    let (major, minor) = (machine.mac_major, machine.mac_minor);
+    let name = match MacFamily::try_from(machine.mac_family) {
+        Ok(MacFamily::Unspecified) => return None,
+        Ok(MacFamily::MacbookPro) => "MacBookPro",
+        Ok(MacFamily::MacbookAir) => "MacBookAir",
+        Ok(MacFamily::MacMini) => "Macmini",
+        Ok(MacFamily::MacStudio) => "MacStudio",
+        Ok(MacFamily::MacPro) => "MacPro",
+        Ok(MacFamily::Imac) => "iMac",
+        Ok(MacFamily::Mac) => "Mac",
+        Ok(MacFamily::Unknown) | Err(_) => return Some(format!("a Mac model {major},{minor}")),
+    };
+    Some(format!("{name}{major},{minor}"))
+}
+
+/// The CPU's vendor and numbers; `None` where the node read none.
+fn cpu_text(machine: &Machine) -> Option<String> {
+    let (family, model, stepping) = (machine.cpu_family, machine.cpu_model, machine.cpu_stepping);
+    let x86 =
+        |vendor: &str| format!("{vendor} CPU family {family} model {model} stepping {stepping}");
+    Some(match CpuVendor::try_from(machine.cpu_vendor) {
+        Ok(CpuVendor::Unspecified) => return None,
+        Ok(CpuVendor::Intel) => x86("Intel"),
+        Ok(CpuVendor::Amd) => x86("AMD"),
+        Ok(CpuVendor::Apple) if family == 0x61 => {
+            format!("Apple CPU part {model:#x} variant and revision {stepping:#x}")
+        }
+        Ok(CpuVendor::Apple) => format!("Apple CPU family {family:#010x} subfamily {model}"),
+        Ok(CpuVendor::ArmOther) => format!(
+            "ARM CPU implementer {family:#x} part {model:#x} variant and revision {stepping:#x}"
+        ),
+        Ok(CpuVendor::Unknown) | Err(_) => x86("an unknown vendor's"),
+    })
+}
+
+/// The health report's machine line; `None` from nodes that predate it or
+/// know nothing of their machine.
+fn machine_line(machine: Option<&Machine>) -> Option<String> {
+    let machine = machine?;
+    let mut parts = Vec::new();
+    parts.extend(mac_model_text(machine));
+    parts.extend(cpu_text(machine));
+    if let (Some(performance), Some(efficiency)) =
+        (machine.performance_cores, machine.efficiency_cores)
+    {
+        parts.push(format!(
+            "{performance} performance and {efficiency} efficiency cores"
+        ));
+    }
+    if machine.cpus > 0 {
+        parts.push(format!("{} CPUs for the node", machine.cpus));
+    }
+    if let Some(events) = machine.throttle_events {
+        parts.push(format!("CPU throttled for heat {events} times since boot"));
+    }
+    (!parts.is_empty()).then(|| format!("Machine: {}.", parts.join("; ")))
+}
+
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
 /// The node's health conditions, one `[HH:MM:SS UTC] <LEVEL> <text>` line
@@ -826,6 +955,12 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         if let Some(line) = store_io_line(report.store_io.as_ref()) {
             let _ = writeln!(out, "{line}");
         }
+    }
+    if let Some(line) = store_space_line(report.store_space.as_ref(), report.generated_unix_ms) {
+        let _ = writeln!(out, "{line}");
+    }
+    if let Some(line) = machine_line(report.machine.as_ref()) {
+        let _ = writeln!(out, "{line}");
     }
     out += &health_lines(report.health.as_ref());
     if report.workers.is_empty() {
@@ -924,6 +1059,8 @@ mod tests {
             health: Some(HealthConditions::default()),
             worker_capacity: 0,
             store_io: None,
+            store_space: None,
+            machine: None,
         }
     }
 
@@ -1326,6 +1463,162 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
              p99 412ms of 58 reads in 60s, disk read 25ms/op, write 3.1ms/op); this \
              node's disk is the cause: check TRIM, the disk's health and other I/O load.",
             "STORE-LINE recovering"
+        );
+    }
+
+    fn full_disk() -> StoreSpace {
+        StoreSpace {
+            total_bytes: 100 << 30,
+            free_bytes: 5 << 30,
+            store_bytes: Some(40 << 30),
+            label_bytes: Some(50 << 30),
+            snapshot_refusals: 6_500,
+            last_refusal_unix_ms: NOW - 300_000,
+            last_refusal_needed_bytes: 6 << 30,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_store_space_line_flags_free_space_under_the_last_refused_need() {
+        let full = full_disk();
+        assert_eq!(
+            store_space_line(Some(&full), NOW).unwrap(),
+            "Store space: disk 5.0 GiB free of 100.0 GiB; stores 40.0 GiB; storage labels \
+             50.0 GiB. Storage labels refused disk space at a snapshot 6500 times since this \
+             node started, the last 5m ago. Free space is under the 6.0 GiB the last refusal \
+             needed: free disk space on this node or give its storage labels a larger disk.",
+            "SPACE-LINE full"
+        );
+        // The labels' own disk decides, when they have one.
+        let apart = StoreSpace {
+            label_total_bytes: Some(2 << 40),
+            label_free_bytes: Some(1 << 40),
+            ..full
+        };
+        assert_eq!(
+            store_space_line(Some(&apart), NOW).unwrap(),
+            "Store space: disk 5.0 GiB free of 100.0 GiB; stores 40.0 GiB; storage labels \
+             50.0 GiB on another disk, 1024.0 GiB free of 2048.0 GiB. Storage labels refused \
+             disk space at a snapshot 6500 times since this node started, the last 5m ago.",
+            "SPACE-LINE apart"
+        );
+        let roomy = StoreSpace {
+            free_bytes: 60 << 30,
+            snapshot_refusals: 0,
+            last_refusal_unix_ms: 0,
+            last_refusal_needed_bytes: 0,
+            label_bytes: None,
+            ..full
+        };
+        assert_eq!(
+            store_space_line(Some(&roomy), NOW).unwrap(),
+            "Store space: disk 60.0 GiB free of 100.0 GiB; stores 40.0 GiB."
+        );
+        assert_eq!(
+            store_space_line(Some(&StoreSpace::default()), NOW).unwrap(),
+            "Store space: disk unread."
+        );
+    }
+
+    #[test]
+    fn the_report_shows_the_store_space_line_only_when_the_node_sends_it() {
+        let old = report(Vec::new(), 0);
+        assert_eq!(store_space_line(old.store_space.as_ref(), NOW), None);
+        assert!(!render_report("…Ab12cd", &old).contains("Store space"));
+        let new = HealthReport {
+            store_space: Some(full_disk()),
+            ..old
+        };
+        let rendered = render_report("…Ab12cd", &new);
+        let second = rendered.lines().nth(1).unwrap();
+        assert!(
+            second.starts_with("Store space: disk 5.0 GiB free"),
+            "SPACE-RENDER: {rendered}"
+        );
+        assert!(
+            second.contains("Free space is under the 6.0 GiB"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_machine_line_names_model_cpu_cores_and_throttling() {
+        let mut mac = Machine {
+            mac_major: 14,
+            mac_minor: 2,
+            cpu_family: 0xda33_d83d,
+            cpu_model: 2,
+            cpus: 8,
+            performance_cores: Some(4),
+            efficiency_cores: Some(4),
+            ..Default::default()
+        };
+        mac.set_mac_family(MacFamily::Mac);
+        mac.set_cpu_vendor(CpuVendor::Apple);
+        assert_eq!(
+            machine_line(Some(&mac)).unwrap(),
+            "Machine: Mac14,2; Apple CPU family 0xda33d83d subfamily 2; 4 performance and 4 \
+             efficiency cores; 8 CPUs for the node."
+        );
+        let mut linux = Machine {
+            cpu_family: 6,
+            cpu_model: 151,
+            cpu_stepping: 2,
+            cpus: 20,
+            throttle_events: Some(12),
+            ..Default::default()
+        };
+        linux.set_cpu_vendor(CpuVendor::Intel);
+        assert_eq!(
+            machine_line(Some(&linux)).unwrap(),
+            "Machine: Intel CPU family 6 model 151 stepping 2; 20 CPUs for the node; CPU \
+             throttled for heat 12 times since boot.",
+            "MACHINE-LINE linux"
+        );
+        let mut pi = Machine {
+            mac_family: 99,
+            mac_major: 2,
+            mac_minor: 1,
+            cpu_family: 0x41,
+            cpu_model: 0xd0b,
+            cpu_stepping: 0x41,
+            cpu_vendor: 99,
+            ..Default::default()
+        };
+        assert_eq!(
+            machine_line(Some(&pi)).unwrap(),
+            "Machine: a Mac model 2,1; an unknown vendor's CPU family 65 model 3339 stepping 65.",
+            "MACHINE-UNKNOWN: values this client does not know"
+        );
+        pi.mac_family = 0;
+        pi.set_cpu_vendor(CpuVendor::ArmOther);
+        assert_eq!(
+            machine_line(Some(&pi)).unwrap(),
+            "Machine: ARM CPU implementer 0x41 part 0xd0b variant and revision 0x41."
+        );
+        assert_eq!(machine_line(Some(&Machine::default())), None);
+        assert_eq!(machine_line(None), None);
+    }
+
+    #[test]
+    fn the_report_shows_the_machine_line_only_when_the_node_sends_it() {
+        let old = report(Vec::new(), 0);
+        assert!(!render_report("…Ab12cd", &old).contains("Machine:"));
+        let new = HealthReport {
+            machine: Some(Machine {
+                mac_family: MacFamily::Mac.into(),
+                mac_major: 14,
+                mac_minor: 2,
+                ..Default::default()
+            }),
+            ..old
+        };
+        let rendered = render_report("…Ab12cd", &new);
+        assert_eq!(
+            rendered.lines().nth(1),
+            Some("Machine: Mac14,2."),
+            "MACHINE-RENDER: {rendered}"
         );
     }
 

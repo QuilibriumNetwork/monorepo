@@ -401,9 +401,13 @@ fn initialize_with_progress(
     let (last, columns) = match kept {
         Some(pair) => pair,
         None => {
-            let admitted = store
-                .admit(epoch, member, &id, n, Stage::Snapshot)
-                .ok_or_else(|| unavailable("no disk space to certify a new sector".into()))?;
+            let Some(admitted) = store.admit(epoch, member, &id, n, Stage::Snapshot) else {
+                return Err(unavailable(
+                    "a new sector's labels not admitted to certify it: too little free disk \
+                     space, or the sector labelled already by another task or worker process"
+                        .into(),
+                ));
+            };
             match admitted.label_kept(params, stop, layers)? {
                 Labelling::Labelled(labelled) if labelled.kept => (labelled.last, labelled.comm_c),
                 // Told to stop: it gave its memory back to more urgent work,
@@ -552,7 +556,13 @@ fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
             };
             let admitted = store
                 .admit(epoch, &member, &id, n, Stage::Snapshot)
-                .ok_or_else(|| unavailable("no disk space to repair a sector".into()))?;
+                .ok_or_else(|| {
+                    unavailable(
+                        "a sector's labels not admitted to repair it: too little free disk \
+                         space, or the sector labelled already by another task or worker process"
+                            .into(),
+                    )
+                })?;
             let labelled = match admitted.label_kept(store.params(), &stop, &|_| {})? {
                 Labelling::Labelled(labelled) => labelled,
                 _ => return Err(unavailable("sector repair stopped".into())),
@@ -1835,6 +1845,74 @@ mod tests {
         let sector = initialize(&store, &member, 1500, path, id, n, &|| false)
             .unwrap_or_else(|error| panic!("the next attempt goes on: {error}"));
         assert_eq!(sector.cert.n, n);
+    }
+
+    /// A new sector refused room for its labels at its certification is
+    /// counted, per attempt, with the free bytes its labels needed, for the
+    /// health report.
+    #[test]
+    fn a_sector_refused_disk_space_is_counted_for_the_health_report() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let full: crate::storage_labels::SpaceSource = Box::new(|_| {
+            Some(quil_forest::storage_health::FsUsage {
+                total_bytes: 1 << 40,
+                ..Default::default()
+            })
+        });
+        let store = LabelStore::with_space(dir.path().to_owned(), full);
+        let member = [0xC8; 32];
+        let (path, id, n) = reserve(&store, &member, b"full disk leaf", 1500, 100).unwrap();
+        for _ in 0..2 {
+            let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                .err()
+                .expect("no room for the sector's labels");
+            assert!(
+                error.to_string().contains("too little free disk"),
+                "{error}"
+            );
+        }
+        let space = store.space();
+        assert_eq!(
+            space.snapshot_refusals, 2,
+            "CERTIFY-COUNT: each refused attempt counts"
+        );
+        let (_, needed) = space.last_refusal.expect("the room it needed");
+        assert!(needed > 0);
+    }
+
+    /// A new sector whose count is being labelled already, in this process
+    /// or another worker process, is not admitted, but is no refusal of disk
+    /// space: the health report counts none for it.
+    #[test]
+    fn a_sector_labelled_already_is_no_disk_refusal() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let ample = crate::storage_labels::ample_space;
+        let store = LabelStore::with_space(dir.path().to_owned(), ample());
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let member = [0xC9; 32];
+        let (path, id, n) = reserve(&store, &member, b"labelled leaf", 1500, 100).unwrap();
+        let counted: Vec<_> = [("busy", &store), ("claimed", &other)]
+            .into_iter()
+            .map(|(kind, holder)| {
+                let held = holder
+                    .admit(1500, &member, &id, n, Stage::Snapshot)
+                    .expect("room for the sector's labels");
+                let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                    .err()
+                    .expect("the sector's count is labelled already");
+                assert!(error.to_string().contains("not admitted"), "{error}");
+                drop(held);
+                let space = store.space();
+                (kind, space.snapshot_refusals, space.last_refusal.is_some())
+            })
+            .collect();
+        assert_eq!(
+            counted,
+            [("busy", 0, false), ("claimed", 0, false)],
+            "BUSY-UNCOUNTED: a count labelled already is no disk refusal"
+        );
     }
 
     #[test]
