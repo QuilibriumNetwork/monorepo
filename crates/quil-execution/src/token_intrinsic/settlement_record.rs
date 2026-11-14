@@ -248,7 +248,8 @@ pub fn encode_entries(entries: &[SettlementEntry]) -> Result<Vec<u8>> {
 
 /// Decode and require the canonical form produced by [`encode_entries`].
 pub fn decode_entries(bytes: &[u8]) -> Result<Vec<SettlementEntry>> {
-    if bytes.len() % ENTRY_BYTES != 0 || bytes.len() / ENTRY_BYTES > MAX_ENTRIES_PER_FRAME {
+    if !bytes.len().is_multiple_of(ENTRY_BYTES) || bytes.len() / ENTRY_BYTES > MAX_ENTRIES_PER_FRAME
+    {
         return Err(invalid("malformed entry list"));
     }
     let entries: Vec<SettlementEntry> = bytes.chunks_exact(ENTRY_BYTES).map(read_entry).collect();
@@ -287,7 +288,9 @@ pub fn encode_relay(frames: &[(u64, Vec<SettlementEntry>)]) -> Result<Vec<u8>> {
 /// source frame lies in [`relay_window`] of the carrying header. Frames without
 /// entries are absent from the result.
 pub fn decode_relay(header_frame: u64, bytes: &[u8]) -> Result<Vec<(u64, Vec<SettlementEntry>)>> {
-    if bytes.len() % RELAY_ENTRY_BYTES != 0 || bytes.len() / RELAY_ENTRY_BYTES > MAX_RELAY_ENTRIES {
+    if !bytes.len().is_multiple_of(RELAY_ENTRY_BYTES)
+        || bytes.len() / RELAY_ENTRY_BYTES > MAX_RELAY_ENTRIES
+    {
         return Err(invalid("malformed relay"));
     }
     let window = relay_window(header_frame);

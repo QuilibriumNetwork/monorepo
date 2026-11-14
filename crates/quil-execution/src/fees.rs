@@ -98,13 +98,10 @@ pub fn collect_bundle_fees(bundle: &MessageBundle, policy: &Policy) -> Vec<BigIn
     let mut queue = Vec::new();
 
     for op in &bundle.requests {
-        match &op.request {
-            Some(MessageRequestInner::TokenOperation(op)) => {
-                if let Some(fee) = token_fee(op, policy) {
-                    queue.push(fee);
-                }
+        if let Some(MessageRequestInner::TokenOperation(op)) = &op.request {
+            if let Some(fee) = token_fee(op, policy) {
+                queue.push(fee);
             }
-            _ => {}
         }
     }
 

@@ -773,11 +773,11 @@ impl ExecutionEngineManager {
         #[cfg(feature = "native-proof")]
         {
             let engines = self.engines.read().ok()?;
-            return engines
+            engines
                 .get("token")
                 .and_then(|e| e.as_any())
                 .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                .and_then(|token| token.verification_budget());
+                .and_then(|token| token.verification_budget())
         }
         #[cfg(not(feature = "native-proof"))]
         None
@@ -789,10 +789,10 @@ impl ExecutionEngineManager {
     pub fn verification_known_to_fit(operation_bytes: usize, budget_secs: f64) -> bool {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::verification_known_to_fit(
+            crate::token_intrinsic::dispatch::verification_known_to_fit(
                 operation_bytes,
                 budget_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -809,11 +809,11 @@ impl ExecutionEngineManager {
     pub fn operation_known_to_fit(operation: &OperationEstimate, budget_secs: f64) -> bool {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::operation_known_to_fit(
+            crate::token_intrinsic::dispatch::operation_known_to_fit(
                 operation.bytes,
                 operation.floor_secs,
                 budget_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -828,10 +828,10 @@ impl ExecutionEngineManager {
     pub fn estimated_operation_secs(operation: &OperationEstimate) -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::estimated_operation_secs(
+            crate::token_intrinsic::dispatch::estimated_operation_secs(
                 operation.bytes,
                 operation.floor_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -845,7 +845,7 @@ impl ExecutionEngineManager {
     pub fn estimated_verify_secs(operation_bytes: usize) -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes);
+            crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes)
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -859,11 +859,11 @@ impl ExecutionEngineManager {
     pub fn confidential_operation_count(address: &[u8], bundle_bytes: &[u8]) -> usize {
         #[cfg(feature = "native-proof")]
         {
-            return TokenExecutionEngine::confidential_operations(&[(
+            TokenExecutionEngine::confidential_operations(&[(
                 address.to_vec(),
                 bundle_bytes.to_vec(),
             )])
-            .len();
+            .len()
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -878,10 +878,10 @@ impl ExecutionEngineManager {
     pub fn confidential_operation_sizes(bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
         #[cfg(feature = "native-proof")]
         {
-            return TokenExecutionEngine::confidential_operations(bundles)
+            TokenExecutionEngine::confidential_operations(bundles)
                 .into_iter()
                 .map(|(_, bytes, _)| bytes.len())
-                .collect();
+                .collect()
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -895,7 +895,7 @@ impl ExecutionEngineManager {
     pub fn frame_verification_budget_secs() -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::verification_budget_secs();
+            crate::token_intrinsic::dispatch::verification_budget_secs()
         }
         #[cfg(not(feature = "native-proof"))]
         0.0
@@ -995,7 +995,7 @@ impl ExecutionEngineManager {
             let bundle =
                 crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
                     .ok()?;
-            return bundle
+            bundle
                 .requests
                 .into_iter()
                 .flatten()
@@ -1004,7 +1004,7 @@ impl ExecutionEngineManager {
                 })
                 .find_map(|request| {
                     quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes)
-                });
+                })
         }
         #[cfg(not(feature = "native-proof"))]
         {

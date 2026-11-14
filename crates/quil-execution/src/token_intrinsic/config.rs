@@ -398,10 +398,10 @@ mod tests {
         data.push(0x01); // has_authority
         data.extend(&[0x00, 0x01]); // key_type = 1 (Ed448 in Go)
         data.extend(&[0x00, 0x39]); // pk_len = 57
-        data.extend(std::iter::repeat(0xAAu8).take(57));
+        data.extend(std::iter::repeat_n(0xAAu8, 57));
         data.push(0x01); // can_burn
         data.extend(&[0x00, 0x20]); // payment_addr_len = 32
-        data.extend(std::iter::repeat(0xBBu8).take(32));
+        data.extend(std::iter::repeat_n(0xBBu8, 32));
         data.push(0x00); // has_fee_basis
 
         let strat = decode_mint_strategy_packed(&data).unwrap();

@@ -548,11 +548,9 @@ mod tests {
         assert!(policy
             .check_self_paid_fee(&application, &[], TYPE_LATTICE_MINT, &BigInt::from(1))
             .is_err());
-        for tp in [TYPE_LATTICE_MINT_CLAIM] {
-            assert!(policy
-                .check_self_paid_fee(&application, &[], tp, &BigInt::from(1))
-                .is_ok());
-        }
+        assert!(policy
+            .check_self_paid_fee(&application, &[], TYPE_LATTICE_MINT_CLAIM, &BigInt::from(1))
+            .is_ok());
         for mode in [ExecutionMode::Application, ExecutionMode::Global] {
             let db = quil_store::RocksDb::open_in_memory().unwrap();
             let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(

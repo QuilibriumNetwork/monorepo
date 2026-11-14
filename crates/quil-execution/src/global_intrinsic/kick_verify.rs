@@ -1139,7 +1139,7 @@ mod tests {
 
     #[test]
     fn extract_rejects_unknown_type_prefix() {
-        let mut bytes = app_frame_bytes(&vec![0xCDu8; 32], &[0x01]);
+        let mut bytes = app_frame_bytes(&[0xCDu8; 32], &[0x01]);
         bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         assert!(extract_kick_frame_filter_and_bitmask(&bytes).is_err());
     }
