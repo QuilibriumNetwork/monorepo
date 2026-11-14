@@ -25,7 +25,7 @@ use super::constants::{
 
 /// Routing decision for a MintTransaction's `MintBehavior`+`ProofBasis`
 /// pair. Derived from the token's deployed `TokenConfiguration`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MintVariant {
     /// `MintWithAuthority`.
     Authority,
@@ -44,6 +44,7 @@ pub enum MintVariant {
     /// `NoMintBehavior` — non-mintable token; minting should reject.
     NoMint,
     /// Unknown combination. Engine should reject.
+    #[default]
     Unknown,
 }
 
@@ -160,12 +161,6 @@ pub struct StaticTokenEntry {
     pub entitlement_root: Option<Vec<u8>>,
     pub payment_fee_baseline: Option<num_bigint::BigInt>,
     pub payment_address: Option<Vec<u8>>,
-}
-
-impl Default for MintVariant {
-    fn default() -> Self {
-        MintVariant::Unknown
-    }
 }
 
 /// In-memory resolver that looks up configs from a pre-populated map.

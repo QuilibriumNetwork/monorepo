@@ -721,7 +721,7 @@ mod tests {
         assert!(bytes.len() <= TARGET_TRANSACTION_BYTES);
         if let Ok(path) = std::env::var("QUIL_TEST_TRANSACTION_PATH") {
             std::fs::write(&path, &bytes).unwrap();
-            std::fs::write(format!("{path}.root"), &admitted_root_bytes).unwrap();
+            std::fs::write(format!("{path}.root"), admitted_root_bytes).unwrap();
         }
         eprintln!(
             "execution_transfer_proved bytes={} proof_bytes={} seconds={:.3}",

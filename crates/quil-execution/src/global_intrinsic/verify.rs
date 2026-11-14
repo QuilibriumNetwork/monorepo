@@ -1743,7 +1743,7 @@ mod tests {
             Some(&alloc_tree),
             &AcceptKeyManager,
         );
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -1756,7 +1756,7 @@ mod tests {
             Some(&alloc_tree),
             &RejectKeyManager,
         );
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -2868,8 +2868,7 @@ mod tests {
         // A consumed target → reject. One-shot: the mere existence of a tombstone
         // blocks re-use (see `seniority_merge_spent_markers_reject_any_consumed_target`).
         let other =
-            crate::global_intrinsic::materialize::create_spent_merge_tree(&vec![0x77u8; 32])
-                .unwrap();
+            crate::global_intrinsic::materialize::create_spent_merge_tree(&[0x77u8; 32]).unwrap();
         let other_blob = crate::prover_registry::vertex_tree_to_blob(&other);
         let r = verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(other_blob.clone())));
         assert!(r.is_err());

@@ -55,7 +55,7 @@ pub fn verify(leaf: &[u8; 32], proof: &[u8], root: &[u8]) -> Result<()> {
     if root.len() != 32 {
         return Err(invalid("configured entitlement root is not 32 bytes"));
     }
-    if proof.len() % LEVEL_BYTES != 0 || proof.len() / LEVEL_BYTES > MAX_DEPTH {
+    if !proof.len().is_multiple_of(LEVEL_BYTES) || proof.len() / LEVEL_BYTES > MAX_DEPTH {
         return Err(invalid("malformed proof"));
     }
     let mut current = *leaf;

@@ -295,7 +295,7 @@ pub fn materialize_code_execute(
         let app = Application::from_canonical_bytes(&op.application)?;
         let stage = *dag.op_stage.get(&op.identifier).unwrap_or(&0u32);
         let op_bytes = serialize_operation(&app, &op.identifier, stage);
-        let key = [(((i + 3) as u8) << 2) as u8];
+        let key = [(((i + 3) as u8) << 2)];
         tree.insert(&key, &op_bytes, &[], &BigInt::from(op_bytes.len() as u64))?;
     }
 

@@ -462,7 +462,7 @@ fn collapse_iri(iri: &str, prefixes: &HashMap<String, String>) -> String {
     for (k, v) in prefixes {
         if iri.starts_with(v.as_str()) {
             match best {
-                Some((_, ref bv)) if v.len() <= bv.len() => {}
+                Some((_, bv)) if v.len() <= bv.len() => {}
                 _ => best = Some((k, v)),
             }
         }
