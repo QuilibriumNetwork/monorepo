@@ -2265,11 +2265,11 @@ mod coins_render_tests {
         // Claimable, unshielded and the failed read show at the default level.
         assert!(header_line(&m)
             .to_string()
-            .starts_with("‹1› Provers  ‹2› Coins 3!"));
+            .starts_with(" Qclient  ‹1› Provers  ‹2› Coins 3!"));
         m.color_coding = true;
         assert!(header_line(&m)
             .to_string()
-            .starts_with("‹1› Provers  ‹2› Coins 3 "));
+            .starts_with(" Qclient  ‹1› Provers  ‹2› Coins 3 "));
     }
 
     /// A Coins key that does not apply to the selection: left out when

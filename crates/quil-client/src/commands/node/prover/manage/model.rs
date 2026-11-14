@@ -566,6 +566,9 @@ pub struct Model {
     pub help_lines: usize,
     pub help_visible: usize,
     pub color_coding: bool,
+    /// The terminal shows 256 colors, not truecolor: the brand mark takes
+    /// its nearest palette index.
+    pub palette_256: bool,
     pub column_sizing: ColumnSizing,
     pub alloc_column_order: Vec<usize>,
     pub avail_column_order: Vec<usize>,

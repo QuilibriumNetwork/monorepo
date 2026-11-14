@@ -219,6 +219,7 @@ async fn event_loop(
     refresh_state: RefreshState,
 ) -> anyhow::Result<()> {
     let mut model = Model::new();
+    model.palette_256 = crossterm::style::available_color_count() < u16::MAX;
     let mut saved = settings::Store::open(settings::default_path(), &mut model);
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 

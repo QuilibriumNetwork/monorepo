@@ -948,10 +948,34 @@ fn tab_bar(m: &Model) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Pack complete KPI blocks, never splitting their internal pipe-separated fields.
+/// The logo pink, and its nearest xterm 256-color index (197, `#ff005f`)
+/// for terminals without truecolor.
+const BRAND: Color = Color::Rgb(0xff, 0x05, 0x6d);
+const BRAND_256: Color = Color::Indexed(197);
+/// The brand mark's columns with the gap before the tabs.
+const BRAND_WIDTH: usize = " Qclient  ".len();
+
+/// The brand mark at the header's left, one space in from the edge: a bold
+/// `Q` in the logo pink, then `client` in the header's style. Without
+/// colors the `Q` is bold alone.
+fn brand_mark(m: &Model) -> [Span<'static>; 3] {
+    let mut q = Style::new().add_modifier(Modifier::BOLD);
+    if m.color_coding {
+        q = q.fg(if m.palette_256 { BRAND_256 } else { BRAND });
+    }
+    [Span::raw(" "), Span::styled("Q", q), Span::raw("client  ")]
+}
+
+/// Pack complete KPI blocks, never splitting their internal pipe-separated
+/// fields. The brand mark leads the tab bar while both fit the width; on a
+/// narrower terminal it yields first.
 fn header_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
     let mut blocks = header_kpis(m);
-    blocks.insert(0, tab_bar(m));
+    let mut tabs = tab_bar(m);
+    if BRAND_WIDTH + tabs.width() <= usize::from(width) {
+        tabs.spans.splice(0..0, brand_mark(m));
+    }
+    blocks.insert(0, tabs);
     pack_kpis(blocks, width)
         .into_iter()
         .flat_map(|line| {
@@ -4394,7 +4418,7 @@ fn help_items() -> Vec<HelpItem> {
         HelpItem::Blank,
         sec("Tabs"),
         kv("‹1› / ‹2›", "Show the Provers or the Coins tab; while a filter is edited, digits stay text. ‹tab› still moves between the panels of a tab"),
-        kv("Tab bar", "First block of the top header, `‹1› Provers  ‹2› Coins`, the current tab bold. The other tab shows how many notices it has at the current level, in the color of the highest (`!` marks a warning or error with colors off); items waiting for an action (`◆`) count from the default level"),
+        kv("Tab bar", "First block of the top header, after the `Qclient` mark (left out when the width cannot hold both): `‹1› Provers  ‹2› Coins`, the current tab bold. The other tab shows how many notices it has at the current level, in the color of the highest (`!` marks a warning or error with colors off); items waiting for an action (`◆`) count from the default level"),
         sec("Top header KPIs"),
         kv("Peer ID", "This node's identity; compact `Peer: …` shows the last 8 characters, ‹n› expands it"),
         kv("Strategy", "Allocation scoring strategy the node reports; expanded mode spells out the priorities:"),
@@ -9082,7 +9106,7 @@ mod compact_action_tests {
         // The tab bar stays: it is how the other tab's notices show.
         let lines = header_lines(&m, 40);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "‹1› Provers  ‹2› Coins");
+        assert_eq!(lines[0].to_string(), " Qclient  ‹1› Provers  ‹2› Coins");
     }
 
     #[test]
@@ -9556,6 +9580,92 @@ mod compact_action_tests {
         assert_eq!(reward_cell(&m, &a.estimated_reward, &a.filter), "2160.0");
         m.node_app_cadence.clear();
         assert_eq!(reward_cell(&m, &a.estimated_reward, &a.filter), "-");
+    }
+}
+
+#[cfg(test)]
+mod brand_mark_tests {
+    use super::*;
+
+    fn loaded() -> Model {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.peer_id = "abcdefgh12345678".into();
+        m.seniority = "1234".into();
+        m.last_fetch_success = Some(std::time::Instant::now());
+        m.cached_shard_info = Some(quil_types::proto::node::GetShardInfoResponse {
+            allocation_scoring_strategy: "reward-greedy".into(),
+            ..Default::default()
+        });
+        m
+    }
+
+    fn header_rows(m: &mut Model, width: u16) -> Vec<String> {
+        render_text(m, width, 24)
+            .lines()
+            .take(2)
+            .map(String::from)
+            .collect()
+    }
+
+    /// The header as drawn at 80x24 and 200x24: the mark one space in from
+    /// the edge, the tabs two spaces after it; at 80 columns the tabs keep
+    /// the first row and a KPI block wraps to the second.
+    #[test]
+    fn the_brand_mark_leads_the_header_at_80_and_wide() {
+        let mut m = loaded();
+        assert_eq!(
+            header_rows(&mut m, 80),
+            [
+                " Qclient  ‹1› Provers  ‹2› Coins · Peer: …12345678 · Strategy: H → $",
+                "Seniority: 1234 · Global: - · Global [s 60m/24h]: -/- · World [GB]: - · RPC: ✓",
+            ]
+        );
+        assert_eq!(
+            header_rows(&mut m, 200)[0],
+            " Qclient  ‹1› Provers  ‹2› Coins · Peer: …12345678 · Strategy: H → $ · \
+             Seniority: 1234 · Global: - · Global [s 60m/24h]: -/- · World [GB]: - · RPC: ✓"
+        );
+    }
+
+    /// Truecolor terminals get the logo pink, 256-color ones its nearest
+    /// index, colorless mode a bold `Q` alone; `client` keeps the header's
+    /// style.
+    #[test]
+    fn the_brand_q_is_bold_logo_pink_by_terminal_colors() {
+        let mut m = loaded();
+        let q = |m: &Model| header_lines(m, 200)[0].spans[1].clone();
+        assert_eq!(q(&m).content, "Q");
+        assert_eq!(
+            q(&m).style,
+            Style::new()
+                .fg(Color::Rgb(0xff, 0x05, 0x6d))
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(header_lines(&m, 200)[0].spans[2], Span::raw("client  "));
+        m.palette_256 = true;
+        assert_eq!(
+            q(&m).style,
+            Style::new()
+                .fg(Color::Indexed(197))
+                .add_modifier(Modifier::BOLD)
+        );
+        m.color_coding = false;
+        assert_eq!(q(&m).style, Style::new().add_modifier(Modifier::BOLD));
+    }
+
+    /// Too narrow for the mark beside the tabs, the mark yields and the
+    /// tabs stay whole.
+    #[test]
+    fn the_brand_mark_yields_first_on_a_narrow_terminal() {
+        let mut m = loaded();
+        for name in TOP_KPI_NAMES {
+            m.hidden_header_kpis.insert((*name).into());
+        }
+        let row = |width| header_lines(&m, width)[0].to_string();
+        assert_eq!(row(32), " Qclient  ‹1› Provers  ‹2› Coins");
+        assert_eq!(row(31), "‹1› Provers  ‹2› Coins");
+        assert_eq!(row(22), "‹1› Provers  ‹2› Coins");
     }
 }
 
