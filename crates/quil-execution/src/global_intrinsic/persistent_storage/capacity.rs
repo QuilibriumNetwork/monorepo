@@ -229,7 +229,10 @@ pub fn check_capacity(
     if message.proof.is_empty() {
         let current = quil_types::consensus::epoch_for_frame(frame);
         if !quil_types::consensus::capacity_precommit_window(current, message.epoch) {
-            return Err(invalid("precommit outside warmup window".into()));
+            return Err(invalid(format!(
+                "precommit outside warmup window: epoch {}, current {current}, signed_at {}",
+                message.epoch, message.signed_at
+            )));
         }
         if message.signed_at > frame
             || frame - message.signed_at > 10
@@ -263,7 +266,11 @@ pub fn check_capacity(
             if pending.epoch >= current.saturating_sub(2)
                 && certificate(state, &message.member, &pending.certificate.sector)?.is_none()
             {
-                return Err(invalid("precommit slot is still occupied".into()));
+                return Err(invalid(format!(
+                    "precommit slot is still occupied: epoch {}, held for epoch {}, current \
+                     {current}",
+                    message.epoch, pending.epoch
+                )));
             }
         }
         return Ok(vec![StateRecord {
@@ -284,8 +291,12 @@ pub fn check_capacity(
     if frame <= beacon_frame {
         return Err(invalid("certificate beacon is not yet known".into()));
     }
-    if quil_types::consensus::epoch_for_frame(frame) > message.epoch.saturating_add(2) {
-        return Err(invalid("precommit expired".into()));
+    let current = quil_types::consensus::epoch_for_frame(frame);
+    if current > message.epoch.saturating_add(2) {
+        return Err(invalid(format!(
+            "precommit expired: epoch {}, current {current}",
+            message.epoch
+        )));
     }
     let count = sector_room_in(state, &message.member)?
         .admit(&message.member, 1)
