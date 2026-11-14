@@ -126,6 +126,7 @@ pub enum NodeCommand {
     /// Install a newer node version (optionally restarting the service).
     Update {
         version: Option<String>,
+        /// Restart the node service if it runs; a stopped one stays stopped.
         #[arg(short = 'r', long)]
         restart: bool,
         /// Install a version older than the linked one.
