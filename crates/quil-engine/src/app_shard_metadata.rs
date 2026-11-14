@@ -477,7 +477,6 @@ pub fn retire_unchallengeable_replicas(
 /// fallibly up front (so a store error aborts rather than silently encoding an
 /// empty leaf), then encoded through the pure `compute_confirm_leaf_roots`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn compute_storage_confirm(
     crdt: &std::sync::Arc<HypergraphCrdt>,
     replica_store: &quil_store::replica_store::ReplicaStore,

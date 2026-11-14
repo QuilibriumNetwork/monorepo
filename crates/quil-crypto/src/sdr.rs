@@ -281,9 +281,7 @@ pub fn sdr_encode(data: &[u8], key: &[u8], params: &SdrParams) -> Vec<u8> {
     for i in 0..data.len() {
         out[i] = data[i] ^ labels[i];
     }
-    for i in data.len()..plen {
-        out[i] = labels[i]; // padding XOR 0
-    }
+    out[data.len()..plen].copy_from_slice(&labels[data.len()..plen]); // padding XOR 0
     out
 }
 

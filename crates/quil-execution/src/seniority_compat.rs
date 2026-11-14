@@ -150,12 +150,8 @@ pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
         const MAX: i64 = 157_208;
         const PERIOD: u64 = 10 * 6 * 60 * 24 * 92;
         if actual > 0 {
-            let divisor = (MAX / actual) as u64;
-            if divisor > 0 {
-                let s = PERIOD / divisor;
-                if s > highest_first {
-                    highest_first = s;
-                }
+            if let Some(s) = PERIOD.checked_div((MAX / actual) as u64) {
+                highest_first = highest_first.max(s);
             }
         }
     }

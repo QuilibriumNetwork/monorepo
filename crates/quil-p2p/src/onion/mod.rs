@@ -403,15 +403,16 @@ mod tests {
         cb(b"initiator", 1, &init.cell);
 
         wait_for_sent(&transport).await;
-        let sent = transport.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, b"initiator"); // CREATED back upstream
-        assert_eq!(sent[0].1, 1);
-        let (cmd, payload) = cell::parse_cell(&sent[0].2).unwrap();
-        assert_eq!(cmd, cell::CMD_CREATED);
-        // Finishing the ntor handshake verifies the relay's confirmation.
-        let _hop = fs_hop_secret(&init, payload);
-        drop(sent);
+        {
+            let sent = transport.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, b"initiator"); // CREATED back upstream
+            assert_eq!(sent[0].1, 1);
+            let (cmd, payload) = cell::parse_cell(&sent[0].2).unwrap();
+            assert_eq!(cmd, cell::CMD_CREATED);
+            // Finishing the ntor handshake verifies the relay's confirmation.
+            let _hop = fs_hop_secret(&init, payload);
+        }
         assert_eq!(relay.active_relays().await, 1);
     }
 
