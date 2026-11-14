@@ -115,7 +115,7 @@ pub fn allocation_ring_reward(
     }
     let divisor = BigInt::from(1u64 << (u32::from(ring.min(62)) + 1));
     let sqrt = (BigInt::from(data_shards) << (2 * POMW_SCALE_BITS)).sqrt();
-    let numerator = state_size * basis << POMW_SCALE_BITS;
+    let numerator = (state_size * basis) << POMW_SCALE_BITS;
     numerator / (world_bytes * divisor * sqrt)
 }
 

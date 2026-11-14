@@ -514,13 +514,13 @@ pub fn admit_bundle(
 pub fn message_settlement_amount(message: &[u8]) -> u128 {
     use crate::message_envelope::{TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
     let of = |r: &CanonicalMessageRequest| {
-        (r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM)
-            .then(|| {
-                SettlementClaim::decode(&r.inner_bytes)
-                    .map(|c| c.settlement)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0)
+        if r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM {
+            SettlementClaim::decode(&r.inner_bytes)
+                .map(|c| c.settlement)
+                .unwrap_or(0)
+        } else {
+            0
+        }
     };
     match message
         .get(..4)

@@ -548,6 +548,12 @@ pub struct InMemoryHypergraphStore {
     per_vertex: std::sync::Mutex<std::collections::HashMap<(String, Vec<u8>), Vec<u8>>>,
 }
 
+impl Default for InMemoryHypergraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryHypergraphStore {
     pub fn new() -> Self {
         Self {

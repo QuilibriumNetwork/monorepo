@@ -480,7 +480,7 @@ impl InMemoryProverRegistry {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
-            let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                 self.unknown_vertex_count += 1;
                 continue;
             };
@@ -536,7 +536,7 @@ impl InMemoryProverRegistry {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
-            let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                 continue;
             };
             if type_hash != TYPE_HASH_ALLOCATION {
@@ -3369,7 +3369,7 @@ impl CommittedProverScan {
                     Ok(Some(r)) => r,
                     _ => return,
                 };
-                let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+                let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                     return;
                 };
                 if type_hash == crate::global_schema::type_hash_storage_seat() {
@@ -3671,7 +3671,7 @@ pub fn all_provers_with_allocations_committed(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash == TYPE_HASH_ALLOCATION {
@@ -3736,7 +3736,7 @@ pub fn all_provers_with_active_allocations_committed(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash == TYPE_HASH_ALLOCATION {
@@ -3828,7 +3828,7 @@ pub fn allocation_status_breakdown(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash != TYPE_HASH_ALLOCATION {
@@ -3977,10 +3977,7 @@ pub fn rebuild_vertex_tree_from_blob(blob: &[u8]) -> quil_tries::VectorCommitmen
 /// Serialize a `VectorCommitmentTree` to a blob for CRDT storage.
 /// Uses Go's `SerializeNonLazyTree` format for wire compatibility.
 pub fn vertex_tree_to_blob(tree: &quil_tries::VectorCommitmentTree) -> Vec<u8> {
-    match quil_tries::serialize_go_tree(tree.root.as_ref()) {
-        Ok(data) => data,
-        Err(_) => Vec::new(),
-    }
+    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -4023,7 +4020,7 @@ mod tests {
             &filter,
             &prefix,
             19,
-            &vec![0x11; 74],
+            &[0x11; 74],
             1234,
             900_000,
         )
@@ -4070,7 +4067,7 @@ mod tests {
                     &filter,
                     &prefix,
                     epoch,
-                    &vec![root_byte; 74],
+                    &[root_byte; 74],
                     8,
                     1000,
                 )
@@ -4324,7 +4321,7 @@ mod tests {
             &filter,
             &prefix,
             5,
-            &vec![0x22; 74],
+            &[0x22; 74],
             64,
             100,
         )
@@ -4364,7 +4361,7 @@ mod tests {
                 &filter,
                 &prefix,
                 epoch,
-                &vec![lr; 74],
+                &[lr; 74],
                 (epoch * 10) + 1,
                 1000,
             )
@@ -8047,7 +8044,7 @@ mod tests {
         seed_shard_floor(
             &store,
             &shard,
-            &vec![0x77u8; 64],
+            &[0x77u8; 64],
             quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
             0xE0,
         );

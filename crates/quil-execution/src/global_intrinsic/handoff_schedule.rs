@@ -685,7 +685,7 @@ pub fn recover_topology_change(
         }
         if let Some(bytes) = read(state, b"reserved", &source.filter)? {
             let later = request(state, &request_id(bytes)?)?
-                .map_or(true, |named| named.frame >= scheduled.frame);
+                .is_none_or(|named| named.frame >= scheduled.frame);
             if later {
                 return Ok(Recovery::Applied(
                     "a later request names a source as a target",

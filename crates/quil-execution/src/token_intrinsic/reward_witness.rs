@@ -147,7 +147,7 @@ pub fn quil_reward_witness(
     };
     let blob = &membership.vertex_blob;
     let tree = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob)
+        root: quil_tries::deserialize_go_tree(blob)
             .map_err(|_| unavailable("corrupt reward record"))?,
     };
     let balance = global_schema::read_field(&tree, REWARD, "Balance")
@@ -172,6 +172,53 @@ pub fn quil_reward_witness(
         cited_frame: header.frame_number,
         reward_root: root.to_vec(),
     })
+}
+
+/// Derive the reward-root domain and owner-bound reward vertex address.
+/// QUIL rewards reside in the global domain; other applications use the
+/// prover address directly. Spend authority is checked separately.
+pub fn derive_pomw_addressing(
+    tx_domain: &[u8],
+    owner_prover_address: &[u8],
+) -> Result<(
+    /* prover_root_domain */ [u8; 32],
+    /* leaf_owner_address */ [u8; 32],
+)> {
+    if tx_domain.len() != 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "pomw: tx domain must be 32 bytes, got {}",
+            tx_domain.len()
+        )));
+    }
+    if owner_prover_address.len() != 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "pomw: owner prover address must be {} bytes, got {}",
+            32,
+            owner_prover_address.len()
+        )));
+    }
+
+    let mut prover_root_domain = [0u8; 32];
+    prover_root_domain.copy_from_slice(&tx_domain[..32]);
+
+    if tx_domain == domains::QUIL_TOKEN {
+        // QUIL special case: reward leaves live under the global
+        // intrinsic domain at `poseidon(domains::QUIL_TOKEN ‖ owner)`
+        // — exactly where `materialize::reward_address` writes them
+        // at join time.
+        prover_root_domain = domains::GLOBAL;
+        let mut preimage = Vec::with_capacity(64);
+        preimage.extend_from_slice(&domains::QUIL_TOKEN);
+        preimage.extend_from_slice(owner_prover_address);
+        let leaf_owner_address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+        Ok((prover_root_domain, leaf_owner_address))
+    } else {
+        // Non-QUIL: the leaf-owner address is the owner prover
+        // address directly under the token's domain.
+        let mut leaf_owner_address = [0u8; 32];
+        leaf_owner_address.copy_from_slice(owner_prover_address);
+        Ok((prover_root_domain, leaf_owner_address))
+    }
 }
 
 #[cfg(test)]
@@ -315,52 +362,5 @@ mod tests {
         assert_eq!(fallback.value, u128::MAX - 1);
         reopened.prune_to_frame(5).unwrap();
         assert!(quil_reward_witness(&state, &clock, &owner).is_err());
-    }
-}
-
-/// Derive the reward-root domain and owner-bound reward vertex address.
-/// QUIL rewards reside in the global domain; other applications use the
-/// prover address directly. Spend authority is checked separately.
-pub fn derive_pomw_addressing(
-    tx_domain: &[u8],
-    owner_prover_address: &[u8],
-) -> Result<(
-    /* prover_root_domain */ [u8; 32],
-    /* leaf_owner_address */ [u8; 32],
-)> {
-    if tx_domain.len() != 32 {
-        return Err(QuilError::InvalidArgument(format!(
-            "pomw: tx domain must be 32 bytes, got {}",
-            tx_domain.len()
-        )));
-    }
-    if owner_prover_address.len() != 32 {
-        return Err(QuilError::InvalidArgument(format!(
-            "pomw: owner prover address must be {} bytes, got {}",
-            32,
-            owner_prover_address.len()
-        )));
-    }
-
-    let mut prover_root_domain = [0u8; 32];
-    prover_root_domain.copy_from_slice(&tx_domain[..32]);
-
-    if tx_domain == domains::QUIL_TOKEN {
-        // QUIL special case: reward leaves live under the global
-        // intrinsic domain at `poseidon(domains::QUIL_TOKEN ‖ owner)`
-        // — exactly where `materialize::reward_address` writes them
-        // at join time.
-        prover_root_domain = domains::GLOBAL;
-        let mut preimage = Vec::with_capacity(64);
-        preimage.extend_from_slice(&domains::QUIL_TOKEN);
-        preimage.extend_from_slice(owner_prover_address);
-        let leaf_owner_address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
-        Ok((prover_root_domain, leaf_owner_address))
-    } else {
-        // Non-QUIL: the leaf-owner address is the owner prover
-        // address directly under the token's domain.
-        let mut leaf_owner_address = [0u8; 32];
-        leaf_owner_address.copy_from_slice(owner_prover_address);
-        Ok((prover_root_domain, leaf_owner_address))
     }
 }

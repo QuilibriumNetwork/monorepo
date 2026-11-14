@@ -2806,7 +2806,7 @@ mod tests {
         let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
         let global = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
         let mut committed = entry(1, &[20], &[1]);
-        committed.settlement = Some(settlement.clone());
+        committed.settlement = Some(settlement);
         assert!(matches!(
             commit_entry(&state, 100, &APP, &committed, SHARD).unwrap(),
             Outcome::Committed { .. }
