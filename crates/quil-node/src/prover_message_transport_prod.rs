@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
 use quil_engine::prover_message_transport::ProverMessageTransport;
+use quil_engine::storage_epoch_batch::ArchiveAnswer;
 use quil_rpc::archive_client::{ArchiveClientError, SharedSubmitError};
 use quil_rpc::{ArchiveClient, ArchiveEndpointPool};
 use quil_types::error::{QuilError, Result};
@@ -308,8 +309,35 @@ struct Delivery {
     accepted: usize,
     /// Refusals that ask for a retry.
     retry: usize,
+    /// Of those, refusals for room: a full rank or share of held proofs.
+    room: usize,
     /// The first archive's refusal, `<archive>: <reason>`.
     refusal: Option<String>,
+}
+
+/// What `delivery` tells the node's storage epoch proof batching
+/// (`storage_epoch_batch::note_archive_answer`): taken by an archive;
+/// refused for room by every archive, with no send that may have landed (a
+/// timeout) and no gossip publish that went out (`gossiped`); otherwise
+/// unknown, which the batching counts as a send that may have landed.
+fn proof_answer(delivery: &Delivery, gossiped: bool) -> ArchiveAnswer {
+    if delivery.accepted > 0 {
+        ArchiveAnswer::Taken
+    } else if delivery.room > 0 && delivery.room == delivery.retry && !gossiped {
+        ArchiveAnswer::RefusedForRoom
+    } else {
+        ArchiveAnswer::Unknown
+    }
+}
+
+/// Tell the node's storage epoch proof batching what the archives answered
+/// `proof` ([`proof_answer`]).
+fn note_answer(proof: &StorageProofSubmission, delivery: &Delivery, gossiped: bool) {
+    quil_engine::storage_epoch_batch::note_archive_answer(
+        &proof.member,
+        &proof.seats,
+        proof_answer(delivery, gossiped),
+    );
 }
 
 /// An archive refusal that asks for a retry: `RESOURCE_EXHAUSTED`, or an
@@ -443,6 +471,7 @@ fn resent(
         return Resent::Done;
     };
     if let Some(proof) = &pending[index].proof {
+        note_answer(proof, delivery, false);
         queue.tally(proof.window_end, |t| {
             t.sent += 1;
             if delivery.accepted > 0 {
@@ -807,6 +836,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             self.start_retries();
         }
         if let Some(proof) = &proof {
+            note_answer(proof, &delivery, publish_bs && bs_result.is_ok());
             self.retry_queue.tally(proof.window_end, |t| {
                 t.sent += 1;
                 if grpc_ok_count > 0 {
@@ -966,6 +996,10 @@ where
             Ok(Err((addr, reason, retry))) => {
                 if retry {
                     delivery.retry += 1;
+                    // The collector's refusal for room (`Refusal::RankFull`).
+                    if reason.contains("rank buffer full") {
+                        delivery.room += 1;
+                    }
                 }
                 if delivery.refusal.is_none() {
                     delivery.refusal = Some(format!("{addr}: {reason}"));
@@ -1354,8 +1388,67 @@ mod tests {
             Delivery {
                 accepted: 1,
                 retry: 1,
+                room: 1,
                 refusal: Some("b: rank buffer full".to_string()),
             }
+        );
+    }
+
+    /// The node's batching hears of a proof as refused for room only when
+    /// nothing else may have landed it: counted as refused, a timed-out
+    /// send an archive took would keep a seat that fails GLOBAL in its
+    /// peers' proofs. Anything else but a take is unknown, which the
+    /// batching counts as a send that may have landed: a timeout, a refusal
+    /// for good, no archive at all, or a gossip publish that went out.
+    #[tokio::test]
+    async fn only_a_refusal_for_room_everywhere_is_answered_as_one() {
+        use quil_engine::storage_epoch_batch::ArchiveAnswer;
+        let answered = |outcomes: &'static [&'static str]| async move {
+            let submit = move |addr: String, _bytes: Vec<u8>| async move {
+                let outcome = outcomes[addr.parse::<usize>().unwrap()];
+                match outcome {
+                    "ok" => Ok::<String, (String, String, bool)>(addr),
+                    "full" => Err((addr, "submit rejected: rank buffer full".to_string(), true)),
+                    "timeout" => Err((addr, "submit rejected: Timeout expired".to_string(), true)),
+                    _ => Err((addr, "submit rejected: invalid".to_string(), false)),
+                }
+            };
+            let addrs = (0..outcomes.len()).map(|i| i.to_string()).collect();
+            fan_out_to_archives(addrs, vec![], submit, false).await
+        };
+        let full = answered(&["full", "full"]).await;
+        println!("REACH i854 archive answers classed");
+        assert_eq!(
+            super::proof_answer(&full, false),
+            ArchiveAnswer::RefusedForRoom,
+            "room_unanswered: a proof every archive refused for room was not answered as one"
+        );
+        assert_eq!(
+            super::proof_answer(&answered(&["full", "invalid"]).await, false),
+            ArchiveAnswer::RefusedForRoom,
+            "room_unanswered: a refusal for good beside one for room hid it"
+        );
+        assert_eq!(
+            super::proof_answer(&answered(&["full", "timeout"]).await, false),
+            ArchiveAnswer::Unknown,
+            "timeout_as_room: a send that may have landed was answered as refused for room"
+        );
+        for outcomes in [&["invalid"][..], &[]] {
+            assert_eq!(
+                super::proof_answer(&answered(outcomes).await, false),
+                ArchiveAnswer::Unknown,
+                "unknown_as_room: {outcomes:?} was not answered as unknown"
+            );
+        }
+        assert_eq!(
+            super::proof_answer(&full, true),
+            ArchiveAnswer::Unknown,
+            "gossip_as_room: a proof gossiped beside refusals for room was answered as refused for room"
+        );
+        assert_eq!(
+            super::proof_answer(&answered(&["full", "ok"]).await, false),
+            ArchiveAnswer::Taken,
+            "taken_unanswered: a proof an archive took was not answered as taken"
         );
     }
 
