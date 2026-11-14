@@ -4,7 +4,9 @@
 //! (`config/config.go:151`); the hex strings are the canonical published keys.
 
 /// The Ed448 public keys (hex) whose quorum signs release digests. Port of Go
-/// `config.Signatories` (`config/config.go:151`).
+/// `config.Signatories` (`config/config.go:151`). `install-qclient.sh` and
+/// `signers/pems` hold copies in the same order; `tests/signatory_copies.rs`
+/// fails when one differs.
 pub const SIGNATORIES: [&str; 17] = [
     "b1214da7f355f5a9edb7bcc23d403bdf789f070cca10db2b4cadc22f2d837afb650944853e35d5f42ef3c4105b802b144b4077d5d3253e4100",
     "de4cfe7083104bfe32f0d4082fa0200464d8b10804a811653eedda376efcad64dd222f0f0ceb0b8ae58abe830d7a7e3f3b2d79d691318daa00",
