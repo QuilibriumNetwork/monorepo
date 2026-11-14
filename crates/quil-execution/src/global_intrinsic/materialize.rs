@@ -1550,6 +1550,30 @@ pub fn materialize_shard_split(
     })
 }
 
+/// The first spine shard a bit-path split of `shard_address` into
+/// `proposed_shards` would register that output addresses reach
+/// ([`quil_forest::bit_path_reaches_outputs`]): an empty shard with no
+/// committee, where an output committed would never be delivered. `None`
+/// when there is none or the filters do not decode (the split is refused
+/// for that by [`materialize_shard_split`]).
+pub fn output_reachable_spine(
+    shard_address: &[u8],
+    proposed_shards: &[Vec<u8>],
+) -> Option<Vec<bool>> {
+    let (_, parent_bits) = quil_forest::decode_shard_filter_or_root(shard_address, 32)?;
+    let child_bits = proposed_shards
+        .iter()
+        .map(|child| quil_forest::decode_shard_bit_path(child, 32).map(|(_, bits)| bits))
+        .collect::<Option<Vec<_>>>()?;
+    let branch = longest_common_bit_prefix(&child_bits);
+    if !branch.starts_with(&parent_bits) {
+        return None;
+    }
+    quil_forest::split_spine_siblings(&parent_bits, &branch)
+        .into_iter()
+        .find(|sibling| quil_forest::bit_path_reaches_outputs(sibling))
+}
+
 /// Deep-bifurcation migration (b): convert an app's stored shard rows from
 /// `Vec<u32>` prefixes to SENTINEL-tagged bit-path prefixes, so a subsequent
 /// deep split can register children that EXTEND one of them. Necessary because

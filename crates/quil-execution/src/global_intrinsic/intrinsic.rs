@@ -959,6 +959,7 @@ impl GlobalIntrinsic {
                         },
                     )?;
                 }
+                Self::refuse_output_reachable_spine(frame_number, &op)?;
                 Ok(true)
             }
             TYPE_SHARD_MERGE => {
@@ -4393,6 +4394,42 @@ impl GlobalIntrinsic {
         .is_ok()
     }
 
+    /// From the strict validation epoch GLOBAL frame `frame_number` refuses
+    /// a bit-path split whose spine would hold an empty shard that output
+    /// addresses reach ([`materialize::output_reachable_spine`]): no
+    /// committee forms there, so an output committed to it would never be
+    /// delivered. Honest proposers never descend past such a region.
+    fn refuse_output_reachable_spine(
+        frame_number: u64,
+        op: &super::prover_ops::ShardSplit,
+    ) -> Result<()> {
+        if !quil_types::consensus::strict_validation_active(frame_number)
+            || frame_number < super::materialize::unified_tree_cutover_frame()
+        {
+            return Ok(());
+        }
+        let Some(spine) =
+            materialize::output_reachable_spine(&op.shard_address, &op.proposed_shards)
+        else {
+            return Ok(());
+        };
+        let path: String = spine
+            .iter()
+            .map(|&bit| if bit { '1' } else { '0' })
+            .collect();
+        tracing::warn!(
+            frame = frame_number,
+            shard = hex::encode(&op.shard_address),
+            spine = %path,
+            "shard split refused: it leaves an empty spine shard that output addresses reach; \
+             the proposer runs a build that descends past such regions"
+        );
+        Err(QuilError::InvalidArgument(format!(
+            "shard split: spine shard {path} of {} is reachable by output addresses",
+            hex::encode(&op.shard_address)
+        )))
+    }
+
     /// ShardSplit invoke_step: register new sub-shard addresses.
     ///
     /// Go equivalent: `ShardSplitOp::Materialize` at
@@ -4470,6 +4507,7 @@ impl GlobalIntrinsic {
             &op.proposed_shards,
             bit_path_mode,
         )?;
+        Self::refuse_output_reachable_spine(frame_number, op)?;
 
         if let (Some(store), true) = (&self.shards_store, self.shard_metadata_writes_enabled) {
             let change = PendingShardChange {
