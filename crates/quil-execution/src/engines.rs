@@ -2727,9 +2727,12 @@ impl HypergraphExecutionEngine {
 
 impl HypergraphExecutionEngine {
     /// Materialize a single hypergraph op (VertexAdd/Remove, HyperedgeAdd/Remove).
+    /// `strict`: the frame executes under the strict validation epoch
+    /// ([`quil_types::consensus::MAINNET_STRICT_VALIDATION_EPOCH`]).
     fn invoke_hypergraph_op(
         &self,
         frame_number: u64,
+        strict: bool,
         inner_bytes: &[u8],
         domain: &[u8],
     ) -> Result<()> {
@@ -2794,6 +2797,17 @@ impl HypergraphExecutionEngine {
             },
         ) = &msg
         {
+            // The metadata vertex holds the configuration and schema the
+            // owner deployed: only the owner's update changes it, as code
+            // execute already refuses that address.
+            if strict
+                && data_address.as_slice()
+                    == &crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS[..]
+            {
+                return Err(QuilError::InvalidArgument(
+                    "hypergraph: vertex address is the application's metadata vertex".into(),
+                ));
+            }
             #[cfg(feature = "confidential-tokens")]
             if state
                 .get(domain, data_address, &va_disc)?
@@ -2992,7 +3006,12 @@ impl HypergraphExecutionEngine {
             _ => {
                 // Vertex add/remove, hyperedge add/remove — existing
                 // materialization path.
-                self.invoke_hypergraph_op(frame_number, inner_bytes, address)
+                let strict = quil_types::consensus::strict_validation_active(
+                    context
+                        .finalized_global_frame
+                        .unwrap_or(context.frame_number),
+                );
+                self.invoke_hypergraph_op(frame_number, strict, inner_bytes, address)
             }
         }
     }

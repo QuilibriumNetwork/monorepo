@@ -384,7 +384,9 @@ fn hypergraph_admission_takes_either_form_and_execution_only_the_bound_one() {
 
 /// Switch on, for this thread, the execution rules the metadata vertex tests
 /// expect from the frame they run at.
-fn strict_writes_from_genesis() {}
+fn strict_writes_from_genesis() {
+    quil_types::consensus::set_strict_validation_epoch_for_thread(Some(0));
+}
 
 /// The write key committed state resolves for `domain`, if any.
 fn resolved_write_key(
@@ -506,4 +508,56 @@ fn the_write_key_cannot_remove_the_metadata_vertex() {
         "METADATA-VERTEX-WRITABLE: a vertex removal at the metadata address applied \
          ({removal:?}) and erased the deployed configuration"
     );
+}
+
+// ---- fix-only tests below ----
+
+/// Until the strict validation epoch a vertex write or removal at the
+/// metadata address applies as before, so every build executes a frame
+/// alike until then; an application frame is judged by its GLOBAL anchor,
+/// not its own number.
+#[test]
+fn metadata_vertex_ops_apply_as_before_until_the_strict_epoch() {
+    quil_types::consensus::set_strict_validation_epoch_for_thread(Some(10));
+    let first = 10 * quil_types::consensus::epoch_length_frames();
+    let metadata = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let at_anchor = |engine: &HypergraphExecutionEngine, domain: &[u8; 32], anchor, inner| {
+        let message = CanonicalMessageRequest::wrap(inner)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let context = quil_types::execution::FrameExecutionContext {
+            frame_number: first + 5,
+            finalized_global_frame: Some(anchor),
+            venue: None,
+            shard: quil_types::execution::ShardPath::WHOLE,
+        };
+        engine
+            .process_message_with_context(context, &num_bigint::BigInt::from(0), domain, &message)
+            .map(|_| ())
+    };
+    for remove in [false, true] {
+        let (owner, write) = (FalconSigner::generate(), FalconSigner::generate());
+        let op = |domain: &[u8; 32]| {
+            if remove {
+                signed_vertex_remove(&write, domain, &metadata)
+            } else {
+                signed_vertex_add(&write, domain, &metadata)
+            }
+        };
+        let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+        let before = at_anchor(&engine, &domain, first - 1, op(&domain));
+        assert!(
+            resolved_write_key(&crdt, &domain).is_none(),
+            "before the epoch the op (remove {remove}) applies as before: {before:?}"
+        );
+        let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+        let from = at_anchor(&engine, &domain, first, op(&domain));
+        assert!(
+            from.is_err()
+                && resolved_write_key(&crdt, &domain) == Some(write.public_key().to_vec()),
+            "from the epoch the op (remove {remove}) is refused: {from:?}"
+        );
+    }
+    quil_types::consensus::set_strict_validation_epoch_for_thread(None);
 }
