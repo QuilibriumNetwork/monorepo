@@ -641,6 +641,9 @@ impl ExecutionEngineManager {
             bundles,
             &PreverifyPacing {
                 executing: ExecutingFrame::Global(frame),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
                 ..Default::default()
             },
         )
@@ -660,6 +663,9 @@ impl ExecutionEngineManager {
             bundles,
             &PreverifyPacing {
                 executing: ExecutingFrame::App(anchor),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
                 ..Default::default()
             },
         )

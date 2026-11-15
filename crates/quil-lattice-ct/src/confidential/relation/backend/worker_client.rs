@@ -507,6 +507,15 @@ impl WorkerVerifier {
         request: &WorkerRequest<'_>,
         timeout: Duration,
     ) -> Result<bool, ClientError> {
+        // A queued frame's verification may wait long for memory: it waits
+        // holding no slot, local or node-wide, then takes them within a
+        // fresh admission wait, so inline verifications meanwhile reach their
+        // own memory admission rather than a slot it holds.
+        let memory_first = self.frame == FrameCheck::Queued;
+        let mut memory = None;
+        if memory_first {
+            memory = self.admit_memory(Instant::now() + self.admission_wait)?;
+        }
         let deadline = Instant::now() + self.admission_wait;
         let _permit = self.acquire_local(deadline)?;
         let _shared = self
@@ -514,11 +523,10 @@ impl WorkerVerifier {
             .as_deref()
             .map(|shared| acquire_shared_until(shared, deadline, self.background))
             .transpose()?;
-        let _memory = self
-            .memory_admission
-            .as_ref()
-            .map(|admit| admit(deadline, self.frame).ok_or(ClientError::Busy))
-            .transpose()?;
+        if !memory_first {
+            memory = self.admit_memory(deadline)?;
+        }
+        let _memory = memory;
         let _held = SlotHeld(Instant::now());
         let bytes = request.encode().map_err(ClientError::Request)?;
         run_worker_capped(
@@ -528,6 +536,15 @@ impl WorkerVerifier {
             self.max_resident_bytes,
         )
         .map_err(ClientError::Process)
+    }
+
+    /// The memory admission's permit ([`Self::with_memory_admission`]) by
+    /// `deadline`: `None` without one, busy when it refuses.
+    fn admit_memory(&self, deadline: Instant) -> Result<Option<MemoryPermit>, ClientError> {
+        self.memory_admission
+            .as_ref()
+            .map(|admit| admit(deadline, self.frame).ok_or(ClientError::Busy))
+            .transpose()
     }
 }
 
@@ -736,6 +753,67 @@ mod tests {
         drop(release);
         assert!(frames.join().unwrap(), "a refused reservation is busy");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A queued frame's verification takes its memory before a worker
+    /// slot; granted memory but finding every slot held by its admission
+    /// wait, it gives the memory back before it returns busy (and is queued
+    /// again), holding none idle meanwhile.
+    #[test]
+    fn a_frames_verification_granted_memory_without_a_slot_gives_it_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct Permit(Arc<AtomicUsize>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+        let granted = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (grants, drops) = (granted.clone(), dropped.clone());
+        let client =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_admission_wait(Duration::from_millis(50))
+                .unwrap()
+                .with_memory_admission(Arc::new(move |_, frame| {
+                    if frame != FrameCheck::Queued {
+                        return None;
+                    }
+                    grants.fetch_add(1, SeqCst);
+                    Some(Box::new(Permit(drops.clone())) as MemoryPermit)
+                }));
+        let request = WorkerRequest {
+            network: [0; 32],
+            application: [0; 32],
+            limits: CompileLimits {
+                max_inputs: 1,
+                max_outputs: 1,
+                max_depth: 1,
+            },
+            submission_bytes: 0,
+            transaction: &[],
+        };
+        let slot = client
+            .acquire_local(Instant::now())
+            .expect("setup: the only worker slot is free");
+        let frame = client.for_frame(FrameCheck::Queued);
+        assert!(
+            matches!(frame.verify(&request), Err(ClientError::Busy)),
+            "a check finding no worker slot is busy"
+        );
+        assert_eq!(
+            granted.load(SeqCst),
+            1,
+            "setup: memory was granted before the slot was looked for"
+        );
+        assert_eq!(
+            dropped.load(SeqCst),
+            1,
+            "memory_kept_after_busy: a frame's check that found no worker slot kept the \
+             memory it was granted"
+        );
+        drop(slot);
     }
 
     /// Each verification's slot time adds to the busy total when it ends,

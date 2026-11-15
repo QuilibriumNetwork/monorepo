@@ -5,7 +5,7 @@
 //! short deadline.
 
 use super::*;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::mpsc;
 
 const GIB: u64 = 1 << 30;
@@ -570,5 +570,394 @@ fn work_due_now_elsewhere_starts_once_stopping_ends_a_frames_check() {
         End::Stop,
         "due_held_after_stopping_ended_the_frame_check_elsewhere: work due now still \
          waited once stopping ended another process's frame check",
+    );
+}
+
+/// A frame's check waiting only for a job slot, its memory fitting, waits
+/// for no memory: its process's record holds back no work due now in the
+/// host's others, which would drain their memory for nothing.
+#[test]
+fn a_frames_check_waiting_for_a_job_slot_holds_back_nothing_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Admission::new(6, Box::new(|| Some(8 * GIB)));
+    storage.strict_due = true;
+    assert!(storage.use_ledger(HostLedger::open_as(dir.path(), "storage").unwrap()));
+    let storage: &'static Admission = Box::leak(Box::new(storage));
+    let mut verifier = Admission::new(1, Box::new(|| Some(8 * GIB)));
+    verifier.strict_due = true;
+    verifier.pressure = warning;
+    verifier.stopping = running;
+    verifier.frame_verifier_wait = PLACE;
+    assert!(verifier.use_ledger(HostLedger::open_as(dir.path(), "verifier").unwrap()));
+    let verifier: &'static Admission = Box::leak(Box::new(verifier));
+    let slot = verifier
+        .reserve_until(MIB, Urgency::Due, &|| false)
+        .expect("setup: the verifier's one job slot is free");
+    let frame = check(verifier, FrameCheck::Queued);
+    until(
+        "setup: a pass found the frame's check waiting for the one job slot",
+        || {
+            let state = verifier.state();
+            state.holders == 1
+                && state
+                    .waiting
+                    .iter()
+                    .any(|waiting| waiting.bytes == 3 * GIB && waiting.ticket < state.passed_below)
+        },
+    );
+    assert!(
+        !storage.ledger.get().unwrap().others().frame_waiting,
+        "frame_waiting_published_for_a_job_slot: a frame's check waiting only for a job \
+         slot held back the host's other processes' work due now"
+    );
+    drop(slot);
+    assert!(
+        returned(&frame, "the check returns").is_some(),
+        "setup: the frame's check fits once the job slot is free"
+    );
+}
+
+/// Which of a frame's check and the work due now on their receivers a pass
+/// granted first: `true` for the work due now.
+fn first_granted(
+    check: &mpsc::Receiver<Option<Reservation>>,
+    due: &mpsc::Receiver<Option<Reservation>>,
+) -> (bool, Option<Reservation>) {
+    let hang = Instant::now() + HANG;
+    loop {
+        if let Ok(granted) = due.try_recv() {
+            return (true, granted);
+        }
+        if let Ok(granted) = check.try_recv() {
+            return (false, granted);
+        }
+        assert!(Instant::now() < hang, "setup: neither was granted");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Frames' checks one after another, each waiting while the one before
+/// runs, hold work due now back for [`PASS_LIMIT`] of them granted, no
+/// more: then it takes its place, starts once the check running ends, and
+/// the next check waits for it. Work due now larger than a check, so the
+/// checks come first in line.
+#[test]
+fn work_due_now_held_back_by_a_stream_of_frames_checks_starts_at_the_bound() {
+    let admission: &'static Admission =
+        Box::leak(Box::new(strict(7 * GIB, warning, running, PLACE)));
+    let share = {
+        let mut state = admission.state();
+        admission.share(&mut state).expect("setup: memory is known")
+    };
+    assert!(
+        (4 * GIB..6 * GIB).contains(&share),
+        "setup: a check or the work due now fits the share alone, not two beside each other"
+    );
+    let mut running = returned(&check(admission, FrameCheck::Queued), "the first check")
+        .expect("setup: the first check fits the share");
+    let mut next = check(admission, FrameCheck::Queued);
+    until("setup: the next check waits for memory", || {
+        frame_waits(admission)
+    });
+    let due = due(admission, 4 * GIB);
+    held(
+        admission,
+        &due,
+        "setup: the work due now started beside a check",
+    );
+    assert_eq!(
+        admission.state().frame_held.len(),
+        1,
+        "setup: the waiting check held the work due now back"
+    );
+    for granted in 1..=PASS_LIMIT + 1 {
+        drop(running);
+        let (due_first, reservation) = first_granted(&next, &due);
+        let reservation = reservation.expect("setup: granted, not given up");
+        if granted <= PASS_LIMIT {
+            assert!(
+                !due_first,
+                "due_started_before_the_bound: work due now passed check {granted}"
+            );
+        } else {
+            assert!(
+                due_first,
+                "frame_hold_unbounded: check {granted} passed work due now held back past \
+                 {PASS_LIMIT} checks granted"
+            );
+            assert!(frame_waits(admission), "setup: the next check still waits");
+            drop(reservation);
+            assert!(
+                returned(&next, "the next check returns").is_some(),
+                "frame_check_not_run_once_the_work_due_now_ended"
+            );
+            return;
+        }
+        running = reservation;
+        next = check(admission, FrameCheck::Queued);
+        until("setup: the next check waits for memory", || {
+            frame_waits(admission)
+        });
+    }
+}
+
+/// Another process's work due now held back past its bound, as its record
+/// says, keeps this process's frames' checks from starting, alone or
+/// within the share; they start once it no longer waits.
+#[test]
+fn a_frames_check_waits_while_work_due_now_elsewhere_takes_its_place() {
+    let admission: &'static Admission = Box::leak(Box::new(strict(
+        0,
+        warning,
+        running,
+        Duration::from_millis(200),
+    )));
+    admission.state().others.due_overdue = true;
+    assert!(
+        returned(&check(admission, FrameCheck::Queued), "the check returns").is_none(),
+        "frame_check_passed_due_overdue_elsewhere: a frame's check started while another \
+         process's work due now held back past its bound waited"
+    );
+    admission.state().others.due_overdue = false;
+    assert!(
+        returned(&check(admission, FrameCheck::Queued), "the check returns").is_some(),
+        "setup: the check runs alone once nothing waits elsewhere"
+    );
+}
+
+/// What the verifier's process of
+/// [`work_due_now_elsewhere_held_back_past_its_window_takes_its_place`]
+/// has available: none until the test lets its frame's check fit.
+static VERIFIER_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+/// [`VERIFIER_AVAILABLE`] of
+/// [`a_frames_check_starts_once_the_only_work_due_now_past_its_window_gives_up`].
+static GIVEN_UP_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the work due now of
+/// [`a_frames_check_starts_once_the_only_work_due_now_past_its_window_gives_up`]
+/// is of no use any more.
+static GIVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// The window a test's work due now is held back for by frames' checks
+/// ([`PASS_WINDOW`]): short, so a window never checked shows in seconds.
+const HOLD_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long a test waits for what [`HOLD_WINDOW`] ends: work due now
+/// waiting looks again every [`RECHECK`], late under parallel load.
+const HOLD_ENDS: Duration = Duration::from_secs(30);
+
+/// Panics with `what` unless `done` holds within `limit`.
+fn within(limit: Duration, what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < until, "{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Work due now in the storage process held back only by a frame's check
+/// waiting in the verifier's: no frame's check is granted in the storage
+/// process, so only [`PASS_WINDOW`] ends the hold. At the window, work
+/// that fits beside the jobs holding memory starts. Work that does not
+/// takes its place: the storage process's record says so, the verifier's
+/// check waits though it fits, and starts once that work has started and
+/// the record no longer says so.
+#[test]
+fn work_due_now_elsewhere_held_back_past_its_window_takes_its_place() {
+    let (_dir, storage, verifier) = two_processes(&VERIFIER_AVAILABLE);
+    let share = 8 * GIB * MEMORY_SHARE_PERCENT / 100;
+    let first = storage.reserve(MIB);
+    let frame = check(verifier, FrameCheck::Queued);
+    let second = past_the_window(&second_due(storage, share));
+    // Fits only once the second job ends, and would fit alone.
+    let third = due(storage, share / 2 + 2 * MIB);
+    within(
+        HOLD_ENDS,
+        "due_overdue_unpublished: the verifier's process never read that work due now \
+         elsewhere waited past its window",
+        || verifier.ledger.get().unwrap().others().due_overdue,
+    );
+    VERIFIER_AVAILABLE.store(64 * GIB, Ordering::SeqCst);
+    let after = verifier.state().passes;
+    until(
+        "setup: the verifier's process passed over its check",
+        || verifier.state().passes > after + 2,
+    );
+    assert!(
+        matches!(frame.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "frame_check_passed_due_overdue_published: a frame's check that fits started while \
+         another process's record said its work due now waited past its window"
+    );
+    drop(second);
+    let third = returned(&third, "the work due now returns");
+    assert!(
+        third.is_some(),
+        "due_overdue_never_started: work due now past its window did not start once it fit"
+    );
+    within(
+        HOLD_ENDS,
+        "due_overdue_sticky: the storage process's record still said its work due now \
+         waited past its window once it started",
+        || !verifier.ledger.get().unwrap().others().due_overdue,
+    );
+    assert!(
+        returned(&frame, "the check returns").is_some(),
+        "frame_check_not_run_once_due_started: a frame's check that fits waited once the \
+         work due now it waited for started"
+    );
+    drop((first, third));
+}
+
+/// Work due now past its window that gives up while it waits, the only
+/// such work in the storage process, no longer holds back frames'
+/// checks: its process runs no pass after (nothing else waits there), so
+/// the record it writes as it leaves must say so, or the verifier's
+/// check, which fits, would wait until that process's next reservation.
+#[test]
+fn a_frames_check_starts_once_the_only_work_due_now_past_its_window_gives_up() {
+    let (_dir, storage, verifier) = two_processes(&GIVEN_UP_AVAILABLE);
+    let share = 8 * GIB * MEMORY_SHARE_PERCENT / 100;
+    let first = storage.reserve(MIB);
+    let frame = check(verifier, FrameCheck::Queued);
+    let second = past_the_window(&second_due(storage, share));
+    // Fits only once the second job ends, and would fit alone.
+    let (sender, third) = mpsc::channel();
+    std::thread::spawn(move || {
+        let expired = || GIVE_UP.load(Ordering::SeqCst);
+        let _ = sender.send(storage.reserve_until(share / 2 + 2 * MIB, Urgency::Due, &expired));
+    });
+    within(
+        HOLD_ENDS,
+        "setup: the verifier's process never read that work due now elsewhere waited past \
+         its window",
+        || verifier.ledger.get().unwrap().others().due_overdue,
+    );
+    GIVEN_UP_AVAILABLE.store(64 * GIB, Ordering::SeqCst);
+    let after = verifier.state().passes;
+    until(
+        "setup: the verifier's process passed over its check",
+        || verifier.state().passes > after + 2,
+    );
+    assert!(
+        matches!(frame.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "setup: a frame's check started while work due now elsewhere waited past its window"
+    );
+    GIVE_UP.store(true, Ordering::SeqCst);
+    assert!(
+        returned(&third, "the work due now returns").is_none(),
+        "setup: the work due now past its window started instead of giving up"
+    );
+    assert!(
+        storage.state().waiting.is_empty(),
+        "setup: work still waits in the storage process"
+    );
+    let frame = frame.recv_timeout(HOLD_ENDS).unwrap_or_else(|error| {
+        panic!(
+            "due_overdue_stale_on_leave: a frame's check that fits still waited after the \
+             only work due now elsewhere past its window gave up: {error}"
+        )
+    });
+    assert!(frame.is_some(), "setup: the frame's check gave up");
+    drop((first, second, frame));
+}
+
+/// A storage process and a verifier's process on one host, sharing a
+/// ledger in the returned directory: the storage process's work due now
+/// is held back by frames' checks for [`HOLD_WINDOW`]; the verifier's has
+/// `available` and runs its frames' checks at warning pressure.
+fn two_processes(
+    available: &'static AtomicU64,
+) -> (tempfile::TempDir, &'static Admission, &'static Admission) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Admission::new(6, Box::new(|| Some(8 * GIB)));
+    storage.strict_due = true;
+    storage.pass_window = HOLD_WINDOW;
+    assert!(storage.use_ledger(HostLedger::open_as(dir.path(), "storage").unwrap()));
+    let storage: &'static Admission = Box::leak(Box::new(storage));
+    let mut verifier = Admission::new(6, Box::new(move || Some(available.load(Ordering::SeqCst))));
+    verifier.strict_due = true;
+    verifier.pressure = warning;
+    verifier.stopping = running;
+    verifier.frame_verifier_wait = HANG;
+    assert!(verifier.use_ledger(HostLedger::open_as(dir.path(), "verifier").unwrap()));
+    let verifier: &'static Admission = Box::leak(Box::new(verifier));
+    (dir, storage, verifier)
+}
+
+/// Work due now of half the storage process's `share` there, once the
+/// verifier's frame's check waits and its record says so: it fits beside
+/// a small job, so only that check holds it back.
+fn second_due(storage: &'static Admission, share: u64) -> mpsc::Receiver<Option<Reservation>> {
+    until(
+        "setup: the frame's check waits in the verifier's process, and its record says so",
+        || storage.ledger.get().unwrap().others().frame_waiting,
+    );
+    let second = due(storage, share / 2);
+    held(
+        storage,
+        &second,
+        "setup: work due now started while another process's frame check waited",
+    );
+    second
+}
+
+/// The work due now on `second`, held back only by another process's
+/// frame's check, once [`HOLD_WINDOW`] ends the hold.
+fn past_the_window(second: &mpsc::Receiver<Option<Reservation>>) -> Reservation {
+    second
+        .recv_timeout(HOLD_ENDS)
+        .unwrap_or_else(|error| {
+            panic!(
+                "due_held_past_its_window_elsewhere: work due now held back only by another \
+                 process's frame check still waited past the window: {error}"
+            )
+        })
+        .expect("setup: the work due now started")
+}
+
+/// Work due now held back past its bound that does not fit even once no
+/// job holds memory does not take its place: frames' checks waiting for
+/// it would never run, and no frame would execute. The next check runs
+/// alone once the one running ends.
+#[test]
+fn a_frames_check_runs_past_held_back_work_that_would_never_fit() {
+    let admission: &'static Admission = Box::leak(Box::new(strict(0, warning, running, PLACE)));
+    let first = returned(&check(admission, FrameCheck::Queued), "the first check")
+        .expect("setup: the first check runs alone");
+    let next = check(admission, FrameCheck::Queued);
+    until("setup: the next check waits for memory", || {
+        frame_waits(admission)
+    });
+    let due = due(admission, MIB);
+    held(
+        admission,
+        &due,
+        "setup: the work due now started beside a check",
+    );
+    {
+        let mut state = admission.state();
+        assert!(
+            admission.share(&mut state).is_some_and(|share| share < MIB),
+            "setup: the work due now does not fit the share"
+        );
+        assert_eq!(
+            state.frame_held.len(),
+            1,
+            "setup: the waiting check held the work due now back"
+        );
+        for held in state.frame_held.values_mut() {
+            held.grants = PASS_LIMIT;
+        }
+    }
+    drop(first);
+    assert!(
+        returned(&next, "the next check returns").is_some(),
+        "frame_check_kept_behind_work_that_never_fits: a frame's check waited for held \
+         back work due now that does not fit with no job holding memory"
+    );
+    assert!(
+        matches!(due.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "setup: the work due now still waits"
     );
 }

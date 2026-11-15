@@ -63,7 +63,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use quil_execution::manager::PreverifyCounts;
+use quil_execution::manager::{FrameCheck, PreverifyCounts};
 use tracing::{info, warn};
 
 /// Verifies one submission's confidential proofs, filling the verdict cache.
@@ -1102,6 +1102,11 @@ fn submission_job(
             &quil_execution::manager::PreverifyPacing {
                 parallelism: Some(1),
                 background: !verifying_for_frame(),
+                frame: if verifying_for_frame() {
+                    FrameCheck::Queued
+                } else {
+                    FrameCheck::No
+                },
                 executing,
                 ..Default::default()
             },
@@ -1546,6 +1551,43 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
         assert!(!queue.pending(&[7; 32]));
         assert_eq!(queue.stats().requeued, MAX_ATTEMPTS as usize - 1);
+    }
+
+    /// A verification a frame waits on that found no worker slot, having
+    /// given back any memory it was granted for want of one, is first again,
+    /// ahead of other frames' submissions, not retried after them.
+    #[test]
+    fn a_busy_verification_a_frame_waits_on_is_first_again() {
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tries = Arc::new(AtomicUsize::new(0));
+        let counted = tries.clone();
+        let busy_once: AdmissionJob = Arc::new(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                busy()
+            } else {
+                verified()
+            }
+        });
+        assert!(queue.offer([1; 32], 10, 1, busy_once, true));
+        assert!(queue.offer([2; 32], 10, 1, job(&runs, verified()), true));
+        assert_eq!(
+            order(&queue),
+            vec![[1; 32], [2; 32]],
+            "setup: in arrival order"
+        );
+        assert!(queue.run_one());
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "setup: the first ran once");
+        assert_eq!(
+            order(&queue),
+            vec![[1; 32], [2; 32]],
+            "busy_frame_check_not_first_again: a frame's busy verification went behind \
+             another frame's"
+        );
+        assert_eq!(queue.stats().requeued, 1);
+        while queue.run_one() {}
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+        assert!(!queue.pending(&[1; 32]) && !queue.pending(&[2; 32]));
     }
 
     /// A verification that fails in the worker is retried after the rest of
