@@ -77,7 +77,10 @@ impl Default for GlobalParentLimits {
             },
             max_ancestors: 32,
             max_ancestry_bytes: 64 << 20,
-            max_proposal_message_bytes: 8 << 20,
+            // The seal share (8 MiB, `SEAL_BYTES_PER_PROPOSAL`) beside a
+            // third for shard proofs; under the 15 MiB finalized-frame gossip
+            // ceiling and `MAX_GLOBAL_FRAME_BYTES` with room for the rest.
+            max_proposal_message_bytes: 12 << 20,
             max_proposal_message_items: 100_000,
             max_elapsed: Duration::from_secs(60),
             max_kept_age: MAX_KEPT_EXECUTION_AGE,

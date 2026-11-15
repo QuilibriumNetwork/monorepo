@@ -117,13 +117,13 @@ fn one_seat_proofs(
 /// One-seat proofs their members delivered, ids from 1 on, filling a
 /// proposal's storage proof budget but for 1,000 bytes; how many.
 fn fill_frame(mc: &MessageCollector) -> u32 {
-    let bytes = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME - 1_000;
+    let bytes = SEAL_BYTES_PER_PROPOSAL - 1_000;
     one_seat_proofs(1, bytes, |id, proof| send(mc, id, &proof)) - 1
 }
 
 /// The keys of the messages a proposal takes.
 fn proposal(mc: &MessageCollector) -> HashSet<[u8; 32]> {
-    mc.snapshot_for_proposal(1, 16 << 20, 10_000, None, &[])
+    mc.snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, None, &[])
         .unwrap()
         .iter()
         .map(|(data, _)| message_key(data))
@@ -163,7 +163,7 @@ fn a_proposal_carries_the_denser_proofs_due_together_first() {
 #[test]
 fn proofs_not_their_members_first_ride_in_arrival_order() {
     let mc = collector();
-    let per_frame = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME / LEN;
+    let per_frame = SEAL_BYTES_PER_PROPOSAL / LEN;
     for id in 1..=per_frame as u32 {
         assert_eq!(send(&mc, id, &settling(id, 1)), SubmitOutcome::Accepted);
     }
@@ -243,7 +243,7 @@ fn a_sender_not_an_active_prover_rides_in_arrival_order() {
         SubmitOutcome::Accepted
     );
     // Then proofs from senders no one names fill it but for 1,000 bytes.
-    let bytes = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME - LEN - 1_000;
+    let bytes = SEAL_BYTES_PER_PROPOSAL - LEN - 1_000;
     let others = one_seat_proofs(1, bytes, |_, proof| {
         mc.add_message_outcome_from(1, proof, Provenance::Other)
     }) - 1;

@@ -48,7 +48,9 @@ pub fn inclusion_model(
     let mut credit = 0u64;
     for frame in 1..=100_000u64 {
         // Accumulated share permits a single large, indivisible proof to fit
-        // within the actual 4 MiB cap, without assuming the whole channel.
+        // within one proof's 4 MiB bound, without assuming the whole channel.
+        // A frame carries at least that much of them (an older leader's
+        // share; a current leader's is 8 MiB), so the model stays cautious.
         credit = credit.saturating_add(budget).min(frame_bytes);
         // Locally initialized sectors remain pending until the worker sees
         // their committed acknowledgment in the following frame.

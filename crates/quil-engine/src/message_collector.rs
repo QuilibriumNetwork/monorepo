@@ -18,6 +18,8 @@ mod cert_union;
 #[cfg(test)]
 mod seal_deadline_tests;
 #[cfg(test)]
+mod seal_share_tests;
+#[cfg(test)]
 mod seat_density_tests;
 pub(crate) use cert_union::order_copies_by_signers;
 pub use cert_union::{session_committees, Committee, CommitteeSource};
@@ -71,8 +73,8 @@ struct CollectedMessage {
     /// Its shard frames passed the collector's verifier (or that of the public
     /// collector a private proposal copied it from).
     verified: bool,
-    /// It carries a storage epoch proof, which a proposal takes only up to
-    /// `STORAGE_SEAL_BYTES_PER_FRAME`.
+    /// It carries a storage epoch proof, which a proposal takes within
+    /// [`SEAL_BYTES_PER_PROPOSAL`] and the room every other message leaves.
     seal: bool,
     /// Its share of a rank and of a proposal.
     class: Class,
@@ -152,8 +154,9 @@ impl CollectedMessage {
 
     /// A storage epoch proof that is neither a capacity message (those have
     /// shares of their own) nor a shard proof: a proposal takes it within
-    /// `STORAGE_SEAL_BYTES_PER_FRAME`, and the GLOBAL collector holds such
-    /// proofs within [`SEAL_BYTES_HELD`] or [`OTHER_SEAL_BYTES_HELD`].
+    /// [`SEAL_BYTES_PER_PROPOSAL`] and the room left, and the GLOBAL
+    /// collector holds such proofs within [`SEAL_BYTES_HELD`] or
+    /// [`OTHER_SEAL_BYTES_HELD`].
     fn held_seal(&self) -> bool {
         self.seal && !self.proof && self.capacity.is_none()
     }
@@ -460,9 +463,23 @@ const MAX_BYTES_PER_RANK: usize = 64 * 1024 * 1024;
 /// Room in each rank of the GLOBAL collector only [`Class::Reserved`]
 /// messages (shard frame headers and storage epoch proofs) may use, so a
 /// flood of any other class cannot refuse them. A rank holds about one header
-/// per shard and storage epoch proofs of about 0.5-0.75 MB each.
+/// per shard and storage epoch proofs of about 0.5-0.75 MB each. The proofs
+/// are held across all ranks within their shares ([`SEAL_BYTES_HELD`],
+/// [`OTHER_SEAL_BYTES_HELD`]) and one rank may hold all of them, so the room
+/// covers both shares and [`HEADER_BYTES_PER_RANK`] beside them. A quarter
+/// of the rank (16 MiB) no longer did once the shares grew to 22 MiB
+/// (2026-11-15): with both full beside a flood, every header was refused.
+/// The other classes keep 36 MiB, three proposals' worth.
 const RESERVED_MESSAGES_PER_RANK: usize = MAX_MESSAGES_PER_RANK / 4;
-const RESERVED_BYTES_PER_RANK: usize = MAX_BYTES_PER_RANK / 4;
+const RESERVED_BYTES_PER_RANK: usize = 28 << 20;
+
+/// Bytes of a rank's reserved room shard frame headers keep with both shares
+/// of held storage epoch proofs full: what they kept before the shares grew
+/// (16 MiB less 6 and 4 MiB).
+const HEADER_BYTES_PER_RANK: usize = 6 << 20;
+const _: () = assert!(
+    SEAL_BYTES_HELD + OTHER_SEAL_BYTES_HELD + HEADER_BYTES_PER_RANK <= RESERVED_BYTES_PER_RANK
+);
 
 /// The share of a rank persistent-sector capacity messages may hold. A
 /// certificate is about 800 KB, so this holds about 20, four times what a
@@ -486,6 +503,18 @@ const CAPACITY_BYTES_PER_MEMBER: usize = 4 << 20;
 const CAPACITY_MESSAGES_PER_PROPOSAL: usize = 256;
 const CAPACITY_BYTES_PER_PROPOSAL: usize = 2 << 20;
 
+/// Bytes of storage epoch proofs a GLOBAL proposal takes ahead of shard
+/// proofs beyond their floor, other messages left waiting and capacity
+/// messages ([`MessageCollector::snapshot_for_proposal`]); past it a proof
+/// rides only in the room every other message leaves. Twice
+/// `STORAGE_SEAL_BYTES_PER_FRAME`, which stays the bound on one proof: at
+/// 4 MiB a frame, one epoch boundary's settlements took 10-25 minutes to
+/// ride while archives refused most sends for room (2026-11-15). No voter
+/// or executor bounds a frame's proof bytes, only its encoded size
+/// (`MAX_GLOBAL_FRAME_BYTES`), so this is leader policy: a leader of an
+/// older build carries 4 MiB, and frames of either build pass every vote.
+pub(crate) const SEAL_BYTES_PER_PROPOSAL: usize = 8 << 20;
+
 /// Bytes of storage epoch proofs ([`CollectedMessage::held_seal`]) from this
 /// node and active provers the GLOBAL collector holds across all its ranks:
 /// what this archive's own frames carry before a held proof ages out. A
@@ -494,10 +523,11 @@ const CAPACITY_BYTES_PER_PROPOSAL: usize = 2 << 20;
 /// can ride the `RETENTION_WINDOW + 1` frames that finalize after it arrives
 /// ([`MessageCollector::prune_after_finalization`]); GLOBAL leaders take
 /// turns, so in a committee of up to five archives this one leads at least
-/// two of them, and two frames carry at least 2 × (4 MiB − 1 MiB) of proofs
-/// under 1 MiB each (`STORAGE_SEAL_BYTES_PER_FRAME`). A proposal takes the
-/// held proof whose window ends soonest first, and of those the oldest, so
-/// each one accepted rides a frame before it ages out; when the share is
+/// two of them, and two frames carry at least
+/// 2 × ([`SEAL_BYTES_PER_PROPOSAL`] − 1 MiB) of proofs under 1 MiB each
+/// (`STORAGE_SEAL_BYTES_PER_FRAME`). A proposal takes the held proof whose
+/// window ends soonest first, and of those the oldest, so each one accepted
+/// rides a frame before it ages out; when the share is
 /// full, a proof whose window ends sooner takes the room of those whose
 /// windows end latest ([`evict_later_seals`]), and the rest are refused
 /// retryably and their senders resend them. Held without
@@ -507,16 +537,15 @@ const CAPACITY_BYTES_PER_PROPOSAL: usize = 2 << 20;
 /// submits of every kind were refused (2026-11-09). Held up to what ten
 /// frames of one leader carry, a third of the proofs accepted aged out when
 /// four archives led in turn.
-const SEAL_BYTES_HELD: usize =
-    2 * (quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME - (1 << 20));
+const SEAL_BYTES_HELD: usize = 2 * (SEAL_BYTES_PER_PROPOSAL - (1 << 20));
 
 /// Bytes of storage epoch proofs from any other sender (a peer this node does
 /// not know as an active prover) the GLOBAL collector holds across all its
-/// ranks, apart from [`SEAL_BYTES_HELD`]: one frame's seal budget. A proposal
+/// ranks, apart from [`SEAL_BYTES_HELD`]: one proposal's seal share. A proposal
 /// takes them after the provers' proofs, so they neither refuse nor delay
 /// one, and they ride the first frame the provers' proofs leave room in. A
 /// prover's own copy of one moves it to the provers' share.
-const OTHER_SEAL_BYTES_HELD: usize = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+const OTHER_SEAL_BYTES_HELD: usize = SEAL_BYTES_PER_PROPOSAL;
 
 /// How often held storage epoch proofs that aged out without riding a frame
 /// are summarized ([`MessageCollector::prune_after_finalization`]).
@@ -3146,11 +3175,13 @@ impl MessageCollector {
     /// verified, so a private copy keeps that ([`Self::add_verified_message`]).
     ///
     /// The budget is shared, not first come first served. Shard proofs are
-    /// guaranteed half of it and other messages (joins, leaves, kicks,
-    /// settlements) the other half; either takes what the other leaves. Other
-    /// messages go newest rank first, storage epoch proofs after them by the
-    /// end of their window, soonest first, and none past its window
-    /// ([`SEAL_BYTES_HELD`]); of those due together, each member's first
+    /// guaranteed half of it (a third of a GLOBAL proposal's) and other
+    /// messages (joins, leaves, kicks, settlements) the rest; either takes
+    /// what the other leaves. Other messages go newest rank first, storage
+    /// epoch proofs after them by the end of their window, soonest first,
+    /// and none past its window ([`SEAL_BYTES_HELD`]), up to their share
+    /// ([`SEAL_BYTES_PER_PROPOSAL`]) and then in the room every other
+    /// message leaves; of those due together, each member's first
     /// that may ride ahead first, by its seats per byte
     /// ([`CollectedMessage::density_member`]), then the rest oldest first.
     /// Shard proofs go a shard at a time, the
@@ -3327,7 +3358,15 @@ impl MessageCollector {
             |candidates: &[Candidate]| candidates.iter().map(|c| c.2.data.len()).sum::<usize>();
         let proof_bytes =
             size(&bundles) + groups.iter().map(|(_, picks)| size(picks)).sum::<usize>();
-        let others_cap = max_bytes - proof_bytes.min(max_bytes / 2);
+        // Shard proofs keep a floor of the budget: half of it, and a third
+        // of a GLOBAL proposal's (4 MiB of 12), so the other messages keep
+        // room for the storage epoch proofs' share beside their own.
+        let proof_floor = if frame.is_some() {
+            max_bytes / 3
+        } else {
+            max_bytes / 2
+        };
+        let others_cap = max_bytes - proof_bytes.min(proof_floor);
         let mut copied = Copied {
             taken: Vec::new(),
             bytes: 0,
@@ -3335,8 +3374,11 @@ impl MessageCollector {
         };
         let mut waiting = Vec::new();
         // Storage epoch proofs are large (about 0.5–0.75 MB each) and cluster
-        // after each epoch's snapshot; past their share they wait.
-        let seal_budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        // after each epoch's snapshot. Past their share they wait for the
+        // room every other message leaves (`beyond`), in their order: until
+        // 2026-11-15 they waited for a later frame although this one had
+        // room, and an epoch boundary's settlements took 10-25 minutes.
+        let seal_budget = SEAL_BYTES_PER_PROPOSAL;
         let seal_len = |candidate: &Candidate| {
             if candidate.2.seal {
                 candidate.2.data.len()
@@ -3345,15 +3387,15 @@ impl MessageCollector {
             }
         };
         let mut seal_bytes = 0usize;
-        let mut seals_left = 0usize;
-        for candidate in others {
+        let mut beyond = Vec::new();
+        for (order, candidate) in others.into_iter().enumerate() {
             let len = seal_len(&candidate);
             if seal_bytes + len > seal_budget {
-                seals_left += 1;
+                beyond.push((order, candidate));
             } else if copied.take(vec![candidate], others_cap) {
                 seal_bytes += len;
             } else {
-                waiting.push(candidate);
+                waiting.push((order, candidate));
             }
         }
         let proofs = bundles.len() + groups.len();
@@ -3367,13 +3409,15 @@ impl MessageCollector {
                 proofs_left += 1;
             }
         }
-        let mut others_left = seals_left;
-        for candidate in waiting {
+        let mut others_left = 0usize;
+        for (order, candidate) in waiting {
             let len = seal_len(&candidate);
-            if seal_bytes + len > seal_budget || !copied.take(vec![candidate], max_bytes) {
-                others_left += 1;
-            } else {
+            if seal_bytes + len > seal_budget {
+                beyond.push((order, candidate));
+            } else if copied.take(vec![candidate], max_bytes) {
                 seal_bytes += len;
+            } else {
+                others_left += 1;
             }
         }
         // Capacity messages go last, behind every storage epoch proof in the
@@ -3395,6 +3439,17 @@ impl MessageCollector {
                 seal_bytes += len;
             }
         }
+        beyond.sort_unstable_by_key(|(order, _)| *order);
+        let mut seals_beyond = 0usize;
+        for (_, candidate) in beyond {
+            let len = candidate.2.data.len();
+            if copied.take(vec![candidate], max_bytes) {
+                seal_bytes += len;
+                seals_beyond += 1;
+            } else {
+                others_left += 1;
+            }
+        }
         if proofs_left + others_left + capacity_left > 0 {
             match frame {
                 Some(frame) => tracing::info!(
@@ -3405,6 +3460,9 @@ impl MessageCollector {
                     others_left,
                     capacity_taken,
                     capacity_left,
+                    seal_bytes,
+                    seal_share = seal_budget,
+                    seals_beyond,
                     bytes = copied.bytes,
                     max_bytes,
                     max_items,
@@ -4859,15 +4917,16 @@ mod tests {
         quil_types::consensus::set_required_anchor_epoch_for_thread(None);
     }
 
-    /// Storage epoch proofs share at most `STORAGE_SEAL_BYTES_PER_FRAME` of a
-    /// proposal; the rest wait for a later one, behind nothing else.
+    /// Storage epoch proofs take at most their share
+    /// ([`SEAL_BYTES_PER_PROPOSAL`]) of a proposal with no room left past it;
+    /// the rest wait for a later one, behind nothing else.
     #[test]
     fn a_proposal_takes_seal_proofs_only_up_to_their_budget() {
         use quil_execution::global_intrinsic::storage_epoch_proof::{
             StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
         };
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let budget = SEAL_BYTES_PER_PROPOSAL;
         let seal = |member: u8| {
             let seal = StorageEpochProof {
                 member: [member; 32],
@@ -4894,9 +4953,7 @@ mod tests {
         assert!(mc.add_message(1, seal(1)));
         assert!(mc.add_message(1, seal(2)));
         assert!(mc.add_message(1, b"other".to_vec()));
-        let taken = mc
-            .snapshot_for_proposal(1, 4 * budget, 100, None, &[])
-            .unwrap();
+        let taken = mc.snapshot_for_proposal(1, budget, 100, None, &[]).unwrap();
         assert_eq!(taken.len(), 2, "one seal and the other message");
         assert!(taken.iter().any(|(data, _)| data == b"other"));
         let first: Vec<Vec<u8>> = taken
@@ -4905,7 +4962,7 @@ mod tests {
             .filter(|d| d != b"other")
             .collect();
         let next = mc
-            .snapshot_for_proposal(1, 4 * budget, 100, None, &first)
+            .snapshot_for_proposal(1, budget, 100, None, &first)
             .unwrap();
         assert_eq!(
             next.len(),
@@ -5066,6 +5123,48 @@ mod tests {
             mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 1)),
             SubmitOutcome::Accepted,
             "class-share reserved-room: a shard header refused once other messages filled the rank"
+        );
+        // One rank may hold both shares of storage epoch proofs in full, and
+        // a flood beside them still leaves a shard header room.
+        let mc = global_collector();
+        let held = |ids: std::ops::RangeInclusive<u32>, provenance: Provenance| {
+            ids.map(|id| numbered_epoch_proof(id, 650_000))
+                .take_while(|proof| {
+                    mc.add_message_outcome_from(1, proof.clone(), provenance)
+                        == SubmitOutcome::Accepted
+                })
+                .map(|proof| proof.len())
+                .sum::<usize>()
+        };
+        let size = numbered_epoch_proof(0, 650_000).len();
+        let provers = held(1..=40, Provenance::Prover);
+        let others = held(101..=140, Provenance::Other);
+        assert!(
+            provers <= SEAL_BYTES_HELD
+                && provers + size > SEAL_BYTES_HELD
+                && others <= OTHER_SEAL_BYTES_HELD
+                && others + size > OTHER_SEAL_BYTES_HELD,
+            "class-share reserved-room: one rank held {provers} and {others} bytes of storage epoch proofs, not both shares"
+        );
+        // Other messages from 1 MiB down to 16 bytes, each size until one is
+        // refused: all the room they may take, to the byte.
+        let mut n = 0u32;
+        let refused = std::iter::successors(Some(1usize << 20), |len| Some(len / 2))
+            .take_while(|len| *len >= 16)
+            .filter(|len| {
+                (0..80).any(|_| {
+                    n += 1;
+                    let mut filler = vec![0u8; *len];
+                    filler[..4].copy_from_slice(&n.to_be_bytes());
+                    mc.add_message_outcome(1, filler) == SubmitOutcome::Filtered(Refusal::RankFull)
+                })
+            })
+            .count();
+        assert_eq!(refused, 17, "other messages of every size fill the rank");
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 1)),
+            SubmitOutcome::Accepted,
+            "class-share reserved-room: a shard header refused beside both shares of storage epoch proofs and a flood"
         );
     }
 
@@ -5269,7 +5368,7 @@ mod tests {
     fn every_storage_epoch_proof_accepted_rides_a_frame_before_it_ages_out() {
         let mc = global_collector();
         let len = 650_000;
-        let per_frame = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME / (len + 1024);
+        let per_frame = SEAL_BYTES_PER_PROPOSAL / (len + 1024);
         let (mut accepted, mut refused, mut id) = (Vec::new(), 0usize, 0u32);
         let mut carried: HashSet<[u8; 32]> = HashSet::new();
         for rank in 1..=40u64 {
@@ -5448,7 +5547,9 @@ mod tests {
         let mc = global_collector();
         let len = 650_000;
         let size = numbered_epoch_proof(0, len).len();
-        let ids: HashMap<[u8; 32], u32> = (1..=40u32)
+        // Enough provers' proofs to fill their share and be refused past it.
+        let last = 20 + (SEAL_BYTES_HELD / size) as u32 + 2;
+        let ids: HashMap<[u8; 32], u32> = (1..=last)
             .map(|id| (sha256(&numbered_epoch_proof(id, len)), id))
             .collect();
         let submit = |id: u32, provenance: Provenance| {
@@ -5473,7 +5574,7 @@ mod tests {
             OTHER_SEAL_BYTES_HELD / size,
             "other senders' share"
         );
-        let provers: Vec<u32> = (21..=40)
+        let provers: Vec<u32> = (21..=last)
             .filter(|&id| match submit(id, Provenance::Prover) {
                 SubmitOutcome::Accepted => true,
                 SubmitOutcome::Filtered(Refusal::RankFull) => false,
