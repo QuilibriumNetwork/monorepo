@@ -13,6 +13,26 @@
 
 nextest-version = { required = "0.9.75" }
 
+# A test that never returns fails its shard and is named instead of
+# holding the shard until the job limit: nextest marks a test SLOW each
+# period and kills it after terminate-after periods. Each limit is at
+# least twice the longest time a green CI shard measured (Nov 2026:
+# 192 s outside the shield-hold tests, 1,492 s for them).
+#
+# The limits do not cover a slow runner. One that built in 37 minutes
+# against 6-9 on green shards ran three tests past these limits that
+# would have passed. A TIMEOUT on such a runner names a slow runner,
+# not a hang: compare the build step's time with a green shard's first.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [[profile.default.overrides]]
 filter = 'package(quil-engine) and (binary(=e2e_consensus) or binary(=e2e_epoch_confirm))'
 threads-required = "num-test-threads"
+
+# The shield-hold tests fill the mempool past its count cap with tens
+# of thousands of messages in a debug build: 840-1,492 s on green
+# shards.
+[[profile.default.overrides]]
+filter = 'package(quil-engine) and test(/^app_engine::shield_hold_tests::/)'
+slow-timeout = { period = "300s", terminate-after = 10 }

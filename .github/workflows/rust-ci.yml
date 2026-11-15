@@ -167,6 +167,12 @@ jobs:
   test:
     name: test (cargo nextest ${{ matrix.partition }}/3)
     runs-on: ubuntu-latest
+    # A backstop for a hang that the slow-timeout in .nextest.toml does
+    # not end, such as one outside a test. The merge queue times a
+    # check out 90 minutes after the group's run is created, and a
+    # shard starts some minutes later, so this ends the shard first.
+    # The longest green shard took 45 minutes.
+    timeout-minutes: 75
     needs: scope
     if: needs.scope.outputs.run == 'true'
     permissions:
@@ -272,6 +278,10 @@ jobs:
   lattice-native:
     name: lattice-native (x86-64)
     runs-on: ubuntu-latest
+    # A backstop for a hang that the slow-timeout in .nextest.toml does
+    # not end; it only frees the runner, as this check is not required.
+    # The longest green run took 16 minutes.
+    timeout-minutes: 60
     needs: scope
     if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
     steps:
