@@ -178,6 +178,9 @@ fn decrypt_aead(ciphertext: &MessageCiphertext, key: &[u8]) -> Result<Vec<u8>, S
     let iv = BASE64_STANDARD
         .decode(&ciphertext.initialization_vector)
         .map_err(|e| format!("Invalid IV: {}", e))?;
+    if iv.len() != 12 {
+        return Err("Invalid IV length".to_string());
+    }
     let nonce = Nonce::from_slice(&iv);
 
     let associated_data = match &ciphertext.associated_data {
@@ -1674,6 +1677,523 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    type Inbox = HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>>;
+
+    /// Delivers `out`, sent by `from`, into each recipient's inbox.
+    fn deliver(inbox: &mut Inbox, from: &[u8], out: HashMap<Vec<u8>, P2PChannelEnvelope>) {
+        for (to, env) in out {
+            inbox.entry(to).or_default().insert(from.to_vec(), env);
+        }
+    }
+
+    /// Four members of an async triple ratchet group with threshold two,
+    /// after the DKG, in the order of their public keys.
+    fn async_group() -> Vec<TripleRatchetParticipant> {
+        let mut rng = rand::thread_rng();
+        let public = |k: &Scalar| {
+            (k * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .to_vec()
+        };
+        let mut keys: Vec<[Scalar; 3]> = (0..4)
+            .map(|_| [(); 3].map(|_| Scalar::random(&mut rng)))
+            .collect();
+        keys.sort_by_key(|k| public(&k[0]));
+        let infos: Vec<PeerInfo> = keys
+            .iter()
+            .map(|k| PeerInfo {
+                public_key: public(&k[0]),
+                identity_public_key: public(&k[1]),
+                signed_pre_public_key: public(&k[2]),
+            })
+            .collect();
+
+        // Every member gets an inbox, empty or not: members send init
+        // messages only to peers whose keys sort after their own, so the
+        // first member receives none.
+        let inbox = || -> Inbox {
+            infos
+                .iter()
+                .map(|p| (p.public_key.clone(), HashMap::new()))
+                .collect()
+        };
+        let mut members = Vec::new();
+        let mut inits = inbox();
+        for (i, k) in keys.iter().enumerate() {
+            let others: Vec<PeerInfo> = (0..4)
+                .filter(|&j| j != i)
+                .map(|j| infos[j].clone())
+                .collect();
+            let (member, out) =
+                TripleRatchetParticipant::new(&others, k[0], k[1], k[2], 2, true).unwrap();
+            members.push(member);
+            deliver(&mut inits, &infos[i].public_key, out);
+        }
+        let mut frags = inbox();
+        for (i, member) in members.iter_mut().enumerate() {
+            let out = member.initialize(&inits[&infos[i].public_key]).unwrap();
+            deliver(&mut frags, &infos[i].public_key, out);
+        }
+        let mut commitments = inbox();
+        for (i, member) in members.iter_mut().enumerate() {
+            for (from, env) in &frags[&infos[i].public_key] {
+                if let Some(out) = member.receive_poly_frag(from, env).unwrap() {
+                    deliver(&mut commitments, &infos[i].public_key, out);
+                }
+            }
+        }
+        let mut reveals = inbox();
+        for (i, member) in members.iter_mut().enumerate() {
+            for (from, env) in &commitments[&infos[i].public_key] {
+                if let Some(out) = member.receive_commitment(from, env).unwrap() {
+                    deliver(&mut reveals, &infos[i].public_key, out);
+                }
+            }
+        }
+        for (i, member) in members.iter_mut().enumerate() {
+            for (from, env) in &reveals[&infos[i].public_key] {
+                member.recombine(from, env).unwrap();
+            }
+        }
+        members
+    }
+
+    #[test]
+    fn a_member_share_verifies_against_the_group_key() {
+        let mut group = async_group();
+        let (id, share) = group[1].dkg_share();
+        assert!(group[0].point_verify(share, id).unwrap());
+    }
+
+    #[test]
+    fn a_point_off_the_group_key_never_verifies() {
+        let mut group = async_group();
+        let (id, _) = group[1].dkg_share();
+        let stranger = (Scalar::random(&mut rand::thread_rng()) * EdwardsPoint::generator())
+            .compress()
+            .to_bytes()
+            .to_vec();
+        assert!(
+            !group[0].point_verify(stranger, id).unwrap(),
+            "point_verify accepted a point off the group key"
+        );
+    }
+
+    /// [`async_group`] after each member has sent one message to the
+    /// others: each first message carries a DKG ratchet step, which moves
+    /// every receiver's group key off the key the DKG produced.
+    fn ratcheted_group() -> Vec<TripleRatchetParticipant> {
+        let mut group = async_group();
+        let before = group[0].dkg_group_key();
+        for i in 0..group.len() {
+            let sealed = group[i].ratchet_encrypt(b"hello").unwrap();
+            for j in (0..group.len()).filter(|&j| j != i) {
+                group[j].ratchet_decrypt(&sealed).unwrap();
+            }
+        }
+        assert_ne!(
+            group[0].dkg_group_key(),
+            before,
+            "no DKG ratchet step moved the group key"
+        );
+        group
+    }
+
+    #[test]
+    fn point_verify_holds_past_a_dkg_ratchet_step() {
+        let mut group = ratcheted_group();
+        let (id, share) = group[1].dkg_share();
+        assert!(
+            group[0].point_verify(share, id).unwrap(),
+            "a member share did not verify after a DKG ratchet step"
+        );
+        let stranger = (Scalar::random(&mut rand::thread_rng()) * EdwardsPoint::generator())
+            .compress()
+            .to_bytes()
+            .to_vec();
+        assert!(
+            !group[0].point_verify(stranger, id).unwrap(),
+            "point_verify accepted a point off the group key"
+        );
+    }
+
+    /// Whether `decrypt` returned an error rather than panicking or
+    /// succeeding.
+    fn refused<T, E>(decrypt: impl FnOnce() -> Result<T, E>) -> bool {
+        matches!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(decrypt)),
+            Ok(Err(_))
+        )
+    }
+
+    #[test]
+    fn aead_decryption_refuses_a_malformed_nonce() {
+        let key = [7u8; 32];
+        let mut sealed = encrypt_aead(b"hello", &key).unwrap();
+        // Five zero bytes; AES-GCM takes twelve.
+        sealed.initialization_vector = "AAAAAAA=".to_string();
+        assert!(
+            refused(|| decrypt_aead(&sealed, &key)),
+            "decryption did not refuse a malformed nonce"
+        );
+    }
+
+    /// `envelope` with its header's nonce cut short, and with its header's
+    /// associated data removed.
+    fn malformed_headers(envelope: &P2PChannelEnvelope) -> [P2PChannelEnvelope; 2] {
+        let mut short_nonce = envelope.clone();
+        short_nonce.message_header.initialization_vector.truncate(5);
+        let mut no_associated_data = envelope.clone();
+        no_associated_data.message_header.associated_data = None;
+        [short_nonce, no_associated_data]
+    }
+
+    #[test]
+    fn a_double_ratchet_refuses_a_malformed_header() {
+        use protocols::doubleratchet::{DoubleRatchetParticipant, MessageCiphertext};
+        let mut rng = rand::thread_rng();
+        let mut receiver = DoubleRatchetParticipant::new(
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 32],
+            false,
+            Scalar::random(&mut rng),
+            Scalar::random(&mut rng) * EdwardsPoint::generator(),
+        )
+        .unwrap();
+        let sealed = |bytes: usize| MessageCiphertext {
+            ciphertext: vec![9u8; bytes],
+            initialization_vector: vec![0u8; 12],
+            associated_data: Some(vec![0u8; 32]),
+        };
+        let envelope = P2PChannelEnvelope {
+            protocol_identifier: 0x0100,
+            message_header: sealed(96),
+            message_body: sealed(32),
+        };
+        for malformed in malformed_headers(&envelope) {
+            assert!(
+                refused(|| receiver.ratchet_decrypt(&malformed)),
+                "the double ratchet did not refuse a malformed header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_triple_ratchet_refuses_a_malformed_header() {
+        let mut group = async_group();
+        let envelope = group[0].ratchet_encrypt(b"hello").unwrap();
+        for malformed in malformed_headers(&envelope) {
+            assert!(
+                refused(|| group[1].ratchet_decrypt(&malformed)),
+                "the triple ratchet did not refuse a malformed header"
+            );
+        }
+    }
+
+    #[test]
+    fn point_verify_refuses_a_point_of_the_wrong_length() {
+        let mut group = async_group();
+        let (id, mut share) = group[1].dkg_share();
+        share.pop();
+        assert!(
+            refused(|| group[0].point_verify(share, id)),
+            "point_verify did not refuse a point of the wrong length"
+        );
+    }
+
+    /// A well-formed reveal no DKG round produced: two points and a
+    /// 56-byte proof.
+    fn stray_reveal() -> Vec<u8> {
+        let point = || {
+            (Scalar::random(&mut rand::thread_rng()) * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .to_vec()
+        };
+        let proof = Scalar::random(&mut rand::thread_rng()).to_bytes().to_vec();
+        serde_json::to_vec(&serde_json::json!({
+            "point": point(),
+            "random_commitment_point": point(),
+            "zk_pok": proof,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_dkg_reveal_that_is_not_json_is_refused() {
+        let mut group = async_group();
+        let (to, from) = (group[0].member_key(), group[1].member_key());
+        let sealed = group[1].seal_dkg_message(&to, b"not a reveal");
+        assert!(
+            refused(|| group[0].recombine(&from, &sealed)),
+            "a malformed DKG reveal was not refused"
+        );
+    }
+
+    #[test]
+    fn a_late_dkg_reveal_is_refused() {
+        let mut group = async_group();
+        let (to, from) = (group[0].member_key(), group[1].member_key());
+        let sealed = group[1].seal_dkg_message(&to, &stray_reveal());
+        assert!(
+            refused(|| group[0].recombine(&from, &sealed)),
+            "a DKG reveal after the DKG was not refused"
+        );
+    }
+
+    #[test]
+    fn a_late_dkg_commitment_is_refused() {
+        let mut group = async_group();
+        let (to, from) = (group[0].member_key(), group[1].member_key());
+        let sealed = group[1].seal_dkg_message(&to, &[7u8; 56]);
+        assert!(
+            refused(|| group[0].receive_commitment(&from, &sealed)),
+            "a DKG commitment after the DKG was not refused"
+        );
+    }
+
+    /// 57 bytes that decode to no point.
+    fn invalid_point() -> [u8; 57] {
+        (0u8..=255)
+            .map(|b| {
+                let mut p = [0u8; 57];
+                p[0] = b;
+                p
+            })
+            .find(|p| bool::from(EdwardsPoint::from_bytes(p[..].into()).is_none()))
+            .expect("every candidate decoded to a point")
+    }
+
+    #[test]
+    fn a_triple_ratchet_refuses_a_header_with_an_invalid_sender_key() {
+        let mut group = async_group();
+        // An invalid sender key, then a zero ephemeral key and chain
+        // lengths: a header any member can seal under the group header key.
+        let mut header = invalid_point().to_vec();
+        header.extend_from_slice(&[0u8; 64]);
+        let sealed = group[1].seal_header(&header);
+        assert!(
+            refused(|| group[0].ratchet_decrypt(&sealed)),
+            "the triple ratchet did not refuse a header with an invalid sender key"
+        );
+    }
+
+    #[test]
+    fn a_double_ratchet_refuses_a_short_header() {
+        use protocols::doubleratchet::DoubleRatchetParticipant;
+        let mut rng = rand::thread_rng();
+        let (sender_key, receiver_key) = (Scalar::random(&mut rng), Scalar::random(&mut rng));
+        let mut sender = DoubleRatchetParticipant::new(
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 32],
+            true,
+            sender_key,
+            receiver_key * EdwardsPoint::generator(),
+        )
+        .unwrap();
+        let receiver = DoubleRatchetParticipant::new(
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 32],
+            false,
+            receiver_key,
+            sender_key * EdwardsPoint::generator(),
+        )
+        .unwrap();
+        let hello = sender.ratchet_encrypt(b"hello").unwrap();
+        assert_eq!(
+            receiver.clone().ratchet_decrypt(&hello).unwrap(),
+            b"hello",
+            "the receiver did not open its correspondent's message"
+        );
+        // A valid point and three of the eight chain-length bytes.
+        let mut header = (sender_key * EdwardsPoint::generator())
+            .compress()
+            .to_bytes()
+            .to_vec();
+        header.extend_from_slice(&[0u8; 3]);
+        let sealed = sender.seal_header(&header);
+        let mut receiver = receiver;
+        assert!(
+            refused(|| receiver.ratchet_decrypt(&sealed)),
+            "the double ratchet did not refuse a short header"
+        );
+    }
+
+    #[test]
+    fn a_triple_ratchet_resize_refuses_a_share_of_the_wrong_length() {
+        let mut group = async_group();
+        let (id, _) = group[1].dkg_share();
+        let share = Scalar::random(&mut rand::thread_rng()).to_bytes().to_vec();
+        assert!(
+            group[0].ratchet_resize(share.clone(), id, 4).is_ok(),
+            "resize refused a well-formed share"
+        );
+        assert!(
+            refused(|| group[0].ratchet_resize(share[..55].to_vec(), id, 4)),
+            "resize did not refuse a share of the wrong length"
+        );
+    }
+
+    #[test]
+    fn a_triple_ratchet_refuses_a_peer_key_that_is_not_a_point() {
+        let mut rng = rand::thread_rng();
+        let ours: Vec<Vec<u8>> = (0..3)
+            .map(|_| Scalar::random(&mut rng).to_bytes().to_vec())
+            .collect();
+        // Each peer as new_triple_ratchet takes it: public key, identity
+        // key and signed pre-key, 57 bytes each.
+        let peers: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                (0..3)
+                    .flat_map(|_| {
+                        (Scalar::random(&mut rng) * EdwardsPoint::generator())
+                            .compress()
+                            .to_bytes()
+                    })
+                    .collect()
+            })
+            .collect();
+        // Some(whether a group was created), or None on a panic.
+        let create = |peers: &Vec<Vec<u8>>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                new_triple_ratchet(peers, &ours[0], &ours[1], &ours[2], 2, true)
+            }))
+            .ok()
+            .map(|state| TripleRatchetParticipant::from_json(&state.ratchet_state).is_ok())
+        };
+        assert_eq!(
+            create(&peers),
+            Some(true),
+            "a group of well-formed peer keys was not created"
+        );
+        let mut pre_key = peers.clone();
+        pre_key[1][114..].copy_from_slice(&invalid_point());
+        assert_eq!(
+            create(&pre_key),
+            Some(false),
+            "group creation did not refuse a peer signed pre-key that is not a point"
+        );
+        let mut identity = peers.clone();
+        identity[1][57..114].copy_from_slice(&invalid_point());
+        assert_eq!(
+            create(&identity),
+            Some(false),
+            "group creation did not refuse a peer identity key that is not a point"
+        );
+    }
+
+    /// The exported resize, as the wasm and mobile bindings call it.
+    mod resize {
+        use super::*;
+
+        type Inbox = HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>>;
+
+        fn deliver(inbox: &mut Inbox, from: &[u8], out: HashMap<Vec<u8>, P2PChannelEnvelope>) {
+            for (to, env) in out {
+                inbox.entry(to).or_default().insert(from.to_vec(), env);
+            }
+        }
+
+        /// Four members of an async triple ratchet group with threshold
+        /// two, after the DKG, in the order of their public keys, and
+        /// those keys.
+        fn group() -> (Vec<TripleRatchetParticipant>, Vec<Vec<u8>>) {
+            let mut rng = rand::thread_rng();
+            let public = |k: &Scalar| {
+                (k * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec()
+            };
+            let mut keys: Vec<[Scalar; 3]> = (0..4)
+                .map(|_| [(); 3].map(|_| Scalar::random(&mut rng)))
+                .collect();
+            keys.sort_by_key(|k| public(&k[0]));
+            let infos: Vec<PeerInfo> = keys
+                .iter()
+                .map(|k| PeerInfo {
+                    public_key: public(&k[0]),
+                    identity_public_key: public(&k[1]),
+                    signed_pre_public_key: public(&k[2]),
+                })
+                .collect();
+            let inbox = || -> Inbox {
+                infos
+                    .iter()
+                    .map(|p| (p.public_key.clone(), HashMap::new()))
+                    .collect()
+            };
+            let mut members = Vec::new();
+            let mut inits = inbox();
+            for (i, k) in keys.iter().enumerate() {
+                let others: Vec<PeerInfo> = (0..4)
+                    .filter(|&j| j != i)
+                    .map(|j| infos[j].clone())
+                    .collect();
+                let (member, out) =
+                    TripleRatchetParticipant::new(&others, k[0], k[1], k[2], 2, true).unwrap();
+                members.push(member);
+                deliver(&mut inits, &infos[i].public_key, out);
+            }
+            let mut frags = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                let out = member.initialize(&inits[&infos[i].public_key]).unwrap();
+                deliver(&mut frags, &infos[i].public_key, out);
+            }
+            let mut commitments = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &frags[&infos[i].public_key] {
+                    if let Some(out) = member.receive_poly_frag(from, env).unwrap() {
+                        deliver(&mut commitments, &infos[i].public_key, out);
+                    }
+                }
+            }
+            let mut reveals = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &commitments[&infos[i].public_key] {
+                    if let Some(out) = member.receive_commitment(from, env).unwrap() {
+                        deliver(&mut reveals, &infos[i].public_key, out);
+                    }
+                }
+            }
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &reveals[&infos[i].public_key] {
+                    member.recombine(from, env).unwrap();
+                }
+            }
+            (members, infos.into_iter().map(|p| p.public_key).collect())
+        }
+
+        /// The other member's share arrives as hex. A share of the wrong
+        /// length must come back as an error, not a panic.
+        #[test]
+        fn triple_ratchet_resize_refuses_a_share_of_the_wrong_length() {
+            let (members, public_keys) = group();
+            let state = members[0].to_json().unwrap();
+            let id = members[0].get_peer_id_map()[&public_keys[1]] as u64;
+            let share = Scalar::random(&mut rand::thread_rng()).to_bytes();
+            let resized = triple_ratchet_resize(state.clone(), hex::encode(share), id, 4);
+            assert!(
+                resized.len() == 4 && resized.iter().all(|s| s.len() == 56),
+                "resize refused a well-formed share: {resized:?}"
+            );
+            println!("REACH resize returned {} shares", resized.len());
+            let refused = std::panic::catch_unwind(move || {
+                triple_ratchet_resize(state, hex::encode(&share[..55]), id, 4)
+            })
+            .expect("resize panicked on a share of the wrong length");
+            assert_eq!(
+                refused.len(),
+                1,
+                "resize accepted a share of the wrong length"
+            );
         }
     }
 }

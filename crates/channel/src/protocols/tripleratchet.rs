@@ -15,7 +15,9 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::doubleratchet::{DoubleRatchetParticipant, MessageCiphertext, P2PChannelEnvelope};
-use super::feldman::{vec_to_array, Feldman, FeldmanFrag, FeldmanReveal};
+use super::feldman::{
+    point_from_bytes, vec_to_array, Feldman, FeldmanError, FeldmanFrag, FeldmanReveal,
+};
 use super::x3dh::{receiver_x3dh, sender_x3dh};
 
 const TRIPLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
@@ -246,24 +248,23 @@ impl TripleRatchetParticipant {
                     .previous_receiving_chain_length
                     .insert(peer.public_key.clone(), 0);
 
+                let peer_identity_key = peer_point(&peer.identity_public_key, "peer identity key")?;
+                let peer_signed_pre_key =
+                    peer_point(&peer.signed_pre_public_key, "peer signed pre-key")?;
                 let session_key = if sender {
                     sender_x3dh(
                         &identity_key,
                         &signed_pre_key,
-                        &EdwardsPoint::from_bytes(peer.identity_public_key.as_slice().into())
-                            .unwrap(),
-                        &EdwardsPoint::from_bytes(peer.signed_pre_public_key.as_slice().into())
-                            .unwrap(),
+                        &peer_identity_key,
+                        &peer_signed_pre_key,
                         96,
                     )
                 } else {
                     receiver_x3dh(
                         &identity_key,
                         &signed_pre_key,
-                        &EdwardsPoint::from_bytes(peer.identity_public_key.as_slice().into())
-                            .unwrap(),
-                        &EdwardsPoint::from_bytes(peer.signed_pre_public_key.as_slice().into())
-                            .unwrap(),
+                        &peer_identity_key,
+                        &peer_signed_pre_key,
                         96,
                     )
                 }
@@ -275,7 +276,7 @@ impl TripleRatchetParticipant {
                     &session_key[64..],
                     sender,
                     signed_pre_key.clone(),
-                    EdwardsPoint::from_bytes(peer.signed_pre_public_key.as_slice().into()).unwrap(),
+                    peer_signed_pre_key,
                 )
                 .unwrap();
 
@@ -689,7 +690,7 @@ impl TripleRatchetParticipant {
         let result = self
             .dkg_ratchet
             .receive_commitments(*self.peer_id_map.get(peer_id).unwrap(), &b.unwrap())
-            .unwrap();
+            .map_err(|e| TripleRatchetError::CryptoError(e.to_string()))?;
 
         if let Some(reveal) = result {
             let d = serde_json::to_vec(&reveal).unwrap();
@@ -720,12 +721,12 @@ impl TripleRatchetParticipant {
             )));
         }
 
-        let rev: FeldmanReveal = serde_json::from_slice(&b.unwrap()).unwrap();
+        let rev: FeldmanReveal = serde_json::from_slice(&b.unwrap())
+            .map_err(|e| TripleRatchetError::InvalidData(e.to_string()))?;
 
         let done = self
             .dkg_ratchet
-            .recombine(*self.peer_id_map.get(peer_id).unwrap(), &rev)
-            .unwrap();
+            .recombine(*self.peer_id_map.get(peer_id).unwrap(), &rev)?;
 
         if !done {
             return Ok(());
@@ -953,6 +954,7 @@ impl TripleRatchetParticipant {
             if next.is_none().into() {
                 return Err(Box::new(TripleRatchetError::MalformedHeader));
             }
+            self.dkg_ratchet.set_public_key(next.unwrap());
         }
 
         Ok((plaintext, should_dkg_ratchet))
@@ -991,6 +993,58 @@ impl TripleRatchetParticipant {
         return Ok(rescaled.unwrap());
     }
 
+    /// The group key as this member's DKG ratchet holds it now.
+    #[cfg(test)]
+    pub(crate) fn dkg_group_key(&self) -> Vec<u8> {
+        self.dkg_ratchet.public_key_bytes()
+    }
+
+    /// This member's DKG id and share point, as another member passes them
+    /// to [`Self::point_verify`].
+    #[cfg(test)]
+    pub(crate) fn dkg_share(&self) -> (usize, Vec<u8>) {
+        let point = self.dkg_ratchet.get_scalar() * EdwardsPoint::generator();
+        (
+            self.dkg_ratchet.get_id(),
+            point.compress().to_bytes().to_vec(),
+        )
+    }
+
+    /// This member's public key, as the others name its channel.
+    #[cfg(test)]
+    pub(crate) fn member_key(&self) -> Vec<u8> {
+        (self.peer_key * EdwardsPoint::generator())
+            .compress()
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// `payload` sealed on this member's channel to `peer`, as its DKG
+    /// messages travel.
+    #[cfg(test)]
+    pub(crate) fn seal_dkg_message(&mut self, peer: &[u8], payload: &[u8]) -> P2PChannelEnvelope {
+        self.peer_channels
+            .get_mut(peer)
+            .unwrap()
+            .ratchet_encrypt(payload)
+            .unwrap()
+    }
+
+    /// An envelope with `header` sealed under the group header key, as a
+    /// member seals its own headers.
+    #[cfg(test)]
+    pub(crate) fn seal_header(&self, header: &[u8]) -> P2PChannelEnvelope {
+        P2PChannelEnvelope {
+            protocol_identifier: TRIPLE_RATCHET_PROTOCOL,
+            message_header: self
+                .encrypt(header, &self.current_header_key, None)
+                .unwrap(),
+            message_body: MessageCiphertext::default(),
+        }
+    }
+
+    /// Whether `point`, as member `id`'s share, combines with this member's
+    /// share to the group key the DKG produced.
     pub fn point_verify(
         &mut self,
         point: Vec<u8>,
@@ -1032,11 +1086,11 @@ impl TripleRatchetParticipant {
             shares.push(&point);
         }
 
-        let result = self.dkg_ratchet.combine_mul_share(shares, ids.as_slice());
-        match result {
-            Ok(pubkey) => Ok(pubkey == self.dkg_ratchet.public_key_bytes()),
-            Err(e) => Err(Box::new(e)),
-        }
+        // The DKG-time key: a DKG ratchet step moves the current group key
+        // to a point the share points no longer combine to.
+        let group_key = self.dkg_ratchet.dkg_public_key()?;
+        let combined = self.dkg_ratchet.combine_mul_share(shares, ids.as_slice())?;
+        Ok(combined == group_key)
     }
 
     fn ratchet_sender_ephemeral_keys(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1309,7 +1363,9 @@ impl TripleRatchetParticipant {
             return Err(TripleRatchetError::MalformedHeader);
         }
 
-        let sender_key = EdwardsPoint::from_bytes(header[..57].into()).unwrap();
+        let sender_key = EdwardsPoint::from_bytes(header[..57].into())
+            .into_option()
+            .ok_or(TripleRatchetError::MalformedHeader)?;
         let receiving_ephemeral_key = Scalar::from_bytes(header[57..113].try_into().unwrap());
         let previous_receiving_chain_length =
             u32::from_be_bytes(header[113..117].try_into().unwrap());
@@ -1386,11 +1442,19 @@ impl TripleRatchetParticipant {
                 "Invalid key length".to_string(),
             ));
         }
+        if ciphertext.initialization_vector.len() != 12 {
+            return Err(TripleRatchetError::InvalidData(
+                "Invalid nonce length".to_string(),
+            ));
+        }
         let cipher = Aes256Gcm::new_from_slice(key).unwrap();
         let nonce = Nonce::from_slice(&ciphertext.initialization_vector);
 
-        let associated_data =
-            associated_data.unwrap_or_else(|| ciphertext.associated_data.as_ref().unwrap());
+        let associated_data = associated_data
+            .or(ciphertext.associated_data.as_deref())
+            .ok_or_else(|| {
+                TripleRatchetError::InvalidData("Missing associated data".to_string())
+            })?;
 
         cipher
             .decrypt(
@@ -1402,6 +1466,15 @@ impl TripleRatchetParticipant {
             )
             .map_err(|e| TripleRatchetError::CryptoError(e.to_string()))
     }
+}
+
+/// The point a peer's key encodes; a key of the wrong length or of no
+/// point is an error naming `what`.
+fn peer_point(bytes: &[u8], what: &str) -> Result<EdwardsPoint, TripleRatchetError> {
+    point_from_bytes(bytes, what).map_err(|e| match e {
+        FeldmanError::InvalidData(reason) => TripleRatchetError::InvalidData(reason),
+        e => TripleRatchetError::CryptoError(e.to_string()),
+    })
 }
 
 fn ratchet_keys(input: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

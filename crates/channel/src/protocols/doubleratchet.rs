@@ -575,7 +575,7 @@ impl DoubleRatchetParticipant {
         &self,
         header: &[u8],
     ) -> Result<(EdwardsPoint, u32, u32), Box<dyn std::error::Error>> {
-        if header.len() < 57 {
+        if header.len() < 65 {
             // 57 bytes for EdwardsPoint + 8 bytes for two u32
             return Err("Malformed header".into());
         }
@@ -642,11 +642,15 @@ impl DoubleRatchetParticipant {
         if key.len() != 32 {
             return Err(format!("Invalid key length").into());
         }
+        if ciphertext.initialization_vector.len() != 12 {
+            return Err("Invalid nonce length".into());
+        }
         let cipher = Aes256Gcm::new_from_slice(key).unwrap();
         let nonce = Nonce::from_slice(&ciphertext.initialization_vector);
 
-        let associated_data =
-            associated_data.unwrap_or_else(|| ciphertext.associated_data.as_ref().unwrap());
+        let associated_data = associated_data
+            .or(ciphertext.associated_data.as_deref())
+            .ok_or("Missing associated data")?;
 
         cipher
             .decrypt(
@@ -670,6 +674,19 @@ impl DoubleRatchetParticipant {
     #[allow(dead_code)] // see `rotate_sending_key`
     pub fn get_public_key(&self) -> EdwardsPoint {
         EdwardsPoint::mul_by_generator(&self.sending_ephemeral_private_key)
+    }
+
+    /// An envelope whose header is `header`, sealed under this
+    /// participant's sending header key, as its correspondent can send.
+    #[cfg(test)]
+    pub(crate) fn seal_header(&self, header: &[u8]) -> P2PChannelEnvelope {
+        P2PChannelEnvelope {
+            protocol_identifier: DOUBLE_RATCHET_PROTOCOL,
+            message_header: self
+                .encrypt(header, &self.current_sending_header_key, None)
+                .unwrap(),
+            message_body: MessageCiphertext::default(),
+        }
     }
 }
 

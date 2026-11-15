@@ -397,6 +397,12 @@ fn deserialize_state<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, Dkl
     serde_json::from_slice(data).map_err(|e| Dkls23Error::DeserializationError(e.to_string()))
 }
 
+/// Signing and refresh need the DKLs23 party state, which a key
+/// generation, a refresh and `rekey_from_secret` store; resized shares
+/// lack it.
+const NO_PARTY_DATA: &str =
+    "key share has no party data: run a key generation before signing or refreshing with it";
+
 fn error_result<T>(msg: &str) -> T
 where
     T: Default + WithError,
@@ -1727,9 +1733,7 @@ pub fn sign_round1(session_state: &[u8]) -> SignRoundResult {
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // If no party data, create a placeholder implementation for testing
-                // In production, DKG must complete with proper Party generation
-                return sign_round1_placeholder(&state);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -1801,48 +1805,6 @@ pub fn sign_round1(session_state: &[u8]) -> SignRoundResult {
     }) // with_curve
 }
 
-/// Placeholder implementation for sign_round1 when Party data is not available
-fn sign_round1_placeholder(state: &SignSessionState) -> SignRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    let mut nonce_commitment = vec![0u8; 64];
-    rng.fill_bytes(&mut nonce_commitment);
-
-    // Send to all other signers
-    let mut messages = Vec::new();
-    for &pid in &state.signer_party_ids {
-        if pid != state.party_id {
-            let combined = serde_json::json!({
-                "type": "sign_phase1_transmit_placeholder",
-                "data": hex::encode(&nonce_commitment),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: pid,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 1;
-    // Store placeholder data
-    new_state.unique_keep_1to2 = Some(nonce_commitment.clone());
-    new_state.keep_1to2 = Some(vec![]);
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => SignRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Process signing round 2
 /// This corresponds to dkls23 signing::sign_phase2
 pub fn sign_round2(session_state: &[u8], received_messages: &[PartyMessage]) -> SignRoundResult {
@@ -1878,8 +1840,7 @@ pub fn sign_round2(session_state: &[u8], received_messages: &[PartyMessage]) -> 
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // Placeholder implementation for testing
-                return sign_round2_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -1996,57 +1957,6 @@ pub fn sign_round2(session_state: &[u8], received_messages: &[PartyMessage]) -> 
     }) // with_curve
 }
 
-/// Placeholder implementation for sign_round2 when Party data is not available
-fn sign_round2_placeholder(
-    state: &SignSessionState,
-    received_messages: &[PartyMessage],
-) -> SignRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    let mut partial_data = vec![0u8; 64];
-    rng.fill_bytes(&mut partial_data);
-
-    // Send to all other signers
-    let mut messages = Vec::new();
-    for &pid in &state.signer_party_ids {
-        if pid != state.party_id {
-            let combined = serde_json::json!({
-                "type": "sign_phase2_transmit_placeholder",
-                "data": hex::encode(&partial_data),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: pid,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 2;
-    new_state.unique_keep_2to3 = Some(partial_data);
-    new_state.keep_2to3 = Some(vec![]);
-
-    // Store received messages
-    for msg in received_messages {
-        new_state
-            .received_transmit_1to2
-            .push((msg.from_party, msg.data.clone()));
-    }
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => SignRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Process signing round 3 (corresponds to dkls23 sign_phase3)
 /// This produces the x-coordinate and broadcasts to all parties
 pub fn sign_round3(session_state: &[u8], received_messages: &[PartyMessage]) -> SignRoundResult {
@@ -2082,8 +1992,7 @@ pub fn sign_round3(session_state: &[u8], received_messages: &[PartyMessage]) -> 
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // Placeholder implementation for testing
-                return sign_round3_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -2194,58 +2103,6 @@ pub fn sign_round3(session_state: &[u8], received_messages: &[PartyMessage]) -> 
     }) // with_curve
 }
 
-/// Placeholder implementation for sign_round3 when Party data is not available
-fn sign_round3_placeholder(
-    state: &SignSessionState,
-    received_messages: &[PartyMessage],
-) -> SignRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    // Generate placeholder broadcast data
-    let mut broadcast_data = vec![0u8; 64];
-    rng.fill_bytes(&mut broadcast_data);
-
-    // Send to all other signers
-    let mut messages = Vec::new();
-    for &pid in &state.signer_party_ids {
-        if pid != state.party_id {
-            let combined = serde_json::json!({
-                "type": "sign_phase3_broadcast_placeholder",
-                "data": hex::encode(&broadcast_data),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: pid,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 3;
-    new_state.x_coord = Some(hex::encode(&broadcast_data)); // Placeholder x_coord as hex string
-    new_state.our_broadcast = Some(vec![]);
-
-    // Store received messages
-    for msg in received_messages {
-        new_state
-            .received_transmit_2to3
-            .push((msg.from_party, msg.data.clone()));
-    }
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => SignRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Finalize signing (corresponds to dkls23 sign_phase4)
 /// Collects broadcasts from all parties and produces the final signature
 pub fn sign_finalize(session_state: &[u8], received_messages: &[PartyMessage]) -> SignFinalResult {
@@ -2281,8 +2138,7 @@ pub fn sign_finalize(session_state: &[u8], received_messages: &[PartyMessage]) -
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // Placeholder implementation for testing
-                return sign_finalize_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -2386,25 +2242,6 @@ pub fn sign_finalize(session_state: &[u8], received_messages: &[PartyMessage]) -
     }) // with_curve
 }
 
-/// Placeholder implementation for sign_finalize when Party data is not available
-fn sign_finalize_placeholder(
-    _state: &SignSessionState,
-    _received_messages: &[PartyMessage],
-) -> SignFinalResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    // Generate placeholder 64-byte (r, s) signature
-    let mut signature = vec![0u8; 64];
-    rng.fill_bytes(&mut signature);
-
-    SignFinalResult {
-        signature,
-        success: true,
-        error_message: None,
-    }
-}
-
 // ============================================
 // Refresh Functions
 // ============================================
@@ -2493,8 +2330,7 @@ pub fn refresh_round1(session_state: &[u8]) -> RefreshRoundResult {
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // Placeholder implementation for testing without Party state
-                return refresh_round1_placeholder(&state);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -2554,47 +2390,6 @@ pub fn refresh_round1(session_state: &[u8]) -> RefreshRoundResult {
     }) // with_curve
 }
 
-/// Placeholder implementation for refresh_round1 when Party data is not available
-fn refresh_round1_placeholder(state: &RefreshSessionState) -> RefreshRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    // Create placeholder polynomial fragments
-    let mut poly_fragments_data = vec![0u8; 32 * state.total_parties as usize];
-    rng.fill_bytes(&mut poly_fragments_data);
-
-    // Create messages to send refresh shares to each party
-    let mut messages = Vec::new();
-    for i in 1..=state.total_parties {
-        if i != state.party_id {
-            let combined = serde_json::json!({
-                "type": "refresh_phase1_poly_fragment",
-                "data": hex::encode(&poly_fragments_data),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: i,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 1;
-    new_state.poly_fragments = Some(poly_fragments_data);
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => RefreshRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Process refresh round 2 (phase 2: process fragments, generate proofs)
 pub fn refresh_round2(
     session_state: &[u8],
@@ -2632,8 +2427,7 @@ pub fn refresh_round2(
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                // Placeholder implementation
-                return refresh_round2_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -2773,49 +2567,6 @@ pub fn refresh_round2(
     }) // with_curve
 }
 
-/// Placeholder implementation for refresh_round2
-fn refresh_round2_placeholder(
-    state: &RefreshSessionState,
-    _received_messages: &[PartyMessage],
-) -> RefreshRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    let mut placeholder_data = vec![0u8; 64];
-    rng.fill_bytes(&mut placeholder_data);
-
-    let mut messages = Vec::new();
-    for i in 1..=state.total_parties {
-        if i != state.party_id {
-            let combined = serde_json::json!({
-                "type": "refresh_phase2_proof",
-                "data": hex::encode(&placeholder_data),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: i,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 2;
-    new_state.correction_value = Some(placeholder_data.clone());
-    new_state.our_proof_commitment = Some(placeholder_data);
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => RefreshRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Process refresh round 3 (phase 3: process transmits)
 pub fn refresh_round3(
     session_state: &[u8],
@@ -2844,7 +2595,7 @@ pub fn refresh_round3(
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                return refresh_round3_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -2924,47 +2675,6 @@ pub fn refresh_round3(
     }) // with_curve
 }
 
-/// Placeholder implementation for refresh_round3
-fn refresh_round3_placeholder(
-    state: &RefreshSessionState,
-    _received_messages: &[PartyMessage],
-) -> RefreshRoundResult {
-    let mut rng = rand::thread_rng();
-    use rand::RngCore;
-
-    let mut placeholder_data = vec![0u8; 64];
-    rng.fill_bytes(&mut placeholder_data);
-
-    let mut messages = Vec::new();
-    for i in 1..=state.total_parties {
-        if i != state.party_id {
-            let combined = serde_json::json!({
-                "type": "refresh_phase3_transmit",
-                "data": hex::encode(&placeholder_data),
-            });
-            messages.push(PartyMessage {
-                from_party: state.party_id,
-                to_party: i,
-                data: serde_json::to_vec(&combined).unwrap_or_default(),
-            });
-        }
-    }
-
-    let mut new_state = state.clone();
-    new_state.round = 3;
-
-    match serialize_state(&new_state) {
-        Ok(session_state) => RefreshRoundResult {
-            session_state,
-            messages_to_send: messages,
-            is_complete: false,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
 /// Finalize refresh (phase 4: verify and produce new key share)
 pub fn refresh_finalize(
     session_state: &[u8],
@@ -2993,7 +2703,7 @@ pub fn refresh_finalize(
                 Err(e) => return error_result(&format!("failed to deserialize party data: {}", e)),
             },
             None => {
-                return refresh_finalize_placeholder(&state, received_messages);
+                return error_result(NO_PARTY_DATA);
             }
         };
 
@@ -3129,42 +2839,6 @@ pub fn refresh_finalize(
             Err(e) => error_result(&e.to_string()),
         }
     }) // with_curve
-}
-
-/// Placeholder implementation for refresh_finalize
-fn refresh_finalize_placeholder(
-    state: &RefreshSessionState,
-    _received_messages: &[PartyMessage],
-) -> RefreshFinalResult {
-    let key_data: KeyShareData = match deserialize_state(&state.key_share) {
-        Ok(k) => k,
-        Err(e) => return error_result(&e.to_string()),
-    };
-
-    let new_generation = state.generation + 1;
-
-    // Create new key share with incremented generation (placeholder doesn't actually refresh)
-    let new_key_share_data = KeyShareData {
-        party_id: state.party_id,
-        threshold: state.threshold,
-        total_parties: state.total_parties,
-        generation: new_generation,
-        curve: state.curve,
-        secret_share: key_data.secret_share,
-        public_key: key_data.public_key,
-        public_shares: key_data.public_shares,
-        party_data: key_data.party_data,
-    };
-
-    match serialize_state(&new_key_share_data) {
-        Ok(new_key_share) => RefreshFinalResult {
-            new_key_share,
-            generation: new_generation,
-            success: true,
-            error_message: None,
-        },
-        Err(e) => error_result(&e.to_string()),
-    }
 }
 
 // ============================================
@@ -4140,10 +3814,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_round1_placeholder() {
+    fn test_sign_round1_with_rekeyed_share() {
         init();
 
-        // Create a key share (without party_data, so placeholder will be used)
+        // A rekeyed share carries party data, so round 1 runs DKLs23
         let secret = vec![0u8; 32];
         let rekey_result = rekey_from_secret(&secret, 2, 3, EllipticCurve::Secp256k1);
         assert!(rekey_result.success);
@@ -4155,7 +3829,7 @@ mod tests {
         let sign_result = sign_init(key_share, &message_hash, &signer_party_ids);
         assert!(sign_result.success);
 
-        // Run round 1 (placeholder since no party_data)
+        // Run round 1
         let round1_result = sign_round1(&sign_result.session_state);
         assert!(
             round1_result.success,
@@ -4170,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_full_protocol_placeholder() {
+    fn test_sign_full_protocol_with_rekeyed_shares() {
         init();
 
         // Create key shares for a 2-of-3 scheme using a valid non-zero secret
@@ -4313,9 +3987,8 @@ mod tests {
         // Both parties should produce signatures
         assert_eq!(signatures.len(), 2);
 
-        // Note: With placeholder implementation (used when rekey_from_secret creates keys without Party state),
-        // signatures are random and won't match. When using proper DKG-generated key shares,
-        // signatures should be identical.
+        // rekey_from_secret stores party data with each share, so both
+        // parties ran the DKLs23 rounds rather than a placeholder.
     }
 
     #[test]
@@ -5073,5 +4746,128 @@ mod tests {
         }
 
         eprintln!("All resized key shares validated successfully!");
+    }
+
+    /// Key shares as a resize (`resize_round2`) leaves them: valid shares
+    /// with no party data, so they cannot run the DKLs23 rounds. Built
+    /// from `rekey_from_secret` shares, which do carry party data, with
+    /// it removed.
+    fn shares_without_party_data() -> Vec<Vec<u8>> {
+        let mut secret = vec![0u8; 32];
+        secret[31] = 1;
+        let rekey = rekey_from_secret(&secret, 2, 3, EllipticCurve::Secp256k1);
+        assert!(rekey.success, "rekey failed: {:?}", rekey.error_message);
+        rekey
+            .key_shares
+            .iter()
+            .map(|share| {
+                let mut key: KeyShareData = deserialize_state(share).unwrap();
+                assert!(key.party_data.is_some(), "rekey share lacks party data");
+                key.party_data = None;
+                serialize_state(&key).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn signing_refuses_a_key_share_without_party_data() {
+        init();
+        let shares = shares_without_party_data();
+        let sign = sign_init(&shares[0], &[0x42u8; 32], &[1, 2]);
+        assert!(sign.success, "sign_init failed: {:?}", sign.error_message);
+
+        let round1 = sign_round1(&sign.session_state);
+        assert!(
+            !round1.success,
+            "signing ran on a key share without party data"
+        );
+        let error = round1.error_message.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    #[test]
+    fn refresh_refuses_a_key_share_without_party_data() {
+        init();
+        let shares = shares_without_party_data();
+        let refresh = refresh_init(&shares[0], 1);
+        assert!(
+            refresh.success,
+            "refresh_init failed: {:?}",
+            refresh.error_message
+        );
+
+        let round1 = refresh_round1(&refresh.session_state);
+        assert!(
+            !round1.success,
+            "refresh ran on a key share without party data"
+        );
+        let error = round1.error_message.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    /// A signing session on a key share without party data, at `round`
+    /// as if the earlier rounds had run.
+    fn signing_at_round(round: u32) -> Vec<u8> {
+        let shares = shares_without_party_data();
+        let sign = sign_init(&shares[0], &[0x42u8; 32], &[1, 2]);
+        assert!(sign.success, "sign_init failed: {:?}", sign.error_message);
+        let mut state: SignSessionState = deserialize_state(&sign.session_state).unwrap();
+        state.round = round;
+        serialize_state(&state).unwrap()
+    }
+
+    /// A refresh session on a key share without party data, at `round`
+    /// as if the earlier rounds had run.
+    fn refresh_at_round(round: u32) -> Vec<u8> {
+        let shares = shares_without_party_data();
+        let refresh = refresh_init(&shares[0], 1);
+        assert!(
+            refresh.success,
+            "refresh_init failed: {:?}",
+            refresh.error_message
+        );
+        let mut state: RefreshSessionState = deserialize_state(&refresh.session_state).unwrap();
+        state.round = round;
+        serialize_state(&state).unwrap()
+    }
+
+    /// One message to party 1 from each of `from`.
+    fn messages_from(from: &[u32]) -> Vec<PartyMessage> {
+        from.iter()
+            .map(|&from_party| PartyMessage {
+                from_party,
+                to_party: 1,
+                data: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Asserts a round refused for want of party data.
+    fn assert_no_party_data(success: bool, error: Option<String>, ran: &str) {
+        assert!(!success, "{ran} ran on a key share without party data");
+        let error = error.unwrap_or_default();
+        assert!(error.contains("party data"), "{error}");
+    }
+
+    #[test]
+    fn later_signing_rounds_refuse_a_key_share_without_party_data() {
+        init();
+        let round2 = sign_round2(&signing_at_round(1), &messages_from(&[2]));
+        assert_no_party_data(round2.success, round2.error_message, "sign_round2");
+        let round3 = sign_round3(&signing_at_round(2), &messages_from(&[2]));
+        assert_no_party_data(round3.success, round3.error_message, "sign_round3");
+        let last = sign_finalize(&signing_at_round(3), &messages_from(&[2]));
+        assert_no_party_data(last.success, last.error_message, "sign_finalize");
+    }
+
+    #[test]
+    fn later_refresh_rounds_refuse_a_key_share_without_party_data() {
+        init();
+        let round2 = refresh_round2(&refresh_at_round(1), &messages_from(&[2, 3]));
+        assert_no_party_data(round2.success, round2.error_message, "refresh_round2");
+        let round3 = refresh_round3(&refresh_at_round(2), &messages_from(&[2, 3]));
+        assert_no_party_data(round3.success, round3.error_message, "refresh_round3");
+        let last = refresh_finalize(&refresh_at_round(3), &messages_from(&[2, 3]));
+        assert_no_party_data(last.success, last.error_message, "refresh_finalize");
     }
 }

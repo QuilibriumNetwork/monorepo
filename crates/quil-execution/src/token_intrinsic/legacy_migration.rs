@@ -61,16 +61,42 @@ fn parse_mpcith_verenc(bytes: &[u8], decryption_key: &[u8]) -> Option<verenc::Ve
     })
 }
 
+/// The recovered chunk of a legacy slot whose verenc recovery fails: the
+/// zero scalar, the bytes every release before the recovery hardening
+/// returned there.
+///
+/// Policy: a failed recovery never aborts `--migrate-legacy`. The slot
+/// reads as this chunk, so the coin migrates with zero amount (and a zero
+/// owner when its address slot fails too) and every node writes the same
+/// bytes as the release; [`migrate_legacy_coin`] warns naming the coin.
+const UNRECOVERED_CHUNK: [u8; 56] = [0u8; 56];
+
+/// A decrypted legacy slot: its plaintext bytes, and whether its recovery
+/// failed so it took [`UNRECOVERED_CHUNK`].
+pub(crate) struct LegacySlot {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) unrecovered: bool,
+}
+
 /// Decrypt a single 621-byte VerEnc blob with the supplied decryption
 /// key and return the combined plaintext bytes. Matches Go
 /// `MPCitHVerifiableEncryptor.Decrypt` with a one-element input list.
-pub(crate) fn decrypt_single_verenc(bytes: &[u8], decryption_key: &[u8]) -> Option<Vec<u8>> {
+/// `None` for a malformed blob; a failed recovery follows the
+/// [`UNRECOVERED_CHUNK`] policy.
+pub(crate) fn decrypt_single_verenc(bytes: &[u8], decryption_key: &[u8]) -> Option<LegacySlot> {
     let d = parse_mpcith_verenc(bytes, decryption_key)?;
-    let chunk = verenc::verenc_recover(d);
+    let (chunk, unrecovered) = match verenc::verenc_try_recover(d) {
+        Ok(chunk) => (chunk, false),
+        Err(verenc::RecoverError::NotRecovered) => (UNRECOVERED_CHUNK.to_vec(), true),
+        Err(verenc::RecoverError::Malformed) => return None,
+    };
     if chunk.is_empty() {
         return None;
     }
-    Some(verenc::combine_chunked_data(vec![chunk]))
+    Some(LegacySlot {
+        bytes: verenc::combine_chunked_data(vec![chunk]),
+        unrecovered,
+    })
 }
 
 /// The decrypted legacy coin: its Ed448-derived owner address and public amount.
@@ -85,6 +111,15 @@ pub struct TransparentCoin {
 /// ImplicitOwnerAddress. `Ok(None)` if the tree isn't a legacy coin (missing
 /// slots). Mirrors the decrypt in `pending::legacy_verify_input`.
 pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<TransparentCoin>> {
+    Ok(decode_legacy_slots(tree)?.map(|(coin, _)| coin))
+}
+
+/// [`decode_legacy_verenc_coin`], with the names of the slots whose
+/// recovery failed ([`UNRECOVERED_CHUNK`]).
+fn decode_legacy_slots(
+    tree: &VectorCommitmentTree,
+) -> Result<Option<(TransparentCoin, Vec<&'static str>)>> {
+    let mut unrecovered = Vec::new();
     let read_slot = |idx: u64| tree.get(&idx.to_be_bytes()).map(|b| b.to_vec());
     let (amount_blob, address_blob) = match (read_slot(1), read_slot(2)) {
         (Some(a), Some(b)) => (a, b),
@@ -97,6 +132,10 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
     // [1..17] as the LE u128; reject if any byte past 16 is set.
     let amt = decrypt_single_verenc(&amount_blob, &PUBLIC_READ_KEY)
         .ok_or_else(|| QuilError::InvalidArgument("migrate: decrypt amount failed".into()))?;
+    if amt.unrecovered {
+        unrecovered.push("amount");
+    }
+    let amt = amt.bytes;
     if amt.len() < 17 {
         return Err(QuilError::InvalidArgument(
             "migrate: legacy amount slot too short".into(),
@@ -114,6 +153,10 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
     // Owner address: decrypt, drop the leading byte, reverse the next 32.
     let addr = decrypt_single_verenc(&address_blob, &PUBLIC_READ_KEY)
         .ok_or_else(|| QuilError::InvalidArgument("migrate: decrypt address failed".into()))?;
+    if addr.unrecovered {
+        unrecovered.push("owner address");
+    }
+    let addr = addr.bytes;
     if addr.len() < 33 {
         return Err(QuilError::InvalidArgument(
             "migrate: legacy address < 33 bytes".into(),
@@ -123,10 +166,13 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
     owner_address.copy_from_slice(&addr[1..33]);
     owner_address.reverse();
 
-    Ok(Some(TransparentCoin {
-        owner_address,
-        amount,
-    }))
+    Ok(Some((
+        TransparentCoin {
+            owner_address,
+            amount,
+        },
+        unrecovered,
+    )))
 }
 
 /// Type hash for a transparent legacy coin vertex: `poseidon(domain ‖
@@ -283,9 +329,18 @@ pub fn migrate_legacy_coin(
     legacy_tree: &VectorCommitmentTree,
     origin: &[u8; 32],
 ) -> Result<Option<([u8; 32], u128, VectorCommitmentTree)>> {
-    let Some(coin) = decode_legacy_verenc_coin(legacy_tree)? else {
+    let Some((coin, unrecovered)) = decode_legacy_slots(legacy_tree)? else {
         return Ok(None);
     };
+    if !unrecovered.is_empty() {
+        tracing::warn!(
+            coin = %hex::encode(origin),
+            slots = ?unrecovered,
+            amount = coin.amount,
+            "legacy migration: verenc recovery failed; the coin migrates with \
+             zero value in those slots, as every release wrote it"
+        );
+    }
     let th = transparent_type_hash(domain)?;
     let tree = create_transparent_coin_tree(&coin, &th, origin)?;
     let addr = super::materialize::coin_content_address(&tree)?;
@@ -754,6 +809,64 @@ mod tests {
         tree.insert(&[0x00], b"not-a-coin", &[], &BigInt::from(10))
             .unwrap();
         assert!(decode_legacy_verenc_coin(&tree).unwrap().is_none());
+    }
+
+    /// A well-formed 621-byte legacy slot encrypted to a key other than
+    /// `PUBLIC_READ_KEY`, so its recovery fails.
+    fn slot_that_fails_recovery() -> Vec<u8> {
+        let mut chunk = vec![0u8; 56];
+        chunk[0] = 1;
+        let proof = verenc::new_verenc_proof(chunk);
+        let compressed = verenc::verenc_compress(verenc::VerencProof {
+            blinding_pubkey: proof.blinding_pubkey.clone(),
+            encryption_key: proof.encryption_key,
+            statement: proof.statement.clone(),
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        });
+        let mut blob = Vec::with_capacity(621);
+        for ct in &compressed.ctexts {
+            blob.extend_from_slice(&ct.c1);
+            blob.extend_from_slice(&ct.c2);
+        }
+        for aux in &compressed.aux {
+            blob.extend_from_slice(aux);
+        }
+        blob.extend_from_slice(&proof.blinding_pubkey);
+        blob.extend_from_slice(&proof.statement);
+        assert_eq!(blob.len(), 621, "not a legacy slot");
+        let recovery = parse_mpcith_verenc(&blob, &PUBLIC_READ_KEY).unwrap();
+        assert!(
+            verenc::verenc_recover(recovery).iter().all(|&b| b == 0),
+            "the slot recovered under the public read key"
+        );
+        blob
+    }
+
+    /// The migration keeps the release's behaviour for a coin whose
+    /// recovery fails: it migrates with zero value rather than aborting.
+    #[test]
+    fn a_legacy_coin_that_fails_recovery_migrates_with_zero_value() {
+        let mut tree = VectorCommitmentTree::new();
+        for slot in [1u64, 2] {
+            let blob = slot_that_fails_recovery();
+            tree.insert(&slot.to_be_bytes(), &blob, &[], &BigInt::from(blob.len()))
+                .unwrap();
+        }
+        let coin = decode_legacy_verenc_coin(&tree)
+            .expect("a failed recovery aborted the legacy migration");
+        assert_eq!(
+            coin,
+            Some(TransparentCoin {
+                owner_address: [0u8; 32],
+                amount: 0,
+            })
+        );
+        let migrated = migrate_legacy_coin(&[0x51u8; 32], &tree, &[0x33u8; 32])
+            .expect("a failed recovery aborted the legacy migration");
+        assert_eq!(migrated.map(|(_, amount, _)| amount), Some(0));
     }
 }
 

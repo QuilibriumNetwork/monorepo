@@ -454,22 +454,38 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     };
 }
 
+/// Why [`verenc_try_recover`] recovered no witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverError {
+    /// A key, point, scalar or list in the request is malformed.
+    Malformed,
+    /// The request is well formed, but no ciphertext decrypts to the
+    /// statement's witness.
+    NotRecovered,
+}
+
+/// The recovered witness bytes, or none when recovery fails for any
+/// reason ([`verenc_try_recover`] tells the reasons apart).
+pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
+    verenc_try_recover(recovery).unwrap_or_default()
+}
+
 // `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
 // casing lets the struct literal below stay field-shorthand.
 #[allow(non_snake_case)]
-pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
+pub fn verenc_try_recover(recovery: VerencDecrypt) -> Result<Vec<u8>, RecoverError> {
     let blinding_key = point_from_bytes(recovery.blinding_pubkey);
     if blinding_key.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let statement = point_from_bytes(recovery.statement);
     if statement.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     if recovery.decryption_key.len() != 56 {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let decryption_key = Scalar::from_bytes(&recovery.decryption_key.try_into().unwrap());
@@ -478,11 +494,11 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     for c in recovery.ciphertexts.ctexts {
         let c1 = point_from_bytes(c.c1);
         if c1.is_none() {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         if c.c2.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let c2 = Scalar::from_bytes(&c.c2.try_into().unwrap());
@@ -494,7 +510,7 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
 
     for c in recovery.ciphertexts.aux {
         if c.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let a = Scalar::from_bytes(&c.try_into().unwrap());
@@ -511,8 +527,12 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let (N, t, n) = RVE_PARAMS[0];
     let vparams = RDkgithParams { N, t, n };
     let ve = RDkgith::setup(&params, &vparams, pke.clone());
-    let wit_recover = ve.recover(&statement.unwrap(), &decryption_key, &ve_ct);
-    return wit_recover.to_bytes().to_vec();
+    let short = ve_ct.ctexts.len() < n || ve_ct.aux.len() < n;
+    match ve.recover(&statement.unwrap(), &decryption_key, &ve_ct) {
+        Some(witness) => Ok(witness.to_bytes().to_vec()),
+        None if short => Err(RecoverError::Malformed),
+        None => Err(RecoverError::NotRecovered),
+    }
 }
 
 pub fn chunk_data_for_verenc(data: Vec<u8>) -> Vec<Vec<u8>> {
@@ -642,5 +662,120 @@ mod tests {
             padded_data.push(0);
         }
         assert!(padded_data == result);
+    }
+
+    /// A proof of `data` and the matching recovery request.
+    fn recovery_of(data: &[u8]) -> VerencDecrypt {
+        let mut chunk = data.to_vec();
+        chunk.resize(56, 0);
+        let proof = new_verenc_proof(chunk);
+        let compressed = verenc_compress(VerencProof {
+            blinding_pubkey: proof.blinding_pubkey.clone(),
+            encryption_key: proof.encryption_key,
+            statement: proof.statement.clone(),
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        });
+        VerencDecrypt {
+            blinding_pubkey: proof.blinding_pubkey,
+            decryption_key: proof.decryption_key,
+            statement: proof.statement,
+            ciphertexts: compressed,
+        }
+    }
+
+    #[test]
+    fn a_failed_recovery_returns_no_bytes() {
+        let mut request = recovery_of(b"hello");
+        request.decryption_key = recovery_of(b"other").decryption_key;
+        let result = verenc_recover(request);
+        assert!(
+            result.is_empty(),
+            "a failed recovery returned {} bytes",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_too_few_ciphertexts() {
+        let request = recovery_of(b"hello");
+        let mut few_ctexts = request.clone();
+        few_ctexts.ciphertexts.ctexts.clear();
+        let mut few_aux = request;
+        few_aux.ciphertexts.aux.clear();
+        for short in [few_ctexts, few_aux] {
+            let result = std::panic::catch_unwind(|| verenc_recover(short));
+            assert!(
+                matches!(&result, Ok(bytes) if bytes.is_empty()),
+                "recovery of a short ciphertext list did not refuse it"
+            );
+        }
+    }
+
+    /// A proof of a one-byte witness, as `verenc_verify` and
+    /// `verenc_compress` take it.
+    fn proof() -> VerencProof {
+        let mut chunk = vec![0u8; 56];
+        chunk[0] = 1;
+        let proof = new_verenc_proof(chunk);
+        VerencProof {
+            blinding_pubkey: proof.blinding_pubkey,
+            encryption_key: proof.encryption_key,
+            statement: proof.statement,
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        }
+    }
+
+    #[test]
+    fn verification_refuses_a_short_polynomial_commitment() {
+        let mut short = proof();
+        assert!(verenc_verify(short.clone()), "the untouched proof fails");
+        short.polycom.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_verify(short));
+        assert!(
+            matches!(result, Ok(false)),
+            "verification of a short polynomial commitment did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_a_short_challenge() {
+        let mut short = proof();
+        assert!(short.challenge.len() > 16, "the challenge is already short");
+        short.challenge.truncate(16);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of a short challenge did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_ciphertexts() {
+        let mut short = proof();
+        assert!(!short.ctexts.is_empty(), "the proof has no ciphertexts");
+        short.ctexts.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few ciphertexts did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_shares() {
+        let mut short = proof();
+        assert!(!short.shares_rands.is_empty(), "the proof has no shares");
+        short.shares_rands.pop();
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few shares did not refuse it"
+        );
     }
 }

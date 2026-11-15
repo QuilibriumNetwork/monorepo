@@ -30,5 +30,5 @@ pub trait VerEnc {
         stm: &Self::Statement,
         dk: &Self::DecKey,
         ve_ct: &Self::VECipherText,
-    ) -> Self::Witness;
+    ) -> Option<Self::Witness>;
 }

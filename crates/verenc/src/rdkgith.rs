@@ -220,6 +220,11 @@ impl VerEnc for RDkgith {
         let t = self.vparams.t;
         let mut hasher = Sha512::new();
 
+        // check the polynomial commitment's length before indexing it
+        if pi.polycom.len() != t + 1 {
+            return false;
+        }
+
         // index of hidden parties
         let p_indices = self.expand_challenge(&pi.challenge);
 
@@ -305,6 +310,13 @@ impl VerEnc for RDkgith {
         let N = self.vparams.N;
         let t = self.vparams.t;
         let n = self.vparams.n;
+        // a malformed proof compresses to nothing, which recovers nothing
+        if pi.challenge.len() < 32 || pi.ctexts.len() != N - t || pi.shares_rands.len() != t {
+            return RDkgithCipherText {
+                ctexts: Vec::new(),
+                aux: Vec::new(),
+            };
+        }
         let mut new_ctexts = Vec::<PKECipherText>::with_capacity(n);
         let mut aux = Vec::<FF>::with_capacity(n);
         let hide_indices = self.expand_challenge(&pi.challenge);
@@ -392,8 +404,11 @@ impl VerEnc for RDkgith {
         stm: &Self::Statement,
         dk: &Self::DecKey,
         ve_ct: &Self::VECipherText,
-    ) -> Self::Witness {
+    ) -> Option<Self::Witness> {
         let n = self.vparams.n;
+        if ve_ct.ctexts.len() < n || ve_ct.aux.len() < n {
+            return None;
+        }
         for i in 0..n {
             let ct = ve_ct.ctexts[i];
             let delta = ve_ct.aux[i];
@@ -401,11 +416,10 @@ impl VerEnc for RDkgith {
             let hash = hash_to_FF(&pt);
             let ptext = ct.c2 - hash * delta;
             if self.check_instance(stm, &ptext) {
-                return ptext;
+                return Some(ptext);
             }
         }
-        print!("recovery failed!");
-        FF::ZERO
+        None
     }
 }
 
@@ -481,7 +495,7 @@ mod tests {
             let ve_ct = ve.compress(&stm, &pi);
             println!("VE ciphertext generated");
             let wit_recover = ve.recover(&stm, &dk, &ve_ct);
-            assert_eq!(wit_recover, wit);
+            assert_eq!(wit_recover, Some(wit));
         }
     }
 
@@ -547,7 +561,7 @@ mod tests {
             );
             let wit_recover = ve.recover(&stm, &dk, &ve_ct);
 
-            assert_eq!(wit_recover, wit);
+            assert_eq!(wit_recover, Some(wit));
         }
     }
 }

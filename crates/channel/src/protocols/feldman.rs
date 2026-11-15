@@ -107,6 +107,16 @@ pub fn vec_to_array<const N: usize>(v: Vec<u8>) -> Result<[u8; N], Box<dyn std::
     Ok(arr)
 }
 
+/// The point `bytes` encodes; an encoding of the wrong length or of no
+/// point is an error naming `what`.
+pub(crate) fn point_from_bytes(bytes: &[u8], what: &str) -> Result<EdwardsPoint, FeldmanError> {
+    let array = vec_to_array::<57>(bytes.to_vec())
+        .map_err(|_| FeldmanError::InvalidData(format!("{what} must be 57 bytes")))?;
+    EdwardsPoint::from_bytes(&array.into())
+        .into_option()
+        .ok_or_else(|| FeldmanError::InvalidData(format!("invalid {what}")))
+}
+
 /// Wipe the secret share and intermediate scalars on drop. The public
 /// points / commitments are not secret and are left alone.
 impl Drop for Feldman {
@@ -574,7 +584,7 @@ impl Feldman {
             return Err(FeldmanError::WrongRound);
         }
 
-        let counterparty_point = EdwardsPoint::from_bytes(reveal.point.as_slice().into()).unwrap();
+        let counterparty_point = point_from_bytes(&reveal.point, "reveal point")?;
 
         if counterparty_point.eq(&EdwardsPoint::generator()).into()
             || counterparty_point == self.generator
@@ -585,7 +595,7 @@ impl Feldman {
         }
 
         let counterparty_random_commitment_point =
-            EdwardsPoint::from_bytes(reveal.random_commitment_point.as_slice().into()).unwrap();
+            point_from_bytes(&reveal.random_commitment_point, "reveal commitment point")?;
 
         if counterparty_random_commitment_point
             .eq(&EdwardsPoint::generator())
@@ -597,7 +607,12 @@ impl Feldman {
             ));
         }
 
-        let counterparty_zkpok = Scalar::from_bytes(reveal.zk_pok.as_slice().try_into().unwrap());
+        let zk_pok: &[u8; 56] = reveal
+            .zk_pok
+            .as_slice()
+            .try_into()
+            .map_err(|_| FeldmanError::InvalidData("reveal proof must be 56 bytes".into()))?;
+        let counterparty_zkpok = Scalar::from_bytes(zk_pok);
 
         let counterparty_zkcommit =
             self.zkcommits_from_counterparties.get(&id).ok_or_else(|| {
@@ -681,12 +696,9 @@ impl Feldman {
             return Err(FeldmanError::WrongRound);
         }
 
-        let point = EdwardsPoint::from_bytes(pubkey.into());
-        if point.is_none().into() {
-            return Err(FeldmanError::InvalidData("invalid pubkey".to_string()));
-        }
+        let point = point_from_bytes(pubkey, "pubkey")?;
 
-        let result = self.scalar.unwrap() * point.unwrap();
+        let result = self.scalar.unwrap() * point;
         if result.is_identity().into() {
             return Err(FeldmanError::InvalidData("invalid pubkey".to_string()));
         }
@@ -694,8 +706,10 @@ impl Feldman {
         return Ok(result.compress().to_bytes().to_vec());
     }
 
+    /// Combines multiplied shares into a group point; the caller decides
+    /// whether it becomes the group key ([`Self::set_public_key`]).
     pub fn combine_mul_share(
-        &mut self,
+        &self,
         shares: Vec<&[u8]>,
         ids: &[usize],
     ) -> Result<Vec<u8>, FeldmanError> {
@@ -707,14 +721,9 @@ impl Feldman {
 
         let mut points = HashMap::<usize, EdwardsPoint>::new();
         for (i, share) in shares.iter().enumerate() {
-            let point = EdwardsPoint::from_bytes((*share).into());
-            if point.is_none().into() {
-                return Err(FeldmanError::InvalidData(
-                    format!("invalid pubkey for {}", ids[i]).to_string(),
-                ));
-            }
+            let point = point_from_bytes(share, &format!("pubkey for {}", ids[i]))?;
 
-            points.insert(ids[i], point.unwrap());
+            points.insert(ids[i], point);
         }
 
         let mut reconstructed_sum = EdwardsPoint::generator();
@@ -738,13 +747,33 @@ impl Feldman {
             reconstructed_sum += reconstructed_fragment;
         }
 
-        self.public_key = reconstructed_sum;
-
         return Ok(reconstructed_sum.compress().to_bytes().to_vec());
     }
 
     pub fn public_key(&self) -> &EdwardsPoint {
         &self.public_key
+    }
+
+    pub fn set_public_key(&mut self, public_key: EdwardsPoint) {
+        self.public_key = public_key;
+    }
+
+    /// The group key the DKG produced, from the share points every member
+    /// revealed. Unlike [`Self::public_key`] it stays fixed when a DKG
+    /// ratchet step moves the group key.
+    pub fn dkg_public_key(&self) -> Result<Vec<u8>, FeldmanError> {
+        if self.round != FeldmanRound::Reconstructed {
+            return Err(FeldmanError::WrongRound);
+        }
+        let ids: Vec<usize> = (1..=self.threshold).collect();
+        let mut points = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let point = self.points_from_counterparties.get(id).ok_or_else(|| {
+                FeldmanError::InvalidData(format!("missing share point for {}", id))
+            })?;
+            points.push(point.compress().to_bytes());
+        }
+        self.combine_mul_share(points.iter().map(|p| &p[..]).collect(), &ids)
     }
 
     pub fn public_key_bytes(&self) -> Vec<u8> {
@@ -766,7 +795,10 @@ impl Feldman {
 
         let mut points = HashMap::<usize, Scalar>::new();
         for (i, share) in shares.iter().enumerate() {
-            let point = Scalar::from_bytes(&(*share).clone().try_into().unwrap());
+            let bytes = vec_to_array::<56>(share.clone()).map_err(|_| {
+                FeldmanError::InvalidData(format!("share for {} must be 56 bytes", ids[i]))
+            })?;
+            let point = Scalar::from_bytes(&bytes);
             if point.is_zero().into() {
                 return Err(FeldmanError::InvalidData(
                     format!("invalid pubkey for {}", ids[i]).to_string(),
@@ -872,5 +904,145 @@ mod feldman_vss_tests {
             recv3.set_poly_frag_for_party(1, &honest, &wrong).is_err(),
             "fragment must not verify against another dealer's commitments",
         );
+    }
+
+    #[test]
+    fn mul_share_refuses_a_point_of_the_wrong_length() {
+        let gen = EdwardsPoint::generator();
+        let mut party = Feldman::new(2, 3, 1, Scalar::random(&mut OsRng), gen);
+        party.sample_polynomial(&mut OsRng).unwrap();
+        let mut point = (Scalar::random(&mut OsRng) * gen)
+            .compress()
+            .to_bytes()
+            .to_vec();
+        point.pop();
+        let result = std::panic::catch_unwind(|| party.mul_share(&point));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "mul_share did not refuse a point of the wrong length"
+        );
+    }
+
+    /// Three parties of a two-of-three DKG, each waiting for the others'
+    /// reveals.
+    fn revealing_parties() -> Vec<Feldman> {
+        let gen = EdwardsPoint::generator();
+        let mut parties: Vec<Feldman> = (1..=3)
+            .map(|id| Feldman::new(2, 3, id, Scalar::random(&mut OsRng), gen))
+            .collect();
+        for party in &mut parties {
+            party.sample_polynomial(&mut OsRng).unwrap();
+        }
+        let dealt: Vec<_> = parties
+            .iter()
+            .map(|p| {
+                (
+                    p.get_poly_frags().unwrap().clone(),
+                    p.get_commitments().unwrap(),
+                )
+            })
+            .collect();
+        let mut zkcommits = Vec::new();
+        for (i, party) in parties.iter_mut().enumerate() {
+            for (j, (frags, commitments)) in dealt.iter().enumerate() {
+                if i != j {
+                    let frag = &frags[&(i + 1)];
+                    if let Some(zkcommit) = party
+                        .set_poly_frag_for_party(j + 1, frag, commitments)
+                        .unwrap()
+                    {
+                        zkcommits.push((i + 1, zkcommit));
+                    }
+                }
+            }
+        }
+        for party in &mut parties {
+            for (from, zkcommit) in &zkcommits {
+                if *from != party.get_id() {
+                    party.receive_commitments(*from, zkcommit).unwrap();
+                }
+            }
+        }
+        parties
+    }
+
+    /// 57 bytes that decode to no point.
+    fn invalid_point() -> Vec<u8> {
+        (0u8..=255)
+            .map(|b| {
+                let mut p = vec![0u8; 57];
+                p[0] = b;
+                p
+            })
+            .find(|p| bool::from(EdwardsPoint::from_bytes(p[..].into()).is_none()))
+            .expect("every candidate decoded to a point")
+    }
+
+    #[test]
+    fn a_reveal_with_malformed_fields_is_refused() {
+        let mut parties = revealing_parties();
+        let point = || {
+            (Scalar::random(&mut OsRng) * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .to_vec()
+        };
+        let proof = || Scalar::random(&mut OsRng).to_bytes().to_vec();
+        let reveal = || FeldmanReveal {
+            point: point(),
+            random_commitment_point: point(),
+            zk_pok: proof(),
+        };
+        let short = |mut v: Vec<u8>| {
+            v.pop();
+            v
+        };
+        let cases = [
+            (
+                "a short point",
+                FeldmanReveal {
+                    point: short(point()),
+                    ..reveal()
+                },
+            ),
+            (
+                "an invalid point",
+                FeldmanReveal {
+                    point: invalid_point(),
+                    ..reveal()
+                },
+            ),
+            (
+                "a short commitment point",
+                FeldmanReveal {
+                    random_commitment_point: short(point()),
+                    ..reveal()
+                },
+            ),
+            (
+                "an invalid commitment point",
+                FeldmanReveal {
+                    random_commitment_point: invalid_point(),
+                    ..reveal()
+                },
+            ),
+            (
+                "a short proof",
+                FeldmanReveal {
+                    zk_pok: short(proof()),
+                    ..reveal()
+                },
+            ),
+        ];
+        for (what, malformed) in cases {
+            let party = &mut parties[0];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                party.recombine(2, &malformed)
+            }));
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "a reveal with {what} was not refused"
+            );
+        }
     }
 }
