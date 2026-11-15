@@ -1168,7 +1168,14 @@ pub(crate) async fn start(
             // transport identity, gated by mtls_seed as before).
             falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
-            retry_queue: Default::default(),
+            // GLOBAL refuses a proof whole once one of its seats' slots
+            // closed (settled, or its window ended) or its registration
+            // was sealed.
+            retry_queue: Arc::new(
+                crate::prover_message_transport_prod::SubmitRetryQueue::reading_slots(
+                    crate::prover_message_transport_prod::registry_slots(prover_registry.clone()),
+                ),
+            ),
             join_header_check,
         },
     );

@@ -136,6 +136,10 @@ pub(crate) struct SubmitRetryQueue {
     /// This node's view of GLOBAL's seat slots ([`SettledSeat`]); none in
     /// tests that need none.
     settled: Option<SettledSeat>,
+    /// Lines on proofs holding a settled seat, per proof digest
+    /// ([`SubmitRetryQueue::warn_settled`]). Locked after `pending` when
+    /// both are.
+    settled_lines: std::sync::Mutex<ArchiveRefusals>,
 }
 
 /// What this node's view of GLOBAL shows of `member`'s seat slot on a
@@ -158,9 +162,17 @@ pub(crate) struct SlotState {
 /// committed by GLOBAL; a slot it lacks or cannot read shows open and
 /// unsealed, so the proof goes.
 pub(crate) fn registry_slots(
-    _registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+    registry: Arc<dyn quil_types::consensus::ProverRegistry>,
 ) -> SettledSeat {
-    Arc::new(|_: &[u8; 32], _: &[u8], _: u64| SlotState::default())
+    Arc::new(move |member: &[u8; 32], shard: &[u8], epoch: u64| {
+        match registry.get_storage_seat_slot(member, shard, epoch) {
+            Ok(Some(slot)) => SlotState {
+                closed: !slot.open,
+                sealed: slot.sealed_at.is_some(),
+            },
+            _ => SlotState::default(),
+        }
+    })
 }
 
 impl SubmitRetryQueue {
@@ -171,6 +183,137 @@ impl SubmitRetryQueue {
             ..Default::default()
         }
     }
+
+    /// The seats `proof` settles that this node's view shows closed
+    /// already, `<shard>@<epoch>` each, and the registrations it seals that
+    /// the view shows sealed, `<shard>@<epoch> sealed`: with any, GLOBAL
+    /// refuses the whole proof (`storage_epoch_proof::check`), so it seals
+    /// and settles none of its seats.
+    fn settled_seats(&self, proof: &StorageProofSubmission) -> Vec<String> {
+        let Some(slots) = &self.settled else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for (shard, epoch, seals, settles) in &proof.seats {
+            if *settles && slots(&proof.member, shard.as_slice(), *epoch).closed {
+                found.push(format!("{}@{epoch}", hex::encode(shard)));
+            }
+            // A seal part seals the registration two epochs on.
+            let seal_epoch = epoch.saturating_add(2);
+            if *seals && slots(&proof.member, shard.as_slice(), seal_epoch).sealed {
+                found.push(format!("{}@{seal_epoch} sealed", hex::encode(shard)));
+            }
+        }
+        found
+    }
+
+    /// Count `proof`, not sent or dropped from the retry queue for a
+    /// settled seat ([`Self::settled_seats`]), in its window's tally.
+    fn count_settled(&self, proof: &StorageProofSubmission) {
+        self.tally(proof.window_end, |t| t.settled += 1);
+    }
+
+    /// Warn that `proof`, of `bytes` bytes digesting to `digest`
+    /// ([`proof_digest`]), holds `settled` seats ([`Self::settled_seats`])
+    /// and what this node did with it (`action`), at this node's GLOBAL
+    /// frame `frame`: once per proof, then every [`ARCHIVE_REFUSAL_EVERY`]
+    /// it comes again, with the times since.
+    fn warn_settled(
+        &self,
+        proof: &StorageProofSubmission,
+        (digest, bytes): (&str, usize),
+        settled: &[String],
+        frame: Option<u64>,
+        action: &'static str,
+    ) {
+        let now = Instant::now();
+        let due = {
+            let mut lines = self.settled_lines.lock().unwrap();
+            lines
+                .archives
+                .retain(|_, (logged, _)| now.duration_since(*logged) < SETTLED_LINES_KEPT);
+            lines.note(now, digest)
+        };
+        let Some((times, secs)) = due else {
+            return;
+        };
+        let (member, _, epochs) = proof.fields();
+        warn!(member, digest, seats = proof.seats.len(), ?settled, ?epochs, bytes,
+            frame = %or_unknown(frame), action, times, secs,
+            "storage epoch proof holds a seat this node's view shows settled or closed, or seals a registration it \
+             shows sealed: GLOBAL refuses the whole proof (a duplicate or late), so it is not sent (again) and its \
+             acceptance drops no other queued proof; the workers of its other seats send them again while their \
+             slots show them owed");
+    }
+
+    /// Drop the queued storage epoch proofs holding a seat this node's view
+    /// shows settled ([`Self::settled_seats`]), each counted in its
+    /// window's tally. A proof whose window is over at this node's GLOBAL
+    /// frame (`frame`, read after the view) stays for [`expire`]: GLOBAL
+    /// closes a slot no proof settled at that frame, and such a proof is
+    /// undelivered, not settled. Each view read clones a registry slot, so
+    /// it reads with `pending` unlocked, a publish never waiting on it; a
+    /// proof replaced or delivered meanwhile is gone already.
+    fn drop_settled(&self, timing: RetryTiming, frame: &dyn Fn() -> Option<u64>) {
+        if self.settled.is_none() {
+            return;
+        }
+        let queued: Vec<(u64, Instant, StorageProofSubmission)> = {
+            let pending = self.pending.lock().unwrap();
+            pending
+                .iter()
+                .filter_map(|queued| Some((queued.id, queued.queued, queued.proof.clone()?)))
+                .collect()
+        };
+        let held: Vec<(u64, Instant, &StorageProofSubmission, Vec<String>)> = queued
+            .iter()
+            .filter_map(|(id, at, proof)| {
+                let settled = self.settled_seats(proof);
+                (!settled.is_empty()).then_some((*id, *at, proof, settled))
+            })
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let frame = frame();
+        let held: Vec<(u64, Vec<String>)> = held
+            .into_iter()
+            .filter(|(_, at, proof, _)| !window_over(proof, *at, timing, frame))
+            .map(|(id, _, _, settled)| (id, settled))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let dropped: Vec<(Queued, Vec<String>)> = {
+            let mut pending = self.pending.lock().unwrap();
+            held.into_iter()
+                .filter_map(|(id, settled)| {
+                    let index = pending.iter().position(|queued| queued.id == id)?;
+                    Some((pending.remove(index)?, settled))
+                })
+                .collect()
+        };
+        for (queued, settled) in dropped {
+            let Some(proof) = &queued.proof else {
+                continue;
+            };
+            let digest = proof_digest(&queued.bytes);
+            let sent = (digest.as_str(), queued.bytes.len());
+            self.warn_settled(proof, sent, &settled, frame, "dropped from the retry queue");
+            self.count_settled(proof);
+        }
+    }
+}
+
+/// How long a proof's last line on a settled seat is kept to bound the next
+/// ([`SubmitRetryQueue::warn_settled`]).
+const SETTLED_LINES_KEPT: Duration = Duration::from_secs(3600);
+
+/// A submission's digest for log lines: the first 8 bytes of its SHA3-256,
+/// in hex.
+fn proof_digest(bytes: &[u8]) -> String {
+    use sha3::Digest;
+    hex::encode(&sha3::Sha3_256::digest(bytes)[..8])
 }
 
 /// What became of the storage epoch proofs whose window ends at one frame
@@ -254,14 +397,29 @@ const RETRY_DROP_LOG_EVERY: Duration = Duration::from_secs(60);
 
 impl SubmitRetryQueue {
     /// Queue `bytes` (once), in place of the queued storage epoch proofs it
-    /// covers; true if no worker is running and the caller must start one.
+    /// supersedes ([`StorageProofSubmission::supersedes`]); true if no
+    /// worker is running and the caller must start one.
     fn push(&self, bytes: Vec<u8>) -> bool {
         let proof = StorageProofSubmission::of(&bytes);
         let mut pending = self.pending.lock().unwrap();
         if !pending.iter().any(|queued| queued.bytes == bytes) {
             if let Some(proof) = &proof {
-                pending
-                    .retain(|queued| !queued.proof.as_ref().is_some_and(|old| proof.covers(old)));
+                let (mut replaced, mut replaced_bytes) = (0usize, 0usize);
+                pending.retain(|queued| {
+                    let gone = queued
+                        .proof
+                        .as_ref()
+                        .is_some_and(|old| proof.supersedes(old));
+                    replaced += usize::from(gone);
+                    replaced_bytes += if gone { queued.bytes.len() } else { 0 };
+                    !gone
+                });
+                if replaced > 0 {
+                    let (member, shards, epochs) = proof.fields();
+                    info!(member, ?shards, ?epochs, bytes = bytes.len(), replaced, replaced_bytes,
+                        "storage epoch proof queued in place of earlier proofs of the same settlements or seals: GLOBAL \
+                         applies only the first of them to ride a frame, so the archives hold one copy");
+                }
             }
             pending.push_back(Queued {
                 id: self.ids.fetch_add(1, Ordering::Relaxed),
@@ -352,16 +510,21 @@ impl SubmitRetryQueue {
         Self::log_drops(&mut self.drops.lock().unwrap(), queued, flush);
     }
 
-    /// Drop the queued storage epoch proofs `delivered` covers, now that an
-    /// archive took it; returns how many.
+    /// Drop the queued storage epoch proofs `delivered` supersedes
+    /// ([`StorageProofSubmission::supersedes`]), now that an archive took
+    /// it; returns how many. None when it holds a seat this node's view
+    /// shows settled ([`Self::settled_seats`]): GLOBAL refuses it whole.
     fn delivered(&self, delivered: &StorageProofSubmission) -> usize {
+        if !self.settled_seats(delivered).is_empty() {
+            return 0;
+        }
         let mut pending = self.pending.lock().unwrap();
         let before = pending.len();
         pending.retain(|queued| {
             !queued
                 .proof
                 .as_ref()
-                .is_some_and(|old| delivered.covers(old))
+                .is_some_and(|old| delivered.supersedes(old))
         });
         before - pending.len()
     }
@@ -415,14 +578,16 @@ impl SubmitRetryQueue {
                     $level!(epoch, window_end, published = t.published, folded = t.folded,
                         sent = t.sent, accepted = t.accepted, refused = t.refused,
                         refused_for_good = t.refused_for_good, undelivered = t.undelivered,
-                        dropped = t.dropped,
+                        dropped = t.dropped, settled = t.settled,
                         "storage epoch proofs of a window that ended: published by this node's workers (folded: sent again while \
                          the retry queue held their seats, so they went at its next round instead of at once), sends to the \
-                         archives, sends an archive took, sends every archive refused for now or for good, and proofs still \
-                         undelivered when the window ended, and proofs a full retry queue dropped. Settlement shows in each \
-                         worker's 'storage settlement recorded' line; undelivered above 0 means GLOBAL withholds those seats' \
-                         storage share; dropped above 0 that those seats settle only if a worker's later send of them landed \
-                         (check that line); refused well above accepted that the archives' held proofs were full")
+                         archives, sends an archive took, sends every archive refused for now or for good, proofs still \
+                         undelivered when the window ended, proofs a full retry queue dropped, and proofs not sent or dropped \
+                         as they held a seat this node's view showed settled, closed or sealed (GLOBAL refuses them whole). \
+                         Settlement shows in each worker's 'storage settlement recorded' line; undelivered above 0 means \
+                         GLOBAL withholds those seats' storage share; dropped above 0 that those seats settle only if a \
+                         worker's later send of them landed (check that line); refused well above accepted that the \
+                         archives' held proofs were full")
                 };
             }
             if t.undelivered > 0 || t.dropped > 0 {
@@ -542,6 +707,9 @@ async fn run_retries<F, Fut, G>(
     let mut delay = timing.first;
     loop {
         tokio::time::sleep(jittered(delay)).await;
+        // Once a round: a proof settled while it ran goes at most once more,
+        // and its acceptance drops no queued proof ([`resent`]).
+        queue.drop_settled(timing, &frame);
         let mut sent = std::collections::HashSet::new();
         let mut failed = false;
         loop {
@@ -638,7 +806,7 @@ fn resent(
             queued.logged = Instant::now();
             let (member, shards, epochs) = proof.fields();
             let (window_end, frames_left, mins_left) = proof.time_left(frame());
-            warn!(member, ?shards, ?epochs, attempts = queued.attempts,
+            warn!(member, ?shards, ?epochs, bytes = queued.bytes.len(), attempts = queued.attempts,
                 secs = queued.queued.elapsed().as_secs(), refusals = %refusals(delivery),
                 window_end, %frames_left, %mins_left, consequence = proof.consequence(),
                 "storage epoch proof still not delivered: no archive took it in time; sending it again until its window ends");
@@ -655,24 +823,53 @@ fn resent(
     let (member, shards, epochs) = proof.fields();
     if delivery.accepted == 0 {
         // A send that timed out may have landed after all.
-        warn!(member, ?shards, ?epochs, attempts = queued.attempts + 1, refusals = %refusals(delivery),
+        warn!(member, ?shards, ?epochs, bytes = queued.bytes.len(), attempts = queued.attempts + 1,
+            refusals = %refusals(delivery),
             "storage epoch proof refused by every archive when sent again; an earlier send may have landed — not sent again");
         return Resent::Done;
     }
+    // Holding a seat settled meanwhile, it seals and settles none.
+    let settled = queue.settled_seats(proof);
     let before = pending.len();
-    pending.retain(|other| !other.proof.as_ref().is_some_and(|old| proof.covers(old)));
+    if settled.is_empty() {
+        pending.retain(|other| {
+            !other
+                .proof
+                .as_ref()
+                .is_some_and(|old| proof.supersedes(old))
+        });
+    } else {
+        let digest = proof_digest(&queued.bytes);
+        let sent = (digest.as_str(), queued.bytes.len());
+        queue.warn_settled(proof, sent, &settled, frame(), "taken by an archive");
+    }
     let superseded = before - pending.len();
     drop(pending);
     let (window_end, frames_left, _) = proof.time_left(frame());
-    info!(member, ?shards, ?epochs, accepted = delivery.accepted, attempts = queued.attempts + 1,
+    info!(member, ?shards, ?epochs, bytes = queued.bytes.len(), accepted = delivery.accepted,
+        attempts = queued.attempts + 1,
         secs = queued.queued.elapsed().as_secs(), window_end, %frames_left, superseded,
         "storage epoch proof delivered when sent again");
     Resent::Done
 }
 
+/// Whether the window of `proof`, queued at `queued`, is over: `frame`,
+/// this node's latest GLOBAL frame, is at its end, or `timing.proof_give_up`
+/// passed while none is known.
+fn window_over(
+    proof: &StorageProofSubmission,
+    queued: Instant,
+    timing: RetryTiming,
+    frame: Option<u64>,
+) -> bool {
+    match frame {
+        Some(frame) => frame >= proof.window_end,
+        None => queued.elapsed() >= timing.proof_give_up,
+    }
+}
+
 /// Drop what can no longer land: a message refused for `timing.give_up`, a
-/// storage epoch proof once `frame`, this node's latest GLOBAL frame, is at
-/// its window's end (or after `timing.proof_give_up` while none is known).
+/// storage epoch proof once its window is over ([`window_over`]).
 /// Returns the window ends of the storage epoch proofs dropped.
 fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64>) -> Vec<u64> {
     let mut given_up = 0;
@@ -683,14 +880,11 @@ fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64
             given_up += usize::from(!keep);
             return keep;
         };
-        let closed = match frame {
-            Some(frame) => frame >= proof.window_end,
-            None => queued.queued.elapsed() >= timing.proof_give_up,
-        };
+        let closed = window_over(proof, queued.queued, timing, frame);
         if closed {
             let (member, shards, epochs) = proof.fields();
-            error!(member, ?shards, ?epochs, window_end = proof.window_end, frame = %or_unknown(frame),
-                attempts = queued.attempts + 1, secs = queued.queued.elapsed().as_secs(),
+            error!(member, ?shards, ?epochs, bytes = queued.bytes.len(), window_end = proof.window_end,
+                frame = %or_unknown(frame), attempts = queued.attempts + 1, secs = queued.queued.elapsed().as_secs(),
                 consequence = proof.consequence(),
                 "storage epoch proof undelivered when its window ended: no archive took it");
             undelivered.push(proof.window_end);
@@ -933,6 +1127,20 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 .report_windows(latest_frame(self.clock_store.as_ref()));
             self.retry_queue
                 .tally(proof.window_end, |t| t.published += 1);
+            // GLOBAL refuses it whole: it would only take the archives' room.
+            let settled = self.retry_queue.settled_seats(proof);
+            if !settled.is_empty() {
+                let digest = proof_digest(&bundle_bytes);
+                self.retry_queue.warn_settled(
+                    proof,
+                    (&digest, bytes),
+                    &settled,
+                    latest_frame(self.clock_store.as_ref()),
+                    "not sent",
+                );
+                self.retry_queue.count_settled(proof);
+                return Ok(());
+            }
             // A worker sends a seat's part again while no archive has taken
             // the last one (about every ten GLOBAL frames): with the queue
             // holding its seats, it takes the queued copy's place and goes
@@ -990,6 +1198,14 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             grpc_ok_count,
             publish_bs.then_some(&bs_result),
         );
+        // Taken though settled meanwhile: GLOBAL refuses it whole.
+        let taken_settled = match &proof {
+            Some(proof) if grpc_ok_count > 0 => {
+                let settled = self.retry_queue.settled_seats(proof);
+                (!settled.is_empty()).then(|| (settled, proof_digest(&bundle_bytes)))
+            }
+            _ => None,
+        };
         // Every archive refused it for now: resend it later.
         let queued = outcome.is_err() && delivery.retry > 0;
         if queued && self.retry_queue.push(bundle_bytes) {
@@ -1011,6 +1227,17 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             let (window_end, frames_left, mins_left) =
                 proof.time_left(latest_frame(self.clock_store.as_ref()));
             if grpc_ok_count > 0 {
+                if let Some((settled, digest)) = &taken_settled {
+                    let frame = latest_frame(self.clock_store.as_ref());
+                    let sent = (digest.as_str(), bytes);
+                    self.retry_queue.warn_settled(
+                        proof,
+                        sent,
+                        settled,
+                        frame,
+                        "taken by an archive",
+                    );
+                }
                 let superseded = self.retry_queue.delivered(proof);
                 info!(member, ?shards, ?epochs, bytes, accepted = grpc_ok_count, archives = archive_count,
                     secs = started.elapsed().as_secs_f64(), window_end, %frames_left, superseded,
@@ -1370,6 +1597,26 @@ impl StorageProofSubmission {
     /// and each of its seats sealed or settled here for the same epoch.
     fn covers(&self, other: &Self) -> bool {
         self.member == other.member && other.seats.iter().all(|seat| self.covers_seat(seat))
+    }
+
+    /// Whether `other`, queued earlier, goes no more once this is queued or
+    /// delivered: this covers it ([`Self::covers`]), or the same member
+    /// settles a seat's epoch in both. GLOBAL refuses a proof whole when one
+    /// of its seats settles an epoch already settled, so of two such proofs
+    /// only the first to ride a frame applies, while both take the
+    /// archives' held room: at the end of epoch 1493's window a node held
+    /// three proofs settling one seat, resent alike, and none landed. The
+    /// node's workers send again what else the earlier one carried, a seal
+    /// on their retry timer and a settlement while its slot shows it owed.
+    fn supersedes(&self, other: &Self) -> bool {
+        let settles_too = |(shard, epoch, _, settles): &(Vec<u8>, u64, bool, bool)| {
+            *settles
+                && self
+                    .seats
+                    .iter()
+                    .any(|(s, e, _, st)| *st && s == shard && e == epoch)
+        };
+        self.covers(other) || (self.member == other.member && other.seats.iter().any(settles_too))
     }
 
     /// Whether delivering this makes `seat` (shard, epoch, seals, settles)
