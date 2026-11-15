@@ -2088,4 +2088,112 @@ mod tests {
             "group creation did not refuse a peer identity key that is not a point"
         );
     }
+
+    /// The exported resize, as the wasm and mobile bindings call it.
+    mod resize {
+        use super::*;
+
+        type Inbox = HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>>;
+
+        fn deliver(inbox: &mut Inbox, from: &[u8], out: HashMap<Vec<u8>, P2PChannelEnvelope>) {
+            for (to, env) in out {
+                inbox.entry(to).or_default().insert(from.to_vec(), env);
+            }
+        }
+
+        /// Four members of an async triple ratchet group with threshold
+        /// two, after the DKG, in the order of their public keys, and
+        /// those keys.
+        fn group() -> (Vec<TripleRatchetParticipant>, Vec<Vec<u8>>) {
+            let mut rng = rand::thread_rng();
+            let public = |k: &Scalar| {
+                (k * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec()
+            };
+            let mut keys: Vec<[Scalar; 3]> = (0..4)
+                .map(|_| [(); 3].map(|_| Scalar::random(&mut rng)))
+                .collect();
+            keys.sort_by_key(|k| public(&k[0]));
+            let infos: Vec<PeerInfo> = keys
+                .iter()
+                .map(|k| PeerInfo {
+                    public_key: public(&k[0]),
+                    identity_public_key: public(&k[1]),
+                    signed_pre_public_key: public(&k[2]),
+                })
+                .collect();
+            let inbox = || -> Inbox {
+                infos
+                    .iter()
+                    .map(|p| (p.public_key.clone(), HashMap::new()))
+                    .collect()
+            };
+            let mut members = Vec::new();
+            let mut inits = inbox();
+            for (i, k) in keys.iter().enumerate() {
+                let others: Vec<PeerInfo> = (0..4)
+                    .filter(|&j| j != i)
+                    .map(|j| infos[j].clone())
+                    .collect();
+                let (member, out) =
+                    TripleRatchetParticipant::new(&others, k[0], k[1], k[2], 2, true).unwrap();
+                members.push(member);
+                deliver(&mut inits, &infos[i].public_key, out);
+            }
+            let mut frags = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                let out = member.initialize(&inits[&infos[i].public_key]).unwrap();
+                deliver(&mut frags, &infos[i].public_key, out);
+            }
+            let mut commitments = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &frags[&infos[i].public_key] {
+                    if let Some(out) = member.receive_poly_frag(from, env).unwrap() {
+                        deliver(&mut commitments, &infos[i].public_key, out);
+                    }
+                }
+            }
+            let mut reveals = inbox();
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &commitments[&infos[i].public_key] {
+                    if let Some(out) = member.receive_commitment(from, env).unwrap() {
+                        deliver(&mut reveals, &infos[i].public_key, out);
+                    }
+                }
+            }
+            for (i, member) in members.iter_mut().enumerate() {
+                for (from, env) in &reveals[&infos[i].public_key] {
+                    member.recombine(from, env).unwrap();
+                }
+            }
+            (members, infos.into_iter().map(|p| p.public_key).collect())
+        }
+
+        /// The other member's share arrives as hex. A share of the wrong
+        /// length must come back as an error, not a panic.
+        #[test]
+        fn triple_ratchet_resize_refuses_a_share_of_the_wrong_length() {
+            let (members, public_keys) = group();
+            let state = members[0].to_json().unwrap();
+            let id = members[0].get_peer_id_map()[&public_keys[1]] as u64;
+            let share = Scalar::random(&mut rand::thread_rng()).to_bytes();
+            let resized = triple_ratchet_resize(state.clone(), hex::encode(share), id, 4);
+            assert!(
+                resized.len() == 4 && resized.iter().all(|s| s.len() == 56),
+                "resize refused a well-formed share: {resized:?}"
+            );
+            println!("REACH resize returned {} shares", resized.len());
+            let refused = std::panic::catch_unwind(move || {
+                triple_ratchet_resize(state, hex::encode(&share[..55]), id, 4)
+            })
+            .expect("resize panicked on a share of the wrong length");
+            assert_eq!(
+                refused.len(),
+                1,
+                "resize accepted a share of the wrong length"
+            );
+        }
+    }
 }
