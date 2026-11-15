@@ -133,8 +133,9 @@ fn a_held_proof_with_an_open_window_outlives_the_retention_window() {
 fn carried_proofs_keep_their_turn() {
     let mc = collector();
     let start = settlement_window(EPOCH).0;
-    // One fits a proposal's bytes, two do not; both fit the held share.
-    let len = 2_500_000;
+    // One fits a proposal's bytes, two do not; both fit one sender's
+    // share of held proofs (`SEAL_BYTES_PER_SENDER`).
+    let len = 1_000_000;
     let older = sized(101, vec![seat(0, true, false)], len);
     let newer = sized(102, vec![seat(0, true, false)], len);
     let relay = peer(700);
@@ -173,6 +174,7 @@ fn share_full_lines_count_every_refusal_once() {
         capacity: (0, 0),
         seals: Seals::default(),
         member: None,
+        sender: None,
     };
     let t0 = Instant::now();
     let mut refused = 0u64;
@@ -425,8 +427,9 @@ fn a_carried_proof_past_its_window_makes_room() {
 fn a_passed_over_second_rides_ahead_of_another_members_only_proof() {
     let mc = collector();
     let start = settlement_window(EPOCH).0;
-    // One fits a proposal's bytes, two do not; both fit the held share.
-    let len = 2_500_000;
+    // One fits a proposal's bytes, two do not; both fit one sender's
+    // share of held proofs (`SEAL_BYTES_PER_SENDER`).
+    let len = 1_000_000;
     let first = sized(1, vec![seat(0, true, false)], len);
     let second = sized(1, vec![seat(1, true, false)], len);
     for proof in [&first, &second] {
@@ -482,6 +485,7 @@ fn a_refusal_after_a_quiet_interval_begins_an_episode() {
         capacity: (0, 0),
         seals: Seals::default(),
         member: None,
+        sender: None,
     };
     let t0 = Instant::now();
     for _ in 0..3 {
