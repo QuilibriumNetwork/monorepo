@@ -913,7 +913,10 @@ impl GlobalParentExecutor {
             }
         };
         let mut captured = Instant::now();
-        let mut branch = self.source.capture_execution_branch(self.limits.branch)?;
+        let mut branch = self.source.capture_execution_branch_as(
+            self.limits.branch,
+            crate::execution_summary::ExecutionRole::Proposal,
+        )?;
         timing.mark("capture branch");
         let cursor = branch.cursor()?;
         if !self.within_window(cursor, number) {

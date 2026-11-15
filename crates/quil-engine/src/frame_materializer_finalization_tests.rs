@@ -304,8 +304,11 @@ fn receipt_less_certified_head_is_authenticated_by_its_certified_child() {
         .is_none());
 }
 
+// Execution timing records a publication once its batch commits: the
+// abandoned attempt executed the frame, yet counts only as abandoned.
 #[test]
 fn intervening_write_abandons_publication_and_a_fresh_attempt_can_succeed() {
+    use crate::execution_summary::{take_abandoned, take_observed, ExecutionRole};
     let fixture = Fixture::new(None);
     let input = frame(
         1,
@@ -321,6 +324,8 @@ fn intervening_write_abandons_publication_and_a_fresh_attempt_can_succeed() {
         .global_commitments_checked()
         .unwrap();
     let notifications = fixture.notifications.load(Ordering::SeqCst);
+    take_observed();
+    take_abandoned();
     let result = fixture
         .source
         .materialize_atomically(&input, limits(), |_| {
@@ -332,6 +337,13 @@ fn intervening_write_abandons_publication_and_a_fresh_attempt_can_succeed() {
             Ok(true)
         });
     assert!(result.is_err());
+    let observed = take_observed();
+    assert!(observed.is_empty(), "abandoned_recorded: {observed:?}");
+    assert_eq!(
+        take_abandoned(),
+        [(1, ExecutionRole::Publication)],
+        "abandoned_uncounted"
+    );
     assert_eq!(fixture.source.last_materialized_frame(), 0);
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 0);
     assert_eq!(fixture.current.materialized(), 0);
@@ -359,8 +371,64 @@ fn intervening_write_abandons_publication_and_a_fresh_attempt_can_succeed() {
         .is_some());
     assert_eq!(fixture.current.materialized(), 1);
     assert_eq!(
+        take_observed(),
+        [(1, ExecutionRole::Publication)],
+        "published_recorded"
+    );
+    let abandoned = take_abandoned();
+    assert!(abandoned.is_empty(), "published_abandoned: {abandoned:?}");
+    assert_eq!(
         fixture.notifications.load(Ordering::SeqCst),
         notifications + 1
+    );
+}
+
+// Execution timing classes each execution by what it is for. A finalized
+// frame's publication runs in a private branch, as a proposal's parent
+// execution does, yet its effects are kept: it counts as committed, so its
+// overruns warn and its time and types reach the interval summary.
+#[test]
+fn execution_timing_counts_a_publication_as_committed() {
+    use crate::execution_summary::{take_observed, ExecutionRole};
+    let fixture = Fixture::new(None);
+    let root = fixture
+        .source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
+    let input = frame(1, root);
+    take_observed();
+
+    let mut proposal = fixture.source.capture_execution_branch(limits()).unwrap();
+    proposal.materialize(&input).unwrap();
+    let mut child = proposal.capture_child(limits()).unwrap();
+    child
+        .materialize(&frame(2, child.prover_root().unwrap()))
+        .unwrap();
+    drop((proposal, child));
+    assert_eq!(
+        take_observed(),
+        [(1, ExecutionRole::Proposal), (2, ExecutionRole::Proposal)],
+        "proposal_role"
+    );
+
+    assert!(fixture
+        .source
+        .materialize_atomically(&input, limits(), |_| Ok(true))
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        take_observed(),
+        [(1, ExecutionRole::Publication)],
+        "publication_role"
+    );
+
+    let in_place = Fixture::new(None);
+    in_place.source.materialize(&input).unwrap();
+    assert_eq!(
+        take_observed(),
+        [(1, ExecutionRole::InPlace)],
+        "in_place_role"
     );
 }
 

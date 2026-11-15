@@ -28,6 +28,7 @@ pub mod difficulty;
 pub mod engine_state;
 pub mod event_distributor;
 pub mod execution_deferral;
+mod execution_summary;
 pub mod fees;
 pub mod fork_choice;
 pub mod frame_bound;

@@ -4,6 +4,7 @@ use super::*;
 
 #[path = "frame_materializer_live_publication.rs"]
 mod publication;
+use crate::execution_summary::ExecutionRole;
 pub use publication::CanonicalAttempt;
 use quil_execution::{ExecutionBranch, ExecutionBranchLimits};
 
@@ -61,6 +62,8 @@ pub struct TentativeFrameResult {
     pub skipped_bundles: Vec<Vec<u8>>,
     pub checkpoint: GlobalExecutionCheckpoint,
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
+    /// A publication's execution, recorded once its batch commits.
+    pub(crate) execution: Option<crate::execution_summary::PendingExecution>,
 }
 
 /// No primary-store, notification or writable materializer handles are exposed.
@@ -166,9 +169,11 @@ impl MaterializerBranch {
         Ok(checkpoint)
     }
 
+    /// A branch over this one's state, executing for the same role.
     pub fn capture_child(&self, limits: MaterializerBranchLimits) -> Result<Self> {
         self.check_open()?;
-        self.materializer.capture_execution_branch(limits)
+        self.materializer
+            .capture_execution_branch_as(limits, self.materializer.execution_role)
     }
 
     /// Execute exactly the next frame. Parent selection and certificates must
@@ -237,6 +242,7 @@ impl MaterializerBranch {
             skipped_bundles: result.skipped_bundles,
             checkpoint,
             prover_ops: result.prover_ops,
+            execution: result.execution,
         })
     }
 }
@@ -275,15 +281,25 @@ impl FrameMaterializer {
     /// mismatch diagnostics are private; immutable maintenance and crypto
     /// services may be shared. Aggregate admission, lifetime, disk policy and
     /// canonical promotion are still the runtime owner's responsibility.
+    /// Its executions count as for a proposal.
     pub fn capture_execution_branch(
         &self,
         limits: MaterializerBranchLimits,
+    ) -> Result<MaterializerBranch> {
+        self.capture_execution_branch_as(limits, ExecutionRole::Proposal)
+    }
+
+    /// [`Self::capture_execution_branch`], executing for `role`.
+    pub(in crate::frame_materializer) fn capture_execution_branch_as(
+        &self,
+        limits: MaterializerBranchLimits,
+        role: ExecutionRole,
     ) -> Result<MaterializerBranch> {
         let _frame = self
             .frame_execution
             .try_lock()
             .map_err(|error| quil_execution::lock_unavailable("materializer frame lock", error))?;
-        self.capture_execution_branch_with(limits, |registry| {
+        self.capture_execution_branch_with(limits, role, |registry| {
             self.execution_manager
                 .capture_execution_branch_seeded(limits.execution, registry)
                 .map(|branch| (branch, ()))
@@ -294,9 +310,11 @@ impl FrameMaterializer {
     /// The caller already holds the source frame lock. The factory may retain
     /// the execution barriers through publication without reacquiring them.
     /// It receives the canonical registry, which may seed the branch's own.
+    /// `role`: what the branch's executions are for.
     fn capture_execution_branch_with<T>(
         &self,
         limits: MaterializerBranchLimits,
+        role: ExecutionRole,
         capture: impl FnOnce(&ConcreteProverRegistry) -> Result<(ExecutionBranch, T)>,
     ) -> Result<(MaterializerBranch, T)> {
         if self.prover_sync_in_progress.load(Ordering::SeqCst) {
@@ -390,6 +408,7 @@ impl FrameMaterializer {
             self.archive_mode,
         );
         materializer.tentative_execution = true;
+        materializer.execution_role = role;
         materializer.global_maintenance = self.global_maintenance.clone();
         materializer.eviction_grace_frames = self.eviction_grace_frames;
         materializer.evictions_enabled = self.evictions_enabled;
