@@ -133,6 +133,44 @@ pub(crate) struct SubmitRetryQueue {
     /// [`RETRY_DROP_LOG_EVERY`]. Never locked with `pending` or `tally`
     /// held.
     drops: std::sync::Mutex<QueueDrops>,
+    /// This node's view of GLOBAL's seat slots ([`SettledSeat`]); none in
+    /// tests that need none.
+    settled: Option<SettledSeat>,
+}
+
+/// What this node's view of GLOBAL shows of `member`'s seat slot on a
+/// shard for an epoch (`StorageSeatSlot`). GLOBAL refuses a proof whole
+/// when one of its seats settles an epoch already settled, or too late, or
+/// seals a registration already sealed.
+pub(crate) type SettledSeat = Arc<dyn Fn(&[u8; 32], &[u8], u64) -> SlotState + Send + Sync>;
+
+/// One seat slot in this node's view of GLOBAL ([`SettledSeat`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SlotState {
+    /// No settlement goes any more: an epoch proof settled the epoch or its
+    /// window ended (`StorageSeatSlot::open` false).
+    pub(crate) closed: bool,
+    /// An epoch proof sealed the registration (`StorageSeatSlot::sealed_at`).
+    pub(crate) sealed: bool,
+}
+
+/// This node's view of GLOBAL's seat slots: the slots `registry` holds,
+/// committed by GLOBAL; a slot it lacks or cannot read shows open and
+/// unsealed, so the proof goes.
+pub(crate) fn registry_slots(
+    _registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+) -> SettledSeat {
+    Arc::new(|_: &[u8; 32], _: &[u8], _: u64| SlotState::default())
+}
+
+impl SubmitRetryQueue {
+    /// An empty queue reading seat slots through `settled`.
+    pub(crate) fn reading_slots(settled: SettledSeat) -> Self {
+        Self {
+            settled: Some(settled),
+            ..Default::default()
+        }
+    }
 }
 
 /// What became of the storage epoch proofs whose window ends at one frame
@@ -157,6 +195,10 @@ struct WindowTally {
     /// Proofs a full retry queue dropped: a worker's later send of their
     /// seats may still deliver them, so they are not counted undelivered.
     dropped: u64,
+    /// Proofs not sent, or dropped from the retry queue, as they held a
+    /// seat this node's view showed settled, closed or sealed: GLOBAL
+    /// refuses them whole.
+    settled: u64,
 }
 
 /// Messages dropped from a full retry queue since the last line about them
@@ -326,6 +368,14 @@ impl SubmitRetryQueue {
 
     fn len(&self) -> usize {
         self.pending.lock().unwrap().len()
+    }
+
+    /// Proofs of the window ending at `window_end` held back for a settled
+    /// seat ([`WindowTally::settled`]).
+    #[cfg(test)]
+    fn settled_in(&self, window_end: u64) -> u64 {
+        let tally = self.tally.lock().unwrap();
+        tally.get(&window_end).map_or(0, |t| t.settled)
     }
 
     /// Whether queued storage epoch proofs of `proof`'s member cover each of
@@ -2710,6 +2760,490 @@ mod tests {
                 .unwrap();
         assert_eq!(queue.delivered(&sealing_too), 1, "the seal of 1335");
         assert_eq!(queue.len(), 2);
+    }
+
+    /// GLOBAL applies only the first of two proofs settling one seat's
+    /// epoch: a later proof settling a queued proof's seat takes its place,
+    /// and a delivered one drops it, though the queued one also seals that
+    /// seat or settles another; a proof only sealing that seat, or settling
+    /// it for another epoch or member, stays.
+    #[test]
+    fn a_later_proof_settling_a_queued_seat_replaces_the_queued_one() {
+        let queue = SubmitRetryQueue::default();
+        let seats = |queue: &SubmitRetryQueue| -> Vec<Vec<(u8, u64, bool, bool)>> {
+            queue
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|queued| {
+                    let proof = queued.proof.as_ref().unwrap();
+                    proof
+                        .seats
+                        .iter()
+                        .map(|(shard, epoch, seals, settles)| (shard[0], *epoch, *seals, *settles))
+                        .collect()
+                })
+                .collect()
+        };
+        // Sealing and settling seat 7, as a first attempt does.
+        queue.push(storage_proof_bundle(1, &[(7, 1335, true, true)], 8));
+        // Settling seats 8 and 9 together.
+        queue.push(storage_proof_bundle(
+            1,
+            &[(8, 1335, false, true), (9, 1335, false, true)],
+            8,
+        ));
+        // Only sealing seat 7; another member; another epoch.
+        queue.push(storage_proof_bundle(1, &[(7, 1335, true, false)], 9));
+        queue.push(storage_proof_bundle(2, &[(7, 1335, false, true)], 8));
+        queue.push(storage_proof_bundle(
+            1,
+            &[(7, 1334, false, true), (6, 1334, false, true)],
+            8,
+        ));
+        assert_eq!(queue.len(), 5);
+        let later = [(7, 1335, false, true), (8, 1335, false, true)];
+        queue.push(storage_proof_bundle(1, &later, 8));
+        eprintln!("REACH settled-seat queue holds {}", queue.len());
+        assert_eq!(
+            seats(&queue),
+            vec![
+                vec![(7, 1335, true, false)],
+                vec![(7, 1335, false, true)],
+                vec![(7, 1334, false, true), (6, 1334, false, true)],
+                later.to_vec(),
+            ],
+            "the later proof replaced the two settling seat 7 or 8 of 1335"
+        );
+        let delivered =
+            StorageProofSubmission::of(&storage_proof_bundle(1, &[(7, 1334, false, true)], 8))
+                .unwrap();
+        assert_eq!(queue.delivered(&delivered), 1, "the settlement of 1334");
+        assert_eq!(queue.len(), 3);
+    }
+
+    /// This node's view of member 1's seat slots, shared with the queue's.
+    type SettledSet = Arc<std::sync::Mutex<Slots>>;
+
+    /// Seat slots (shard byte, epoch) of member 1 this node's view shows
+    /// closed, and those whose registration it shows sealed.
+    #[derive(Default)]
+    struct Slots {
+        closed: std::collections::HashSet<(u8, u64)>,
+        sealed: std::collections::HashSet<(u8, u64)>,
+    }
+
+    /// A [`SettledSet`], shared with the queue's view of seat slots.
+    fn settled_view() -> (SettledSet, super::SettledSeat) {
+        let settled: SettledSet = Default::default();
+        let view = settled.clone();
+        let seat: super::SettledSeat =
+            Arc::new(move |member: &[u8; 32], shard: &[u8], epoch: u64| {
+                let slots = view.lock().unwrap();
+                let at = (shard[0], epoch);
+                super::SlotState {
+                    closed: *member == [1; 32] && slots.closed.contains(&at),
+                    sealed: *member == [1; 32] && slots.sealed.contains(&at),
+                }
+            });
+        (settled, seat)
+    }
+
+    /// GLOBAL refuses a proof whole when one of its seats settles an epoch
+    /// already settled: a queued proof holding a seat this node's view
+    /// shows settled is not sent again, and the proof of its other seats
+    /// queued beside it is.
+    #[tokio::test]
+    async fn a_queued_proof_holding_a_settled_seat_is_not_sent_again() {
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view));
+        let group = storage_proof_bundle(1, &[(7, 1495, false, true), (9, 1495, false, true)], 8);
+        let alone = storage_proof_bundle(1, &[(8, 1495, false, true)], 8);
+        queue.push(group.clone());
+        queue.push(alone.clone());
+        assert_eq!(queue.len(), 2, "both proofs queued");
+        // Seat 9 settled by another proof while the group waited.
+        settled.lock().unwrap().closed.insert((9, 1495));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let log = sent.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |bytes| {
+                log.lock().unwrap().push(bytes);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        eprintln!("REACH settled-seat resend sends={}", sent.len());
+        assert!(
+            !sent.contains(&group),
+            "settled_resend: the proof holding settled seat 9 was sent again"
+        );
+        assert_eq!(sent, vec![alone], "the proof of seat 8 was sent");
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// GLOBAL closes a slot no proof settled once its frame reaches the
+    /// settlement window's end, the frame a queued proof's window ends at:
+    /// that proof is given up as undelivered, its window's line a warning,
+    /// never dropped as one holding a settled seat.
+    #[tokio::test]
+    async fn a_queued_proof_whose_window_ended_is_undelivered_not_settled() {
+        #[derive(Clone)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let writer = Lines(captured.clone());
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view));
+        let bundle = storage_proof_bundle(1, &[(17, 1495, false, true)], 8);
+        let window_end = StorageProofSubmission::of(&bundle).unwrap().window_end;
+        queue.push(bundle);
+        assert_eq!(queue.len(), 1, "the proof of seat 17 queued");
+        // GLOBAL's frame reached the window's end: the slot shows closed.
+        settled.lock().unwrap().closed.insert((17, 1495));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let count = sends.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_retries(
+                queue.clone(),
+                FAST,
+                move |_bytes: Vec<u8>| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Delivery {
+                            accepted: 1,
+                            ..Default::default()
+                        }
+                    }
+                },
+                move || Some(window_end),
+            ),
+        )
+        .await
+        .expect("given up at the window's end");
+        let text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("storage epoch proofs of a window that ended"))
+            .collect();
+        eprintln!("REACH settled-seat expired window lines={}", lines.len());
+        assert_eq!(lines.len(), 1, "one window line in {text}");
+        assert!(
+            lines[0].contains("WARN")
+                && lines[0].contains("undelivered=1")
+                && !lines[0].contains("settled=1"),
+            "expired_settled: the proof of seat 17, its window ended, was not counted undelivered: {}",
+            lines[0]
+        );
+        assert!(
+            text.contains("storage epoch proof undelivered when its window ended"),
+            "the proof's own undelivered line: {text}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "not sent after its window");
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// An archive taking a proof that holds a seat already settled drops no
+    /// queued proof: GLOBAL refuses it whole, so it seals and settles none
+    /// of the seats it shares with them.
+    #[test]
+    fn an_accepted_proof_holding_a_settled_seat_drops_no_queued_proof() {
+        let (settled, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        settled.lock().unwrap().closed.insert((9, 1495));
+        let alone = storage_proof_bundle(1, &[(8, 1495, false, true)], 8);
+        queue.push(alone.clone());
+        let taken = StorageProofSubmission::of(&storage_proof_bundle(
+            1,
+            &[(8, 1495, false, true), (9, 1495, false, true)],
+            8,
+        ))
+        .unwrap();
+        let superseded = queue.delivered(&taken);
+        eprintln!("REACH settled-seat acceptance superseded={superseded}");
+        assert_eq!(
+            superseded, 0,
+            "settled_supersedes: a proof holding settled seat 9 dropped the queued proof of seat 8"
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// A proof sent again from the retry queue, taken by an archive as
+    /// another proof settled one of its seats, drops no queued proof: GLOBAL
+    /// refuses it whole, so the seal queued beside it still goes.
+    #[tokio::test]
+    async fn a_resent_proof_taken_as_its_seat_settled_drops_no_queued_proof() {
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view));
+        let group = storage_proof_bundle(1, &[(10, 1495, true, true), (11, 1495, false, true)], 8);
+        let seal = storage_proof_bundle(1, &[(10, 1495, true, false)], 8);
+        queue.push(group.clone());
+        queue.push(seal.clone());
+        assert_eq!(queue.len(), 2, "the seal queued beside the group");
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let log = sent.clone();
+        let race = (group.clone(), settled.clone());
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |bytes| {
+                if bytes == race.0 {
+                    race.1.lock().unwrap().closed.insert((11, 1495));
+                }
+                log.lock().unwrap().push(bytes);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        eprintln!("REACH settled-seat resent acceptance sends={}", sent.len());
+        assert_eq!(
+            sent,
+            vec![group, seal],
+            "settled_resent_supersedes: the seal of seat 10 was dropped by a resent proof holding settled seat 11"
+        );
+    }
+
+    /// A proof holding a seat this node's view shows settled is not sent:
+    /// GLOBAL refuses it whole, and it would take the archives' room.
+    #[tokio::test]
+    async fn a_proof_holding_a_settled_seat_is_not_sent() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        let (settled, view) = settled_view();
+        settled.lock().unwrap().closed.insert((9, 1495));
+        assert!(
+            view(&[1; 32], &[9; 35], 1495).closed,
+            "seat 9 shows settled"
+        );
+        let (address, seen) = full_archive().await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(address).await;
+        let transport = super::ProdProverMessageTransport {
+            archive_pool: pool,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            p2p_handle: quil_p2p::node::P2PHandle::for_test(false),
+            falcon_signing_key: Some(quil_p2p::generate_falcon_signing_key()),
+            publish_to_blossomsub: false,
+            retry_queue: Arc::new(SubmitRetryQueue::reading_slots(view)),
+            join_header_check: Arc::new(|_: &quil_types::proto::global::GlobalFrame| true),
+        };
+        let group = storage_proof_bundle(1, &[(8, 1495, false, true), (9, 1495, false, true)], 64);
+        let window_end = StorageProofSubmission::of(&group).unwrap().window_end;
+        let _ = transport.publish_prover_bundle(group).await;
+        let sends = seen.load(Ordering::SeqCst);
+        eprintln!("REACH settled-seat publish sends={sends}");
+        assert_eq!(
+            sends, 0,
+            "settled_publish: the proof holding settled seat 9 went to the archives"
+        );
+        assert_eq!(transport.retry_queue.len(), 0, "nor queued");
+        assert_eq!(
+            transport.retry_queue.settled_in(window_end),
+            1,
+            "settled_tally: a proof held back for a settled seat was not counted in its window"
+        );
+        let _ = transport
+            .publish_prover_bundle(storage_proof_bundle(1, &[(8, 1495, false, true)], 64))
+            .await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "the proof of seat 8 went");
+    }
+
+    /// GLOBAL refuses a proof whole when one of its seats seals a
+    /// registration already sealed: a queued proof sealing a registration
+    /// this node's view shows sealed is not sent again, and the seal queued
+    /// beside it is. Its window's line counts it.
+    #[tokio::test]
+    async fn a_queued_proof_sealing_a_sealed_registration_is_not_sent_again() {
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view));
+        // Seals of seats 10 and 12 together, and of seat 13 alone.
+        let group = storage_proof_bundle(1, &[(10, 1495, true, false), (12, 1495, true, false)], 8);
+        let alone = storage_proof_bundle(1, &[(13, 1495, true, false)], 8);
+        let window_end = StorageProofSubmission::of(&group).unwrap().window_end;
+        queue.push(group.clone());
+        queue.push(alone.clone());
+        assert_eq!(queue.len(), 2, "both proofs queued");
+        // Seat 12's registration for epoch 1497 sealed by another proof
+        // while the group waited; its slot is open.
+        settled.lock().unwrap().sealed.insert((12, 1497));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let log = sent.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |bytes| {
+                log.lock().unwrap().push(bytes);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        eprintln!("REACH settled-seat sealed sends={}", sent.len());
+        assert!(
+            !sent.contains(&group),
+            "sealed_resend: the proof sealing seat 12's sealed registration was sent again"
+        );
+        assert_eq!(sent, vec![alone], "the seal of seat 13 was sent");
+        assert_eq!(queue.len(), 0);
+        assert_eq!(
+            queue.settled_in(window_end),
+            1,
+            "settled_tally: a proof held back for a settled seat was not counted in its window"
+        );
+    }
+
+    /// Each check reads only the part a seat carries: a seal goes though
+    /// its seat's slot shows settled, and a settlement though the
+    /// registration two epochs on shows sealed; a settlement of a slot
+    /// shown settled does not go.
+    #[tokio::test]
+    async fn a_seal_of_a_settled_slot_and_a_settlement_under_a_sealed_registration_are_sent() {
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view.clone()));
+        // Seat 14 seals its registration for 1497, seat 15 settles 1495,
+        // seat 16 settles 1495.
+        let seal = storage_proof_bundle(1, &[(14, 1495, true, false)], 8);
+        let settle = storage_proof_bundle(1, &[(15, 1495, false, true)], 8);
+        let again = storage_proof_bundle(1, &[(16, 1495, false, true)], 8);
+        for bundle in [&seal, &settle, &again] {
+            queue.push(bundle.clone());
+        }
+        assert_eq!(queue.len(), 3, "the three proofs queued");
+        // Seat 14's slot of 1495 settled, seat 15's registration for 1497
+        // sealed and seat 16's slot of 1495 settled, by other proofs.
+        {
+            let mut slots = settled.lock().unwrap();
+            slots.closed.extend([(14, 1495), (16, 1495)]);
+            slots.sealed.insert((15, 1497));
+        }
+        let shown = |shard: u8, epoch| view(&[1; 32], &[shard; 35], epoch);
+        assert!(
+            shown(14, 1495).closed && !shown(14, 1497).sealed,
+            "seat 14's slot shows settled, its registration unsealed"
+        );
+        assert!(
+            !shown(15, 1495).closed && shown(15, 1497).sealed,
+            "seat 15's slot shows open, its registration sealed"
+        );
+        assert!(shown(16, 1495).closed, "seat 16's slot shows settled");
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let log = sent.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |bytes| {
+                log.lock().unwrap().push(bytes);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        eprintln!("REACH settled-seat parts sends={}", sent.len());
+        assert!(
+            !sent.contains(&again),
+            "settled_parts: the proof settling seat 16's settled slot was sent again"
+        );
+        assert!(
+            sent.contains(&seal),
+            "settles_part: the seal of seat 14 was held back as its slot settled"
+        );
+        assert!(
+            sent.contains(&settle),
+            "seals_part: the settlement of seat 15 was held back as its registration sealed"
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// The production view of seat slots reads the slots the registry holds:
+    /// an open slot shows open, a settled or expired one closed, a sealed
+    /// registration sealed; a slot it lacks shows open and unsealed.
+    #[test]
+    fn the_registry_view_shows_open_settled_expired_and_sealed_slots() {
+        use quil_execution::global_intrinsic::storage_seat::{Outcome, SeatSlot};
+        let registry = Arc::new(quil_execution::prover_registry::SharedProverRegistry::new());
+        let slots = [
+            (1495, Outcome::Open, Some(100)),
+            (1496, Outcome::Settled(200), Some(150)),
+            (1497, Outcome::Expired(300), None),
+            (1498, Outcome::Open, None),
+        ];
+        registry.write_for_tests(|cache| {
+            for (epoch, outcome, sealed_at) in slots {
+                let slot = SeatSlot {
+                    epoch,
+                    leaves: vec![vec![0]],
+                    registered_at: 50,
+                    sealed_at,
+                    outcome,
+                    ..Default::default()
+                };
+                cache.insert_storage_seat_slot_for_tests(&[1; 32], &[7; 35], slot.view());
+            }
+        });
+        let view = super::registry_slots(registry);
+        let shown: Vec<(u64, super::SlotState)> = (1495..=1499)
+            .map(|epoch| (epoch, view(&[1; 32], &[7; 35], epoch)))
+            .collect();
+        eprintln!("REACH settled-seat view {shown:?}");
+        let state = |closed, sealed| super::SlotState { closed, sealed };
+        assert_eq!(
+            shown,
+            vec![
+                (1495, state(false, true)),
+                (1496, state(true, true)),
+                (1497, state(true, false)),
+                (1498, state(false, false)),
+                (1499, state(false, false)),
+            ],
+            "slot_view: the registry view misread open, settled, expired or sealed slots"
+        );
+        assert_eq!(
+            view(&[2; 32], &[7; 35], 1496),
+            super::SlotState::default(),
+            "another member's seat shows open"
+        );
     }
 }
 
