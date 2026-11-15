@@ -327,7 +327,7 @@ fn check_linked_still_start(
              the stored source again, then install official releases, which start under any \
              source ('qclient node update --release-source official --allow-downgrade' and \
              'qclient update --release-source official --allow-downgrade'), then run this \
-             again",
+             again, which enables auto-update again",
             if next.is_some() { "replace" } else { "remove" },
             path.display(),
             link.display(),
@@ -982,7 +982,8 @@ mod tests {
     /// A refused source change names the way out in order: disable
     /// auto-update first, whose job would otherwise install from the
     /// stored source again and relink a release that starts only under
-    /// it, then install official releases.
+    /// it, then install official releases, then run the change again,
+    /// which enables auto-update again.
     #[cfg(unix)]
     #[test]
     fn a_stranding_refusal_says_to_disable_auto_update_first() {
@@ -1000,9 +1001,14 @@ mod tests {
         };
         let disable = err.find("'qclient node auto-update disable'");
         let install = err.find("'qclient node update --release-source official --allow-downgrade'");
+        let rerun = err.find("then run this again, which enables auto-update again");
         assert!(
             matches!((disable, install), (Some(d), Some(i)) if d < i),
             "auto_update_not_disabled_first: {err}"
+        );
+        assert!(
+            matches!((install, rerun), (Some(i), Some(r)) if i < r),
+            "auto_update_reenable_unsaid: {err}"
         );
     }
 

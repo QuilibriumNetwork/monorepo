@@ -94,12 +94,19 @@ pub async fn update(
         allow_downgrade,
     )
     .await?;
-    if !installed.fresh {
+    finish_update(installed.fresh, &installed.path, restart, &version)
+}
+
+/// What `node update` does once `version` is installed at `path`
+/// (`fresh`: by this run): with `restart`, restart the node service only
+/// if it runs ([`restart_after_update`]).
+fn finish_update(fresh: bool, path: &Path, restart: bool, version: &str) -> anyhow::Result<()> {
+    if !fresh {
         println!("Node {version} is already installed; nothing to update");
         return Ok(());
     }
-    println!("Updated node to {}", installed.path.display());
-    let line = restart_after_update(restart, &version, super::service::restart_if_running)?;
+    println!("Updated node to {}", path.display());
+    let line = restart_after_update(restart, version, super::service::restart_if_running)?;
     if let Some(line) = line {
         println!("{line}");
     }
@@ -514,6 +521,47 @@ mod tests {
         );
         let untouched = restart_after_update(false, "2.1.0.26", || panic!("service_touched"));
         assert_eq!(untouched.unwrap(), None);
+    }
+
+    /// `node update --restart` on a stopped node runs the service state
+    /// query alone, through the service manager itself (a `sudo` on PATH
+    /// that logs its arguments and answers "stopped"): an unconditional
+    /// restart there would start a node its operator stopped.
+    #[cfg(unix)]
+    #[test]
+    fn update_restart_leaves_a_stopped_node_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        // Beside the test binary, which runs from there: a temporary
+        // directory may be mounted without exec.
+        let exe = std::env::current_exe().unwrap();
+        let tmp = tempfile::TempDir::new_in(exe.parent().unwrap()).unwrap();
+        let log = tmp.path().join("sudo.log");
+        let sudo = tmp.path().join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in\n\
+                 'systemctl is-active') exit 3 ;;\n'launchctl print') exit 113 ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![tmp.path().to_path_buf()];
+        dirs.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let done = finish_update(true, Path::new("/opt/node"), true, "2.1.0.26");
+        std::env::set_var("PATH", path);
+        let ran = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = ran.lines().collect();
+        assert!(
+            done.is_ok()
+                && lines.len() == 1
+                && (lines[0].starts_with("systemctl is-active ")
+                    || lines[0].starts_with("launchctl print ")),
+            "update_started_a_stopped_node: {done:?}, ran {lines:?}"
+        );
     }
 
     #[test]
