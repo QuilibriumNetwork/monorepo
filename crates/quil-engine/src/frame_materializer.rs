@@ -153,6 +153,9 @@ pub struct FrameMaterializer {
     /// Only the owning branch constructor enables this checked, nonpublishing
     /// path. The owner closes captured storage on every failed frame attempt.
     tentative_execution: bool,
+    /// What its executions are for, as execution timing logs them. In
+    /// place unless the branch constructor's caller names another role.
+    execution_role: crate::execution_summary::ExecutionRole,
     /// Immutable policy; receives this materializer's providers on every call.
     global_maintenance: Option<crate::frame_maintenance::GlobalMaintenance>,
     /// Execution manager for processing frame requests.
@@ -355,6 +358,9 @@ pub struct MaterializeResult {
     pub skipped_bundles: Vec<Vec<u8>>,
     /// The prover lifecycle filters the frame's bundles carried.
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
+    /// A publication's execution, recorded once its batch commits; every
+    /// other execution is recorded before this result returns.
+    pub(crate) execution: Option<crate::execution_summary::PendingExecution>,
 }
 
 impl FrameMaterializer {
@@ -376,6 +382,7 @@ impl FrameMaterializer {
         Self {
             frame_execution: std::sync::Mutex::new(()),
             tentative_execution: false,
+            execution_role: crate::execution_summary::ExecutionRole::InPlace,
             global_maintenance: None,
             execution_manager,
             prover_registry,
@@ -544,6 +551,7 @@ impl FrameMaterializer {
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
+                execution: None,
             });
         }
 
@@ -568,6 +576,7 @@ impl FrameMaterializer {
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
+                execution: None,
             });
         }
 
@@ -725,6 +734,7 @@ impl FrameMaterializer {
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
+                execution: None,
             });
         }
 
@@ -976,29 +986,20 @@ impl FrameMaterializer {
             self.execution_manager
                 .preverify_global_bundles(frame_number, &routed);
         }
-        // Where message execution goes when it runs slow: per op kind
-        // (messages, validate µs, process µs, slowest µs) and the execution
-        // sections the intrinsics mark. The epoch-boundary lifecycle wave
-        // spent 90-190 ms per message here against ~30 ms validating.
+        // Where message execution goes: per message type (messages,
+        // validate and process time, slowest) and the execution sections the
+        // intrinsics mark, for overrun warnings and the interval summary.
+        // The epoch-boundary lifecycle wave spent 90-190 ms per message here
+        // against ~30 ms validating.
         let execution_started = std::time::Instant::now();
         let sections = quil_execution::step_timing::collect();
         let mut prover_ops = crate::prover_op_tally::ProverOpTally::default();
-        let mut execution_us: std::collections::HashMap<String, (usize, u64, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut execution_tally = crate::execution_summary::ExecutionTally::default();
         let mut record_execution = |raw: &[u8], validate_us: u64, process_us: u64| {
-            let total = validate_us + process_us;
-            // Decoding a kind costs a copy of the bundle; only slow ones need it.
-            let kind = if total >= 10_000 {
-                crate::leader_provider::message_kinds(raw)
-            } else {
-                "under 10 ms".to_string()
-            };
-            let entry = execution_us.entry(kind).or_insert((0, 0, 0, 0));
-            *entry = (
-                entry.0 + 1,
-                entry.1 + validate_us,
-                entry.2 + process_us,
-                entry.3.max(total),
+            execution_tally.record(
+                crate::execution_summary::bundle_kind(raw),
+                validate_us,
+                process_us,
             );
         };
         for bundle in &frame.requests {
@@ -1211,31 +1212,18 @@ impl FrameMaterializer {
         if executed >= crate::stage_clock::SLOW_EXECUTION {
             crate::stage_clock::note_slow("GLOBAL message execution", executed);
         }
-        if executed >= crate::stage_clock::WARN_AFTER {
-            let ms = |us: u64| us / 1000;
-            let mut by_kind: Vec<_> = execution_us.into_iter().collect();
-            by_kind.sort_by(|a, b| (b.1 .1 + b.1 .2).cmp(&(a.1 .1 + a.1 .2)));
-            let mut sections = sections;
-            sections.sort_by(|a, b| b.2.cmp(&a.2));
-            warn!(
-                frame = frame_number,
-                tentative = self.tentative_execution,
-                total_ms = execution_started.elapsed().as_millis() as u64,
-                by_kind = %by_kind
-                    .iter()
-                    .map(|(kind, (n, validate, process, max))| format!(
-                        "{n}× {kind}: validate {} ms, process {} ms (max {})",
-                        ms(*validate), ms(*process), ms(*max)))
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                sections = %sections
-                    .iter()
-                    .map(|(name, n, total)| format!("{name}: {n}× {} ms", total.as_millis()))
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                "slow GLOBAL message execution",
-            );
-        }
+        // Recorded once this execution's effects commit: below for one in
+        // place, after its batch for a publication. Abandoned before that,
+        // it counts only as abandoned.
+        let execution = crate::execution_summary::PendingExecution::new(
+            frame_number,
+            self.execution_role,
+            execution_tally.summarize(
+                executed,
+                crate::execution_summary::execution_budget(frame_number),
+                sections,
+            ),
+        );
         // Persist the per-bundle outcomes for this frame (best-effort on the
         // canonical path; required for a complete tentative delta). Aligned by index to
         // `frame.requests`. Read back by the explorer to show which requests
@@ -1781,6 +1769,13 @@ impl FrameMaterializer {
         if !self.tentative_execution {
             prover_ops.log(frame_number);
         }
+        let execution = match self.execution_role {
+            crate::execution_summary::ExecutionRole::Publication => Some(execution),
+            _ => {
+                execution.completed();
+                None
+            }
+        };
 
         Ok(MaterializeResult {
             processed,
@@ -1790,6 +1785,7 @@ impl FrameMaterializer {
             finalized_bundles,
             skipped_bundles,
             prover_ops,
+            execution,
         })
     }
 
@@ -3376,6 +3372,7 @@ mod tests {
             finalized_bundles: Vec::new(),
             skipped_bundles: Vec::new(),
             prover_ops: Default::default(),
+            execution: None,
         };
         assert_eq!(r.processed, 5);
         assert_eq!(r.skipped, 1);

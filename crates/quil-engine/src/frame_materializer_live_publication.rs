@@ -135,9 +135,14 @@ impl FrameMaterializer {
             &mut timing,
         );
         self.execution_counters.attempted(&result);
-        let result = result?;
-        if let Some(published) = &result {
+        let mut result = result?;
+        if let Some(published) = &mut result {
             published.prover_ops.log(number);
+            // Committed: an attempt that failed before here counted only
+            // as abandoned.
+            if let Some(execution) = published.execution.take() {
+                execution.completed();
+            }
         }
         // All execution barriers were released before these callbacks, including
         // on an authenticated replay after a previous commit or restart.
@@ -168,10 +173,14 @@ impl FrameMaterializer {
             .lock(&self.frame_execution)
             .ok_or_else(|| unavailable("canonical materializer is busy or poisoned"))?;
         let capture_started = std::time::Instant::now();
-        let captured = self.capture_execution_branch_with(limits, |registry| {
-            self.execution_manager
-                .capture_execution_branch_guarded_seeded(limits.execution, registry)
-        });
+        let captured = self.capture_execution_branch_with(
+            limits,
+            crate::execution_summary::ExecutionRole::Publication,
+            |registry| {
+                self.execution_manager
+                    .capture_execution_branch_guarded_seeded(limits.execution, registry)
+            },
+        );
         self.execution_counters.captured(capture_started.elapsed());
         let (mut branch, mut publication) = captured?;
         timing.mark("capture branch");
