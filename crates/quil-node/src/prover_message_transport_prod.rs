@@ -129,6 +129,10 @@ pub(crate) struct SubmitRetryQueue {
     /// once it ends ([`SubmitRetryQueue::report_windows`]). Locked after
     /// `pending` when both are.
     tally: std::sync::Mutex<std::collections::BTreeMap<u64, WindowTally>>,
+    /// Messages dropped from the full queue, logged at most once per
+    /// [`RETRY_DROP_LOG_EVERY`]. Never locked with `pending` or `tally`
+    /// held.
+    drops: std::sync::Mutex<QueueDrops>,
 }
 
 /// What became of the storage epoch proofs whose window ends at one frame
@@ -150,6 +154,21 @@ struct WindowTally {
     refused_for_good: u64,
     /// Proofs still queued when the window ended.
     undelivered: u64,
+    /// Proofs a full retry queue dropped: a worker's later send of their
+    /// seats may still deliver them, so they are not counted undelivered.
+    dropped: u64,
+}
+
+/// Messages dropped from a full retry queue since the last line about them
+/// ([`SubmitRetryQueue::log_drops`]).
+#[derive(Default)]
+struct QueueDrops {
+    messages: u64,
+    /// Of those, storage epoch proofs.
+    proofs: u64,
+    bytes: u64,
+    /// When the last line was logged.
+    logged: Option<Instant>,
 }
 
 /// One queued submission.
@@ -187,6 +206,9 @@ const RETRY_TIMING: RetryTiming = RetryTiming {
 };
 const RETRY_MAX_MESSAGES: usize = 256;
 const RETRY_MAX_BYTES: usize = 32 << 20;
+/// How often messages dropped from a full retry queue are logged: the first
+/// at once, then those of each interval in one line.
+const RETRY_DROP_LOG_EVERY: Duration = Duration::from_secs(60);
 
 impl SubmitRetryQueue {
     /// Queue `bytes` (once), in place of the queued storage epoch proofs it
@@ -209,16 +231,83 @@ impl SubmitRetryQueue {
                 logged: Instant::now(),
             });
             let mut total: usize = pending.iter().map(|queued| queued.bytes.len()).sum();
+            let mut dropped = Vec::new();
             while pending.len() > RETRY_MAX_MESSAGES || total > RETRY_MAX_BYTES {
-                let Some(dropped) = pending.pop_front() else {
+                let Some(oldest) = pending.pop_front() else {
                     break;
                 };
-                total -= dropped.bytes.len();
-                warn!("prover submission retry queue full — dropping its oldest message");
+                total -= oldest.bytes.len();
+                dropped.push(oldest);
             }
+            let queued = (pending.len(), total);
+            drop(pending);
+            if !dropped.is_empty() {
+                self.dropped(&dropped, queued);
+            }
+        } else {
+            drop(pending);
         }
-        drop(pending);
         !self.running.swap(true, Ordering::AcqRel)
+    }
+
+    /// Count the messages a full queue `dropped` (the storage epoch proofs
+    /// among them in their window's tally) and log them
+    /// ([`Self::log_drops`]); `queued` is what the queue still holds, in
+    /// messages and bytes.
+    fn dropped(&self, dropped: &[Queued], queued: (usize, usize)) {
+        let mut proofs = 0u64;
+        for proof in dropped.iter().filter_map(|queued| queued.proof.as_ref()) {
+            proofs += 1;
+            self.tally(proof.window_end, |t| t.dropped += 1);
+        }
+        let mut drops = self.drops.lock().unwrap();
+        drops.messages += dropped.len() as u64;
+        drops.proofs += proofs;
+        drops.bytes += dropped
+            .iter()
+            .map(|queued| queued.bytes.len() as u64)
+            .sum::<u64>();
+        Self::log_drops(&mut drops, queued, false);
+    }
+
+    /// One line for the messages dropped from the full queue since the last
+    /// one: at the first drop, then at most once per
+    /// [`RETRY_DROP_LOG_EVERY`] while drops continue, once more for any left
+    /// unlogged when a round finds the interval over, and, with `flush`, at
+    /// once for any left unlogged.
+    fn log_drops(drops: &mut QueueDrops, (queued, queued_bytes): (usize, usize), flush: bool) {
+        let early = drops
+            .logged
+            .is_some_and(|at| at.elapsed() < RETRY_DROP_LOG_EVERY);
+        if drops.messages == 0 || (early && !flush) {
+            return;
+        }
+        let secs = drops.logged.map(|at| at.elapsed().as_secs());
+        warn!(dropped = drops.messages, proofs = drops.proofs, bytes = drops.bytes,
+            since_secs = %or_unknown(secs), queued, queued_bytes,
+            max_messages = RETRY_MAX_MESSAGES, max_bytes = RETRY_MAX_BYTES,
+            "prover submission retry queue full: its oldest messages were dropped since the last such line \
+             (since_secs unknown: the first). The archives refused or did not answer this node's submissions \
+             for longer than the queue holds: see the 'storage epoch proof still not delivered' lines for their \
+             reasons. A dropped storage epoch proof counts as dropped, not undelivered, in its window's summary: \
+             a worker's later send of its seats may still deliver them");
+        *drops = QueueDrops {
+            logged: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+
+    /// Log the drops left unlogged once their interval is over, or with
+    /// `flush` at once ([`Self::log_drops`]).
+    fn report_drops(&self, flush: bool) {
+        let queued = {
+            let pending = self.pending.lock().unwrap();
+            (
+                pending.len(),
+                pending.iter().map(|queued| queued.bytes.len()).sum(),
+            )
+        };
+        Self::log_drops(&mut self.drops.lock().unwrap(), queued, flush);
     }
 
     /// Drop the queued storage epoch proofs `delivered` covers, now that an
@@ -276,15 +365,17 @@ impl SubmitRetryQueue {
                     $level!(epoch, window_end, published = t.published, folded = t.folded,
                         sent = t.sent, accepted = t.accepted, refused = t.refused,
                         refused_for_good = t.refused_for_good, undelivered = t.undelivered,
+                        dropped = t.dropped,
                         "storage epoch proofs of a window that ended: published by this node's workers (folded: sent again while \
                          the retry queue held their seats, so they went at its next round instead of at once), sends to the \
                          archives, sends an archive took, sends every archive refused for now or for good, and proofs still \
-                         undelivered when the window ended. Settlement shows in each worker's 'storage settlement recorded' \
-                         line; undelivered above 0 means GLOBAL withholds those seats' storage share, refused well above \
-                         accepted that the archives' held proofs were full")
+                         undelivered when the window ended, and proofs a full retry queue dropped. Settlement shows in each \
+                         worker's 'storage settlement recorded' line; undelivered above 0 means GLOBAL withholds those seats' \
+                         storage share; dropped above 0 that those seats settle only if a worker's later send of them landed \
+                         (check that line); refused well above accepted that the archives' held proofs were full")
                 };
             }
-            if t.undelivered > 0 {
+            if t.undelivered > 0 || t.dropped > 0 {
                 window_line!(warn);
             } else {
                 window_line!(info);
@@ -412,6 +503,7 @@ async fn run_retries<F, Fut, G>(
                 }
                 drop(pending);
                 queue.report_windows(frame);
+                queue.report_drops(false);
                 let pending = queue.pending.lock().unwrap();
                 pending
                     .iter()
@@ -431,6 +523,8 @@ async fn run_retries<F, Fut, G>(
                 if queue.pending.lock().unwrap().is_empty()
                     || queue.running.swap(true, Ordering::AcqRel)
                 {
+                    // Drops left unlogged would wait for the next full queue.
+                    queue.report_drops(true);
                     return;
                 }
                 continue;
@@ -2437,6 +2531,155 @@ mod tests {
                 && lines[0].contains("undelivered=1"),
             "seal-resend summary-fields: {}",
             lines[0]
+        );
+    }
+
+    /// This thread's log lines, as the formatter writes them, while it
+    /// lives.
+    struct Logs {
+        text: Arc<std::sync::Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl Logs {
+        fn capture() -> Self {
+            #[derive(Clone)]
+            struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Lines {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().write(bytes)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let text: Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+            let writer = Lines(text.clone());
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            );
+            Self { text, _guard }
+        }
+
+        /// The lines so far that contain `text`.
+        fn lines(&self, text: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.text.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains(text))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Storage epoch proofs that overfill the retry queue by `extra`, each
+    /// of its own seat.
+    fn overfull_queue(extra: usize) -> Vec<Vec<u8>> {
+        (0..super::RETRY_MAX_MESSAGES + extra)
+            .map(|i| storage_proof_bundle(1 + (i / 256) as u8, &[(i as u8, 1335, false, true)], 8))
+            .collect()
+    }
+
+    /// Storage epoch proofs a full retry queue drops count as dropped, not
+    /// undelivered (a worker's later send of their seats may still deliver
+    /// them), in their window's summary, which warns; the drops of one
+    /// interval make one warning, not one each. Until 2026-11-15 the summary
+    /// missed them and every drop logged its own unstructured line.
+    #[test]
+    fn a_full_retry_queue_counts_its_dropped_proofs_and_warns_once() {
+        let logs = Logs::capture();
+        let queue = SubmitRetryQueue::default();
+        let bundles = overfull_queue(3);
+        let window_end = StorageProofSubmission::of(&bundles[0]).unwrap().window_end;
+        for bundle in bundles {
+            queue.push(bundle);
+        }
+        assert_eq!(queue.len(), super::RETRY_MAX_MESSAGES, "the queue is full");
+        queue.report_windows(Some(window_end));
+        let windows = logs.lines("storage epoch proofs of a window that ended");
+        let drops = logs.lines("retry queue full");
+        eprintln!(
+            "REACH retry-drop windows={} drop_lines={}",
+            windows.len(),
+            drops.len()
+        );
+        assert!(
+            windows.len() == 1
+                && windows[0].contains("WARN")
+                && windows[0].contains(" undelivered=0 dropped=3"),
+            "retry-drop tally: the window's summary did not warn of 3 dropped proofs, none undelivered: {windows:?}"
+        );
+        assert!(
+            drops.len() == 1 && drops[0].contains(" dropped=1 proofs=1 "),
+            "retry-drop warn-once: not one line for the first of 3 drops within one interval: {drops:?}"
+        );
+    }
+
+    /// Drops still unlogged when the retry queue drains are logged then,
+    /// not with the next full queue, maybe hours later and with the wrong
+    /// interval and queue size. Until 2026-11-15 they waited for it.
+    #[tokio::test]
+    async fn drops_left_unlogged_are_logged_once_the_retry_queue_drains() {
+        let logs = Logs::capture();
+        let queue = Arc::new(SubmitRetryQueue::default());
+        for bundle in overfull_queue(3) {
+            queue.push(bundle);
+        }
+        let submit = |_bytes: Vec<u8>| async {
+            Delivery {
+                accepted: 1,
+                ..Default::default()
+            }
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_retries(queue.clone(), FAST, submit, || Some(0)),
+        )
+        .await
+        .expect("the queue empties");
+        assert_eq!(queue.len(), 0);
+        let drops = logs.lines("retry queue full");
+        eprintln!("REACH retry-drop-flush drop_lines={}", drops.len());
+        assert!(
+            drops.len() == 2
+                && drops[0].contains(" dropped=1 proofs=1 ")
+                && drops[1].contains(" dropped=2 proofs=2 ")
+                && drops[1].contains(" queued=0 "),
+            "retry-drop flush: the 2 drops left unlogged were not logged as the queue drained: {drops:?}"
+        );
+    }
+
+    /// Drops after a line wait out its interval, then make one line at the
+    /// next retry round, and no more while none are new.
+    #[test]
+    fn drops_left_unlogged_are_logged_once_their_interval_is_over() {
+        let logs = Logs::capture();
+        let queue = SubmitRetryQueue::default();
+        for bundle in overfull_queue(3) {
+            queue.push(bundle);
+        }
+        queue.report_drops(false);
+        assert_eq!(
+            logs.lines("retry queue full").len(),
+            1,
+            "retry-drop interval: a line for the drops within the interval"
+        );
+        {
+            let mut drops = queue.drops.lock().unwrap();
+            let interval = super::RETRY_DROP_LOG_EVERY;
+            drops.logged = drops.logged.and_then(|at| at.checked_sub(interval));
+        }
+        queue.report_drops(false);
+        queue.report_drops(false);
+        let drops = logs.lines("retry queue full");
+        eprintln!("REACH retry-drop-interval drop_lines={}", drops.len());
+        assert!(
+            drops.len() == 2
+                && drops[1].contains(" dropped=2 proofs=2 ")
+                && !drops[1].contains("since_secs=unknown"),
+            "retry-drop interval: the 2 drops left unlogged were not logged once at the interval's end: {drops:?}"
         );
     }
 
