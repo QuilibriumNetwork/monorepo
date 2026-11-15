@@ -6,16 +6,16 @@
 
 use super::*;
 use quil_execution::global_intrinsic::storage_epoch_proof::{
-    SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    SeatProof, StorageEpochProof, MAX_PROOF_LEN, TYPE_STORAGE_EPOCH_PROOF,
 };
 use quil_execution::global_intrinsic::storage_seat::settlement_window;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
 /// The epoch the seats below settle: each settlement's window ends as
 /// `EPOCH + 2` begins, as does the window of a seal of `EPOCH + 2`.
-const EPOCH: u64 = 1478;
+pub(super) const EPOCH: u64 = 1478;
 /// About the size of a settlement proof on mainnet, of one seat or several.
-const LEN: usize = 650_000;
+pub(super) const LEN: usize = 650_000;
 
 /// Member `id`'s address.
 fn member(id: u32) -> [u8; 32] {
@@ -25,12 +25,12 @@ fn member(id: u32) -> [u8; 32] {
 }
 
 /// The identity member `id`'s node delivers with.
-fn peer(id: u32) -> Vec<u8> {
+pub(super) fn peer(id: u32) -> Vec<u8> {
     [&b"peer"[..], &id.to_be_bytes()].concat()
 }
 
 /// A seat of `EPOCH` on shard `shard` that settles, seals, or both.
-fn seat(shard: u8, settles: bool, seals: bool) -> SeatProof {
+pub(super) fn seat(shard: u8, settles: bool, seals: bool) -> SeatProof {
     SeatProof {
         shard_filter: vec![shard; 32],
         epoch: EPOCH,
@@ -41,7 +41,7 @@ fn seat(shard: u8, settles: bool, seals: bool) -> SeatProof {
 }
 
 /// Member `id`'s proof of `seats`, `len` bytes long as a bundle.
-fn sized(id: u32, seats: Vec<SeatProof>, len: usize) -> Vec<u8> {
+pub(super) fn sized(id: u32, seats: Vec<SeatProof>, len: usize) -> Vec<u8> {
     let bundle = |proof_len: usize| {
         let mut bytes = vec![0u8; proof_len];
         bytes[..4].copy_from_slice(&id.to_be_bytes());
@@ -63,12 +63,16 @@ fn sized(id: u32, seats: Vec<SeatProof>, len: usize) -> Vec<u8> {
     let overhead = bundle(4).len() - 4;
     let bytes = bundle(len - overhead);
     assert_eq!(bytes.len(), len);
+    assert!(
+        len - overhead <= MAX_PROOF_LEN as usize,
+        "fixture proof over MAX_PROOF_LEN decodes as none"
+    );
     bytes
 }
 
 /// Member `id`'s proof settling `seats` of its seats of `EPOCH`, of
 /// [`LEN`] bytes.
-fn settling(id: u32, seats: u8) -> Vec<u8> {
+pub(super) fn settling(id: u32, seats: u8) -> Vec<u8> {
     sized(id, (0..seats).map(|s| seat(s, true, false)).collect(), LEN)
 }
 
@@ -80,7 +84,7 @@ fn five() -> Vec<SeatProof> {
 /// A collector of GLOBAL messages that saw a frame of epoch `EPOCH + 1`
 /// finalized, before the windows above end, and names member `id` the
 /// sender `peer(id)`.
-fn collector() -> MessageCollector {
+pub(super) fn collector() -> MessageCollector {
     let mc = MessageCollector::new();
     mc.set_class_shares();
     mc.note_finalized_frame(settlement_window(EPOCH).0);
@@ -92,7 +96,7 @@ fn collector() -> MessageCollector {
 }
 
 /// `bytes` delivered by member `sender`, an active prover.
-fn send(mc: &MessageCollector, sender: u32, bytes: &[u8]) -> SubmitOutcome {
+pub(super) fn send(mc: &MessageCollector, sender: u32, bytes: &[u8]) -> SubmitOutcome {
     mc.add_message_outcome_by(1, bytes.to_vec(), Provenance::Prover, &peer(sender))
 }
 

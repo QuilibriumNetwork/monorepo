@@ -64,7 +64,8 @@ pub(super) enum SeatEvent {
     /// Held, then dropped before its window ended: its rank aged out, or
     /// its proof's window for an earlier seat ended.
     AgedOut,
-    /// Held when its window ended.
+    /// Held when its window ended, as is a proof carried past the
+    /// retention window to its window's end.
     Closed,
     /// In a finalized frame.
     Carried,
@@ -866,8 +867,10 @@ mod tests {
         }
     }
 
-    /// Finalize up to `frame - 1` and age out every rank held at 1.
-    fn age_out(mc: &super::super::MessageCollector, frame: u64) {
+    /// Finalize up to `frame - 1` and prune every rank past retention. A
+    /// proof held at rank 1 whose window ends by `frame` is carried past
+    /// retention to its window's end, so it counts as held at it (closed).
+    fn end_window(mc: &super::super::MessageCollector, frame: u64) {
         mc.note_finalized_frame(frame - 1);
         for rank in 2..=super::super::RETENTION_WINDOW + 2 {
             mc.prune_after_finalization(rank);
@@ -881,7 +884,7 @@ mod tests {
 
     /// The GLOBAL collector logs one line for a settlement window once the
     /// next frame to finalize reaches its end: the seats it held, those it
-    /// only refused for room, and those that aged out, a seat any
+    /// only refused for room, and those held when it ended, a seat any
     /// finalized frame carried counting as neither and an unregistered one
     /// apart (mainnet, 2026-11-13: archives refused seats for room to each
     /// window's end, and nothing counted the seats lost).
@@ -908,7 +911,7 @@ mod tests {
             SubmitOutcome::Filtered(Refusal::RankFull)
         );
         mc.mark_finalized(&[held[0].clone(), carried]);
-        age_out(&mc, end);
+        end_window(&mc, end);
         let ended = lines(&mc);
         eprintln!("REACH window-seats collector held={} {ended:?}", held.len());
         assert_eq!(
@@ -917,7 +920,7 @@ mod tests {
                 window_end: end,
                 admitted: held.len(),
                 refused_only: 1,
-                aged_out: held.len() - 1,
+                closed: held.len() - 1,
                 unregistered_seats: 1,
                 ..Default::default()
             }],
@@ -940,7 +943,7 @@ mod tests {
             mc.add_message_outcome(1, settlement(1, EPOCH)),
             SubmitOutcome::Accepted
         );
-        age_out(&mc, end);
+        end_window(&mc, end);
         let (from, whole) = settlement_window(EPOCH + 2);
         mc.note_finalized_frame(from);
         let rank = 20;
@@ -980,7 +983,7 @@ mod tests {
             mc.add_message_outcome(1, settlement(1_000, EPOCH)),
             SubmitOutcome::Accepted
         );
-        age_out(&mc, later);
+        end_window(&mc, later);
         let ended = lines(&mc);
         eprintln!("REACH window-seats evicted held={} {ended:?}", held.len());
         assert_eq!(
@@ -989,7 +992,7 @@ mod tests {
                 WindowCounts {
                     window_end: end,
                     admitted: 1,
-                    aged_out: 1,
+                    closed: 1,
                     ..Default::default()
                 },
                 WindowCounts {
@@ -997,7 +1000,7 @@ mod tests {
                     admitted: held.len(),
                     refused_only: 1,
                     evicted: 1,
-                    aged_out: held.len() - 1,
+                    closed: held.len() - 1,
                     ..Default::default()
                 },
             ],
@@ -1094,7 +1097,7 @@ mod tests {
             mc.add_message_outcome(1, settlement(1, EPOCH)),
             SubmitOutcome::Accepted
         );
-        age_out(&mc, end);
+        end_window(&mc, end);
         let ended = lines(&mc);
         eprintln!("REACH window-seats crowd {ended:?}");
         assert_eq!(
@@ -1102,7 +1105,7 @@ mod tests {
             vec![WindowCounts {
                 window_end: end,
                 admitted: 1,
-                aged_out: 1,
+                closed: 1,
                 unregistered_seats: UNREGISTERED_SEATS_PER_WINDOW,
                 ..Default::default()
             }],
@@ -1149,7 +1152,7 @@ mod tests {
         for bytes in [two, dense] {
             assert_eq!(mc.add_message_outcome(1, bytes), SubmitOutcome::Accepted);
         }
-        age_out(&mc, end);
+        end_window(&mc, end);
         let ended = lines(&mc);
         eprintln!("REACH window-seats capped kept={kept} {ended:?}");
         assert_eq!(
@@ -1157,7 +1160,7 @@ mod tests {
             vec![WindowCounts {
                 window_end: end,
                 admitted: kept,
-                aged_out: kept,
+                closed: kept,
                 overflowed: true,
                 ..Default::default()
             }],
@@ -1223,7 +1226,7 @@ mod tests {
         let read = PROOFS_READ.with(Cell::get);
         mc.mark_finalized(&[bytes]);
         let again = PROOFS_READ.with(Cell::get) - read;
-        age_out(&mc, end);
+        end_window(&mc, end);
         let ended = lines(&mc);
         eprintln!("REACH window-seats read-once again={again} {ended:?}");
         assert_eq!(
@@ -1266,7 +1269,7 @@ mod tests {
         mc.mark_finalized(std::slice::from_ref(&bytes));
         assert_eq!(mc.add_message_outcome(1, bytes), SubmitOutcome::Duplicate);
         let again = PROOFS_READ.with(Cell::get) - read;
-        age_out(&mc, end);
+        end_window(&mc, end);
         let ended = lines(&mc);
         eprintln!("REACH window-seats copies again={again} {ended:?}");
         assert_eq!(
