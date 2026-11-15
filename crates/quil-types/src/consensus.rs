@@ -1143,9 +1143,12 @@ pub struct StorageSnapshotRoots {
 /// 2026-10-20.
 pub const STORAGE_SEAL_CHALLENGES: usize = 64;
 
-/// Serialized storage epoch proofs a GLOBAL proposal carries at most. GLOBAL
-/// verifies every one (decided 2026-10-20); they cluster once the epoch's
-/// registrations land, and one is about 0.5–0.75 MB.
+/// Serialized bytes one storage epoch proof takes at most; provers size each
+/// against it, and one is about 0.5–0.75 MB. GLOBAL verifies every one
+/// (decided 2026-10-20); they cluster once the epoch's registrations land.
+/// Until 2026-11-15 it was also what a GLOBAL proposal carried of them at
+/// most, and a leader of an older build still carries this much a frame; a
+/// current leader carries up to quil-engine's `SEAL_BYTES_PER_PROPOSAL`.
 pub const STORAGE_SEAL_BYTES_PER_FRAME: usize = 4 << 20;
 
 /// The epoch whose registrations, openings and audits use the hash storage

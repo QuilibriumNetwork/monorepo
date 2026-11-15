@@ -119,7 +119,7 @@ fn ids(taken: &[(Vec<u8>, bool)], of: &HashMap<[u8; 32], u32>) -> Vec<u32> {
 #[test]
 fn a_proposal_carries_the_proofs_due_soonest_first() {
     let mc = global_collector();
-    let per_frame = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME / soon(0).len();
+    let per_frame = SEAL_BYTES_PER_PROPOSAL / soon(0).len();
     let mut of = HashMap::new();
     for id in 1..=per_frame as u32 {
         let bytes = late(id);
@@ -132,7 +132,7 @@ fn a_proposal_carries_the_proofs_due_soonest_first() {
         assert_eq!(mc.add_message_outcome(1, bytes), SubmitOutcome::Accepted);
     }
     let taken = mc
-        .snapshot_for_proposal(1, 16 << 20, 10_000, None, &[])
+        .snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, None, &[])
         .unwrap();
     let taken = ids(&taken, &of);
     eprintln!("REACH seal-deadline order taken={taken:?}");
@@ -181,7 +181,7 @@ fn a_full_share_makes_room_for_a_proof_due_sooner() {
     );
     assert_eq!(mc.pending_count(1), held as usize, "one seal left for it");
     let taken = mc
-        .snapshot_for_proposal(1, 16 << 20, 10_000, None, &[])
+        .snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, None, &[])
         .unwrap();
     let taken = ids(&taken, &of);
     assert_eq!(taken.first(), Some(&1), "the oldest seal stays");
@@ -200,7 +200,7 @@ fn a_proof_past_its_window_rides_no_frame() {
     let mc = global_collector();
     assert_eq!(mc.add_message_outcome(50, soon(1)), SubmitOutcome::Accepted);
     let taken = mc
-        .snapshot_for_proposal(50, 16 << 20, 10_000, Some(end), &[])
+        .snapshot_for_proposal(50, SEAL_BYTES_PER_PROPOSAL, 10_000, Some(end), &[])
         .unwrap();
     eprintln!("REACH seal-deadline closed taken={}", taken.len());
     assert!(
@@ -378,7 +378,7 @@ fn an_abandoned_proposal_ends_no_window() {
         "seal-deadline abandoned: settlements an abandoned proposal passed left"
     );
     let taken = mc
-        .snapshot_for_proposal(1, 16 << 20, 10_000, Some(end - 2), &[])
+        .snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, Some(end - 2), &[])
         .unwrap();
     assert!(!taken.is_empty(), "the next frame carries the settlements");
 }
@@ -451,7 +451,7 @@ fn a_promotion_into_a_full_share_makes_room_for_a_proof_due_sooner() {
     );
     assert_eq!(mc.pending_count(1), held - 1, "one seal left for it");
     let taken = mc
-        .snapshot_for_proposal(1, 16 << 20, 10_000, None, &[])
+        .snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, None, &[])
         .unwrap();
     assert_eq!(ids(&taken, &of), [101], "the settlement rides first");
 }
@@ -512,11 +512,11 @@ fn a_full_rank_makes_no_room() {
 
 /// Settlements due at their window's end and seals with an epoch to spare
 /// arrive over the window's first two thirds, together 110% of what its
-/// frames carry (6 proofs of 650 KB in 4 MiB a frame). Archives take turns
-/// to lead; a sender sends each proof not yet taken to every archive each
-/// frame, and one taken again ten frames on while no frame carried it (a
-/// worker's next attempt). Every settlement rides before its window ends;
-/// the seals take the room left and the frames after.
+/// frames carry (12 proofs of 650 KB in a proposal's 8 MiB share). Archives
+/// take turns to lead; a sender sends each proof not yet taken to every
+/// archive each frame, and one taken again ten frames on while no frame
+/// carried it (a worker's next attempt). Every settlement rides before its
+/// window ends; the seals take the room left and the frames after.
 #[test]
 fn settlements_ride_before_their_window_ends_under_110_percent_demand() {
     const ARCHIVES: usize = 2;
@@ -524,7 +524,7 @@ fn settlements_ride_before_their_window_ends_under_110_percent_demand() {
     const RESEND: u64 = 10;
     let end = settlement_window(EPOCH).1;
     let start = end - WINDOW;
-    let per_frame = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME / soon(0).len();
+    let per_frame = SEAL_BYTES_PER_PROPOSAL / soon(0).len();
     let capacity = WINDOW as usize * per_frame;
     let demand = capacity * 11 / 10;
     struct Sent {
@@ -586,7 +586,7 @@ fn settlements_ride_before_their_window_ends_under_110_percent_demand() {
         }
         let leader = &archives[frame as usize % ARCHIVES];
         let taken: Vec<Vec<u8>> = leader
-            .snapshot_for_proposal(frame, 16 << 20, 10_000, Some(frame), &[])
+            .snapshot_for_proposal(frame, SEAL_BYTES_PER_PROPOSAL, 10_000, Some(frame), &[])
             .unwrap()
             .into_iter()
             .map(|(data, _)| data)
