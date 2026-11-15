@@ -93,9 +93,13 @@ use quil_types::error::{QuilError, Result};
 use tracing::{info, warn};
 
 use crate::storage_ledger::HostLedger;
+use quil_execution::manager::FrameCheck;
 
 #[cfg(any(target_os = "macos", test))]
 mod macos_memory;
+
+#[cfg(test)]
+mod frame_verifier_tests;
 
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
@@ -491,19 +495,21 @@ pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservati
     admission().reserve_until(bytes, Urgency::Due, expired)
 }
 
+/// How long a verification a finalized frame waits on waits for memory in
+/// its place, past its caller's short slot deadline
+/// ([`Admission::reserve_verifier`]).
+pub const FRAME_VERIFIER_MEMORY_WAIT: Duration = Duration::from_secs(300);
+
 /// Transaction-verifier children share storage jobs' memory and host ledger.
 /// They never use the oversized-job escape, and respect their caller's short
 /// admission deadline so a memory wait cannot block frame execution.
-pub fn reserve_verifier_until(bytes: u64, deadline: Instant) -> Option<Reservation> {
-    let expired = || Instant::now() >= deadline || stopping();
-    if stopping() {
-        return None;
-    }
-    // Like verifier slot admission, try once even for a zero wait budget.
-    // The deadline cancels waiting; it does not forbid an immediate grant.
-    admission()
-        .reserve_until(bytes, Urgency::Verification, &expired)
-        .filter(|_| !stopping())
+/// `frame`: whether, and how, a finalized frame waits on the verification.
+pub fn reserve_verifier_until(
+    bytes: u64,
+    deadline: Instant,
+    frame: FrameCheck,
+) -> Option<Reservation> {
+    admission().reserve_verifier(bytes, deadline, frame)
 }
 
 /// A 512 MiB sector's resident labelling reservation is about 2.6 GiB.
@@ -918,6 +924,23 @@ fn available_memory() -> Option<u64> {
     }
 }
 
+/// The kernel's memory pressure level where it reports one: macOS's
+/// normal 1, warning 2, [`PRESSURE_CRITICAL`] 4; `None` elsewhere.
+fn kernel_pressure() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_memory::pressure()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The kernel's critical memory pressure level ([`kernel_pressure`]): not
+/// even a frame's proof check starts alone then ([`Admission::fits`]).
+const PRESSURE_CRITICAL: u32 = 4;
+
 /// Bytes that must be available for `bytes` of work ahead to fit with no
 /// job holding memory ([`Admission::fits`], [`MEMORY_SHARE_PERCENT`]).
 fn needs_available(bytes: u64) -> u64 {
@@ -1111,6 +1134,12 @@ pub struct Admission {
     state: Mutex<State>,
     /// [`PASS_WINDOW`], shorter in tests.
     pass_window: Duration,
+    /// [`FRAME_VERIFIER_MEMORY_WAIT`], shorter in tests.
+    frame_verifier_wait: Duration,
+    /// Whether the node is stopping ([`stopping`]); its own in tests.
+    stopping: fn() -> bool,
+    /// [`kernel_pressure`]; its own in tests.
+    pressure: fn() -> Option<u32>,
     changed: Condvar,
     slots: usize,
     /// [`ahead_jobs_for`]; more in tests of the memory alone.
@@ -1184,6 +1213,14 @@ struct State {
     stale: bool,
     /// When the last pass was.
     last_pass: Option<Instant>,
+    /// Passes that took their turn, for tests to wait on a pass rather
+    /// than on time.
+    #[cfg(test)]
+    passes: u64,
+    /// The next ticket when the last pass that took its turn began: every
+    /// reservation still waiting with a lower ticket was waiting then.
+    #[cfg(test)]
+    passed_below: u64,
     /// Reservations held for leaves labelled now
     /// ([`Reservation::labelling_now`]).
     labelling_now: usize,
@@ -1294,6 +1331,9 @@ impl Admission {
             strict_due: false,
             state: Mutex::new(State::default()),
             pass_window: PASS_WINDOW,
+            frame_verifier_wait: FRAME_VERIFIER_MEMORY_WAIT,
+            stopping,
+            pressure: kernel_pressure,
             changed: Condvar::new(),
             slots: slots.max(1),
             ahead_jobs: AHEAD_JOBS,
@@ -1485,6 +1525,31 @@ impl Admission {
         expired: &dyn Fn() -> bool,
     ) -> Option<Reservation> {
         self.reserve_ordered(bytes, urgency, None, true, expired)
+    }
+
+    /// [`reserve_verifier_until`] on this admission.
+    pub fn reserve_verifier(
+        &'static self,
+        bytes: u64,
+        deadline: Instant,
+        frame: FrameCheck,
+    ) -> Option<Reservation> {
+        // The tip's behaviour: the seams are read only by the fix.
+        let _ = (
+            frame,
+            self.frame_verifier_wait,
+            &self.pressure,
+            PRESSURE_CRITICAL,
+        );
+        let stopping = self.stopping;
+        let expired = || Instant::now() >= deadline || stopping();
+        if stopping() {
+            return None;
+        }
+        // Like verifier slot admission, try once even for a zero wait budget.
+        // The deadline cancels waiting; it does not forbid an immediate grant.
+        self.reserve_until(bytes, Urgency::Verification, &expired)
+            .filter(|_| !stopping())
     }
 
     /// A ticket: the order reservations and seats ([`ahead_place`]) asked.
@@ -1729,6 +1794,11 @@ impl Admission {
             return;
         };
         state.stale = false;
+        #[cfg(test)]
+        {
+            state.passes += 1;
+            state.passed_below = state.next_ticket;
+        }
         self.read_others(state);
         self.yield_to_elsewhere(state);
         self.ask_yields(state);

@@ -391,6 +391,7 @@ impl PrewarmShared {
                     done: None,
                     pause: Some(pause),
                     background: false,
+                    frame: quil_execution::manager::FrameCheck::No,
                     executing: ExecutingFrame::App(item.anchor),
                 },
             );
@@ -1089,6 +1090,7 @@ pub fn preverify_through_within(
                     done: Some(&done),
                     pause: None,
                     background: false,
+                    frame: quil_execution::manager::FrameCheck::No,
                     executing: ExecutingFrame::App(lowest.flatten()),
                 },
             );

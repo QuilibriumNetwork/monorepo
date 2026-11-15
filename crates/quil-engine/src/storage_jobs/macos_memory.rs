@@ -47,6 +47,12 @@ pub(super) fn available() -> Option<u64> {
     snapshot().map(Snapshot::headroom)
 }
 
+/// The kernel's memory pressure level (normal 1, warning 2, critical 4).
+#[cfg(target_os = "macos")]
+pub(super) fn pressure() -> Option<u32> {
+    snapshot().map(|snapshot| snapshot.pressure)
+}
+
 #[cfg(target_os = "macos")]
 fn snapshot() -> Option<Snapshot> {
     use std::{ffi::CStr, mem, ptr, sync::OnceLock};

@@ -1283,3 +1283,162 @@ fn a_spend_naming_a_key_image_twice_never_reaches_proof_work() {
     manager.preverify_bundles(&pairs(distinct));
     assert_eq!(worker_runs(&runs), 1, "the counting worker never ran");
 }
+
+/// A pre-verification a finalized frame waits on tells the worker's memory
+/// admission so from the threads it verifies on, which never saw its
+/// caller's thread state; any other pre-verification does not.
+#[test]
+fn a_frames_preverification_tells_the_memory_admission_from_its_own_threads() {
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, _runs) = counting_worker(directory.path());
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let worker = worker.with_memory_admission(Arc::new(move |_, frame| {
+        let thread = std::thread::current().name().map(str::to_owned);
+        seen.lock().unwrap().push((frame, thread));
+        None
+    }));
+    let manager = token_manager_with(worker);
+    let caller = std::thread::current().name().map(str::to_owned);
+    let falcon = quil_types::crypto::KeyType::Falcon512 as u32;
+    for (seed, frame) in [
+        (1u8, FrameCheck::No),
+        (2, FrameCheck::Inline),
+        (3, FrameCheck::Queued),
+    ] {
+        manager.preverify_bundles_paced(
+            &[(
+                APPLICATION.to_vec(),
+                bundle(settlement(3, 0x80 + seed, seed, falcon)),
+            )],
+            &PreverifyPacing {
+                frame,
+                ..Default::default()
+            },
+        );
+        let calls = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(
+            !calls.is_empty() && calls.iter().all(|(_, thread)| *thread != caller),
+            "setup: verified on threads of its own: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|&(told, _)| told == frame),
+            "frame_flag_lost_on_the_lanes: {frame:?}, the memory admission was \
+             told {calls:?}"
+        );
+    }
+}
+
+/// What a memory admission was told of the frames waiting on its checks.
+type Told = Arc<std::sync::Mutex<Vec<FrameCheck>>>;
+
+/// A [`counting_worker`] whose memory admission records what each check
+/// tells it of a frame waiting on it, and refuses the check: nothing runs.
+fn told_worker(directory: &std::path::Path) -> (WorkerVerifier, Told) {
+    let (worker, _runs) = counting_worker(directory);
+    let told = Told::default();
+    let seen = told.clone();
+    let worker = worker.with_memory_admission(Arc::new(move |_, frame| {
+        seen.lock().unwrap().push(frame);
+        None
+    }));
+    (worker, told)
+}
+
+/// The global venue's pre-verification ahead of a GLOBAL frame it executes
+/// runs checks that frame waits on: it tells the memory admission so.
+#[test]
+fn the_global_venues_preverification_tells_the_memory_admission_a_frame_waits() {
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, told) = told_worker(directory.path());
+    let manager = token_manager_with(worker);
+    publish_root(&manager.crdt(), 3);
+    let pairs = vec![(APPLICATION.to_vec(), bundle(transfer(3, 0x91, 0x92)))];
+    let unverified =
+        manager.unverified_confidential_operations_for(ExecutingFrame::Global(102), &pairs);
+    assert_eq!(
+        unverified.len(),
+        1,
+        "setup: the transfer was verified ahead"
+    );
+    manager.preverify_global_bundles(102, &pairs);
+    let calls = std::mem::take(&mut *told.lock().unwrap());
+    assert!(
+        !calls.is_empty(),
+        "setup: the transfer reached no admission"
+    );
+    assert!(
+        calls.iter().all(|&frame| frame == FrameCheck::Inline),
+        "global_lanes_not_told_inline: the memory admission was told {calls:?}"
+    );
+}
+
+/// An app shard's pre-verification ahead of a frame it executes runs
+/// checks that frame waits on: it tells the memory admission so.
+#[test]
+fn an_app_frames_preverification_tells_the_memory_admission_a_frame_waits() {
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, told) = told_worker(directory.path());
+    let manager = token_manager_with(worker);
+    let falcon = quil_types::crypto::KeyType::Falcon512 as u32;
+    let pairs = vec![(
+        APPLICATION.to_vec(),
+        bundle(settlement(3, 0x93, 0x94, falcon)),
+    )];
+    let unverified =
+        manager.unverified_confidential_operations_for(ExecutingFrame::App(None), &pairs);
+    assert_eq!(
+        unverified.len(),
+        1,
+        "setup: the settlement was verified ahead"
+    );
+    manager.preverify_app_frame_bundles(None, &pairs);
+    let calls = std::mem::take(&mut *told.lock().unwrap());
+    assert!(
+        !calls.is_empty(),
+        "setup: the settlement reached no admission"
+    );
+    assert!(
+        calls.iter().all(|&frame| frame == FrameCheck::Inline),
+        "app_lanes_not_told_inline: the memory admission was told {calls:?}"
+    );
+}
+
+/// A frame's execution verifies, on the engine's thread, what was not
+/// verified ahead: the frame waits on that check, and the memory admission
+/// is told so.
+#[test]
+fn a_frames_execution_tells_the_memory_admission_the_frame_waits() {
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, told) = told_worker(directory.path());
+    let manager = token_manager_with(worker);
+    let pairs = vec![(APPLICATION.to_vec(), bundle(transfer(3, 0x95, 0x96)))];
+    let unverified =
+        manager.unverified_confidential_operations_for(ExecutingFrame::App(Some(101)), &pairs);
+    assert_eq!(
+        unverified.len(),
+        1,
+        "setup: the transfer was verified ahead"
+    );
+    let executed = manager.process_message_with_context(
+        quil_types::execution::FrameExecutionContext {
+            frame_number: 102,
+            finalized_global_frame: Some(101),
+            shard: quil_types::execution::ShardPath::WHOLE,
+            venue: Some(quil_types::execution::Venue::Application),
+        },
+        &BigInt::from(0),
+        &APPLICATION,
+        &pairs[0].1,
+    );
+    let calls = std::mem::take(&mut *told.lock().unwrap());
+    assert!(
+        !calls.is_empty(),
+        "setup: the transfer reached no admission ({:?})",
+        executed.map(|_| ())
+    );
+    assert!(
+        calls.iter().all(|&frame| frame == FrameCheck::Inline),
+        "commit_dispatch_not_told_inline: the memory admission was told {calls:?}"
+    );
+}
