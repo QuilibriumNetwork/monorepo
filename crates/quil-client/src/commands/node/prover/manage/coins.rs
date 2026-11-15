@@ -5,13 +5,16 @@
 //! [`LEGACY_REFRESH`] while the Coins tab is open, and on `r`. A read
 //! lists both owner forms through `token legacy`'s own functions, so the
 //! figures match `qclient token legacy`. Shielded coins are read on `E`
-//! only ([`super::transfer`]).
+//! only ([`super::transfer`]). `H` shows the wallet's History, read from
+//! the private action log ([`crate::commands::token::history`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::commands::token::action_log::ActionLog;
+use crate::commands::token::history;
 use crate::commands::token::legacy::Snapshot;
 
 use super::model::{Model, NoticeSeverity, Tab};
@@ -56,6 +59,8 @@ pub enum Middle {
     /// The pending transfers of the shielded coins, and the transfer
     /// actions.
     Transfers,
+    /// The wallet actions the private action log recorded, on `H`.
+    History,
 }
 
 impl Middle {
@@ -65,6 +70,7 @@ impl Middle {
             Self::Claim => "Claim status",
             Self::ShieldPlan => "Shield plan",
             Self::Transfers => "Transfers",
+            Self::History => "History",
         }
     }
 }
@@ -79,6 +85,9 @@ pub fn middle(m: &Model) -> Middle {
     }
     if m.coins.transfer.dialog.is_some() {
         return Middle::Transfers;
+    }
+    if m.coins.history.open {
+        return Middle::History;
     }
     match m.coins.cursor {
         0 => Middle::Claim,
@@ -105,6 +114,8 @@ pub enum Selection {
     Claim,
     /// The Transfers panel: the pending transfers of the shielded coins.
     Transfers,
+    /// The History panel: the wallet actions recorded.
+    History,
     Notifications,
 }
 
@@ -120,6 +131,7 @@ pub fn selection(m: &Model) -> Selection {
             Middle::Claim => Selection::Claim,
             Middle::ShieldPlan => Selection::Plan,
             Middle::Transfers => Selection::Transfers,
+            Middle::History => Selection::History,
         },
         CoinsFocus::Notifications => Selection::Notifications,
     }
@@ -249,12 +261,25 @@ fn cursor_rows(m: &Model) -> (usize, usize, &'static str) {
                 super::transfer::escrows(m).len().max(1),
                 Middle::Transfers.title(),
             ),
+            Middle::History => (
+                m.coins.history.cursor,
+                history_rows(m).max(1),
+                Middle::History.title(),
+            ),
         },
         CoinsFocus::Notifications => (
             m.notice_offset,
             m.notice_lines.saturating_sub(m.notice_visible) + 1,
             "Notifications",
         ),
+    }
+}
+
+/// Rows of the History panel: one per action read.
+pub fn history_rows(m: &Model) -> usize {
+    match &m.coins.history.read {
+        Some(HistoryRead::Read(history)) => history.actions.len(),
+        _ => 0,
     }
 }
 
@@ -330,22 +355,140 @@ pub fn key_refusal(m: &Model, key: &str) -> Option<String> {
             if !matches!(selection(m), Selection::Shielded | Selection::Transfers) =>
         {
             Some(format!(
-                "Transfers: ‹{key}› acts on shielded coins; select the shielded row or the \
-                 Transfers panel."
+                "Transfers: ‹{key}› acts on shielded coins; select the shielded row or {}.",
+                transfers_panel(m)
             ))
         }
         "A" | "R" if selection(m) != Selection::Transfers => Some(format!(
-            "Transfers: ‹{key}› acts on the pending transfer under the cursor; select it in the \
-             Transfers panel."
+            "Transfers: ‹{key}› acts on the pending transfer under the cursor; select it in {}.",
+            transfers_panel(m)
         )),
         "E" | "T" | "P" | "A" | "R" | "J" => {
             super::transfer::refusal(m, key.chars().next().unwrap_or(' '))
+        }
+        "H" if m.coins.shield.dialog.is_some()
+            || m.coins.mint.dialog.is_some()
+            || m.coins.transfer.dialog.is_some() =>
+        {
+            Some("History: ‹H› shows once the action open in the middle panel closes.".into())
         }
         "[/] {/}" => ['[', ']', '{', '}']
             .iter()
             .all(|&key| edge_move(m, key).is_err())
             .then(|| format!("{}: its edges are at their limits.", cursor_rows(m).2)),
         _ => None,
+    }
+}
+
+/// The Transfers panel as a refusal names it: History, while open, holds
+/// its place until ‹H› closes it.
+fn transfers_panel(m: &Model) -> &'static str {
+    if m.coins.history.open {
+        "the Transfers panel, once ‹H› closes History"
+    } else {
+        "the Transfers panel"
+    }
+}
+
+/// What a read of the private action log found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryRead {
+    /// The log is off: `--no-action-log`, `noActionLog: true` in the
+    /// qclient config, or a render, which never reads it.
+    Off,
+    /// The read failed: why (no path; the log's own errors name none).
+    Failed(String),
+    Read(history::History),
+}
+
+/// The History panel's state.
+#[derive(Debug, Default)]
+pub struct History {
+    /// The panel replaces the Balances row's in the middle panel.
+    pub open: bool,
+    /// The row under the cursor: 0 is the newest action.
+    pub cursor: usize,
+    /// A read is in flight, started at this time.
+    pub reading: Option<Instant>,
+    /// A read was asked for while one was in flight: it starts when that
+    /// one ends, as the log may have changed after it began.
+    pub again: bool,
+    pub read: Option<HistoryRead>,
+}
+
+/// Read `log` for the History panel: [`HistoryRead::Off`] with none.
+pub fn read_history_log(log: Option<&ActionLog>) -> HistoryRead {
+    let Some(log) = log else {
+        return HistoryRead::Off;
+    };
+    match log.read() {
+        Ok(text) => HistoryRead::Read(history::parse(&text.unwrap_or_default())),
+        Err(error) => HistoryRead::Failed(format!("{error:#}")),
+    }
+}
+
+/// Start a read of the action log, or, while one is in flight, another
+/// once it ends.
+fn read_history(m: &mut Model) -> Vec<Cmd> {
+    if m.coins.history.reading.is_some() {
+        m.coins.history.again = true;
+        return vec![];
+    }
+    m.coins.history.reading = Some(Instant::now());
+    vec![Cmd::ReadHistory]
+}
+
+/// ‹H›: show the History panel, focused on its newest row, with a fresh
+/// read; again, give the middle panel back to the Balances row.
+fn toggle_history(m: &mut Model) -> Vec<Cmd> {
+    let history = &mut m.coins.history;
+    history.open = !history.open;
+    if !history.open {
+        return vec![];
+    }
+    history.cursor = 0;
+    m.coins.focus = CoinsFocus::Middle;
+    read_history(m)
+}
+
+/// A finished read of the action log. The cursor keeps its action when
+/// newer ones arrive above it; on the newest row it stays on the newest.
+/// The read asked for while this one was in flight starts now, if the
+/// panel is still open.
+pub fn apply_history(m: &mut Model, read: HistoryRead) -> Vec<Cmd> {
+    let history = &mut m.coins.history;
+    history.reading = None;
+    if let (Some(HistoryRead::Read(old)), HistoryRead::Read(new)) = (&history.read, &read) {
+        let held = old
+            .actions
+            .get(history.cursor)
+            .filter(|_| history.cursor > 0);
+        let row = held.and_then(|held| {
+            new.actions
+                .iter()
+                .position(|a| a.at == held.at && a.kind == held.kind && a.source == held.source)
+        });
+        if let Some(row) = row {
+            history.cursor = row;
+        }
+    }
+    history.read = Some(read);
+    let last = history_rows(m).saturating_sub(1);
+    m.coins.history.cursor = m.coins.history.cursor.min(last);
+    if std::mem::take(&mut m.coins.history.again) && m.coins.history.open {
+        read_history(m)
+    } else {
+        vec![]
+    }
+}
+
+/// A shield, mint or transfer action ended, its outcome recorded: the
+/// History panel, when open, reads the log again.
+pub fn action_ended(m: &mut Model) -> Vec<Cmd> {
+    if m.coins.history.open {
+        read_history(m)
+    } else {
+        vec![]
     }
 }
 
@@ -391,6 +534,8 @@ pub struct Coins {
     /// The shielded coins, their pending transfers and the transfer
     /// actions.
     pub transfer: super::transfer::Transfers,
+    /// The wallet actions recorded in the private action log.
+    pub history: History,
     /// When each current notice was first shown, by its key.
     pub notice_since: HashMap<&'static str, SystemTime>,
     /// How far each edge is moved from its default, in rows (kept between
@@ -471,6 +616,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let plan = selection(m) == Selection::Plan;
     let claim = selection(m) == Selection::Claim;
     let transfers = selection(m) == Selection::Transfers;
+    let history = selection(m) == Selection::History;
     let plan_rows = plan_rows(m);
     let hint = match ev.code {
         KeyCode::Up | KeyCode::Char('k') => Some("↑/k"),
@@ -486,6 +632,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('A') => Some("A"),
         KeyCode::Char('R') => Some("R"),
         KeyCode::Char('J') => Some("J"),
+        KeyCode::Char('H') => Some("H"),
         _ => None,
     };
     if let Some(why) = hint.and_then(|key| key_refusal(m, key)) {
@@ -502,6 +649,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.coins.mint.dialog = None;
             m.coins.transfer.dialog = None;
         }
+        KeyCode::Char('H') => return toggle_history(m),
         KeyCode::Char('S') => return super::shield::request(m),
         KeyCode::Char('E') => return super::transfer::request_read(m),
         KeyCode::Char('T') => return super::transfer::request_form(m, false),
@@ -553,6 +701,13 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Down | KeyCode::Char('j') if transfers => {
             let rows = super::transfer::escrows(m).len();
             m.coins.transfer.cursor = (m.coins.transfer.cursor + 1).min(rows.saturating_sub(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') if history => {
+            m.coins.history.cursor = m.coins.history.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if history => {
+            let last = history_rows(m).saturating_sub(1);
+            m.coins.history.cursor = (m.coins.history.cursor + 1).min(last);
         }
         KeyCode::Up | KeyCode::Char('k') if plan => {
             m.coins.plan_cursor = m.coins.plan_cursor.saturating_sub(1);
@@ -1380,5 +1535,192 @@ mod coins_tests {
         // Progress of a read no longer in flight is stale.
         apply_legacy_progress(&mut m, 1, 512);
         assert!(reading(&m).is_none());
+    }
+
+    /// Three recorded actions, newest first.
+    fn three_actions() -> HistoryRead {
+        actions_and(&[])
+    }
+
+    /// The three actions and `newer` records after them.
+    fn actions_and(newer: &[String]) -> HistoryRead {
+        use crate::commands::token::history::record_line as rec;
+        let ok = r#"{"outcome":"ok"}"#;
+        let mut log = vec![
+            rec(100, "merge", "start", "cli", r#"{"fee":"8"}"#),
+            rec(101, "merge", "outcome", "cli", ok),
+            rec(200, "transfer", "start", "manager", r#"{"amount":"5"}"#),
+            rec(201, "transfer", "outcome", "manager", ok),
+            rec(300, "shield", "start", "cli", r#"{"batches":1}"#),
+        ];
+        log.extend_from_slice(newer);
+        HistoryRead::Read(history::parse(&log.join("\n")))
+    }
+
+    /// An action that ends while a read is in flight gets a read once that
+    /// one ends, as the first may predate its outcome record: one read
+    /// however many were asked, and none once History has closed.
+    #[test]
+    fn a_read_asked_during_a_read_starts_when_it_ends() {
+        use super::super::msg::Msg;
+        use super::super::update::apply_msg;
+        let mut m = Model::new();
+        open(&mut m);
+        assert!(matches!(
+            handle_key(&mut m, key('H')).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        assert!(action_ended(&mut m).is_empty(), "in flight");
+        assert!(action_ended(&mut m).is_empty(), "in flight");
+        assert!(
+            matches!(
+                apply_msg(&mut m, Msg::History(three_actions())).as_slice(),
+                [Cmd::ReadHistory]
+            ),
+            "reread_dropped"
+        );
+        assert!(m.coins.history.reading.is_some());
+        assert!(apply_msg(&mut m, Msg::History(three_actions())).is_empty());
+        assert_eq!(m.coins.history.reading, None);
+        // Closed before the read ends: no read follows.
+        assert!(matches!(
+            action_ended(&mut m).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        assert!(action_ended(&mut m).is_empty());
+        assert!(handle_key(&mut m, key('H')).is_empty());
+        assert!(
+            apply_msg(&mut m, Msg::History(three_actions())).is_empty(),
+            "closed: no read"
+        );
+        assert!(!m.coins.history.again);
+    }
+
+    /// A read with newer actions keeps the cursor on the action it was on;
+    /// on the newest row it stays on the newest; an action gone from the
+    /// log leaves it on a row.
+    #[test]
+    fn a_new_read_keeps_the_cursor_on_its_action() {
+        use crate::commands::token::history::record_line as rec;
+        let mut m = Model::new();
+        open(&mut m);
+        handle_key(&mut m, key('H'));
+        apply_history(&mut m, three_actions());
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        assert_eq!(m.coins.history.cursor, 1);
+        let mint = rec(400, "mint", "start", "manager", "{}");
+        apply_history(&mut m, actions_and(std::slice::from_ref(&mint)));
+        assert_eq!(m.coins.history.cursor, 2, "cursor_left_its_action");
+        let Some(HistoryRead::Read(read)) = &m.coins.history.read else {
+            panic!("not read");
+        };
+        assert_eq!(read.actions[2].kind, "transfer");
+        // The newest row follows the newest action.
+        m.coins.history.cursor = 0;
+        let ok = rec(401, "mint", "outcome", "manager", r#"{"outcome":"ok"}"#);
+        let merge = rec(500, "merge", "start", "cli", "{}");
+        apply_history(&mut m, actions_and(&[mint.clone(), ok, merge]));
+        assert_eq!(m.coins.history.cursor, 0);
+        // Its action gone, the cursor keeps to the rows there are.
+        m.coins.history.cursor = 4;
+        apply_history(&mut m, HistoryRead::Read(history::parse(&mint)));
+        assert_eq!(m.coins.history.cursor, 0);
+    }
+
+    /// While History holds the middle panel, a transfer key's refusal says
+    /// ‹H› closes it, as the Transfers panel shows only then.
+    #[test]
+    fn transfer_refusals_under_history_name_its_key() {
+        let mut m = Model::new();
+        open(&mut m);
+        handle_key(&mut m, key('H'));
+        for c in ["E", "T", "P", "J", "A", "R"] {
+            let why = key_refusal(&m, c).unwrap();
+            assert!(
+                why.ends_with("the Transfers panel, once ‹H› closes History."),
+                "h_unnamed: {why}"
+            );
+        }
+        handle_key(&mut m, key('H'));
+        let why = key_refusal(&m, "A").unwrap();
+        assert!(why.ends_with("select it in the Transfers panel."), "{why}");
+    }
+
+    /// ‹H› opens History in the middle panel, focused on its newest row,
+    /// and reads the log; its cursor keeps to its rows; ‹H› again gives
+    /// the panel back to the Balances row. While an action holds the
+    /// middle panel, ‹H› only says why.
+    #[test]
+    fn h_toggles_the_history_panel_and_reads_the_log() {
+        let mut m = Model::new();
+        open(&mut m);
+        assert_eq!(middle(&m), Middle::Claim);
+        assert!(matches!(
+            handle_key(&mut m, key('H')).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        assert_eq!(
+            (middle(&m), selection(&m)),
+            (Middle::History, Selection::History)
+        );
+        apply_history(&mut m, three_actions());
+        assert_eq!(m.coins.history.reading, None);
+        assert_eq!(history_rows(&m), 3);
+        let down = KeyEvent::from(KeyCode::Down);
+        for _ in 0..5 {
+            handle_key(&mut m, down);
+        }
+        assert_eq!(m.coins.history.cursor, 2);
+        assert!(key_refusal(&m, "↓/j").is_some());
+        handle_key(&mut m, KeyEvent::from(KeyCode::Up));
+        assert_eq!(m.coins.history.cursor, 1);
+        // A shorter read keeps the cursor on a row.
+        apply_history(&mut m, HistoryRead::Read(Default::default()));
+        assert_eq!(m.coins.history.cursor, 0);
+        // An action ended: the open panel reads again.
+        assert!(matches!(
+            action_ended(&mut m).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        apply_history(&mut m, HistoryRead::Off);
+        assert!(handle_key(&mut m, key('H')).is_empty());
+        assert_eq!(middle(&m), Middle::Claim);
+        assert!(action_ended(&mut m).is_empty(), "closed: no read");
+        // An action's preparation holds the middle panel.
+        m.coins.transfer.dialog = Some(super::super::transfer::Dialog::Preparing(Instant::now()));
+        let why = key_refusal(&m, "H").unwrap();
+        assert!(why.starts_with("History: ‹H›"), "{why}");
+        assert!(handle_key(&mut m, key('H')).is_empty());
+        assert!(!m.coins.history.open);
+        assert_eq!(m.status_msg, why);
+    }
+
+    /// The panel's read: off without a log, nothing yet before the first
+    /// record, the records once there, the log's own refusal otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn the_history_read_is_off_empty_read_or_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(read_history_log(None), HistoryRead::Off);
+        let config = tempfile::tempdir().unwrap();
+        let log = ActionLog::new(config.path());
+        assert_eq!(
+            read_history_log(Some(&log)),
+            HistoryRead::Read(Default::default())
+        );
+        log.append("merge", "start", serde_json::json!({ "fee": "2" }))
+            .unwrap();
+        let HistoryRead::Read(read) = read_history_log(Some(&log)) else {
+            panic!("not read");
+        };
+        assert_eq!(read.actions.len(), 1);
+        assert_eq!(read.actions[0].fee, Some(2));
+        std::fs::set_permissions(log.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_history_log(Some(&log)),
+            HistoryRead::Failed(
+                "wallet/actions.jsonl has mode 644; the action log needs 600 (owner only)".into()
+            )
+        );
     }
 }

@@ -73,6 +73,12 @@ const WRITES: &[&str] = &[
 /// outside the tests and [`WRITERS`]: none replaces a key or state file.
 const OTHER_WRITES: &[(&str, &str, &str, &str)] = &[
     (
+        "quil-client/src/commands/token/action_log.rs",
+        "open_unfollowed",
+        "OpenOptions::new(",
+        "a read-only open of the action log, no link followed",
+    ),
+    (
         "quil-config/src/private_files.rs",
         "atomic_write",
         "rename(",

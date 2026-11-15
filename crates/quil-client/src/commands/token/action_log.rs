@@ -6,12 +6,14 @@
 //! share selectively, so it stays on this machine, readable by its owner
 //! only: the directory is created 0700 and the file 0600, and a wider mode
 //! or a link in their place refuses the write. It lies outside the node's
-//! `.log/`, so log exports and log requests never carry it, and nothing
-//! draws it. It keeps [`MAX_AGE`] of records within [`MAX_BYTES`].
+//! `.log/`, so log exports and log requests never carry it; only
+//! `qclient token history` and the node manager's History panel read it
+//! back ([`super::history`]), and a render never does. It keeps
+//! [`MAX_AGE`] of records within [`MAX_BYTES`].
 //! `--no-action-log` (node manager) or `noActionLog: true` in the qclient
 //! config turns it off.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -50,6 +52,34 @@ impl ActionLog {
 
     pub(crate) fn path(&self) -> PathBuf {
         self.dir.join(FILE)
+    }
+
+    /// The log's text, `None` when there is none yet. A link or a wider
+    /// mode in the place of its directory or file refuses the read, as it
+    /// refuses a write, and so does a file past twice the size bound,
+    /// which no write leaves.
+    pub(crate) fn read(&self) -> anyhow::Result<Option<String>> {
+        if !private::check_dir(&self.dir)? {
+            return Ok(None);
+        }
+        let path = self.path();
+        if matches!(
+            std::fs::symlink_metadata(&path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Ok(None);
+        }
+        let cap = self.max_bytes.saturating_mul(2);
+        let mut bytes = Vec::new();
+        private::open_read(&path)?
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= cap,
+            "{DIR}/{FILE} holds over {cap} bytes, past its bound; the next recorded action \
+             trims it"
+        );
+        Ok(Some(String::from_utf8(bytes)?))
     }
 
     /// Append one record of `kind` and `phase` with `fields` (an object),
@@ -163,8 +193,22 @@ mod private {
             }
             Err(e) => anyhow::bail!("{}: {e}", name(dir)),
         };
+        owner_dir(dir, &meta)
+    }
+
+    /// Whether `dir` exists, creating nothing; refuse one that is a link
+    /// or open to others, where another user could swap the file.
+    pub(super) fn check_dir(dir: &Path) -> anyhow::Result<bool> {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => owner_dir(dir, &meta).map(|()| true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => anyhow::bail!("{}: {e}", name(dir)),
+        }
+    }
+
+    fn owner_dir(dir: &Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
         anyhow::ensure!(meta.is_dir(), "{} is not a directory", name(dir));
-        owner_only(dir, &meta, 0o700)
+        owner_only(dir, meta, 0o700)
     }
 
     /// Refuse a path that is a link or no regular file, or open to others.
@@ -206,9 +250,19 @@ mod private {
 
     pub(super) fn open_read(path: &Path) -> anyhow::Result<File> {
         check(path)?;
-        let file = File::open(path)?;
+        let file = open_unfollowed(path)?;
         same(path, &file)?;
         Ok(file)
+    }
+
+    /// Open `path` to read, following no link in its place and waiting on
+    /// no FIFO swapped in after the check: a link fails the open, and
+    /// [`same`] refuses a FIFO.
+    pub(super) fn open_unfollowed(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
     }
 
     /// Replace `path` with `body` through [`quil_config::atomic_write`]:
@@ -228,6 +282,13 @@ mod private {
 
     pub(super) fn ensure_dir(_dir: &Path) -> anyhow::Result<()> {
         anyhow::bail!(REFUSED)
+    }
+
+    pub(super) fn check_dir(dir: &Path) -> anyhow::Result<bool> {
+        if dir.exists() {
+            anyhow::bail!(REFUSED)
+        }
+        Ok(false)
     }
 
     pub(super) fn open_append(_path: &Path) -> anyhow::Result<File> {
@@ -596,6 +657,26 @@ mod tests {
             .collect()
     }
 
+    /// `f`'s result from a thread, failing the test as `what` when it has
+    /// none within 10 s: an open or a read of a FIFO with no writer
+    /// returns at once or never, so the wait is a cap, not a pace. A panic
+    /// in the thread fails the test with its own message.
+    fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(value) => value,
+            Err(RecvTimeoutError::Timeout) => panic!("{what}: no answer within 10 s"),
+            Err(RecvTimeoutError::Disconnected) => match thread.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => panic!("{what}: the thread sent no answer"),
+            },
+        }
+    }
+
     /// The first write creates the directory 0700 and the file 0600; each
     /// record is one JSON line with its time, kind and phase.
     #[test]
@@ -614,6 +695,118 @@ mod tests {
         assert_eq!(records[0]["phase"], "start");
         assert_eq!(records[0]["batches"], 2);
         assert!(records[1]["ts"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    /// The log reads back as written, none before the first record; a
+    /// wider mode or a link in its place refuses the read.
+    #[test]
+    fn the_log_reads_back_owner_only() {
+        let config = tempfile::tempdir().unwrap();
+        let log = ActionLog::new(config.path());
+        assert_eq!(log.read().unwrap(), None);
+        log.append("merge", "start", serde_json::json!({ "fee": "2" }))
+            .unwrap();
+        let text = log.read().unwrap().unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(r#""kind":"merge""#), "{text}");
+        std::fs::set_permissions(log.path(), std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            log.read().unwrap_err().to_string(),
+            "wallet/actions.jsonl has mode 640; the action log needs 600 (owner only)"
+        );
+        std::fs::remove_file(log.path()).unwrap();
+        let elsewhere = config.path().join("elsewhere");
+        std::fs::write(&elsewhere, "{}").unwrap();
+        symlink(&elsewhere, log.path()).unwrap();
+        assert_eq!(
+            log.read().unwrap_err().to_string(),
+            "wallet/actions.jsonl is not a regular file"
+        );
+    }
+
+    /// The read checks the wallet directory as a write does, creating
+    /// nothing: one open to the group or a link in its place refuses it,
+    /// as another user could swap the file in it.
+    #[test]
+    fn the_read_refuses_a_shared_or_linked_wallet_dir() {
+        let config = tempfile::tempdir().unwrap();
+        let log = ActionLog::new(config.path());
+        let dir = config.path().join(DIR);
+        assert_eq!(log.read().unwrap(), None);
+        assert!(!dir.exists(), "a read created the directory");
+        log.append("merge", "start", serde_json::json!({ "fee": "2" }))
+            .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            log.read().unwrap_err().to_string(),
+            "wallet has mode 770; the action log needs 700 (owner only)"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let moved = config.path().join("moved");
+        std::fs::rename(&dir, &moved).unwrap();
+        symlink(&moved, &dir).unwrap();
+        assert_eq!(
+            log.read().unwrap_err().to_string(),
+            "wallet is not a directory"
+        );
+    }
+
+    /// The read's open follows no link and waits on no FIFO, so a swap
+    /// between the check and the open can neither redirect nor hang it.
+    #[test]
+    fn the_read_open_follows_no_link_and_waits_on_no_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let config = tempfile::tempdir().unwrap();
+        let target = config.path().join("target");
+        std::fs::write(&target, "{}").unwrap();
+        let link = config.path().join("link");
+        symlink(&target, &link).unwrap();
+        let error = private::open_unfollowed(&link).expect_err("link_followed");
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
+        let fifo = config.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = fifo.clone();
+        let opened = bounded("fifo_open_waited", move || {
+            private::open_unfollowed(&path).is_ok()
+        });
+        assert!(opened, "fifo_open_failed");
+        // In the log's place, the read refuses it.
+        let log = ActionLog::new(config.path());
+        log.append("merge", "start", serde_json::json!({})).unwrap();
+        std::fs::rename(&fifo, log.path()).unwrap();
+        let reader = log.clone();
+        let read = bounded("fifo_read_waited", move || reader.read());
+        assert_eq!(
+            read.unwrap_err().to_string(),
+            "wallet/actions.jsonl is not a regular file"
+        );
+    }
+
+    /// A log past twice its size bound, which no write leaves, refuses the
+    /// read rather than load it whole; the next record trims it.
+    #[test]
+    fn the_read_refuses_a_log_past_twice_its_bound() {
+        let config = tempfile::tempdir().unwrap();
+        let log = ActionLog {
+            max_bytes: 64,
+            ..ActionLog::new(config.path())
+        };
+        log.append("merge", "start", serde_json::json!({})).unwrap();
+        std::fs::write(log.path(), "x".repeat(128)).unwrap();
+        assert_eq!(log.read().unwrap().unwrap().len(), 128);
+        std::fs::write(log.path(), "x".repeat(129)).unwrap();
+        assert_eq!(
+            log.read().unwrap_err().to_string(),
+            "wallet/actions.jsonl holds over 128 bytes, past its bound; the next recorded \
+             action trims it"
+        );
+        log.append("merge", "outcome", serde_json::json!({ "outcome": "ok" }))
+            .unwrap();
+        let text = log.read().unwrap().unwrap();
+        assert!(text.contains(r#""phase":"outcome""#), "{text}");
+        assert!(!text.contains('x'), "{text}");
     }
 
     /// A directory or file open to others, or a link in place of the
