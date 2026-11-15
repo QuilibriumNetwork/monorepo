@@ -2337,6 +2337,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         std::time::Duration::from_secs(1),
     )
     .with_frame_capacity(0);
+    // A storage epoch proof made or sent again here leaves out the
+    // settlements committed GLOBAL state shows settled: GLOBAL refuses a
+    // proof whole for one.
+    let settled = crdt.clone();
+    quil_engine::storage_epoch_batch::set_settled_view(Arc::new(
+        move |member: &[u8; 32], filter: &[u8], epoch: u64| {
+            let state = quil_execution::hypergraph_state::HypergraphState::new(settled.clone());
+            settled_at(&state, member, filter, epoch)
+        },
+    ));
     let grpc_server = quil_rpc::GlobalRpcServer::new(
         Arc::new(cached_lookup),
     )
@@ -6614,6 +6624,86 @@ mod committed_app_head_tests {
         );
         crdt.set_covered_prefix(&[63; 43]).unwrap();
         assert!(committed_global_app_heads(&crdt, &[filter]).is_err());
+    }
+}
+
+/// The GLOBAL frame at which committed `state` shows `member`'s settlement
+/// of `epoch` on `filter` settled; `None` while it shows it owed or
+/// expired, or cannot be read: the settled view storage epoch proofs read
+/// (`quil_engine::storage_epoch_batch::set_settled_view`).
+fn settled_at(
+    state: &quil_execution::hypergraph_state::HypergraphState,
+    member: &[u8; 32],
+    filter: &[u8],
+    epoch: u64,
+) -> Option<u64> {
+    use quil_execution::global_intrinsic::storage_seat::{self, Outcome};
+    match storage_seat::read(state, member, filter)
+        .ok()??
+        .slot(epoch)?
+        .outcome
+    {
+        Outcome::Settled(at) => Some(at),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod settled_view_tests {
+    use super::*;
+    use quil_execution::global_intrinsic::storage_seat::{self, Outcome, Seat, SeatSlot};
+    use quil_execution::hypergraph_state::HypergraphState;
+
+    /// The settled view reads the epoch's own slot of the seat in committed
+    /// state, and only a settled one: GLOBAL refuses a proof whole for a
+    /// settled seat, and an expired one is left out by its window.
+    #[test]
+    fn the_settled_view_shows_only_a_settled_slot_of_the_epoch() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let (member, filter) = ([0x4c; 32], vec![0x2a; 35]);
+        let slot = |epoch, outcome| SeatSlot {
+            epoch,
+            outcome,
+            ..Default::default()
+        };
+        let seat = Seat {
+            member,
+            filter: filter.clone(),
+            slots: vec![
+                slot(1500, Outcome::Settled(1_070_111)),
+                slot(1501, Outcome::Open),
+                slot(1502, Outcome::Expired(1_071_000)),
+            ],
+        };
+        let state = HypergraphState::new(crdt.clone());
+        storage_seat::write(&state, 1_071_000, &seat).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(
+            1_071_000,
+            &quil_store::encoding::global_materialized_cursor_key(),
+        )
+        .unwrap();
+        let committed = HypergraphState::new(crdt.clone());
+        assert!(
+            storage_seat::read(&committed, &member, &filter)
+                .unwrap()
+                .is_some_and(|read| read.slots.len() == 3),
+            "the seat is not in committed state: the test proves nothing"
+        );
+        let shown: Vec<Option<u64>> = (1500..=1502)
+            .map(|epoch| settled_at(&committed, &member, &filter, epoch))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![Some(1_070_111), None, None],
+            "settled_view_wrong: the view showed a slot other than the epoch's settled one"
+        );
     }
 }
 
