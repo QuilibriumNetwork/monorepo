@@ -51,6 +51,8 @@ pub struct P2PNode {
     direct_peers: Vec<(PeerId, Multiaddr)>,
     /// `p2p.additionalListenMultiaddrs`; none on a worker's swarm.
     additional_listen: Vec<String>,
+    /// What the node made of its configured peer lists.
+    peer_list_notes: PeerListNotes,
     network: u8,
     /// If a new Ed448 key was generated, the hex-encoded config key (228 chars).
     /// The caller should persist this in the config file.
@@ -81,54 +83,94 @@ pub struct P2PNode {
     dns: crate::dns_config::DnsSource,
 }
 
+/// What a node made of its configured peer lists, for the operator.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PeerListNotes {
+    /// Bootstrap peers `p2p.extraBootstrapPeers` added to the network's list.
+    pub added_bootstrap_peers: usize,
+    /// Each configured entry the node does not dial, with its config key.
+    pub rejected: Vec<(&'static str, String)>,
+}
+
+impl PeerListNotes {
+    /// Warn of each rejected entry and say how many bootstrap peers
+    /// `p2p.extraBootstrapPeers` added.
+    pub fn log(&self) {
+        for (key, entry) in &self.rejected {
+            warn!(
+                key = %key,
+                entry = %entry,
+                "a configured peer is not a multiaddr with a /p2p/<peer-id> segment, so the node \
+                 does not dial it; fix or remove the entry in config.yml"
+            );
+        }
+        if self.added_bootstrap_peers > 0 {
+            info!(
+                added = self.added_bootstrap_peers,
+                "p2p.extraBootstrapPeers adds {} bootstrap peers to the network's list",
+                self.added_bootstrap_peers
+            );
+        }
+    }
+}
+
 /// Parse operator-configured multiaddr strings into `(PeerId, Multiaddr)`
 /// pairs, applying the same `/dnsaddr/` → `/dns/` rewrite (and QUIC marker
-/// synthesis) the Quilibrium bootstrap entries require. Entries that don't
-/// parse or lack a `/p2p/<peer-id>` segment are skipped. Shared by both
-/// bootstrap-peer and direct-peer parsing so the two stay in lockstep.
-fn parse_peer_multiaddrs(entries: &[String]) -> Vec<(PeerId, Multiaddr)> {
-    entries
-        .iter()
-        .filter_map(|addr_str| {
-            let raw: Multiaddr = addr_str.parse().ok()?;
-            let was_dnsaddr = raw.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)));
-            let mut rewritten = Multiaddr::empty();
-            let mut last_was_udp = false;
-            let mut quic_inserted = false;
-            for proto in raw.iter() {
-                match proto {
-                    Protocol::Dnsaddr(host) => {
-                        rewritten.push(Protocol::Dns(host));
-                        last_was_udp = false;
-                    }
-                    Protocol::Udp(_) => {
-                        rewritten.push(proto);
-                        last_was_udp = true;
-                    }
-                    other => {
-                        // Quilibrium `/dnsaddr/` entries omit the QUIC
-                        // marker that TXT records would have supplied —
-                        // synthesize it.
-                        if was_dnsaddr
-                            && last_was_udp
-                            && !quic_inserted
-                            && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
-                        {
-                            rewritten.push(Protocol::QuicV1);
-                            quic_inserted = true;
-                        }
-                        rewritten.push(other);
-                        last_was_udp = false;
-                    }
-                }
+/// synthesis) the Quilibrium bootstrap entries require. Returns the pairs and
+/// each entry that does not parse or lacks a `/p2p/<peer-id>` segment; blank
+/// entries are skipped. Shared by both bootstrap-peer and direct-peer parsing
+/// so the two stay in lockstep.
+fn parse_peer_multiaddrs(entries: &[String]) -> (Vec<(PeerId, Multiaddr)>, Vec<String>) {
+    let mut peers = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in entries.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        match parse_peer_multiaddr(entry) {
+            Some(peer) => peers.push(peer),
+            None => rejected.push(entry.to_string()),
+        }
+    }
+    (peers, rejected)
+}
+
+/// One entry of [`parse_peer_multiaddrs`].
+fn parse_peer_multiaddr(addr_str: &str) -> Option<(PeerId, Multiaddr)> {
+    let raw: Multiaddr = addr_str.parse().ok()?;
+    let was_dnsaddr = raw.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)));
+    let mut rewritten = Multiaddr::empty();
+    let mut last_was_udp = false;
+    let mut quic_inserted = false;
+    for proto in raw.iter() {
+        match proto {
+            Protocol::Dnsaddr(host) => {
+                rewritten.push(Protocol::Dns(host));
+                last_was_udp = false;
             }
-            let peer_id = rewritten.iter().find_map(|p| match p {
-                Protocol::P2p(id) => Some(id),
-                _ => None,
-            })?;
-            Some((peer_id, rewritten))
-        })
-        .collect()
+            Protocol::Udp(_) => {
+                rewritten.push(proto);
+                last_was_udp = true;
+            }
+            other => {
+                // Quilibrium `/dnsaddr/` entries omit the QUIC
+                // marker that TXT records would have supplied —
+                // synthesize it.
+                if was_dnsaddr
+                    && last_was_udp
+                    && !quic_inserted
+                    && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
+                {
+                    rewritten.push(Protocol::QuicV1);
+                    quic_inserted = true;
+                }
+                rewritten.push(other);
+                last_was_udp = false;
+            }
+        }
+    }
+    let peer_id = rewritten.iter().find_map(|p| match p {
+        Protocol::P2p(id) => Some(id),
+        _ => None,
+    })?;
+    Some((peer_id, rewritten))
 }
 
 impl P2PNode {
@@ -207,13 +249,33 @@ impl P2PNode {
         // which it can't dial ("Unsupported resolved address"). Inject
         // `/quic-v1/` between `/udp/<port>` and `/p2p/<id>` for any
         // address that came in as `/dnsaddr/`.
-        let bootstrap_peers = parse_peer_multiaddrs(&config.bootstrap_peers);
+        let (mut bootstrap_peers, rejected_bootstrap) =
+            parse_peer_multiaddrs(&config.bootstrap_peers);
+        // `p2p.extraBootstrapPeers` adds to the network's list here, where
+        // the dial list is built, so a saved config keeps both as written.
+        let (extra_bootstrap_peers, rejected_extra) =
+            parse_peer_multiaddrs(&config.extra_bootstrap_peers);
+        let mut added_bootstrap_peers = 0;
+        for peer in extra_bootstrap_peers {
+            if !bootstrap_peers.contains(&peer) {
+                bootstrap_peers.push(peer);
+                added_bootstrap_peers += 1;
+            }
+        }
         // Operator-configured direct peers (e.g. the genesis global
         // archives). Parsed identically to bootstrap peers; entries must
         // carry a `/p2p/<peer-id>` segment so we can pin them by PeerId.
         // These are registered via `add_direct_peer` + persistently dialed
         // in `start()`.
-        let direct_peers = parse_peer_multiaddrs(&config.direct_peers);
+        let (direct_peers, rejected_direct) = parse_peer_multiaddrs(&config.direct_peers);
+        let rejected = [
+            ("p2p.bootstrapPeers", rejected_bootstrap),
+            ("p2p.extraBootstrapPeers", rejected_extra),
+            ("p2p.directPeers", rejected_direct),
+        ]
+        .into_iter()
+        .flat_map(|(key, entries)| entries.into_iter().map(move |entry| (key, entry)))
+        .collect();
 
         Ok(Self {
             peer_id,
@@ -221,6 +283,10 @@ impl P2PNode {
             bootstrap_peers,
             direct_peers,
             additional_listen: config.additional_listen_multiaddrs.clone(),
+            peer_list_notes: PeerListNotes {
+                added_bootstrap_peers,
+                rejected,
+            },
             network: config.network,
             generated_key_hex,
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
@@ -228,6 +294,12 @@ impl P2PNode {
             pubsub_from_peer_id: None,
             dns: crate::dns_config::DnsSource::system(),
         })
+    }
+
+    /// What the node made of its configured peer lists; the master logs it
+    /// once ([`PeerListNotes::log`]).
+    pub fn peer_list_notes(&self) -> &PeerListNotes {
+        &self.peer_list_notes
     }
 
     /// Replaces the resolver config source `start()` reads.
@@ -588,18 +660,40 @@ impl P2PNode {
             }
         }
         let mut started = 0usize;
+        let mut failed = Vec::new();
         for addr in listeners {
             match swarm.listen_on(addr.clone()) {
                 Ok(_) => {
                     debug!(%addr, "p2p listener starting");
                     started += 1;
                 }
-                Err(e) => warn!(
+                Err(e) => failed.push((addr, e)),
+            }
+        }
+        // A listener that does not start is not fatal while another runs: a
+        // host without IPv6 keeps listening on IPv4.
+        for (addr, e) in &failed {
+            let ipv6 = addr
+                .iter()
+                .next()
+                .is_some_and(|p| matches!(p, Protocol::Ip6(_)));
+            if ipv6 && started > 0 {
+                warn!(
                     %addr,
                     error = format!("{:?}", e),
+                    listening = started,
+                    "the IPv6 p2p listener failed to start, so peers reach this node over IPv4 \
+                     only; IPv4 continues. A host without IPv6 can set p2p.listenMultiaddr and \
+                     drop /ip6 entries of p2p.additionalListenMultiaddrs to silence this"
+                );
+            } else {
+                warn!(
+                    %addr,
+                    error = format!("{:?}", e),
+                    listening = started,
                     "a p2p listener failed to start, so peers cannot dial this address; check \
                      that the host has the address family and the port is free"
-                ),
+                );
             }
         }
         if started == 0 {
@@ -1467,6 +1561,7 @@ impl P2PNode {
                 cmd_tx,
                 external_addrs,
                 listen_addrs,
+                listen_v6,
                 peer_count,
                 metrics_registry,
                 direct_stats,
@@ -1487,6 +1582,8 @@ pub struct P2PHandle {
     external_addrs: tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs>,
     /// The listeners' current addresses, kept by the swarm event loop.
     listen_addrs: tokio::sync::watch::Receiver<Vec<String>>,
+    /// Whether `listenMultiaddr` is IPv6, the family AutoNAT probes.
+    listen_v6: bool,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
@@ -1915,6 +2012,13 @@ impl P2PHandle {
         self.listen_addrs.borrow().clone()
     }
 
+    /// Whether AutoNAT probes IPv6 rather than IPv4: its servers and the
+    /// addresses it confirms are of the family of `listenMultiaddr`, which
+    /// PeerInfo announces.
+    pub fn autonat_probes_ipv6(&self) -> bool {
+        self.listen_v6
+    }
+
     /// Follow changes to [`observed_addresses`](Self::observed_addresses).
     pub fn watch_external_addresses(
         &self,
@@ -1951,6 +2055,7 @@ impl P2PHandle {
             cmd_tx,
             external_addrs: tokio::sync::watch::channel(Default::default()).1,
             listen_addrs: tokio::sync::watch::channel(Vec::new()).1,
+            listen_v6: false,
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
@@ -2379,6 +2484,59 @@ fn ipv6_routable(ip: std::net::Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `p2p.extraBootstrapPeers` adds each new dialable entry to the
+    /// network's list and counts only those; an entry of any peer list
+    /// without a peer id, or not an address, is named with its key.
+    #[test]
+    fn extra_bootstrap_peers_add_only_dialable_entries() {
+        let own = format!("/ip4/192.0.2.1/udp/8336/quic-v1/p2p/{}", PeerId::random());
+        let extra = format!("/ip6/2001:db8::1/udp/8336/quic-v1/p2p/{}", PeerId::random());
+        let config = P2PConfig {
+            network: 99,
+            bootstrap_peers: vec![own.clone(), "/ip4/192.0.2.9/udp/8336/quic-v1".into()],
+            extra_bootstrap_peers: vec![
+                format!(" {extra} "),
+                extra.clone(),
+                own.clone(),
+                "/ip6/2001:db8::2/udp/8336/quic-v1".into(),
+                "not an address".into(),
+                String::new(),
+            ],
+            direct_peers: vec!["/dns/archive/udp/8336/quic-v1".into()],
+            ..P2PConfig::default()
+        };
+        let node = P2PNode::new_with_options(&config, true, None).unwrap();
+        let dialed: Vec<String> = node
+            .bootstrap_peers
+            .iter()
+            .map(|(_, addr)| addr.to_string())
+            .collect();
+        assert_eq!(
+            dialed,
+            [own, extra],
+            "extra peers not added to the dial list"
+        );
+        assert_eq!(
+            node.peer_list_notes(),
+            &PeerListNotes {
+                added_bootstrap_peers: 1,
+                rejected: vec![
+                    (
+                        "p2p.bootstrapPeers",
+                        "/ip4/192.0.2.9/udp/8336/quic-v1".into()
+                    ),
+                    (
+                        "p2p.extraBootstrapPeers",
+                        "/ip6/2001:db8::2/udp/8336/quic-v1".into()
+                    ),
+                    ("p2p.extraBootstrapPeers", "not an address".into()),
+                    ("p2p.directPeers", "/dns/archive/udp/8336/quic-v1".into()),
+                ],
+            },
+            "an entry no node dials counted or not named"
+        );
+    }
 
     fn routable(addr: &str) -> bool {
         is_routable(&addr.parse().unwrap())

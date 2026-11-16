@@ -51,6 +51,11 @@ pub struct P2PConfig {
     pub idont_want_message_threshold: i32,
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    /// Bootstrap peers added to the network's list, on mainnet to the
+    /// built-in one, which `bootstrapPeers` cannot change there; e.g. an
+    /// operator's own archive or an IPv6 or DNS address of a peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_bootstrap_peers: Vec<String>,
     #[serde(default)]
     pub listen_multiaddr: String,
     #[serde(default = "default_stream_listen")]
@@ -95,6 +100,13 @@ fn default_stream_listen() -> String {
     "/ip4/0.0.0.0/tcp/8340".into()
 }
 
+/// The p2p listen address of a config that names none.
+pub const DEFAULT_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0/udp/8336/quic-v1";
+
+/// The IPv6 counterpart of [`DEFAULT_LISTEN_MULTIADDR`], which a config
+/// naming no listen address also listens on.
+pub const DEFAULT_IPV6_LISTEN_MULTIADDR: &str = "/ip6/::/udp/8336/quic-v1";
+
 /// Every setting but the peer key, which is the node's network identity
 /// and shows only whether it is set: a config printed with `{:?}` (a log
 /// line, a panic, an error chain) must not carry it.
@@ -114,6 +126,7 @@ impl std::fmt::Debug for P2PConfig {
             iwant_followup_time_ms,
             idont_want_message_threshold,
             bootstrap_peers,
+            extra_bootstrap_peers,
             listen_multiaddr,
             stream_listen_multiaddr,
             additional_listen_multiaddrs,
@@ -144,6 +157,7 @@ impl std::fmt::Debug for P2PConfig {
             .field("iwant_followup_time_ms", iwant_followup_time_ms)
             .field("idont_want_message_threshold", idont_want_message_threshold)
             .field("bootstrap_peers", bootstrap_peers)
+            .field("extra_bootstrap_peers", extra_bootstrap_peers)
             .field("listen_multiaddr", listen_multiaddr)
             .field("stream_listen_multiaddr", stream_listen_multiaddr)
             .field("additional_listen_multiaddrs", additional_listen_multiaddrs)
@@ -217,6 +231,39 @@ pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> O
 }
 
 impl P2PConfig {
+    /// Whether the config names no p2p listen address, so the node listens
+    /// on [`DEFAULT_LISTEN_MULTIADDR`] and, unless the config names
+    /// additional listen addresses, on [`DEFAULT_IPV6_LISTEN_MULTIADDR`] and
+    /// the peer gRPC port of both families.
+    pub fn listens_by_default(&self) -> bool {
+        self.listen_multiaddr.is_empty() && self.additional_listen_multiaddrs.is_empty()
+    }
+
+    /// The p2p listen address and the additional ones the node binds: the
+    /// configured ones, or for a config naming none, the default IPv4
+    /// address and its IPv6 counterpart.
+    pub fn listen_multiaddrs(&self) -> (String, Vec<String>) {
+        if !self.listen_multiaddr.is_empty() {
+            return (
+                self.listen_multiaddr.clone(),
+                self.additional_listen_multiaddrs.clone(),
+            );
+        }
+        let additional = if self.listens_by_default() {
+            vec![DEFAULT_IPV6_LISTEN_MULTIADDR.to_string()]
+        } else {
+            self.additional_listen_multiaddrs.clone()
+        };
+        (DEFAULT_LISTEN_MULTIADDR.to_string(), additional)
+    }
+
+    /// Whether the peer gRPC listener takes both address families: a config
+    /// that [`listens_by_default`](Self::listens_by_default) on the default
+    /// stream address.
+    pub fn stream_listens_on_both_families(&self) -> bool {
+        self.listens_by_default() && self.stream_listen_multiaddr == default_stream_listen()
+    }
+
     /// Whether onion links and the exit may dial a peer's loopback, private
     /// or otherwise non-public address: only off mainnet, where devnets run
     /// on one host or network. On mainnet a peer's advertised address could
@@ -293,6 +340,12 @@ impl P2PConfig {
                 .map(|s| s.to_string())
                 .collect();
         }
+        // `extraBootstrapPeers` adds to that list where the node builds its
+        // dial list (`quil_p2p::node`), never here: a config saved after
+        // loading would carry the merged list. A new key rather than honoring
+        // `bootstrapPeers` on mainnet: configs written by earlier releases
+        // carry their built-in lists, including hosts since retired, which
+        // every such node would dial again.
     }
 }
 

@@ -4913,6 +4913,68 @@ mod tests {
             .is_none());
     }
 
+    /// A node on the default listeners binds IPv6 beside IPv4 but probes
+    /// and announces IPv4 only: its AutoNAT failures settle IPv4, and its
+    /// IPv6 listener, which no config names, raises no note. A config that
+    /// names IPv6 keeps the note; a build that names no probed family keeps
+    /// the rule for two families listened on.
+    #[test]
+    fn a_default_dual_stack_node_unreachable_on_ipv4_cannot_be_dialed() {
+        use reachability::{CheckState, Family, Transport};
+        let judge = |report: &NodeReachability| {
+            let mut reg = HealthRegistry::default();
+            reg.observe_reachability(report, T0);
+            reg.evaluate(T0, &no_cadence);
+            (
+                current(&reg, ConditionKind::PeersCannotDial).is_some(),
+                current(&reg, ConditionKind::Ipv6NotPublished).is_some(),
+            )
+        };
+        let v4 = "/ip4/192.168.1.20/udp/8336/quic-v1";
+        let v6 = "/ip6/2001:db8::7/udp/8336/quic-v1";
+        let mut report = reachability_report(&[v4, v6], &[v4], true);
+        report.autonat_family = "ipv4".to_string();
+        report.listens_by_default = true;
+        let assessment = reachability::assess(&report);
+        let quic = |family| {
+            assessment
+                .families
+                .iter()
+                .find(|f| f.family == family)
+                .and_then(|f| f.checks.iter().find(|c| c.transport == Transport::Quic))
+                .map(|c| c.state)
+        };
+        assert_eq!(
+            (assessment.verdict, quic(Family::Ipv4), quic(Family::Ipv6)),
+            (
+                Verdict::NotReachable,
+                Some(CheckState::NotReachable),
+                Some(CheckState::Unknown)
+            ),
+            "AutoNAT's failures must settle the probed family alone"
+        );
+        assert_eq!(
+            judge(&report),
+            (true, false),
+            "a default node's conditions: (cannot dial, IPv6 not published)"
+        );
+        let mut named = report.clone();
+        named.listens_by_default = false;
+        assert_eq!(
+            judge(&named),
+            (true, true),
+            "a configured IPv6 listener raises no note"
+        );
+        let mut earlier = report;
+        earlier.autonat_family = String::new();
+        earlier.listens_by_default = false;
+        assert_eq!(
+            reachability::assess(&earlier).verdict,
+            Verdict::Unknown,
+            "a build naming no probed family is judged by its own family"
+        );
+    }
+
     /// Every kind has its own text, label, action and scope, and an unknown
     /// value still reads as something to look up; only reward and
     /// reachability evidence stays on this node.

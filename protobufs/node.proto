@@ -156,6 +156,14 @@ message NodeReachability {
   // The master's addresses in the last PeerInfo it published.
   repeated string announced_pubsub_multiaddrs = 6;
   repeated string announced_stream_multiaddrs = 7;
+  // The address family AutoNAT probes, so of its status, probe runs and
+  // confirmed addresses: `ipv4` or `ipv6`, that of the p2p listen address,
+  // which PeerInfo announces. Empty from builds before this field.
+  string autonat_family = 8;
+  // Whether the config names no p2p listen address, so the node listens on
+  // the default IPv4 address and its IPv6 counterpart, which it does not
+  // announce.
+  bool listens_by_default = 9;
 }
 
 // A run of AutoNAT probes of this node without a dial-back.

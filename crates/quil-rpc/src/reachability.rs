@@ -276,8 +276,28 @@ pub fn assess(report: &NodeReachability) -> Assessment {
         .filter(|f| *f == Family::Ipv4 || seen(*f))
         .collect();
     // AutoNAT's status and failures do not name a family: they tell about
-    // a family only while it is the only one listened on.
-    let attributable = families.iter().filter(|f| seen(**f)).count() <= 1;
+    // the family the node reports AutoNAT probes. For a node of an earlier
+    // build, they tell about a family only while it is the only one
+    // listened on.
+    let probed = match report.autonat_family.as_str() {
+        "ipv4" => Some(Family::Ipv4),
+        "ipv6" => Some(Family::Ipv6),
+        _ => None,
+    };
+    let single = families.iter().filter(|f| seen(**f)).count() <= 1;
+    let unattributed = |family: Family| match probed {
+        Some(probed) if probed != family => Some(format!(
+            "AutoNAT probes {} only and has confirmed no {} address",
+            probed.label(),
+            family.label()
+        )),
+        Some(_) => None,
+        None if single => None,
+        None => Some(
+            "AutoNAT has confirmed no address, and its results do not name the address family"
+                .to_string(),
+        ),
+    };
 
     let mut checked = Vec::new();
     for family in families {
@@ -304,7 +324,7 @@ pub fn assess(report: &NodeReachability) -> Assessment {
                     host,
                     report,
                     run.as_ref(),
-                    attributable,
+                    unattributed(family),
                 ),
             };
             checks.push(Check {
@@ -338,6 +358,7 @@ pub fn assess(report: &NodeReachability) -> Assessment {
         &confirmed,
         &announced,
         report.announced,
+        report.listens_by_default,
         verdict,
     );
     Assessment {
@@ -356,7 +377,9 @@ pub enum Ipv6Note {
     /// It binds no address peers could dial and publishes none, while the
     /// node is not known reachable.
     NoneBound,
-    /// It binds `bound` but publishes no IPv6 address.
+    /// It binds `bound`, which its config names, but publishes no IPv6
+    /// address. The IPv6 listener of a config naming none is not noted:
+    /// the node never announces it.
     NotPublished { bound: String },
     /// AutoNAT confirmed only IPv6 addresses.
     ConfirmedOnly,
@@ -385,6 +408,7 @@ fn ipv6_note(
     confirmed: &[Endpoint],
     announced: &[Endpoint],
     has_published: bool,
+    listens_by_default: bool,
     verdict: Verdict,
 ) -> Option<Ipv6Note> {
     let is_v6 = |e: &&Endpoint| e.family() == Family::Ipv6;
@@ -395,9 +419,11 @@ fn ipv6_note(
     let published = announced.iter().any(|e| e.family() == Family::Ipv6);
     match bound {
         None if !published && verdict != Verdict::Reachable => Some(Ipv6Note::NoneBound),
-        Some(e) if !published && has_published => Some(Ipv6Note::NotPublished {
-            bound: e.host_port(),
-        }),
+        Some(e) if !published && has_published && !listens_by_default => {
+            Some(Ipv6Note::NotPublished {
+                bound: e.host_port(),
+            })
+        }
         _ if confirmed.iter().any(|e| e.family() == Family::Ipv6)
             && confirmed.iter().all(|e| e.family() == Family::Ipv6) =>
         {
@@ -431,7 +457,7 @@ fn check(
     host: Option<(IpAddr, HostClass)>,
     report: &NodeReachability,
     run: Option<&ProbeRun>,
-    attributable: bool,
+    unattributed: Option<String>,
 ) -> (CheckState, String) {
     if let Some(addr) = confirmed
         .iter()
@@ -461,12 +487,8 @@ fn check(
             format!("this host's address {ip} is behind carrier-grade NAT"),
         );
     }
-    if !attributable {
-        return (
-            CheckState::Unknown,
-            "AutoNAT has confirmed no address, and its results do not name the address family"
-                .to_string(),
-        );
+    if let Some(evidence) = unattributed {
+        return (CheckState::Unknown, evidence);
     }
     if let Some(run) = run.filter(|run| run.unreachable) {
         return (
