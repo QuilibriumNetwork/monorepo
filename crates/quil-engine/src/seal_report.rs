@@ -4,9 +4,12 @@
 //! storage registration" lines across its cores and never said why a slot
 //! did not seal (2026-11-16).
 //!
-//! The seal's job and the label store note what refused it
-//! ([`note_refusal`], [`note_disk_short`]); the seat's engine concludes
-//! the epoch once, at its first frame ([`conclude`]).
+//! The seal's job notes what refused it or that it sent the seal part
+//! ([`note_refusal`], [`note_published`]), the label store what disk it
+//! lacked ([`note_disk_short`]); the seat's engine notes each GLOBAL
+//! frame it checks ([`note_frame`]) and concludes the epoch once, at its
+//! first frame ([`conclude`]). Notes live in the process: one started
+//! after the seal's send window opened says so instead of guessing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,6 +26,8 @@ pub enum Reason {
     LabelNotRetained,
     NotRegistered,
     SealedLate,
+    Undelivered,
+    Restarted,
     Other,
 }
 
@@ -53,6 +58,8 @@ impl Reason {
             Reason::LabelNotRetained => "label not retained",
             Reason::NotRegistered => "not registered",
             Reason::SealedLate => "sealed after the epoch began",
+            Reason::Undelivered => "undelivered",
+            Reason::Restarted => "node restarted since the send",
             Reason::Other => "other",
         }
     }
@@ -84,6 +91,16 @@ impl Reason {
                 "the 'storage seal part' and 'storage epoch proof' lines: the seal landed \
                  after the epoch began"
             }
+            Reason::Undelivered => {
+                "the master's 'storage epoch proof undelivered' errors and its window summary's \
+                 refused count: archives refused the proof carrying the seal (as 'rank buffer \
+                 full') until its window ended"
+            }
+            Reason::Restarted => {
+                "the previous run's 'storage epoch proof part prepared' lines and the master's \
+                 'storage epoch proof undelivered' errors: this run began after the seal's send \
+                 window opened, so it cannot tell whether the seal was sent"
+            }
             Reason::Other => "the 'storage seal part not prepared' warnings for the error",
         }
     }
@@ -95,6 +112,10 @@ pub enum Outcome {
     Sealed,
     NotAttempted,
     Refused,
+    /// Sent to the master, never sealed.
+    Sent,
+    /// This process did not see the whole send window.
+    Unknown,
 }
 
 impl Outcome {
@@ -103,6 +124,8 @@ impl Outcome {
             Outcome::Sealed => "sealed",
             Outcome::NotAttempted => "not attempted",
             Outcome::Refused => "refused",
+            Outcome::Sent => "sent",
+            Outcome::Unknown => "unknown",
         }
     }
 }
@@ -179,13 +202,16 @@ impl fmt::Display for SealLine {
     }
 }
 
-/// What this process saw refuse seals, by seat and epoch, and which seats
-/// and epochs it concluded. Kept for the last [`KEPT_EPOCHS`] epochs.
+/// What this process saw refuse or send seals, by seat and epoch, which
+/// seats and epochs it concluded, and the first GLOBAL frame it checked.
+/// Kept for the last [`KEPT_EPOCHS`] epochs.
 #[derive(Default)]
 pub struct Notes {
     refusals: BTreeMap<(Vec<u8>, u64), (u32, String)>,
     disk: BTreeMap<u64, (u64, Option<u64>)>,
+    published: BTreeSet<(Vec<u8>, u64)>,
     concluded: BTreeSet<(Vec<u8>, u64)>,
+    watching_from: Option<u64>,
 }
 
 const KEPT_EPOCHS: u64 = 4;
@@ -201,14 +227,25 @@ impl Notes {
         self.disk.insert(epoch, (needed, free));
     }
 
+    pub fn note_published(&mut self, filter: &[u8], epoch: u64) {
+        self.published.insert((filter.to_vec(), epoch));
+    }
+
+    /// A GLOBAL frame this process checked; the first one bounds what its
+    /// notes can show.
+    pub fn note_frame(&mut self, frame: u64) {
+        self.watching_from.get_or_insert(frame);
+    }
+
     /// The line for `filter`'s seat in `epoch`, once; `slot` is GLOBAL's
-    /// registration, `start` the epoch's first frame, `unprovable` whether
-    /// this process found the registration cannot be sealed.
+    /// registration, `window` the frames the seal is sent in (it ends at
+    /// the epoch's first frame), `unprovable` whether this process found
+    /// the registration cannot be sealed.
     pub fn conclude(
         &mut self,
         filter: &[u8],
         epoch: u64,
-        start: u64,
+        window: std::ops::Range<u64>,
         slot: Option<SlotView>,
         held: bool,
         unprovable: bool,
@@ -221,16 +258,23 @@ impl Notes {
         self.disk.retain(|e, _| *e >= floor);
         let refused = self.refusals.remove(&(filter.to_vec(), epoch));
         self.refusals.retain(|(_, e), _| *e >= floor);
+        let published = self.published.remove(&(filter.to_vec(), epoch));
+        self.published.retain(|(_, e)| *e >= floor);
+        // Begun after the window opened, this process may have missed a
+        // send by the one before it.
+        let restarted = self.watching_from.is_none_or(|from| from > window.start);
         let disk = self.disk.get(&epoch).copied();
         let registered = slot.filter(|slot| slot.has_leaves);
         let sealed_at = registered.and_then(|slot| slot.sealed_at);
         let (outcome, reason) = match (registered, sealed_at, &refused) {
-            (Some(_), Some(at), _) if at < start => (Outcome::Sealed, None),
+            (Some(_), Some(at), _) if at < window.end => (Outcome::Sealed, None),
             (Some(_), Some(_), _) => (Outcome::Sealed, Some(Reason::SealedLate)),
+            (Some(_), None, _) if published => (Outcome::Sent, Some(Reason::Undelivered)),
             (_, _, Some((_, error))) => (Outcome::Refused, Some(Reason::classify(error))),
             (Some(_), None, None) if unprovable => {
                 (Outcome::NotAttempted, Some(Reason::LabelNotRetained))
             }
+            (Some(_), None, None) if restarted => (Outcome::Unknown, Some(Reason::Restarted)),
             (None, _, None) if disk.is_some() => (Outcome::NotAttempted, Some(Reason::DiskShort)),
             (None, _, None) => (Outcome::NotAttempted, Some(Reason::NotRegistered)),
             (Some(_), None, None) => (Outcome::NotAttempted, Some(Reason::Other)),
@@ -255,7 +299,9 @@ fn notes() -> std::sync::MutexGuard<'static, Notes> {
     static NOTES: Mutex<Notes> = Mutex::new(Notes {
         refusals: BTreeMap::new(),
         disk: BTreeMap::new(),
+        published: BTreeSet::new(),
         concluded: BTreeSet::new(),
+        watching_from: None,
     });
     NOTES.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -270,10 +316,22 @@ pub fn note_disk_short(epoch: u64, needed: u64, free: Option<u64>) {
     notes().note_disk_short(epoch, needed, free);
 }
 
+/// The seal part for `filter`'s registration of `epoch` went to the master.
+pub fn note_published(filter: &[u8], epoch: u64) {
+    notes().note_published(filter, epoch);
+}
+
+/// A seat's engine checks GLOBAL `frame` for its seals and settlements.
+pub fn note_frame(frame: u64) {
+    notes().note_frame(frame);
+}
+
 /// Log, once per seat and epoch, how the seat's seal for `epoch` ended.
+/// A seal for `epoch` is sent while its previous epoch runs.
 pub fn conclude(filter: &[u8], epoch: u64, slot: Option<SlotView>, held: bool, unprovable: bool) {
-    let start = quil_types::consensus::epoch_start_frame(epoch);
-    let Some(line) = notes().conclude(filter, epoch, start, slot, held, unprovable) else {
+    use quil_types::consensus::epoch_start_frame;
+    let window = epoch_start_frame(epoch.saturating_sub(1))..epoch_start_frame(epoch);
+    let Some(line) = notes().conclude(filter, epoch, window, slot, held, unprovable) else {
         return;
     };
     let (outcome, reason) = (
@@ -307,7 +365,7 @@ mod tests {
             has_leaves: true,
         };
         let line = notes
-            .conclude(&[0xab], 7, 700, Some(slot), true, false)
+            .conclude(&[0xab], 7, 600..700, Some(slot), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -323,7 +381,7 @@ mod tests {
             )
         );
         assert_eq!(
-            notes.conclude(&[0xab], 7, 700, Some(slot), true, false),
+            notes.conclude(&[0xab], 7, 600..700, Some(slot), true, false),
             None,
             "once"
         );
@@ -366,7 +424,7 @@ mod tests {
             has_leaves: true,
         };
         let line = notes
-            .conclude(&[1], 7, 700, Some(sealed), true, false)
+            .conclude(&[1], 7, 600..700, Some(sealed), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason, line.warns()),
@@ -378,19 +436,123 @@ mod tests {
             ..sealed
         };
         let line = notes
-            .conclude(&[2], 7, 700, Some(late), true, false)
+            .conclude(&[2], 7, 600..700, Some(late), true, false)
             .unwrap();
         assert_eq!(
             (line.reason, line.warns()),
             (Some(Reason::SealedLate), true)
         );
-        let line = notes.conclude(&[3], 7, 700, None, false, false).unwrap();
+        let line = notes
+            .conclude(&[3], 7, 600..700, None, false, false)
+            .unwrap();
         assert_eq!(
             (line.outcome, line.reason, line.warns()),
             (Outcome::NotAttempted, Some(Reason::NotRegistered), false)
         );
-        let line = notes.conclude(&[4], 7, 700, None, true, false).unwrap();
+        let line = notes
+            .conclude(&[4], 7, 600..700, None, true, false)
+            .unwrap();
         assert!(line.warns(), "a held seat with no registration warns");
+        println!("seal-report reached: {line}");
+    }
+
+    const UNSEALED: SlotView = SlotView {
+        sealed_at: None,
+        has_leaves: true,
+    };
+
+    #[test]
+    fn a_published_seal_unsealed_concludes_undelivered() {
+        let mut notes = Notes::default();
+        notes.note_frame(550);
+        notes.note_published(&[0xab], 7);
+        let line = notes
+            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::Sent, Some(Reason::Undelivered)),
+            "a sent seal never sealed concludes sent, undelivered"
+        );
+        assert!(line.warns());
+        assert_eq!(
+            line.to_string(),
+            format!(
+                "epoch=7 filter=ab outcome=sent held=true reason=\"undelivered\" check=\"{}\"",
+                Reason::Undelivered.check()
+            )
+        );
+        assert!(line.check().contains("'storage epoch proof undelivered'"));
+        // Refused once, then sent: the send is what failed, the refusal
+        // still counted.
+        notes.note_refusal(&[0xcd], 7, "sector initialization slots are occupied");
+        notes.note_published(&[0xcd], 7);
+        let line = notes
+            .conclude(&[0xcd], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason, line.refusals),
+            (Outcome::Sent, Some(Reason::Undelivered), 1)
+        );
+        // Watched from before the window opened and never sent.
+        let line = notes
+            .conclude(&[0xef], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::NotAttempted, Some(Reason::Other))
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    #[test]
+    fn a_run_begun_after_the_send_window_opened_concludes_unknown() {
+        // Begun after the epoch began, as at a restart 367 frames in.
+        let mut restarted = Notes::default();
+        restarted.note_frame(767);
+        let line = restarted
+            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::Unknown, Some(Reason::Restarted)),
+            "a run that missed the send window cannot tell whether it was sent"
+        );
+        assert!(line.warns());
+        assert_eq!(
+            line.to_string(),
+            format!(
+                "epoch=7 filter=ab outcome=unknown held=true reason=\"node restarted since the \
+                 send\" check=\"{}\"",
+                Reason::Restarted.check()
+            )
+        );
+        // Begun inside the window: still blind to the earlier sends.
+        let mut midway = Notes::default();
+        midway.note_frame(650);
+        let line = midway
+            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(line.outcome, Outcome::Unknown);
+        // What this run itself saw still names its reason.
+        restarted.note_refusal(&[0xcd], 7, "sector initialization slots are occupied");
+        let line = restarted
+            .conclude(&[0xcd], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::Refused, Some(Reason::SlotsOccupied))
+        );
+        // Begun at the window's first frame: it saw every send.
+        let mut whole = Notes::default();
+        whole.note_frame(600);
+        let line = whole
+            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::NotAttempted, Some(Reason::Other))
+        );
         println!("seal-report reached: {line}");
     }
 }

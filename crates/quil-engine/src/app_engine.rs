@@ -4104,6 +4104,8 @@ impl StorageEpochCheck {
         if !hash_storage_proofs_at(epoch) && !hash_storage_proofs_at(seal_epoch) {
             return;
         }
+        // The first frame checked bounds which sends this process saw.
+        crate::seal_report::note_frame(global_frame_number);
         let (Some(kv), Some(publish)) = (self.kv_db.clone(), self.coverage_publish.clone()) else {
             return;
         };
@@ -4508,6 +4510,9 @@ impl StorageEpochCheck {
                     bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
                     "storage epoch proof part prepared for the node");
                 publish(bytes);
+                if seals && seal.is_some() {
+                    crate::seal_report::note_published(&filter, epoch + 2);
+                }
                 // GLOBAL needs a retry interval from now, not from the claim;
                 // a settlement sent again apart from the attempts moves no
                 // attempt's clock.
