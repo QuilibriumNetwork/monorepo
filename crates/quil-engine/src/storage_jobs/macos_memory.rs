@@ -348,4 +348,62 @@ mod tests {
             .no_headroom_cause()
             .is_some_and(|cause| cause.starts_with("reclaimable")));
     }
+
+    /// An operator's 16 GiB Mac at normal pressure (`vm_stat`, `top`): the
+    /// node, its data workers in process, owns 8122 MiB; 16 KiB pages, 94950
+    /// wired, free 5800 plus 352 speculative, 282560 file-backed and 2971
+    /// purgeable. Its headroom is short of a 3 GiB check's share, so only a
+    /// check a frame waits on starts, alone, and only while the node's
+    /// footprint leaves room for it (here up to about 11.05 GiB).
+    #[test]
+    fn an_operators_16_gib_mac_runs_a_frames_check_alone_within_capacity() {
+        const PAGE: u64 = 16 << 10;
+        const CHECK: u64 = 3 * GIB;
+        let mac = Snapshot {
+            total: 17_179_869_184,
+            wired: 94_950 * PAGE,
+            footprint: 8122 << 20,
+            reclaimable: (5800 + 352 + 282_560 + 2971) * PAGE,
+            pressure: 1,
+        };
+        assert_eq!(mac.headroom(), 4_242_063_360);
+        assert!(mac.headroom() < super::super::needs_available(CHECK));
+        assert_eq!(mac.no_headroom_cause(), None);
+        assert_eq!(mac.capacity(), 6_570_803_200);
+        assert!(super::super::frame_alone_allowed(
+            0,
+            Some(mac.pressure),
+            Some(mac.capacity()),
+            CHECK
+        ));
+        let edge = mac.total - mac.wired - mac.floor() - CHECK;
+        let at_edge = Snapshot {
+            footprint: edge,
+            ..mac
+        };
+        assert_eq!(at_edge.capacity(), CHECK);
+        assert!(super::super::frame_alone_allowed(
+            0,
+            Some(1),
+            Some(at_edge.capacity()),
+            CHECK
+        ));
+        // Its compressor (6531 MiB) counted in the footprint too.
+        for footprint in [edge + 1, (8122 + 6531) << 20] {
+            let full = Snapshot { footprint, ..mac };
+            assert!(
+                !super::super::frame_alone_allowed(0, Some(1), Some(full.capacity()), CHECK),
+                "frame_alone_past_capacity: a 3 GiB check ran alone at a {footprint} byte \
+                 footprint"
+            );
+        }
+        let full = Snapshot {
+            footprint: (8122 + 6531) << 20,
+            ..mac
+        };
+        assert_eq!((full.headroom(), full.capacity()), (0, 0));
+        assert!(full
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("footprint")));
+    }
 }
