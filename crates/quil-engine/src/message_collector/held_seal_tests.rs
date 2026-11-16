@@ -382,24 +382,35 @@ fn the_carried_rank_holds_no_more_than_a_rank() {
 fn a_carried_proof_past_its_window_makes_room() {
     let mc = collector();
     let start = settlement_window(EPOCH).0;
+    // As many as the held share takes: one more does not fit.
     let len = 2_500_000;
-    for id in [1, 2] {
+    let held = SEAL_BYTES_HELD / len;
+    for id in 1..=held as u32 {
         let proof = sized(id, vec![seat(0, true, false)], len);
         assert_eq!(send(&mc, id, &proof), SubmitOutcome::Accepted);
     }
     let last = RETENTION_WINDOW + 3;
     finalize(&mc, start, last);
-    // Both carried; the frame of their window's end finalizes.
-    mc.note_finalized_frame(settlement_window(EPOCH).1);
     let seat = SeatProof {
         shard_filter: vec![0; 32],
         epoch: EPOCH + 1,
         settles: true,
         ..Default::default()
     };
-    let later = sized(3, vec![seat], len);
-    let outcome = mc.add_message_outcome_by(last + 1, later, Provenance::Prover, &peer(3));
-    eprintln!("REACH held-seal carried_evicted outcome={outcome:?}");
+    // All carried with their window open: the share is full for a proof
+    // due later.
+    let early = sized(101, vec![seat.clone()], len);
+    let full = mc.add_message_outcome_by(last + 1, early, Provenance::Prover, &peer(101));
+    assert_ne!(
+        full,
+        SubmitOutcome::Accepted,
+        "carried_full: the share took a proof due later beside {held} carried proofs due sooner"
+    );
+    // The frame of their window's end finalizes.
+    mc.note_finalized_frame(settlement_window(EPOCH).1);
+    let later = sized(100, vec![seat], len);
+    let outcome = mc.add_message_outcome_by(last + 1, later, Provenance::Prover, &peer(100));
+    eprintln!("REACH held-seal carried_evicted held={held} full={full:?} outcome={outcome:?}");
     assert_eq!(
         outcome,
         SubmitOutcome::Accepted,
