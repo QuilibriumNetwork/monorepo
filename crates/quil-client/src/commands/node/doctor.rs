@@ -512,6 +512,9 @@ mod tests {
                     .into_iter()
                     .collect(),
                 announced_stream_multiaddrs: Vec::new(),
+                // A build that does not name the family AutoNAT probes.
+                autonat_family: String::new(),
+                listens_by_default: false,
             },
             announce_override: None,
             stream_listen: STREAM.to_string(),
@@ -766,6 +769,18 @@ mod tests {
         let d = diagnose(&obs);
         assert_eq!(d.verdict, Verdict::Unknown);
         assert_eq!(state(&d, Family::Ipv6, Transport::Tcp), CheckState::Unknown);
+        // Unless the node names the family AutoNAT probes: they settle it.
+        obs.report.autonat_family = "ipv4".to_string();
+        let d = diagnose(&obs);
+        assert_eq!(d.verdict, Verdict::NotReachable);
+        assert_eq!(
+            state(&d, Family::Ipv4, Transport::Tcp),
+            CheckState::NotReachable
+        );
+        assert_eq!(state(&d, Family::Ipv6, Transport::Tcp), CheckState::Unknown);
+        let text = render(&d);
+        assert!(text.contains("sudo ufw allow 8336/tcp"), "{text}");
+        assert!(text.contains("AutoNAT probes IPv4 only"), "{text}");
     }
 
     /// The notes that speak about IPv6.

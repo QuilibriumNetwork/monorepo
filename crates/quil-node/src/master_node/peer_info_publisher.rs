@@ -51,15 +51,30 @@ pub(crate) struct AnnouncedAddrs {
     pub stream: Vec<String>,
 }
 
+/// How the node listens, beside its listeners' addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Listening {
+    /// AutoNAT probes IPv6 rather than IPv4.
+    pub autonat_ipv6: bool,
+    /// The config names no p2p listen address.
+    pub by_default: bool,
+}
+
 /// This node's reachability for `get_node_info`: `listen` are the p2p
 /// listeners' addresses, `ext` the AutoNAT-confirmed addresses with
 /// AutoNAT's view, `announced` the last PeerInfo's master addresses.
 pub(crate) fn node_reachability(
     listen: Vec<String>,
+    listening: Listening,
     ext: &ConfirmedExternalAddrs,
     announced: &AnnouncedAddrs,
     now: std::time::Instant,
 ) -> quil_types::proto::node::NodeReachability {
+    let autonat_family = if listening.autonat_ipv6 {
+        "ipv6"
+    } else {
+        "ipv4"
+    };
     quil_types::proto::node::NodeReachability {
         listen_multiaddrs: listen,
         nat_status: ext.autonat.nat_status.to_string(),
@@ -75,6 +90,8 @@ pub(crate) fn node_reachability(
         announced: announced.published,
         announced_pubsub_multiaddrs: announced.pubsub.clone(),
         announced_stream_multiaddrs: announced.stream.clone(),
+        autonat_family: autonat_family.to_string(),
+        listens_by_default: listening.by_default,
     }
 }
 
@@ -1564,6 +1581,44 @@ mod reachability_tests {
     use super::*;
     use quil_p2p::external_addr::ProbeFailureSummary;
 
+    const IPV4_NAMED: Listening = Listening {
+        autonat_ipv6: false,
+        by_default: false,
+    };
+
+    /// The report names the family AutoNAT probes and whether the node
+    /// listens on the defaults, which decide what its results and IPv6
+    /// listener mean.
+    #[test]
+    fn the_report_names_the_probed_family_and_default_listening() {
+        let report = |listening| {
+            let r = node_reachability(
+                Vec::new(),
+                listening,
+                &ConfirmedExternalAddrs::default(),
+                &AnnouncedAddrs::default(),
+                std::time::Instant::now(),
+            );
+            (r.autonat_family, r.listens_by_default)
+        };
+        assert_eq!(
+            report(Listening {
+                autonat_ipv6: false,
+                by_default: true,
+            }),
+            ("ipv4".to_string(), true),
+            "the probed family or default listening is not reported"
+        );
+        assert_eq!(
+            report(Listening {
+                autonat_ipv6: true,
+                by_default: false,
+            }),
+            ("ipv6".to_string(), false),
+            "the probed family or default listening is not reported"
+        );
+    }
+
     #[test]
     fn node_reachability_reports_autonat_view_and_announced_addresses() {
         let since = std::time::Instant::now();
@@ -1587,7 +1642,7 @@ mod reachability_tests {
         };
         let listen = vec!["/ip4/203.0.113.7/tcp/8336".to_string()];
         let now = since + Duration::from_secs(1_920);
-        let r = node_reachability(listen.clone(), &ext, &announced, now);
+        let r = node_reachability(listen.clone(), IPV4_NAMED, &ext, &announced, now);
         assert_eq!(r.listen_multiaddrs, listen);
         assert_eq!(r.nat_status, "private");
         assert_eq!(r.confirmed_multiaddrs, ext.addrs);
@@ -1608,6 +1663,7 @@ mod reachability_tests {
         // Before the first probe and publish.
         let r = node_reachability(
             Vec::new(),
+            IPV4_NAMED,
             &ConfirmedExternalAddrs::default(),
             &AnnouncedAddrs::default(),
             now,

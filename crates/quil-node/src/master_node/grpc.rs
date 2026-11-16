@@ -2803,9 +2803,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     > = {
         let p2p = p2p_handle.clone();
         let external = p2p_handle.watch_external_addresses();
+        let listening = super::peer_info_publisher::Listening {
+            autonat_ipv6: p2p_handle.autonat_probes_ipv6(),
+            by_default: config.p2p.listens_by_default(),
+        };
         Arc::new(move || {
             super::peer_info_publisher::node_reachability(
                 p2p.listen_addresses(),
+                listening,
                 &external.borrow(),
                 &announced_addrs.borrow(),
                 std::time::Instant::now(),
@@ -3994,6 +3999,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     }
 
     if let Ok(addr) = stream_addr.parse::<std::net::SocketAddr>() {
+        let stream_plan = crate::util::stream_listener::bind_plan(addr, &config.p2p);
         let global_service = tonic::service::interceptor::InterceptedService::new(
             // 64 MiB decode/encode (tonic defaults to 4 MiB). Inbound
             // submits are small, but full global-frame / app-shard
@@ -4520,13 +4526,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     .map_err(anyhow::Error::from)?;
                 let res = rt.block_on(async move {
             info!(addr = %addr, "starting peer gRPC (mTLS) on dedicated runtime");
-            let listener = crate::util::stream_listener::bind(addr).await.map_err(|e| {
+            let listener = crate::util::stream_listener::bind_planned(stream_plan).await.map_err(|e| {
                 anyhow::anyhow!("binding the peer gRPC listener on {addr} failed: {e}")
             })?;
             let bound = listener.local_addr().map_err(anyhow::Error::from)?;
             info!(
                 addr = %bound,
-                both_families = crate::util::stream_listener::takes_both_families(addr),
+                both_families = crate::util::stream_listener::takes_both_families(bound),
                 "peer gRPC listener bound"
             );
             // Post-quantum :8340 transport: each connection runs a sntrup761

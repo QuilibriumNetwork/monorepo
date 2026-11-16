@@ -11,6 +11,23 @@ pub(crate) struct P2pHandles {
     pub listen_addr: String,
 }
 
+/// The master's p2p listen address and the config its node starts from.
+/// A config naming no listen address also listens on IPv6; a host without
+/// IPv6 keeps its IPv4 listener (`P2PNode::start`). CLI `--network` is the
+/// source of truth: it overrides the YAML's `p2p.network` so a single config
+/// file can be reused across networks without the BlossomSub protocol id
+/// falling back to the mainnet variant on testnet runs.
+pub(crate) fn p2p_node_config(
+    p2p: &quil_config::P2PConfig,
+    network: u8,
+) -> (String, quil_config::P2PConfig) {
+    let (listen_addr, additional_listen) = p2p.listen_multiaddrs();
+    let mut p2p_config = p2p.clone();
+    p2p_config.network = network;
+    p2p_config.additional_listen_multiaddrs = additional_listen;
+    (listen_addr, p2p_config)
+}
+
 pub(crate) async fn init(
     sup: &mut Supervisor<anyhow::Error>,
     config: &quil_config::Config,
@@ -24,18 +41,7 @@ pub(crate) async fn init(
     // ---------------------------------------------------------------
     // 5. Start P2P networking
     // ---------------------------------------------------------------
-    let listen_addr = if config.p2p.listen_multiaddr.is_empty() {
-        "/ip4/0.0.0.0/udp/8336/quic-v1".to_string()
-    } else {
-        config.p2p.listen_multiaddr.clone()
-    };
-
-    // CLI `--network` is the source of truth — override the YAML's
-    // `p2p.network` so a single config file can be reused across
-    // networks without the BlossomSub protocol id falling back to
-    // the mainnet variant on testnet runs.
-    let mut p2p_config = config.p2p.clone();
-    p2p_config.network = network;
+    let (listen_addr, mut p2p_config) = p2p_node_config(&config.p2p, network);
 
     // Ensure the Ed448 SENIORITY-ROOT key exists (persisted in
     // config.p2p.peer_priv_key). It is NO LONGER the network identity — that is
@@ -60,6 +66,7 @@ pub(crate) async fn init(
         quil_p2p::node::P2PNode::new_with_falcon_identity(&p2p_config, falcon_signing_key)?;
     let peer_id = p2p_node.peer_id;
     info!(%peer_id, "P2P identity ready (Falcon network identity)");
+    p2p_node.peer_list_notes().log();
 
     info!(%peer_id, "starting P2P networking");
 
@@ -388,6 +395,27 @@ mod tests {
     use super::*;
     use quil_p2p::ValidationResult::{Accept, Ignore, Reject};
     use std::time::Duration;
+
+    /// The master's p2p node takes the CLI network and, for a config naming
+    /// no listen address, the IPv6 counterpart of the default one; a named
+    /// listen address stays as configured.
+    #[test]
+    fn the_master_node_listens_on_both_families_by_default() {
+        let mut p2p = quil_config::P2PConfig::default();
+        let (listen, node) = p2p_node_config(&p2p, 2);
+        assert_eq!(listen, quil_config::DEFAULT_LISTEN_MULTIADDR);
+        assert_eq!(
+            node.additional_listen_multiaddrs,
+            [quil_config::DEFAULT_IPV6_LISTEN_MULTIADDR],
+            "the master node does not listen on IPv6"
+        );
+        assert_eq!(node.network, 2);
+
+        p2p.listen_multiaddr = "/ip4/0.0.0.0/udp/8337/quic-v1".into();
+        let (listen, node) = p2p_node_config(&p2p, 2);
+        assert_eq!(listen, p2p.listen_multiaddr);
+        assert!(node.additional_listen_multiaddrs.is_empty());
+    }
 
     /// A message bundle of one operation, distinct for each `n`, as a wallet's
     /// node publishes it on an application's submission topic. Its operation

@@ -173,7 +173,7 @@ impl ConfigNotices {
     pub fn bootstrap_peers_line(&self) -> Option<String> {
         self.replaced_bootstrap_peers.map(|configured| {
             format!(
-                "mainnet uses its {} built-in bootstrap peers instead of the {configured} configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this",
+                "mainnet uses its {} built-in bootstrap peers instead of the {configured} configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this, list peers to add in p2p.extraBootstrapPeers",
                 MAINNET_BOOTSTRAP_PEERS.len()
             )
         })
@@ -793,6 +793,102 @@ p2p:
     // Notices
     // =================================================================
 
+    /// `p2p.extraBootstrapPeers` stays out of `bootstrapPeers`: a config
+    /// saved after loading keeps the list as written, and on mainnet a
+    /// reload of it reports no replaced bootstrap list.
+    #[test]
+    fn extra_bootstrap_peers_stay_out_of_a_saved_config() {
+        let extra = "/ip6/2001:db8::1/udp/8336/quic-v1/p2p/QmExtra".to_string();
+        let own = "/dns/boot/udp/8336/quic-v1/p2p/QmBoot".to_string();
+        let saved = |dir: &Path| -> Config {
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("config.yml")).unwrap()).unwrap()
+        };
+        let dir = tempdir("extra_bootstrap_saved");
+        std::fs::write(
+            dir.join("config.yml"),
+            format!("p2p:\n  network: 2\n  bootstrapPeers:\n    - {own}\n  extraBootstrapPeers:\n    - {extra}\n"),
+        )
+        .unwrap();
+        for round in 0..2 {
+            let (config, _) = load_config_with_notices(&dir).unwrap();
+            save_config(&dir, &config).unwrap();
+            let on_disk = saved(&dir).p2p;
+            assert_eq!(
+                on_disk.bootstrap_peers,
+                [own.clone()],
+                "extra peers saved into bootstrapPeers (round {round})"
+            );
+            assert_eq!(on_disk.extra_bootstrap_peers, [extra.clone()]);
+        }
+
+        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|peer| peer.to_string())
+            .collect();
+        std::fs::write(
+            dir.join("config.yml"),
+            format!("p2p:\n  network: 0\n  extraBootstrapPeers:\n    - {extra}\n"),
+        )
+        .unwrap();
+        for round in 0..2 {
+            let (config, notices) = load_config_with_notices(&dir).unwrap();
+            assert_eq!(
+                notices.bootstrap_peers_line(),
+                None,
+                "a saved mainnet config reports a replaced bootstrap list (round {round})"
+            );
+            save_config(&dir, &config).unwrap();
+            assert_eq!(saved(&dir).p2p.bootstrap_peers, built_in);
+        }
+        cleanup(&dir);
+        assert!(!serde_yaml::to_string(&crate::P2PConfig::default())
+            .unwrap()
+            .contains("extraBootstrapPeers"));
+    }
+
+    /// A config naming no listen address listens on the default IPv4 address
+    /// and its IPv6 counterpart, and the peer gRPC port on both families; a
+    /// named listen address, additional listen addresses or a named stream
+    /// address stay as configured.
+    #[test]
+    fn a_config_naming_no_listen_address_listens_on_both_families() {
+        let mut p = crate::P2PConfig::default();
+        p.apply_defaults();
+        assert_eq!(
+            p.listen_multiaddrs(),
+            (
+                "/ip4/0.0.0.0/udp/8336/quic-v1".to_string(),
+                vec!["/ip6/::/udp/8336/quic-v1".to_string()]
+            ),
+            "no IPv6 counterpart of the default listen address"
+        );
+        assert!(p.stream_listens_on_both_families());
+
+        let mut named = p.clone();
+        named.listen_multiaddr = "/ip4/0.0.0.0/udp/8336/quic-v1".into();
+        assert_eq!(
+            named.listen_multiaddrs(),
+            ("/ip4/0.0.0.0/udp/8336/quic-v1".to_string(), Vec::new())
+        );
+        assert!(!named.stream_listens_on_both_families());
+
+        let mut additional = p.clone();
+        additional.additional_listen_multiaddrs = vec!["/ip6/2001:db8::1/udp/8336/quic-v1".into()];
+        assert_eq!(
+            additional.listen_multiaddrs(),
+            (
+                "/ip4/0.0.0.0/udp/8336/quic-v1".to_string(),
+                vec!["/ip6/2001:db8::1/udp/8336/quic-v1".to_string()]
+            )
+        );
+        assert!(!additional.stream_listens_on_both_families());
+
+        let mut stream = p.clone();
+        stream.stream_listen_multiaddr = "/ip4/0.0.0.0/tcp/8341".into();
+        assert!(!stream.stream_listens_on_both_families());
+        assert_eq!(stream.listen_multiaddrs(), p.listen_multiaddrs());
+    }
+
     /// Mainnet's replacement of the configured bootstrap peers is reported
     /// only when a non-empty configured list differs from the built-in one.
     #[test]
@@ -825,7 +921,7 @@ p2p:
         assert_eq!(
             notices.bootstrap_peers_line().unwrap(),
             format!(
-                "mainnet uses its {} built-in bootstrap peers instead of the 1 configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this",
+                "mainnet uses its {} built-in bootstrap peers instead of the 1 configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this, list peers to add in p2p.extraBootstrapPeers",
                 built_in.len()
             )
         );
