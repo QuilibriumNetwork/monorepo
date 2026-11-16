@@ -2662,7 +2662,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         )
                     };
                     let proc_mem = crate::mem_stats::process_memory();
-                    let (host_mem, host_vm) = crate::mem_stats::host_memory_sample();
+                    let host_sample = crate::mem_stats::host_memory_sample();
+                    let host_mem = host_sample.logged;
                     let (rocksdb_stores, rocksdb_memtables, rocksdb_table_readers) =
                         quil_store::open_stores_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
@@ -2687,7 +2688,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         // (free, active, inactive, wired, compressed,
                         // purgeable, speculative), in MB.
                         // Same sample as host_mem_available_mb.
-                        host_vm_mb = host_vm.map(|v| v.render()),
+                        host_vm_mb = host_sample.vm.map(|v| v.render()),
                         peer_info_cache = sizes.peer_info_cache,
                         // Its bounds (peer_info_bounds.rs): memory held, and
                         // records evicted, expired and refused since start.
@@ -2758,7 +2759,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         ),
                         "memory snapshot"
                     );
-                    if let Some(h) = host_mem {
+                    // None on macOS: its figures are logged above, never acted on.
+                    if let Some(h) = host_sample.for_decisions() {
                         match host_memory_watch.observe(&h, std::time::Instant::now()) {
                             crate::mem_stats::HostMemoryAction::Warn { low_secs } => warn!(
                                 scope = "this host",
