@@ -206,7 +206,7 @@ pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
 pub fn host_memory() -> Option<HostMemory> {
     #[cfg(target_os = "macos")]
     {
-        return macos_host_memory();
+        return macos_vm().and_then(macos_host_memory);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -214,11 +214,27 @@ pub fn host_memory() -> Option<HostMemory> {
     }
 }
 
+/// Host memory and the macOS page breakdown it came from, read once so
+/// the two agree; the breakdown is `None` off macOS.
+pub fn host_memory_sample() -> (Option<HostMemory>, Option<MacVm>) {
+    let vm = macos_vm();
+    #[cfg(target_os = "macos")]
+    let host = vm.and_then(macos_host_memory);
+    #[cfg(not(target_os = "macos"))]
+    let host = host_memory();
+    (host, vm)
+}
+
 /// The macOS `host_statistics64` page counts, in bytes. macOS has no
-/// `MemAvailable`: `free + inactive + purgeable + speculative` is the
-/// memory it gives back on demand, so a reader sees the same figures
-/// the system's own monitor adds up. `compressed` and `wired` are held,
-/// not available.
+/// `MemAvailable`; available is `free + inactive`, as psutil computes it
+/// (psutil 5.9.8 `_psosx.py`, `virtual_memory`):
+/// `avail = inactive + free`.
+///
+/// The kernel's `free_count` already holds the speculative pages: Apple's
+/// `vm_stat` (system_cmds `vm_stat.c`) prints `"Pages free:"` as
+/// `vm_stat.free_count - vm_stat.speculative_count`, so adding
+/// `speculative` again counts it twice. `purgeable`, `wired` and
+/// `compressed` are reported, not counted as available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacVm {
     pub free_bytes: u64,
@@ -248,19 +264,18 @@ impl MacVm {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    /// Memory the system gives back on demand.
+    /// Memory the system gives back on demand: free (speculative
+    /// included) plus inactive.
     pub fn available_bytes(&self) -> u64 {
-        self.free_bytes
-            .saturating_add(self.inactive_bytes)
-            .saturating_add(self.purgeable_bytes)
-            .saturating_add(self.speculative_bytes)
+        self.free_bytes.saturating_add(self.inactive_bytes)
     }
 
-    /// `free=..,active=..,...` in MB, the field order of the struct.
+    /// `free=..,active=..,...` in MB, the field order of the struct;
+    /// `free` excludes speculative, as `vm_stat` prints it.
     pub fn render(&self) -> String {
         format!(
             "free={},active={},inactive={},wired={},compressed={},purgeable={},speculative={}",
-            fmt_mb(self.free_bytes),
+            fmt_mb(self.free_bytes.saturating_sub(self.speculative_bytes)),
             fmt_mb(self.active_bytes),
             fmt_mb(self.inactive_bytes),
             fmt_mb(self.wired_bytes),
@@ -333,9 +348,8 @@ fn sysctl_value<T: Default>(name: &str) -> Option<T> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_host_memory() -> Option<HostMemory> {
+fn macos_host_memory(vm: MacVm) -> Option<HostMemory> {
     let total: u64 = sysctl_value("hw.memsize")?;
-    let vm = macos_vm()?;
     // `vm.swapusage` is `struct xsw_usage`; zero swap when it is absent.
     // SAFETY: `xsw_usage` is plain integers; all-zero is a valid value.
     let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
@@ -351,7 +365,9 @@ fn macos_host_memory() -> Option<HostMemory> {
             0,
         )
     };
-    let (swap_total, swap_used) = if rc == 0 {
+    // A short write leaves part of the struct zero: count it as absent.
+    let full = len == std::mem::size_of::<libc::xsw_usage>();
+    let (swap_total, swap_used) = if rc == 0 && full {
         (swap.xsu_total, swap.xsu_used)
     } else {
         (0, 0)
@@ -722,14 +738,19 @@ mod host_memory_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn macos_pages_scale_by_page_size_and_available_sums_the_reclaimable() {
-        let vm = MacVm::from_pages([10, 20, 30, 40, 50, 60, 70], 16384);
-        assert_eq!(vm.free_bytes, 10 * 16384);
+    fn macos_available_is_free_plus_inactive_counting_speculative_once() {
+        // Kernel counts: free 100 pages, of which 70 speculative.
+        let vm = MacVm::from_pages([100, 20, 30, 40, 50, 60, 70], 16384);
+        assert_eq!(vm.free_bytes, 100 * 16384);
         assert_eq!(vm.wired_bytes, 40 * 16384);
         assert_eq!(vm.compressed_bytes, 50 * 16384);
-        // free + inactive + purgeable + speculative; never active, wired
-        // or compressed.
-        assert_eq!(vm.available_bytes(), (10 + 30 + 60 + 70) * 16384);
+        // free (speculative inside it) + inactive; never purgeable,
+        // speculative again, active, wired or compressed.
+        assert_eq!(
+            vm.available_bytes(),
+            (100 + 30) * 16384,
+            "available counts speculative once and purgeable never"
+        );
         assert_eq!(
             MacVm::from_pages([u64::MAX; 7], 16384).available_bytes(),
             u64::MAX
@@ -738,12 +759,16 @@ mod host_memory_tests {
 
     #[test]
     fn macos_render_names_every_field_in_mb() {
-        let vm = MacVm::from_pages([64, 128, 0, 0, 0, 0, 0], 16384);
+        // free 96 pages, 32 of them speculative: vm_stat shows 64 free.
+        let vm = MacVm::from_pages([96, 128, 0, 0, 0, 0, 32], 16384);
         assert_eq!(
             vm.render(),
             "free=1.0,active=2.0,inactive=0.0,wired=0.0,compressed=0.0,\
-             purgeable=0.0,speculative=0.0"
+             purgeable=0.0,speculative=0.5"
         );
+        // More speculative than free (a racy sample) renders 0, never wraps.
+        let racy = MacVm::from_pages([1, 0, 0, 0, 0, 0, 2], 16384);
+        assert!(racy.render().starts_with("free=0.0,"));
     }
 
     #[cfg(target_os = "linux")]
@@ -752,6 +777,9 @@ mod host_memory_tests {
         let m = host_memory().expect("/proc/meminfo is readable on Linux");
         assert!(m.total_bytes > 0 && m.available_bytes <= m.total_bytes);
         assert_eq!(macos_vm(), None);
+        let (sampled, vm) = host_memory_sample();
+        assert!(sampled.is_some_and(|s| s.total_bytes == m.total_bytes));
+        assert_eq!(vm, None);
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;

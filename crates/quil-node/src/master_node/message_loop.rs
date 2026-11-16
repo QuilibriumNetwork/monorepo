@@ -2662,7 +2662,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         )
                     };
                     let proc_mem = crate::mem_stats::process_memory();
-                    let host_mem = crate::mem_stats::host_memory();
+                    let (host_mem, host_vm) = crate::mem_stats::host_memory_sample();
                     let (rocksdb_stores, rocksdb_memtables, rocksdb_table_readers) =
                         quil_store::open_stores_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
@@ -2677,8 +2677,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         vsize_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.vsize_bytes))
                             .unwrap_or_else(|| "?".to_string()),
-                        // Whole host (all processes), from /proc/meminfo;
-                        // omitted when unavailable.
+                        // Whole host (all processes), from /proc/meminfo
+                        // or macOS page counts; omitted when unavailable.
                         host_mem_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.total_bytes)),
                         host_mem_available_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.available_bytes)),
                         host_swap_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_total_bytes)),
@@ -2686,7 +2686,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         // macOS only: the page breakdown behind "available"
                         // (free, active, inactive, wired, compressed,
                         // purgeable, speculative), in MB.
-                        host_vm_mb = crate::mem_stats::macos_vm().map(|v| v.render()),
+                        // Same sample as host_mem_available_mb.
+                        host_vm_mb = host_vm.map(|v| v.render()),
                         peer_info_cache = sizes.peer_info_cache,
                         // Its bounds (peer_info_bounds.rs): memory held, and
                         // records evicted, expired and refused since start.
