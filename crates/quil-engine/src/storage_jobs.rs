@@ -635,6 +635,23 @@ impl Starved {
     }
 }
 
+/// When a frame's check last ran alone past the host's room
+/// ([`FrameAlone::Starved`]), none having fit since: the next ones run so
+/// too, at once. Read only through [`Self::lasts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Escape(Option<Instant>);
+
+impl Escape {
+    /// Whether the escape lasts at `now`: one ran past the room within
+    /// `forget` ([`VERIFIER_FRAME_FORGET`]). Past it no frame asked for
+    /// long, so none waits on the starvation that began it; the next check
+    /// starves the bound afresh ([`Starved::frame_since`]).
+    fn lasts(&self, now: Instant, forget: Duration) -> bool {
+        self.0
+            .is_some_and(|ran| now.saturating_duration_since(ran) <= forget)
+    }
+}
+
 /// What a proof check a finalized frame waits on may do beyond the memory
 /// share ([`frame_alone_allowed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -647,7 +664,8 @@ enum FrameAlone {
     Fits,
     /// It runs alone although the host has no room for it: checks frames
     /// wait on have been starved [`VERIFIER_STARVED_WARN`] or more
-    /// ([`Starved::frame`]), or one already ran so since one last fit.
+    /// ([`Starved::frame`]), or one already ran so since one last fit, within
+    /// [`VERIFIER_FRAME_FORGET`] ([`Escape`]).
     /// Nothing in the node shrinks its footprint or the pressure while
     /// frames wait, so waiting longer would never end. Only a frame's
     /// refused check starts that starvation, a check no frame waits on
@@ -656,8 +674,8 @@ enum FrameAlone {
     /// [`VERIFIER_FRAME_FORGET`]. The escape warns once; each
     /// check past the room then logs at most once a minute (`past_room`).
     /// It ends at the next frame's check that fits (the share or the room)
-    /// while this process holds no job; one fitting the share beside held
-    /// jobs ends none.
+    /// while this process holds no job, one fitting the share beside held
+    /// jobs ends none; or once none ran so within [`VERIFIER_FRAME_FORGET`].
     Starved,
 }
 
@@ -678,7 +696,7 @@ struct HostMemory {
 /// (pressure not critical, the check within capacity, so wired and this
 /// process's memory stay within physical memory), or past it once checks
 /// have been starved `starved_for` of `bound` or more, or `escaped` (one ran
-/// so and none has fit since).
+/// so lately and none has fit since: [`Escape::lasts`]).
 fn frame_alone_allowed(
     others: u64,
     memory: HostMemory,
@@ -1421,9 +1439,10 @@ struct State {
     /// The warning that they have ([`VERIFIER_STARVED_WARN`]), at most one
     /// per interval within a starvation, the first of each due at once.
     verifier_starved_line: LineEvery,
-    /// Whether a frame's check ran alone past the host's room since one last
-    /// fit ([`FrameAlone::Starved`]): the next ones do too, at once.
-    frame_alone_escaped: bool,
+    /// When a frame's check last ran alone past the host's room, none having
+    /// fit since ([`Escape`]): the next ones do too, at once, until none asks
+    /// for long.
+    frame_alone_escaped: Escape,
     /// Since when another process has kept the turn to decide, and whether
     /// this one has logged deciding without it ([`Admission::grant_turn`]).
     grant_busy: Option<(Instant, bool)>,
@@ -2874,8 +2893,9 @@ impl Admission {
     /// Within the host's room (pressure not critical, the check within its
     /// capacity) it runs at once; past it only once checks are starved, as
     /// nothing in the node ends that refusal, and then each next one at
-    /// once until one fits again. Strict macOS admission refuses it
-    /// otherwise at any pressure, and the frame waiting on it waits.
+    /// once until one fits again or none ran so for long ([`Escape`]).
+    /// Strict macOS admission refuses it otherwise at any pressure, and the
+    /// frame waiting on it waits.
     fn frame_alone(&self, state: &mut State, bytes: u64, others: u64) -> bool {
         if others > 0 {
             return false;
@@ -2885,21 +2905,24 @@ impl Admission {
         let starved_for = state
             .verifier_starved
             .frame_for(now, self.verifier_frame_forget);
+        let escaped = self.frame_escape_lasts(state, now);
         let alone = frame_alone_allowed(
             others,
             memory,
             bytes,
             starved_for,
             self.verifier_starved_warn,
-            state.frame_alone_escaped,
+            escaped,
         );
         if alone == FrameAlone::Refused || !self.take_alone(state) {
             return false;
         }
         if alone == FrameAlone::Fits {
             self.frame_fits_again(state, bytes);
-        } else if !state.frame_alone_escaped {
-            state.frame_alone_escaped = true;
+        } else {
+            state.frame_alone_escaped = Escape(Some(now));
+        }
+        if alone == FrameAlone::Starved && !escaped {
             warn!(
                 bytes,
                 starved_secs = starved_for.as_secs(),
@@ -2939,10 +2962,30 @@ impl Admission {
         true
     }
 
+    /// Whether a frame's checks still run alone past the host's room at
+    /// `now` ([`Escape::lasts`]); one no frame asked for long ends here,
+    /// logged once.
+    fn frame_escape_lasts(&self, state: &mut State, now: Instant) -> bool {
+        let forget = self.verifier_frame_forget;
+        if state.frame_alone_escaped.lasts(now, forget) {
+            return true;
+        }
+        if let Some(ran) = std::mem::take(&mut state.frame_alone_escaped).0 {
+            info!(
+                idle_secs = now.saturating_duration_since(ran).as_secs(),
+                forget_secs = forget.as_secs(),
+                "proof checks finalized frames wait on no longer run alone past the host's \
+                 room: none ran so for longer than the forget bound; the next one waits for \
+                 the room or its starvation bound again"
+            );
+        }
+        false
+    }
+
     /// A frame's check fits again (within the share or the host's room):
     /// the ones after it no longer run alone past the host's room.
     fn frame_fits_again(&self, state: &mut State, bytes: u64) {
-        if std::mem::take(&mut state.frame_alone_escaped) {
+        if std::mem::take(&mut state.frame_alone_escaped).0.is_some() {
             info!(
                 bytes,
                 "proof checks finalized frames wait on fit the host's room again: they no \

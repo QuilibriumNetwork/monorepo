@@ -1106,7 +1106,7 @@ fn a_starved_frames_check_runs_alone_past_the_hosts_room_until_one_fits() {
     );
     drop(granted);
     assert!(
-        admission.state().frame_alone_escaped,
+        admission.state().frame_alone_escaped != Escape::default(),
         "setup: it ran past the room"
     );
     assert!(
@@ -1119,7 +1119,7 @@ fn a_starved_frames_check_runs_alone_past_the_hosts_room_until_one_fits() {
         "setup: within the room it runs alone"
     );
     assert!(
-        !admission.state().frame_alone_escaped,
+        admission.state().frame_alone_escaped == Escape::default(),
         "frame_alone_escape_not_ended: a check fit the room again"
     );
     ROOM.store(PRESSURE_CRITICAL, Ordering::SeqCst);
@@ -1415,6 +1415,52 @@ fn an_abandoned_frames_starvation_is_forgotten() {
     assert!(
         !lines.contains(STARVED_LINE),
         "abandoned_frame_warned: the next frame's check warned of the old starvation: {lines}"
+    );
+}
+
+/// The line that a frame's escape past the host's room ended unused
+/// ([`Admission::frame_escape_lasts`]).
+const ESCAPE_FORGOTTEN_LINE: &str = "no longer run alone past the host's room: none ran so";
+
+/// A frame's checks ran alone past the host's room, then none for longer
+/// than [`VERIFIER_FRAME_FORGET`]: the next one that does not fit waits
+/// for its starvation bound again, and the escape's end logs once.
+#[test]
+fn an_abandoned_frames_escape_is_forgotten() {
+    let forget = 2 * STARVED_BOUND;
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    admission.verifier_starved_gap = Duration::from_millis(5);
+    admission.verifier_frame_forget = forget;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let ask = || admission.reserve_verifier(3 * GIB, Instant::now(), FrameCheck::Inline);
+    // Asked again until it starves the bound: each ask keeps the frame's
+    // starvation, however late a wake under load.
+    let deadline = Instant::now() + HANG;
+    while ask().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "setup: starved past the bound, it never ran"
+        );
+        std::thread::sleep(STARVED_BOUND / 10);
+    }
+    assert!(
+        admission.state().frame_alone_escaped != Escape::default(),
+        "setup: it ran past the room"
+    );
+    // It last ran before this: load only lengthens the idle time.
+    let ran = Instant::now();
+    std::thread::sleep((ran + forget + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    let mut granted = None;
+    let lines = logged(|| granted = ask());
+    assert!(
+        granted.is_none(),
+        "abandoned_escape_kept: none ran past the room for long, yet the next ran past it at once"
+    );
+    assert_eq!(
+        lines.matches(ESCAPE_FORGOTTEN_LINE).count(),
+        1,
+        "escape_end_not_logged: {lines}"
     );
 }
 
