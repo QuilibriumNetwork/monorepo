@@ -4,7 +4,7 @@
 
 use super::*;
 use quil_execution::global_intrinsic::storage_epoch_proof::{
-    SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    SeatProof, StorageEpochProof, MAX_PROOF_LEN, TYPE_STORAGE_EPOCH_PROOF,
 };
 use quil_execution::global_intrinsic::storage_seat::settlement_window;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -314,6 +314,44 @@ fn an_other_senders_full_share_makes_room_for_a_proof_due_sooner() {
         "seal-deadline other-evict: another sender's settlement due before every held seal was refused"
     );
     assert_eq!(mc.pending_count(1), held, "one seal left for it");
+}
+
+/// Another sender's proof over a frame's seal budget due sooner takes the
+/// room of one held due later, as any proof does: other senders' share
+/// holds one such proof by its bytes alone, so a far-window one keeps
+/// no sooner one out until it ends. Each carries the longest proof field
+/// a proof decodes with, so its window end is read: one longer decodes as
+/// no proof, and a proof of unknown window takes no room.
+#[test]
+fn an_other_senders_proof_over_a_frame_due_sooner_takes_a_later_ones_room() {
+    let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+    let longest = MAX_PROOF_LEN as usize;
+    let mc = knowing(now());
+    let later = sized(1, EPOCH + 1, false, longest);
+    let sooner = sized(2, EPOCH, true, longest);
+    for message in [&later, &sooner] {
+        assert!(
+            message.len() > budget && storage_kinds(message).window_end.is_some(),
+            "a proof over a frame's seal budget that decodes, of {} bytes",
+            message.len()
+        );
+    }
+    assert_eq!(
+        mc.add_message_outcome_by(1, later.clone(), Provenance::Other, b"o"),
+        SubmitOutcome::Accepted,
+        "another sender's proof over a frame's seal budget, due later, held first"
+    );
+    let outcome = mc.add_message_outcome_by(1, sooner.clone(), Provenance::Other, b"p");
+    eprintln!("REACH seal-deadline other-oversize-evict outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "SEAL-SEAT-OTHERS: another sender's proof over a frame's seal budget due sooner waited for one due later"
+    );
+    assert!(
+        holds(&mc, &sooner) && !holds(&mc, &later),
+        "the one due later left for it"
+    );
 }
 
 /// A full share makes room only from its own proofs: a proof due sooner
