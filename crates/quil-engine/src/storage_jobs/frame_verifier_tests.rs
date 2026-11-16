@@ -961,3 +961,139 @@ fn a_frames_check_runs_past_held_back_work_that_would_never_fit() {
         "setup: the work due now still waits"
     );
 }
+
+fn one_gib_capacity() -> Option<u64> {
+    Some(GIB)
+}
+
+fn eight_gib_capacity() -> Option<u64> {
+    Some(8 * GIB)
+}
+
+/// Alone beyond the share only when nothing else of the node holds memory,
+/// the kernel's pressure is not critical and the check fits the host's
+/// capacity, where the platform reports one.
+#[test]
+fn a_frames_check_alone_is_bounded_by_others_pressure_and_capacity() {
+    assert!(frame_alone_allowed(0, Some(2), Some(3 * GIB), 3 * GIB));
+    assert!(frame_alone_allowed(0, None, None, 3 * GIB));
+    assert!(!frame_alone_allowed(1, Some(1), None, 3 * GIB));
+    assert!(!frame_alone_allowed(
+        0,
+        Some(PRESSURE_CRITICAL),
+        Some(8 * GIB),
+        3 * GIB
+    ));
+    assert!(
+        !frame_alone_allowed(0, Some(2), Some(3 * GIB - 1), 3 * GIB),
+        "frame_alone_past_capacity: a check larger than the host's capacity ran alone"
+    );
+}
+
+/// At no headroom, a 3 GiB check a frame waits on runs alone within 8 GiB of
+/// capacity, and is refused within 1 GiB: alone, it would grow wired and
+/// this process's memory past physical memory.
+#[test]
+fn a_frames_check_runs_alone_only_within_the_hosts_capacity() {
+    let mut roomy = strict(0, warning, running, PROMPT_PLACE);
+    roomy.capacity = eight_gib_capacity;
+    let roomy: &'static Admission = Box::leak(Box::new(roomy));
+    let granted = check(roomy, FrameCheck::Inline)
+        .recv_timeout(HANG)
+        .expect("the check returns");
+    assert!(granted.is_some(), "setup: within capacity it runs alone");
+    drop(granted);
+    let mut short = strict(0, warning, running, PROMPT_PLACE);
+    short.capacity = one_gib_capacity;
+    let short: &'static Admission = Box::leak(Box::new(short));
+    let granted = check(short, FrameCheck::Inline)
+        .recv_timeout(HANG)
+        .expect("the check returns");
+    assert!(
+        granted.is_none(),
+        "frame_alone_past_capacity: a 3 GiB check ran alone in 1 GiB of capacity"
+    );
+}
+
+/// What [`a_starved_check_is_noted_until_one_is_admitted`]'s admission has
+/// available.
+static STARVED_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+/// A check refused for memory notes since when checks are starved, kept by
+/// the next refusal; an admitted check ends it.
+#[test]
+fn a_starved_check_is_noted_until_one_is_admitted() {
+    let mut admission = Admission::new(
+        6,
+        Box::new(|| Some(STARVED_AVAILABLE.load(Ordering::SeqCst))),
+    );
+    admission.strict_due = true;
+    admission.pressure = critical;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let refused = |what: &str| {
+        let granted = check(admission, FrameCheck::No)
+            .recv_timeout(HANG)
+            .expect("the check returns");
+        assert!(granted.is_none(), "setup: {what} refused at no headroom");
+        admission.state().verifier_starved.map(|(since, _)| since)
+    };
+    let first = refused("the first check");
+    assert!(
+        first.is_some(),
+        "starvation_not_noted: a refused check left no mark"
+    );
+    assert_eq!(
+        refused("the second check"),
+        first,
+        "starvation_restarted: a check refused again restarted it"
+    );
+    STARVED_AVAILABLE.store(8 * GIB, Ordering::SeqCst);
+    let granted = check(admission, FrameCheck::No)
+        .recv_timeout(HANG)
+        .expect("the check returns");
+    assert!(granted.is_some(), "setup: the check fits");
+    assert!(
+        admission.state().verifier_starved.is_none(),
+        "starvation_not_cleared: an admitted check left it running"
+    );
+}
+
+/// Waits within [`VERIFIER_STARVED_GAP`] of the last one are one
+/// starvation; a later one starts another.
+#[test]
+fn a_starvation_spans_waits_within_its_gap() {
+    let start = Instant::now();
+    let gap = Duration::from_secs(60);
+    let later = start + Duration::from_secs(50);
+    assert_eq!(starved_span(None, start, gap), (start, start));
+    assert_eq!(
+        starved_span(Some((start, start)), later, gap),
+        (start, later),
+        "starvation_restarted: a wait within the gap restarted it"
+    );
+    let after = later + gap + Duration::from_secs(1);
+    assert_eq!(
+        starved_span(Some((start, later)), after, gap),
+        (after, after),
+        "starvation_outlived_its_gap: a wait past the gap continued it"
+    );
+}
+
+/// One line per interval, the next counting those skipped.
+#[test]
+fn a_line_every_interval_counts_what_it_skipped() {
+    let (start, every) = (Instant::now(), Duration::from_secs(60));
+    let mut line = LineEvery::default();
+    assert_eq!(line.due(start, every), Some(0));
+    assert_eq!(
+        line.due(start + Duration::from_secs(1), every),
+        None,
+        "line_not_bounded: a second line within the interval"
+    );
+    assert_eq!(line.due(start + Duration::from_secs(2), every), None);
+    assert_eq!(
+        line.due(start + every, every),
+        Some(2),
+        "line_lost_its_count: the next line must count the two skipped"
+    );
+}

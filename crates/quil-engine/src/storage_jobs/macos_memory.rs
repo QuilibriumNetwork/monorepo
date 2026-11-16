@@ -32,25 +32,100 @@ impl Snapshot {
             // Known pressure is zero headroom, not a failed measurement.
             return 0;
         }
-        self.total
-            .saturating_sub(self.wired)
-            .saturating_sub(self.footprint)
+        self.unowned()
             .min(self.reclaimable)
             // Admission leaves another 25% of this budget unused. This
             // additional floor covers host growth while a job starts.
-            .saturating_sub((self.total / 32).clamp(256 << 20, 1 << 30))
+            .saturating_sub(self.floor())
+    }
+
+    /// Physical memory neither wired nor this process's footprint, less
+    /// [`Self::floor`], whatever the pressure: the most a job running alone
+    /// may take without growing wired and own memory past physical memory
+    /// (other applications' pages compress or swap instead).
+    pub(super) fn capacity(self) -> u64 {
+        self.unowned().saturating_sub(self.floor())
+    }
+
+    /// Which input made [`Self::headroom`] zero, for its log line: `None`
+    /// when it is not.
+    pub(super) fn no_headroom_cause(self) -> Option<&'static str> {
+        if self.pressure != 1 {
+            Some("pressure: the kernel reports warning or critical memory pressure")
+        } else if self.unowned() <= self.floor() {
+            Some("footprint: wired memory plus this process's footprint fill physical memory")
+        } else if self.reclaimable <= self.floor() {
+            Some("reclaimable: free, file-backed and purgeable pages are within the floor")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn floor(self) -> u64 {
+        (self.total / 32).clamp(256 << 20, 1 << 30)
+    }
+
+    fn unowned(self) -> u64 {
+        self.total
+            .saturating_sub(self.wired)
+            .saturating_sub(self.footprint)
     }
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn available() -> Option<u64> {
-    snapshot().map(Snapshot::headroom)
+    let snapshot = snapshot()?;
+    if let Some(cause) = snapshot.no_headroom_cause() {
+        log_no_headroom(snapshot, cause);
+    }
+    Some(snapshot.headroom())
+}
+
+/// At most one line per this interval says why the host has no headroom.
+#[cfg(target_os = "macos")]
+const NO_HEADROOM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[cfg(target_os = "macos")]
+fn log_no_headroom(snapshot: Snapshot, cause: &'static str) {
+    use std::sync::{Mutex, PoisonError};
+    static LINE: Mutex<super::LineEvery> = Mutex::new(super::LineEvery(None));
+    let Some(skipped) = LINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(std::time::Instant::now(), NO_HEADROOM_LOG_EVERY)
+    else {
+        return;
+    };
+    tracing::info!(
+        cause,
+        pressure = snapshot.pressure,
+        total = snapshot.total,
+        wired = snapshot.wired,
+        footprint = snapshot.footprint,
+        reclaimable = snapshot.reclaimable,
+        floor = snapshot.floor(),
+        capacity = snapshot.capacity(),
+        more_since_last_line = skipped,
+        action = "jobs and proof checks admitted by memory wait (a check a finalized frame \
+                  waits on may run alone within capacity); check `memory_pressure` and \
+                  `vm_stat`, quit other applications, or lower the database cache or the \
+                  worker count",
+        "macOS memory admission has no headroom: pressure normal is 1, warning 2, critical 4; \
+         headroom is total less wired and footprint, at most reclaimable, less floor; logged \
+         at most once per 5 minutes"
+    );
 }
 
 /// The kernel's memory pressure level (normal 1, warning 2, critical 4).
 #[cfg(target_os = "macos")]
 pub(super) fn pressure() -> Option<u32> {
     snapshot().map(|snapshot| snapshot.pressure)
+}
+
+/// [`Snapshot::capacity`] now.
+#[cfg(target_os = "macos")]
+pub(super) fn capacity() -> Option<u64> {
+    snapshot().map(Snapshot::capacity)
 }
 
 #[cfg(target_os = "macos")]
@@ -230,5 +305,47 @@ mod tests {
             snapshot.pressure,
             snapshot.headroom()
         );
+    }
+
+    /// The line logged at no headroom names the input that made it zero, and
+    /// the capacity a check alone is bounded by ignores pressure and
+    /// reclaimable pages, but not wired memory, the footprint or the floor.
+    #[test]
+    fn no_headroom_names_its_cause_and_capacity_ignores_pressure() {
+        let mac = Snapshot {
+            total: 16 * GIB,
+            wired: 2 * GIB,
+            footprint: 4 * GIB,
+            reclaimable: 3 * GIB,
+            pressure: 1,
+        };
+        assert_eq!(mac.no_headroom_cause(), None);
+        assert_eq!(mac.capacity(), 10 * GIB - GIB / 2);
+        let warned = Snapshot { pressure: 2, ..mac };
+        assert_eq!(warned.headroom(), 0);
+        assert!(
+            warned
+                .no_headroom_cause()
+                .is_some_and(|cause| cause.starts_with("pressure")),
+            "no_headroom_cause_missed: warning pressure gave {:?}",
+            warned.no_headroom_cause()
+        );
+        assert_eq!(warned.capacity(), mac.capacity());
+        let full = Snapshot {
+            footprint: 14 * GIB - (GIB / 2),
+            ..mac
+        };
+        assert_eq!(full.capacity(), 0);
+        assert!(full
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("footprint")));
+        let drained = Snapshot {
+            reclaimable: GIB / 2,
+            ..mac
+        };
+        assert_eq!(drained.headroom(), 0);
+        assert!(drained
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("reclaimable")));
     }
 }

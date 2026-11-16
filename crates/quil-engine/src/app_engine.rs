@@ -4654,13 +4654,15 @@ impl AppConsensusEngine {
                         frame = frame_number,
                         operations = unverified.len(),
                         waited_secs = waited.as_secs(),
+                        memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
                         estimate_secs = estimate_secs.round() as u64,
                         queued_ahead,
                         scope = "this node's proof worker",
-                        action = "the frame keeps waiting and materializes once its proofs verify; this node \
-                                  verifies confidential proofs slower than its shards' frames carry them: check \
-                                  its CPU and proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 \
-                                  at once)",
+                        action = "the frame keeps waiting and materializes once its proofs verify; \
+                                  memory_starved_secs above 0 says its checks wait for memory or a slot (see \
+                                  the line on proof checks starved); else this node verifies confidential \
+                                  proofs slower than its shards' frames carry them: check its CPU and \
+                                  proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 at once)",
                         "app-shard frame materialization still waits for its proof verification on a background thread"
                     );
                 }
@@ -6653,14 +6655,28 @@ impl AppConsensusEngine {
             }
             _ => 0,
         };
-        info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
-            waited_secs = now.saturating_duration_since(wait.since).as_secs(),
-            cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
-            scope = "this node's proof worker",
-            action = "an expected wait: the frame is authenticated and committed, and materializes once its \
-                proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
-                failure; if it lasts hours, check this node's CPU and proofWorker settings",
-            "archive replay frame waits for its proof verification");
+        let waited = now.saturating_duration_since(wait.since);
+        if proof_wait_overruns(waited) {
+            warn!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+                waited_secs = waited.as_secs(),
+                memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
+                cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+                scope = "this node's proof worker",
+                action = "the frame is committed and materializes once its proofs verify; its recovery \
+                    defers meanwhile; memory_starved_secs above 0 says this node's proof checks wait for \
+                    memory or a slot (see the line on proof checks starved), else check this node's CPU \
+                    and proofWorker settings",
+                "archive replay frame still waits for its proof verification");
+        } else {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+                waited_secs = waited.as_secs(),
+                cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+                scope = "this node's proof worker",
+                action = "an expected wait: the frame is authenticated and committed, and materializes once its \
+                    proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
+                    failure; if it lasts hours, check this node's CPU and proofWorker settings",
+                "archive replay frame waits for its proof verification");
+        }
         if let Some(wait) = self.proof_wait.as_mut() {
             wait.logged = Some(now);
         }
@@ -19534,8 +19550,15 @@ impl UnrewindableFenceBlock {
 }
 
 /// How often an archive recovery that keeps finding its frame waiting for
-/// this node's proof verification logs the wait again.
+/// this node's proof verification logs the wait again; a wait this long
+/// warns ([`proof_wait_overruns`]).
 const PROOF_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// Whether an archive replay frame waiting `waited` for this node's proof
+/// verification warns: from [`PROOF_WAIT_REPEAT`], its second line on.
+fn proof_wait_overruns(waited: Duration) -> bool {
+    waited >= PROOF_WAIT_REPEAT
+}
 
 /// The frame after the cursor whose materialization stopped to wait for this
 /// node's proof verification: its proofs verify in the background
@@ -21787,6 +21810,21 @@ mod frame_gap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An archive replay frame waiting for this node's proof verification
+    /// logs its first line as an expected wait and warns from its second,
+    /// [`PROOF_WAIT_REPEAT`] in.
+    #[test]
+    fn a_replay_frames_proof_wait_warns_from_its_second_line() {
+        assert!(!proof_wait_overruns(Duration::ZERO));
+        assert!(!proof_wait_overruns(
+            PROOF_WAIT_REPEAT - Duration::from_secs(1)
+        ));
+        assert!(
+            proof_wait_overruns(PROOF_WAIT_REPEAT),
+            "proof_wait_warned_late: a wait of {PROOF_WAIT_REPEAT:?} did not warn"
+        );
+    }
 
     /// A successor whose start waits on its predecessor's state takes the
     /// next recovery turn, though its recovery queued before the refusal.
