@@ -10,12 +10,18 @@ use std::sync::mpsc;
 
 const GIB: u64 = 1 << 30;
 
-fn warning() -> Option<u32> {
-    Some(2)
+fn warning() -> HostMemory {
+    HostMemory {
+        pressure: Some(2),
+        capacity: None,
+    }
 }
 
-fn critical() -> Option<u32> {
-    Some(4)
+fn critical() -> HostMemory {
+    HostMemory {
+        pressure: Some(PRESSURE_CRITICAL),
+        capacity: None,
+    }
 }
 
 fn running() -> bool {
@@ -40,17 +46,17 @@ const PROMPT_PLACE: Duration = Duration::from_secs(10);
 /// [`PROMPT_PLACE`].
 const PROMPT: Duration = Duration::from_secs(3);
 
-/// A strict admission with `available` bytes at kernel pressure `pressure`,
+/// A strict admission with `available` bytes on a host of `memory`,
 /// stopping as `stopping` says; frames' checks wait `place` in their place.
 fn strict(
     available: u64,
-    pressure: fn() -> Option<u32>,
+    memory: fn() -> HostMemory,
     stopping: fn() -> bool,
     place: Duration,
 ) -> Admission {
     let mut admission = Admission::new(6, Box::new(move || Some(available)));
     admission.strict_due = true;
-    admission.pressure = pressure;
+    admission.memory = memory;
     admission.stopping = stopping;
     admission.frame_verifier_wait = place;
     admission
@@ -225,8 +231,11 @@ fn a_frames_check_on_the_engines_thread_keeps_its_callers_deadline() {
 
 static PRESSURE: AtomicU32 = AtomicU32::new(PRESSURE_CRITICAL);
 
-fn flipping() -> Option<u32> {
-    Some(PRESSURE.load(Ordering::SeqCst))
+fn flipping() -> HostMemory {
+    HostMemory {
+        pressure: Some(PRESSURE.load(Ordering::SeqCst)),
+        capacity: None,
+    }
 }
 
 /// Refused at critical pressure, a frame's check waiting in its place runs
@@ -409,7 +418,7 @@ fn work_due_now_waits_while_a_frames_check_waits_for_memory() {
 /// verifier's frame check waits for that memory in its place.
 fn elsewhere(
     dir: &tempfile::TempDir,
-    pressure: fn() -> Option<u32>,
+    memory: fn() -> HostMemory,
     stopping: fn() -> bool,
     place: Duration,
 ) -> (
@@ -421,7 +430,7 @@ fn elsewhere(
     storage.strict_due = true;
     assert!(storage.use_ledger(HostLedger::open_as(dir.path(), "storage").unwrap()));
     let storage: &'static Admission = Box::leak(Box::new(storage));
-    let verifier = strict(0, pressure, stopping, place);
+    let verifier = strict(0, memory, stopping, place);
     assert!(verifier.use_ledger(HostLedger::open_as(dir.path(), "verifier").unwrap()));
     let verifier: &'static Admission = Box::leak(Box::new(verifier));
     let first = storage.reserve(MIB);
@@ -585,7 +594,7 @@ fn a_frames_check_waiting_for_a_job_slot_holds_back_nothing_elsewhere() {
     let storage: &'static Admission = Box::leak(Box::new(storage));
     let mut verifier = Admission::new(1, Box::new(|| Some(8 * GIB)));
     verifier.strict_due = true;
-    verifier.pressure = warning;
+    verifier.memory = warning;
     verifier.stopping = running;
     verifier.frame_verifier_wait = PLACE;
     assert!(verifier.use_ledger(HostLedger::open_as(dir.path(), "verifier").unwrap()));
@@ -877,7 +886,7 @@ fn two_processes(
     let storage: &'static Admission = Box::leak(Box::new(storage));
     let mut verifier = Admission::new(6, Box::new(move || Some(available.load(Ordering::SeqCst))));
     verifier.strict_due = true;
-    verifier.pressure = warning;
+    verifier.memory = warning;
     verifier.stopping = running;
     verifier.frame_verifier_wait = HANG;
     assert!(verifier.use_ledger(HostLedger::open_as(dir.path(), "verifier").unwrap()));
@@ -962,32 +971,69 @@ fn a_frames_check_runs_past_held_back_work_that_would_never_fit() {
     );
 }
 
-fn one_gib_capacity() -> Option<u64> {
-    Some(GIB)
+fn one_gib_capacity() -> HostMemory {
+    HostMemory {
+        capacity: Some(GIB),
+        ..warning()
+    }
 }
 
-fn eight_gib_capacity() -> Option<u64> {
-    Some(8 * GIB)
+fn eight_gib_capacity() -> HostMemory {
+    HostMemory {
+        capacity: Some(8 * GIB),
+        ..warning()
+    }
 }
 
-/// Alone beyond the share only when nothing else of the node holds memory,
-/// the kernel's pressure is not critical and the check fits the host's
-/// capacity, where the platform reports one.
+/// Alone beyond the share only when nothing else of the node holds memory;
+/// then within the host's room (pressure not critical, the check within
+/// its capacity, where reported), or past it once checks have starved the
+/// bound or one already ran so: a refusal nothing ends is a halt.
 #[test]
 fn a_frames_check_alone_is_bounded_by_others_pressure_and_capacity() {
-    assert!(frame_alone_allowed(0, Some(2), Some(3 * GIB), 3 * GIB));
-    assert!(frame_alone_allowed(0, None, None, 3 * GIB));
-    assert!(!frame_alone_allowed(1, Some(1), None, 3 * GIB));
-    assert!(!frame_alone_allowed(
-        0,
-        Some(PRESSURE_CRITICAL),
-        Some(8 * GIB),
-        3 * GIB
-    ));
-    assert!(
-        !frame_alone_allowed(0, Some(2), Some(3 * GIB - 1), 3 * GIB),
-        "frame_alone_past_capacity: a check larger than the host's capacity ran alone"
+    let bound = VERIFIER_STARVED_WARN;
+    let short = bound - Duration::from_secs(1);
+    let alone = |others, pressure, capacity, starved_for, escaped| {
+        frame_alone_allowed(
+            others,
+            HostMemory { pressure, capacity },
+            3 * GIB,
+            starved_for,
+            bound,
+            escaped,
+        )
+    };
+    let zero = Duration::ZERO;
+    assert_eq!(
+        alone(0, Some(2), Some(3 * GIB), zero, false),
+        FrameAlone::Fits
     );
+    assert_eq!(alone(0, None, None, zero, false), FrameAlone::Fits);
+    assert_eq!(
+        alone(1, Some(1), None, bound, true),
+        FrameAlone::Refused,
+        "frame_alone_beside_others: it ran alone while another process held memory"
+    );
+    for (pressure, capacity, what) in [
+        (Some(PRESSURE_CRITICAL), Some(8 * GIB), "critical pressure"),
+        (Some(2), Some(3 * GIB - 1), "beyond capacity"),
+    ] {
+        assert_eq!(
+            alone(0, pressure, capacity, short, false),
+            FrameAlone::Refused,
+            "frame_alone_past_capacity: a check ran alone at {what} before starving"
+        );
+        assert_eq!(
+            alone(0, pressure, capacity, bound, false),
+            FrameAlone::Starved,
+            "frame_alone_refused_forever: starved the bound, a check stayed refused at {what}"
+        );
+        assert_eq!(
+            alone(0, pressure, capacity, zero, true),
+            FrameAlone::Starved,
+            "frame_alone_escape_not_kept: after one ran past the room, the next waited at {what}"
+        );
+    }
 }
 
 /// At no headroom, a 3 GiB check a frame waits on runs alone within 8 GiB of
@@ -996,7 +1042,7 @@ fn a_frames_check_alone_is_bounded_by_others_pressure_and_capacity() {
 #[test]
 fn a_frames_check_runs_alone_only_within_the_hosts_capacity() {
     let mut roomy = strict(0, warning, running, PROMPT_PLACE);
-    roomy.capacity = eight_gib_capacity;
+    roomy.memory = eight_gib_capacity;
     let roomy: &'static Admission = Box::leak(Box::new(roomy));
     let granted = check(roomy, FrameCheck::Inline)
         .recv_timeout(HANG)
@@ -1004,7 +1050,7 @@ fn a_frames_check_runs_alone_only_within_the_hosts_capacity() {
     assert!(granted.is_some(), "setup: within capacity it runs alone");
     drop(granted);
     let mut short = strict(0, warning, running, PROMPT_PLACE);
-    short.capacity = one_gib_capacity;
+    short.memory = one_gib_capacity;
     let short: &'static Admission = Box::leak(Box::new(short));
     let granted = check(short, FrameCheck::Inline)
         .recv_timeout(HANG)
@@ -1015,12 +1061,81 @@ fn a_frames_check_runs_alone_only_within_the_hosts_capacity() {
     );
 }
 
+/// The kernel pressure [`room`] reports.
+static ROOM: AtomicU32 = AtomicU32::new(PRESSURE_CRITICAL);
+
+/// A host at [`ROOM`]'s pressure: no room for a check alone at critical.
+fn room() -> HostMemory {
+    HostMemory {
+        pressure: Some(ROOM.load(Ordering::SeqCst)),
+        capacity: None,
+    }
+}
+
+/// [`Admission::reserve_verifier`] of a 3 GiB check for a frame, what it
+/// returned once it did.
+fn checked(admission: &'static Admission, frame: FrameCheck) -> Option<Reservation> {
+    check(admission, frame)
+        .recv_timeout(HANG)
+        .expect("the check returns")
+}
+
+/// How long checks a frame waits on starve before one runs alone past the
+/// host's room, in tests ([`VERIFIER_STARVED_WARN`]).
+const STARVED_BOUND: Duration = Duration::from_millis(300);
+
+/// Refused at critical pressure, a frame's check runs alone once checks
+/// have starved the bound, as nothing in the node ends that refusal; the
+/// next ones then run at once, until one fits the host's room again.
+#[test]
+fn a_starved_frames_check_runs_alone_past_the_hosts_room_until_one_fits() {
+    let mut admission = strict(0, room, running, PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let start = Instant::now();
+    let granted = checked(admission, FrameCheck::Queued);
+    assert!(
+        granted.is_some(),
+        "frame_check_refused_forever: starved past the bound, it never ran"
+    );
+    // Its starvation began after `start`: a late wake under load only
+    // lengthens this, never shortens it.
+    assert!(
+        start.elapsed() >= STARVED_BOUND,
+        "frame_escape_early: it ran past the room before the bound"
+    );
+    drop(granted);
+    assert!(
+        admission.state().frame_alone_escaped,
+        "setup: it ran past the room"
+    );
+    assert!(
+        checked(admission, FrameCheck::Inline).is_some(),
+        "frame_alone_escape_not_kept: the next check waited to starve again"
+    );
+    ROOM.store(2, Ordering::SeqCst);
+    assert!(
+        checked(admission, FrameCheck::Inline).is_some(),
+        "setup: within the room it runs alone"
+    );
+    assert!(
+        !admission.state().frame_alone_escaped,
+        "frame_alone_escape_not_ended: a check fit the room again"
+    );
+    ROOM.store(PRESSURE_CRITICAL, Ordering::SeqCst);
+    assert!(
+        checked(admission, FrameCheck::Inline).is_none(),
+        "frame_alone_past_room: a check ran at critical pressure after one fit"
+    );
+}
+
 /// What [`a_starved_check_is_noted_until_one_is_admitted`]'s admission has
 /// available.
 static STARVED_AVAILABLE: AtomicU64 = AtomicU64::new(0);
 
 /// A check refused for memory notes since when checks are starved, kept by
-/// the next refusal; an admitted check ends it.
+/// the next refusal, with its warning's interval afresh; an admitted check
+/// ends it.
 #[test]
 fn a_starved_check_is_noted_until_one_is_admitted() {
     let mut admission = Admission::new(
@@ -1028,19 +1143,28 @@ fn a_starved_check_is_noted_until_one_is_admitted() {
         Box::new(|| Some(STARVED_AVAILABLE.load(Ordering::SeqCst))),
     );
     admission.strict_due = true;
-    admission.pressure = critical;
+    admission.memory = critical;
     let admission: &'static Admission = Box::leak(Box::new(admission));
+    admission.state().verifier_starved_line = LineEvery(Some((Instant::now(), 7)));
     let refused = |what: &str| {
         let granted = check(admission, FrameCheck::No)
             .recv_timeout(HANG)
             .expect("the check returns");
         assert!(granted.is_none(), "setup: {what} refused at no headroom");
-        admission.state().verifier_starved.map(|(since, _)| since)
+        admission
+            .state()
+            .verifier_starved
+            .span
+            .map(|(since, _)| since)
     };
     let first = refused("the first check");
     assert!(
         first.is_some(),
         "starvation_not_noted: a refused check left no mark"
+    );
+    assert!(
+        admission.state().verifier_starved_line.0.is_none(),
+        "starved_line_kept_across_starvations: a new one would not warn at its bound"
     );
     assert_eq!(
         refused("the second check"),
@@ -1053,9 +1177,75 @@ fn a_starved_check_is_noted_until_one_is_admitted() {
         .expect("the check returns");
     assert!(granted.is_some(), "setup: the check fits");
     assert!(
-        admission.state().verifier_starved.is_none(),
+        admission.state().verifier_starved == Starved::default(),
         "starvation_not_cleared: an admitted check left it running"
     );
+}
+
+/// A check no frame waits on (a warm), refused past the bound, starts no
+/// frame's escape: the next frame's check at critical pressure is refused,
+/// and runs alone only once its own starvation reaches the bound.
+#[test]
+fn a_refused_check_no_frame_waits_on_starts_no_frames_escape() {
+    let mut admission = strict(0, critical, running, PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let start = Instant::now();
+    assert!(
+        checked(admission, FrameCheck::No).is_none(),
+        "setup: the warm is refused at no headroom"
+    );
+    // Past the bound, well within the starvation's gap.
+    std::thread::sleep((start + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    assert!(
+        checked(admission, FrameCheck::Inline).is_none(),
+        "warm_started_escape: a frame's check ran past the room on a warm's starvation"
+    );
+    assert!(
+        checked(admission, FrameCheck::Queued).is_some(),
+        "frame_check_refused_forever: starved past the bound, it never ran"
+    );
+}
+
+/// A frame's check asked again further apart than the starvation's gap, as
+/// a frame retrying on the engine's thread may, runs alone past the host's
+/// room at the bound: its escape keeps no gap.
+#[test]
+fn a_frames_check_asked_past_the_gap_runs_alone_at_the_bound() {
+    let gap = Duration::from_millis(5);
+    // Each ask comes further apart than the gap, well within the bound.
+    let spacing = Duration::from_millis(20);
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    admission.verifier_starved_gap = gap;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let start = Instant::now();
+    assert!(
+        checked(admission, FrameCheck::Inline).is_none(),
+        "setup: the first ask is refused at critical pressure"
+    );
+    // Its starvation began within the first ask: before `first`.
+    let first = Instant::now();
+    let mut refused = 1;
+    loop {
+        std::thread::sleep(spacing);
+        let asked = Instant::now();
+        if checked(admission, FrameCheck::Inline).is_some() {
+            // Its starvation began after `start`: load only lengthens this.
+            assert!(
+                start.elapsed() >= STARVED_BOUND,
+                "frame_escape_early: it ran past the room before the bound"
+            );
+            break;
+        }
+        refused += 1;
+        assert!(
+            asked.duration_since(first) < STARVED_BOUND,
+            "frame_escape_restarted: ask {refused}, asked {:?} after the first, past the \
+             bound, was refused",
+            asked.duration_since(first)
+        );
+    }
 }
 
 /// Waits within [`VERIFIER_STARVED_GAP`] of the last one are one

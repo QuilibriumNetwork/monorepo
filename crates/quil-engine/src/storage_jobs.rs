@@ -507,8 +507,9 @@ const FRAME_ALONE_LOG_EVERY: Duration = Duration::from_secs(60);
 /// one waits) warns, then once per this interval while it lasts.
 const VERIFIER_STARVED_WARN: Duration = Duration::from_secs(10 * 60);
 
-/// Waits for memory this far apart are one starvation: a refused check's
-/// caller asks again within it ([`Admission::verifier_starved`]).
+/// Waits for memory this far apart are one starvation for its warning and
+/// [`verifier_starved_secs`]: a refused check's caller asks again within it
+/// ([`Starved::span`]). A frame's escape keeps no gap ([`Starved::frame`]).
 const VERIFIER_STARVED_GAP: Duration = Duration::from_secs(60);
 
 /// One log line per interval, counting the occurrences it skipped.
@@ -545,31 +546,126 @@ fn starved_span(
     }
 }
 
-/// Whether a proof check a finalized frame waits on may run alone beyond the
-/// memory share ([`Admission::frame_alone`]): no other process of the node
-/// holds memory, the kernel's pressure (where reported) is not critical, and
-/// the check fits the host's capacity (where reported, macOS's
-/// `Snapshot::capacity`), so wired and this process's memory stay within
-/// physical memory.
+/// Since when proof checks have been starved ([`State::verifier_starved`]):
+/// two spans, noted together ([`Self::note`]) and ended together, by a
+/// check admitted in this process ([`Admission::reserve_classed`]) or the
+/// process's exit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Starved {
+    /// Any check's wait, for the warning and [`verifier_starved_secs`]:
+    /// since when, and when one last waited ([`starved_span`]).
+    span: Option<(Instant, Instant)>,
+    /// Since when a check a finalized frame waits on has waited, for its
+    /// escape ([`FrameAlone::Starved`]). No gap: a frame asks for its check
+    /// again until it runs, however far apart its asks are; a check no frame
+    /// waits on starts none.
+    frame: Option<Instant>,
+}
+
+impl Starved {
+    /// Note a check waiting at `now`, one a frame waits on if `frame`: true
+    /// when it starts a new [`Self::span`], none having waited within `gap`.
+    fn note(&mut self, now: Instant, gap: Duration, frame: bool) -> bool {
+        let (since, seen) = starved_span(self.span, now, gap);
+        self.span = Some((since, seen));
+        if frame {
+            self.frame.get_or_insert(now);
+        }
+        since == now
+    }
+
+    /// How long checks have been starved at `now`, for the warning: zero
+    /// when none waited within `gap`.
+    fn checks_for(&self, now: Instant, gap: Duration) -> Duration {
+        self.span
+            .filter(|(_, seen)| now.saturating_duration_since(*seen) <= gap)
+            .map_or(Duration::ZERO, |(since, _)| {
+                now.saturating_duration_since(since)
+            })
+    }
+
+    /// How long a check a frame waits on has been starved at `now`, for its
+    /// escape.
+    fn frame_for(&self, now: Instant) -> Duration {
+        self.frame
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+}
+
+/// What a proof check a finalized frame waits on may do beyond the memory
+/// share ([`frame_alone_allowed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameAlone {
+    /// It waits: another process of the node holds memory, or the host has
+    /// no room for it and checks have not been starved long.
+    Refused,
+    /// It runs alone: the kernel's pressure is not critical and it fits the
+    /// host's capacity.
+    Fits,
+    /// It runs alone although the host has no room for it: checks frames
+    /// wait on have been starved [`VERIFIER_STARVED_WARN`] or more
+    /// ([`Starved::frame`]), or one already ran so since one last fit.
+    /// Nothing in the node shrinks its footprint or the pressure while
+    /// frames wait, so waiting longer would never end. Only a frame's
+    /// refused check starts that starvation, a check no frame waits on
+    /// (a warm) never; a frame dropped after a refusal still lets one later
+    /// check escape early, alone and warned. The escape warns once; each
+    /// check past the room then logs at most once a minute (`past_room`).
+    /// It ends at the next frame's check that fits (the share or the room)
+    /// while this process holds no job; one fitting the share beside held
+    /// jobs ends none.
+    Starved,
+}
+
+/// What the host's memory allows a job running alone, read in one look
+/// ([`host_memory`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HostMemory {
+    /// The kernel's memory pressure level, where reported (macOS).
+    pressure: Option<u32>,
+    /// Bytes a job running alone may take, where reported (macOS's
+    /// `Snapshot::capacity`).
+    capacity: Option<u64>,
+}
+
+/// Whether a proof check of `bytes` a finalized frame waits on may run
+/// alone beyond the memory share ([`Admission::frame_alone`]): only while no
+/// other process of the node holds memory; then within the host's `memory`
+/// (pressure not critical, the check within capacity, so wired and this
+/// process's memory stay within physical memory), or past it once checks
+/// have been starved `starved_for` of `bound` or more, or `escaped` (one ran
+/// so and none has fit since).
 fn frame_alone_allowed(
     others: u64,
-    pressure: Option<u32>,
-    capacity: Option<u64>,
+    memory: HostMemory,
     bytes: u64,
-) -> bool {
-    others == 0
-        && pressure != Some(PRESSURE_CRITICAL)
-        && capacity.is_none_or(|capacity| bytes <= capacity)
+    starved_for: Duration,
+    bound: Duration,
+    escaped: bool,
+) -> FrameAlone {
+    if others > 0 {
+        FrameAlone::Refused
+    } else if memory.pressure != Some(PRESSURE_CRITICAL)
+        && memory.capacity.is_none_or(|capacity| bytes <= capacity)
+    {
+        FrameAlone::Fits
+    } else if escaped || starved_for >= bound {
+        FrameAlone::Starved
+    } else {
+        FrameAlone::Refused
+    }
 }
 
 /// Seconds proof checks have been starved for memory or a slot in this
 /// process now: 0 when none is ([`VERIFIER_STARVED_WARN`]).
 pub fn verifier_starved_secs() -> u64 {
-    let state = admission().state();
-    state
+    let admission = admission();
+    let gap = admission.verifier_starved_gap;
+    admission
+        .state()
         .verifier_starved
-        .filter(|(_, seen)| seen.elapsed() <= VERIFIER_STARVED_GAP)
-        .map_or(0, |(since, _)| since.elapsed().as_secs())
+        .checks_for(Instant::now(), gap)
+        .as_secs()
 }
 
 /// Transaction-verifier children share storage jobs' memory and host ledger.
@@ -1010,34 +1106,24 @@ fn available_memory() -> Option<u64> {
     }
 }
 
-/// The kernel's memory pressure level where it reports one: macOS's
-/// normal 1, warning 2, [`PRESSURE_CRITICAL`] 4; `None` elsewhere.
-fn kernel_pressure() -> Option<u32> {
+/// The kernel's memory pressure level and the host's capacity for a job
+/// running alone, in one look where reported: macOS's pressure (normal 1,
+/// warning 2, [`PRESSURE_CRITICAL`] 4) and `Snapshot::capacity`; neither
+/// elsewhere.
+fn host_memory() -> HostMemory {
     #[cfg(target_os = "macos")]
     {
-        macos_memory::pressure()
+        macos_memory::host_memory()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        None
+        HostMemory::default()
     }
 }
 
-/// Bytes a job running alone may take ([`frame_alone_allowed`]): macOS's
-/// `Snapshot::capacity`; `None` elsewhere.
-fn host_capacity() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        macos_memory::capacity()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-/// The kernel's critical memory pressure level ([`kernel_pressure`]): not
-/// even a frame's proof check starts alone then ([`Admission::fits`]).
+/// The kernel's critical memory pressure level ([`host_memory`]): a frame's
+/// proof check starts alone then only once checks are starved
+/// ([`FrameAlone::Starved`]).
 const PRESSURE_CRITICAL: u32 = 4;
 
 /// Bytes that must be available for `bytes` of work ahead to fit with no
@@ -1237,10 +1323,12 @@ pub struct Admission {
     frame_verifier_wait: Duration,
     /// Whether the node is stopping ([`stopping`]); its own in tests.
     stopping: fn() -> bool,
-    /// [`kernel_pressure`]; its own in tests.
-    pressure: fn() -> Option<u32>,
-    /// [`host_capacity`]; its own in tests.
-    capacity: fn() -> Option<u64>,
+    /// [`host_memory`]; its own in tests.
+    memory: fn() -> HostMemory,
+    /// [`VERIFIER_STARVED_WARN`], shorter in tests.
+    verifier_starved_warn: Duration,
+    /// [`VERIFIER_STARVED_GAP`], shorter in tests.
+    verifier_starved_gap: Duration,
     changed: Condvar,
     slots: usize,
     /// [`ahead_jobs_for`]; more in tests of the memory alone.
@@ -1279,11 +1367,15 @@ struct State {
     /// When a frame's check running alone was last logged, and how many
     /// have since ([`Admission::frame_alone`]).
     frame_alone_logged: Option<(Instant, u64)>,
-    /// Since when proof checks have waited with none admitted, and when one
-    /// last waited ([`starved_span`]); cleared when one is admitted.
-    verifier_starved: Option<(Instant, Instant)>,
-    /// The warning that they have ([`VERIFIER_STARVED_WARN`]).
+    /// Since when proof checks have waited with none admitted ([`Starved`]);
+    /// cleared when one is admitted.
+    verifier_starved: Starved,
+    /// The warning that they have ([`VERIFIER_STARVED_WARN`]), at most one
+    /// per interval within a starvation, the first of each due at once.
     verifier_starved_line: LineEvery,
+    /// Whether a frame's check ran alone past the host's room since one last
+    /// fit ([`FrameAlone::Starved`]): the next ones do too, at once.
+    frame_alone_escaped: bool,
     /// Since when another process has kept the turn to decide, and whether
     /// this one has logged deciding without it ([`Admission::grant_turn`]).
     grant_busy: Option<(Instant, bool)>,
@@ -1483,8 +1575,9 @@ impl Admission {
             pass_window: PASS_WINDOW,
             frame_verifier_wait: FRAME_VERIFIER_MEMORY_WAIT,
             stopping,
-            pressure: kernel_pressure,
-            capacity: host_capacity,
+            memory: host_memory,
+            verifier_starved_warn: VERIFIER_STARVED_WARN,
+            verifier_starved_gap: VERIFIER_STARVED_GAP,
             changed: Condvar::new(),
             slots: slots.max(1),
             ahead_jobs: AHEAD_JOBS,
@@ -1859,7 +1952,7 @@ impl Admission {
                         idle_available = look.map(|look| look.idle_available),
                         window_low = look.map(|look| look.window_low),
                         share = look.map(|look| look.share),
-                        pressure = (self.pressure)(),
+                        pressure = (self.memory)().pressure,
                         ahead = state
                             .waiting
                             .iter()
@@ -1904,7 +1997,7 @@ impl Admission {
         }
         let jobs = state.holders;
         if urgency.verification() {
-            state.verifier_starved = None;
+            state.verifier_starved = Starved::default();
         }
         drop(state);
         if waited {
@@ -2641,7 +2734,11 @@ impl Admission {
                     within || (!self.strict_due && others == 0 && self.take_alone(state))
                 }
                 Urgency::Verification => within,
-                Urgency::FrameVerification => within || self.frame_alone(state, bytes, others),
+                Urgency::FrameVerification if within => {
+                    self.frame_fits_again(state, bytes);
+                    true
+                }
+                Urgency::FrameVerification => self.frame_alone(state, bytes, others),
                 // Unknown memory: one at a time on the host.
                 Urgency::Ahead => {
                     within || (!self.strict_due && state.idle_available.is_none() && others == 0)
@@ -2656,31 +2753,38 @@ impl Admission {
         })
     }
 
-    /// Whether a verification a finalized frame waits on, not fitting the
-    /// share, runs alone on the host ([`Urgency::FrameVerification`]): no
-    /// reservation held here (the caller's) or by the host's other
-    /// processes, the kernel's memory pressure not critical, and the host's
-    /// alone lock taken. Strict macOS admission refuses it otherwise at any
-    /// pressure, and the frame waiting on it never executes.
-    /// Note a proof check of `bytes` waiting now ([`starved_span`]), and warn
-    /// once checks have been starved past [`VERIFIER_STARVED_WARN`], at most
-    /// once per it.
+    /// Note a proof check of `bytes` waiting now ([`Starved::note`]), and
+    /// warn once checks have been starved past [`VERIFIER_STARVED_WARN`], at
+    /// most once per it within a starvation; a new one warns afresh.
     fn verifier_starved(&self, state: &mut State, bytes: u64, urgency: Urgency) {
         let now = Instant::now();
-        let (since, seen) = starved_span(state.verifier_starved, now, VERIFIER_STARVED_GAP);
-        state.verifier_starved = Some((since, seen));
-        let starved = now.saturating_duration_since(since);
-        if starved < VERIFIER_STARVED_WARN {
+        let gap = self.verifier_starved_gap;
+        let frame = urgency == Urgency::FrameVerification;
+        if state.verifier_starved.note(now, gap, frame) {
+            state.verifier_starved_line = LineEvery::default();
+        }
+        let starved = state.verifier_starved.checks_for(now, gap);
+        if starved < self.verifier_starved_warn {
             return;
         }
-        let Some(skipped) = state.verifier_starved_line.due(now, VERIFIER_STARVED_WARN) else {
+        if state
+            .verifier_starved_line
+            .due(now, self.verifier_starved_warn)
+            .is_none()
+        {
             return;
-        };
+        }
         let look = state.last_look;
+        let memory = (self.memory)();
         warn!(
             starved_secs = starved.as_secs(),
             bytes,
-            frame_waits = urgency == Urgency::FrameVerification,
+            frame_waits = frame,
+            checks_waiting = state
+                .waiting
+                .iter()
+                .filter(|waiting| waiting.urgency.verification())
+                .count(),
             limit = binding_limit(
                 state.holders,
                 self.slots,
@@ -2693,11 +2797,11 @@ impl Admission {
             jobs = state.holders,
             available = look.map(|look| look.available),
             share = look.map(|look| look.share),
-            pressure = (self.pressure)(),
-            capacity = (self.capacity)(),
-            more_since_last_line = skipped,
+            pressure = memory.pressure,
+            capacity = memory.capacity,
             scope = "this node's proof worker",
-            action = "frames waiting on these checks do not execute meanwhile; `limit` says what \
+            action = "frames waiting on these checks do not execute meanwhile; a check a frame \
+                      waits on now runs alone once nothing else holds memory; `limit` says what \
                       binds: memory (on macOS, a line naming the cause logs when the host has no \
                       headroom: quit other applications, or lower the database cache or the \
                       worker count) or job_slots; the frame's own line names its worker",
@@ -2706,17 +2810,53 @@ impl Admission {
         );
     }
 
+    /// Whether a verification a finalized frame waits on, not fitting the
+    /// share, runs alone on the host ([`Urgency::FrameVerification`]): as
+    /// [`frame_alone_allowed`] says, with the host's alone lock taken.
+    /// Within the host's room (pressure not critical, the check within its
+    /// capacity) it runs at once; past it only once checks are starved, as
+    /// nothing in the node ends that refusal, and then each next one at
+    /// once until one fits again. Strict macOS admission refuses it
+    /// otherwise at any pressure, and the frame waiting on it waits.
     fn frame_alone(&self, state: &mut State, bytes: u64, others: u64) -> bool {
         if others > 0 {
             return false;
         }
-        let (pressure, capacity) = ((self.pressure)(), (self.capacity)());
-        if !frame_alone_allowed(others, pressure, capacity, bytes) || !self.take_alone(state) {
+        let now = Instant::now();
+        let memory = (self.memory)();
+        let starved_for = state.verifier_starved.frame_for(now);
+        let alone = frame_alone_allowed(
+            others,
+            memory,
+            bytes,
+            starved_for,
+            self.verifier_starved_warn,
+            state.frame_alone_escaped,
+        );
+        if alone == FrameAlone::Refused || !self.take_alone(state) {
             return false;
+        }
+        if alone == FrameAlone::Fits {
+            self.frame_fits_again(state, bytes);
+        } else if !state.frame_alone_escaped {
+            state.frame_alone_escaped = true;
+            warn!(
+                bytes,
+                starved_secs = starved_for.as_secs(),
+                available = state.idle_available,
+                pressure = memory.pressure,
+                capacity = memory.capacity,
+                scope = "this node's proof worker",
+                action = "the host may compress or swap other memory while each runs; quit \
+                          other applications, or lower the database cache or the worker count",
+                "proof checks finalized frames wait on run alone past the host's room \
+                 (critical memory pressure, or beyond its capacity: physical memory less wired \
+                 memory, this process's footprint and a floor) after starving: nothing in the \
+                 node ends that refusal; until one fits again, logged then"
+            );
         }
         // One line per interval: on a host short of memory every frame's
         // checks may run alone.
-        let now = Instant::now();
         let since = match &mut state.frame_alone_logged {
             Some((at, since)) if now.duration_since(*at) < FRAME_ALONE_LOG_EVERY => {
                 *since = since.saturating_add(1);
@@ -2727,17 +2867,28 @@ impl Admission {
         info!(
             bytes,
             available = state.idle_available,
-            pressure,
-            capacity,
+            pressure = memory.pressure,
+            capacity = memory.capacity,
+            past_room = alone == FrameAlone::Starved,
             more_since_last_line = since,
             "proof check a finalized frame waits on runs alone on the host beyond the memory \
-             share: nothing else holds memory and the kernel's memory pressure is not \
-             critical, and it fits the host's capacity (physical memory less wired memory, \
-             this process's footprint and a floor); the host may compress or swap other \
-             memory until it ends, else the frame would never execute; logged at most once a \
-             minute"
+             share: nothing else holds memory; within the host's room (pressure not critical, \
+             within capacity) unless `past_room`; the host may compress or swap other memory \
+             until it ends, else the frame would never execute; logged at most once a minute"
         );
         true
+    }
+
+    /// A frame's check fits again (within the share or the host's room):
+    /// the ones after it no longer run alone past the host's room.
+    fn frame_fits_again(&self, state: &mut State, bytes: u64) {
+        if std::mem::take(&mut state.frame_alone_escaped) {
+            info!(
+                bytes,
+                "proof checks finalized frames wait on fit the host's room again: they no \
+                 longer run alone past it"
+            );
+        }
     }
 
     /// Take the host's alone lock for work due now beyond the share

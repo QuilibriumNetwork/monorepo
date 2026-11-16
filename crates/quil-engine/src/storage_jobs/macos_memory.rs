@@ -107,7 +107,7 @@ fn log_no_headroom(snapshot: Snapshot, cause: &'static str) {
         capacity = snapshot.capacity(),
         more_since_last_line = skipped,
         action = "jobs and proof checks admitted by memory wait (a check a finalized frame \
-                  waits on may run alone within capacity); check `memory_pressure` and \
+                  waits on may run alone within capacity, past it once checks starve); check `memory_pressure` and \
                   `vm_stat`, quit other applications, or lower the database cache or the \
                   worker count",
         "macOS memory admission has no headroom: pressure normal is 1, warning 2, critical 4; \
@@ -116,16 +116,14 @@ fn log_no_headroom(snapshot: Snapshot, cause: &'static str) {
     );
 }
 
-/// The kernel's memory pressure level (normal 1, warning 2, critical 4).
+/// The kernel's memory pressure level (normal 1, warning 2, critical 4)
+/// and [`Snapshot::capacity`], from one snapshot.
 #[cfg(target_os = "macos")]
-pub(super) fn pressure() -> Option<u32> {
-    snapshot().map(|snapshot| snapshot.pressure)
-}
-
-/// [`Snapshot::capacity`] now.
-#[cfg(target_os = "macos")]
-pub(super) fn capacity() -> Option<u64> {
-    snapshot().map(Snapshot::capacity)
+pub(super) fn host_memory() -> super::HostMemory {
+    snapshot().map_or_else(super::HostMemory::default, |snapshot| super::HostMemory {
+        pressure: Some(snapshot.pressure),
+        capacity: Some(snapshot.capacity()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -353,8 +351,9 @@ mod tests {
     /// node, its data workers in process, owns 8122 MiB; 16 KiB pages, 94950
     /// wired, free 5800 plus 352 speculative, 282560 file-backed and 2971
     /// purgeable. Its headroom is short of a 3 GiB check's share, so only a
-    /// check a frame waits on starts, alone, and only while the node's
-    /// footprint leaves room for it (here up to about 11.05 GiB).
+    /// check a frame waits on starts, alone, while the node's footprint
+    /// leaves room for it (here up to about 11.05 GiB), else once checks
+    /// have starved.
     #[test]
     fn an_operators_16_gib_mac_runs_a_frames_check_alone_within_capacity() {
         const PAGE: u64 = 16 << 10;
@@ -370,31 +369,46 @@ mod tests {
         assert!(mac.headroom() < super::super::needs_available(CHECK));
         assert_eq!(mac.no_headroom_cause(), None);
         assert_eq!(mac.capacity(), 6_570_803_200);
-        assert!(super::super::frame_alone_allowed(
-            0,
-            Some(mac.pressure),
-            Some(mac.capacity()),
-            CHECK
-        ));
+        use super::super::{frame_alone_allowed, FrameAlone, HostMemory, VERIFIER_STARVED_WARN};
+        use std::time::Duration;
+        let alone = |snapshot: Snapshot, starved_for| {
+            frame_alone_allowed(
+                0,
+                HostMemory {
+                    pressure: Some(snapshot.pressure),
+                    capacity: Some(snapshot.capacity()),
+                },
+                CHECK,
+                starved_for,
+                VERIFIER_STARVED_WARN,
+                false,
+            )
+        };
+        assert_eq!(alone(mac, Duration::ZERO), FrameAlone::Fits);
         let edge = mac.total - mac.wired - mac.floor() - CHECK;
         let at_edge = Snapshot {
             footprint: edge,
             ..mac
         };
         assert_eq!(at_edge.capacity(), CHECK);
-        assert!(super::super::frame_alone_allowed(
-            0,
-            Some(1),
-            Some(at_edge.capacity()),
-            CHECK
-        ));
-        // Its compressor (6531 MiB) counted in the footprint too.
+        assert_eq!(alone(at_edge, Duration::ZERO), FrameAlone::Fits);
+        // Its compressor (6531 MiB) counted in the footprint too: refused
+        // until checks have starved the bound, then alone past capacity, as
+        // nothing in the node shrinks that footprint while frames wait.
+        let just_short = VERIFIER_STARVED_WARN - Duration::from_secs(1);
         for footprint in [edge + 1, (8122 + 6531) << 20] {
             let full = Snapshot { footprint, ..mac };
-            assert!(
-                !super::super::frame_alone_allowed(0, Some(1), Some(full.capacity()), CHECK),
+            assert_eq!(
+                alone(full, just_short),
+                FrameAlone::Refused,
                 "frame_alone_past_capacity: a 3 GiB check ran alone at a {footprint} byte \
                  footprint"
+            );
+            assert_eq!(
+                alone(full, VERIFIER_STARVED_WARN),
+                FrameAlone::Starved,
+                "frame_alone_refused_forever: starved, a 3 GiB check stayed refused at a \
+                 {footprint} byte footprint"
             );
         }
         let full = Snapshot {
