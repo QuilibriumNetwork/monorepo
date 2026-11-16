@@ -6881,6 +6881,72 @@ mod tests {
         );
     }
 
+    /// Another sender's held proof over a frame's seal budget leaves the
+    /// provers' place to an active prover's proof: each share holds one
+    /// such proof, so a peer that is no active prover, or a client, cannot
+    /// keep a member's out for as long as it resends one.
+    #[test]
+    fn another_senders_proof_over_a_frame_leaves_the_place_to_a_provers() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let junk = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, junk, Provenance::Other, b"o"),
+            SubmitOutcome::Accepted,
+            "another sender's proof over a frame's seal budget, held first"
+        );
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!(
+            (held.prover.0, held.other.0),
+            (0, 1),
+            "the premise: one other sender's proof held, no prover's"
+        );
+        let member = epoch_proof_of_len(2, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, member, Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-SEAT-CLASS: an active prover's proof over a frame's seal budget waited for another sender's"
+        );
+    }
+
+    /// A prover's copy of another sender's held proof over a frame's seal
+    /// budget, from that sender or another, moves it to the provers' share
+    /// only while that share holds no other such proof: the provers' place
+    /// stays one.
+    #[test]
+    fn a_promoted_proof_over_a_frame_waits_for_the_provers_place() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let first = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, first.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let other = epoch_proof_of_len(2, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, other.clone(), Provenance::Other, b"o"),
+            SubmitOutcome::Accepted,
+            "another sender's proof over a frame's seal budget, held beside a prover's"
+        );
+        for peer in [&b"o"[..], b"b"] {
+            assert_eq!(
+                mc.add_message_outcome_by(1, other.clone(), Provenance::Prover, peer),
+                SubmitOutcome::Filtered(Refusal::RankFull),
+                "SEAL-SEAT-PROMOTED: a prover's copy from {peer:?} moved a second proof over a frame's seal budget into the provers' share"
+            );
+        }
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!((held.prover.0, held.other.0), (1, 1));
+        mc.remove(&[first]);
+        assert_eq!(
+            mc.add_message_outcome_by(1, other, Provenance::Prover, b"o"),
+            SubmitOutcome::Duplicate,
+            "SEAL-SEAT-PROMOTED-FREED: the sender's own prover copy was refused after the provers' place freed"
+        );
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!((held.prover.0, held.other.0), (1, 0));
+    }
+
     /// A proof of a proposal's seal share is held and rides a proposal at a
     /// leader's message cap (12 MiB); one a byte larger is refused for good.
     #[test]
