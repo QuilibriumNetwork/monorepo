@@ -1248,6 +1248,157 @@ fn a_frames_check_asked_past_the_gap_runs_alone_at_the_bound() {
     }
 }
 
+/// What [`a_warm_admitted_keeps_a_frames_starvation`]'s admission has
+/// available.
+static WARM_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+/// A warm admitted while a frame's check starves at critical pressure ends
+/// none of that frame's starvation: the frame's check, asked again past the
+/// bound from its first refusal, runs alone.
+#[test]
+fn a_warm_admitted_keeps_a_frames_starvation() {
+    let mut admission = Admission::new(6, Box::new(|| Some(WARM_AVAILABLE.load(Ordering::SeqCst))));
+    admission.strict_due = true;
+    admission.memory = critical;
+    admission.frame_verifier_wait = PROMPT_PLACE;
+    admission.verifier_starved_warn = STARVED_BOUND;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    assert!(
+        checked(admission, FrameCheck::Inline).is_none(),
+        "setup: the frame's check is refused at critical pressure"
+    );
+    // Its starvation began before this: load only lengthens it.
+    let refused = Instant::now();
+    WARM_AVAILABLE.store(8 * GIB, Ordering::SeqCst);
+    let warm = checked(admission, FrameCheck::No);
+    assert!(warm.is_some(), "setup: the warm fits");
+    drop(warm);
+    WARM_AVAILABLE.store(0, Ordering::SeqCst);
+    std::thread::sleep((refused + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    assert!(
+        checked(admission, FrameCheck::Inline).is_some(),
+        "warm_ended_frames_starvation: a warm's admission restarted the frame's wait"
+    );
+}
+
+/// A frame's starvation outlives the gap between its asks: its next ask
+/// starts no new warning interval and counts from the first; a warm's
+/// admission ends only the general span, a frame's check's ends both.
+#[test]
+fn a_frames_starvation_outlives_the_gap() {
+    let start = Instant::now();
+    let gap = Duration::from_secs(60);
+    let later = start + Duration::from_secs(120);
+    let mut starved = Starved::default();
+    assert!(
+        starved.note(start, gap, true),
+        "setup: the first ask starts it"
+    );
+    assert!(
+        !starved.note(later, gap, true),
+        "frame_ask_restarted_line: a frame's ask past the gap started a new warning interval"
+    );
+    assert_eq!(
+        starved.frames_for(later, gap),
+        Duration::from_secs(120),
+        "starved_secs_lost_frame: a frame's ask past the gap restarted its count"
+    );
+    starved.admitted(false);
+    assert_eq!(
+        starved.frame,
+        Some(start),
+        "warm_ended_frames_starvation: a warm's admission ended the frame's"
+    );
+    assert_eq!(
+        starved.span, None,
+        "setup: a warm's admission ends the span"
+    );
+    starved.admitted(true);
+    assert_eq!(
+        starved,
+        Starved::default(),
+        "frame_starvation_not_cleared: a frame's check admitted left it running"
+    );
+}
+
+/// What a closure logged, through a subscriber on this thread.
+fn logged(run: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let bytes = lines.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+/// The starved checks' warning ([`Admission::verifier_starved`]).
+const STARVED_LINE: &str = "proof checks starved:";
+
+/// A refused check's starvation warns only once it reaches the bound.
+#[test]
+fn a_starved_checks_warning_waits_for_its_bound() {
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let refuse = || {
+        assert!(
+            admission
+                .reserve_verifier(3 * GIB, Instant::now(), FrameCheck::No)
+                .is_none(),
+            "setup: the warm is refused at no headroom"
+        );
+    };
+    let first = logged(refuse);
+    // Its starvation began before this: load only lengthens it.
+    let refused = Instant::now();
+    assert!(
+        !first.contains(STARVED_LINE),
+        "starved_warned_early: it warned before the bound: {first}"
+    );
+    std::thread::sleep((refused + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    assert_eq!(
+        logged(refuse).matches(STARVED_LINE).count(),
+        1,
+        "starved_never_warned: starved past the bound, it did not warn once"
+    );
+}
+
+/// A frame's checks running alone past the host's room warn once, not
+/// once per check.
+#[test]
+fn a_frames_escape_past_the_room_warns_once() {
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = Duration::ZERO;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let logs = logged(|| {
+        for ask in ["first", "second"] {
+            let granted = admission.reserve_verifier(3 * GIB, Instant::now(), FrameCheck::Inline);
+            assert!(
+                granted.is_some(),
+                "setup: the {ask} check runs alone at a zero bound"
+            );
+        }
+    });
+    assert_eq!(
+        logs.matches("run alone past the host's room").count(),
+        1,
+        "escape_warned_each_check: {logs}"
+    );
+}
+
 /// Waits within [`VERIFIER_STARVED_GAP`] of the last one are one
 /// starvation; a later one starts another.
 #[test]

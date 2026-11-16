@@ -509,7 +509,8 @@ const VERIFIER_STARVED_WARN: Duration = Duration::from_secs(10 * 60);
 
 /// Waits for memory this far apart are one starvation for its warning and
 /// [`verifier_starved_secs`]: a refused check's caller asks again within it
-/// ([`Starved::span`]). A frame's escape keeps no gap ([`Starved::frame`]).
+/// ([`Starved::span`]). A frame's starvation keeps no gap, for its escape,
+/// its warning and [`verifier_starved_secs`] ([`Starved::frames_for`]).
 const VERIFIER_STARVED_GAP: Duration = Duration::from_secs(60);
 
 /// One log line per interval, counting the occurrences it skipped.
@@ -547,12 +548,12 @@ fn starved_span(
 }
 
 /// Since when proof checks have been starved ([`State::verifier_starved`]):
-/// two spans, noted together ([`Self::note`]) and ended together, by a
-/// check admitted in this process ([`Admission::reserve_classed`]) or the
-/// process's exit.
+/// two spans, noted together ([`Self::note`]) and ended by a check admitted
+/// in this process ([`Self::admitted`]) or the process's exit: any check
+/// ends [`Self::span`], only a check a frame waits on ends [`Self::frame`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Starved {
-    /// Any check's wait, for the warning and [`verifier_starved_secs`]:
+    /// Any check's wait, for the warning on a check no frame waits on:
     /// since when, and when one last waited ([`starved_span`]).
     span: Option<(Instant, Instant)>,
     /// Since when a check a finalized frame waits on has waited, for its
@@ -564,14 +565,28 @@ struct Starved {
 
 impl Starved {
     /// Note a check waiting at `now`, one a frame waits on if `frame`: true
-    /// when it starts a new [`Self::span`], none having waited within `gap`.
+    /// when it starts a new starvation: a new [`Self::span`], none having
+    /// waited within `gap`, while no frame's starvation lasts.
     fn note(&mut self, now: Instant, gap: Duration, frame: bool) -> bool {
         let (since, seen) = starved_span(self.span, now, gap);
         self.span = Some((since, seen));
+        let fresh = since == now && self.frame.is_none();
         if frame {
             self.frame.get_or_insert(now);
         }
-        since == now
+        fresh
+    }
+
+    /// A check admitted, one a frame waits on if `frame`: it ends
+    /// [`Self::span`], and [`Self::frame`] only if `frame`. A check no frame
+    /// waits on (a warm) fits only when a frame's would, but a frame's check
+    /// refused at critical pressure in between keeps waiting, so a warm's
+    /// admission ends none of its starvation.
+    fn admitted(&mut self, frame: bool) {
+        self.span = None;
+        if frame {
+            self.frame = None;
+        }
     }
 
     /// How long checks have been starved at `now`, for the warning: zero
@@ -589,6 +604,13 @@ impl Starved {
     fn frame_for(&self, now: Instant) -> Duration {
         self.frame
             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+
+    /// How long checks have been starved at `now`, counting a frame's
+    /// starvation however far apart its checks are asked: for the warning
+    /// on a frame's check and [`verifier_starved_secs`].
+    fn frames_for(&self, now: Instant, gap: Duration) -> Duration {
+        self.checks_for(now, gap).max(self.frame_for(now))
     }
 }
 
@@ -657,14 +679,15 @@ fn frame_alone_allowed(
 }
 
 /// Seconds proof checks have been starved for memory or a slot in this
-/// process now: 0 when none is ([`VERIFIER_STARVED_WARN`]).
+/// process now, a frame's however far apart its checks are asked
+/// ([`Starved::frames_for`]): 0 when none is ([`VERIFIER_STARVED_WARN`]).
 pub fn verifier_starved_secs() -> u64 {
     let admission = admission();
     let gap = admission.verifier_starved_gap;
     admission
         .state()
         .verifier_starved
-        .checks_for(Instant::now(), gap)
+        .frames_for(Instant::now(), gap)
         .as_secs()
 }
 
@@ -1997,7 +2020,9 @@ impl Admission {
         }
         let jobs = state.holders;
         if urgency.verification() {
-            state.verifier_starved = Starved::default();
+            state
+                .verifier_starved
+                .admitted(urgency == Urgency::FrameVerification);
         }
         drop(state);
         if waited {
@@ -2754,8 +2779,10 @@ impl Admission {
     }
 
     /// Note a proof check of `bytes` waiting now ([`Starved::note`]), and
-    /// warn once checks have been starved past [`VERIFIER_STARVED_WARN`], at
-    /// most once per it within a starvation; a new one warns afresh.
+    /// warn once checks have been starved past [`VERIFIER_STARVED_WARN`]
+    /// (for a frame's check, its frame's starvation counts however far apart
+    /// it is asked: [`Starved::frames_for`]), at most once per it within a
+    /// starvation; a new one warns afresh.
     fn verifier_starved(&self, state: &mut State, bytes: u64, urgency: Urgency) {
         let now = Instant::now();
         let gap = self.verifier_starved_gap;
@@ -2763,7 +2790,11 @@ impl Admission {
         if state.verifier_starved.note(now, gap, frame) {
             state.verifier_starved_line = LineEvery::default();
         }
-        let starved = state.verifier_starved.checks_for(now, gap);
+        let starved = if frame {
+            state.verifier_starved.frames_for(now, gap)
+        } else {
+            state.verifier_starved.checks_for(now, gap)
+        };
         if starved < self.verifier_starved_warn {
             return;
         }
