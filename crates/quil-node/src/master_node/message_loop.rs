@@ -4421,9 +4421,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let shared = "203.0.113.7:8340";
+        let shared = "185.1.113.7:8340";
         assert_eq!(
-            archive_record_endpoints(&record(a, &["/ip4/203.0.113.7/tcp/8340"]), 0),
+            archive_record_endpoints(&record(a, &["/ip4/185.1.113.7/tcp/8340"]), 0),
             vec![shared.to_string()]
         );
         assert_eq!(
@@ -4434,16 +4434,16 @@ mod tests {
         let other = archive_record_endpoints(
             &record(
                 b,
-                &["/ip4/203.0.113.7/tcp/8340", "/ip4/203.0.113.8/tcp/8340"],
+                &["/ip4/185.1.113.7/tcp/8340", "/ip4/185.1.113.8/tcp/8340"],
             ),
             0,
         );
         assert_eq!(
             (other, pinned_archive_peer(shared)),
-            (vec!["203.0.113.8:8340".to_string()], Some(a)),
+            (vec!["185.1.113.8:8340".to_string()], Some(a)),
             "R112-D-2: another archive's record took over an endpoint pinned to the first"
         );
-        assert_eq!(pinned_archive_peer("203.0.113.8:8340"), Some(b));
+        assert_eq!(pinned_archive_peer("185.1.113.8:8340"), Some(b));
     }
 
     /// R112-D-2: what the gossip handler adds to the archive pool is pinned
@@ -4457,17 +4457,17 @@ mod tests {
         let info = quil_p2p::CanonicalPeerInfo {
             peer_id: peer.to_bytes(),
             reachability: vec![quil_p2p::CanonicalReachability {
-                stream_multiaddrs: vec!["/ip4/203.0.113.21/tcp/8340".to_string()],
+                stream_multiaddrs: vec!["/ip4/185.1.113.21/tcp/8340".to_string()],
                 ..Default::default()
             }],
             ..Default::default()
         };
         let pool = quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO);
         let first = add_archive_record_endpoints(&pool, &info, 0).await;
-        assert_eq!(first.as_deref(), Some("203.0.113.21:8340"));
-        assert_eq!(pool.get_all().await, vec!["203.0.113.21:8340".to_string()]);
+        assert_eq!(first.as_deref(), Some("185.1.113.21:8340"));
+        assert_eq!(pool.get_all().await, vec!["185.1.113.21:8340".to_string()]);
         assert_eq!(
-            quil_rpc::archive_client::pinned_archive_peer("203.0.113.21:8340"),
+            quil_rpc::archive_client::pinned_archive_peer("185.1.113.21:8340"),
             Some(peer),
             "R112-D-2: the gossip handler added an archive endpoint unpinned"
         );

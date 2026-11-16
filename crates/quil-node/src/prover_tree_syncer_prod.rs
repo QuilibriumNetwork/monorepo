@@ -1299,7 +1299,7 @@ impl ProdProverTreeSyncer {
                 // Resolving discovers the master's archives on first use.
                 let addr = syncer.resolve_addr().await?;
                 let endpoints = match syncer.archive_pool.as_ref() {
-                    Some(pool) => pool.get_all().await,
+                    Some(pool) => pool.archives().await,
                     None => vec![addr],
                 };
                 crate::storage_history::outgoing_history_from_endpoints(
@@ -2203,7 +2203,7 @@ impl ProdProverTreeSyncer {
         let mut endpoints = vec![first.clone()];
         if let Some(pool) = self.archive_pool.as_ref() {
             endpoints.extend(
-                pool.get_all()
+                pool.archives()
                     .await
                     .into_iter()
                     .filter(|endpoint| *endpoint != first),

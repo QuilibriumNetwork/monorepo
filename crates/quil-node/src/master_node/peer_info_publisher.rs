@@ -258,23 +258,42 @@ fn select_pubsub_addr(
 }
 
 /// The stream addresses PeerInfo announces: the
-/// `announceStreamListenMultiaddr` override when set; else the stream listen
-/// port on the IP of `pubsub_addr`, or on the stream listen IP when it names
-/// one.
+/// `announceStreamListenMultiaddr` override when set; else one per address
+/// family the stream listener takes, the stream listen port on the IP of
+/// `pubsub_addr` for its family and on the first confirmed address of each
+/// other family, or on the stream listen IP when it names one. IPv4 comes
+/// first, so a peer that dials only the first address keeps the family
+/// most peers reach.
 fn select_stream_addrs(
     announce_stream: &str,
     stream_listen: &str,
     pubsub_addr: &str,
+    confirmed: &[String],
 ) -> Vec<String> {
     if !announce_stream.is_empty() {
-        vec![announce_stream.to_string()]
-    } else if !stream_listen.is_empty() {
-        crate::util::multiaddr::extract_stream_addr(pubsub_addr, stream_listen)
-            .into_iter()
-            .collect()
-    } else {
-        Vec::new()
+        return vec![announce_stream.to_string()];
     }
+    if stream_listen.is_empty() {
+        return Vec::new();
+    }
+    let mut addrs: Vec<String> = Vec::new();
+    for candidate in std::iter::once(pubsub_addr).chain(confirmed.iter().map(String::as_str)) {
+        let Some(addr) = crate::util::multiaddr::extract_stream_addr(candidate, stream_listen)
+        else {
+            continue;
+        };
+        let family = |a: &str| {
+            a.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(str::to_owned)
+        };
+        if !addrs.iter().any(|held| family(held) == family(&addr)) {
+            addrs.push(addr);
+        }
+    }
+    addrs.sort_by_key(|addr| !addr.starts_with("/ip4/"));
+    addrs
 }
 
 /// The worker configuration of `quil_p2p::build_worker_reachability`.
@@ -744,7 +763,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             let ext = addr_rx.borrow().clone();
             let (pubsub_addr, source) =
                 select_pubsub_addr(&pi_announce, &ext.addrs, &pi_listen_fallback);
-            let stream_addrs = select_stream_addrs(&pi_announce_stream, &pi_stream_listen, &pubsub_addr);
+            let stream_addrs = select_stream_addrs(
+                &pi_announce_stream,
+                &pi_stream_listen,
+                &pubsub_addr,
+                &ext.addrs,
+            );
             // Per-worker reachabilities (one per running worker with a
             // non-empty filter) once the worker manager is available.
             let pairs: Vec<(u32, Vec<u8>)> = match pi_worker_manager_slot.get() {
@@ -1068,7 +1092,7 @@ mod tests {
                     ] {
                         for worker_addrs in [&thread_mode, &process_mode] {
                             let (pubsub, _) = select_pubsub_addr(announce, &[], listen);
-                            let stream = select_stream_addrs("", stream_listen, &pubsub);
+                            let stream = select_stream_addrs("", stream_listen, &pubsub, &[]);
                             let reachability =
                                 build_reachability(&pubsub, &stream, &workers, worker_addrs);
                             assert_eq!(
@@ -1099,22 +1123,46 @@ mod tests {
                 (QUIC6, AnnounceSource::Confirmed)
             );
             assert_eq!(
-                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub, &[]),
                 strings(&["/ip6/2001:db8::7/tcp/8340"])
             );
             // A specific listen address needs no AutoNAT server on IPv6.
             let (pubsub, source) = select_pubsub_addr("", &[], QUIC6);
             assert_eq!((pubsub.as_str(), source), (QUIC6, AnnounceSource::Fallback));
             assert_eq!(
-                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub, &[]),
                 strings(&["/ip6/2001:db8::7/tcp/8340"])
             );
             // A wildcard without a confirmed address announces nothing.
             let (pubsub, _) = select_pubsub_addr("", &[], listen);
             assert_eq!(pubsub, "");
             assert_eq!(
-                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub, &[]),
                 Vec::<String>::new()
+            );
+        }
+
+        /// A dual-stack node whose first confirmed address is IPv6: an IPv4
+        /// stream listener still gets its IPv4 stream address, and a
+        /// listener on both families announces both, IPv4 first.
+        #[test]
+        fn peer_info_announces_a_stream_address_per_family_the_listener_takes() {
+            const QUIC6: &str = "/ip6/2001:db8::7/udp/8336/quic-v1";
+            let confirmed = strings(&[QUIC6, QUIC_A]);
+            let (pubsub, _) = select_pubsub_addr("", &confirmed, "/ip6/::/udp/8336/quic-v1");
+            assert_eq!(pubsub, QUIC6);
+            assert_eq!(
+                select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub, &confirmed),
+                strings(&["/ip4/203.0.113.7/tcp/8340"]),
+                "ipv4_stream_addr_missing behind an IPv6 pubsub address"
+            );
+            assert_eq!(
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub, &confirmed),
+                strings(&["/ip4/203.0.113.7/tcp/8340", "/ip6/2001:db8::7/tcp/8340"])
+            );
+            assert_eq!(
+                select_stream_addrs("", "/ip6/2001:db8::9/tcp/8340", &pubsub, &confirmed),
+                strings(&["/ip6/2001:db8::7/tcp/8340"])
             );
         }
 
@@ -1131,7 +1179,7 @@ mod tests {
             };
             let (pubsub, source) = select_pubsub_addr("", &strings(&[TCP_A]), LISTEN);
             assert_eq!(source, AnnounceSource::Confirmed);
-            let stream = select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub);
+            let stream = select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub, &[]);
             let reachability = build_reachability(&pubsub, &stream, &workers, &thread_mode);
             assert_eq!(reachability.len(), 2);
             for record in &reachability {

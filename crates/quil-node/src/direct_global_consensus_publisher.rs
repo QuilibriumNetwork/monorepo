@@ -337,7 +337,7 @@ impl DirectGlobalConsensusPublisher {
         let clients = self.clients.clone();
         let failures = self.failures.clone();
         self.spawner.detach("direct-consensus-fanout", async move {
-            let addrs = pool.get_all().await;
+            let addrs = pool.archives().await;
             for addr in addrs {
                 let bitmask = bitmask.clone();
                 let data = data.clone();

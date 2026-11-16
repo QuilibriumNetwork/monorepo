@@ -3331,7 +3331,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         // a different archive with materialized state.
                         // Over the connections this process shares with the
                         // archives, each held until its queries end.
-                        for endpoint in archive_pool.get_all().await {
+                        for endpoint in archive_pool.archives().await {
                             match quil_rpc::ArchiveClient::shared(&endpoint, &seed).await {
                                 Ok(client) => clients.push(((*client).clone(), Some(client))),
                                 Err(e) => tracing::debug!(endpoint = %endpoint, error = %e, "shard info: archive-pool dial failed"),
@@ -3958,13 +3958,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             "0.0.0.0:8340".to_string()
         }
     };
+    let (main_listen, additional_listens) = config.p2p.listen_multiaddrs();
+    let listens: Vec<String> = std::iter::once(main_listen)
+        .chain(additional_listens)
+        .collect();
     if crate::util::multiaddr::ipv6_p2p_without_stream(
-        &config.p2p.listen_multiaddr,
+        &listens,
         &config.p2p.stream_listen_multiaddr,
         &config.p2p.announce_stream_listen_multiaddr,
     ) {
         warn!(
-            listen = %config.p2p.listen_multiaddr,
+            listen = %listens.join(","),
             stream_listen = %config.p2p.stream_listen_multiaddr,
             "the p2p listener takes IPv6 but the peer gRPC listener IPv4 only, so PeerInfo \
              carries no stream address and peers cannot reach this node's stream port; set \

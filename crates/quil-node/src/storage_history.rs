@@ -99,7 +99,7 @@ pub fn from_pool(
         let key = key.clone();
         let rotation = rotation.clone();
         Box::pin(async move {
-            let endpoints = rotation.next(&pool.get_all().await);
+            let endpoints = rotation.next(&pool.archives().await);
             let dial = |endpoint: String| {
                 let key = key.clone();
                 async move { ArchiveClient::connect_mtls(&endpoint, &key).await }
@@ -204,7 +204,7 @@ pub fn outgoing_history_from_pool(
         let pool = pool.clone();
         let key = key.clone();
         Box::pin(async move {
-            let endpoints = pool.get_all().await;
+            let endpoints = pool.archives().await;
             outgoing_history_from_endpoints(&endpoints, &key, filter, from, through).await
         })
     })

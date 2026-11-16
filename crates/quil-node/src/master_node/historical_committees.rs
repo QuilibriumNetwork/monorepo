@@ -227,7 +227,7 @@ impl HistoricalCommittees {
             return Ok(local.into_iter().flatten().collect());
         }
         let mut last_error = None;
-        for addr in self.pool.get_all().await {
+        for addr in self.pool.archives().await {
             match self.fetch_certified_run(&addr, lo, hi).await {
                 Ok(headers) => return Ok(headers),
                 Err(error) => {
@@ -314,7 +314,7 @@ impl HistoricalCommittees {
             .global_requests_retained_from()
             .is_some_and(|from| number < from);
         let mut refusals = Vec::new();
-        for addr in self.pool.get_all().await.into_iter().take(ANCHOR_ARCHIVES) {
+        for addr in self.pool.archives().await.into_iter().take(ANCHOR_ARCHIVES) {
             let fetched = tokio::time::timeout(ANCHOR_FETCH, async {
                 let mut client = (self.connect)(addr.clone()).await?;
                 let read = if header_only {
@@ -478,7 +478,7 @@ impl HistoricalCommittees {
         let removes_bytes = removes.map(|r| r.to_vec()).unwrap_or_default();
         let expected: [&[u8]; 4] = [&root, &removes_bytes, &[], &[]];
         let mut synced = false;
-        for addr in self.pool.get_all().await {
+        for addr in self.pool.archives().await {
             let attempt = async {
                 let mut client = (self.connect)(addr.clone()).await?;
                 crate::forest_sync::sync_shard_phases_on(
