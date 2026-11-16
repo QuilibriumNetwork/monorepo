@@ -2683,6 +2683,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         host_mem_available_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.available_bytes)),
                         host_swap_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_total_bytes)),
                         host_swap_used_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_used_bytes)),
+                        // macOS only: the page breakdown behind "available"
+                        // (free, active, inactive, wired, compressed,
+                        // purgeable, speculative), in MB.
+                        host_vm_mb = crate::mem_stats::macos_vm().map(|v| v.render()),
                         peer_info_cache = sizes.peer_info_cache,
                         // Its bounds (peer_info_bounds.rs): memory held, and
                         // records evicted, expired and refused since start.

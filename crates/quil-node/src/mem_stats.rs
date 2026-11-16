@@ -200,10 +200,166 @@ pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
     })
 }
 
-/// Host memory now, or `None` when `/proc/meminfo` is unreadable
-/// (non-Linux) or lacks the required fields.
+/// Host memory now, or `None` when the platform's source is unreadable
+/// or lacks the required fields. Linux reads `/proc/meminfo`; macOS
+/// derives it from [`macos_vm`] and `sysctl`.
 pub fn host_memory() -> Option<HostMemory> {
-    parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    #[cfg(target_os = "macos")]
+    {
+        return macos_host_memory();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    }
+}
+
+/// The macOS `host_statistics64` page counts, in bytes. macOS has no
+/// `MemAvailable`: `free + inactive + purgeable + speculative` is the
+/// memory it gives back on demand, so a reader sees the same figures
+/// the system's own monitor adds up. `compressed` and `wired` are held,
+/// not available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacVm {
+    pub free_bytes: u64,
+    pub active_bytes: u64,
+    pub inactive_bytes: u64,
+    pub wired_bytes: u64,
+    pub compressed_bytes: u64,
+    pub purgeable_bytes: u64,
+    pub speculative_bytes: u64,
+}
+
+impl MacVm {
+    /// Page counts `(free, active, inactive, wired, compressed,
+    /// purgeable, speculative)` scaled by the page size.
+    pub fn from_pages(pages: [u64; 7], page_size: u64) -> Self {
+        let b = |i: usize| pages[i].saturating_mul(page_size);
+        MacVm {
+            free_bytes: b(0),
+            active_bytes: b(1),
+            inactive_bytes: b(2),
+            wired_bytes: b(3),
+            compressed_bytes: b(4),
+            purgeable_bytes: b(5),
+            speculative_bytes: b(6),
+        }
+    }
+
+    /// Memory the system gives back on demand.
+    pub fn available_bytes(&self) -> u64 {
+        self.free_bytes
+            .saturating_add(self.inactive_bytes)
+            .saturating_add(self.purgeable_bytes)
+            .saturating_add(self.speculative_bytes)
+    }
+
+    /// `free=..,active=..,...` in MB, the field order of the struct.
+    pub fn render(&self) -> String {
+        format!(
+            "free={},active={},inactive={},wired={},compressed={},purgeable={},speculative={}",
+            fmt_mb(self.free_bytes),
+            fmt_mb(self.active_bytes),
+            fmt_mb(self.inactive_bytes),
+            fmt_mb(self.wired_bytes),
+            fmt_mb(self.compressed_bytes),
+            fmt_mb(self.purgeable_bytes),
+            fmt_mb(self.speculative_bytes),
+        )
+    }
+}
+
+/// macOS page breakdown now; `None` elsewhere or when the call fails.
+pub fn macos_vm() -> Option<MacVm> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `vm_statistics64` is plain data the kernel fills; the
+        // count passed is the struct's size in 32-bit words, as
+        // `host_statistics64` expects, and the host port is this task's.
+        unsafe {
+            let mut info: libc::vm_statistics64 = std::mem::zeroed();
+            let mut count = libc::HOST_VM_INFO64_COUNT;
+            #[allow(deprecated)]
+            let kr = libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                &mut info as *mut _ as *mut libc::integer_t,
+                &mut count,
+            );
+            if kr != 0 {
+                return None;
+            }
+            let page = libc::sysconf(libc::_SC_PAGESIZE);
+            if page <= 0 {
+                return None;
+            }
+            return Some(MacVm::from_pages(
+                [
+                    info.free_count as u64,
+                    info.active_count as u64,
+                    info.inactive_count as u64,
+                    info.wire_count as u64,
+                    info.compressor_page_count as u64,
+                    info.purgeable_count as u64,
+                    info.speculative_count as u64,
+                ],
+                page as u64,
+            ));
+        }
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_value<T: Default>(name: &str) -> Option<T> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut out = T::default();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `out` is a plain value of `len` bytes; `sysctlbyname`
+    // writes at most `len` bytes and reports the count it wrote.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &mut out as *mut T as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(out)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_host_memory() -> Option<HostMemory> {
+    let total: u64 = sysctl_value("hw.memsize")?;
+    let vm = macos_vm()?;
+    // `vm.swapusage` is `struct xsw_usage`; zero swap when it is absent.
+    // SAFETY: `xsw_usage` is plain integers; all-zero is a valid value.
+    let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xsw_usage>();
+    let name = std::ffi::CString::new("vm.swapusage").ok()?;
+    // SAFETY: as in `sysctl_value`; the struct is plain data of `len` bytes.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut swap as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let (swap_total, swap_used) = if rc == 0 {
+        (swap.xsu_total, swap.xsu_used)
+    } else {
+        (0, 0)
+    };
+    Some(HostMemory {
+        total_bytes: total,
+        available_bytes: vm.available_bytes(),
+        swap_total_bytes: swap_total,
+        swap_used_bytes: swap_used,
+    })
 }
 
 /// Minimum interval between repeated low-memory warnings.
@@ -562,6 +718,39 @@ impl StructuralSources {
 mod host_memory_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn macos_pages_scale_by_page_size_and_available_sums_the_reclaimable() {
+        let vm = MacVm::from_pages([10, 20, 30, 40, 50, 60, 70], 16384);
+        assert_eq!(vm.free_bytes, 10 * 16384);
+        assert_eq!(vm.wired_bytes, 40 * 16384);
+        assert_eq!(vm.compressed_bytes, 50 * 16384);
+        // free + inactive + purgeable + speculative; never active, wired
+        // or compressed.
+        assert_eq!(vm.available_bytes(), (10 + 30 + 60 + 70) * 16384);
+        assert_eq!(
+            MacVm::from_pages([u64::MAX; 7], 16384).available_bytes(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn macos_render_names_every_field_in_mb() {
+        let vm = MacVm::from_pages([64, 128, 0, 0, 0, 0, 0], 16384);
+        assert_eq!(
+            vm.render(),
+            "free=1.0,active=2.0,inactive=0.0,wired=0.0,compressed=0.0,\
+             purgeable=0.0,speculative=0.0"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_memory_reads_this_hosts_total_on_linux() {
+        let m = host_memory().expect("/proc/meminfo is readable on Linux");
+        assert!(m.total_bytes > 0 && m.available_bytes <= m.total_bytes);
+        assert_eq!(macos_vm(), None);
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
