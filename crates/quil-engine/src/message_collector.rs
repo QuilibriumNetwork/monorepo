@@ -6411,7 +6411,10 @@ mod tests {
         eprintln!(
             "REACH seal-sender burst carried={carried:?} within={within} refusals={refusals}"
         );
-        assert!(refusals > 0, "the sender's share held the burst whole");
+        assert!(
+            refusals > 0,
+            "SEAL-SENDER-BURST-SPLIT: the sender's share held the burst whole"
+        );
         assert!(
             carried.iter().all(Option::is_some),
             "SEAL-SENDER-BURST: one sender's burst of {burst:?} rode frames {carried:?} of the first {within}"
@@ -6585,6 +6588,29 @@ mod tests {
             "SEAL-OVERSIZE-FINAL: a proof no frame carries was refused retryably, so its sender resends it until its window ends"
         );
         assert!(!Refusal::UnsendableSeal.retryable());
+    }
+
+    /// The edge of a proof no frame carries: one of exactly a frame's seal
+    /// budget is held, one a byte larger is refused for good.
+    #[test]
+    fn a_proof_of_a_frames_seal_budget_is_held_and_one_byte_more_is_not() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let envelope = numbered_epoch_proof(0, budget).len() - budget;
+        let mc = global_collector();
+        let at = numbered_epoch_proof(1, budget - envelope);
+        assert_eq!(at.len(), budget);
+        assert_eq!(
+            mc.add_message_outcome_by(1, at, Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-FRAME-EDGE: a proof of a frame's seal budget was refused"
+        );
+        let over = numbered_epoch_proof(2, budget - envelope + 1);
+        assert_eq!(over.len(), budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, over, Provenance::Prover, b"b"),
+            SubmitOutcome::Filtered(Refusal::UnsendableSeal),
+            "SEAL-FRAME-OVER: a proof a byte over a frame's seal budget was not refused for good"
+        );
     }
 
     /// A prover's copy of another sender's held storage epoch proof moves it
