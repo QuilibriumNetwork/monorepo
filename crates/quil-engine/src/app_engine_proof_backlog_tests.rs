@@ -10,6 +10,7 @@
 use super::*;
 use crate::admission_verify::{AdmissionJob, AdmissionQueue};
 use quil_execution::manager::PreverifyCounts;
+use quil_lattice_ct::confidential::relation::backend::worker_client::{FrameCheck, WorkerVerifier};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -248,7 +249,35 @@ impl Drop for BusyVoter {
 }
 
 fn busy_voter() -> BusyVoter {
-    use quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier;
+    voter_with(|dir| {
+        let slots = dir.join("slots");
+        let worker = WorkerVerifier::new(dir.join("absent-worker"), 1, Duration::from_secs(2))
+            .unwrap()
+            .with_concurrency(2)
+            .unwrap()
+            .with_shared_admission(slots.clone())
+            .unwrap();
+        let held: Vec<std::fs::File> = [slots, dir.join("slots.1")]
+            .into_iter()
+            .map(|path| {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap();
+                file.try_lock().unwrap();
+                file
+            })
+            .collect();
+        (worker, held)
+    })
+}
+
+/// A voter over the proof worker `worker` makes in the voter's directory,
+/// holding the files it returns for the test.
+fn voter_with(
+    worker: impl FnOnce(&std::path::Path) -> (WorkerVerifier, Vec<std::fs::File>),
+) -> BusyVoter {
     let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
     let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
     let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
@@ -269,25 +298,7 @@ fn busy_voter() -> BusyVoter {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let slots = dir.join("slots");
-    let worker = WorkerVerifier::new(dir.join("absent-worker"), 1, Duration::from_secs(2))
-        .unwrap()
-        .with_concurrency(2)
-        .unwrap()
-        .with_shared_admission(slots.clone())
-        .unwrap();
-    let held: Vec<std::fs::File> = [slots.clone(), dir.join("slots.1")]
-        .into_iter()
-        .map(|path| {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .unwrap();
-            file.try_lock().unwrap();
-            file
-        })
-        .collect();
+    let (worker, held) = worker(&dir);
     let manager = Arc::new(
         quil_execution::ExecutionEngineManager::new_with_shards(
             prover,
@@ -343,8 +354,18 @@ fn busy_voter() -> BusyVoter {
 /// that key, so it passes every check before its proof (its proof is not
 /// valid). Its proofs are not known to verify within the budget on a node
 /// that has not measured its size class, so members verify it in the
-/// background.
+/// background. It pays a fee of 2, below its dynamic cost: a frame that
+/// materializes it skips it before its proof (`check_self_paid_fee`).
 fn shield_bundle(voter: &BusyVoter, n: u32) -> quil_types::proto::global::MessageBundle {
+    shield_bundle_with_fee(voter, n, 2)
+}
+
+/// `shield_bundle` paying `fee` out of a coin of `10 + fee`.
+fn shield_bundle_with_fee(
+    voter: &BusyVoter,
+    n: u32,
+    fee: u128,
+) -> quil_types::proto::global::MessageBundle {
     use quil_execution::{
         hypergraph_state::{vertex_adds_discriminator, HypergraphState},
         token_intrinsic::{legacy_migration, materialize},
@@ -371,7 +392,7 @@ fn shield_bundle(voter: &BusyVoter, n: u32) -> quil_types::proto::global::Messag
     let tree = legacy_migration::create_transparent_coin_tree(
         &legacy_migration::TransparentCoin {
             owner_address: quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap(),
-            amount: 12,
+            amount: 10 + fee,
         },
         &legacy_migration::transparent_type_hash(&application).unwrap(),
         &salt,
@@ -395,8 +416,8 @@ fn shield_bundle(voter: &BusyVoter, n: u32) -> quil_types::proto::global::Messag
         application,
         transparent_address,
         owner_public_key: public.clone().try_into().unwrap(),
-        amount: 12,
-        fee: 2,
+        amount: 10 + fee,
+        fee,
         outputs: vec![Output {
             commitment: key.commit(10, &opening),
             owner: [5; IDENTITY_BYTES],
@@ -632,4 +653,141 @@ fn a_refused_proposal_warms_up_nothing() {
     frame.header.as_mut().unwrap().fee_total = 0u128.to_be_bytes().to_vec();
     assert_eq!((voter.check)(&frame), Ok(()));
     assert!(digests.iter().any(|digest| queue.pending(digest)));
+}
+
+/// A finalized frame whose operations are known to verify within the
+/// budget is not deferred (`defer_for_proof_verification`): it verifies
+/// them as it materializes, on its lanes and in its commit dispatch. Under
+/// strict (macOS) admission at no headroom, with nothing holding memory,
+/// those checks run alone, so the frame materializes; refused, it would
+/// fail as busy on every retry. The worker here rejects every proof.
+#[test]
+fn a_frame_of_known_to_fit_operations_materializes_at_no_headroom() {
+    let admission = crate::storage_jobs::Admission::strict_at_no_headroom_for_tests();
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let seen = told.clone();
+    let voter = voter_with(move |dir| {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("rejecting-worker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\necho run >> \"$0.runs\"\nexit 81\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = WorkerVerifier::new(script, 1, Duration::from_secs(10))
+            .unwrap()
+            .with_memory_admission(Arc::new(move |deadline, frame| {
+                seen.lock().unwrap().push(frame);
+                admission
+                    .reserve_verifier(3 << 30, deadline, frame)
+                    .map(|permit| Box::new(permit) as _)
+            }));
+        (worker, Vec::new())
+    });
+    // The frame skips, before its proof, a shield paying less than its
+    // dynamic cost (`check_self_paid_fee`); this one pays more.
+    const FEE: u128 = 1 << 24;
+    let bundle = shield_bundle_with_fee(&voter, 1, FEE);
+    let required = {
+        let request = bundle.requests[0].request.as_ref();
+        let Some(quil_types::proto::global::message_request::Request::TokenOperation(op)) = request
+        else {
+            unreachable!("shield_bundle carries one token operation")
+        };
+        let cost = voter.manager.get_cost(&canonical(&bundle)).unwrap();
+        let multiplier = crate::rewards::fee_multiplier_for_cost(
+            voter.manager.pricing_network(),
+            50_000,
+            0,
+            &cost,
+            1,
+        )
+        .unwrap();
+        multiplier
+            * num_bigint::BigInt::from(
+                quil_execution::token_intrinsic::cost::state_growth(&op.canonical_bytes).unwrap(),
+            )
+    };
+    assert!(
+        required > num_bigint::BigInt::from(2) && required <= num_bigint::BigInt::from(FEE),
+        "setup: the shield pays its dynamic cost {required}, which a fee of 2 does not"
+    );
+    let result = materialize_app_shard_requests(
+        &voter.manager,
+        &[bundle],
+        1,
+        50_000,
+        0,
+        1,
+        &voter.filter,
+        0,
+    );
+    let runs = std::fs::read_to_string(voter.dir.join("rejecting-worker.runs"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let told = std::mem::take(&mut *told.lock().unwrap());
+    match result {
+        Err(error) if quil_execution::token_intrinsic::is_proof_worker_busy(&error) => panic!(
+            "frame_refused_at_no_headroom: a finalized frame fails as busy on every retry; \
+             its checks were told {told:?}"
+        ),
+        Err(error) => panic!("setup: the frame failed otherwise: {error}"),
+        Ok(_) => assert!(
+            runs > 0,
+            "setup: the frame's operation reached the proof worker"
+        ),
+    }
+    assert!(
+        told.iter().all(|&frame| frame == FrameCheck::Inline),
+        "frame_lanes_unflagged: every check the frame waits on as it executes is told so, \
+         within its caller's deadline: {told:?}"
+    );
+}
+
+/// The admission queue tells the proof worker's memory admission, from its
+/// own threads, which check a finalized frame waits on: one queued for a
+/// frame (`offer_frame_submission`) may wait in its place and run alone,
+/// an arrival (`offer_submission`) neither.
+#[test]
+fn the_queue_tells_the_memory_admission_which_check_a_frame_waits_on() {
+    use crate::admission_verify::{self, AdmissionQueue};
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let seen = told.clone();
+    let voter = voter_with(move |dir| {
+        let worker = WorkerVerifier::new(dir.join("absent-worker"), 1, Duration::from_secs(2))
+            .unwrap()
+            .with_memory_admission(Arc::new(move |_, frame| {
+                seen.lock().unwrap().push(frame);
+                None
+            }));
+        (worker, Vec::new())
+    });
+    let mut asked = Vec::new();
+    for (n, for_frame) in [(1, true), (2, false)] {
+        let canonical = canonical(&shield_bundle(&voter, n));
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let (manager, filter) = (&voter.manager, &voter.filter);
+        assert!(if for_frame {
+            admission_verify::offer_frame_submission(&queue, manager, filter, &canonical, None)
+        } else {
+            admission_verify::offer_submission(&queue, manager, filter, &canonical, false)
+        });
+        assert!(queue.run_one());
+        asked.push(std::mem::take(&mut *told.lock().unwrap()));
+    }
+    let (frames, arrivals) = (&asked[0], &asked[1]);
+    assert!(
+        !frames.is_empty() && !arrivals.is_empty(),
+        "setup: both checks reached the memory admission: {asked:?}"
+    );
+    assert!(
+        frames.iter().all(|&frame| frame == FrameCheck::Queued),
+        "queued_frame_check_not_told: a frame's check from the queue was told {frames:?}"
+    );
+    assert!(
+        arrivals.iter().all(|&frame| frame == FrameCheck::No),
+        "arrival_told_a_frame_waits: an arrival's check was told {arrivals:?}"
+    );
 }

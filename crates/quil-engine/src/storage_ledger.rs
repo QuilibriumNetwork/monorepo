@@ -9,8 +9,9 @@
 //! storage labels ([`crate::storage_labels::install`]): `<id>.lock`, locked
 //! for as long as the process runs, and `<id>.res`, replaced whenever its
 //! jobs' reservations change, with the bytes they hold, the leaves it
-//! labels ahead and whether work due now waits for memory, and the bytes
-//! its storage labels have still to write
+//! labels ahead, whether work due now waits for memory and whether a
+//! check a finalized frame waits on does, and the bytes its storage labels
+//! have still to write
 //! ([`HostLedger::publish_labels_pending`]). A record whose lock is free
 //! belongs to a process that ended and is removed. The one process running
 //! work due now beyond the share alone holds `alone.lock`. The one process
@@ -35,6 +36,13 @@ pub struct Held {
     pub ahead: u64,
     /// Whether work due now waits for memory.
     pub due_waiting: bool,
+    /// Whether a check a finalized frame waits on waits for memory
+    /// (`crate::storage_jobs::Urgency::FrameVerification`).
+    pub frame_waiting: bool,
+    /// Whether work due now that frames' checks waiting for memory held
+    /// back past its bound waits for memory: frames' checks wait for it
+    /// (`crate::storage_jobs::Admission`).
+    pub due_overdue: bool,
 }
 
 /// One process's record: what its storage jobs hold, and the bytes the
@@ -47,19 +55,45 @@ struct Record {
     labels_pending: u64,
 }
 
+/// A record's length; one whose frame check waits for memory, or whose
+/// work due now held back by frames' checks waits past its bound, has one
+/// more byte of flags ([`FRAME_WAITING`], [`DUE_OVERDUE`]), which a process
+/// of a build before that byte cannot read, so it counts that record as
+/// holding nothing only meanwhile.
 const RECORD_LEN: usize = 25;
 
-fn encode(record: Record) -> [u8; RECORD_LEN] {
-    let mut out = [0u8; RECORD_LEN];
+/// The flag byte's bit for [`Held::frame_waiting`].
+const FRAME_WAITING: u8 = 1;
+
+/// The flag byte's bit for [`Held::due_overdue`].
+const DUE_OVERDUE: u8 = 2;
+
+fn encode(record: Record) -> Vec<u8> {
+    let mut out = vec![0u8; RECORD_LEN];
     out[..8].copy_from_slice(&record.held.bytes.to_le_bytes());
     out[8..16].copy_from_slice(&record.held.ahead.to_le_bytes());
     out[16] = u8::from(record.held.due_waiting);
     out[17..].copy_from_slice(&record.labels_pending.to_le_bytes());
+    let flags = (u8::from(record.held.frame_waiting) * FRAME_WAITING)
+        | (u8::from(record.held.due_overdue) * DUE_OVERDUE);
+    if flags != 0 {
+        out.push(flags);
+    }
     out
 }
 
 fn decode(bytes: &[u8]) -> Option<Record> {
-    if bytes.len() != RECORD_LEN || bytes[16] > 1 {
+    let flags = match bytes.len() {
+        RECORD_LEN => 0,
+        len if len == RECORD_LEN + 1
+            && bytes[RECORD_LEN] != 0
+            && bytes[RECORD_LEN] & !(FRAME_WAITING | DUE_OVERDUE) == 0 =>
+        {
+            bytes[RECORD_LEN]
+        }
+        _ => return None,
+    };
+    if bytes[16] > 1 {
         return None;
     }
     Some(Record {
@@ -67,8 +101,10 @@ fn decode(bytes: &[u8]) -> Option<Record> {
             bytes: u64::from_le_bytes(bytes[..8].try_into().ok()?),
             ahead: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
             due_waiting: bytes[16] == 1,
+            frame_waiting: flags & FRAME_WAITING != 0,
+            due_overdue: flags & DUE_OVERDUE != 0,
         },
-        labels_pending: u64::from_le_bytes(bytes[17..].try_into().ok()?),
+        labels_pending: u64::from_le_bytes(bytes[17..RECORD_LEN].try_into().ok()?),
     })
 }
 
@@ -197,6 +233,8 @@ impl HostLedger {
                 sum.held.bytes = sum.held.bytes.saturating_add(held.bytes);
                 sum.held.ahead = sum.held.ahead.saturating_add(held.ahead);
                 sum.held.due_waiting |= held.due_waiting;
+                sum.held.frame_waiting |= held.frame_waiting;
+                sum.held.due_overdue |= held.due_overdue;
                 sum.labels_pending = sum.labels_pending.saturating_add(record.labels_pending);
             }
         }
@@ -324,18 +362,24 @@ mod tests {
             bytes: 5,
             ahead: 1,
             due_waiting: false,
+            frame_waiting: false,
+            due_overdue: false,
         })
         .unwrap();
         b.publish(Held {
             bytes: 7,
             ahead: 0,
             due_waiting: true,
+            frame_waiting: false,
+            due_overdue: false,
         })
         .unwrap();
         c.publish(Held {
             bytes: 11,
             ahead: 1,
             due_waiting: false,
+            frame_waiting: true,
+            due_overdue: false,
         })
         .unwrap();
         assert_eq!(
@@ -343,7 +387,9 @@ mod tests {
             Held {
                 bytes: 18,
                 ahead: 1,
-                due_waiting: true
+                due_waiting: true,
+                frame_waiting: true,
+                due_overdue: false,
             }
         );
         drop(c);
@@ -352,7 +398,9 @@ mod tests {
             Held {
                 bytes: 7,
                 ahead: 0,
-                due_waiting: true
+                due_waiting: true,
+                frame_waiting: false,
+                due_overdue: false,
             }
         );
         assert!(!dir.join("c.res").exists() && !dir.join("c.lock").exists());
@@ -361,6 +409,68 @@ mod tests {
             "one process per record"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record says a frame's check waits in one byte more, only while
+    /// one does: the bytes before it keep the layout a process of an older
+    /// build reads.
+    #[test]
+    fn a_waiting_frame_check_adds_a_byte_after_the_old_layout() {
+        let held = Held {
+            bytes: 5,
+            ahead: 2,
+            due_waiting: true,
+            frame_waiting: false,
+            due_overdue: false,
+        };
+        let record = Record {
+            held,
+            labels_pending: 9,
+        };
+        let waiting = Record {
+            held: Held {
+                frame_waiting: true,
+                ..held
+            },
+            ..record
+        };
+        let old = encode(record);
+        let new = encode(waiting);
+        assert_eq!(old.len(), RECORD_LEN);
+        assert_eq!(
+            new.len(),
+            RECORD_LEN + 1,
+            "frame_waiting_byte_missing: a waiting frame check is not recorded"
+        );
+        assert_eq!(new[..RECORD_LEN], old[..]);
+        assert_eq!(decode(&old), Some(record));
+        assert_eq!(decode(&new), Some(waiting), "frame_waiting_not_read_back");
+        let overdue = Record {
+            held: Held {
+                due_overdue: true,
+                ..held
+            },
+            ..record
+        };
+        let both = Record {
+            held: Held {
+                frame_waiting: true,
+                due_overdue: true,
+                ..held
+            },
+            ..record
+        };
+        for (record, what) in [(overdue, "due_overdue"), (both, "both flags")] {
+            let bytes = encode(record);
+            assert_eq!(bytes.len(), RECORD_LEN + 1, "{what}: flag byte missing");
+            assert_eq!(bytes[..RECORD_LEN], old[..], "{what}: old layout changed");
+            assert_eq!(decode(&bytes), Some(record), "{what}: not read back");
+        }
+        let mut unknown = new;
+        for flags in [0, 4] {
+            unknown[RECORD_LEN] = flags;
+            assert_eq!(decode(&unknown), None, "flag byte {flags} read");
+        }
     }
 
     /// One process at a time holds the alone lock.
@@ -407,6 +517,8 @@ mod tests {
                 bytes: 5,
                 ahead: 0,
                 due_waiting: false,
+                frame_waiting: false,
+                due_overdue: false,
             })
             .unwrap();
         let _turn = ledger.grant_turn(Duration::from_secs(60)).unwrap().unwrap();

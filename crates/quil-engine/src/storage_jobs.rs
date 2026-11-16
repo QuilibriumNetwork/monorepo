@@ -93,9 +93,13 @@ use quil_types::error::{QuilError, Result};
 use tracing::{info, warn};
 
 use crate::storage_ledger::HostLedger;
+use quil_execution::manager::FrameCheck;
 
 #[cfg(any(target_os = "macos", test))]
 mod macos_memory;
+
+#[cfg(test)]
+mod frame_verifier_tests;
 
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
@@ -491,19 +495,27 @@ pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservati
     admission().reserve_until(bytes, Urgency::Due, expired)
 }
 
+/// How long a verification a finalized frame waits on waits for memory in
+/// its place, past its caller's short slot deadline
+/// ([`Admission::reserve_verifier`]).
+pub const FRAME_VERIFIER_MEMORY_WAIT: Duration = Duration::from_secs(300);
+
+/// At most one line per interval for a frame's checks running alone.
+const FRAME_ALONE_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// Transaction-verifier children share storage jobs' memory and host ledger.
-/// They never use the oversized-job escape, and respect their caller's short
-/// admission deadline so a memory wait cannot block frame execution.
-pub fn reserve_verifier_until(bytes: u64, deadline: Instant) -> Option<Reservation> {
-    let expired = || Instant::now() >= deadline || stopping();
-    if stopping() {
-        return None;
-    }
-    // Like verifier slot admission, try once even for a zero wait budget.
-    // The deadline cancels waiting; it does not forbid an immediate grant.
-    admission()
-        .reserve_until(bytes, Urgency::Verification, &expired)
-        .filter(|_| !stopping())
+/// They respect their caller's short admission deadline, so a memory wait
+/// cannot block frame execution, and never run alone beyond the share;
+/// except one a finalized frame waits on (`frame`), which runs alone on the
+/// host when it does not fit ([`Urgency::FrameVerification`]), and, verified
+/// off the engine's thread by the admission queue ([`FrameCheck::Queued`]),
+/// waits up to [`FRAME_VERIFIER_MEMORY_WAIT`] in its place.
+pub fn reserve_verifier_until(
+    bytes: u64,
+    deadline: Instant,
+    frame: FrameCheck,
+) -> Option<Reservation> {
+    admission().reserve_verifier(bytes, deadline, frame)
 }
 
 /// A 512 MiB sector's resident labelling reservation is about 2.6 GiB.
@@ -694,7 +706,18 @@ pub enum Urgency {
     Due,
     /// Due now, but always bounded by memory, including when alone.
     Verification,
+    /// A verification a finalized frame waits on: bounded by memory, but
+    /// alone on the host beyond it unless the kernel's memory pressure is
+    /// critical; else the frame never executes ([`Admission::fits`]).
+    FrameVerification,
     Ahead,
+}
+
+impl Urgency {
+    /// A proof verification's child, whether a frame waits on it or not.
+    fn verification(self) -> bool {
+        matches!(self, Self::Verification | Self::FrameVerification)
+    }
 }
 
 /// What work ahead was asked to give its memory back to
@@ -918,6 +941,23 @@ fn available_memory() -> Option<u64> {
     }
 }
 
+/// The kernel's memory pressure level where it reports one: macOS's
+/// normal 1, warning 2, [`PRESSURE_CRITICAL`] 4; `None` elsewhere.
+fn kernel_pressure() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_memory::pressure()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The kernel's critical memory pressure level ([`kernel_pressure`]): not
+/// even a frame's proof check starts alone then ([`Admission::fits`]).
+const PRESSURE_CRITICAL: u32 = 4;
+
 /// Bytes that must be available for `bytes` of work ahead to fit with no
 /// job holding memory ([`Admission::fits`], [`MEMORY_SHARE_PERCENT`]).
 fn needs_available(bytes: u64) -> u64 {
@@ -1111,6 +1151,12 @@ pub struct Admission {
     state: Mutex<State>,
     /// [`PASS_WINDOW`], shorter in tests.
     pass_window: Duration,
+    /// [`FRAME_VERIFIER_MEMORY_WAIT`], shorter in tests.
+    frame_verifier_wait: Duration,
+    /// Whether the node is stopping ([`stopping`]); its own in tests.
+    stopping: fn() -> bool,
+    /// [`kernel_pressure`]; its own in tests.
+    pressure: fn() -> Option<u32>,
     changed: Condvar,
     slots: usize,
     /// [`ahead_jobs_for`]; more in tests of the memory alone.
@@ -1146,6 +1192,9 @@ struct State {
     alone: Option<(u64, std::fs::File)>,
     /// The alone lock taken by the fit being granted.
     alone_pending: Option<std::fs::File>,
+    /// When a frame's check running alone was last logged, and how many
+    /// have since ([`Admission::frame_alone`]).
+    frame_alone_logged: Option<(Instant, u64)>,
     /// Since when another process has kept the turn to decide, and whether
     /// this one has logged deciding without it ([`Admission::grant_turn`]).
     grant_busy: Option<(Instant, bool)>,
@@ -1179,11 +1228,26 @@ struct State {
     granted: HashSet<u64>,
     /// Waiting reservations later ones passed, by ticket.
     passed: HashMap<u64, Passed>,
+    /// Work due now a frame's check waiting for memory held back, by ticket
+    /// ([`Admission::frame_held_over`]).
+    frame_held: HashMap<u64, FrameHeld>,
+    /// Such work held back past its bound and still waiting after the last
+    /// pass, by ticket: frames' checks wait for it while it waits
+    /// ([`due_overdue`]).
+    overdue: Vec<u64>,
     /// Whether a reservation was asked for, given back, resized or left
     /// since the last pass.
     stale: bool,
     /// When the last pass was.
     last_pass: Option<Instant>,
+    /// Passes that took their turn, for tests to wait on a pass rather
+    /// than on time.
+    #[cfg(test)]
+    passes: u64,
+    /// The next ticket when the last pass that took its turn began: every
+    /// reservation still waiting with a lower ticket was waiting then.
+    #[cfg(test)]
+    passed_below: u64,
     /// Reservations held for leaves labelled now
     /// ([`Reservation::labelling_now`]).
     labelling_now: usize,
@@ -1256,6 +1320,19 @@ struct Passed {
     holding: bool,
 }
 
+/// Work due now held back while a frame's check waits for memory
+/// ([`State::frame_held`]).
+#[derive(Debug, Clone, Copy)]
+struct FrameHeld {
+    /// When it was first held back: kept until it starts, through passes
+    /// no frame's check waits ([`Admission::frame_held_over`]).
+    first: Instant,
+    /// Frames' checks granted in this process since.
+    grants: u32,
+    /// Whether it was logged as taking its place.
+    logged: bool,
+}
+
 /// One look at the memory beside the reservations held ([`Admission`]).
 #[derive(Debug, Clone, Copy)]
 struct Look {
@@ -1263,6 +1340,27 @@ struct Look {
     idle_available: u64,
     window_low: u64,
     share: u64,
+}
+
+/// Whether a check a finalized frame waits on waits for memory, in this
+/// process or, as their records last said, the host's others: other work
+/// due now waits meanwhile ([`Admission::admit_waiting`]).
+fn frame_check_waits(state: &State) -> bool {
+    state.others.frame_waiting
+        || state
+            .waiting
+            .iter()
+            .any(|waiting| waiting.urgency == Urgency::FrameVerification)
+}
+
+/// Whether work due now held back past its bound by frames' checks
+/// ([`State::overdue`]) still waits: not once it left its queue or was
+/// granted, whichever path wrote the record after.
+fn due_overdue(state: &State) -> bool {
+    state
+        .overdue
+        .iter()
+        .any(|&ticket| state.waiting.iter().any(|w| w.ticket == ticket))
 }
 
 /// What keeps a waiting job from starting: every slot held (`job_slots`),
@@ -1294,6 +1392,9 @@ impl Admission {
             strict_due: false,
             state: Mutex::new(State::default()),
             pass_window: PASS_WINDOW,
+            frame_verifier_wait: FRAME_VERIFIER_MEMORY_WAIT,
+            stopping,
+            pressure: kernel_pressure,
             changed: Condvar::new(),
             slots: slots.max(1),
             ahead_jobs: AHEAD_JOBS,
@@ -1380,14 +1481,23 @@ impl Admission {
         let Some(ledger) = self.ledger.get() else {
             return;
         };
+        // With every job slot held, what waits waits for a slot, not for
+        // memory: the host's other processes need give none back.
+        let for_memory = state.holders < self.slots;
         let held = crate::storage_ledger::Held {
             bytes: state.reserved,
             ahead: state.yielding.len() as u64,
-            due_waiting: state.holders < self.slots
+            due_waiting: for_memory
                 && state
                     .waiting
                     .iter()
                     .any(|waiting| waiting.urgency != Urgency::Ahead),
+            frame_waiting: for_memory
+                && state
+                    .waiting
+                    .iter()
+                    .any(|waiting| waiting.urgency == Urgency::FrameVerification),
+            due_overdue: for_memory && due_overdue(state),
         };
         if let Err(error) = ledger.publish(held) {
             if !self.ledger_warned.swap(true, Ordering::Relaxed) {
@@ -1487,6 +1597,39 @@ impl Admission {
         self.reserve_ordered(bytes, urgency, None, true, expired)
     }
 
+    /// [`reserve_verifier_until`] on this admission.
+    pub fn reserve_verifier(
+        &'static self,
+        bytes: u64,
+        deadline: Instant,
+        frame: FrameCheck,
+    ) -> Option<Reservation> {
+        let stopping = self.stopping;
+        // A frame's check may run alone. Queued, off the engine's thread, it
+        // also keeps its place past its caller's deadline: work ahead yields
+        // to it, and other work due now waits while it does, here and in the
+        // host's other processes, so the jobs holding memory drain and it
+        // fits, or runs alone. On the engine's thread, or the
+        // lanes it waits on, it keeps its caller's deadline: the engine
+        // never blocks for memory, and the frame retries.
+        let (deadline, urgency) = match frame {
+            FrameCheck::Queued => {
+                let place = Instant::now() + self.frame_verifier_wait;
+                (deadline.max(place), Urgency::FrameVerification)
+            }
+            FrameCheck::Inline => (deadline, Urgency::FrameVerification),
+            FrameCheck::No => (deadline, Urgency::Verification),
+        };
+        let expired = || Instant::now() >= deadline || stopping();
+        if stopping() {
+            return None;
+        }
+        // Like verifier slot admission, try once even for a zero wait budget.
+        // The deadline cancels waiting; it does not forbid an immediate grant.
+        self.reserve_until(bytes, urgency, &expired)
+            .filter(|_| !stopping())
+    }
+
     /// A ticket: the order reservations and seats ([`ahead_place`]) asked.
     fn next_ticket(&self) -> u64 {
         let mut state = self.state();
@@ -1538,7 +1681,9 @@ impl Admission {
         // Work due now goes before every reservation for work ahead, and
         // before larger ones for work due now: the shortest ends first.
         let place = match urgency {
-            Urgency::Due | Urgency::Verification => (0, bytes, ticket, 0, 0),
+            Urgency::Due | Urgency::Verification | Urgency::FrameVerification => {
+                (0, bytes, ticket, 0, 0)
+            }
             Urgency::Ahead => {
                 let order = order.unwrap_or(AheadOrder {
                     deferrable: false,
@@ -1575,7 +1720,7 @@ impl Admission {
         let started = Instant::now();
         let mut waited = false;
         while !self.take_grant(&mut state, ticket) {
-            if urgency == Urgency::Verification {
+            if urgency.verification() {
                 // A zero admission wait means try once, then refuse promptly.
                 drop(state);
                 let gone = expired();
@@ -1623,17 +1768,21 @@ impl Admission {
                         idle_available = look.map(|look| look.idle_available),
                         window_low = look.map(|look| look.window_low),
                         share = look.map(|look| look.share),
+                        pressure = (self.pressure)(),
                         ahead = state
                             .waiting
                             .iter()
                             .position(|waiting| waiting.ticket == ticket)
                             .unwrap_or(0),
                         due = urgency != Urgency::Ahead,
+                        frame_check_waits = frame_check_waits(&state),
                         "storage job waits to start: `limit` is what binds: memory (the \
                          reservations held plus this job exceed the share), job_slots (every \
                          slot is held) or queue_order (it would fit, but a job ahead of it in \
-                         order waits for memory and holds its place); an expected wait that \
-                         ends when a job ends"
+                         order waits for memory and holds its place); work due now also waits \
+                         while frame_check_waits (a finalized frame's check, here or in \
+                         another process of the node, waits for the memory jobs hold); an \
+                         expected wait that ends when a job ends"
                     );
                 }
             }
@@ -1641,7 +1790,7 @@ impl Admission {
                 .changed
                 .wait_timeout(
                     state,
-                    if urgency == Urgency::Verification {
+                    if urgency.verification() {
                         RECHECK.min(Duration::from_millis(25))
                     } else {
                         RECHECK
@@ -1653,7 +1802,7 @@ impl Admission {
             drop(state);
             let gone = expired();
             state = self.state();
-            if urgency == Urgency::Verification {
+            if urgency.verification() {
                 // A different process may have yielded since the last look.
                 state.stale = true;
             }
@@ -1680,7 +1829,7 @@ impl Admission {
             bytes,
             ticket,
             labelling: false,
-            verification: urgency == Urgency::Verification,
+            verification: urgency.verification(),
         })
     }
 
@@ -1714,7 +1863,17 @@ impl Admission {
     ///   rank, or first passed [`PASS_WINDOW`] ago. It holds its place until
     ///   it fits beside the jobs holding memory, at the latest once they end
     ///   and it runs alone. Work ahead that does not fit with no job holding
-    ///   memory holds no place: no job ending will make it fit.
+    ///   memory holds no place: no job ending will make it fit;
+    /// - other work due now waits while a check a finalized frame waits on
+    ///   waits for memory, here or in the host's other processes
+    ///   ([`frame_check_waits`]), so the jobs holding memory drain and the
+    ///   check fits, or runs alone. It counts no pass of the check and holds
+    ///   no place: one passed [`PASS_LIMIT`] times would keep a check behind
+    ///   it waiting. Held back past [`PASS_LIMIT`] frames' checks granted
+    ///   here or [`PASS_WINDOW`], work that fits once no job holds memory
+    ///   takes its place: frames' checks, here and in the host's other
+    ///   processes, wait until it starts or leaves its queue
+    ///   ([`Self::frame_held_over`], [`due_overdue`]).
     ///
     /// Then asks work ahead holding memory to give it back, as much as the
     /// first in line lack ([`Self::ask_yields`]).
@@ -1729,10 +1888,16 @@ impl Admission {
             return;
         };
         state.stale = false;
+        #[cfg(test)]
+        {
+            state.passes += 1;
+            state.passed_below = state.next_ticket;
+        }
         self.read_others(state);
         self.yield_to_elsewhere(state);
         self.ask_yields(state);
         let asked = state.yielding.values().any(|yielding| yielding.asked);
+        let over = self.frame_held_over(state);
         let mut skipped: Vec<(u64, u8)> = Vec::new();
         // The rank of one holding its place: nothing of its rank passes it.
         let mut holding: Option<u8> = None;
@@ -1757,16 +1922,43 @@ impl Admission {
                 index += 1;
                 continue;
             }
+            if matches!(waiting.urgency, Urgency::Due | Urgency::Verification)
+                && frame_check_waits(state)
+                && !over.contains(&waiting.ticket)
+            {
+                let now = Instant::now();
+                state.frame_held.entry(waiting.ticket).or_insert(FrameHeld {
+                    first: now,
+                    grants: 0,
+                    logged: false,
+                });
+                index += 1;
+                continue;
+            }
+            if waiting.urgency == Urgency::FrameVerification
+                && (state.others.due_overdue
+                    || over
+                        .iter()
+                        .any(|&ticket| state.waiting.iter().any(|w| w.ticket == ticket)))
+            {
+                index += 1;
+                continue;
+            }
             let alone = state.holders == 0;
             if self.fits(state, waiting.bytes, waiting.urgency) {
                 ahead_granted |= waiting.urgency == Urgency::Ahead;
                 state.waiting.remove(index);
                 state.reserved = state.reserved.saturating_add(waiting.bytes);
-                if waiting.urgency == Urgency::Verification {
+                if waiting.urgency.verification() {
                     state.verifier_bytes = state.verifier_bytes.saturating_add(waiting.bytes);
                 }
                 state.holders += 1;
                 state.granted.insert(waiting.ticket);
+                if waiting.urgency == Urgency::FrameVerification {
+                    for held in state.frame_held.values_mut() {
+                        held.grants = held.grants.saturating_add(1);
+                    }
+                }
                 if let Some(lock) = state.alone_pending.take() {
                     state.alone = Some((waiting.ticket, lock));
                 }
@@ -1803,12 +1995,77 @@ impl Admission {
             skipped.push((waiting.ticket, rank));
             index += 1;
         }
+        state.overdue = over
+            .into_iter()
+            .filter(|&ticket| state.waiting.iter().any(|w| w.ticket == ticket))
+            .collect();
         self.note_held_back(state, ahead_granted, alone_short);
         if granted {
             self.ask_yields(state);
             self.changed.notify_all();
         }
         self.publish(state);
+    }
+
+    /// The work due now held back while frames' checks waited for memory
+    /// ([`frame_check_waits`]) that takes its place: held back past
+    /// [`PASS_LIMIT`] of them granted in this process, or [`PASS_WINDOW`],
+    /// so a stream of checks running alone one after another keeps it
+    /// waiting no longer. Only work that fits once no job holds memory:
+    /// the checks wait for it, and one that never would fit would keep
+    /// every frame from executing. Forgets what no longer waits; logged
+    /// once per reservation.
+    ///
+    /// The bound counts from when it was first held back, not restarted
+    /// while no check waits: checks running one after another leave such
+    /// moments (one runs, the next not yet asked), and a restart there
+    /// would hold it back afresh with every check. So work held back once
+    /// and then waiting [`PASS_WINDOW`] for memory beside other jobs takes
+    /// its place before the next check; only work that would fit alone.
+    fn frame_held_over(&self, state: &mut State) -> Vec<u64> {
+        let State {
+            frame_held,
+            waiting,
+            ..
+        } = &mut *state;
+        frame_held.retain(|ticket, _| waiting.iter().any(|w| w.ticket == *ticket));
+        let due: Vec<Waiting> = waiting
+            .iter()
+            .filter(|w| matches!(w.urgency, Urgency::Due | Urgency::Verification))
+            .filter(|w| {
+                frame_held.get(&w.ticket).is_some_and(|held| {
+                    held.grants >= PASS_LIMIT || held.first.elapsed() >= self.pass_window
+                })
+            })
+            .copied()
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let share = self.share(state);
+        let mut over = Vec::new();
+        for w in due {
+            let alone = w.urgency == Urgency::Due && !self.strict_due;
+            if !alone && share.is_none_or(|share| w.bytes > share) {
+                continue;
+            }
+            if let Some(held) = state.frame_held.get_mut(&w.ticket) {
+                if !held.logged {
+                    held.logged = true;
+                    info!(
+                        bytes = w.bytes,
+                        seconds = held.first.elapsed().as_secs_f64(),
+                        frame_checks_granted = held.grants,
+                        "storage job due now takes its place before frames' proof checks: they \
+                         held it back while waiting for memory past the bound; frames' checks \
+                         here and in the node's other processes on this host wait until it \
+                         starts: an expected wait"
+                    );
+                }
+            }
+            over.push(w.ticket);
+        }
+        over
     }
 
     /// Note work ahead held back for memory ([`State::held_back`]) after a
@@ -2149,7 +2406,7 @@ impl Admission {
             state.waiting.remove(index);
         } else if state.granted.remove(&ticket) {
             state.reserved = state.reserved.saturating_sub(bytes);
-            if urgency == Urgency::Verification {
+            if urgency.verification() {
                 state.verifier_bytes = state.verifier_bytes.saturating_sub(bytes);
             }
             state.holders = state.holders.saturating_sub(1);
@@ -2263,8 +2520,10 @@ impl Admission {
     /// The host's other processes' reservations count as held
     /// ([`install_host_ledger`]). Work due now beyond the share runs alone
     /// on the host: while no other process's jobs hold memory and it holds
-    /// the host's alone lock, so one process at a time decides it. Work
-    /// ahead starts nowhere while another process's work due now waits for
+    /// the host's alone lock, so one process at a time decides it; not
+    /// under strict (macOS) admission, and a verification never, except
+    /// one a finalized frame waits on ([`Self::frame_alone`]). Work ahead
+    /// starts nowhere while another process's work due now waits for
     /// memory or runs alone.
     fn fits(&self, state: &mut State, bytes: u64, urgency: Urgency) -> bool {
         let now = Instant::now();
@@ -2288,6 +2547,7 @@ impl Admission {
                     within || (!self.strict_due && others == 0 && self.take_alone(state))
                 }
                 Urgency::Verification => within,
+                Urgency::FrameVerification => within || self.frame_alone(state, bytes, others),
                 // Unknown memory: one at a time on the host.
                 Urgency::Ahead => {
                     within || (!self.strict_due && state.idle_available.is_none() && others == 0)
@@ -2300,6 +2560,43 @@ impl Admission {
         self.share(state).is_some_and(|share| {
             u128::from(state.reserved) + u128::from(others) + u128::from(bytes) <= u128::from(share)
         })
+    }
+
+    /// Whether a verification a finalized frame waits on, not fitting the
+    /// share, runs alone on the host ([`Urgency::FrameVerification`]): no
+    /// reservation held here (the caller's) or by the host's other
+    /// processes, the kernel's memory pressure not critical, and the host's
+    /// alone lock taken. Strict macOS admission refuses it otherwise at any
+    /// pressure, and the frame waiting on it never executes.
+    fn frame_alone(&self, state: &mut State, bytes: u64, others: u64) -> bool {
+        if others > 0 {
+            return false;
+        }
+        let pressure = (self.pressure)();
+        if pressure == Some(PRESSURE_CRITICAL) || !self.take_alone(state) {
+            return false;
+        }
+        // One line per interval: on a host short of memory every frame's
+        // checks may run alone.
+        let now = Instant::now();
+        let since = match &mut state.frame_alone_logged {
+            Some((at, since)) if now.duration_since(*at) < FRAME_ALONE_LOG_EVERY => {
+                *since = since.saturating_add(1);
+                return true;
+            }
+            logged => logged.replace((now, 0)).map_or(0, |(_, since)| since),
+        };
+        info!(
+            bytes,
+            available = state.idle_available,
+            pressure,
+            more_since_last_line = since,
+            "proof check a finalized frame waits on runs alone on the host beyond the memory \
+             share: nothing else holds memory and the kernel's memory pressure is not \
+             critical; the host may compress or swap memory until it ends, else the frame \
+             would never execute; logged at most once a minute"
+        );
+        true
     }
 
     /// Take the host's alone lock for work due now beyond the share

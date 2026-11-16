@@ -752,10 +752,17 @@ impl TokenExecutionEngine {
         if operations.is_empty() {
             return counts;
         }
-        let background;
+        // The lanes verify on threads of their own: what the caller knows
+        // of the verification travels in the worker, not in thread state.
+        let paced;
         let worker = if pacing.background {
-            background = worker.background();
-            &background
+            paced = worker.background();
+            &paced
+        } else if pacing.frame
+            != quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck::No
+        {
+            paced = worker.for_frame(pacing.frame);
+            &paced
         } else {
             worker
         };
@@ -1203,6 +1210,14 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             inner_tp,
                         )
                     });
+                    // Execution runs only frames, finalized or replayed:
+                    // the frame waits on these checks, on this thread, within
+                    // their caller's deadline.
+                    let frame_worker = self.token_worker.as_ref().map(|worker| {
+                        worker.for_frame(
+                            quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck::Inline,
+                        )
+                    });
                     if commits {
                         return match effective_mode(self.mode, context) {
                             ExecutionMode::Application => policy.dispatch_for_commit(
@@ -1212,7 +1227,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _address,
                                 inner_bytes,
                                 inner_tp,
-                                self.token_worker.as_ref(),
+                                frame_worker.as_ref(),
                                 paid_allowance.take(),
                             ),
                             ExecutionMode::Global => policy.dispatch_commit_inline(
@@ -1222,7 +1237,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _address,
                                 inner_bytes,
                                 inner_tp,
-                                self.token_worker.as_ref(),
+                                frame_worker.as_ref(),
                                 paid_allowance.take(),
                             ),
                         };
@@ -1234,7 +1249,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             self.clock_store.as_ref(),
                             _address,
                             inner_bytes,
-                            self.token_worker.as_ref(),
+                            frame_worker.as_ref(),
                         );
                     }
                     // Every other confidential operation commits through the

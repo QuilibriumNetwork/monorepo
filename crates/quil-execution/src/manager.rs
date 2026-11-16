@@ -1,3 +1,5 @@
+#[cfg(feature = "confidential-tokens")]
+pub use quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck;
 #[cfg(all(test, feature = "confidential-tokens"))]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use std::collections::HashMap;
@@ -299,14 +301,17 @@ pub struct OperationEstimate {
 /// How a pre-verification pass runs: at most `parallelism` operations at once
 /// (default: the worker's slots), each finished one counted into `done`, none
 /// started while `pause` returns true, as `background` work (no finalized
-/// frame waits on it) leaving the first node-wide worker slot free, and
-/// ahead of `executing` (default: a frame not known yet).
+/// frame waits on it) leaving the first node-wide worker slot free, or as
+/// work a finalized frame waits on (`frame`, told to the worker's memory
+/// admission), and ahead of `executing` (default: a frame not known yet).
 #[derive(Default)]
 pub struct PreverifyPacing<'a> {
     pub parallelism: Option<usize>,
     pub done: Option<&'a std::sync::atomic::AtomicUsize>,
     pub pause: Option<&'a (dyn Fn() -> bool + Sync)>,
     pub background: bool,
+    #[cfg(feature = "confidential-tokens")]
+    pub frame: FrameCheck,
     pub executing: ExecutingFrame,
 }
 
@@ -636,6 +641,9 @@ impl ExecutionEngineManager {
             bundles,
             &PreverifyPacing {
                 executing: ExecutingFrame::Global(frame),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
                 ..Default::default()
             },
         )
@@ -655,6 +663,9 @@ impl ExecutionEngineManager {
             bundles,
             &PreverifyPacing {
                 executing: ExecutingFrame::App(anchor),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
                 ..Default::default()
             },
         )
