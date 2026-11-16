@@ -546,8 +546,9 @@ struct ConnectState {
 enum ConnectNote {
     /// The archive's outage: every endpoint of it this node knows fails.
     Archive(quil_engine::outage::OutageEvent),
-    /// This endpoint fails while `reachable`, an endpoint of the same archive
-    /// on the other IP family, connects: this family is unreachable from here.
+    /// This endpoint fails while endpoints of the same archive connect, all
+    /// on the other IP family (`reachable` is one): this family is
+    /// unreachable from here.
     FamilyUnreachable { reachable: String },
     /// This endpoint fails while `reachable`, another endpoint of the same
     /// archive on the same family (or named by DNS), connects.
@@ -673,9 +674,9 @@ pub fn archive_directory(
 
 /// Record one connection attempt to `addr`; returns the transition to log.
 /// A failure while another endpoint of the same archive last connected is
-/// noted once, as that family's when the two are IP literals of different
-/// families, else as that address's; the archive's outage begins only when
-/// none of its endpoints connects.
+/// noted once: as that address's when such an endpoint is on the same
+/// family (or either is named by DNS), else as that family's; the archive's
+/// outage begins only when none of its endpoints connects.
 fn connect_outage(addr: &str, ok: bool) -> Option<ConnectNote> {
     let now = std::time::Instant::now();
     let (archive, siblings) = archive_of(addr);
@@ -697,18 +698,20 @@ fn connect_outage(addr: &str, ok: bool) -> Option<ConnectNote> {
             .map(ConnectNote::Archive)
             .or(recovered.then_some(ConnectNote::AddressRecovered));
     }
-    let reachable = siblings
+    let (other_family, same_family): (Vec<String>, Vec<String>) = siblings
         .into_iter()
-        .find(|sibling| state.last.get(sibling) == Some(&None));
-    if let Some(reachable) = reachable {
-        if !state.sibling_down.insert(addr.to_string()) {
-            return None;
-        }
-        return Some(if other_ip_family(addr, &reachable) {
-            ConnectNote::FamilyUnreachable { reachable }
-        } else {
-            ConnectNote::AddressUnreachable { reachable }
-        });
+        .filter(|sibling| state.last.get(sibling) == Some(&None))
+        .partition(|sibling| other_ip_family(addr, sibling));
+    let note = match (
+        same_family.into_iter().min(),
+        other_family.into_iter().min(),
+    ) {
+        (Some(reachable), _) => Some(ConnectNote::AddressUnreachable { reachable }),
+        (None, Some(reachable)) => Some(ConnectNote::FamilyUnreachable { reachable }),
+        (None, None) => None,
+    };
+    if let Some(note) = note {
+        return state.sibling_down.insert(addr.to_string()).then_some(note);
     }
     state
         .outages
@@ -748,15 +751,15 @@ fn log_connect_outage(addr: &str, note: Option<ConnectNote>, error_chain: &str) 
         }
         Some(ConnectNote::FamilyUnreachable { reachable }) => {
             info!(%addr, family, %reachable, error_chain, scope = "self",
-                action = "no action needed: this node reaches the archive at the other \
-                          address; check this node's route for that family only if every \
+                action = "no action needed: this node reaches the archive on the other \
+                          family; check this node's route for this family only if every \
                           archive shows it",
-                "archive unreachable on this address family; using its other address")
+                "archive unreachable on this address family; using its other family")
         }
         Some(ConnectNote::AddressUnreachable { reachable }) => {
             info!(%addr, family, %reachable, error_chain, scope = "peer",
                 action = "no action needed: this node reaches the archive at another address",
-                "archive unreachable at this address; using its other address")
+                "archive unreachable at this address; using another of its addresses")
         }
         Some(ConnectNote::AddressRecovered) => {
             info!(%addr, family, "archive reachable at this address again")
@@ -2438,6 +2441,35 @@ mod pinned_archive_tests {
         );
     }
 
+    /// The attempt started on a failure gets a full stagger before the next
+    /// starts, as one started on the stagger does (RFC 8305 section 5).
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_started_on_a_failure_gets_a_full_stagger() {
+        let fail: std::net::SocketAddr = "192.0.2.75:8340".parse().unwrap();
+        let hang: std::net::SocketAddr = "[2001:db8::75]:8340".parse().unwrap();
+        let live: std::net::SocketAddr = "192.0.2.76:8340".parse().unwrap();
+        let (delay, fails_after) = (Duration::from_secs(10), Duration::from_secs(4));
+        let start = tokio::time::Instant::now();
+        let connected = happy_eyeballs(vec![fail, hang, live], delay, move |addr| async move {
+            if addr == fail {
+                tokio::time::sleep(fails_after).await;
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            if addr == hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(addr)
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, live);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= fails_after + delay,
+            "stagger_not_reset_on_failure: the third attempt started after {elapsed:?}"
+        );
+    }
+
     /// A dial whose every attempt fails returns the last attempt's error,
     /// and one over no address says so.
     #[tokio::test(start_paused = true)]
@@ -2468,29 +2500,38 @@ mod pinned_archive_tests {
         assert_eq!(none.kind(), std::io::ErrorKind::AddrNotAvailable);
     }
 
-    /// Two endpoints of one archive on the same family (or one named by
-    /// DNS): one failing while the other connects is noted once, as that
-    /// address's, never as an unreachable address family.
+    /// Two IPv4 endpoints of one archive, one named by DNS and one IPv6:
+    /// an IPv4 one failing while the other IPv4 one and the IPv6 one connect
+    /// is noted once, as that address's, never as an unreachable address
+    /// family, whichever sibling the pin table yields first; so is the
+    /// DNS-named one failing.
     #[test]
     fn a_same_family_sibling_failing_is_no_family_note() {
-        let archive = quil_p2p::PeerId::random();
-        let (a, b, name) = (
-            "192.0.2.61:8340",
-            "192.0.2.62:8340",
-            "archive61.example:8340",
-        );
-        for endpoint in [a, b, name] {
-            pin_archive_peer(endpoint, archive).unwrap();
-        }
-        assert_eq!(connect_outage(a, true), None);
-        for endpoint in [b, name] {
-            let note = connect_outage(endpoint, false);
-            assert!(note.is_some(), "the failing address is noted");
-            assert!(
-                !matches!(note, Some(ConnectNote::FamilyUnreachable { .. })),
-                "same_family_sibling_called_family: {endpoint} {note:?}"
+        for n in 0..32 {
+            let archive = quil_p2p::PeerId::random();
+            let a = format!("192.0.2.{}:8340", 100 + n);
+            let b = format!("198.51.100.{}:8340", 100 + n);
+            let v6 = format!("[2001:db8::61:{n}]:8340");
+            let name = format!("archive{n}.example:8340");
+            for endpoint in [&a, &b, &v6, &name] {
+                pin_archive_peer(endpoint, archive).unwrap();
+            }
+            assert_eq!(connect_outage(&a, true), None);
+            assert_eq!(connect_outage(&v6, true), None);
+            for endpoint in [&b, &name] {
+                let note = connect_outage(endpoint, false);
+                assert!(note.is_some(), "the failing address is noted");
+                assert!(
+                    !matches!(note, Some(ConnectNote::FamilyUnreachable { .. })),
+                    "same_family_sibling_called_family: {endpoint} {note:?}"
+                );
+                assert_eq!(connect_outage(endpoint, false), None, "noted once");
+            }
+            assert_eq!(
+                connect_outage(&a, false),
+                Some(ConnectNote::FamilyUnreachable { reachable: v6 }),
+                "only the other family left connecting"
             );
-            assert_eq!(connect_outage(endpoint, false), None, "noted once");
         }
     }
 
