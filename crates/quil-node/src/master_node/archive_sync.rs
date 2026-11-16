@@ -3427,7 +3427,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 crate::prover_tree_syncer_prod::source_failed(addr);
                             }
                         }
-                        let archives = sync_pool.len().await;
+                        let archives = sync_pool.get_all().await.len();
                         warn!(rounds = INITIAL_SYNC_ROUNDS, archives,
                             retry_every_s = sync_interval_secs, scope = "this node",
                             action = "check this node's outbound connections and DNS to the archives \

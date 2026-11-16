@@ -141,6 +141,24 @@ struct ArchiveEndpointPoolInner {
     cursor: usize,
 }
 
+/// [`ArchiveEndpointPool::get_all`] over `endpoints`.
+fn one_per_archive(endpoints: &[String]) -> Vec<String> {
+    use crate::archive_client::{endpoint_last_failed, pinned_archive_peer};
+    let mut chosen: Vec<(Option<quil_p2p::PeerId>, String)> = Vec::new();
+    for endpoint in endpoints {
+        let peer = pinned_archive_peer(endpoint);
+        match peer.and_then(|peer| chosen.iter().position(|(held, _)| *held == Some(peer))) {
+            None => chosen.push((peer, endpoint.clone())),
+            Some(index) => {
+                if endpoint_last_failed(&chosen[index].1) && !endpoint_last_failed(endpoint) {
+                    chosen[index].1 = endpoint.clone();
+                }
+            }
+        }
+    }
+    chosen.into_iter().map(|(_, endpoint)| endpoint).collect()
+}
+
 impl ArchiveEndpointPool {
     /// Build a pool with the given blacklist TTL. `Duration::ZERO` disables
     /// blacklisting (see the `blacklist_ttl` field). The production default
@@ -185,8 +203,20 @@ impl ArchiveEndpointPool {
         self.inner.lock().await.endpoints.len()
     }
 
-    /// Get all current archive endpoints (for submitting prover messages).
+    /// One endpoint per known archive, for callers that fan out to archives
+    /// (submitting prover messages, picking distinct anchors): endpoints
+    /// pinned to the same peer are one archive, at the place of its first
+    /// endpoint. Of an archive's endpoints the first whose last connection
+    /// did not fail is offered, so an archive this node reaches on one
+    /// address family only is sent to once, on the family that connects.
     pub async fn get_all(&self) -> Vec<String> {
+        let endpoints = self.inner.lock().await.endpoints.clone();
+        one_per_archive(&endpoints)
+    }
+
+    /// Every known endpoint, each family of an archive apart (the archive
+    /// directory this node serves its own processes).
+    pub async fn endpoints(&self) -> Vec<String> {
         self.inner.lock().await.endpoints.clone()
     }
 
@@ -1475,6 +1505,32 @@ mod pool_tests {
         pool.add("b.example.com:443".into()).await;
         let all = pool.get_all().await;
         assert_eq!(all, vec!["a.example.com:443", "b.example.com:443"]);
+    }
+
+    /// An archive announcing an IPv4 and an IPv6 endpoint is one archive
+    /// to fan-out callers: the family that last connected is offered, and
+    /// three archives give three distinct anchors.
+    #[tokio::test]
+    async fn get_all_offers_one_endpoint_per_archive() {
+        use crate::archive_client::pin_archive_peer;
+        let p = pool();
+        let dual = quil_p2p::PeerId::random();
+        let (v6, v4) = ("[2001:db8::41]:8340", "192.0.2.41:8340");
+        pin_archive_peer(v6, dual).unwrap();
+        pin_archive_peer(v4, dual).unwrap();
+        for endpoint in [v6, v4, "192.0.2.42:8340", "192.0.2.43:8340"] {
+            p.add(endpoint.to_string()).await;
+        }
+        assert_eq!(p.endpoints().await.len(), 4, "every family stays known");
+        let all = p.get_all().await;
+        assert_eq!(all, vec![v6, "192.0.2.42:8340", "192.0.2.43:8340"]);
+        crate::archive_client::record_connect_for_tests(v4, true);
+        crate::archive_client::record_connect_for_tests(v6, false);
+        assert_eq!(
+            p.get_all().await,
+            vec![v4, "192.0.2.42:8340", "192.0.2.43:8340"],
+            "the family that connects is offered"
+        );
     }
 
     #[tokio::test]

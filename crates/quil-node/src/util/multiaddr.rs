@@ -33,12 +33,17 @@ pub(crate) fn stream_listen_host_port(ma: &str) -> Option<String> {
     }
 }
 
-/// Whether a p2p listen address on IPv6 leaves peers without a stream address
-/// to dial: the stream listener takes IPv4 only and no announce override names
-/// another. PeerInfo then carries no stream address.
-pub(crate) fn ipv6_p2p_without_stream(listen: &str, stream_listen: &str, announce: &str) -> bool {
+/// Whether a p2p listen address on IPv6, the main one or an additional one,
+/// leaves peers reaching this node over IPv6 without a stream address to dial:
+/// the stream listener takes IPv4 only and no announce override names
+/// another. PeerInfo then carries no IPv6 stream address.
+pub(crate) fn ipv6_p2p_without_stream(
+    listens: &[String],
+    stream_listen: &str,
+    announce: &str,
+) -> bool {
     let is_ip6 = |ma: &str| ma.trim_start_matches('/').starts_with("ip6/");
-    is_ip6(listen) && !is_ip6(stream_listen) && announce.is_empty()
+    listens.iter().any(|listen| is_ip6(listen)) && !is_ip6(stream_listen) && announce.is_empty()
 }
 
 /// The stream endpoint of a peer-info `host:port`: the pubsub port replaced by
@@ -457,16 +462,23 @@ mod tests {
 
     #[test]
     fn ipv6_p2p_with_the_default_ipv4_stream_listener_is_flagged() {
-        const P6: &str = "/ip6/::/udp/8336/quic-v1";
-        assert!(ipv6_p2p_without_stream(P6, "/ip4/0.0.0.0/tcp/8340", ""));
-        assert!(!ipv6_p2p_without_stream(P6, "/ip6/::/tcp/8340", ""));
+        let listens = |addrs: &[&str]| addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let p6 = listens(&["/ip6/::/udp/8336/quic-v1"]);
+        assert!(ipv6_p2p_without_stream(&p6, "/ip4/0.0.0.0/tcp/8340", ""));
+        assert!(!ipv6_p2p_without_stream(&p6, "/ip6/::/tcp/8340", ""));
         assert!(!ipv6_p2p_without_stream(
-            P6,
+            &p6,
             "/ip4/0.0.0.0/tcp/8340",
             "/ip6/2001:db8::7/tcp/8340"
         ));
         assert!(!ipv6_p2p_without_stream(
-            "/ip4/0.0.0.0/udp/8336/quic-v1",
+            &listens(&["/ip4/0.0.0.0/udp/8336/quic-v1"]),
+            "/ip4/0.0.0.0/tcp/8340",
+            ""
+        ));
+        // An additional IPv6 listen address counts as the main one does.
+        assert!(ipv6_p2p_without_stream(
+            &listens(&["/ip4/0.0.0.0/udp/8336/quic-v1", "/ip6/::/udp/8336/quic-v1"]),
             "/ip4/0.0.0.0/tcp/8340",
             ""
         ));
