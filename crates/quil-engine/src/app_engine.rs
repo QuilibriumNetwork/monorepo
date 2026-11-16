@@ -4116,6 +4116,28 @@ impl StorageEpochCheck {
                 .ok()
                 .flatten()
         };
+        // How the seal of the epoch just begun ended, once per seat.
+        if hash_storage_proofs_at(current) {
+            let ended = slot(current);
+            crate::seal_report::conclude(
+                shard,
+                current,
+                ended.as_ref().map(|slot| crate::seal_report::SlotView {
+                    sealed_at: slot.sealed_at,
+                    has_leaves: !slot.leaves.is_empty(),
+                }),
+                own_seat,
+                ended.as_ref().is_some_and(|slot| {
+                    crate::storage_epoch_batch::seal_unprovable(
+                        &member,
+                        shard,
+                        current.saturating_sub(2),
+                        slot.registered_at,
+                        &slot.leaves,
+                    )
+                }),
+            );
+        }
         // A registration this process found it cannot seal (its column
         // commitment is another labelling's) is not tried again: the
         // settlement waits for no seal, and no worker relabels its leaves.
@@ -4458,6 +4480,7 @@ impl StorageEpochCheck {
                         let seal_epoch = epoch + 2;
                         let unsealed = crate::storage_epoch_batch::unsealed_seat_outcome(seal_epoch);
                         let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
+                        crate::seal_report::note_refusal(&filter, seal_epoch, &error.to_string());
                         if !crate::storage_epoch_batch::seal_failed_for_good(&error.to_string()) {
                             warn!(epoch, seal_epoch, attempt, global_frame, filter = %hex::encode(&filter), %error, unsealed,
                                 "storage seal part not prepared: withdrawn from the node's batch, so the member's other seats are proved \
