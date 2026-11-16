@@ -3,9 +3,11 @@
 //! The binary lives in `main.rs`; this library exposes the reusable
 //! pieces (config, node-config resolution, key manager, gRPC connection,
 //! and the `Send` helper) so they can be unit- and integration-tested
-//! independently of `clap` argument parsing.
+//! independently of `clap` argument parsing. `cli` holds the command-line
+//! definition the binary parses with.
 
 pub mod alias_store;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod keys;
