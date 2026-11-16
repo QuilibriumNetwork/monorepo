@@ -26,11 +26,13 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 quil-engine = { path = ".." }
-quil-execution = { path = "../../quil-execution" }
+quil-execution = { path = "../../quil-execution", features = ["native-proof"] }
 
 [workspace]
 
 [patch.crates-io]
+commonware-consensus = { path = "../../commonware-consensus" }
+libp2p-gossipsub = { path = "../../libp2p-gossipsub" }
 jmt = { path = "../../jmt" }
 libp2p-identity = { path = "../../libp2p-identity" }
 libp2p-autonat = { path = "../../libp2p-autonat" }
