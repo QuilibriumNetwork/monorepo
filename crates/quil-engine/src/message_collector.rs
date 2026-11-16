@@ -16,6 +16,8 @@ use quil_execution::manager::ShieldClaim;
 
 mod cert_union;
 #[cfg(test)]
+mod held_seal_tests;
+#[cfg(test)]
 mod seal_deadline_tests;
 #[cfg(test)]
 mod seal_share_tests;
@@ -37,7 +39,9 @@ use window_seats::SeatEvent;
 
 /// Number of ranks to retain before pruning (matches Go's retention window).
 /// The public GLOBAL collector counts it in finalized frames
-/// ([`MessageCollector::prune_after_finalization`]).
+/// ([`MessageCollector::prune_after_finalization`]), and keeps a held
+/// storage epoch proof whose window ends within [`carry_lead_frames`] past
+/// it, until it rides, is evicted or its window ends.
 const RETENTION_WINDOW: u64 = 10;
 
 /// The one shard frame a message carries.
@@ -99,6 +103,43 @@ struct CollectedMessage {
     /// For a storage epoch proof the GLOBAL collector files: its seats, for
     /// the window line ([`window_seats::seat_ids`]), read as it is filed.
     seats: window_seats::Seats,
+    /// For a held storage epoch proof: the proposals that left it for a
+    /// later frame.
+    passed: Option<Passed>,
+}
+
+/// Why a proposal left a held storage epoch proof for a later frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// Past the proofs' share ([`SEAL_BYTES_PER_PROPOSAL`]), the room every
+    /// other message left had none for it.
+    SealBudget,
+    /// Within the proofs' share, the proposal's byte or item budget had no
+    /// room for it.
+    ProposalFull,
+}
+
+impl Skip {
+    fn as_str(self) -> &'static str {
+        match self {
+            Skip::SealBudget => "seal_budget",
+            Skip::ProposalFull => "proposal_full",
+        }
+    }
+}
+
+/// The proposals of this node that left a held storage epoch proof for a
+/// later frame ([`MessageCollector::snapshot_for_proposal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Passed {
+    /// The frame of the first.
+    first: u64,
+    /// The frame of the latest.
+    last: u64,
+    /// How many frames' proposals did, each counted once.
+    proposals: u32,
+    /// Why the latest did.
+    skip: Skip,
 }
 
 impl CollectedMessage {
@@ -138,6 +179,7 @@ impl CollectedMessage {
             member: kinds.member,
             own: false,
             seats: Default::default(),
+            passed: None,
         }
     }
 
@@ -517,20 +559,21 @@ pub(crate) const SEAL_BYTES_PER_PROPOSAL: usize = 8 << 20;
 
 /// Bytes of storage epoch proofs ([`CollectedMessage::held_seal`]) from this
 /// node and active provers the GLOBAL collector holds across all its ranks:
-/// what this archive's own frames carry before a held proof ages out. A
-/// sender stops resending a proof once one archive accepts it, so a proof
-/// only this archive took rides only a frame this archive leads. A held proof
-/// can ride the `RETENTION_WINDOW + 1` frames that finalize after it arrives
+/// what two of this archive's own frames carry. A sender stops resending a
+/// proof once one archive accepts it, so a proof only this archive took
+/// rides only a frame this archive leads. A held proof whose window ends
+/// within [`carry_lead_frames`] stays until a frame carries it, a proof due
+/// sooner takes its room or its window ends
 /// ([`MessageCollector::prune_after_finalization`]); GLOBAL leaders take
 /// turns, so in a committee of up to five archives this one leads at least
-/// two of them, and two frames carry at least
+/// two of every ten frames, and two frames carry at least
 /// 2 × ([`SEAL_BYTES_PER_PROPOSAL`] − 1 MiB) of proofs under 1 MiB each
 /// (`STORAGE_SEAL_BYTES_PER_FRAME`). A proposal takes the held proof whose
-/// window ends soonest first, and of those the oldest, so each one accepted
-/// rides a frame before it ages out; when the share is
-/// full, a proof whose window ends sooner takes the room of those whose
-/// windows end latest ([`evict_later_seals`]), and the rest are refused
-/// retryably and their senders resend them. Held without
+/// window ends soonest first, and of those first the ones an earlier
+/// proposal passed over, oldest first, so each one accepted rides in turn;
+/// when the share is full, a proof whose window ends sooner takes the room
+/// of those whose windows end latest ([`evict_later_seals`]), and the rest
+/// are refused retryably and their senders resend them. Held without
 /// a limit, during each epoch's proof wave they filled every rank buffer to
 /// its byte cap and held up to about 500 MB, while ten frames carry 40 MiB:
 /// most aged out after their senders had been told they were accepted, and
@@ -547,8 +590,8 @@ const SEAL_BYTES_HELD: usize = 2 * (SEAL_BYTES_PER_PROPOSAL - (1 << 20));
 /// prover's own copy of one moves it to the provers' share.
 const OTHER_SEAL_BYTES_HELD: usize = SEAL_BYTES_PER_PROPOSAL;
 
-/// How often held storage epoch proofs that aged out without riding a frame
-/// are summarized ([`MessageCollector::prune_after_finalization`]).
+/// How often held storage epoch proofs dropped without riding a frame are
+/// summarized ([`MessageCollector::note_seal_drops`]).
 const SEALS_AGED_OUT_LOG_EVERY: Duration = Duration::from_secs(60);
 
 // The seats of storage epoch proofs by window end, logged once each ends.
@@ -586,8 +629,8 @@ fn evict_later_seals(
     held: Seals,
     frame: u64,
     dropped: &mut Vec<window_seats::Dropped>,
-) -> Seals {
-    let mut evicted = Seals::default();
+) -> SealDrops {
+    let mut evicted = SealDrops::default();
     if frame == 0 {
         return evicted;
     }
@@ -647,7 +690,7 @@ fn evict_later_seals(
     }
     for (rank, key) in victims {
         if let Some(message) = buffers.get_mut(&rank).and_then(|b| b.take(&key)) {
-            evicted.count(&message);
+            evicted.record(DropReason::Evicted, rank, &message);
             let event = if message.window_end.is_some_and(|end| end <= frame) {
                 window_seats::SeatEvent::Closed
             } else {
@@ -661,6 +704,79 @@ fn evict_later_seals(
         }
     }
     evicted
+}
+
+/// How far past `frame`, the next GLOBAL frame to finalize, a held storage
+/// epoch proof's window may end for the collector to keep it past
+/// `RETENTION_WINDOW` ([`age_ranks`]): one epoch. Each frame that can carry
+/// a proof lies within one epoch of its window's end: a seal of epoch S
+/// rides only after the frame its registration was recorded at, by a
+/// confirm in epoch S - 1, and before S begins; a settlement of epoch E
+/// only from the lockstep window after E + 1 begins until E + 1 ends
+/// (`storage_epoch_proof::check`, `storage_seat::settlement_window`). A
+/// proof whose window is beyond that lead ages out as before.
+fn carry_lead_frames() -> u64 {
+    quil_types::consensus::epoch_length_frames()
+}
+
+/// Drop the ranks of `buffers` below `cutoff`, `RETENTION_WINDOW` finalized
+/// frames old, but for their held storage epoch proofs whose window ends
+/// within [`carry_lead_frames`] of `frame`, while a frame is known (`frame`
+/// above 0): those move, in rank and arrival order, to the lowest of those
+/// ranks holding one, up to a rank's caps
+/// ([`MessageCollector::prune_after_finalization`]). Counts the held proofs
+/// dropped in `drops`, and adds their seats to `dropped`.
+fn age_ranks(
+    buffers: &mut HashMap<u64, RankBuffer>,
+    cutoff: u64,
+    frame: u64,
+    drops: &mut SealDrops,
+    dropped: &mut Vec<window_seats::Dropped>,
+) {
+    fn drop_aged(
+        drops: &mut SealDrops,
+        dropped: &mut Vec<window_seats::Dropped>,
+        rank: u64,
+        message: CollectedMessage,
+    ) {
+        drops.record(DropReason::Aged, rank, &message);
+        dropped.push(window_seats::Dropped {
+            event: SeatEvent::AgedOut,
+            prover: message.prover,
+            seats: message.seats,
+        });
+    }
+    let mut aged: Vec<u64> = buffers.keys().copied().filter(|r| *r < cutoff).collect();
+    aged.sort_unstable();
+    let mut carried: Option<(u64, RankBuffer)> = None;
+    for rank in aged {
+        let Some(buffer) = buffers.remove(&rank) else {
+            continue;
+        };
+        for message in buffer.into_messages() {
+            if !message.held_seal() {
+                continue;
+            }
+            let within_lead = message
+                .window_end
+                .is_some_and(|end| end <= frame.saturating_add(carry_lead_frames()));
+            if frame == 0 || !within_lead {
+                drop_aged(drops, dropped, rank, message);
+                continue;
+            }
+            let (_, kept) = carried.get_or_insert_with(|| (rank, RankBuffer::new()));
+            if kept.len() >= MAX_MESSAGES_PER_RANK
+                || kept.bytes.saturating_add(message.data.len()) > MAX_BYTES_PER_RANK
+            {
+                drop_aged(drops, dropped, rank, message);
+            } else {
+                kept.add(message);
+            }
+        }
+    }
+    if let Some((rank, kept)) = carried {
+        buffers.insert(rank, kept);
+    }
 }
 
 /// How much more densely `a` carries seats than `b`: the seals and
@@ -1086,18 +1202,23 @@ impl RankBuffer {
     }
 
     /// Drop the held storage epoch proofs whose window ends at or before
-    /// `frame`: no frame from it on can carry them. Adds their seats to
-    /// `dropped`.
-    fn take_closed_seals(&mut self, frame: u64, dropped: &mut Vec<window_seats::Dropped>) -> Seals {
+    /// `frame`: no frame from it on can carry them. Counts them, held at
+    /// `rank`, in `drops`, and adds their seats to `dropped`.
+    fn take_closed_seals(
+        &mut self,
+        frame: u64,
+        rank: u64,
+        drops: &mut SealDrops,
+        dropped: &mut Vec<window_seats::Dropped>,
+    ) {
         let keys: Vec<[u8; 32]> = [true, false]
             .into_iter()
             .flat_map(|prover| self.shares.seal_ends.of(prover).range(..=(frame, u64::MAX)))
             .filter_map(|(_, arrival)| self.messages.get(arrival).map(|m| m.hash))
             .collect();
-        let mut closed = Seals::default();
         for key in keys {
             if let Some(message) = self.take(&key) {
-                closed.count(&message);
+                drops.record(DropReason::Closed, rank, &message);
                 dropped.push(window_seats::Dropped {
                     event: window_seats::SeatEvent::Closed,
                     prover: message.prover,
@@ -1105,7 +1226,30 @@ impl RankBuffer {
                 });
             }
         }
-        closed
+    }
+
+    /// Note that a proposal of `frame` left the held message with `key` for
+    /// a later frame, for `skip`; a frame's proposals count once.
+    fn mark_passed(&mut self, key: &[u8; 32], frame: u64, skip: Skip) {
+        let Some(message) = self
+            .seen
+            .get(key)
+            .and_then(|arrival| self.messages.get_mut(arrival))
+        else {
+            return;
+        };
+        let passed = message.passed.get_or_insert(Passed {
+            first: frame,
+            last: frame,
+            proposals: 0,
+            skip,
+        });
+        if passed.proposals == 0 || passed.last != frame {
+            passed.proposals = passed.proposals.saturating_add(1);
+        }
+        passed.first = passed.first.min(frame);
+        passed.last = frame;
+        passed.skip = skip;
     }
 
     /// Count the held storage epoch proof with `key` as an active prover's,
@@ -1780,15 +1924,15 @@ pub struct MessageCollector {
     share_full_active: std::sync::atomic::AtomicBool,
     /// The log of submits refused over a class share of a rank.
     share_full: std::sync::Mutex<ShareFullLog>,
-    /// Held storage epoch proofs that aged out without riding a frame, or
-    /// were dropped for one due sooner or past their window.
-    seals_aged_out: std::sync::Mutex<SealsAgedOut>,
     /// The seats of storage epoch proofs by window end, logged once each
     /// ends ([`window_seats`]). Locked after `buffers` when both are.
     window_seats: std::sync::Mutex<window_seats::WindowSeats>,
     /// The window lines logged, for tests.
     #[cfg(test)]
     windows_ended: std::sync::Mutex<Vec<window_seats::WindowCounts>>,
+    /// Held storage epoch proofs dropped without riding a frame, since the
+    /// last summary.
+    seal_drops: std::sync::Mutex<SealDropLog>,
     /// The newest GLOBAL frame this node saw finalized
     /// ([`Self::note_finalized_frame`]), 0 until one
     /// ([`Self::next_seal_frame`]). A proposal's frame does not count: one
@@ -2002,49 +2146,203 @@ impl RankFullLog {
     }
 }
 
-/// A stretch of refusals over a class share of a rank, for
-/// [`MessageCollector::note_share_full`].
+/// Refusals over a class share of a rank, for
+/// [`MessageCollector::note_share_full`]. A share full of held storage epoch
+/// proofs refuses and accepts in turn, as each frame frees room that the
+/// next submits fill: one episode spans those turns until a whole
+/// [`RANK_FULL_LOG_EVERY`] passes without a refusal, and its lines count
+/// every refusal once. Ended and begun at each turn, each line counted one
+/// refusal by share and the rest went unlabelled: on one archive the lines
+/// of a day counted under 2% of its refusals (2026-11-14).
+#[derive(Default)]
 struct ShareFullLog {
-    outage: crate::outage::Outage,
     /// Refusals since the last line, by share.
     unreserved: u64,
     capacity: u64,
     member: u64,
     seals: u64,
     other_seals: u64,
-    /// The stretch refused a message other than a storage epoch proof.
+    /// The shares accepted again this many times since the last line.
+    reopened: u64,
+    /// The last event was a refusal.
+    refusing: bool,
+    /// Since the last line, a message other than a storage epoch proof was
+    /// refused.
     not_only_seals: bool,
+    /// The episode's first refusal, and its refusals.
+    since: Option<Instant>,
+    total: u64,
+    last_refusal: Option<Instant>,
+    /// When the last line was logged.
+    logged: Option<Instant>,
 }
 
 impl ShareFullLog {
-    fn new() -> Self {
-        Self {
-            outage: crate::outage::Outage::begin_after_repeating(1, RANK_FULL_LOG_EVERY),
-            unreserved: 0,
-            capacity: 0,
-            member: 0,
-            seals: 0,
-            other_seals: 0,
-            not_only_seals: false,
+    /// The refusals since the last line, cleared.
+    fn take_counts(&mut self) -> (u64, u64, u64, u64, u64) {
+        (
+            std::mem::take(&mut self.unreserved),
+            std::mem::take(&mut self.capacity),
+            std::mem::take(&mut self.member),
+            std::mem::take(&mut self.seals),
+            std::mem::take(&mut self.other_seals),
+        )
+    }
+
+    /// No line was logged within the last [`RANK_FULL_LOG_EVERY`].
+    fn line_due(&self, now: Instant) -> bool {
+        self.logged
+            .is_none_or(|at| now.saturating_duration_since(at) >= RANK_FULL_LOG_EVERY)
+    }
+
+    /// The episode's last refusal is a whole [`RANK_FULL_LOG_EVERY`] old.
+    fn quiet(&self, now: Instant) -> bool {
+        self.last_refusal
+            .is_some_and(|at| now.saturating_duration_since(at) >= RANK_FULL_LOG_EVERY)
+    }
+
+    /// End the episode; what its last line reports.
+    fn end(&mut self) -> ShareFullEnd {
+        let lasted_secs = self
+            .since
+            .take()
+            .zip(self.last_refusal.take())
+            .map_or(0, |(since, last)| {
+                last.saturating_duration_since(since).as_secs()
+            });
+        let (unreserved, capacity, member, seals, other_seals) = self.take_counts();
+        self.not_only_seals = false;
+        self.refusing = false;
+        ShareFullEnd {
+            unreserved,
+            capacity,
+            member,
+            seals,
+            other_seals,
+            reopened: std::mem::take(&mut self.reopened),
+            total: std::mem::take(&mut self.total),
+            lasted_secs,
         }
     }
 }
 
-/// Held storage epoch proofs that aged out without riding a frame, since the
-/// last summary ([`MessageCollector::note_seals_aged_out`]).
+/// An ended episode of refusals over class shares ([`ShareFullLog::end`]):
+/// the refusals since the previous line by share, and the episode's.
+struct ShareFullEnd {
+    unreserved: u64,
+    capacity: u64,
+    member: u64,
+    seals: u64,
+    other_seals: u64,
+    reopened: u64,
+    total: u64,
+    lasted_secs: u64,
+}
+
+/// What dropped a held storage epoch proof no frame carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropReason {
+    /// Its window unknown, or ending beyond [`carry_lead_frames`], it left
+    /// with its rank after `RETENTION_WINDOW` finalized frames.
+    Aged,
+    /// It made room for a proof whose window ends sooner
+    /// ([`evict_later_seals`]).
+    Evicted,
+    /// Its window ended ([`RankBuffer::take_closed_seals`]).
+    Closed,
+}
+
+impl DropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DropReason::Aged => "aged_out",
+            DropReason::Evicted => "evicted",
+            DropReason::Closed => "closed",
+        }
+    }
+}
+
+/// One held storage epoch proof dropped, for the drop summary.
+#[derive(Clone, Copy, Debug)]
+struct SealDrop {
+    why: DropReason,
+    /// The rank it was held at.
+    rank: u64,
+    window_end: Option<u64>,
+    passed: Option<Passed>,
+}
+
+/// Held storage epoch proofs dropped without riding a frame
+/// ([`MessageCollector::note_seal_drops`]).
+#[derive(Clone, Copy, Default, Debug)]
+struct SealDrops {
+    aged: Seals,
+    evicted: Seals,
+    closed: Seals,
+    /// Active provers' proofs among them that a proposal of this node had
+    /// left for a later frame ([`Passed`]).
+    passed_over: usize,
+    /// Of those, the ones whose window ended.
+    passed_closed: usize,
+    /// The last dropped, one passed over before any other.
+    latest: Option<SealDrop>,
+}
+
+impl SealDrops {
+    /// Count `message`, a held storage epoch proof held at `rank`, dropped
+    /// for `why`.
+    fn record(&mut self, why: DropReason, rank: u64, message: &CollectedMessage) {
+        match why {
+            DropReason::Aged => self.aged.count(message),
+            DropReason::Evicted => self.evicted.count(message),
+            DropReason::Closed => self.closed.count(message),
+        }
+        if message.prover && message.passed.is_some() {
+            self.passed_over += 1;
+            if why == DropReason::Closed {
+                self.passed_closed += 1;
+            }
+        }
+        self.note_latest(SealDrop {
+            why,
+            rank,
+            window_end: message.window_end,
+            passed: message.passed,
+        });
+    }
+
+    fn note_latest(&mut self, drop: SealDrop) {
+        if drop.passed.is_some() || self.latest.is_none_or(|latest| latest.passed.is_none()) {
+            self.latest = Some(drop);
+        }
+    }
+
+    fn add(&mut self, more: SealDrops) {
+        self.aged.add(more.aged);
+        self.evicted.add(more.evicted);
+        self.closed.add(more.closed);
+        self.passed_over += more.passed_over;
+        self.passed_closed += more.passed_closed;
+        if let Some(latest) = more.latest {
+            self.note_latest(latest);
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.aged.total() + self.evicted.total() + self.closed.total()
+    }
+}
+
+/// Held storage epoch proofs dropped without riding a frame since the last
+/// summary ([`MessageCollector::note_seal_drops`]).
 #[derive(Default)]
-struct SealsAgedOut {
-    seals: Seals,
+struct SealDropLog {
+    pending: SealDrops,
     /// When the last summary was logged.
     logged: Option<Instant>,
     /// Since this collector started, from active provers.
     #[cfg(test)]
-    prover_total: usize,
-    /// Dropped for a proof whose window ends sooner, and past their window,
-    /// since the last summary of those ([`MessageCollector::note_seals_dropped`]).
-    evicted: Seals,
-    closed: Seals,
-    dropped_logged: Option<Instant>,
+    prover_aged_total: usize,
 }
 
 /// What a refusal over a class share found, for its log line.
@@ -2098,12 +2396,20 @@ impl MessageCollector {
     }
 
     /// Count a submit refused over a class share of a rank; log the first of
-    /// a stretch and then one line per [`RANK_FULL_LOG_EVERY`] with the counts.
+    /// an episode and then at most one line per [`RANK_FULL_LOG_EVERY`] with
+    /// the counts since the previous line ([`ShareFullLog`]). A refusal a
+    /// whole interval after the last ends that episode and begins another.
     fn note_share_full(&self, now: Instant, state: ShareFullState) {
-        use crate::outage::OutageEvent;
+        let mut log = self.share_full.lock().unwrap();
+        if log.quiet(now) {
+            // A whole interval passed without a refusal, though no submit
+            // was accepted to end the episode: this refusal begins another,
+            // and its first line is due.
+            Self::log_share_full_end(state.rank, log.end());
+            log.logged = None;
+        }
         self.share_full_active
             .store(true, std::sync::atomic::Ordering::Release);
-        let mut log = self.share_full.lock().unwrap();
         match state.share {
             Share::Unreserved => log.unreserved += 1,
             Share::Capacity => log.capacity += 1,
@@ -2114,18 +2420,19 @@ impl MessageCollector {
         if !matches!(state.share, Share::Seals | Share::OtherSeals) {
             log.not_only_seals = true;
         }
-        let secs = match log.outage.observe(now, false) {
-            Some(OutageEvent::Began) => 0,
-            Some(OutageEvent::Continues { secs, .. }) => secs,
-            _ => return,
-        };
-        let (unreserved, capacity, member, seals, other_seals) = (
-            std::mem::take(&mut log.unreserved),
-            std::mem::take(&mut log.capacity),
-            std::mem::take(&mut log.member),
-            std::mem::take(&mut log.seals),
-            std::mem::take(&mut log.other_seals),
-        );
+        log.refusing = true;
+        log.total += 1;
+        log.last_refusal = Some(now);
+        let since = *log.since.get_or_insert(now);
+        if !log.line_due(now) {
+            return;
+        }
+        log.logged = Some(now);
+        let secs = now.saturating_duration_since(since).as_secs();
+        let (unreserved, capacity, member, seals, other_seals) = log.take_counts();
+        let reopened = std::mem::take(&mut log.reopened);
+        let total = log.total;
+        let not_only_seals = std::mem::take(&mut log.not_only_seals);
         macro_rules! share_full_line {
             ($level:ident) => {
                 tracing::$level!(
@@ -2143,6 +2450,8 @@ impl MessageCollector {
                     other_seal_pending = state.seals.other.0,
                     other_seal_bytes = state.seals.other.1,
                     other_seal_max_bytes = OTHER_SEAL_BYTES_HELD,
+                    reopened,
+                    refused_total = total,
                     for_secs = secs,
                     capacity_pending = state.capacity.0,
                     capacity_bytes = state.capacity.1,
@@ -2152,43 +2461,61 @@ impl MessageCollector {
                     unreserved_bytes = state.unreserved.1,
                     reserved_bytes = RESERVED_BYTES_PER_RANK,
                     latest_member = %state.member.map(hex::encode).unwrap_or_default(),
-                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive's frames carry before they age out (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes). seal_refused during an epoch's proof wave is expected and senders resend: a stretch refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends when the rank advances or held messages ride a frame"
+                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
                 )
             };
         }
-        if log.not_only_seals {
+        if not_only_seals {
             share_full_line!(warn);
         } else {
             share_full_line!(info);
         }
     }
 
-    /// Log the end of a stretch of refusals over a class share, if one is
-    /// open.
+    /// Note a submit accepted within class shares; log the end of an episode
+    /// of refusals over them once a whole [`RANK_FULL_LOG_EVERY`] passed
+    /// without one, with the refusals since the previous line.
     fn note_share_accepting(&self, now: Instant, rank: u64) {
-        use crate::outage::OutageEvent;
         if !self
             .share_full_active
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .load(std::sync::atomic::Ordering::Acquire)
         {
             return;
         }
         let mut log = self.share_full.lock().unwrap();
-        log.not_only_seals = false;
-        let unreported = std::mem::take(&mut log.unreserved)
-            + std::mem::take(&mut log.capacity)
-            + std::mem::take(&mut log.member)
-            + std::mem::take(&mut log.seals)
-            + std::mem::take(&mut log.other_seals);
-        if let Some(OutageEvent::Ended { secs, failures }) = log.outage.observe(now, true) {
-            tracing::info!(
-                rank,
-                refused_total = failures,
-                refused_since_last_line = unreported,
-                lasted_secs = secs,
-                "message collector: accepting submits within class shares again"
-            );
+        if std::mem::take(&mut log.refusing) {
+            log.reopened += 1;
         }
+        if log
+            .last_refusal
+            .is_some_and(|at| now.saturating_duration_since(at) < RANK_FULL_LOG_EVERY)
+        {
+            return;
+        }
+        self.share_full_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        let end = log.end();
+        log.logged = Some(now);
+        drop(log);
+        Self::log_share_full_end(rank, end);
+    }
+
+    /// Log the end of an episode of refusals over class shares.
+    fn log_share_full_end(rank: u64, end: ShareFullEnd) {
+        tracing::info!(
+            rank,
+            refused_total = end.total,
+            refused_since_last_line =
+                end.unreserved + end.capacity + end.member + end.seals + end.other_seals,
+            capacity_refused = end.capacity,
+            member_refused = end.member,
+            unreserved_refused = end.unreserved,
+            seal_refused = end.seals,
+            other_seal_refused = end.other_seals,
+            reopened = end.reopened,
+            lasted_secs = end.lasted_secs,
+            "message collector: refusals over class shares ended, none for a whole interval; counts are since the previous line, refused_total over the whole episode of lasted_secs"
+        );
     }
 
     /// Log the end of a stretch of refusals, if one is open.
@@ -2236,11 +2563,11 @@ impl MessageCollector {
             rank_full: std::sync::Mutex::new(RankFullLog::new()),
             class_shares: std::sync::atomic::AtomicBool::new(false),
             share_full_active: std::sync::atomic::AtomicBool::new(false),
-            share_full: std::sync::Mutex::new(ShareFullLog::new()),
-            seals_aged_out: Default::default(),
+            share_full: Default::default(),
             window_seats: Default::default(),
             #[cfg(test)]
             windows_ended: Default::default(),
+            seal_drops: Default::default(),
             finalized_frame: std::sync::atomic::AtomicU64::new(0),
             rejects_active: std::sync::atomic::AtomicBool::new(false),
             rejects: std::sync::Mutex::new(RejectLog::new()),
@@ -2972,7 +3299,7 @@ impl MessageCollector {
                 let evicted = evict_later_seals(&mut buffers, &message, seals, frame, &mut dropped);
                 if evicted.total() > 0 {
                     seals = Seals::held(&buffers);
-                    self.note_seals_dropped(Instant::now(), evicted, Seals::default());
+                    self.note_seal_drops(Instant::now(), evicted);
                     self.note_dropped_seats(&dropped, frame);
                     over = seals.over(&message);
                 }
@@ -3262,17 +3589,31 @@ impl MessageCollector {
         // Storage epoch proofs go after the other messages, active provers'
         // first, each by its window's end, soonest first: a proof due sooner
         // rides ahead of those with frames to spare, and the collector holds
-        // no more of them than its frames carry before they age out
-        // ([`SEAL_BYTES_HELD`]), so each one accepted rides in turn. Taken
-        // newest first, those that later arrivals passed aged out. At an
-        // equal window end, the oldest proof each member delivered itself as
-        // an active prover, of at least [`SEAT_DENSITY_MIN_BYTES`]
-        // ([`CollectedMessage::density_member`]), goes first, those carrying
-        // more seats per byte first ([`denser`]); then the rest, oldest
-        // first: at most one proof per member and window end moves ahead of
-        // the others: one pass over them before the sort.
+        // no more of them than its frames carry ([`SEAL_BYTES_HELD`]), so
+        // each one accepted rides in turn. Taken newest first, those that
+        // later arrivals passed aged out. At an equal window end, those an
+        // earlier frame's proposal of this node passed over ([`Passed`]) go
+        // first, oldest first; then the oldest proof each member delivered
+        // itself as an active prover, of at least [`SEAT_DENSITY_MIN_BYTES`]
+        // ([`CollectedMessage::density_member`]), those carrying more seats
+        // per byte first ([`denser`]); then the rest, oldest first: at most
+        // one proof per member and window end moves ahead of the others: one
+        // pass over them before the sort. A member's second proof passed
+        // over so rides ahead even of another member's only proof due with
+        // it, by design: seats per byte order the proofs a proposal first
+        // meets, and one left for a later frame waits no longer for proofs
+        // that arrived after it. Without the first rule, each frame's room
+        // went to members' first proofs that arrived since, and a relayed
+        // proof or a member's second, passed over by every proposal, aged
+        // out (2026-11-14).
+        let passed_before = |m: &CollectedMessage| {
+            frame.is_some_and(|frame| m.passed.is_some_and(|p| p.first < frame))
+        };
         let mut firsts: HashMap<(bool, u64, [u8; 32]), (u64, u64)> = HashMap::new();
         for &(rank, arrival, m) in &seals {
+            if passed_before(m) {
+                continue;
+            }
             if let Some(member) = m.density_member() {
                 let end = m.window_end.unwrap_or(u64::MAX);
                 let first = firsts
@@ -3296,7 +3637,12 @@ impl MessageCollector {
             .collect();
         seals.sort_unstable_by(|(a, a_first), (b, b_first)| {
             let key = |c: &Candidate, first: bool| {
-                (!c.2.prover, c.2.window_end.unwrap_or(u64::MAX), !first)
+                (
+                    !c.2.prover,
+                    c.2.window_end.unwrap_or(u64::MAX),
+                    !passed_before(c.2),
+                    !first,
+                )
             };
             key(a, *a_first)
                 .cmp(&key(b, *b_first))
@@ -3388,6 +3734,14 @@ impl MessageCollector {
         };
         let mut seal_bytes = 0usize;
         let mut beyond = Vec::new();
+        // The held storage epoch proofs a proposal of a frame leaves, the
+        // rank of the copy it read, and why ([`Passed`]).
+        let mut passed: Vec<(u64, [u8; 32], Skip)> = Vec::new();
+        let mut pass = |candidate: &Candidate, skip: Skip| {
+            if frame.is_some() && candidate.2.held_seal() {
+                passed.push((candidate.0, candidate.2.hash, skip));
+            }
+        };
         for (order, candidate) in others.into_iter().enumerate() {
             let len = seal_len(&candidate);
             if seal_bytes + len > seal_budget {
@@ -3418,6 +3772,7 @@ impl MessageCollector {
                 seal_bytes += len;
             } else {
                 others_left += 1;
+                pass(&candidate, Skip::ProposalFull);
             }
         }
         // Capacity messages go last, behind every storage epoch proof in the
@@ -3448,6 +3803,7 @@ impl MessageCollector {
                 seals_beyond += 1;
             } else {
                 others_left += 1;
+                pass(&candidate, Skip::SealBudget);
             }
         }
         if proofs_left + others_left + capacity_left > 0 {
@@ -3481,10 +3837,24 @@ impl MessageCollector {
         }
         let mut taken = copied.taken;
         taken.sort_unstable_by_key(|c| (c.0, c.1));
-        Ok(taken
+        let taken: Vec<(Vec<u8>, bool)> = taken
             .into_iter()
             .map(|(_, _, m)| (m.data.clone(), m.verified))
-            .collect())
+            .collect();
+        drop(finalized);
+        drop(buffers);
+        if let (Some(frame), false) = (frame, passed.is_empty()) {
+            // A poisoned lock leaves the order as it was; the copy stands. A
+            // proof that rode, aged or moved since is not marked.
+            if let Ok(mut buffers) = self.buffers.write() {
+                for (rank, key, skip) in passed {
+                    if let Some(buffer) = buffers.get_mut(&rank) {
+                        buffer.mark_passed(&key, frame, skip);
+                    }
+                }
+            }
+        }
+        Ok(taken)
     }
 
     /// Record what a GLOBAL proposal of `frame` copies from: the carriable
@@ -3591,6 +3961,17 @@ impl MessageCollector {
     /// the first frame after the 880,560 halt (2026-10-14) would have dropped
     /// every message it did not carry, each one already reported to its
     /// submitter as accepted.
+    ///
+    /// A held storage epoch proof whose window ends within
+    /// [`carry_lead_frames`] stays past the window while a frame is known
+    /// (the shares bound what is held): it leaves when a frame carries it, a
+    /// proof due sooner takes its room ([`evict_later_seals`]) or its window
+    /// ends. Each pruned rank's such
+    /// proofs move, in order, to the oldest pruned rank holding one, so their
+    /// turn is kept and at most one rank older than the window remains.
+    /// Dropped with their rank after ten frames, proofs a frame of this
+    /// archive's had passed over were lost though their senders had been
+    /// told they were accepted (2026-11-14).
     pub fn prune_after_finalization(&self, rank: u64) {
         self.intake.note_published(Instant::now());
         let cutoff = {
@@ -3607,8 +3988,7 @@ impl MessageCollector {
             }
             ranks[0]
         };
-        let mut aged = Seals::default();
-        let mut closed = Seals::default();
+        let mut drops = SealDrops::default();
         let frame = self.next_seal_frame();
         // The seats of the held proofs that age out and close, for the
         // window line.
@@ -3616,29 +3996,14 @@ impl MessageCollector {
         let mut dropped = Vec::new();
         {
             let mut buffers = self.buffers.write().unwrap();
-            buffers.retain(|&r, buffer| {
-                if r < cutoff {
-                    aged.add(buffer.shares.seals);
-                    if shared {
-                        dropped.extend(buffer.iter().filter(|(_, m)| m.held_seal()).map(
-                            |(_, m)| window_seats::Dropped {
-                                event: SeatEvent::AgedOut,
-                                prover: m.prover,
-                                seats: m.seats.clone(),
-                            },
-                        ));
-                    }
-                }
-                r >= cutoff
-            });
+            age_ranks(&mut buffers, cutoff, frame, &mut drops, &mut dropped);
             if frame > 0 {
-                for buffer in buffers.values_mut() {
-                    closed.add(buffer.take_closed_seals(frame, &mut dropped));
+                for (&rank, buffer) in buffers.iter_mut() {
+                    buffer.take_closed_seals(frame, rank, &mut drops, &mut dropped);
                 }
             }
         }
-        self.note_seals_aged_out(Instant::now(), aged);
-        self.note_seals_dropped(Instant::now(), Seals::default(), closed);
+        self.note_seal_drops(Instant::now(), drops);
         if shared {
             self.note_dropped_seats(&dropped, frame);
             if frame > 0 {
@@ -3698,77 +4063,68 @@ impl MessageCollector {
         seats
     }
 
-    /// Count held storage epoch proofs dropped for a proof whose window ends
-    /// sooner (`evicted`) or past their window (`closed`); log them at most
-    /// once per [`SEALS_AGED_OUT_LOG_EVERY`].
-    fn note_seals_dropped(&self, now: Instant, evicted: Seals, closed: Seals) {
-        let mut log = self.seals_aged_out.lock().unwrap();
-        log.evicted.add(evicted);
-        log.closed.add(closed);
-        if log.evicted.total() + log.closed.total() == 0
-            || log
-                .dropped_logged
-                .is_some_and(|at| now.saturating_duration_since(at) < SEALS_AGED_OUT_LOG_EVERY)
-        {
-            return;
-        }
-        let (evicted, closed) = (
-            std::mem::take(&mut log.evicted),
-            std::mem::take(&mut log.closed),
-        );
-        log.dropped_logged = Some(now);
-        tracing::info!(
-            scope = "network",
-            evicted = evicted.prover.0,
-            evicted_bytes = evicted.prover.1,
-            other_evicted = evicted.other.0,
-            other_evicted_bytes = evicted.other.1,
-            closed = closed.total(),
-            closed_bytes = closed.prover.1 + closed.other.1,
-            seal_max_bytes = SEAL_BYTES_HELD,
-            "message collector: held storage epoch proofs dropped; counts are since the previous line: evicted (active provers') and other_evicted made room in a full share for proofs whose window ends sooner, and their senders send them again while their seats stay unsettled or unsealed; closed reached the end of their window, after which GLOBAL refuses them. evicted above 0 means more storage epoch proofs arrive than frames carry"
-        );
-    }
-
-    /// Count held storage epoch proofs that aged out without riding a frame;
-    /// log them at most once per [`SEALS_AGED_OUT_LOG_EVERY`].
-    fn note_seals_aged_out(&self, now: Instant, aged: Seals) {
-        let mut log = self.seals_aged_out.lock().unwrap();
-        log.seals.add(aged);
+    /// Count held storage epoch proofs dropped without riding a frame
+    /// ([`SealDrops`]); log them at most once per
+    /// [`SEALS_AGED_OUT_LOG_EVERY`], in one line.
+    fn note_seal_drops(&self, now: Instant, drops: SealDrops) {
+        let mut log = self.seal_drops.lock().unwrap();
         #[cfg(test)]
         {
-            log.prover_total += aged.prover.0;
+            log.prover_aged_total += drops.aged.prover.0;
         }
-        let held = log.seals;
-        if held == Seals::default()
+        log.pending.add(drops);
+        if log.pending.total() == 0
             || log
                 .logged
                 .is_some_and(|at| now.saturating_duration_since(at) < SEALS_AGED_OUT_LOG_EVERY)
         {
             return;
         }
-        log.seals = Seals::default();
+        let drops = std::mem::take(&mut log.pending);
         log.logged = Some(now);
-        macro_rules! aged_out_line {
+        let latest = drops.latest;
+        let passed = latest.and_then(|drop| drop.passed);
+        macro_rules! seal_drops_line {
             ($level:ident) => {
                 tracing::$level!(
                     scope = "network",
-                    aged_out = held.prover.0,
-                    aged_out_bytes = held.prover.1,
-                    other_aged_out = held.other.0,
-                    other_aged_out_bytes = held.other.1,
+                    aged_out = drops.aged.prover.0,
+                    aged_out_bytes = drops.aged.prover.1,
+                    other_aged_out = drops.aged.other.0,
+                    other_aged_out_bytes = drops.aged.other.1,
+                    evicted = drops.evicted.prover.0,
+                    evicted_bytes = drops.evicted.prover.1,
+                    other_evicted = drops.evicted.other.0,
+                    other_evicted_bytes = drops.evicted.other.1,
+                    closed = drops.closed.prover.0,
+                    closed_bytes = drops.closed.prover.1,
+                    other_closed = drops.closed.other.0,
+                    other_closed_bytes = drops.closed.other.1,
+                    passed_over = drops.passed_over,
+                    passed_closed = drops.passed_closed,
+                    latest_drop = latest.map_or("", |drop| drop.why.as_str()),
+                    latest_rank = latest.map_or(0, |drop| drop.rank),
+                    latest_window_end = latest.and_then(|drop| drop.window_end).unwrap_or(0),
+                    latest_passed_by = passed.map_or(0, |passed| passed.proposals),
+                    latest_first_passed = passed.map_or(0, |passed| passed.first),
+                    latest_last_passed = passed.map_or(0, |passed| passed.last),
+                    latest_skip = passed.map_or("", |passed| passed.skip.as_str()),
                     seal_max_bytes = SEAL_BYTES_HELD,
                     retention_frames = RETENTION_WINDOW,
-                    "message collector: held storage epoch proofs aged out without riding a frame; counts are since the previous line: aged_out from active provers, other_aged_out from other senders. Their senders were told they were accepted and send them again only at their next attempt, while their seats stay unsettled or unsealed, so one whose window ends first is missing from its epoch unless another archive's frame carries it. aged_out above 0 means this archive's frames carried fewer proofs than it held (seal_max_bytes) within retention_frames: check that this archive leads its turns"
+                    "message collector: held storage epoch proofs dropped without riding a frame; counts are since the previous line, active provers' and (other_*) other senders': aged_out had no known window, or one ending over an epoch ahead, and left with their rank after retention_frames finalized frames; evicted made room in a full share for proofs whose window ends sooner, and their senders send them again while their seats stay unsettled or unsealed; closed reached the end of their window, after which GLOBAL refuses them. passed_over counts active provers' proofs among them that a proposal of this node left for a later frame, passed_closed those of them closed. latest_* describe the last dropped, one passed over first: held at latest_rank, its window ending at latest_window_end (0 unknown), left by the proposals of latest_passed_by frames from latest_first_passed to latest_last_passed, the last for latest_skip (seal_budget: proofs due sooner or passed over before filled the frame's storage proof budget; proposal_full: the proposal's own budget). A warning means an active prover's proof was lost after its sender was told it was accepted: check that this archive leads its turns and that its proposals carry storage epoch proofs"
                 )
             };
         }
-        // An active prover's proof lost after it was told it was accepted is
-        // a warning; other senders' proofs ride only the room provers leave.
-        if held.prover.0 > 0 {
-            aged_out_line!(warn);
+        // An active prover's proof lost after it was told it was accepted,
+        // aged out or closed, whether or not a proposal of this node passed
+        // it over, is a warning: its window ended unless another archive's
+        // frame carried a copy. Other senders' proofs ride only the room
+        // provers leave, and a proof due sooner takes a later one's room by
+        // design.
+        if drops.aged.prover.0 > 0 || drops.closed.prover.0 > 0 {
+            seal_drops_line!(warn);
         } else {
-            aged_out_line!(info);
+            seal_drops_line!(info);
         }
     }
 
@@ -3776,7 +4132,7 @@ impl MessageCollector {
     /// riding a frame, since this collector started.
     #[cfg(test)]
     fn seals_aged_out(&self) -> usize {
-        self.seals_aged_out.lock().unwrap().prover_total
+        self.seal_drops.lock().unwrap().prover_aged_total
     }
 
     /// A prover's copy of a held storage epoch proof: one another sender
@@ -3801,7 +4157,7 @@ impl MessageCollector {
             let evicted = evict_later_seals(buffers, message, seals, frame, &mut dropped);
             if evicted.total() > 0 {
                 seals = Seals::held(buffers);
-                self.note_seals_dropped(Instant::now(), evicted, Seals::default());
+                self.note_seal_drops(Instant::now(), evicted);
                 self.note_dropped_seats(&dropped, frame);
             }
         }
@@ -5642,7 +5998,7 @@ mod tests {
     fn an_active_provers_aged_out_epoch_proof_logs_a_warning() {
         let logs = crate::outage::test_logs::CapturedLogs::default();
         let _logs = logs.install();
-        let text = "held storage epoch proofs aged out without riding a frame";
+        let text = "held storage epoch proofs dropped without riding a frame";
         let age_out = |provenance: Provenance| {
             let mc = global_collector();
             assert_eq!(
