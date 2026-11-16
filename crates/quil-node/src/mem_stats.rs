@@ -168,7 +168,9 @@ pub struct HostMemory {
 
 /// Parse the text of `/proc/meminfo`. Returns `None` unless `MemTotal`
 /// and `MemAvailable` are both present. Absent swap lines count as no
-/// swap; malformed lines are skipped. Never panics.
+/// swap; malformed lines are skipped. Never panics. Off macOS only:
+/// macOS has no `/proc/meminfo` (see [`macos_vm`]).
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
     let (mut total, mut avail, mut swap_total, mut swap_free) = (None, None, 0u64, 0u64);
     for line in text.lines() {
