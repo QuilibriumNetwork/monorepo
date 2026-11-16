@@ -231,6 +231,7 @@ pub struct MacVm {
 }
 
 impl MacVm {
+    #[cfg(any(target_os = "macos", test))]
     /// Page counts `(free, active, inactive, wired, compressed,
     /// purgeable, speculative)` scaled by the page size.
     pub fn from_pages(pages: [u64; 7], page_size: u64) -> Self {
@@ -246,6 +247,7 @@ impl MacVm {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     /// Memory the system gives back on demand.
     pub fn available_bytes(&self) -> u64 {
         self.free_bytes
