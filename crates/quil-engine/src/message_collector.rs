@@ -232,10 +232,17 @@ impl CollectedMessage {
     }
 
     /// A held storage epoch proof larger than a frame's seal budget
-    /// (`STORAGE_SEAL_BYTES_PER_FRAME`): the collector holds one at a time
-    /// ([`SenderSeals::over`]), up to a proposal's seal share.
+    /// (`STORAGE_SEAL_BYTES_PER_FRAME`), up to a proposal's seal share.
     fn oversize_seal(&self) -> bool {
         self.held_seal() && self.data.len() > quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME
+    }
+
+    /// An active prover's proof over a frame's seal budget
+    /// ([`Self::oversize_seal`]): the collector holds one at a time
+    /// ([`SenderSeals::over`]). Other senders' share holds one by its bytes
+    /// alone, and one due sooner takes its room ([`evict_later_seals`]).
+    fn takes_seal_place(&self) -> bool {
+        self.prover && self.oversize_seal()
     }
 }
 
@@ -679,6 +686,10 @@ const SEAL_BYTES_HELD: usize = 2 * (SEAL_BYTES_PER_PROPOSAL - (1 << 20));
 /// one, and they ride the first frame the provers' proofs leave room in. A
 /// prover's own copy of one moves it to the provers' share.
 const OTHER_SEAL_BYTES_HELD: usize = SEAL_BYTES_PER_PROPOSAL;
+// It holds two proofs over a frame's seal budget at no time, so it keeps
+// no place for one: one due sooner takes the room of one due later.
+const _: () =
+    assert!(2 * (quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME + 1) > OTHER_SEAL_BYTES_HELD);
 
 /// What the held storage epoch proofs one sender delivered may take of
 /// [`SEAL_BYTES_HELD`] and [`OTHER_SEAL_BYTES_HELD`] together, across all
@@ -691,12 +702,15 @@ const OTHER_SEAL_BYTES_HELD: usize = SEAL_BYTES_PER_PROPOSAL;
 /// an epoch boundary, not more of one sender's. A sender holding none is
 /// held one proof up to what a frame carries, above this share, so a
 /// member's largest proof is never refused for good. One proof larger than
-/// that, up to a proposal's seal share, is held at a time
-/// ([`CollectedMessage::oversize_seal`]), from a sender holding none: a
-/// proposal still carries it (`MAX_GLOBAL_FRAME_BYTES` bounds a frame, not
-/// its proofs), so refusing it for good would halt it. Others wait,
-/// refused retryably, until it leaves; with it, three colluding active
-/// provers are the fewest that fill the provers' share (four without). A
+/// that, up to a proposal's seal share, is held from a sender holding
+/// none, one at a time from active provers
+/// ([`CollectedMessage::takes_seal_place`]) and one in other senders'
+/// share by its bytes: a proposal still carries it
+/// (`MAX_GLOBAL_FRAME_BYTES` bounds a frame, not its proofs), so refusing
+/// it for good would halt it. Another active prover's waits, refused
+/// retryably, until it leaves, and another sender's proof never keeps a
+/// member's out; with it, three colluding active provers are the fewest
+/// that fill the provers' share (four without). A
 /// proof over a proposal's seal share is refused for good
 /// ([`CollectedMessage::unsendable_seal`]). The rest are refused retryably
 /// and their senders resend them every 5 to 60 seconds until their windows
@@ -969,8 +983,8 @@ struct Shares {
     seal_senders: HashMap<[u8; 32], (usize, usize)>,
     /// The seats of storage epoch proofs by sender, with their copies.
     seal_seats: HashMap<([u8; 32], [u8; 32]), usize>,
-    /// Storage epoch proofs over a frame's seal budget
-    /// ([`CollectedMessage::oversize_seal`]).
+    /// Active provers' storage epoch proofs over a frame's seal budget
+    /// ([`CollectedMessage::takes_seal_place`]).
     seal_oversize: usize,
 }
 
@@ -1049,8 +1063,8 @@ struct SenderSeals {
     held: (usize, usize),
     /// It holds a proof of a seat the proof proves.
     seat: bool,
-    /// Held proofs over a frame's seal budget from any sender, the proof
-    /// itself apart, if it is one ([`CollectedMessage::oversize_seal`]).
+    /// Active provers' held proofs over a frame's seal budget, if the
+    /// message is one ([`CollectedMessage::takes_seal_place`]).
     oversize: usize,
 }
 
@@ -1065,15 +1079,10 @@ impl SenderSeals {
         let Some(sender) = message.sender.filter(|_| message.held_seal()) else {
             return held;
         };
-        let oversize = message.oversize_seal();
+        let place = message.takes_seal_place();
         for buffer in buffers.values() {
-            if oversize {
-                // A held copy of the proof itself (one a prover's copy
-                // promotes) is not another.
-                held.oversize += buffer
-                    .shares
-                    .seal_oversize
-                    .saturating_sub(usize::from(buffer.seen.contains_key(&message.hash)));
+            if place {
+                held.oversize += buffer.shares.seal_oversize;
             }
             // A buffer holds a sender's seats only with its proofs.
             let Some((count, bytes)) = buffer.shares.seal_senders.get(&sender) else {
@@ -1098,8 +1107,9 @@ impl SenderSeals {
         }
         let len = message.data.len();
         let (count, bytes) = self.held;
-        // A proof over a frame's seal budget waits for any other one held;
-        // the sender's share refuses it if the sender holds any proof.
+        // An active prover's proof over a frame's seal budget waits for
+        // another one held; the sender's share refuses it if the sender
+        // holds any proof.
         let over = self.seat
             || self.seat_taken(message)
             || (count > 0
@@ -1108,10 +1118,24 @@ impl SenderSeals {
         over.then_some(Share::Sender)
     }
 
-    /// `message` is a proof over a frame's seal budget and another one is
-    /// held.
+    /// `message` is an active prover's proof over a frame's seal budget
+    /// and another one is held.
     fn seat_taken(&self, message: &CollectedMessage) -> bool {
-        message.oversize_seal() && self.oversize > 0
+        message.takes_seal_place() && self.oversize > 0
+    }
+
+    /// Why `message`, a proof over a frame's seal budget, was refused for
+    /// `share`, for its line ([`MessageCollector::note_oversize_seal`]).
+    fn oversize_refusal(&self, message: &CollectedMessage, share: Share) -> &'static str {
+        match share {
+            Share::Sender if self.seat_taken(message) => {
+                "another active prover's proof over a frame's seal budget is held"
+            }
+            Share::Sender => "its sender holds other proofs",
+            Share::Seals => "the active provers' share is full",
+            Share::OtherSeals => "other senders' share is full",
+            _ => "its rank's share is full",
+        }
     }
 }
 
@@ -1204,7 +1228,7 @@ impl Shares {
         if let Some(seals) = self.seals.share_of(message) {
             seals.0 += 1;
             seals.1 += len;
-            if message.oversize_seal() {
+            if message.takes_seal_place() {
                 self.seal_oversize += 1;
             }
             if let Some(sender) = message.sender {
@@ -1237,7 +1261,7 @@ impl Shares {
         if let Some(seals) = self.seals.share_of(message) {
             seals.0 -= 1;
             seals.1 -= len;
-            if message.oversize_seal() {
+            if message.takes_seal_place() {
                 self.seal_oversize -= 1;
             }
             if let Some(sender) = message.sender {
@@ -2732,7 +2756,7 @@ impl MessageCollector {
             deferred_since,
             frame_seal_bytes = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME,
             max_bytes = SEAL_BYTES_PER_PROPOSAL,
-            "message collector: a storage epoch proof over a frame's seal budget (frame_seal_bytes) arrived; one such proof, up to max_bytes, is held at a time, from a sender holding no other, and rides a frame whose other proofs leave room. A deferred one is refused retryably and its sender resends it until its window ends. held_since and deferred_since count such proofs since the previous line. A member's prover keeps each part under frame_seal_bytes: check the sender's release if these recur"
+            "message collector: a storage epoch proof over a frame's seal budget (frame_seal_bytes) arrived; one such proof, up to max_bytes, is held at a time from active provers and one from other senders, each from a sender holding no other, and rides a frame whose other proofs leave room. A deferred one is refused retryably and its sender resends it until its window ends. held_since and deferred_since count such proofs since the previous line. A member's prover keeps each part under frame_seal_bytes: check the sender's release if these recur"
         );
     }
 
@@ -2812,7 +2836,7 @@ impl MessageCollector {
                     unreserved_bytes = state.unreserved.1,
                     reserved_bytes = RESERVED_BYTES_PER_RANK,
                     latest_member = %state.member.map(hex::encode).unwrap_or_default(),
-                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes), sender_seal_refused those over one sender's share across both (latest_sender names the last, holding sender_seal_pending proofs of sender_seal_bytes, at most sender_seal_max_bytes, or one proof up to a frame's seal budget, and one per seat; one proof over a frame's seal budget is held at a time); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
+                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes), sender_seal_refused those over one sender's share across both (latest_sender names the last, holding sender_seal_pending proofs of sender_seal_bytes, at most sender_seal_max_bytes, or one proof up to a frame's seal budget, and one per seat; one proof over a frame's seal budget is held at a time from active provers and one from others); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
                 )
             };
         }
@@ -3686,15 +3710,7 @@ impl MessageCollector {
                 },
             );
             if let Some(bytes) = oversize {
-                let reason = match share {
-                    Share::Sender if from_sender.seat_taken(&message) => {
-                        "another proof over a frame's seal budget is held"
-                    }
-                    Share::Sender => "its sender holds other proofs",
-                    Share::Seals => "the active provers' share is full",
-                    Share::OtherSeals => "other senders' share is full",
-                    _ => "its rank's share is full",
-                };
+                let reason = from_sender.oversize_refusal(&message, share);
                 self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
             }
             self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
@@ -3703,7 +3719,7 @@ impl MessageCollector {
         match buffer.add(message) {
             AddOutcome::Added => {
                 if let Some(bytes) = oversize {
-                    let reason = "held alone: no other proof over a frame's seal budget is held";
+                    let reason = "held alone: no other proof over a frame's seal budget is held in its share";
                     self.note_oversize_seal(Instant::now(), true, sender, bytes, rank, reason);
                 }
                 self.note_window_seats(SeatEvent::Admitted, seats_prover, &seats);
@@ -4543,10 +4559,11 @@ impl MessageCollector {
         else {
             return SubmitOutcome::Duplicate;
         };
-        // Its own copy moves within the sender's share.
+        // Its own copy moves within the sender's share, but takes the
+        // provers' place for a proof over a frame's seal budget only if free.
         let over_sender = if buffers[&rank].held_seal_sender(&message.hash) == Some(message.sender)
         {
-            None
+            from_sender.seat_taken(message).then_some(Share::Sender)
         } else {
             from_sender.over(message)
         };
@@ -4577,6 +4594,11 @@ impl MessageCollector {
                     sender: Some((sender_label(sender), from_sender.held)),
                 },
             );
+            if message.sender.is_some() && message.oversize_seal() {
+                let reason = from_sender.oversize_refusal(message, share);
+                let bytes = message.data.len();
+                self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
+            }
             if let Some(seats) = buffer.held_seats(&message.hash) {
                 self.note_window_seats(SeatEvent::Refused, true, seats);
             }
