@@ -20,6 +20,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use quil_config::HealthReportConfig;
+use quil_engine::storage_labels::LabelSpace;
+use quil_forest::storage_health::FsUsage;
 use quil_p2p::PeerId;
 use quil_types::consensus::JoinWait;
 use quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient;
@@ -27,8 +29,8 @@ use quil_types::proto::diagnostics::diagnostics_service_server::{
     DiagnosticsService, DiagnosticsServiceServer,
 };
 use quil_types::proto::diagnostics::{
-    Blocker, FailureCount, GetHealthReportRequest, HealthConditions, HealthReport, Phase,
-    RecoveryFailure, RecoveryPhase, StoreIoHealth, WorkerHealth,
+    Blocker, FailureCount, GetHealthReportRequest, HealthConditions, HealthReport, Machine, Phase,
+    RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreSpace, WorkerHealth,
 };
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
@@ -326,6 +328,49 @@ pub struct HealthInputs {
     /// The node's health conditions
     /// ([`crate::health_conditions::HealthRegistry::snapshot`]).
     pub health: Option<HealthConditions>,
+    /// The disk space of this node's stores and labels ([`store_space`]).
+    pub store_space: Option<StoreSpace>,
+    /// The machine this node runs on ([`crate::machine::current`]).
+    pub machine: Option<Machine>,
+}
+
+/// The disk space of this node's stores and storage labels: `master`, the
+/// master store's filesystem; `store_bytes`, this process's stores' files
+/// ([`quil_forest::storage_health::stores_file_bytes`]); `labels`, what the
+/// labels this process keeps tell
+/// ([`quil_engine::storage_labels::LabelStore::space`]). Their filesystem
+/// is named apart only when it is not the master store's. `None` when
+/// nothing is known.
+pub fn store_space(
+    master: Option<FsUsage>,
+    store_bytes: Option<u64>,
+    labels: Option<LabelSpace>,
+) -> Option<StoreSpace> {
+    if master.is_none() && store_bytes.is_none() && labels.is_none() {
+        return None;
+    }
+    let mut space = StoreSpace {
+        total_bytes: master.map_or(0, |usage| usage.total_bytes),
+        free_bytes: master.map_or(0, |usage| usage.free_bytes),
+        store_bytes,
+        ..Default::default()
+    };
+    if let Some(labels) = labels {
+        space.label_bytes = Some(labels.kept_bytes);
+        if let Some(usage) = labels
+            .usage
+            .filter(|usage| master.is_none_or(|master| master.device != usage.device))
+        {
+            space.label_total_bytes = Some(usage.total_bytes);
+            space.label_free_bytes = Some(usage.free_bytes);
+        }
+        space.snapshot_refusals = labels.snapshot_refusals;
+        if let Some((at, needed)) = labels.last_refusal {
+            space.last_refusal_unix_ms = at;
+            space.last_refusal_needed_bytes = needed;
+        }
+    }
+    Some(space)
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -347,6 +392,8 @@ pub fn build_report(
         master_store_write_failed: inputs.master_store_write_failed,
         worker_capacity: inputs.worker_capacity,
         store_io: inputs.store_io.clone(),
+        store_space: inputs.store_space,
+        machine: inputs.machine,
         // Before the workers, within half the size bound; a peer gets no
         // kind local to this node.
         health: inputs
@@ -1270,6 +1317,111 @@ mod tests {
             build_report(&HealthInputs::default(), &[], 3_000, Requester::Own).store_io,
             None
         );
+    }
+
+    /// The stores' disk space is filled from the master store's
+    /// filesystem, the stores' own count and the labels kept; the labels'
+    /// filesystem is named apart only when it is another; it rides the
+    /// report to a peer through encoding, and nothing known sends none.
+    #[test]
+    fn the_store_space_is_filled_from_the_volume_stores_and_labels() {
+        use prost::Message;
+        let volume = FsUsage {
+            device: 7,
+            total_bytes: 2_000 << 30,
+            free_bytes: 150 << 30,
+            used_bytes: 1_850 << 30,
+            ..Default::default()
+        };
+        let labels = LabelSpace {
+            usage: Some(volume),
+            kept_bytes: 900 << 30,
+            snapshot_refusals: 6_500,
+            last_refusal: Some((1_700_000_000_000, 210 << 30)),
+        };
+        let space = store_space(Some(volume), Some(120 << 30), Some(labels)).unwrap();
+        assert_eq!(
+            space,
+            StoreSpace {
+                total_bytes: 2_000 << 30,
+                free_bytes: 150 << 30,
+                store_bytes: Some(120 << 30),
+                label_bytes: Some(900 << 30),
+                label_total_bytes: None,
+                label_free_bytes: None,
+                snapshot_refusals: 6_500,
+                last_refusal_unix_ms: 1_700_000_000_000,
+                last_refusal_needed_bytes: 210 << 30,
+            },
+            "SPACE-SAME-DISK: the labels' disk is the store's"
+        );
+        let elsewhere = LabelSpace {
+            usage: Some(FsUsage {
+                device: 8,
+                total_bytes: 4_000 << 30,
+                free_bytes: 40 << 30,
+                ..Default::default()
+            }),
+            ..labels
+        };
+        let apart = store_space(Some(volume), None, Some(elsewhere)).unwrap();
+        assert_eq!(
+            apart.label_total_bytes.zip(apart.label_free_bytes),
+            Some((4_000 << 30, 40 << 30))
+        );
+        assert_eq!(apart.store_bytes, None);
+        let master_only = store_space(Some(volume), Some(1), None).unwrap();
+        assert_eq!(
+            (master_only.label_bytes, master_only.snapshot_refusals),
+            (None, 0)
+        );
+        assert_eq!(store_space(None, None, None), None);
+
+        let inputs = HealthInputs {
+            store_space: Some(space),
+            ..Default::default()
+        };
+        let to_peer = Requester::Peer(peer());
+        let report = build_report(&inputs, &[], 3_000, to_peer);
+        let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.store_space, Some(space));
+        assert_eq!(
+            build_report(&HealthInputs::default(), &[], 3_000, Requester::Own).store_space,
+            None
+        );
+    }
+
+    /// The machine rides the report to a peer; nothing known sends none.
+    #[test]
+    fn the_machine_rides_the_report_to_a_peer() {
+        use prost::Message;
+        use quil_types::proto::diagnostics::{CpuVendor, MacFamily};
+        let machine = Machine {
+            mac_family: MacFamily::Mac.into(),
+            mac_major: 14,
+            mac_minor: 2,
+            cpu_vendor: CpuVendor::Apple.into(),
+            cpu_family: 0xda33_d83d,
+            cpu_model: 2,
+            cpu_stepping: 0,
+            cpus: 8,
+            performance_cores: Some(4),
+            efficiency_cores: Some(4),
+            throttle_events: None,
+        };
+        let inputs = HealthInputs {
+            machine: Some(machine),
+            ..Default::default()
+        };
+        let report = build_report(&inputs, &[], 3_000, Requester::Peer(peer()));
+        let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            decoded.machine,
+            Some(machine),
+            "MACHINE-SENT: the machine rides the report"
+        );
+        let none = build_report(&HealthInputs::default(), &[], 3_000, Requester::Own);
+        assert_eq!(none.machine, None);
     }
 
     /// The configured count and each worker above it, which drains, are

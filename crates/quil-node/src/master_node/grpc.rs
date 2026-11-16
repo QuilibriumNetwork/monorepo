@@ -4839,6 +4839,13 @@ fn health_inputs(
         store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
         // The node's registry; the source sets it.
         health: None,
+        store_space: quil_rpc::diagnostics_service::store_space(
+            quil_forest::storage_health::store_path(quil_forest::StoreRole::Master)
+                .and_then(|path| quil_forest::storage_health::fs_usage(&path)),
+            quil_forest::storage_health::stores_file_bytes(),
+            quil_engine::storage_labels::installed().map(|labels| labels.space()),
+        ),
+        machine: Some(quil_rpc::machine::current()),
     }
 }
 
@@ -5273,7 +5280,8 @@ mod health_input_tests {
     }
 
     /// The report reads the master's worker view as the refresh loop builds
-    /// it, and each allocated shard's committed session head.
+    /// it, each allocated shard's committed session head and this node's
+    /// machine.
     #[test]
     fn the_report_reads_the_worker_view_and_committed_session_heads() {
         let workers = quil_engine::test_support::TestWorkerManager::new();
@@ -5372,6 +5380,10 @@ mod health_input_tests {
 
         let inputs = health_inputs(&view, &head, &crdt, &registry, &address);
         assert_eq!(inputs.global_head_frame, 100);
+        assert!(
+            inputs.machine.is_some(),
+            "HEALTH-MACHINE: the report carries this node's machine"
+        );
         assert_eq!(
             inputs.committee_heads.keys().collect::<Vec<_>>(),
             [&filter],

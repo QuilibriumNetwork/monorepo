@@ -599,6 +599,16 @@ pub fn store_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The bytes of the SST files of this process's open registered stores,
+/// as each store's RocksDB counts them: no directory walk. `None` without
+/// an open store whose count could be read.
+pub fn stores_file_bytes() -> Option<u64> {
+    open_databases()
+        .into_iter()
+        .filter_map(|(_, database)| database.upgrade()?.sst_bytes())
+        .reduce(u64::saturating_add)
+}
+
 static HELD: Mutex<BTreeSet<StoreRole>> = Mutex::new(BTreeSet::new());
 
 /// Mark the store of `role` as stopped for its recovery, until
@@ -1488,5 +1498,39 @@ mod tests {
             "{reserve}"
         );
         assert_eq!(next_step("EIO", true, master), "then restart the node");
+    }
+
+    /// The stores' size is the sum of their own SST counts, from every open
+    /// registered store and none other; without one it is unknown.
+    #[test]
+    fn the_stores_size_sums_each_open_stores_own_file_count() {
+        assert_eq!(stores_file_bytes(), None, "no store is open yet");
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (first, second) = (open(a.path()), open(b.path()));
+        first.register_store(StoreRole::Worker(7_031));
+        second.register_store(StoreRole::Worker(7_032));
+        let unregistered = tempfile::tempdir().unwrap();
+        let other = open(unregistered.path());
+        for (db, key) in [(&first, 1u8), (&second, 2), (&other, 3)] {
+            db.put([key], vec![key; 64 << 10]).unwrap();
+            db.flush().unwrap();
+        }
+        let sst = |db: &CoordinatedDb| {
+            db.property_int_value("rocksdb.total-sst-files-size")
+                .unwrap()
+                .unwrap()
+        };
+        assert!(sst(&first) > 0 && sst(&second) > 0 && sst(&other) > 0);
+        assert_eq!(
+            stores_file_bytes(),
+            Some(sst(&first) + sst(&second)),
+            "STORES-SUM: every open registered store counts"
+        );
+        drop(second);
+        assert_eq!(
+            stores_file_bytes(),
+            Some(sst(&first)),
+            "a closed store is not counted"
+        );
     }
 }

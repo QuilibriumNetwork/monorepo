@@ -52,6 +52,17 @@ pub(crate) struct DatabaseInner {
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+impl DatabaseInner {
+    /// The bytes of the store's SST files as RocksDB counts them (no
+    /// directory walk); `None` when the property cannot be read.
+    pub(crate) fn sst_bytes(&self) -> Option<u64> {
+        self.db
+            .property_int_value("rocksdb.total-sst-files-size")
+            .ok()
+            .flatten()
+    }
+}
+
 impl Drop for DatabaseInner {
     fn drop(&mut self) {
         // Once the process is exiting the store is left open: a close could
