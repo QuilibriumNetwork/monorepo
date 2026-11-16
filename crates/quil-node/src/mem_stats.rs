@@ -202,26 +202,23 @@ pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
     })
 }
 
-/// Host memory now, or `None` when `/proc/meminfo` is unreadable or
-/// lacks the required fields; always `None` on macOS, as before macOS
-/// figures were logged. Decisions read this (verifier slots, the
-/// low-memory warning); macOS figures reach only the memory log line,
-/// through [`host_memory_sample`].
+/// Host memory for decisions (verifier slots, the low-memory warning):
+/// [`HostMemorySample::for_decisions`] of a fresh sample.
 pub fn host_memory() -> Option<HostMemory> {
-    #[cfg(target_os = "macos")]
-    {
-        return None;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
-    }
+    host_memory_sample().for_decisions()
+}
+
+/// `/proc/meminfo` now, or `None` when it is unreadable or lacks the
+/// required fields.
+#[cfg(not(target_os = "macos"))]
+fn read_meminfo() -> Option<HostMemory> {
+    parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
 /// One host memory sample for the periodic memory log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMemorySample {
-    /// What the line logs: [`host_memory`] off macOS; on macOS derived
+    /// What the line logs: `/proc/meminfo` off macOS; on macOS derived
     /// from `vm` and `sysctl`.
     pub logged: Option<HostMemory>,
     /// The macOS page breakdown behind `logged`; `None` off macOS.
@@ -229,9 +226,10 @@ pub struct HostMemorySample {
 }
 
 impl HostMemorySample {
-    /// What decisions may read (the low-memory warning): `logged` off
-    /// macOS, `None` when it came from macOS page counts, as
-    /// [`host_memory`] returns there.
+    /// What decisions read, the one rule for every caller (verifier
+    /// slots and the low-memory warning, through [`host_memory`] or
+    /// directly): `logged` off macOS; `None` when it came from macOS
+    /// page counts, so macOS figures reach only the memory log line.
     pub fn for_decisions(&self) -> Option<HostMemory> {
         if self.vm.is_some() {
             return None;
@@ -250,7 +248,7 @@ pub fn host_memory_sample() -> HostMemorySample {
     #[cfg(not(target_os = "macos"))]
     {
         HostMemorySample {
-            logged: host_memory(),
+            logged: read_meminfo(),
             vm: None,
         }
     }
@@ -871,8 +869,7 @@ mod host_memory_tests {
     fn macos_figures_never_reach_decisions() {
         let logged = Some(mem(16, 1));
         let vm = Some(MacVm::from_pages([64, 0, 0, 0, 0, 0, 0], 16384));
-        // Logged, but the low-memory warning reads None on macOS, as
-        // host_memory() returns there.
+        // Logged, but no decision reads macOS page counts.
         assert_eq!(
             HostMemorySample { logged, vm }.for_decisions(),
             None,
