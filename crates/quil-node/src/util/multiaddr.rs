@@ -1,7 +1,7 @@
 /// Convert an `/ip4/X/tcp/Y` or `/ip6/X/tcp/Y` multiaddr string into `X:Y`
 /// (`[X]:Y`). Returns `None` for unsupported multiaddr shapes (DNS, non-TCP)
-/// so we don't try to dial non-routable archive endpoints. Filters loopback
-/// and private ranges since those would only resolve to our own machine.
+/// so we don't try to dial non-routable archive endpoints. Keeps only a
+/// globally routable address, as the mesh does for advertised addresses.
 #[allow(dead_code)]
 pub(crate) fn multiaddr_to_host_port(ma: &str) -> Option<String> {
     multiaddr_to_host_port_with_network(ma, 0)
@@ -9,8 +9,8 @@ pub(crate) fn multiaddr_to_host_port(ma: &str) -> Option<String> {
 
 /// Like `multiaddr_to_host_port`, but on testnet/devnet (network != 0)
 /// accepts RFC1918 private addresses (192.168.x.x, 10.x.x.x, etc.) and
-/// loopback. Mainnet still rejects them so a misconfigured archive
-/// doesn't poison the pool with unroutable peers.
+/// loopback. Mainnet keeps only a globally routable address so a
+/// misconfigured archive doesn't poison the pool with unroutable peers.
 pub(crate) fn multiaddr_to_host_port_with_network(ma: &str, network: u8) -> Option<String> {
     match ma.trim_start_matches('/').split('/').next() {
         Some("ip4" | "ip6") => archive_multiaddr_to_host_port(ma, network),
@@ -61,10 +61,11 @@ pub(crate) fn pubsub_to_stream_endpoint(addr: &str) -> String {
 /// `/dns4/`, `/dns6/`, `/dns/` over `/tcp/PORT`. Bare `host:port` is
 /// rejected so configs round-trip between Go and Rust.
 ///
-/// IP forms apply the same private/loopback/unspecified filtering as
-/// `multiaddr_to_host_port_with_network` (gated on `network`). DNS forms
-/// pass the hostname through verbatim — the gRPC client resolves at dial
-/// time, which mirrors `manet.ToNetAddr`'s behavior.
+/// IP forms keep only a globally routable address on mainnet
+/// (`quil_p2p::node::is_routable_multiaddr`) and, on another network,
+/// any unicast one. DNS forms pass the hostname through verbatim — the
+/// gRPC client resolves at dial time, which mirrors `manet.ToNetAddr`'s
+/// behavior.
 pub(crate) fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<String> {
     let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
     if parts.len() < 4 {
@@ -76,36 +77,22 @@ pub(crate) fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<St
     let port: u16 = parts[3].parse().ok()?;
     let allow_private = network != 0;
     match parts[0] {
-        "ip4" => {
-            let ip: std::net::Ipv4Addr = parts[1].parse().ok()?;
-            let reject = if allow_private {
-                ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+        family @ ("ip4" | "ip6") => {
+            let ip: std::net::IpAddr = if family == "ip4" {
+                std::net::IpAddr::V4(parts[1].parse().ok()?)
             } else {
-                ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_unspecified()
-                    || ip.is_broadcast()
-                    || ip.is_multicast()
+                std::net::IpAddr::V6(parts[1].parse().ok()?)
             };
-            if reject {
-                return None;
-            }
-            Some(format!("{}:{}", ip, port))
-        }
-        "ip6" => {
-            let ip: std::net::Ipv6Addr = parts[1].parse().ok()?;
-            let reject = if allow_private {
-                ip.is_unspecified() || ip.is_multicast()
+            let keep = if allow_private {
+                let broadcast = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
+                !(ip.is_unspecified() || ip.is_multicast() || broadcast)
             } else {
-                ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                // The rule the mesh applies to the addresses peers
+                // advertise: documentation, shared and reserved ranges
+                // and an IPv4-mapped private address are not dialable.
+                quil_p2p::node::is_routable_multiaddr(&format!("/{family}/{ip}"))
             };
-            if reject {
-                return None;
-            }
-            Some(format!("[{}]:{}", ip, port))
+            keep.then(|| std::net::SocketAddr::new(ip, port).to_string())
         }
         "dns4" | "dns6" | "dns" => {
             let host = parts[1];
@@ -127,6 +114,13 @@ pub(crate) fn archive_multiaddr_peer(ma: &str) -> Option<quil_p2p::PeerId> {
         .windows(2)
         .find(|pair| pair[0] == "p2p")
         .and_then(|pair| pair[1].parse().ok())
+}
+
+/// A genesis archive's static endpoint, its address on port 8340 (an IPv6
+/// one bracketed); `None` when the address does not parse.
+pub(crate) fn genesis_archive_endpoint(ip: &str) -> Option<String> {
+    let ip: std::net::IpAddr = ip.parse().ok()?;
+    Some(std::net::SocketAddr::new(ip, 8340).to_string())
 }
 
 /// Build a stream multiaddr by extracting the IP from a pubsub multiaddr and
@@ -180,7 +174,7 @@ pub(crate) fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_multiaddr_peer, archive_multiaddr_to_host_port};
+    use super::{archive_multiaddr_peer, archive_multiaddr_to_host_port, genesis_archive_endpoint};
     use super::{
         extract_stream_addr, ipv6_p2p_without_stream, multiaddr_to_host_port,
         multiaddr_to_host_port_with_network, pubsub_to_stream_endpoint, stream_listen_host_port,
@@ -212,9 +206,54 @@ mod tests {
     #[test]
     fn archive_multiaddr_accepts_ip6() {
         assert_eq!(
-            archive_multiaddr_to_host_port("/ip6/2001:db8::1/tcp/8340", 0),
-            Some("[2001:db8::1]:8340".into())
+            archive_multiaddr_to_host_port("/ip6/2a00:1::1/tcp/8340", 0),
+            Some("[2a00:1::1]:8340".into())
         );
+    }
+
+    /// On mainnet an archive address is kept only when globally routable,
+    /// by the mesh's rule: documentation, shared (carrier-grade NAT),
+    /// benchmarking and reserved ranges and an IPv4-mapped private address
+    /// are dropped; another network keeps them.
+    #[test]
+    fn a_mainnet_archive_address_must_be_globally_routable() {
+        for unroutable in [
+            "/ip4/203.0.113.7/tcp/8340",
+            "/ip4/100.64.0.1/tcp/8340",
+            "/ip4/198.18.0.1/tcp/8340",
+            "/ip4/240.0.0.1/tcp/8340",
+            "/ip6/::ffff:10.0.0.1/tcp/8340",
+        ] {
+            assert_eq!(
+                archive_multiaddr_to_host_port(unroutable, 0),
+                None,
+                "unroutable_archive_address_kept on mainnet: {unroutable}"
+            );
+            assert!(
+                archive_multiaddr_to_host_port(unroutable, 1).is_some(),
+                "a devnet dropped {unroutable}"
+            );
+        }
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/8340/p2p/x", 0).as_deref(),
+            Some("1.2.3.4:8340")
+        );
+    }
+
+    /// A genesis archive's IPv6 address is bracketed in its endpoint, so the
+    /// port is not read as part of the address; an IPv4 one is not.
+    #[test]
+    fn a_genesis_archive_endpoint_brackets_an_ipv6_address() {
+        assert_eq!(
+            genesis_archive_endpoint("2a00:1::1").as_deref(),
+            Some("[2a00:1::1]:8340"),
+            "unbracketed_genesis_endpoint"
+        );
+        assert_eq!(
+            genesis_archive_endpoint("1.2.3.4").as_deref(),
+            Some("1.2.3.4:8340")
+        );
+        assert_eq!(genesis_archive_endpoint("not-an-ip"), None);
     }
 
     #[test]
@@ -477,10 +516,13 @@ mod tests {
             ""
         ));
         // An additional IPv6 listen address counts as the main one does.
-        assert!(ipv6_p2p_without_stream(
-            &listens(&["/ip4/0.0.0.0/udp/8336/quic-v1", "/ip6/::/udp/8336/quic-v1"]),
-            "/ip4/0.0.0.0/tcp/8340",
-            ""
-        ));
+        assert!(
+            ipv6_p2p_without_stream(
+                &listens(&["/ip4/0.0.0.0/udp/8336/quic-v1", "/ip6/::/udp/8336/quic-v1"]),
+                "/ip4/0.0.0.0/tcp/8340",
+                ""
+            ),
+            "additional_ipv6_listen_unflagged"
+        );
     }
 }

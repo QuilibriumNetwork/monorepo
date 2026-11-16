@@ -134,15 +134,22 @@ pub(crate) fn global_consensus_participant(archive_mode: bool, network: u8) -> b
     archive_mode || network == 99
 }
 
-/// Pin each mainnet genesis archive's static endpoint (`ip:8340`) to the
-/// archive's peer id, and return the endpoints. The genesis archive at that
-/// address presents this identity on `:8340` as on the mesh; a dial reaching
-/// anyone else fails. The pins are per process: the master and each cluster
-/// worker process set their own.
+/// Pin each mainnet genesis archive's static endpoint (`ip:8340`, an IPv6
+/// address bracketed) to the archive's peer id, and return the endpoints.
+/// The genesis archive at that address presents this identity on `:8340`
+/// as on the mesh; a dial reaching anyone else fails. The pins are per
+/// process: the master and each cluster worker process set their own.
 pub(crate) fn pin_genesis_archive_endpoints() -> Vec<String> {
     let mut endpoints = Vec::new();
     for (peer_id, ip) in quil_engine::genesis::genesis_archive_static_ips() {
-        let endpoint = format!("{}:8340", ip);
+        let Some(endpoint) = crate::util::multiaddr::genesis_archive_endpoint(&ip) else {
+            tracing::warn!(
+                peer = %peer_id,
+                %ip,
+                "genesis archive address does not parse; that archive is not dialed"
+            );
+            continue;
+        };
         match peer_id.parse::<quil_p2p::PeerId>() {
             Ok(peer) => {
                 if let Err(held) = quil_rpc::archive_client::pin_archive_peer(&endpoint, peer) {

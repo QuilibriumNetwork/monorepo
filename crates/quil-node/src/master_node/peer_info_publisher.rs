@@ -1153,7 +1153,8 @@ mod tests {
             assert_eq!(pubsub, QUIC6);
             assert_eq!(
                 select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub, &confirmed),
-                strings(&["/ip4/203.0.113.7/tcp/8340"])
+                strings(&["/ip4/203.0.113.7/tcp/8340"]),
+                "ipv4_stream_addr_missing behind an IPv6 pubsub address"
             );
             assert_eq!(
                 select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub, &confirmed),

@@ -1523,7 +1523,11 @@ mod pool_tests {
         }
         assert_eq!(p.endpoints().await.len(), 4, "every family stays known");
         let all = p.get_all().await;
-        assert_eq!(all, vec![v6, "192.0.2.42:8340", "192.0.2.43:8340"]);
+        assert_eq!(
+            all,
+            vec![v6, "192.0.2.42:8340", "192.0.2.43:8340"],
+            "archive_offered_per_family: one endpoint per archive"
+        );
         crate::archive_client::record_connect_for_tests(v4, true);
         crate::archive_client::record_connect_for_tests(v6, false);
         assert_eq!(

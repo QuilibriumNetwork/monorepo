@@ -600,7 +600,7 @@ mod tests {
 
     const FILTER: [u8; 35] = [7; 35];
     // TEST-NET-3 documentation address.
-    const STREAM: &str = "/ip4/203.0.113.7/tcp/8340";
+    const STREAM: &str = "/ip4/185.1.113.7/tcp/8340";
 
     fn signed(timestamp: i64, filter: &[u8]) -> quil_p2p::CanonicalPeerInfo {
         let signer = quil_crypto::FalconSigner::generate();
@@ -609,7 +609,7 @@ mod tests {
             peer_id: quil_p2p::peer_id_from_falcon_pubkey(&public_key),
             reachability: vec![quil_p2p::CanonicalReachability {
                 filter: filter.to_vec(),
-                pubsub_multiaddrs: vec!["/ip4/203.0.113.7/udp/8336/quic-v1".into()],
+                pubsub_multiaddrs: vec!["/ip4/185.1.113.7/udp/8336/quic-v1".into()],
                 stream_multiaddrs: vec![STREAM.into()],
             }],
             timestamp,
@@ -667,7 +667,7 @@ mod tests {
         let running = cache_of([member.clone()]);
         assert_eq!(
             addrs(shard_member_endpoints(&running.read(), &FILTER, 0)),
-            vec!["203.0.113.7:8340".to_string()]
+            vec!["185.1.113.7:8340".to_string()]
         );
         assert_eq!(save(&running, &path, 0, now).unwrap(), 1);
 
@@ -684,7 +684,7 @@ mod tests {
         );
         assert_eq!(
             addrs(shard_member_endpoints(&restarted.read(), &FILTER, 0)),
-            vec!["203.0.113.7:8340".to_string()]
+            vec!["185.1.113.7:8340".to_string()]
         );
         let held = restarted.read().get(&member.peer_id).cloned().unwrap();
         assert_eq!(
@@ -701,7 +701,7 @@ mod tests {
         let good = signed(now - 60_000, &FILTER);
         // Another endpoint written into a signed record.
         let mut tampered = signed(now - 60_000, &FILTER);
-        tampered.reachability[0].stream_multiaddrs = vec!["/ip4/198.51.100.9/tcp/8340".into()];
+        tampered.reachability[0].stream_multiaddrs = vec!["/ip4/185.22.100.9/tcp/8340".into()];
         // Signed by its own key, naming another peer's ID.
         let mut forged = signed(now - 60_000, &FILTER);
         forged.peer_id = good.peer_id.clone();
@@ -801,7 +801,7 @@ mod tests {
         {
             let mut info = info.clone();
             info.reachability[0].stream_multiaddrs =
-                vec![format!("/ip4/203.0.113.{}/tcp/8340", 10 + index)];
+                vec![format!("/ip4/185.1.113.{}/tcp/8340", 10 + index)];
             held.push(info);
         }
         let cache = cache_of(held);
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(
             endpoints,
             vec![MemberEndpoint {
-                addr: "203.0.113.10:8340".into(),
+                addr: "185.1.113.10:8340".into(),
                 peer: quil_p2p::PeerId::from_bytes(&member.peer_id).unwrap(),
             }]
         );
@@ -1107,7 +1107,7 @@ mod tests {
             .map(|record| {
                 let mut info = signed(now, &FILTER);
                 info.reachability[0].stream_multiaddrs = (0..10)
-                    .map(|i| format!("/ip4/203.0.113.{}/tcp/{}", 1 + record, 8340 + i))
+                    .map(|i| format!("/ip4/185.1.113.{}/tcp/{}", 1 + record, 8340 + i))
                     .collect();
                 info
             })
@@ -1135,7 +1135,7 @@ mod tests {
         // record with their own key.
         let mut padded = signed(now, &FILTER);
         padded.reachability[0].stream_multiaddrs = (0..200)
-            .map(|i| format!("/ip4/203.0.113.{}/tcp/{}", 1 + i % 200, 8340 + i))
+            .map(|i| format!("/ip4/185.1.113.{}/tcp/{}", 1 + i % 200, 8340 + i))
             .collect();
         let cache = cache_of([padded]);
         let endpoints = shard_member_endpoints(&cache.read(), &FILTER, 0).len();
