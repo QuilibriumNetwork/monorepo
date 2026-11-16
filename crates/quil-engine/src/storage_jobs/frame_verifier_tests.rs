@@ -1289,23 +1289,24 @@ fn a_frames_starvation_outlives_the_gap() {
     let start = Instant::now();
     let gap = Duration::from_secs(60);
     let later = start + Duration::from_secs(120);
+    let forget = VERIFIER_FRAME_FORGET;
     let mut starved = Starved::default();
     assert!(
-        starved.note(start, gap, true),
+        starved.note(start, gap, forget, true),
         "setup: the first ask starts it"
     );
     assert!(
-        !starved.note(later, gap, true),
+        !starved.note(later, gap, forget, true),
         "frame_ask_restarted_line: a frame's ask past the gap started a new warning interval"
     );
     assert_eq!(
-        starved.frames_for(later, gap),
+        starved.frames_for(later, gap, forget),
         Duration::from_secs(120),
         "starved_secs_lost_frame: a frame's ask past the gap restarted its count"
     );
     starved.admitted(false);
     assert_eq!(
-        starved.frame,
+        starved.frame_since(later, forget),
         Some(start),
         "warm_ended_frames_starvation: a warm's admission ended the frame's"
     );
@@ -1373,6 +1374,47 @@ fn a_starved_checks_warning_waits_for_its_bound() {
         logged(refuse).matches(STARVED_LINE).count(),
         1,
         "starved_never_warned: starved past the bound, it did not warn once"
+    );
+}
+
+/// A frame's check refused once and not asked again, its frame no longer
+/// waiting, leaves no starvation past the forget bound: none is reported,
+/// and the next frame's check neither warns nor runs alone past the room.
+#[test]
+fn an_abandoned_frames_starvation_is_forgotten() {
+    let forget = 2 * STARVED_BOUND;
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    admission.verifier_starved_gap = Duration::from_millis(5);
+    admission.verifier_frame_forget = forget;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let ask = || {
+        admission
+            .reserve_verifier(3 * GIB, Instant::now(), FrameCheck::Inline)
+            .is_none()
+    };
+    assert!(ask(), "setup: the frame's check is refused at no headroom");
+    // Its last ask was before this: load only lengthens the idle time.
+    let asked = Instant::now();
+    std::thread::sleep((asked + forget + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    let now = Instant::now();
+    assert_eq!(
+        admission
+            .state()
+            .verifier_starved
+            .frames_for(now, admission.verifier_starved_gap, forget),
+        Duration::ZERO,
+        "abandoned_frame_still_starved: no frame asked past the bound, yet it counts as starved"
+    );
+    let mut refused = false;
+    let lines = logged(|| refused = ask());
+    assert!(
+        refused,
+        "abandoned_frame_escaped: the next frame's check ran alone past the room at once"
+    );
+    assert!(
+        !lines.contains(STARVED_LINE),
+        "abandoned_frame_warned: the next frame's check warned of the old starvation: {lines}"
     );
 }
 
