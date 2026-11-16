@@ -784,7 +784,7 @@ impl PeerCoinReader {
             .collect();
         endpoints.extend(
             self.archive_pool
-                .get_all()
+                .archives()
                 .await
                 .into_iter()
                 .filter(|endpoint| seen.insert(endpoint.clone()))
@@ -1347,7 +1347,7 @@ impl PeerCoinReader {
     ) -> Option<(quil_types::store::LegacyCoinPageData, String)> {
         for endpoint in self
             .archive_pool
-            .get_all()
+            .archives()
             .await
             .into_iter()
             .take(MAX_ATTEMPTS)

@@ -1200,7 +1200,7 @@ impl GlobalService for GlobalRpcServer {
             .as_ref()
             .ok_or_else(|| Status::unavailable("archive directory unavailable"))?;
         let endpoints: Vec<String> = pool
-            .endpoints()
+            .get_all()
             .await
             .into_iter()
             .filter(|entry| !entry.is_empty() && entry.len() <= 512)

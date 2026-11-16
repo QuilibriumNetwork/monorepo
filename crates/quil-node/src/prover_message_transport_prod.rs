@@ -956,7 +956,7 @@ async fn submit_to_archives_with(
     let Some(seed) = seed else {
         return (0, Delivery::default());
     };
-    let archive_addrs = pool.get_all().await;
+    let archive_addrs = pool.archives().await;
     let archives = archive_addrs.len();
     let proof = carries_storage_proof(&bytes);
     let submit = move |stream_addr: String, bytes: Vec<u8>| {
@@ -1028,7 +1028,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         if let Some(seed) = self.falcon_signing_key.clone() {
             let addrs: Vec<String> = self
                 .archive_pool
-                .get_all()
+                .archives()
                 .await
                 .into_iter()
                 .take(MAX_ARCHIVES_TO_TRY)

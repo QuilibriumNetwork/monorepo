@@ -531,23 +531,29 @@ static CONNECT_OUTAGES: std::sync::LazyLock<std::sync::Mutex<ConnectState>> =
     std::sync::LazyLock::new(Default::default);
 /// Connection results by archive: an outage per archive (its pinned peer, or
 /// the endpoint of an unpinned one), and for pinned endpoints the last result
-/// of each, so one family failing while another connects is no outage.
+/// of each, so one endpoint failing while another connects is no outage.
 #[derive(Default)]
 struct ConnectState {
     outages: std::collections::HashMap<String, quil_engine::outage::Outage>,
-    last_ok: std::collections::HashMap<String, bool>,
-    family_down: std::collections::HashSet<String>,
+    /// Per pinned endpoint: `None` when its last attempt connected, else the
+    /// [`ConnectState::failures`] count at that failure (lower is older).
+    last: std::collections::HashMap<String, Option<u64>>,
+    failures: u64,
+    sibling_down: std::collections::HashSet<String>,
 }
 /// What one connection result changes, for the log.
 #[derive(Debug, PartialEq)]
 enum ConnectNote {
     /// The archive's outage: every endpoint of it this node knows fails.
     Archive(quil_engine::outage::OutageEvent),
-    /// This endpoint fails while `reachable`, another endpoint of the same
-    /// archive, connects: its address family is unreachable from here.
+    /// This endpoint fails while `reachable`, an endpoint of the same archive
+    /// on the other IP family, connects: this family is unreachable from here.
     FamilyUnreachable { reachable: String },
-    /// This endpoint connects again after [`ConnectNote::FamilyUnreachable`].
-    FamilyRecovered,
+    /// This endpoint fails while `reachable`, another endpoint of the same
+    /// archive on the same family (or named by DNS), connects.
+    AddressUnreachable { reachable: String },
+    /// This endpoint connects again after one of the two notes above.
+    AddressRecovered,
 }
 /// The address family of a `host:port` endpoint, for the log.
 fn endpoint_family(addr: &str) -> &'static str {
@@ -572,15 +578,28 @@ fn archive_of(addr: &str) -> (String, Vec<String>) {
         None => (addr.to_string(), Vec::new()),
     }
 }
-/// Whether the last connection attempt to `addr`, a pinned endpoint, failed;
-/// the archive pool then offers another endpoint of the same archive first.
-pub fn endpoint_last_failed(addr: &str) -> bool {
+/// When the last connection attempt to `addr`, a pinned endpoint, failed:
+/// `None` if it connected or was never tried, else its failure's order
+/// (lower is older). The archive pool offers another endpoint of the same
+/// archive first, and of endpoints that all failed the one that failed first.
+pub fn endpoint_failure_order(addr: &str) -> Option<u64> {
     CONNECT_OUTAGES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .last_ok
+        .last
         .get(addr)
-        == Some(&false)
+        .copied()
+        .flatten()
+}
+/// Whether two endpoints are IP literals of different families.
+fn other_ip_family(a: &str, b: &str) -> bool {
+    match (
+        a.parse::<std::net::SocketAddr>(),
+        b.parse::<std::net::SocketAddr>(),
+    ) {
+        (Ok(a), Ok(b)) => a.is_ipv6() != b.is_ipv6(),
+        _ => false,
+    }
 }
 
 /// The identity each archive endpoint this node knows the peer of must
@@ -654,33 +673,42 @@ pub fn archive_directory(
 
 /// Record one connection attempt to `addr`; returns the transition to log.
 /// A failure while another endpoint of the same archive last connected is
-/// that endpoint's family, noted once; the archive's outage begins only when
+/// noted once, as that family's when the two are IP literals of different
+/// families, else as that address's; the archive's outage begins only when
 /// none of its endpoints connects.
 fn connect_outage(addr: &str, ok: bool) -> Option<ConnectNote> {
     let now = std::time::Instant::now();
     let (archive, siblings) = archive_of(addr);
     let mut state = CONNECT_OUTAGES.lock().unwrap_or_else(|e| e.into_inner());
     if archive != addr {
-        state.last_ok.insert(addr.to_string(), ok);
+        let failed = (!ok).then(|| {
+            state.failures += 1;
+            state.failures
+        });
+        state.last.insert(addr.to_string(), failed);
     }
     if ok {
-        let recovered = state.family_down.remove(addr);
+        let recovered = state.sibling_down.remove(addr);
         let ended = state
             .outages
             .remove(&archive)
             .and_then(|mut outage| outage.observe(now, true));
         return ended
             .map(ConnectNote::Archive)
-            .or(recovered.then_some(ConnectNote::FamilyRecovered));
+            .or(recovered.then_some(ConnectNote::AddressRecovered));
     }
     let reachable = siblings
         .into_iter()
-        .find(|sibling| state.last_ok.get(sibling) == Some(&true));
+        .find(|sibling| state.last.get(sibling) == Some(&None));
     if let Some(reachable) = reachable {
-        return state
-            .family_down
-            .insert(addr.to_string())
-            .then_some(ConnectNote::FamilyUnreachable { reachable });
+        if !state.sibling_down.insert(addr.to_string()) {
+            return None;
+        }
+        return Some(if other_ip_family(addr, &reachable) {
+            ConnectNote::FamilyUnreachable { reachable }
+        } else {
+            ConnectNote::AddressUnreachable { reachable }
+        });
     }
     state
         .outages
@@ -725,8 +753,13 @@ fn log_connect_outage(addr: &str, note: Option<ConnectNote>, error_chain: &str) 
                           archive shows it",
                 "archive unreachable on this address family; using its other address")
         }
-        Some(ConnectNote::FamilyRecovered) => {
-            info!(%addr, family, "archive reachable on this address family again")
+        Some(ConnectNote::AddressUnreachable { reachable }) => {
+            info!(%addr, family, %reachable, error_chain, scope = "peer",
+                action = "no action needed: this node reaches the archive at another address",
+                "archive unreachable at this address; using its other address")
+        }
+        Some(ConnectNote::AddressRecovered) => {
+            info!(%addr, family, "archive reachable at this address again")
         }
         None => {}
     }
@@ -1949,8 +1982,9 @@ fn interleave_families(addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::Socket
     out
 }
 
-/// Race `connect` over `addrs` in order, starting the next attempt when one
-/// fails or `delay` passes; the first success wins and drops the others.
+/// Race `connect` over `addrs` in order, starting the next attempt as soon
+/// as one fails, else `delay` after the last start (RFC 8305 section 5); the
+/// first success wins and drops the others.
 /// The error is the last attempt's when every one fails.
 async fn happy_eyeballs<T, F, Fut>(
     addrs: Vec<std::net::SocketAddr>,
@@ -1971,19 +2005,23 @@ where
         ));
     };
     pending.push(connect(first));
+    let stagger = tokio::time::sleep(delay);
+    tokio::pin!(stagger);
     loop {
         let more = next.len() > 0;
         tokio::select! {
-            Some(result) = pending.next() => match result {
-                Ok(stream) => return Ok(stream),
-                Err(error) if pending.is_empty() => match next.next() {
-                    Some(addr) => pending.push(connect(addr)),
-                    None => return Err(error),
-                },
-                Err(_) => {}
+            Some(result) = pending.next() => match (result, next.next()) {
+                (Ok(stream), _) => return Ok(stream),
+                (Err(_), Some(addr)) => {
+                    pending.push(connect(addr));
+                    stagger.as_mut().reset(tokio::time::Instant::now() + delay);
+                }
+                (Err(error), None) if pending.is_empty() => return Err(error),
+                (Err(_), None) => {}
             },
-            _ = tokio::time::sleep(delay), if more => {
+            () = &mut stagger, if more => {
                 pending.extend(next.next().map(&connect));
+                stagger.as_mut().reset(tokio::time::Instant::now() + delay);
             }
         }
     }
@@ -2372,6 +2410,90 @@ mod pinned_archive_tests {
         assert_eq!(connected.unwrap(), v4);
     }
 
+    /// An attempt failing while an earlier one still pends starts the next
+    /// at once, not a stagger later (RFC 8305 section 5).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_attempt_starts_the_next_at_once() {
+        let hang: std::net::SocketAddr = "[2001:db8::71]:8340".parse().unwrap();
+        let fail: std::net::SocketAddr = "192.0.2.71:8340".parse().unwrap();
+        let live: std::net::SocketAddr = "[2001:db8::72]:8340".parse().unwrap();
+        let delay = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let connected = happy_eyeballs(vec![hang, fail, live], delay, move |addr| async move {
+            if addr == hang {
+                std::future::pending::<()>().await;
+            }
+            if addr == fail {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            Ok(addr)
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, live);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < delay * 2,
+            "next_attempt_waits_after_failure: connected after {elapsed:?}"
+        );
+    }
+
+    /// A dial whose every attempt fails returns the last attempt's error,
+    /// and one over no address says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_failing_everywhere_returns_the_last_error() {
+        let addrs: Vec<std::net::SocketAddr> =
+            ["192.0.2.73:8340", "[2001:db8::73]:8340", "192.0.2.74:8340"]
+                .iter()
+                .map(|addr| addr.parse().unwrap())
+                .collect();
+        let error = happy_eyeballs(addrs.clone(), Duration::from_secs(10), |addr| async move {
+            Err::<std::net::SocketAddr, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                addr.to_string(),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            addrs[2].to_string(),
+            "last_attempt_error_returned"
+        );
+        let none = happy_eyeballs(Vec::new(), Duration::from_secs(10), |addr| async move {
+            Ok::<_, std::io::Error>(addr)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(none.kind(), std::io::ErrorKind::AddrNotAvailable);
+    }
+
+    /// Two endpoints of one archive on the same family (or one named by
+    /// DNS): one failing while the other connects is noted once, as that
+    /// address's, never as an unreachable address family.
+    #[test]
+    fn a_same_family_sibling_failing_is_no_family_note() {
+        let archive = quil_p2p::PeerId::random();
+        let (a, b, name) = (
+            "192.0.2.61:8340",
+            "192.0.2.62:8340",
+            "archive61.example:8340",
+        );
+        for endpoint in [a, b, name] {
+            pin_archive_peer(endpoint, archive).unwrap();
+        }
+        assert_eq!(connect_outage(a, true), None);
+        for endpoint in [b, name] {
+            let note = connect_outage(endpoint, false);
+            assert!(note.is_some(), "the failing address is noted");
+            assert!(
+                !matches!(note, Some(ConnectNote::FamilyUnreachable { .. })),
+                "same_family_sibling_called_family: {endpoint} {note:?}"
+            );
+            assert_eq!(connect_outage(endpoint, false), None, "noted once");
+        }
+    }
+
     /// One archive at an IPv4 and an IPv6 endpoint: the IPv6 one failing
     /// while the IPv4 one connects is noted once and is no outage; the
     /// archive's outage begins only when its IPv4 endpoint fails too.
@@ -2389,7 +2511,7 @@ mod pinned_archive_tests {
                 reachable: v4.to_string()
             })
         );
-        assert!(endpoint_last_failed(v6) && !endpoint_last_failed(v4));
+        assert!(endpoint_failure_order(v6).is_some() && endpoint_failure_order(v4).is_none());
         for _ in 0..5 {
             assert_eq!(connect_outage(v6, false), None, "noted once");
         }

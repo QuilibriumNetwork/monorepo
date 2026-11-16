@@ -61,6 +61,7 @@ h2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 quil-store = { path = "../quil-store", features = ["test-utils"] }
 
 [lints]

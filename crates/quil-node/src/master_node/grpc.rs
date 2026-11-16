@@ -3331,7 +3331,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         // a different archive with materialized state.
                         // Over the connections this process shares with the
                         // archives, each held until its queries end.
-                        for endpoint in archive_pool.get_all().await {
+                        for endpoint in archive_pool.archives().await {
                             match quil_rpc::ArchiveClient::shared(&endpoint, &seed).await {
                                 Ok(client) => clients.push(((*client).clone(), Some(client))),
                                 Err(e) => tracing::debug!(endpoint = %endpoint, error = %e, "shard info: archive-pool dial failed"),

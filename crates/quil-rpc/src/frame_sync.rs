@@ -141,22 +141,36 @@ struct ArchiveEndpointPoolInner {
     cursor: usize,
 }
 
-/// [`ArchiveEndpointPool::get_all`] over `endpoints`.
+/// [`ArchiveEndpointPool::archives`] over `endpoints`.
 fn one_per_archive(endpoints: &[String]) -> Vec<String> {
-    use crate::archive_client::{endpoint_last_failed, pinned_archive_peer};
-    let mut chosen: Vec<(Option<quil_p2p::PeerId>, String)> = Vec::new();
+    use crate::archive_client::{endpoint_failure_order, pinned_archive_peer};
+    // Per archive: its endpoint on offer and when that one last failed.
+    let mut chosen: Vec<(Option<quil_p2p::PeerId>, String, Option<u64>)> = Vec::new();
     for endpoint in endpoints {
         let peer = pinned_archive_peer(endpoint);
-        match peer.and_then(|peer| chosen.iter().position(|(held, _)| *held == Some(peer))) {
-            None => chosen.push((peer, endpoint.clone())),
+        let failed = endpoint_failure_order(endpoint);
+        match peer.and_then(|peer| chosen.iter().position(|(held, ..)| *held == Some(peer))) {
+            None => chosen.push((peer, endpoint.clone(), failed)),
             Some(index) => {
-                if endpoint_last_failed(&chosen[index].1) && !endpoint_last_failed(endpoint) {
-                    chosen[index].1 = endpoint.clone();
+                let offered = &mut chosen[index];
+                // An endpoint that did not fail beats one that did; of two that
+                // failed, the one that failed first is retried first.
+                let better = match (offered.2, failed) {
+                    (Some(_), None) => true,
+                    (Some(offered_at), Some(at)) => at < offered_at,
+                    (None, _) => false,
+                };
+                if better {
+                    offered.1 = endpoint.clone();
+                    offered.2 = failed;
                 }
             }
         }
     }
-    chosen.into_iter().map(|(_, endpoint)| endpoint).collect()
+    chosen
+        .into_iter()
+        .map(|(_, endpoint, _)| endpoint)
+        .collect()
 }
 
 impl ArchiveEndpointPool {
@@ -203,21 +217,23 @@ impl ArchiveEndpointPool {
         self.inner.lock().await.endpoints.len()
     }
 
+    /// Every known archive endpoint, each address family of an archive
+    /// apart: the set callers check membership in (an endpoint
+    /// [`ArchiveEndpointPool::next`] gave, the archive directory).
+    pub async fn get_all(&self) -> Vec<String> {
+        self.inner.lock().await.endpoints.clone()
+    }
+
     /// One endpoint per known archive, for callers that fan out to archives
     /// (submitting prover messages, picking distinct anchors): endpoints
     /// pinned to the same peer are one archive, at the place of its first
     /// endpoint. Of an archive's endpoints the first whose last connection
     /// did not fail is offered, so an archive this node reaches on one
-    /// address family only is sent to once, on the family that connects.
-    pub async fn get_all(&self) -> Vec<String> {
+    /// address only is sent to once, there; when all of them failed, the one
+    /// that failed first is offered, so they are retried in turn.
+    pub async fn archives(&self) -> Vec<String> {
         let endpoints = self.inner.lock().await.endpoints.clone();
         one_per_archive(&endpoints)
-    }
-
-    /// Every known endpoint, each family of an archive apart (the archive
-    /// directory this node serves its own processes).
-    pub async fn endpoints(&self) -> Vec<String> {
-        self.inner.lock().await.endpoints.clone()
     }
 
     /// Pick the next non-blacklisted endpoint round-robin. Returns `None` if
@@ -1511,7 +1527,7 @@ mod pool_tests {
     /// to fan-out callers: the family that last connected is offered, and
     /// three archives give three distinct anchors.
     #[tokio::test]
-    async fn get_all_offers_one_endpoint_per_archive() {
+    async fn archives_offers_one_endpoint_per_archive() {
         use crate::archive_client::pin_archive_peer;
         let p = pool();
         let dual = quil_p2p::PeerId::random();
@@ -1521,8 +1537,8 @@ mod pool_tests {
         for endpoint in [v6, v4, "192.0.2.42:8340", "192.0.2.43:8340"] {
             p.add(endpoint.to_string()).await;
         }
-        assert_eq!(p.endpoints().await.len(), 4, "every family stays known");
-        let all = p.get_all().await;
+        assert_eq!(p.get_all().await.len(), 4, "every family stays known");
+        let all = p.archives().await;
         assert_eq!(
             all,
             vec![v6, "192.0.2.42:8340", "192.0.2.43:8340"],
@@ -1531,10 +1547,60 @@ mod pool_tests {
         crate::archive_client::record_connect_for_tests(v4, true);
         crate::archive_client::record_connect_for_tests(v6, false);
         assert_eq!(
-            p.get_all().await,
+            p.archives().await,
             vec![v4, "192.0.2.42:8340", "192.0.2.43:8340"],
             "the family that connects is offered"
         );
+    }
+
+    /// Callers that check membership (a shard list's reporter, the endpoint
+    /// `next` gave) find every family of an archive in `get_all`, the one
+    /// whose last connection failed included.
+    #[tokio::test]
+    async fn get_all_keeps_every_endpoint_of_a_dual_stack_archive() {
+        use crate::archive_client::{pin_archive_peer, record_connect_for_tests};
+        let p = pool();
+        let dual = quil_p2p::PeerId::random();
+        let (v6, v4) = ("[2001:db8::44]:8340", "192.0.2.44:8340");
+        pin_archive_peer(v6, dual).unwrap();
+        pin_archive_peer(v4, dual).unwrap();
+        for endpoint in [v6, v4, "192.0.2.45:8340"] {
+            p.add(endpoint.to_string()).await;
+        }
+        record_connect_for_tests(v4, true);
+        record_connect_for_tests(v6, false);
+        let all = p.get_all().await;
+        for _ in 0..3 {
+            let next = p.next().await.unwrap();
+            assert!(
+                all.contains(&next),
+                "endpoint_missing_from_get_all: {next} not in {all:?}"
+            );
+        }
+    }
+
+    /// When every endpoint of an archive last failed, the one that failed
+    /// first is offered, so its endpoints are retried in turn rather than
+    /// the first in pool order forever.
+    #[test]
+    fn an_archive_failing_on_every_endpoint_alternates() {
+        use crate::archive_client::{pin_archive_peer, record_connect_for_tests};
+        let dual = quil_p2p::PeerId::random();
+        let (v6, v4) = ("[2001:db8::46]:8340", "192.0.2.46:8340");
+        pin_archive_peer(v6, dual).unwrap();
+        pin_archive_peer(v4, dual).unwrap();
+        let endpoints = [v6.to_string(), v4.to_string()];
+        record_connect_for_tests(v6, false);
+        record_connect_for_tests(v4, false);
+        assert_eq!(one_per_archive(&endpoints), vec![v6], "failed first");
+        record_connect_for_tests(v6, false);
+        assert_eq!(
+            one_per_archive(&endpoints),
+            vec![v4],
+            "both_failed_first_forever: the endpoint that failed first is retried"
+        );
+        record_connect_for_tests(v4, false);
+        assert_eq!(one_per_archive(&endpoints), vec![v6]);
     }
 
     #[tokio::test]

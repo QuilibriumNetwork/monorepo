@@ -1060,7 +1060,7 @@ async fn run_record_only_backfill(
         lo, hi, "record-only backfill: filling missing frame records"
     );
 
-    let endpoints = pool.get_all().await;
+    let endpoints = pool.archives().await;
     if endpoints.is_empty() {
         info!(
             holes = initial,
@@ -1536,7 +1536,7 @@ async fn run_state_jump(
         if sync_all_shards && local_head >= STATE_JUMP_MAX_FRAME {
             return None;
         }
-        let endpoints = pool.get_all().await;
+        let endpoints = pool.archives().await;
         // Did we read a head from any peer this pass, and the max head among peers
         // we would actually jump to (i.e. passing the archive ceiling policy)?
         // These decide far-behind vs caught-up when no jump completes.
@@ -3397,7 +3397,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 if !sync_archive_mode {
                     let registry_sync = sync_pl.begin_registry_sync();
                     let synced = bootstrap_prover_sync(bootstrap_rx, &sync_token, || async {
-                        let initial_peers = sync_pool.get_all().await;
+                        let initial_peers = sync_pool.archives().await;
                         if initial_peers.is_empty() { return false; }
                         info!(archives = initial_peers.len(), "starting initial prover tree sync");
                         // Reuse an authenticated startup jump when available;
@@ -3410,7 +3410,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                                 }
                             }
-                            let order = crate::prover_tree_syncer_prod::archive_pull_order(sync_pool.get_all().await);
+                            let order = crate::prover_tree_syncer_prod::archive_pull_order(sync_pool.archives().await);
                             for addr in order.iter() {
                                 if sync_token.is_cancelled() { break 'rounds; }
                                 match crate::forest_sync::sync_single_shard_verified(
@@ -3427,7 +3427,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 crate::prover_tree_syncer_prod::source_failed(addr);
                             }
                         }
-                        let archives = sync_pool.get_all().await.len();
+                        let archives = sync_pool.archives().await.len();
                         warn!(rounds = INITIAL_SYNC_ROUNDS, archives,
                             retry_every_s = sync_interval_secs, scope = "this node",
                             action = "check this node's outbound connections and DNS to the archives \
@@ -5265,7 +5265,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // boundary, and in the pool's order they would all
                             // ask the first archive, then all the next.
                             let reconcile_peers = crate::prover_tree_syncer_prod::archive_pull_order(
-                                sync_pool.get_all().await,
+                                sync_pool.archives().await,
                             );
                             let mut reconcile_converged = false;
                             // A node that does not materialize global frames (a regular)
