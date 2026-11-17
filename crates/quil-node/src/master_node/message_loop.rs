@@ -3196,37 +3196,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             }
                                                         }
 
-                                                        // Build the in-memory ProverRegistry
-                                                        // from the persisted vertex store.
-                                                        let mut registry =
-                                                            quil_execution::InMemoryProverRegistry::new();
-                                                        registry.refresh(store.as_ref())?;
-                                                        info!(
-                                                            provers_visited = registry.provers_visited(),
-                                                            allocations_visited = registry.allocations_visited(),
-                                                            rewards_visited = registry.rewards_visited(),
-                                                            distinct_provers = registry.distinct_provers(),
-                                                            distinct_filters = registry.distinct_filters(),
-                                                            "prover registry refreshed"
-                                                        );
-
-                                                        // Sample a few active provers.
-                                                        let all_active =
-                                                            registry.get_all_active_app_shard_provers();
-                                                        info!(
-                                                            active_count = all_active.len(),
-                                                            "active prover count from registry"
-                                                        );
-                                                        for prover in all_active.iter().take(3) {
-                                                            info!(
-                                                                address = %hex::encode(&prover.address),
-                                                                seniority = prover.seniority,
-                                                                available_storage = prover.available_storage,
-                                                                allocations = prover.allocations.len(),
-                                                                "  active prover"
-                                                            );
-                                                        }
-                                                        Ok(())
+                                                        summarize_bootstrap_registry(|registry| {
+                                                            registry.refresh(store.as_ref()).map_err(anyhow::Error::from)
+                                                        })
                                                     });
                                                 }
                                             }
@@ -3504,12 +3476,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             let _store = probe::section(ProbeSection::GlobalFrameStore);
                                             let pipeline = global_finalization_for_recv.get();
                                             activation_waits_for_recv.global_finalization.observe(pipeline.is_some(), Some(frame_num));
-                                            if pipeline.is_some_and(|pipeline| pipeline.offer_synced(&frame))
-                                            {
-                                                Ok(())
-                                            } else {
-                                                clock_store_recv.put_global_frame(&frame, None)
-                                            }
+                                            store_gossip_frame(
+                                                &frame,
+                                                |frame| pipeline.is_some_and(|pipeline| pipeline.offer_synced(frame)),
+                                                |frame| clock_store_recv.put_global_frame(frame, None),
+                                            )
                                         };
                                         match stored {
                                             Ok(()) => {
@@ -3750,8 +3721,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                warn!(error = %e, "failed to store frame");
+                                            Err(_) => {
+                                                // Logged, bounded, by store_gossip_frame.
                                             }
                                         }
                                     }
@@ -4058,9 +4029,169 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     }));
 }
 
+/// Log a summary of the prover registry in the node's store after the
+/// first archive's prover tree bootstrap, with `refresh` filling an empty
+/// registry from the store. Its result is the detached task's, so it is
+/// always `Ok`: an error there stopped the whole node, and its service
+/// manager restarted it into the same read. A failed read logs its class
+/// and skips the summary; the registry the node runs on is loaded apart
+/// from it and retries its loads (`runtime_state`).
+fn summarize_bootstrap_registry<F>(refresh: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut quil_execution::InMemoryProverRegistry) -> anyhow::Result<()>,
+{
+    use quil_forest::storage_health;
+
+    let mut registry = quil_execution::InMemoryProverRegistry::new();
+    if let Err(error) = refresh(&mut registry) {
+        let error = format!("{error:#}");
+        let class = storage_health::error_class(&error);
+        let error = storage_health::redact_paths(&error);
+        if class == "CORRUPTION" {
+            error!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                %error,
+                "prover registry summary after the prover tree bootstrap skipped: a block of the master store {}; {}",
+                storage_health::CORRUPTION_CAUSE,
+                storage_health::corruption_next_step(Some(quil_forest::StoreRole::Master)),
+            );
+        } else {
+            warn!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                %error,
+                "prover registry summary after the prover tree bootstrap skipped: reading the master store \
+                 failed; the registry the node runs on retries its loads; check this node's disk if store \
+                 errors repeat"
+            );
+        }
+        return Ok(());
+    }
+    info!(
+        provers_visited = registry.provers_visited(),
+        allocations_visited = registry.allocations_visited(),
+        rewards_visited = registry.rewards_visited(),
+        distinct_provers = registry.distinct_provers(),
+        distinct_filters = registry.distinct_filters(),
+        "prover registry refreshed"
+    );
+
+    // Sample a few active provers.
+    let all_active = registry.get_all_active_app_shard_provers();
+    info!(
+        active_count = all_active.len(),
+        "active prover count from registry"
+    );
+    for prover in all_active.iter().take(3) {
+        info!(
+            address = %hex::encode(&prover.address),
+            seniority = prover.seniority,
+            available_storage = prover.available_storage,
+            allocations = prover.allocations.len(),
+            "  active prover"
+        );
+    }
+    Ok(())
+}
+
+/// The duty of storing a gossiped GLOBAL frame canonically.
+const GOSSIP_FRAME_STORE: &str = "store gossiped GLOBAL frame";
+
+/// Store a gossiped GLOBAL frame: the finalization pipeline keeps it as a
+/// certified candidate (`offer` true), else `put` writes it canonically. A
+/// store that refuses writes fails every received frame, so the canonical
+/// write's outcome is logged bounded per [`GOSSIP_FRAME_STORE`]; a frame the
+/// pipeline took is no canonical write and ends no condition.
+fn store_gossip_frame<E: std::fmt::Display>(
+    frame: &quil_types::proto::global::GlobalFrame,
+    offer: impl FnOnce(&quil_types::proto::global::GlobalFrame) -> bool,
+    put: impl FnOnce(&quil_types::proto::global::GlobalFrame) -> Result<(), E>,
+) -> Result<(), E> {
+    if offer(frame) {
+        return Ok(());
+    }
+    let stored = put(frame);
+    quil_engine::bounded_warn::note_retry(
+        GOSSIP_FRAME_STORE,
+        frame.header.as_ref().map_or(0, |h| h.frame_number),
+        stored.as_ref().err(),
+    );
+    stored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn global_frame(number: u64) -> quil_types::proto::global::GlobalFrame {
+        quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: number,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A store that refuses writes fails every gossiped GLOBAL frame's
+    /// canonical write (an archive peer received two or three a second):
+    /// 50 refused frames log one line, and the next write at the highest
+    /// failed frame ends it; a frame the pipeline takes ends nothing.
+    #[test]
+    fn a_store_refusing_writes_warns_once_for_gossiped_frames() {
+        let logs = crate::util::log_capture::Capture::default();
+        let _logs = logs.install();
+        let refused = "store error: database has a failed write; reopen and reconcile durable state before writing again";
+        for number in 1..=50 {
+            let stored = store_gossip_frame(&global_frame(number), |_| false, |_| Err(refused));
+            assert!(stored.is_err(), "premise: frame {number} refused");
+        }
+        assert_eq!(
+            logs.lines_with("store gossiped GLOBAL frame failed").len(),
+            1,
+            "gossip_store_spew: {:?}",
+            logs.lines_with("store gossiped GLOBAL frame")
+        );
+        assert_eq!(
+            quil_engine::bounded_warn::failing_attempts(GOSSIP_FRAME_STORE),
+            Some(50),
+            "gossip_store_unbounded"
+        );
+        assert!(store_gossip_frame(&global_frame(60), |_| true, |_| Err(refused)).is_ok());
+        assert!(store_gossip_frame(&global_frame(49), |_| false, |_| Ok::<(), &str>(())).is_ok());
+        assert!(
+            logs.lines_with("succeeded after failures").is_empty(),
+            "gossip_store_ended_early"
+        );
+        assert!(store_gossip_frame(&global_frame(50), |_| false, |_| Ok::<(), &str>(())).is_ok());
+        let ended = logs.lines_with("store gossiped GLOBAL frame succeeded after failures");
+        assert_eq!(ended.len(), 1, "gossip_store_end_missing");
+        assert!(ended[0].contains("attempts=50"), "{ended:?}");
+    }
+
+    /// A store error while summarizing the prover registry after the prover
+    /// tree bootstrap failed the detached task, and the task's error stopped
+    /// the node. The summary is skipped instead, whatever the error's class.
+    #[test]
+    fn a_store_error_in_the_bootstrap_registry_summary_does_not_fail_the_task() {
+        for cause in [
+            "Corruption: block checksum mismatch: stored = 1, computed = 2 in /store/000123.sst",
+            "IO error: Input/output error",
+        ] {
+            let outcome = summarize_bootstrap_registry(|_| Err(anyhow::anyhow!(cause)));
+            assert!(
+                outcome.is_ok(),
+                "bootstrap_summary_failed_the_task: {cause}: {outcome:?}"
+            );
+        }
+        assert!(
+            summarize_bootstrap_registry(|_| Ok(())).is_ok(),
+            "an empty registry summary failed"
+        );
+    }
 
     /// Any peer can publish on a shard's frame topic. A node without an
     /// archive ingest (a cluster master) must not make a gossiped frame with

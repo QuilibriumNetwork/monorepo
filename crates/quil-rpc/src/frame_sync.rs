@@ -372,16 +372,50 @@ pub type FrameCertified = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
 /// Uncertified frames held per poller at most; the lowest go first.
 const MAX_HELD_UNCERTIFIED: usize = 256;
 
-/// Store an admitted chain (lowest first) through the store hook, else
-/// canonically, and fire `on_frame` for each stored frame in order. A failed
-/// canonical write stops at that frame, so no later frame is stored above it.
 /// Time [`store_chain`] spent persisting frames and in `on_frame`.
 #[derive(Default)]
 struct StoreTiming {
     store: Duration,
     on_frame: Duration,
+    /// The highest frame [`store_chain`] wrote canonically, if any.
+    written: Option<u64>,
 }
 
+/// The duty of storing a catch-up poll's fetched frames canonically.
+const CATCHUP_FRAME_STORE: &str = "store catch-up GLOBAL frame";
+/// The duty of storing a head poll's frame canonically.
+const HEAD_FRAME_STORE: &str = "store polled head GLOBAL frame";
+
+/// [`store_chain`] for `duty` at `frame`, its outcome logged bounded: a store
+/// that refuses writes fails every polled frame. A write ends the condition
+/// at the highest frame it wrote; a chain the hook took, or that the clock
+/// already held, ends nothing. None when the chain failed.
+fn store_chain_noted(
+    duty: &'static str,
+    frame: u64,
+    config: &ArchivePollerConfig,
+    clock_store: &RocksClockStore,
+    chain: &[GlobalFrame],
+) -> Option<StoreTiming> {
+    match store_chain(config, clock_store, chain) {
+        Ok(stored) => {
+            if let Some(written) = stored.written {
+                quil_engine::bounded_warn::note_retry::<quil_types::error::QuilError>(
+                    duty, written, None,
+                );
+            }
+            Some(stored)
+        }
+        Err(error) => {
+            quil_engine::bounded_warn::note_retry(duty, frame, Some(&error));
+            None
+        }
+    }
+}
+
+/// Store an admitted chain (lowest first) through the store hook, else
+/// canonically, and fire `on_frame` for each stored frame in order. A failed
+/// canonical write stops at that frame, so no later frame is stored above it.
 fn store_chain(
     config: &ArchivePollerConfig,
     clock_store: &RocksClockStore,
@@ -403,6 +437,7 @@ fn store_chain(
             let _store = probe::section(ProbeSection::GlobalFrameStore);
             if !already_canonical(clock_store, frame) {
                 clock_store.put_global_frame(frame, None)?;
+                timing.written = frame.header.as_ref().map(|h| h.frame_number);
             }
         }
         timing.store += started.elapsed();
@@ -1317,11 +1352,14 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         let validated = processing.elapsed();
                         let chain = admit_frame(config.frame_certified.as_ref(), &mut held, frame);
                         let admitted = processing.elapsed();
-                        let stored =
-                            store_chain(&config, &clock_store, &chain).unwrap_or_else(|e| {
-                                warn!(error = %e, frame = fn_, "store catchup frame failed");
-                                StoreTiming::default()
-                            });
+                        let stored = store_chain_noted(
+                            CATCHUP_FRAME_STORE,
+                            fn_,
+                            &config,
+                            &clock_store,
+                            &chain,
+                        )
+                        .unwrap_or_default();
                         log_slow_processing(
                             &addr,
                             fn_,
@@ -1475,12 +1513,14 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             continue;
         }
         let admit = processing.elapsed() - validated;
-        let stored = match store_chain(&config, &clock_store, &admitted) {
-            Ok(stored) => stored,
-            Err(e) => {
-                warn!(error = %e, frame = new_number, "store head frame failed");
-                continue;
-            }
+        let Some(stored) = store_chain_noted(
+            HEAD_FRAME_STORE,
+            new_number,
+            &config,
+            &clock_store,
+            &admitted,
+        ) else {
+            continue;
         };
         log_slow_processing(
             &addr,
@@ -2045,6 +2085,59 @@ mod admit_tests {
         assert_ne!(db.inner().latest_sequence_number(), sequence);
         assert_eq!(clock.get_global_frame(6).unwrap(), other);
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A store that refuses writes fails every polled frame's canonical
+    /// write. Each poll duty counts its refused frames as one bounded
+    /// condition; a frame the clock already holds is no write and ends
+    /// nothing; the next write at the highest failed frame ends it.
+    #[test]
+    fn a_store_refusing_writes_bounds_each_poll_duty() {
+        use quil_engine::bounded_warn::failing_attempts;
+        let config = ArchivePollerConfig::default();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        db.inner().refuse_writes(
+            "Corruption: block checksum mismatch: stored = 0, computed = 1, type = 4 in 000001.sst",
+        );
+        let held = frame(3, 3, None, true);
+        for duty in [CATCHUP_FRAME_STORE, HEAD_FRAME_STORE] {
+            // Each duty its own healthy store: a frame another duty wrote
+            // is already canonical there, which is no write.
+            let healthy_db = quil_store::RocksDb::open_in_memory().unwrap();
+            let healthy = RocksClockStore::new(healthy_db.inner());
+            healthy.put_global_frame(&held, None).unwrap();
+            for number in 10..60u64 {
+                let chain = [frame(number, number as u8, None, true)];
+                assert!(
+                    store_chain_noted(duty, number, &config, &clock, &chain).is_none(),
+                    "premise: {duty}: frame {number} refused"
+                );
+            }
+            assert_eq!(
+                failing_attempts(duty),
+                Some(50),
+                "poll_store_unbounded: {duty}"
+            );
+            let skipped =
+                store_chain_noted(duty, 3, &config, &healthy, std::slice::from_ref(&held))
+                    .expect("an identical frame is not rewritten");
+            assert_eq!(skipped.written, None, "{duty}: an identical frame");
+            assert_eq!(
+                failing_attempts(duty),
+                Some(50),
+                "{duty}: ended by no write"
+            );
+            let written =
+                store_chain_noted(duty, 59, &config, &healthy, &[frame(59, 59, None, true)])
+                    .expect("a healthy store writes");
+            assert_eq!(written.written, Some(59), "{duty}: a healthy write");
+            assert_eq!(
+                failing_attempts(duty),
+                None,
+                "poll_store_end_missing: {duty}"
+            );
+        }
     }
 
     /// The held set is bounded; the lowest go first.

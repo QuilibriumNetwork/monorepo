@@ -122,6 +122,16 @@ impl Default for GlobalFinalizationLimits {
     }
 }
 
+/// [`GlobalFinalizationPipeline::note_retry`]'s duty of a canonical clock write.
+pub(crate) const CANONICAL_WRITE: &str = "canonical GLOBAL frame write";
+/// [`GlobalFinalizationPipeline::note_retry`]'s duty of a frame's sequenced
+/// ingest: the GLOBAL frame waits for its application frames.
+pub(crate) const INGEST: &str = "GLOBAL frame waits: ingest of its application frames";
+/// The duty of persisting a synced frame as a certified candidate.
+pub(crate) const SYNCED_CANDIDATE: &str = "persist synced GLOBAL candidate";
+/// The duty of persisting a synced chain's uncertified ancestors.
+pub(crate) const SYNCED_ANCESTOR: &str = "persist synced GLOBAL ancestor candidate";
+
 /// What the worker does after one step at its next height.
 #[derive(Debug)]
 pub enum FinalizationStep {
@@ -237,17 +247,10 @@ impl GlobalFinalizationPipeline {
         };
         let _section =
             quil_types::thread_probe::section(quil_types::thread_probe::Section::SequencedIngest);
-        match ingest(frame) {
-            Ok(ready) => ready,
-            Err(error) => {
-                tracing::warn!(
-                    frame = frame.header.as_ref().map_or(0, |h| h.frame_number),
-                    %error,
-                    "GLOBAL frame waits: its application frames could not be ingested"
-                );
-                false
-            }
-        }
+        let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        let ingested = ingest(frame);
+        self.note_retry(INGEST, number, ingested.as_ref().err(), Instant::now());
+        ingested.unwrap_or(false)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -312,11 +315,15 @@ impl GlobalFinalizationPipeline {
         // plan executing it, which read its candidate, and that plan would then
         // fall back. Certificates of one block may differ; either suffices.
         if !self.holds_certified_candidate(frame) {
-            if let Err(error) = self
+            let persisted = self
                 .clock
-                .put_global_clock_frame_candidate(frame, &crate::cw_global_seams::NoopTxn)
-            {
-                tracing::warn!(frame = header.frame_number, %error, "persist synced GLOBAL candidate failed");
+                .put_global_clock_frame_candidate(frame, &crate::cw_global_seams::NoopTxn);
+            crate::bounded_warn::note_retry(
+                SYNCED_CANDIDATE,
+                header.frame_number,
+                persisted.as_ref().err(),
+            );
+            if persisted.is_err() {
                 return false;
             }
         }
@@ -388,15 +395,15 @@ impl GlobalFinalizationPipeline {
             child = parent;
         }
         for ancestor in ancestors {
-            if let Err(error) = self
+            let persisted = self
                 .clock
-                .put_global_clock_frame_candidate(ancestor, &crate::cw_global_seams::NoopTxn)
-            {
-                tracing::warn!(
-                    frame = ancestor.header.as_ref().map_or(0, |h| h.frame_number),
-                    %error,
-                    "persist synced GLOBAL ancestor candidate failed"
-                );
+                .put_global_clock_frame_candidate(ancestor, &crate::cw_global_seams::NoopTxn);
+            crate::bounded_warn::note_retry(
+                SYNCED_ANCESTOR,
+                ancestor.header.as_ref().map_or(0, |h| h.frame_number),
+                persisted.as_ref().err(),
+            );
+            if persisted.is_err() {
                 return false;
             }
         }
@@ -650,13 +657,31 @@ impl GlobalFinalizationPipeline {
             self.clock.put_global_clock_frame(frame, txn.as_ref())?;
             txn.commit()
         };
-        match write() {
+        let written = write();
+        self.note_retry(
+            CANONICAL_WRITE,
+            next,
+            written.as_ref().err(),
+            Instant::now(),
+        );
+        match written {
             Ok(()) => FinalizationStep::Legacy,
-            Err(error) => {
-                tracing::warn!(frame = next, %error, "canonical GLOBAL frame write failed");
-                FinalizationStep::Retry(self.limits.retry)
-            }
+            Err(_) => FinalizationStep::Retry(self.limits.retry),
         }
+    }
+
+    /// Log the outcome of `duty` ([`CANONICAL_WRITE`], [`INGEST`]) for frame
+    /// `next` at `now`, bounded per duty by
+    /// [`crate::bounded_warn::note_retry_at`]: a store that refuses writes
+    /// fails every retry, every [`GlobalFinalizationLimits::retry`].
+    pub(crate) fn note_retry(
+        &self,
+        duty: &'static str,
+        next: u64,
+        error: Option<&quil_types::error::QuilError>,
+        now: Instant,
+    ) {
+        crate::bounded_warn::note_retry_at(duty, next, error, now);
     }
 
     /// The frame at `next` when a certified frame above it finalizes it as an

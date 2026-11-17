@@ -1177,7 +1177,8 @@ pub(crate) fn init(
         );
         // A worker whose own store stopped writing (a failed write, or
         // free space below the floor) is stopped and restarted, reopening
-        // the store, once its disk has room again.
+        // the store, once its disk has room again. If the worker is given
+        // up after a corrupt block, its line names the store to move aside.
         crate::storage_watch::spawn_worker_recovery(
             Arc::new(ThreadWorkerStores {
                 manager: thread_mgr.clone(),

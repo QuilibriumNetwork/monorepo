@@ -7,14 +7,16 @@
 //! and reopened, which replays its WAL. A thread worker's store is reopened
 //! by stopping the worker and restarting it once its disk has room again;
 //! the master's store, or a separate worker process's, by exiting for the
-//! service manager to restart the process.
+//! service manager to restart the process: once its disk has room again,
+//! or five minutes after a corrupt block. A store stopped for any other
+//! class stays stopped until the operator restarts the node.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use quil_forest::storage_health::{self, describe_stores, FsUsage};
+use quil_forest::storage_health::{self, describe_stores, FsUsage, CORRUPTION_CAUSE};
 use quil_forest::{DiskThresholds, StoreRole};
 use tracing::{error, info, warn};
 
@@ -90,7 +92,8 @@ enum Step {
     Reopening { at: Instant, reminded: Instant },
     /// The store reopened.
     Reopened { at: Instant },
-    /// Left to the operator, who restarts the node.
+    /// Left to the operator, who restarts the node, or for a corrupt block
+    /// moves the store aside first.
     GaveUp { reminded: Instant },
 }
 
@@ -99,6 +102,10 @@ struct Recovering {
     path: PathBuf,
     step: Step,
     restarts: u32,
+    /// The store's last latch was a corrupt block, read while it was still
+    /// open: a restart of the node meets the same block, so every line
+    /// that leaves the worker to the operator names moving the store aside.
+    corrupt: bool,
 }
 
 /// What one look at the worker stores did, by worker, logged as one line
@@ -116,14 +123,36 @@ struct Events {
     reopened: Vec<u32>,
     not_ready: Vec<(u32, u64)>,
     reopen_retry: Vec<u32>,
-    not_reopened: Vec<u32>,
     recovered: Vec<u32>,
-    exhausted: Vec<u32>,
-    abandoned: Vec<u32>,
+    /// Left to the operator, by worker and whether its last latch was a
+    /// corrupt block ([`Recovering::corrupt`]).
+    not_reopened: Vec<(u32, bool)>,
+    exhausted: Vec<(u32, bool)>,
+    abandoned: Vec<(u32, bool)>,
 }
 
 fn workers(cores: impl IntoIterator<Item = u32>) -> String {
     describe_stores(&cores.into_iter().map(StoreRole::Worker).collect::<Vec<_>>())
+}
+
+/// The workers given up for other errors, and those for a corrupt block
+/// with the operator's next step for their stores.
+fn given_up(cores: Vec<(u32, bool)>) -> (Vec<u32>, Option<(String, String)>) {
+    let (corrupt, other): (Vec<_>, Vec<_>) = cores.into_iter().partition(|(_, corrupt)| *corrupt);
+    let other = other.into_iter().map(|(core, _)| core).collect();
+    let corrupt = corrupt.first().map(|&(first, _)| {
+        let next_step = storage_health::corruption_next_step(Some(StoreRole::Worker(first)));
+        let workers = workers(corrupt.iter().map(|&(core, _)| core));
+        (workers, next_step)
+    });
+    (other, corrupt)
+}
+
+/// Whether the latched store of `role`, still open, failed for a corrupt
+/// block: once stopped and released, the store is closed and its failure
+/// no longer readable.
+fn latched_corrupt(role: StoreRole) -> bool {
+    storage_health::store_failure(role).is_some_and(|(class, _)| class == "CORRUPTION")
 }
 
 impl Events {
@@ -198,28 +227,47 @@ impl Events {
                 "restarted workers ended before serving their shards from their reopened stores: {workers}; they \
                  stay stopped, and are restarted again");
         }
-        if !self.not_reopened.is_empty() {
-            let workers = workers(self.not_reopened);
+        let (not_reopened, corrupt) = given_up(self.not_reopened);
+        if !not_reopened.is_empty() {
+            let workers = workers(not_reopened);
             error!(%workers, restarts = MAX_RESTARTS, scope = "this node",
                 "restarted workers ended before serving their shards from their reopened stores: {workers}; they \
                  stay stopped rather than run on the master's stores: check the disk and the store files, then \
                  restart the node");
+        }
+        if let Some((workers, next_step)) = corrupt {
+            error!(%workers, restarts = MAX_RESTARTS, error_class = "CORRUPTION", scope = "this node",
+                "restarted workers ended before serving their shards from their reopened stores: {workers}; a \
+                 block of their files {CORRUPTION_CAUSE}, so they stay stopped rather than run on the master's \
+                 stores: {next_step}");
         }
         if !self.recovered.is_empty() {
             let workers = workers(self.recovered);
             info!(%workers, stable_secs = STABLE_AFTER.as_secs(), scope = "this node",
                 "worker stores recovered: {workers} have not stopped writing since they were reopened");
         }
-        if !self.exhausted.is_empty() {
-            let workers = workers(self.exhausted);
+        let (exhausted, corrupt) = given_up(self.exhausted);
+        if !exhausted.is_empty() {
+            let workers = workers(exhausted);
             error!(%workers, restarts = MAX_RESTARTS, scope = "this node",
                 "worker stores stopped writing again after {MAX_RESTARTS} restarts in a row: {workers}; the node \
                  keeps these workers stopped: check the disk and the store files, then restart the node");
         }
-        if !self.abandoned.is_empty() {
-            let workers = workers(self.abandoned);
+        if let Some((workers, next_step)) = corrupt {
+            error!(%workers, restarts = MAX_RESTARTS, error_class = "CORRUPTION", scope = "this node",
+                "worker stores stopped writing again after {MAX_RESTARTS} restarts in a row: {workers}; a block \
+                 of their files {CORRUPTION_CAUSE}, so the node keeps these workers stopped: {next_step}");
+        }
+        let (abandoned, corrupt) = given_up(self.abandoned);
+        if !abandoned.is_empty() {
+            let workers = workers(abandoned);
             error!(%workers, scope = "this node",
                 "worker stores are not recovered automatically: {workers}: restart the node");
+        }
+        if let Some((workers, next_step)) = corrupt {
+            error!(%workers, error_class = "CORRUPTION", scope = "this node",
+                "worker stores are not recovered automatically: {workers}; a block of their files \
+                 {CORRUPTION_CAUSE}: {next_step}");
         }
     }
 }
@@ -266,6 +314,8 @@ impl WorkerRecovery {
                 }) => *restarts,
                 Some(_) => continue,
             };
+            // Read before the stop below closes the store.
+            let corrupt = latched_corrupt(role);
             if restarts >= MAX_RESTARTS {
                 // Stopped as on its first stop, and never restarted: left
                 // running on a store that refuses writes, its seat would be
@@ -275,13 +325,14 @@ impl WorkerRecovery {
                     events.stuck.push(core);
                 }
                 control.release(core);
-                events.exhausted.push(core);
+                events.exhausted.push((core, corrupt));
                 self.workers.insert(
                     core,
                     Recovering {
                         path: PathBuf::new(),
                         step: Step::GaveUp { reminded: now },
                         restarts,
+                        corrupt,
                     },
                 );
                 continue;
@@ -304,6 +355,7 @@ impl WorkerRecovery {
                         reminded: now,
                     },
                     restarts,
+                    corrupt,
                 },
             );
         }
@@ -347,7 +399,7 @@ impl WorkerRecovery {
                                 events.restart_failed.push((core, error.to_string()))
                             }
                             Err(_) => {
-                                events.abandoned.push(core);
+                                events.abandoned.push((core, entry.corrupt));
                                 entry.step = Step::GaveUp { reminded: now };
                             }
                         }
@@ -380,7 +432,7 @@ impl WorkerRecovery {
                         }
                         control.release(core);
                         if entry.restarts >= MAX_RESTARTS {
-                            events.not_reopened.push(core);
+                            events.not_reopened.push((core, entry.corrupt));
                             entry.step = Step::GaveUp { reminded: now };
                         } else {
                             events.reopen_retry.push(core);
@@ -406,7 +458,7 @@ impl WorkerRecovery {
                         // worker stays stopped: it never runs on the master's
                         // stores. A counted restart, retried.
                         if entry.restarts >= MAX_RESTARTS {
-                            events.not_reopened.push(core);
+                            events.not_reopened.push((core, entry.corrupt));
                             entry.step = Step::GaveUp { reminded: now };
                         } else {
                             events.reopen_retry.push(core);
@@ -426,7 +478,7 @@ impl WorkerRecovery {
                 }
                 Step::GaveUp { reminded } => {
                     if now.saturating_duration_since(reminded) >= REMIND {
-                        events.abandoned.push(core);
+                        events.abandoned.push((core, entry.corrupt));
                         entry.step = Step::GaveUp { reminded: now };
                     }
                 }
@@ -469,6 +521,10 @@ pub(crate) fn spawn_worker_recovery(
 enum Reopen {
     /// An error more space does not resolve: the operator acts.
     Never,
+    /// A corrupt block: after [`storage_health::CORRUPTION_EXIT_DELAY`],
+    /// since a restart reopens the store and meets the block again only
+    /// if it reads it.
+    Delay,
     /// A space error on a filesystem that showed no room: its headroom.
     Headroom,
     /// A space error on a filesystem that showed room (a disk quota,
@@ -483,8 +539,8 @@ enum Reopen {
 const RESERVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// When a process whose own store stopped writing exits: once the store's
-/// disk has room again, so that its service manager restarts it and the
-/// store is reopened.
+/// disk has room again, or a bounded delay after a corrupt block, so that
+/// its service manager restarts it and the store is reopened.
 pub(crate) struct ProcessExit {
     role: StoreRole,
     /// The store's directory, when it stopped and what its reopening
@@ -533,9 +589,12 @@ impl ProcessExit {
             if !storage_health::store_latched(self.role) {
                 return None;
             }
-            // Read once the failure is recorded: the latch sets its flag first.
+            // The latch sets its flag under the failure record's lock, so a
+            // latched store's failure is readable here.
             let (class, no_room) = storage_health::store_failure(self.role)?;
-            let reopen = if !storage_health::space_class(class) {
+            let reopen = if class == "CORRUPTION" {
+                Reopen::Delay
+            } else if !storage_health::space_class(class) {
                 Reopen::Never
             } else if storage_health::recovers_with_space(class, no_room) {
                 Reopen::Headroom
@@ -556,6 +615,18 @@ impl ProcessExit {
                     );
                     return None;
                 }
+                Reopen::Delay => error!(
+                    store = %store,
+                    error_class = class,
+                    exit_in_secs = storage_health::CORRUPTION_EXIT_DELAY.as_secs(),
+                    scope = "this node",
+                    "store stopped writing: a block of its files {}: this process exits in {}s for its service \
+                     manager to restart it and reopen the store; the service needs a restart policy (systemd \
+                     Restart=on-failure, launchd KeepAlive); if the error returns after the restart, {}",
+                    storage_health::CORRUPTION_CAUSE,
+                    storage_health::CORRUPTION_EXIT_DELAY.as_secs(),
+                    storage_health::corruption_next_step(Some(self.role)),
+                ),
                 Reopen::Reservation => info!(
                     store = %store,
                     error_class = class,
@@ -580,8 +651,24 @@ impl ProcessExit {
         if reopen == Reopen::Never {
             return None;
         }
-        let usage = probe(&path);
         let waited_secs = now.saturating_duration_since(since).as_secs();
+        if reopen == Reopen::Delay {
+            if now.saturating_duration_since(since) < storage_health::CORRUPTION_EXIT_DELAY {
+                return None;
+            }
+            error!(
+                store = %store,
+                error_class = "CORRUPTION",
+                waited_secs,
+                scope = "this node",
+                "store stopped writing for a corrupt block: exiting so that the service manager restarts this \
+                 process and reopens the store"
+            );
+            return Some(format!(
+                "the {store} store stopped writing for a corrupt block; exiting to reopen it"
+            ));
+        }
+        let usage = probe(&path);
         let room = has_space(usage);
         if room && (reopen == Reopen::Headroom || self.reserved(now, &path)) {
             error!(
@@ -626,7 +713,8 @@ impl ProcessExit {
 }
 
 /// A supervised task that fails, so the process exits non-zero, once the
-/// stopped store of `role` can be reopened ([`ProcessExit`]).
+/// stopped store of `role` can be reopened ([`ProcessExit`]): its disk has
+/// room again, or five minutes passed since a corrupt block stopped it.
 pub(crate) async fn exit_when_store_reopenable(role: StoreRole) -> anyhow::Result<()> {
     let mut exit = ProcessExit::new(role, Instant::now());
     loop {
@@ -665,6 +753,7 @@ mod tests {
         reopen: std::sync::atomic::AtomicBool,
         serving: std::sync::atomic::AtomicBool,
         running: std::sync::atomic::AtomicBool,
+        fail_restart: std::sync::atomic::AtomicBool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -680,6 +769,7 @@ mod tests {
                 reopen: std::sync::atomic::AtomicBool::new(true),
                 serving: std::sync::atomic::AtomicBool::new(true),
                 running: std::sync::atomic::AtomicBool::new(false),
+                fail_restart: std::sync::atomic::AtomicBool::new(false),
                 calls: Mutex::new(Vec::new()),
             };
             for core in cores {
@@ -702,9 +792,13 @@ mod tests {
         }
 
         fn latch(&self, core: u32) {
+            self.latch_for(core, "IO error: No space left on device");
+        }
+
+        fn latch_for(&self, core: u32, cause: &str) {
             self.open.lock().unwrap()[&core]
                 .inner()
-                .refuse_writes("IO error: No space left on device");
+                .refuse_writes(cause);
         }
 
         /// Something else keeps `core`'s store open until `let_go`.
@@ -737,6 +831,9 @@ mod tests {
         }
         fn restart(&self, core: u32) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("restart {core}"));
+            if self.fail_restart.load(Ordering::SeqCst) {
+                anyhow::bail!("no thread for worker {core}");
+            }
             if self.reopen.load(Ordering::SeqCst) {
                 self.open(core);
             }
@@ -1100,6 +1197,165 @@ mod tests {
         assert!(!recovery.is_idle());
     }
 
+    /// A thread worker's store that keeps stopping for a corrupt block
+    /// meets the same block after a restart of the node, so the line that
+    /// gives the worker up, and its reminder, name the store to move aside,
+    /// not a restart.
+    #[test]
+    fn a_worker_store_given_up_for_a_corrupt_block_names_the_store_to_move_aside() {
+        let capture = crate::util::log_capture::Capture::default();
+        let _guard = capture.install();
+        let core = 8_202;
+        let workers = Workers::new(&[core]);
+        let probe = |_: &Path| Some(usage(500));
+        let mut recovery = WorkerRecovery::new();
+        let t0 = Instant::now();
+        for round in 0..=MAX_RESTARTS as u64 {
+            workers.latch_for(
+                core,
+                "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+                 /var/lib/node/worker-store/8202/000042.sst offset 0 size 4011",
+            );
+            for step in 0..3 {
+                recovery.tick(
+                    t0 + Duration::from_secs(40 * round + 10 * step),
+                    &workers,
+                    &probe,
+                );
+            }
+        }
+        let gave_up = capture.lines_with("restarts in a row");
+        assert_eq!(gave_up.len(), 1, "worker_not_given_up: {gave_up:?}");
+        let line = &gave_up[0];
+        assert!(
+            line.contains("CORRUPTION")
+                && line.contains("move the worker store's directory aside")
+                && line.contains("db.workerPaths"),
+            "corrupt_give_up_says_restart: {line}"
+        );
+        assert!(
+            !line.contains("then restart the node") && !line.contains("/var/lib/node"),
+            "corrupt_give_up_says_restart: {line}"
+        );
+        // The reminder comes after the store closed: the class it names was
+        // read on the latch.
+        let given_up_at = t0 + Duration::from_secs(40 * MAX_RESTARTS as u64);
+        recovery.tick(given_up_at + REMIND, &workers, &probe);
+        let reminded = capture.lines_with("not recovered automatically");
+        assert_eq!(reminded.len(), 1, "worker_not_reminded: {reminded:?}");
+        let line = &reminded[0];
+        assert!(
+            line.contains("CORRUPTION")
+                && line.contains("move the worker store's directory aside")
+                && !line.contains("restart the node"),
+            "corrupt_reminder_says_restart: {line}"
+        );
+    }
+
+    /// A worker whose store stopped for a corrupt block and whose restarts
+    /// never reopen it is given up with the store to move aside, though
+    /// its store is closed by then.
+    #[test]
+    fn a_worker_not_reopened_after_a_corrupt_block_names_the_store_to_move_aside() {
+        let capture = crate::util::log_capture::Capture::default();
+        let _guard = capture.install();
+        let core = 8_203;
+        let workers = Workers::new(&[core]);
+        workers.reopen.store(false, Ordering::SeqCst);
+        let probe = |_: &Path| Some(usage(500));
+        let mut recovery = WorkerRecovery::new();
+        let t0 = Instant::now();
+        workers.latch_for(
+            core,
+            "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+             /var/lib/node/worker-store/8203/000042.sst offset 0 size 4011",
+        );
+        for secs in (0..=400).step_by(10) {
+            recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
+        }
+        let gave_up = capture.lines_with("stay stopped rather than run");
+        assert_eq!(gave_up.len(), 1, "worker_not_given_up: {gave_up:?}");
+        let line = &gave_up[0];
+        assert!(
+            line.contains("CORRUPTION")
+                && line.contains("move the worker store's directory aside")
+                && !line.contains("restart the node")
+                && !line.contains("/var/lib/node"),
+            "corrupt_not_reopened_says_restart: {line}"
+        );
+    }
+
+    /// A worker whose store stopped for a corrupt block, and whose thread
+    /// ends after each restart reopens the store, is given up with the
+    /// store to move aside.
+    #[test]
+    fn a_worker_dying_on_its_reopened_corrupt_store_names_the_store_to_move_aside() {
+        let capture = crate::util::log_capture::Capture::default();
+        let _guard = capture.install();
+        let core = 8_204;
+        let workers = Workers::new(&[core]);
+        workers.serving.store(false, Ordering::SeqCst);
+        let probe = |_: &Path| Some(usage(500));
+        let mut recovery = WorkerRecovery::new();
+        let t0 = Instant::now();
+        workers.latch_for(
+            core,
+            "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+             /var/lib/node/worker-store/8204/000042.sst offset 0 size 4011",
+        );
+        for secs in (0..=300).step_by(10) {
+            recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
+        }
+        let gave_up = capture.lines_with("stay stopped rather than run");
+        assert_eq!(gave_up.len(), 1, "worker_not_given_up: {gave_up:?}");
+        let line = &gave_up[0];
+        assert!(
+            line.contains("CORRUPTION")
+                && line.contains("move the worker store's directory aside")
+                && !line.contains("restart the node")
+                && !line.contains("/var/lib/node"),
+            "corrupt_died_says_restart: {line}"
+        );
+    }
+
+    /// A worker whose store stopped for a corrupt block, and whose
+    /// restarts fail, is given up with the store to move aside.
+    #[test]
+    fn a_worker_failing_to_restart_after_a_corrupt_block_names_the_store_to_move_aside() {
+        let capture = crate::util::log_capture::Capture::default();
+        let _guard = capture.install();
+        let core = 8_205;
+        let workers = Workers::new(&[core]);
+        workers.fail_restart.store(true, Ordering::SeqCst);
+        let probe = |_: &Path| Some(usage(500));
+        let mut recovery = WorkerRecovery::new();
+        let t0 = Instant::now();
+        workers.latch_for(
+            core,
+            "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+             /var/lib/node/worker-store/8205/000042.sst offset 0 size 4011",
+        );
+        for secs in (0..=300).step_by(10) {
+            recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
+        }
+        let restarts = workers
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("restart"))
+            .count();
+        assert_eq!(restarts, MAX_RESTARTS as usize, "{:?}", workers.calls());
+        let gave_up = capture.lines_with("not recovered automatically");
+        assert_eq!(gave_up.len(), 1, "worker_not_given_up: {gave_up:?}");
+        let line = &gave_up[0];
+        assert!(
+            line.contains("CORRUPTION")
+                && line.contains("move the worker store's directory aside")
+                && !line.contains("restart the node")
+                && !line.contains("/var/lib/node"),
+            "corrupt_restart_failed_says_restart: {line}"
+        );
+    }
+
     /// A process whose own store stopped writing exits once its disk has
     /// room again, not before.
     #[test]
@@ -1157,6 +1413,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A process whose own store stopped for a corrupt block exits after
+    /// a bounded delay, whatever its disk shows, so its service manager
+    /// restarts it instead of leaving it running with the store refusing
+    /// writes until an operator notices.
+    #[test]
+    fn a_process_whose_store_has_a_corrupt_block_exits_after_a_delay() {
+        let probe = |_: &Path| Some(usage(500));
+        let dir = tempfile::tempdir().unwrap();
+        let store = quil_store::RocksDb::open(dir.path()).unwrap();
+        let role = StoreRole::Worker(8_331);
+        assert!(store.inner().register_store(role));
+        let t0 = Instant::now();
+        let mut exit = ProcessExit::new(role, t0);
+        assert_eq!(exit.tick(t0 + Duration::from_secs(5), &probe), None);
+        store.inner().refuse_writes(
+            "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in 128010.sst",
+        );
+        assert_eq!(
+            storage_health::store_failure(role),
+            Some(("CORRUPTION", false)),
+            "corruption_not_classed: the latched cause"
+        );
+        let latched = t0 + Duration::from_secs(10);
+        assert_eq!(
+            exit.tick(latched, &probe),
+            None,
+            "exited_before_the_delay: at once"
+        );
+        let before = latched + Duration::from_secs(299);
+        assert_eq!(
+            exit.tick(before, &probe),
+            None,
+            "exited_before_the_delay: at 299s"
+        );
+        let reason = exit
+            .tick(latched + Duration::from_secs(300), &probe)
+            .expect("corrupt_store_did_not_exit once the delay has passed");
+        assert!(reason.contains("worker 8331 store"), "{reason}");
+        assert!(reason.contains("corrupt block"), "{reason}");
     }
 
     /// A store whose filesystem showed room when it ran out of space (a

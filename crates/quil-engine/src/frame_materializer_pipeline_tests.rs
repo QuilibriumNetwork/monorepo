@@ -297,6 +297,204 @@ fn a_canonical_clock_written_ahead_by_sync_uses_the_legacy_order() {
     assert_eq!(rig.source.last_materialized_frame(), 0);
 }
 
+/// A store that refuses writes fails the canonical clock write at every
+/// retry (an archive peer logged it two or three times a second for
+/// hours): the failures warn once, not once per retry.
+#[test]
+fn a_store_refusing_writes_warns_once_for_repeated_canonical_write_failures() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let mut ahead = input.clone();
+    ahead.header.as_mut().unwrap().frame_number = 2;
+    save(rig.clock.as_ref(), &ahead);
+    let (pipeline, _) = pipeline(&rig, vec![], 8);
+    pipeline.offer(input.clone());
+    rig.db.inner().refuse_writes(
+        "Corruption: block checksum mismatch: stored = 0, computed = 1, type = 4 in 000001.sst",
+    );
+    assert!(
+        rig.db.inner().write_failed(),
+        "premise: the store refuses writes"
+    );
+    for retry in 0..50 {
+        assert!(
+            matches!(pipeline.step(1), FinalizationStep::Retry(_)),
+            "premise: retry {retry} of a refused canonical write"
+        );
+    }
+    assert!(
+        rig.clock.get_global_clock_frame(1).is_err(),
+        "premise: no canonical write went through"
+    );
+    let warned = logs.lines_with("canonical GLOBAL frame write failed");
+    assert_eq!(
+        warned.len(),
+        1,
+        "write_failure_spew: {} lines for 50 refused writes",
+        warned.len()
+    );
+    assert!(warned[0].contains("frame=1"), "{warned:?}");
+}
+
+/// A store that refuses writes fails every synced frame's candidate write
+/// (the poller offers each fetched frame): 50 refused offers log one line.
+#[test]
+fn a_store_refusing_writes_warns_once_for_synced_candidates() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, vec![], 8);
+    rig.db.inner().refuse_writes(
+        "Corruption: block checksum mismatch: stored = 0, computed = 1, type = 4 in 000001.sst",
+    );
+    for offer in 0..50 {
+        assert!(
+            !pipeline.offer_synced(&input),
+            "premise: offer {offer} refused"
+        );
+    }
+    assert_eq!(
+        crate::bounded_warn::failing_attempts(crate::global_finalization::SYNCED_CANDIDATE),
+        Some(50),
+        "synced_candidate_unbounded"
+    );
+    let warned = logs.lines_with("persist synced GLOBAL candidate failed");
+    assert_eq!(warned.len(), 1, "synced_candidate_spew: {warned:?}");
+    assert!(warned[0].contains("frame=1"), "{warned:?}");
+}
+
+/// A store that refuses writes fails every synced chain's ancestor write:
+/// 50 refused chains log one line.
+#[test]
+fn a_store_refusing_writes_warns_once_for_synced_ancestors() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let ancestor = rig.deploy();
+    let rank = ancestor.header.as_ref().unwrap().rank;
+    let mut descendant = state_frame(&rig.source, 2, rank + 5, id(&ancestor));
+    certify_parent(&mut descendant, &rig.signer, 0, rank);
+    let (pipeline, _) = pipeline(&rig, vec![], 8);
+    rig.db.inner().refuse_writes(
+        "Corruption: block checksum mismatch: stored = 0, computed = 1, type = 4 in 000001.sst",
+    );
+    for offer in 0..50 {
+        assert!(
+            !pipeline.offer_synced_chain(&[ancestor.clone(), descendant.clone()]),
+            "premise: chain {offer} refused"
+        );
+    }
+    assert_eq!(
+        crate::bounded_warn::failing_attempts(crate::global_finalization::SYNCED_ANCESTOR),
+        Some(50),
+        "synced_ancestor_unbounded"
+    );
+    let warned = logs.lines_with("persist synced GLOBAL ancestor candidate failed");
+    assert_eq!(warned.len(), 1, "synced_ancestor_spew: {warned:?}");
+}
+
+/// A sequenced ingest that fails at every retry of the finalization
+/// worker (its store refuses writes) warns once, not once per retry.
+#[test]
+fn a_failing_sequenced_ingest_warns_once_for_repeated_retries() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, vec![], 8);
+    let pipeline = pipeline.with_sequenced_ingest(Arc::new(|_: &GlobalFrame| {
+        Err(quil_types::error::QuilError::Store(
+            "database has a failed write; reopen and reconcile durable state before writing again"
+                .into(),
+        ))
+    }));
+    for retry in 0..50 {
+        assert!(
+            !pipeline.ingest_before(&input),
+            "premise: retry {retry} waits"
+        );
+    }
+    let warned = logs.lines_with("ingest of its application frames failed");
+    assert_eq!(warned.len(), 1, "ingest_failure_spew: {warned:?}");
+    assert!(warned[0].contains("frame=1"), "{warned:?}");
+}
+
+/// Canonical clock writes failing in a row log one line at the first, one
+/// per WARN_REPEAT with the failures since the last line, and one when a
+/// write succeeds again with all the failures.
+#[test]
+fn canonical_write_failures_log_a_start_bounded_repeats_and_an_end() {
+    use crate::bounded_warn::WARN_REPEAT;
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let (pipeline, _) = pipeline(&rig, vec![], 8);
+    let error = quil_types::error::QuilError::Store(
+        "database has a failed write; reopen and reconcile durable state before writing again"
+            .into(),
+    );
+    let t0 = std::time::Instant::now();
+    // 1000 retries over 100 s, ten frames.
+    for retry in 0..1000u64 {
+        pipeline.note_retry(
+            crate::global_finalization::CANONICAL_WRITE,
+            7 + retry / 100,
+            Some(&error),
+            t0 + Duration::from_millis(100 * retry),
+        );
+    }
+    let started = logs.lines_with("canonical GLOBAL frame write failed");
+    assert_eq!(started.len(), 1, "write_failure_spew: {started:?}");
+    assert!(started[0].contains("frame=7"), "{started:?}");
+    assert!(
+        logs.lines_with("still failing").is_empty(),
+        "write_failure_summary_early"
+    );
+    pipeline.note_retry(
+        crate::global_finalization::CANONICAL_WRITE,
+        20,
+        Some(&error),
+        t0 + WARN_REPEAT,
+    );
+    let summary = logs.lines_with("canonical GLOBAL frame write still failing");
+    assert_eq!(summary.len(), 1, "write_failure_summary_missing");
+    assert!(summary[0].contains("frame=20"), "{summary:?}");
+    assert!(summary[0].contains("attempts=1000"), "{summary:?}");
+    assert_eq!(
+        logs.lines_with("canonical GLOBAL frame write failed").len(),
+        1,
+        "write_failure_spew: a repeat logged as a start"
+    );
+    pipeline.note_retry(
+        crate::global_finalization::CANONICAL_WRITE,
+        20,
+        None,
+        t0 + WARN_REPEAT + Duration::from_secs(1),
+    );
+    let ended = logs.lines_with("canonical GLOBAL frame write succeeded after failures");
+    assert_eq!(ended.len(), 1, "write_failure_end_missing");
+    assert!(ended[0].contains("attempts=1001"), "{ended:?}");
+    pipeline.note_retry(
+        crate::global_finalization::CANONICAL_WRITE,
+        21,
+        None,
+        t0 + WARN_REPEAT + Duration::from_secs(2),
+    );
+    assert_eq!(
+        logs.lines_with("succeeded after failures").len(),
+        1,
+        "write_failure_end_repeated"
+    );
+}
+
 #[test]
 fn unauthenticated_finalizations_are_never_published_or_reloaded() {
     let rig = Rig::new();
