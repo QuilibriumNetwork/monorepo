@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn an_archive_node_sizes_its_verifier_slots_to_the_machine() {
         let cpus = std::thread::available_parallelism().map_or(1, |cpus| cpus.get());
-        let available = crate::mem_stats::host_memory().map(|memory| memory.available_bytes);
+        let available = available_for_verifiers();
         // Three slots at 3 GiB each; a literal so the test builds on the base.
         if cpus < 3 || available.is_some_and(|bytes| bytes < 9 << 30) {
             eprintln!("skipped: {cpus} CPUs and {available:?} bytes available fit two slots");
