@@ -440,13 +440,14 @@ async fn a_leader_defers_bundles_past_the_frame_bound() {
 /// fits is not deferred.
 #[tokio::test]
 async fn a_held_bundle_takes_no_room_in_the_frame() {
-    use crate::frame_bound::{deferred_here, MAX_APP_FRAME_ITEMS};
+    use crate::frame_bound::{deferred_here, MAX_COLLECTED_ITEMS};
     use quil_execution::manager::CommitOutlook;
     // The shield's source coin is written into another rig's store only.
     let other = rig(half(false), Proofs::Absent);
     let rig = rig(half(false), Proofs::Absent);
+    // The largest bundle a leader proposes: the frame's whole room.
     let mut requests = vec![formed_shield(&other)];
-    requests.extend(unconverted(0, MAX_APP_FRAME_ITEMS - 2));
+    requests.extend(unconverted(0, MAX_COLLECTED_ITEMS - 2));
     let held = bundle(requests);
     let manager = rig.engine.execution_engine.as_ref().unwrap();
     let canonical = crate::consensus_wire::app_bundle_to_canonical_bytes(
@@ -468,6 +469,39 @@ async fn a_held_bundle_takes_no_room_in_the_frame() {
         before,
         "BUDGET-AFTER-HOLDS: a held bundle took the frame's room"
     );
+}
+
+/// A bundle the application decode admits (the submission topics'
+/// validator and the leader's own check) is one the leader proposes: the
+/// largest that fits beside its coin deliveries is admitted and taken, and
+/// one with a request more is refused at admission, not collected and
+/// deferred at every turn until it ages out.
+#[tokio::test]
+async fn admission_takes_only_bundles_a_leader_proposes() {
+    use crate::frame_bound::{deferred_here, MAX_APP_FRAME_ITEMS};
+    use quil_execution::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME;
+    // The leader keeps room for its deliveries, each a bundle of one request.
+    let largest = MAX_APP_FRAME_ITEMS - 2 * MAX_DELIVERIES_PER_FRAME - 1;
+    for requests in [largest, largest + 1] {
+        let rig = rig(half(false), Proofs::Unconfigured);
+        let data = bundle(unconverted(0, requests));
+        let admitted = crate::consensus_wire::decode_app_message_bundle(&data).is_ok();
+        assert!(
+            admitted || requests > largest,
+            "BUNDLE-BOUND: admission refused a bundle of {requests} requests a leader proposes"
+        );
+        if !admitted {
+            continue;
+        }
+        assert!(rig.collector.add_message(0, data));
+        let before = deferred_here();
+        turn(&rig.leader, 1);
+        assert_eq!(
+            deferred_here(),
+            before,
+            "BUNDLE-BOUND: admission took a bundle of {requests} requests the leader defers"
+        );
+    }
 }
 
 /// Offer gossip-sized bundles of junk shields of `source` until the rank cap
