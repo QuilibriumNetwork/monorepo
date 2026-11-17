@@ -1418,20 +1418,28 @@ fn an_abandoned_frames_starvation_is_forgotten() {
     );
 }
 
-/// The line that a frame's escape past the host's room ended unused
-/// ([`Admission::frame_escape_lasts`]).
-const ESCAPE_FORGOTTEN_LINE: &str = "no longer run alone past the host's room: none ran so";
+/// What [`a_frames_escape_ends_when_one_fits_again`]'s host reports.
+static FITS_AGAIN: AtomicU32 = AtomicU32::new(PRESSURE_CRITICAL);
 
-/// A frame's checks ran alone past the host's room, then none for longer
-/// than [`VERIFIER_FRAME_FORGET`]: the next one that does not fit waits
-/// for its starvation bound again, and the escape's end logs once.
+fn fits_again() -> HostMemory {
+    HostMemory {
+        pressure: Some(FITS_AGAIN.load(Ordering::SeqCst)),
+        capacity: None,
+    }
+}
+
+/// The line that a frame's escape past the host's room ended
+/// ([`Admission::frame_fits_again`]).
+const ESCAPE_ENDED_LINE: &str = "fit the host's room again: they no longer run alone past it";
+
+/// A frame's checks ran alone past the host's room: the escape ends when
+/// one fits the room again, logged once with how long it lasted, and the
+/// next one that does not fit waits for its starvation bound again.
 #[test]
-fn an_abandoned_frames_escape_is_forgotten() {
-    let forget = 2 * STARVED_BOUND;
-    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+fn a_frames_escape_ends_when_one_fits_again() {
+    let mut admission = strict(0, fits_again, running, PROMPT_PLACE);
     admission.verifier_starved_warn = STARVED_BOUND;
     admission.verifier_starved_gap = Duration::from_millis(5);
-    admission.verifier_frame_forget = forget;
     let admission: &'static Admission = Box::leak(Box::new(admission));
     let ask = || admission.reserve_verifier(3 * GIB, Instant::now(), FrameCheck::Inline);
     // Asked again until it starves the bound: each ask keeps the frame's
@@ -1448,19 +1456,54 @@ fn an_abandoned_frames_escape_is_forgotten() {
         admission.state().frame_alone_escaped != Escape::default(),
         "setup: it ran past the room"
     );
-    // It last ran before this: load only lengthens the idle time.
-    let ran = Instant::now();
-    std::thread::sleep((ran + forget + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    FITS_AGAIN.store(2, Ordering::SeqCst);
     let mut granted = None;
     let lines = logged(|| granted = ask());
-    assert!(
-        granted.is_none(),
-        "abandoned_escape_kept: none ran past the room for long, yet the next ran past it at once"
-    );
+    assert!(granted.is_some(), "setup: within the room it runs alone");
+    drop(granted);
     assert_eq!(
-        lines.matches(ESCAPE_FORGOTTEN_LINE).count(),
+        lines.matches(ESCAPE_ENDED_LINE).count(),
         1,
         "escape_end_not_logged: {lines}"
+    );
+    assert!(
+        lines.contains("past_room_secs="),
+        "escape_end_not_logged: no past_room_secs: {lines}"
+    );
+    FITS_AGAIN.store(PRESSURE_CRITICAL, Ordering::SeqCst);
+    assert!(
+        ask().is_none(),
+        "escape_not_ended: one fit the room again, yet the next ran past it at once"
+    );
+}
+
+/// A frame's checks ran alone past the host's room, which the host never
+/// gives back: the next one, asked later than [`VERIFIER_FRAME_FORGET`],
+/// runs at once too, not after its starvation bound again.
+#[test]
+fn a_sparse_frames_escape_lasts_until_one_fits() {
+    let forget = 2 * STARVED_BOUND;
+    let mut admission = strict(0, critical, running, PROMPT_PLACE);
+    admission.verifier_starved_warn = STARVED_BOUND;
+    admission.verifier_starved_gap = Duration::from_millis(5);
+    admission.verifier_frame_forget = forget;
+    let admission: &'static Admission = Box::leak(Box::new(admission));
+    let ask = || admission.reserve_verifier(3 * GIB, Instant::now(), FrameCheck::Inline);
+    let deadline = Instant::now() + HANG;
+    while ask().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "setup: starved past the bound, it never ran"
+        );
+        std::thread::sleep(STARVED_BOUND / 10);
+    }
+    // It ran before this: load only lengthens the gap to the next.
+    let ran = Instant::now();
+    std::thread::sleep((ran + forget + STARVED_BOUND).saturating_duration_since(Instant::now()));
+    assert!(
+        ask().is_some(),
+        "sparse_escape_forgotten: the host never gave its room back, yet a check asked past \
+         the forget bound waited for its starvation bound again"
     );
 }
 
