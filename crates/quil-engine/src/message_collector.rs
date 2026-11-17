@@ -106,6 +106,14 @@ struct CollectedMessage {
     /// For a held storage epoch proof: the proposals that left it for a
     /// later frame.
     passed: Option<Passed>,
+    /// For a held storage epoch proof, the share of one sender it counts
+    /// toward ([`seal_sender`]); `None` for this node's own.
+    sender: Option<[u8; 32]>,
+    /// The seats the storage epoch proofs it carries prove ([`seat_identity`]).
+    seat_keys: Vec<[u8; 32]>,
+    /// Its storage epoch proofs prove more seats than one proof covers
+    /// ([`StorageKinds::too_many_seats`]).
+    too_many_seats: bool,
 }
 
 /// Why a proposal left a held storage epoch proof for a later frame.
@@ -180,6 +188,9 @@ impl CollectedMessage {
             own: false,
             seats: Default::default(),
             passed: None,
+            sender: None,
+            seat_keys: kinds.seat_keys,
+            too_many_seats: kinds.too_many_seats,
         }
     }
 
@@ -210,6 +221,28 @@ impl CollectedMessage {
     fn density_member(&self) -> Option<[u8; 32]> {
         self.member
             .filter(|_| self.own && self.data.len() >= SEAT_DENSITY_MIN_BYTES)
+    }
+
+    /// A held storage epoch proof no member sends: larger than a proposal's
+    /// seal share ([`SEAL_BYTES_PER_PROPOSAL`]; a member's prover keeps each
+    /// part under a frame's seal budget, `storage_epoch_batch`), or proving
+    /// more seats than one proof covers (a member sends one proof a bundle).
+    fn unsendable_seal(&self) -> bool {
+        self.held_seal() && (self.data.len() > SEAL_BYTES_PER_PROPOSAL || self.too_many_seats)
+    }
+
+    /// A held storage epoch proof larger than a frame's seal budget
+    /// (`STORAGE_SEAL_BYTES_PER_FRAME`), up to a proposal's seal share.
+    fn oversize_seal(&self) -> bool {
+        self.held_seal() && self.data.len() > quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME
+    }
+
+    /// An active prover's proof over a frame's seal budget
+    /// ([`Self::oversize_seal`]): the collector holds one at a time
+    /// ([`SenderSeals::over`]). Other senders' share holds one by its bytes
+    /// alone, and one due sooner takes its room ([`evict_later_seals`]).
+    fn takes_seal_place(&self) -> bool {
+        self.prover && self.oversize_seal()
     }
 }
 
@@ -266,6 +299,12 @@ struct StorageKinds {
     /// If asked for, the seats of its well-formed proofs that are no
     /// capacity messages ([`window_seats::seat_ids`]).
     seats: window_seats::Seats,
+    /// The seats its well-formed storage epoch proofs that are not capacity
+    /// messages prove ([`seat_identity`]), up to one proof's
+    /// (`storage_epoch_proof::MAX_SEATS`).
+    seat_keys: Vec<[u8; 32]>,
+    /// They prove more seats than that; the rest are not in `seat_keys`.
+    too_many_seats: bool,
 }
 
 /// The GLOBAL frame from which execution refuses `proof`: the end of its
@@ -299,7 +338,7 @@ fn storage_kinds(data: &[u8]) -> StorageKinds {
 fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
     use quil_execution::global_intrinsic::persistent_storage::capacity_message;
     use quil_execution::global_intrinsic::storage_epoch_proof::{
-        StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        StorageEpochProof, MAX_SEATS, TYPE_STORAGE_EPOCH_PROOF,
     };
     let mut kinds = StorageKinds {
         seal: false,
@@ -309,6 +348,8 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
         seat_halves: 0,
         member: None,
         seats: Default::default(),
+        seat_keys: Vec::new(),
+        too_many_seats: false,
     };
     let Ok(bundle) =
         quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data)
@@ -343,6 +384,19 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
                 let cap = window_seats::seat_ids_cap(data.len());
                 window_seats::seat_ids(&proof, cap, &mut kinds.seats);
             }
+            // A bundle of many proofs within a frame's seal budget proves
+            // about 190k seats; each held proof's seats are looked up under
+            // the buffers' lock ([`SenderSeals::of`]).
+            kinds.too_many_seats |= kinds.seat_keys.len() + proof.seats.len() > MAX_SEATS as usize;
+            if kinds.too_many_seats {
+                continue;
+            }
+            kinds.seat_keys.extend(
+                proof
+                    .seats
+                    .iter()
+                    .map(|seat| seat_identity(&proof.member, seat)),
+            );
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
                 member: proof.member,
@@ -378,6 +432,49 @@ fn precommit_identity(
     h.update(message.epoch.to_be_bytes());
     h.update(message.certificate.to_bytes());
     Some(h.finalize().into())
+}
+
+/// Which seat part a storage epoch proof proves: its member, shard, epoch
+/// and parts (sealing, settling). A seat's seal and its settlement may go
+/// in proofs of their own, so each is a seat part of its own.
+fn seat_identity(
+    member: &[u8; 32],
+    seat: &quil_execution::global_intrinsic::storage_epoch_proof::SeatProof,
+) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/collector/seat/v1");
+    h.update(member);
+    h.update((seat.shard_filter.len() as u64).to_be_bytes());
+    h.update(&seat.shard_filter);
+    h.update(seat.epoch.to_be_bytes());
+    h.update([u8::from(seat.seals), u8::from(seat.settles)]);
+    h.finalize().into()
+}
+
+/// The share of held storage epoch proofs a proof from `sender` counts
+/// toward ([`SEAL_BYTES_PER_SENDER`]): none for this node's own; one for
+/// every sender it cannot name, together.
+fn seal_sender(sender: Sender<'_>) -> Option<[u8; 32]> {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/collector/seal-sender/v1");
+    match sender {
+        Sender::Local => return None,
+        Sender::Unidentified => h.update([1]),
+        Sender::Peer(peer) => {
+            h.update([2]);
+            h.update(peer);
+        }
+    }
+    Some(h.finalize().into())
+}
+
+/// How a share-full line names `sender`.
+fn sender_label(sender: Sender<'_>) -> String {
+    match sender {
+        Sender::Local => "local".into(),
+        Sender::Unidentified => "unidentified".into(),
+        Sender::Peer(peer) => hex::encode(peer),
+    }
 }
 
 /// Who delivered a message, for the share of a rank its capacity message is
@@ -589,6 +686,53 @@ const SEAL_BYTES_HELD: usize = 2 * (SEAL_BYTES_PER_PROPOSAL - (1 << 20));
 /// one, and they ride the first frame the provers' proofs leave room in. A
 /// prover's own copy of one moves it to the provers' share.
 const OTHER_SEAL_BYTES_HELD: usize = SEAL_BYTES_PER_PROPOSAL;
+// It holds two proofs over a frame's seal budget at no time, so it keeps
+// no place for one: one due sooner takes the room of one due later.
+const _: () =
+    assert!(2 * (quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME + 1) > OTHER_SEAL_BYTES_HELD);
+
+/// What the held storage epoch proofs one sender delivered may take of
+/// [`SEAL_BYTES_HELD`] and [`OTHER_SEAL_BYTES_HELD`] together, across all
+/// ranks: half of what a frame carries (`STORAGE_SEAL_BYTES_PER_FRAME`) and
+/// a seventh of the provers' share. Proofs carry no signature and are not
+/// verified on arrival, so without it one sender's distinct proofs filled
+/// the share and every member's proof was refused until this archive's
+/// frames dropped them. It stays a fixed size as the shares grow
+/// ([`SEAL_BYTES_PER_PROPOSAL`]): they grew to hold more members' proofs at
+/// an epoch boundary, not more of one sender's. A sender holding none is
+/// held one proof up to what a frame carries, above this share, so a
+/// member's largest proof is never refused for good. One proof larger than
+/// that, up to a proposal's seal share, is held from a sender holding
+/// none, one at a time from active provers
+/// ([`CollectedMessage::takes_seal_place`]) and one in other senders'
+/// share by its bytes: a proposal still carries it
+/// (`MAX_GLOBAL_FRAME_BYTES` bounds a frame, not its proofs), so refusing
+/// it for good would halt it. Another active prover's waits, refused
+/// retryably, until it leaves, and another sender's proof never keeps a
+/// member's out; with it, three colluding active provers are the fewest
+/// that fill the provers' share (four without). A
+/// proof over a proposal's seal share is refused for good
+/// ([`CollectedMessage::unsendable_seal`]). The rest are refused retryably
+/// and their senders resend them every 5 to 60 seconds until their windows
+/// end; each is held once the sender's earlier ones ride a frame, fail the
+/// leader's validation or age out. This share binds by design: one
+/// member's live peak was 7.65 MB in six proofs within 60 seconds and
+/// 20.9 MB in fifteen within 80 frames (2026-11-16), held in parts as
+/// each finalized frame carries the earlier ones.
+const SEAL_BYTES_PER_SENDER: usize = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME / 2;
+const _: () = assert!(SEAL_BYTES_PER_SENDER <= SEAL_BYTES_HELD / 3);
+// One proof over a frame's seal budget and one sender's largest leave the
+// provers' share room for a member's settlement proof (about 0.82 MB).
+const _: () = assert!(
+    SEAL_BYTES_PER_PROPOSAL + quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME + (1 << 20)
+        <= SEAL_BYTES_HELD
+);
+/// The held storage epoch proofs one sender delivered, in all: one per 128
+/// KiB of its share. The smallest proof a member sends, a native proof of
+/// one leaf, is about 190 KB, so its bytes bind first, at ten, and this
+/// never binds; a fixed eight bound first at 1.5 MB of native proofs
+/// (2026-11-16).
+const SEALS_PER_SENDER: usize = SEAL_BYTES_PER_SENDER / (128 << 10);
 
 /// How often held storage epoch proofs dropped without riding a frame are
 /// summarized ([`MessageCollector::note_seal_drops`]).
@@ -815,6 +959,9 @@ enum Share {
     /// The storage epoch proofs from other senders held across all ranks
     /// ([`OTHER_SEAL_BYTES_HELD`]).
     OtherSeals,
+    /// One sender's storage epoch proofs held across all ranks
+    /// ([`SEAL_BYTES_PER_SENDER`]), or its copy of a seat it holds a proof of.
+    Sender,
 }
 
 /// What a rank buffer holds of each class with a share, as (messages, bytes).
@@ -832,6 +979,13 @@ struct Shares {
     seals: Seals,
     /// The same by window end ([`SealEnds`]).
     seal_ends: SealEnds,
+    /// Storage epoch proofs by sender ([`CollectedMessage::sender`]).
+    seal_senders: HashMap<[u8; 32], (usize, usize)>,
+    /// The seats of storage epoch proofs by sender, with their copies.
+    seal_seats: HashMap<([u8; 32], [u8; 32]), usize>,
+    /// Active provers' storage epoch proofs over a frame's seal budget
+    /// ([`CollectedMessage::takes_seal_place`]).
+    seal_oversize: usize,
 }
 
 /// A rank's held storage epoch proofs ([`CollectedMessage::held_seal`]) by
@@ -899,6 +1053,101 @@ impl SealEnds {
             .map(|&(end, arrival)| (true, end, arrival))
             .chain(later.map(|&(end, arrival)| (false, end, arrival)))
     }
+}
+
+/// What the sender of a storage epoch proof holds across all ranks, for its
+/// share ([`SEAL_BYTES_PER_SENDER`]).
+#[derive(Clone, Copy, Default)]
+struct SenderSeals {
+    /// Its held proofs, as (messages, bytes).
+    held: (usize, usize),
+    /// It holds a proof of a seat the proof proves.
+    seat: bool,
+    /// Active provers' held proofs over a frame's seal budget, if the
+    /// message is one ([`CollectedMessage::takes_seal_place`]).
+    oversize: usize,
+}
+
+impl SenderSeals {
+    /// What `message`'s sender holds in `buffers`. Run under the buffers'
+    /// lock for every held proof submitted: it looks up the message's seats
+    /// (at most one proof's) only in the buffers holding the sender's
+    /// proofs (at most [`SEALS_PER_SENDER`]), so a sender holding none costs
+    /// a lookup a rank.
+    fn of(buffers: &HashMap<u64, RankBuffer>, message: &CollectedMessage) -> Self {
+        let mut held = Self::default();
+        let Some(sender) = message.sender.filter(|_| message.held_seal()) else {
+            return held;
+        };
+        let place = message.takes_seal_place();
+        for buffer in buffers.values() {
+            if place {
+                held.oversize += buffer.shares.seal_oversize;
+            }
+            // A buffer holds a sender's seats only with its proofs.
+            let Some((count, bytes)) = buffer.shares.seal_senders.get(&sender) else {
+                continue;
+            };
+            held.held.0 += count;
+            held.held.1 += bytes;
+            held.seat = held.seat
+                || message.seat_keys.iter().any(|seat| {
+                    #[cfg(test)]
+                    note_seat_lookup();
+                    buffer.shares.seal_seats.contains_key(&(sender, *seat))
+                });
+        }
+        held
+    }
+
+    /// `message` would go over its sender's share, held with these.
+    fn over(&self, message: &CollectedMessage) -> Option<Share> {
+        if !message.held_seal() || message.sender.is_none() {
+            return None;
+        }
+        let len = message.data.len();
+        let (count, bytes) = self.held;
+        // An active prover's proof over a frame's seal budget waits for
+        // another one held; the sender's share refuses it if the sender
+        // holds any proof.
+        let over = self.seat
+            || self.seat_taken(message)
+            || (count > 0
+                && (count >= SEALS_PER_SENDER
+                    || bytes.saturating_add(len) > SEAL_BYTES_PER_SENDER));
+        over.then_some(Share::Sender)
+    }
+
+    /// `message` is an active prover's proof over a frame's seal budget
+    /// and another one is held.
+    fn seat_taken(&self, message: &CollectedMessage) -> bool {
+        message.takes_seal_place() && self.oversize > 0
+    }
+
+    /// Why `message`, a proof over a frame's seal budget, was refused for
+    /// `share`, for its line ([`MessageCollector::note_oversize_seal`]).
+    fn oversize_refusal(&self, message: &CollectedMessage, share: Share) -> &'static str {
+        match share {
+            Share::Sender if self.seat_taken(message) => {
+                "another active prover's proof over a frame's seal budget is held"
+            }
+            Share::Sender => "its sender holds other proofs",
+            Share::Seals => "the active provers' share is full",
+            Share::OtherSeals => "other senders' share is full",
+            _ => "its rank's share is full",
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The seat lookups [`SenderSeals::of`] made on this thread.
+    static SEAT_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_seat_lookup() {
+    SEAT_LOOKUPS.with(|n| n.set(n.get() + 1));
 }
 
 /// Storage epoch proofs held ([`CollectedMessage::held_seal`]), as
@@ -979,6 +1228,17 @@ impl Shares {
         if let Some(seals) = self.seals.share_of(message) {
             seals.0 += 1;
             seals.1 += len;
+            if message.takes_seal_place() {
+                self.seal_oversize += 1;
+            }
+            if let Some(sender) = message.sender {
+                let held = self.seal_senders.entry(sender).or_default();
+                held.0 += 1;
+                held.1 += len;
+                for seat in &message.seat_keys {
+                    *self.seal_seats.entry((sender, *seat)).or_default() += 1;
+                }
+            }
         }
         if let Some(parts) = &message.capacity {
             self.capacity.0 += 1;
@@ -1001,6 +1261,26 @@ impl Shares {
         if let Some(seals) = self.seals.share_of(message) {
             seals.0 -= 1;
             seals.1 -= len;
+            if message.takes_seal_place() {
+                self.seal_oversize -= 1;
+            }
+            if let Some(sender) = message.sender {
+                if let Some(held) = self.seal_senders.get_mut(&sender) {
+                    held.0 -= 1;
+                    held.1 -= len;
+                    if held.0 == 0 {
+                        self.seal_senders.remove(&sender);
+                    }
+                }
+                for seat in &message.seat_keys {
+                    if let Some(copies) = self.seal_seats.get_mut(&(sender, *seat)) {
+                        *copies -= 1;
+                        if *copies == 0 {
+                            self.seal_seats.remove(&(sender, *seat));
+                        }
+                    }
+                }
+            }
         }
         if let Some(parts) = &message.capacity {
             self.capacity.0 -= 1;
@@ -1252,9 +1532,18 @@ impl RankBuffer {
         passed.skip = skip;
     }
 
+    /// Whose share the held storage epoch proof with `key` counts toward.
+    fn held_seal_sender(&self, key: &[u8; 32]) -> Option<Option<[u8; 32]>> {
+        self.seen
+            .get(key)
+            .and_then(|arrival| self.messages.get(arrival))
+            .map(|message| message.sender)
+    }
+
     /// Count the held storage epoch proof with `key` as an active prover's,
-    /// and as its member's own if `own` ([`CollectedMessage::own`]).
-    fn promote_seal(&mut self, key: &[u8; 32], own: bool) {
+    /// delivered by `sender` ([`CollectedMessage::sender`]), and as its
+    /// member's own if `own` ([`CollectedMessage::own`]).
+    fn promote_seal(&mut self, key: &[u8; 32], sender: Option<[u8; 32]>, own: bool) {
         let Some(&arrival) = self.seen.get(key) else {
             return;
         };
@@ -1264,6 +1553,7 @@ impl RankBuffer {
         self.shares.remove(message);
         self.shares.seal_ends.remove(arrival, message);
         message.prover = true;
+        message.sender = sender;
         message.own |= own;
         self.shares.add(message);
         self.shares.seal_ends.add(arrival, message);
@@ -1340,6 +1630,10 @@ pub enum Refusal {
     /// Another shield of the same coin signed by the same key is pending
     /// here or awaits its GLOBAL decision (the collector's shield claims).
     ShieldClaimed,
+    /// A storage epoch proof no member sends, larger than a proposal's seal
+    /// share or proving more seats than one proof covers
+    /// ([`CollectedMessage::unsendable_seal`]).
+    UnsendableSeal,
 }
 
 impl Refusal {
@@ -1353,6 +1647,7 @@ impl Refusal {
             Self::NoProposer => "this node is not an archive: it proposes no GLOBAL frames, so a message submitted to it would never be included",
             Self::InvalidAltShardUpdate => "alt shard update failed verification",
             Self::ShieldClaimed => "another shield of this coin signed by the same key is pending here or awaits its GLOBAL decision",
+            Self::UnsendableSeal => "storage epoch proof larger than a GLOBAL proposal's seal share, or proving more seats than one proof covers",
         }
     }
 
@@ -1924,6 +2219,9 @@ pub struct MessageCollector {
     share_full_active: std::sync::atomic::AtomicBool,
     /// The log of submits refused over a class share of a rank.
     share_full: std::sync::Mutex<ShareFullLog>,
+    /// The log of held and deferred storage epoch proofs over a frame's
+    /// seal budget ([`MessageCollector::note_oversize_seal`]).
+    oversize_seals: std::sync::Mutex<OversizeSealLog>,
     /// The seats of storage epoch proofs by window end, logged once each
     /// ends ([`window_seats`]). Locked after `buffers` when both are.
     window_seats: std::sync::Mutex<window_seats::WindowSeats>,
@@ -1970,6 +2268,19 @@ type SenderMember = Box<dyn Fn(&[u8]) -> Option<[u8; 32]> + Send + Sync>;
 /// reaches the collector, and a stalled rank refuses thousands per minute
 /// (2026-10-27: ~40,000 lines per archive in 2.75 h).
 const RANK_FULL_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Least time between lines on held or deferred storage epoch proofs over
+/// a frame's seal budget ([`MessageCollector::note_oversize_seal`]).
+const OVERSIZE_SEAL_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// Held and deferred storage epoch proofs over a frame's seal budget since
+/// the last line, and when that line was logged.
+#[derive(Default)]
+struct OversizeSealLog {
+    logged: Option<Instant>,
+    held: usize,
+    deferred: usize,
+}
 
 /// How often rejected shard-frame submits are logged while they continue.
 /// A node whose committed shard set is behind the network's rejects every live
@@ -2162,6 +2473,7 @@ struct ShareFullLog {
     member: u64,
     seals: u64,
     other_seals: u64,
+    sender: u64,
     /// The shares accepted again this many times since the last line.
     reopened: u64,
     /// The last event was a refusal.
@@ -2179,13 +2491,14 @@ struct ShareFullLog {
 
 impl ShareFullLog {
     /// The refusals since the last line, cleared.
-    fn take_counts(&mut self) -> (u64, u64, u64, u64, u64) {
+    fn take_counts(&mut self) -> (u64, u64, u64, u64, u64, u64) {
         (
             std::mem::take(&mut self.unreserved),
             std::mem::take(&mut self.capacity),
             std::mem::take(&mut self.member),
             std::mem::take(&mut self.seals),
             std::mem::take(&mut self.other_seals),
+            std::mem::take(&mut self.sender),
         )
     }
 
@@ -2210,7 +2523,7 @@ impl ShareFullLog {
             .map_or(0, |(since, last)| {
                 last.saturating_duration_since(since).as_secs()
             });
-        let (unreserved, capacity, member, seals, other_seals) = self.take_counts();
+        let (unreserved, capacity, member, seals, other_seals, sender) = self.take_counts();
         self.not_only_seals = false;
         self.refusing = false;
         ShareFullEnd {
@@ -2219,6 +2532,7 @@ impl ShareFullLog {
             member,
             seals,
             other_seals,
+            sender,
             reopened: std::mem::take(&mut self.reopened),
             total: std::mem::take(&mut self.total),
             lasted_secs,
@@ -2234,6 +2548,7 @@ struct ShareFullEnd {
     member: u64,
     seals: u64,
     other_seals: u64,
+    sender: u64,
     reopened: u64,
     total: u64,
     lasted_secs: u64,
@@ -2355,6 +2670,9 @@ struct ShareFullState {
     seals: Seals,
     /// The member a refused capacity message names.
     member: Option<[u8; 32]>,
+    /// Who delivered a refused storage epoch proof, with its held proofs
+    /// across all ranks as (messages, bytes).
+    sender: Option<(String, (usize, usize))>,
 }
 
 /// The buffer a refusal found full, for its log line.
@@ -2395,6 +2713,53 @@ impl MessageCollector {
         );
     }
 
+    /// Log a storage epoch proof over a frame's seal budget held (`held`) or
+    /// refused retryably for `reason`: at most one line per
+    /// [`OVERSIZE_SEAL_LOG_EVERY`], counting those since the last.
+    fn note_oversize_seal(
+        &self,
+        now: Instant,
+        held: bool,
+        sender: Sender<'_>,
+        bytes: usize,
+        rank: u64,
+        reason: &'static str,
+    ) {
+        let (held_since, deferred_since) = {
+            let mut log = self.oversize_seals.lock().unwrap();
+            if held {
+                log.held += 1;
+            } else {
+                log.deferred += 1;
+            }
+            if log
+                .logged
+                .is_some_and(|at| now.duration_since(at) < OVERSIZE_SEAL_LOG_EVERY)
+            {
+                return;
+            }
+            log.logged = Some(now);
+            (
+                std::mem::take(&mut log.held),
+                std::mem::take(&mut log.deferred),
+            )
+        };
+        tracing::warn!(
+            scope = "network",
+            action = if held { "hold" } else { "wait" },
+            sender = %sender_label(sender),
+            bytes,
+            rank,
+            frame = self.next_seal_frame(),
+            reason,
+            held_since,
+            deferred_since,
+            frame_seal_bytes = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME,
+            max_bytes = SEAL_BYTES_PER_PROPOSAL,
+            "message collector: a storage epoch proof over a frame's seal budget (frame_seal_bytes) arrived; one such proof, up to max_bytes, is held at a time from active provers and one from other senders, each from a sender holding no other, and rides a frame whose other proofs leave room. A deferred one is refused retryably and its sender resends it until its window ends. held_since and deferred_since count such proofs since the previous line. A member's prover keeps each part under frame_seal_bytes: check the sender's release if these recur"
+        );
+    }
+
     /// Count a submit refused over a class share of a rank; log the first of
     /// an episode and then at most one line per [`RANK_FULL_LOG_EVERY`] with
     /// the counts since the previous line ([`ShareFullLog`]). A refusal a
@@ -2416,8 +2781,12 @@ impl MessageCollector {
             Share::Member => log.member += 1,
             Share::Seals => log.seals += 1,
             Share::OtherSeals => log.other_seals += 1,
+            Share::Sender => log.sender += 1,
         }
-        if !matches!(state.share, Share::Seals | Share::OtherSeals) {
+        if !matches!(
+            state.share,
+            Share::Seals | Share::OtherSeals | Share::Sender
+        ) {
             log.not_only_seals = true;
         }
         log.refusing = true;
@@ -2429,10 +2798,11 @@ impl MessageCollector {
         }
         log.logged = Some(now);
         let secs = now.saturating_duration_since(since).as_secs();
-        let (unreserved, capacity, member, seals, other_seals) = log.take_counts();
+        let (unreserved, capacity, member, seals, other_seals, sender) = log.take_counts();
         let reopened = std::mem::take(&mut log.reopened);
         let total = log.total;
         let not_only_seals = std::mem::take(&mut log.not_only_seals);
+        let (latest_sender, (sender_pending, sender_bytes)) = state.sender.unwrap_or_default();
         macro_rules! share_full_line {
             ($level:ident) => {
                 tracing::$level!(
@@ -2450,6 +2820,11 @@ impl MessageCollector {
                     other_seal_pending = state.seals.other.0,
                     other_seal_bytes = state.seals.other.1,
                     other_seal_max_bytes = OTHER_SEAL_BYTES_HELD,
+                    sender_seal_refused = sender,
+                    latest_sender = %latest_sender,
+                    sender_seal_pending = sender_pending,
+                    sender_seal_bytes = sender_bytes,
+                    sender_seal_max_bytes = SEAL_BYTES_PER_SENDER,
                     reopened,
                     refused_total = total,
                     for_secs = secs,
@@ -2461,7 +2836,7 @@ impl MessageCollector {
                     unreserved_bytes = state.unreserved.1,
                     reserved_bytes = RESERVED_BYTES_PER_RANK,
                     latest_member = %state.member.map(hex::encode).unwrap_or_default(),
-                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
+                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes), sender_seal_refused those over one sender's share across both (latest_sender names the last, holding sender_seal_pending proofs of sender_seal_bytes, at most sender_seal_max_bytes, or one proof up to a frame's seal budget, and one per seat; one proof over a frame's seal budget is held at a time from active provers and one from others); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
                 )
             };
         }
@@ -2506,12 +2881,13 @@ impl MessageCollector {
             rank,
             refused_total = end.total,
             refused_since_last_line =
-                end.unreserved + end.capacity + end.member + end.seals + end.other_seals,
+                end.unreserved + end.capacity + end.member + end.seals + end.other_seals + end.sender,
             capacity_refused = end.capacity,
             member_refused = end.member,
             unreserved_refused = end.unreserved,
             seal_refused = end.seals,
             other_seal_refused = end.other_seals,
+            sender_seal_refused = end.sender,
             reopened = end.reopened,
             lasted_secs = end.lasted_secs,
             "message collector: refusals over class shares ended, none for a whole interval; counts are since the previous line, refused_total over the whole episode of lasted_secs"
@@ -2564,6 +2940,7 @@ impl MessageCollector {
             class_shares: std::sync::atomic::AtomicBool::new(false),
             share_full_active: std::sync::atomic::AtomicBool::new(false),
             share_full: Default::default(),
+            oversize_seals: Default::default(),
             window_seats: Default::default(),
             #[cfg(test)]
             windows_ended: Default::default(),
@@ -2978,6 +3355,14 @@ impl MessageCollector {
                 message.own = self.sender_member.get().and_then(|of| of(peer)) == Some(member);
             }
         }
+        if message.held_seal() {
+            message.sender = seal_sender(sender);
+        }
+        // A sender's proof no member sends is refused for good, before any
+        // work under the buffers' lock: retried, it would never be held.
+        if message.sender.is_some() && self.class_shares() && message.unsendable_seal() {
+            return SubmitOutcome::Filtered(Refusal::UnsendableSeal);
+        }
         // Already included in a finalized frame → never re-accept. This
         // is what stops a message from re-entering the mempool after it
         // has been consumed by a committed frame. The archive already has
@@ -3092,7 +3477,7 @@ impl MessageCollector {
         {
             if message.prover && message.held_seal() && self.class_shares() {
                 let mut buffers = self.buffers.write().unwrap();
-                return self.promote_seal(&mut buffers, &message);
+                return self.promote_seal(&mut buffers, &message, sender);
             }
             return SubmitOutcome::Duplicate;
         }
@@ -3231,7 +3616,7 @@ impl MessageCollector {
             && buffers.values().any(|b| b.contains(&message.hash))
         {
             if message.prover {
-                return self.promote_seal(&mut buffers, &message);
+                return self.promote_seal(&mut buffers, &message, sender);
             }
             return SubmitOutcome::Duplicate;
         }
@@ -3267,21 +3652,25 @@ impl MessageCollector {
         let (hash, verified, class) = (message.hash, message.verified, message.class);
         let shared = self.class_shares();
         let held_seal = message.held_seal();
+        // A proof over a frame's seal budget, for its line.
+        let oversize = (shared && message.sender.is_some() && message.oversize_seal())
+            .then_some(message.data.len());
         // The storage epoch proofs held across all ranks, for their shares
         // and the refusal line.
-        let mut seals = if shared {
-            Seals::held(&buffers)
+        let (mut seals, from_sender) = if shared {
+            (Seals::held(&buffers), SenderSeals::of(&buffers, &message))
         } else {
-            Seals::default()
+            Default::default()
         };
         let ranks_held = buffers.len();
-        // Every other share first: a message one of them refuses takes no
-        // held proof's room.
+        // Every other share first, its sender's included: a message one of
+        // them refuses takes no held proof's room.
         let mut over = if shared {
             buffers
                 .entry(rank)
                 .or_insert_with(RankBuffer::new)
                 .over_share(&message)
+                .or_else(|| from_sender.over(&message))
         } else {
             None
         };
@@ -3317,13 +3706,22 @@ impl MessageCollector {
                     capacity: buffer.shares.capacity,
                     seals,
                     member: message.capacity.as_ref().map(|c| c.member),
+                    sender: held_seal.then(|| (sender_label(sender), from_sender.held)),
                 },
             );
+            if let Some(bytes) = oversize {
+                let reason = from_sender.oversize_refusal(&message, share);
+                self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
+            }
             self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
             return SubmitOutcome::Filtered(Refusal::RankFull);
         }
         match buffer.add(message) {
             AddOutcome::Added => {
+                if let Some(bytes) = oversize {
+                    let reason = "held alone: no other proof over a frame's seal budget is held in its share";
+                    self.note_oversize_seal(Instant::now(), true, sender, bytes, rank, reason);
+                }
                 self.note_window_seats(SeatEvent::Admitted, seats_prover, &seats);
                 let now = Instant::now();
                 self.note_rank_accepting(now, rank);
@@ -3346,6 +3744,10 @@ impl MessageCollector {
             }
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
             AddOutcome::Full => {
+                if let Some(bytes) = oversize {
+                    let reason = "its rank buffer is full";
+                    self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
+                }
                 self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
                 self.intake.note(Intake::RefusedRankFull, Instant::now());
                 self.note_rank_full(
@@ -4136,22 +4538,37 @@ impl MessageCollector {
     }
 
     /// A prover's copy of a held storage epoch proof: one another sender
-    /// delivered moves to the provers' share, when that has room or makes
-    /// room as for a submit ([`evict_later_seals`]). Else it is refused
-    /// retryably, as a full rank, so the prover resends it.
+    /// delivered moves to the provers' share and to the prover's own share
+    /// ([`SEAL_BYTES_PER_SENDER`]), when both have room, the provers' share
+    /// making room as for a submit ([`evict_later_seals`]) once the
+    /// prover's own has it. Else it is refused retryably, as a full rank,
+    /// so the prover resends it. Charged to the sender that delivered it
+    /// first, a prover could move any number of other senders' proofs
+    /// into the provers' share.
     fn promote_seal(
         &self,
         buffers: &mut HashMap<u64, RankBuffer>,
         message: &CollectedMessage,
+        sender: Sender<'_>,
     ) -> SubmitOutcome {
         let mut seals = Seals::held(buffers);
+        let from_sender = SenderSeals::of(buffers, message);
         let Some(rank) = buffers
             .iter()
             .find_map(|(&rank, b)| b.holds_other_seal(&message.hash).then_some(rank))
         else {
             return SubmitOutcome::Duplicate;
         };
-        if seals.over(message).is_some() {
+        // Its own copy moves within the sender's share, but takes the
+        // provers' place for a proof over a frame's seal budget only if free.
+        let over_sender = if buffers[&rank].held_seal_sender(&message.hash) == Some(message.sender)
+        {
+            from_sender.seat_taken(message).then_some(Share::Sender)
+        } else {
+            from_sender.over(message)
+        };
+        // A copy over its sender's share takes no held proof's room.
+        if over_sender.is_none() && seals.over(message).is_some() {
             let mut dropped = Vec::new();
             let frame = self.next_seal_frame();
             let evicted = evict_later_seals(buffers, message, seals, frame, &mut dropped);
@@ -4164,24 +4581,30 @@ impl MessageCollector {
         let Some(buffer) = buffers.get_mut(&rank) else {
             return SubmitOutcome::Duplicate;
         };
-        if seals.over(message).is_some() {
+        if let Some(share) = over_sender.or_else(|| seals.over(message)) {
             self.note_share_full(
                 Instant::now(),
                 ShareFullState {
                     rank,
-                    share: Share::Seals,
+                    share,
                     unreserved: buffer.shares.unreserved,
                     capacity: buffer.shares.capacity,
                     seals,
                     member: None,
+                    sender: Some((sender_label(sender), from_sender.held)),
                 },
             );
+            if message.sender.is_some() && message.oversize_seal() {
+                let reason = from_sender.oversize_refusal(message, share);
+                let bytes = message.data.len();
+                self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
+            }
             if let Some(seats) = buffer.held_seats(&message.hash) {
                 self.note_window_seats(SeatEvent::Refused, true, seats);
             }
             return SubmitOutcome::Filtered(Refusal::RankFull);
         }
-        buffer.promote_seal(&message.hash, message.own);
+        buffer.promote_seal(&message.hash, message.sender, message.own);
         // The held copy's seats, read when it was filed.
         if let Some(seats) = buffer.held_seats(&message.hash) {
             self.note_window_seats(SeatEvent::Admitted, true, seats);
@@ -5483,13 +5906,25 @@ mod tests {
         // One rank may hold both shares of storage epoch proofs in full, and
         // a flood beside them still leaves a shard header room.
         let mc = global_collector();
+        // Each other sender is a peer of its own, each within its share
+        // ([`SEAL_BYTES_PER_SENDER`]); the provers' proofs are this node's.
         let held = |ids: std::ops::RangeInclusive<u32>, provenance: Provenance| {
-            ids.map(|id| numbered_epoch_proof(id, 650_000))
-                .take_while(|proof| {
-                    mc.add_message_outcome_from(1, proof.clone(), provenance)
-                        == SubmitOutcome::Accepted
+            ids.map(|id| (id, numbered_epoch_proof(id, 650_000)))
+                .take_while(|(id, proof)| {
+                    let outcome = match provenance {
+                        Provenance::Other => mc.add_message_outcome_by(
+                            1,
+                            proof.clone(),
+                            provenance,
+                            &id.to_be_bytes(),
+                        ),
+                        Provenance::Prover => {
+                            mc.add_message_outcome_from(1, proof.clone(), provenance)
+                        }
+                    };
+                    outcome == SubmitOutcome::Accepted
                 })
-                .map(|proof| proof.len())
+                .map(|(_, proof)| proof.len())
                 .sum::<usize>()
         };
         let size = numbered_epoch_proof(0, 650_000).len();
@@ -5908,8 +6343,18 @@ mod tests {
         let ids: HashMap<[u8; 32], u32> = (1..=last)
             .map(|id| (sha256(&numbered_epoch_proof(id, len)), id))
             .collect();
-        let submit = |id: u32, provenance: Provenance| {
-            mc.add_message_outcome_from(1, numbered_epoch_proof(id, len), provenance)
+        // Each other sender is a peer of its own, each within its share
+        // ([`SEAL_BYTES_PER_SENDER`]); the provers' proofs are this node's.
+        let submit = |id: u32, provenance: Provenance| match provenance {
+            Provenance::Other => mc.add_message_outcome_by(
+                1,
+                numbered_epoch_proof(id, len),
+                provenance,
+                &id.to_be_bytes(),
+            ),
+            Provenance::Prover => {
+                mc.add_message_outcome_from(1, numbered_epoch_proof(id, len), provenance)
+            }
         };
         let frame = |rank: u64| -> Vec<u32> {
             let taken: Vec<Vec<u8>> = mc
@@ -5964,6 +6409,839 @@ mod tests {
         assert!(
             second.contains(&promoted),
             "seal-share promoted: the second frame took {second:?}, not proof {promoted} a prover sent again"
+        );
+    }
+
+    /// One active prover's storage epoch proofs leave room in the provers'
+    /// share for another member's. Proofs are not verified on arrival, so
+    /// one prover can send any number of distinct ones: forty of 600 KB
+    /// arrive from one peer, then a member's genuine proof from its own.
+    #[test]
+    fn one_active_provers_proofs_leave_room_for_another_members_proof() {
+        let mc = global_collector();
+        let flood: Vec<SubmitOutcome> = (1..=40u32)
+            .map(|id| {
+                mc.add_message_outcome_by(
+                    1,
+                    numbered_epoch_proof(id, 600_000),
+                    Provenance::Prover,
+                    b"one-prover",
+                )
+            })
+            .collect();
+        let held = flood
+            .iter()
+            .filter(|outcome| **outcome == SubmitOutcome::Accepted)
+            .count();
+        let genuine = mc.add_message_outcome_by(
+            1,
+            numbered_epoch_proof(1_000, 650_000),
+            Provenance::Prover,
+            b"member",
+        );
+        eprintln!("REACH seal-sender flood_held={held} of 40, genuine={genuine:?}");
+        assert_eq!(
+            genuine,
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-FLOOD: one prover's {held} proofs filled the provers' share ({SEAL_BYTES_HELD} bytes) and a member's genuine proof was refused"
+        );
+    }
+
+    /// A member's burst of storage epoch proofs from one sender rides frames
+    /// well within its window: each proof a finalized frame carries leaves the
+    /// sender's share, and the sender's refused proofs are held at its next
+    /// resend. The burst is the largest live one within 60 seconds (one
+    /// member, 2026-11-16): six proofs, 7,650,428 bytes, five at once and one
+    /// 24 seconds later. The member sends each proof to every archive, so the
+    /// archive leading a GLOBAL frame (one every 10 seconds) holds what this
+    /// one holds, and every archive releases what a finalized frame carried,
+    /// whoever led it. The sender resends refused proofs in rounds a back-off
+    /// apart, from 5 seconds doubling to 60 and back to 5 after a delivery,
+    /// here without the jitter that shortens it. The frame bound follows from
+    /// the caps: a frame carries all a lone sender holds (its share, or one
+    /// proof up to a frame's seal budget), so the round after it holds at
+    /// least one proof, or as many of the largest as the share fits; rounds
+    /// after a delivery are a frame apart; and a proof sent between a frame
+    /// and a round refuses that round, whose doubled back-off costs a frame.
+    #[test]
+    fn a_members_burst_rides_within_its_window() {
+        const FRAME_SECS: u64 = 10;
+        let (first, longest) = (5, 60);
+        // Each proof's live size in bytes and the second it was sent.
+        let burst: [(usize, u64); 6] = [
+            (821_894, 0),
+            (846_518, 0),
+            (1_480_784, 0),
+            (1_513_836, 0),
+            (1_502_236, 0),
+            (1_485_160, 24),
+        ];
+        let proofs: Vec<Vec<u8>> = (1..)
+            .zip(burst)
+            .map(|(id, (size, _))| {
+                let envelope = seat_proof(9, id, 1500, true, id, size).len() - size;
+                let proof = seat_proof(9, id, 1500, true, id, size - envelope);
+                assert_eq!(proof.len(), size, "proof {id} is not its live size");
+                proof
+            })
+            .collect();
+        let largest = burst.iter().map(|&(size, _)| size).max().unwrap();
+        assert!(largest <= quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME);
+        assert_eq!(
+            2 * first,
+            FRAME_SECS,
+            "a round after a delivery is a frame later"
+        );
+        let per_round = (SEAL_BYTES_PER_SENDER / largest).max(1);
+        let late = burst.iter().filter(|&&(_, at)| at > 0).count();
+        let within = (burst.len().div_ceil(per_round) + late) as u64;
+        assert!(within < crate::storage_epoch_batch::settle_closing_frames());
+        let mc = global_collector();
+        let keys: Vec<[u8; 32]> = proofs.iter().map(|p| message_key(p)).collect();
+        let send = |i: usize, rank: u64| match mc.add_message_outcome_by(
+            rank,
+            proofs[i].clone(),
+            Provenance::Prover,
+            b"member",
+        ) {
+            SubmitOutcome::Accepted => true,
+            SubmitOutcome::Filtered(Refusal::RankFull) => false,
+            other => panic!("proof {i}: {other:?}"),
+        };
+        let mut queued: Vec<usize> = Vec::new();
+        let mut carried: Vec<Option<u64>> = vec![None; proofs.len()];
+        let (mut delay, mut next_send, mut refusals) = (first, first, 0);
+        for second in 0..=within * FRAME_SECS {
+            if second > 0 && second.is_multiple_of(FRAME_SECS) {
+                let frame = second / FRAME_SECS;
+                // The leader, whichever archive it is, holds what this one does.
+                let taken: Vec<Vec<u8>> = mc
+                    .snapshot_for_proposal(frame, SEAL_BYTES_PER_PROPOSAL, 100_000, None, &[])
+                    .unwrap()
+                    .into_iter()
+                    .map(|(data, _)| data)
+                    .collect();
+                mc.note_finalized_frame(frame);
+                mc.mark_finalized(&taken);
+                mc.prune_after_finalization(frame);
+                for data in &taken {
+                    let key = message_key(data);
+                    let Some(i) = keys.iter().position(|k| *k == key) else {
+                        continue;
+                    };
+                    carried[i].get_or_insert(frame);
+                    let held = mc
+                        .buffers
+                        .read()
+                        .unwrap()
+                        .values()
+                        .any(|b| b.contains(&key));
+                    assert!(
+                        !held,
+                        "SEAL-SENDER-CARRIED: frame {frame} carried proof {i} and it stayed held"
+                    );
+                }
+            }
+            let rank = second / FRAME_SECS + 1;
+            for (i, &(_, at)) in burst.iter().enumerate() {
+                if at == second && !send(i, rank) {
+                    refusals += 1;
+                    queued.push(i);
+                }
+            }
+            if second != next_send || queued.is_empty() {
+                continue;
+            }
+            let before = queued.len();
+            queued.retain(|&i| {
+                let held = send(i, rank);
+                refusals += usize::from(!held);
+                !held
+            });
+            if queued.len() < before {
+                delay = first;
+            }
+            delay = (delay * 2).min(longest);
+            next_send = second + delay;
+        }
+        eprintln!(
+            "REACH seal-sender burst carried={carried:?} within={within} refusals={refusals}"
+        );
+        assert!(
+            refusals > 0,
+            "SEAL-SENDER-BURST-SPLIT: the sender's share held the burst whole"
+        );
+        assert!(
+            carried.iter().all(Option::is_some),
+            "SEAL-SENDER-BURST: one sender's burst of {burst:?} rode frames {carried:?} of the first {within}"
+        );
+    }
+
+    /// A sender's native proofs of one leaf (190,971 bytes) are held up to
+    /// its byte share: no count bound refuses them first.
+    #[test]
+    fn a_senders_native_proofs_fill_its_byte_share() {
+        let mc = global_collector();
+        let len = 190_971;
+        let size = seat_proof(1, 1, 1500, true, 1, len).len();
+        let share = SEAL_BYTES_PER_SENDER / size;
+        let held = (1..=u8::MAX)
+            .take_while(|&id| {
+                let proof = seat_proof(id, id, 1500, true, id, len);
+                mc.add_message_outcome_by(1, proof, Provenance::Prover, b"member")
+                    == SubmitOutcome::Accepted
+            })
+            .count();
+        eprintln!("REACH seal-sender native held={held} share={share}");
+        assert_eq!(
+            held,
+            share,
+            "SEAL-SENDER-NATIVE: one sender held {held} native proofs of {size} bytes, its byte share holds {share}"
+        );
+    }
+
+    /// Three colluding active provers, each holding all a sender can (one
+    /// proof of a frame's seal budget, above its share), leave a member's
+    /// settlement proof (about 0.82 MB) room in the provers' share: four are
+    /// the fewest that fill it.
+    #[test]
+    fn three_colluding_provers_leave_room_for_a_settlement_proof() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        // A frame's seal budget, then 1 MiB down to 256 bytes by quarters.
+        let sizes = std::iter::once(budget - 1_000).chain((0..7).map(|i| (1 << 20) >> (2 * i)));
+        let mut id = 0u8;
+        let mut colluders = Vec::new();
+        for peer in [&b"colluder-1"[..], b"colluder-2", b"colluder-3"] {
+            let mut held = 0;
+            for len in sizes.clone() {
+                loop {
+                    id += 1;
+                    let proof = seat_proof(id, id, 1500, true, id, len);
+                    let size = proof.len();
+                    if mc.add_message_outcome_by(1, proof, Provenance::Prover, peer)
+                        != SubmitOutcome::Accepted
+                    {
+                        break;
+                    }
+                    held += size;
+                }
+            }
+            colluders.push(held);
+        }
+        let held = Seals::held(&mc.buffers.read().unwrap()).prover.1;
+        let settlement = seat_proof(250, 250, 1500, false, 250, 850_000);
+        let outcome = mc.add_message_outcome_by(1, settlement, Provenance::Prover, b"member");
+        eprintln!(
+            "REACH seal-sender collude colluders={colluders:?} held={held} outcome={outcome:?}"
+        );
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-COLLUDE: three colluding provers held {held} of {SEAL_BYTES_HELD} bytes and a member's settlement proof was refused"
+        );
+        assert!(
+            colluders
+                .iter()
+                .all(|&held| held + 1_100 > budget && held <= budget),
+            "each colluder holds a frame's seal budget: {colluders:?} of {budget}"
+        );
+    }
+
+    /// Two colluding active provers contending for the one place for a
+    /// proof over a frame's seal budget, one holding proofs first and then
+    /// trying it, the other trying it first, hold at most one proposal's
+    /// seal share and a frame's seal budget, and leave a member's
+    /// settlement proof (about 0.82 MB) room in the provers' share: the
+    /// place takes one such proof, from a sender holding no other.
+    #[test]
+    fn two_colluding_provers_contending_for_a_proof_over_a_frame_leave_room_for_a_settlement_proof()
+    {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let seat = SEAL_BYTES_PER_PROPOSAL - 1_000;
+        // A frame's seal budget, then 1 MiB down to 256 bytes by quarters.
+        let ladder: Vec<usize> = std::iter::once(budget - 1_000)
+            .chain((0..7).map(|i| (1 << 20) >> (2 * i)))
+            .collect();
+        let mut id = 0u8;
+        let mut colluders = Vec::new();
+        for (peer, seat_first) in [(&b"colluder-1"[..], false), (b"colluder-2", true)] {
+            let mut sizes = ladder.clone();
+            if seat_first {
+                sizes.insert(0, seat);
+            } else {
+                sizes.push(seat);
+            }
+            let mut held = 0;
+            for len in sizes {
+                loop {
+                    id += 1;
+                    let proof = seat_proof(id, id, 1500, true, id, len);
+                    let size = proof.len();
+                    if mc.add_message_outcome_by(1, proof, Provenance::Prover, peer)
+                        != SubmitOutcome::Accepted
+                    {
+                        break;
+                    }
+                    held += size;
+                }
+            }
+            colluders.push(held);
+        }
+        let held = Seals::held(&mc.buffers.read().unwrap()).prover.1;
+        let settlement = seat_proof(250, 250, 1500, false, 250, 850_000);
+        let outcome = mc.add_message_outcome_by(1, settlement, Provenance::Prover, b"member");
+        eprintln!(
+            "REACH seal-sender collude-seat colluders={colluders:?} held={held} outcome={outcome:?}"
+        );
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-COLLUDE-SEAT: two colluding provers held {held} of {SEAL_BYTES_HELD} bytes and a member's settlement proof was refused"
+        );
+        assert!(
+            held <= SEAL_BYTES_PER_PROPOSAL + budget,
+            "SEAL-SEAT-BOUND: two colluding provers held {held} bytes, over a proposal's seal share and a frame's seal budget"
+        );
+        assert_eq!(
+            colluders.iter().filter(|&&held| held > budget).count(),
+            1,
+            "one colluder holds a proof over a frame's seal budget: {colluders:?}"
+        );
+    }
+
+    /// A storage epoch proof of one seat part: `member`'s seat on shard
+    /// `shard` for `epoch`, sealing or settling, with a `len`-byte proof
+    /// filled with `tag`.
+    fn seat_proof(member: u8, shard: u8, epoch: u64, seals: bool, tag: u8, len: usize) -> Vec<u8> {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        };
+        let proof = StorageEpochProof {
+            member: [member; 32],
+            seats: vec![SeatProof {
+                shard_filter: vec![shard; 32],
+                epoch,
+                seals,
+                settles: !seals,
+                ..Default::default()
+            }],
+            proof: vec![tag; len],
+        };
+        one_request(TYPE_STORAGE_EPOCH_PROOF, proof.to_canonical_bytes())
+    }
+
+    /// A sender holds one proof of each seat part at a time: another proof
+    /// of a seat part it holds waits until its held one leaves. Another
+    /// part of the seat, or another sender's proof of the same part, is
+    /// held.
+    #[test]
+    fn a_sender_holds_one_proof_of_each_seat_part() {
+        let mc = global_collector();
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let first = seat_proof(7, 9, 1500, true, 1, 1_000);
+        assert_eq!(by(first.clone(), b"a"), SubmitOutcome::Accepted);
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, true, 2, 1_000), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "SEAL-SEAT: a second proof of a seat part one sender holds was held"
+        );
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, false, 3, 1_000), b"a"),
+            SubmitOutcome::Accepted,
+            "the seat's settlement is a part of its own"
+        );
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, true, 2, 1_000), b"b"),
+            SubmitOutcome::Accepted,
+            "another sender's proof of the part"
+        );
+        mc.remove(&[first]);
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, true, 4, 1_000), b"a"),
+            SubmitOutcome::Accepted,
+            "the sender's held proof of the part left"
+        );
+    }
+
+    /// A sender holding no storage epoch proof is held one above its share
+    /// up to what a frame carries; one over a proposal's seal share is
+    /// refused for good, and any further proof over the sender's share
+    /// retryably.
+    #[test]
+    fn a_sender_holding_none_is_held_one_proof_up_to_a_frames_seal_budget() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let large = seat_proof(1, 1, 1500, true, 1, 3 << 20);
+        assert!(large.len() > SEAL_BYTES_PER_SENDER && large.len() <= budget);
+        assert_eq!(
+            mc.add_message_outcome_by(1, large, Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "a sender's first proof above its share"
+        );
+        assert_eq!(
+            mc.add_message_outcome_by(
+                1,
+                seat_proof(2, 2, 1500, true, 2, 1_000),
+                Provenance::Prover,
+                b"a",
+            ),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "a further proof over the sender's share"
+        );
+        let mc = global_collector();
+        let oversized = seat_proof(3, 3, 1500, true, 3, SEAL_BYTES_PER_PROPOSAL);
+        assert!(oversized.len() > SEAL_BYTES_PER_PROPOSAL && oversized.len() <= SEAL_BYTES_HELD);
+        let outcome = mc.add_message_outcome_by(1, oversized, Provenance::Prover, b"b");
+        assert_ne!(
+            outcome,
+            SubmitOutcome::Accepted,
+            "SEAL-OVERSIZE: a proof over a proposal's seal share was held"
+        );
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Filtered(Refusal::UnsendableSeal),
+            "SEAL-OVERSIZE-FINAL: a proof over a proposal's seal share was refused retryably, so its sender resends it until its window ends"
+        );
+        assert!(!Refusal::UnsendableSeal.retryable());
+    }
+
+    /// A storage epoch proof of exactly `len` bytes, distinct for each `id`.
+    fn epoch_proof_of_len(id: u32, len: usize) -> Vec<u8> {
+        let envelope = numbered_epoch_proof(0, len).len() - len;
+        let proof = numbered_epoch_proof(id, len - envelope);
+        assert_eq!(proof.len(), len);
+        proof
+    }
+
+    /// A proof of exactly a frame's seal budget is an ordinary one: it is
+    /// held while another sender holds the one proof over that budget.
+    #[test]
+    fn a_proof_of_a_frames_seal_budget_is_held_beside_a_larger_one() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        assert_eq!(
+            by(epoch_proof_of_len(1, budget + 1), b"a"),
+            SubmitOutcome::Accepted,
+            "a proof a byte over a frame's seal budget, held first"
+        );
+        assert_eq!(
+            by(epoch_proof_of_len(2, budget), b"b"),
+            SubmitOutcome::Accepted,
+            "SEAL-FRAME-EDGE: a proof of a frame's seal budget waited for one over it"
+        );
+    }
+
+    /// A proof a byte over a frame's seal budget is held from a sender
+    /// holding none and rides a proposal at a leader's message cap (12
+    /// MiB); from a sender holding another proof it waits, refused
+    /// retryably.
+    #[test]
+    fn a_proof_a_byte_over_a_frames_seal_budget_is_held_from_a_sender_holding_none() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let over = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, over.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-FRAME-OVER: a proof a byte over a frame's seal budget from a sender holding none was refused"
+        );
+        let taken = mc
+            .snapshot_for_proposal(1, 12 << 20, 100_000, None, &[])
+            .unwrap();
+        assert!(
+            taken.iter().any(|(data, _)| *data == over),
+            "SEAL-FRAME-OVER-CARRIED: a proposal left the held proof out"
+        );
+        let mc = global_collector();
+        assert_eq!(
+            mc.add_message_outcome_by(1, numbered_epoch_proof(2, 1_000), Provenance::Prover, b"b"),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome_by(1, epoch_proof_of_len(3, budget + 1), Provenance::Prover, b"b"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "SEAL-SEAT-ALONE: a proof over a frame's seal budget was held from a sender holding another"
+        );
+    }
+
+    /// While one proof over a frame's seal budget is held, another sender's
+    /// waits, refused retryably, and is held once the first leaves. A third
+    /// sender's proof stays held throughout, so the rank's buffer, and what
+    /// it counts, outlives the first.
+    #[test]
+    fn a_second_proof_over_a_frames_seal_budget_waits_for_the_first() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        assert_eq!(
+            by(numbered_epoch_proof(3, 650_000), b"c"),
+            SubmitOutcome::Accepted
+        );
+        let first = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(by(first.clone(), b"a"), SubmitOutcome::Accepted);
+        let second = epoch_proof_of_len(2, budget + 1);
+        assert_eq!(
+            by(second.clone(), b"b"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "SEAL-SEAT-TAKEN: a second proof over a frame's seal budget was held, or refused for good"
+        );
+        assert!(Refusal::RankFull.retryable());
+        mc.remove(&[first]);
+        assert_eq!(
+            by(second, b"b"),
+            SubmitOutcome::Accepted,
+            "SEAL-SEAT-FREED: a proof over a frame's seal budget was refused after the held one left"
+        );
+    }
+
+    /// Another sender's held proof over a frame's seal budget leaves the
+    /// provers' place to an active prover's proof: each share holds one
+    /// such proof, so a peer that is no active prover, or a client, cannot
+    /// keep a member's out for as long as it resends one.
+    #[test]
+    fn another_senders_proof_over_a_frame_leaves_the_place_to_a_provers() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let junk = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, junk, Provenance::Other, b"o"),
+            SubmitOutcome::Accepted,
+            "another sender's proof over a frame's seal budget, held first"
+        );
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!(
+            (held.prover.0, held.other.0),
+            (0, 1),
+            "the premise: one other sender's proof held, no prover's"
+        );
+        let member = epoch_proof_of_len(2, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, member, Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-SEAT-CLASS: an active prover's proof over a frame's seal budget waited for another sender's"
+        );
+    }
+
+    /// A prover's copy of another sender's held proof over a frame's seal
+    /// budget, from that sender or another, moves it to the provers' share
+    /// only while that share holds no other such proof: the provers' place
+    /// stays one.
+    #[test]
+    fn a_promoted_proof_over_a_frame_waits_for_the_provers_place() {
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let mc = global_collector();
+        let first = epoch_proof_of_len(1, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, first.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let other = epoch_proof_of_len(2, budget + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, other.clone(), Provenance::Other, b"o"),
+            SubmitOutcome::Accepted,
+            "another sender's proof over a frame's seal budget, held beside a prover's"
+        );
+        for peer in [&b"o"[..], b"b"] {
+            assert_eq!(
+                mc.add_message_outcome_by(1, other.clone(), Provenance::Prover, peer),
+                SubmitOutcome::Filtered(Refusal::RankFull),
+                "SEAL-SEAT-PROMOTED: a prover's copy from {peer:?} moved a second proof over a frame's seal budget into the provers' share"
+            );
+        }
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!((held.prover.0, held.other.0), (1, 1));
+        mc.remove(&[first]);
+        assert_eq!(
+            mc.add_message_outcome_by(1, other, Provenance::Prover, b"o"),
+            SubmitOutcome::Duplicate,
+            "SEAL-SEAT-PROMOTED-FREED: the sender's own prover copy was refused after the provers' place freed"
+        );
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!((held.prover.0, held.other.0), (1, 0));
+    }
+
+    /// A proof of a proposal's seal share is held and rides a proposal at a
+    /// leader's message cap (12 MiB); one a byte larger is refused for good.
+    #[test]
+    fn a_proof_of_a_proposals_seal_share_is_held_and_one_byte_more_is_not() {
+        let mc = global_collector();
+        let at = epoch_proof_of_len(1, SEAL_BYTES_PER_PROPOSAL);
+        assert_eq!(
+            mc.add_message_outcome_by(1, at.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-SHARE-EDGE: a proof of a proposal's seal share was refused"
+        );
+        let taken = mc
+            .snapshot_for_proposal(1, 12 << 20, 100_000, None, &[])
+            .unwrap();
+        assert!(
+            taken.iter().any(|(data, _)| *data == at),
+            "SEAL-SHARE-EDGE-CARRIED: a proposal left the held proof out"
+        );
+        let mc = global_collector();
+        let over = epoch_proof_of_len(2, SEAL_BYTES_PER_PROPOSAL + 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, over, Provenance::Prover, b"b"),
+            SubmitOutcome::Filtered(Refusal::UnsendableSeal),
+            "SEAL-SHARE-OVER: a proof a byte over a proposal's seal share was not refused for good"
+        );
+    }
+
+    /// A prover's copy of another sender's held storage epoch proof moves it
+    /// into the prover's own share: six other senders deliver a proof each,
+    /// and one prover's copies promote only as many as its share holds.
+    #[test]
+    fn a_promoted_proof_counts_toward_the_promoting_senders_share() {
+        let mc = global_collector();
+        let len = 650_000;
+        for id in 1..=6u32 {
+            assert_eq!(
+                mc.add_message_outcome_by(
+                    1,
+                    numbered_epoch_proof(id, len),
+                    Provenance::Other,
+                    &id.to_be_bytes()
+                ),
+                SubmitOutcome::Accepted,
+                "other sender {id}"
+            );
+        }
+        let promoted = (1..=6u32)
+            .filter(|&id| {
+                mc.add_message_outcome_by(
+                    1,
+                    numbered_epoch_proof(id, len),
+                    Provenance::Prover,
+                    b"p",
+                ) == SubmitOutcome::Duplicate
+            })
+            .count();
+        let share = SEAL_BYTES_PER_SENDER / numbered_epoch_proof(0, len).len();
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!(
+            (promoted, held.prover.0),
+            (share, share),
+            "SEAL-PROMOTE: one prover promoted {promoted} other senders' proofs, its share holds {share}"
+        );
+    }
+
+    /// A sender's prover copy of a proof it delivered as another sender's
+    /// moves it into the provers' share within its own share: the proof is
+    /// its own, so its seat is not another proof's.
+    #[test]
+    fn a_senders_own_prover_copy_promotes_its_held_proof() {
+        let mc = global_collector();
+        let proof = numbered_epoch_proof(1, 650_000);
+        assert_eq!(
+            mc.add_message_outcome_by(1, proof.clone(), Provenance::Other, b"p"),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome_by(1, proof, Provenance::Prover, b"p"),
+            SubmitOutcome::Duplicate,
+            "SEAL-OWN-COPY: a sender's prover copy of its own held proof was refused"
+        );
+        let held = Seals::held(&mc.buffers.read().unwrap());
+        assert_eq!(
+            (held.prover.0, held.other.0),
+            (1, 0),
+            "SEAL-OWN-COPY: the sender's own copy did not move to the provers' share"
+        );
+    }
+
+    /// A sender holds at most [`SEALS_PER_SENDER`] proofs, however small:
+    /// its next 100 KB proof is refused, and another sender's is held. Once
+    /// one of its proofs leaves, removed or carried by a finalized frame, it
+    /// is held one more.
+    #[test]
+    fn a_sender_holds_at_most_its_count_of_proofs() {
+        let mc = global_collector();
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let proof = |id: u8| seat_proof(id, id, 1500, true, id, 100_000);
+        let n = SEALS_PER_SENDER as u8;
+        assert!((SEALS_PER_SENDER + 1) * proof(1).len() <= SEAL_BYTES_PER_SENDER);
+        for id in 1..=n {
+            assert_eq!(by(proof(id), b"a"), SubmitOutcome::Accepted, "proof {id}");
+        }
+        assert_eq!(
+            by(proof(n + 1), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "SEAL-COUNT: a sender's proof past its count was held"
+        );
+        assert_eq!(
+            by(proof(n + 2), b"b"),
+            SubmitOutcome::Accepted,
+            "another sender's"
+        );
+        mc.remove(&[proof(1)]);
+        assert_eq!(
+            by(proof(n + 1), b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-RELEASE: a sender's proof left and its share stayed full"
+        );
+        mc.mark_finalized(&[proof(2)]);
+        assert_eq!(
+            by(proof(n + 3), b"a"),
+            SubmitOutcome::Accepted,
+            "SEAL-SENDER-RELEASE: a finalized frame carried a sender's proof and its share stayed full"
+        );
+        assert_eq!(
+            by(proof(n + 4), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "a sender's share full again"
+        );
+    }
+
+    /// A sender's share sums its proofs at every rank: its third 720 KB
+    /// proof, at a third rank, goes over it; another sender's is held.
+    #[test]
+    fn a_senders_share_sums_its_proofs_across_ranks() {
+        let mc = global_collector();
+        let by = |rank: u64, data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(rank, data, Provenance::Prover, peer)
+        };
+        let len = 720_000;
+        for rank in 1..=2u64 {
+            assert_eq!(
+                by(rank, seat_proof(rank as u8, 1, 1500, true, 1, len), b"a"),
+                SubmitOutcome::Accepted,
+                "rank {rank}"
+            );
+        }
+        let third = seat_proof(3, 1, 1500, true, 1, len);
+        assert!(3 * len > SEAL_BYTES_PER_SENDER && 2 * third.len() < SEAL_BYTES_PER_SENDER);
+        assert_eq!(
+            by(3, third.clone(), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "SEAL-SENDER-RANKS: a sender's proofs at other ranks were not counted toward its share"
+        );
+        assert_eq!(
+            by(3, third, b"b"),
+            SubmitOutcome::Accepted,
+            "another sender's"
+        );
+    }
+
+    /// One bundle of storage epoch proofs, each of another member from
+    /// `first` on with `seats` seats of no frames, bindings or STARK (about
+    /// 22 bytes a seat), as many as fit in `budget` bytes, with its seats.
+    fn many_seat_bundle(first: u32, seats: usize, budget: usize) -> (Vec<u8>, usize) {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let (mut requests, mut len) = (Vec::new(), 16);
+        for member in first.. {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&member.to_be_bytes());
+            let proof = StorageEpochProof {
+                member: id,
+                seats: (0..seats)
+                    .map(|shard| SeatProof {
+                        shard_filter: vec![shard as u8],
+                        epoch: 1500,
+                        seals: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                proof: Vec::new(),
+            };
+            let request = CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: proof.to_canonical_bytes(),
+            };
+            let request_len = 4 + request.to_canonical_bytes().unwrap().len();
+            if len + request_len > budget {
+                break;
+            }
+            len += request_len;
+            requests.push(Some(request));
+        }
+        let count = requests.len() * seats;
+        let bundle = CanonicalMessageBundle {
+            requests,
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        (bundle, count)
+    }
+
+    /// The seat lookups [`SenderSeals::of`] makes on this thread in `f`.
+    fn seat_lookups<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = SEAT_LOOKUPS.with(|n| n.get());
+        let out = f();
+        (out, SEAT_LOOKUPS.with(|n| n.get()) - before)
+    }
+
+    /// The work a held storage epoch proof's submit does under the buffers'
+    /// lock is bounded: a bundle of about 190k seats within a frame's seal
+    /// budget is refused for good before any seat lookup; a sender holding
+    /// nothing costs none, however many ranks hold proofs; one holding a
+    /// proof costs at most one proof's seats a rank it holds proofs at.
+    #[test]
+    fn a_held_proofs_seat_lookups_are_bounded() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::MAX_SEATS;
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let max_seats = MAX_SEATS as usize;
+        let mc = global_collector();
+        let by = |rank: u64, data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(rank, data, Provenance::Prover, peer)
+        };
+        let ranks = 40u64;
+        for rank in 1..=ranks {
+            assert_eq!(
+                by(
+                    rank,
+                    seat_proof(rank as u8, 1, 1500, true, 1, 1_000),
+                    &rank.to_be_bytes()
+                ),
+                SubmitOutcome::Accepted,
+                "rank {rank}"
+            );
+        }
+        assert_eq!(
+            by(1, seat_proof(200, 1, 1500, true, 2, 1_000), b"a"),
+            SubmitOutcome::Accepted
+        );
+        let (bundle, seats) = many_seat_bundle(0, max_seats, budget);
+        assert!(bundle.len() <= budget && seats > 180_000, "{seats} seats");
+        let (outcome, lookups) = seat_lookups(|| by(2, bundle, b"a"));
+        assert!(
+            lookups <= max_seats,
+            "SEAL-SEAT-WORK: a {seats}-seat bundle made {lookups} seat lookups under the buffers' lock"
+        );
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Filtered(Refusal::UnsendableSeal),
+            "a bundle proving more seats than one proof covers"
+        );
+        let (one, seats) = many_seat_bundle(1 << 20, max_seats, 7_000);
+        assert_eq!(seats, max_seats);
+        let (outcome, lookups) = seat_lookups(|| by(2, one, b"z"));
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert_eq!(
+            lookups,
+            0,
+            "SEAL-SEAT-WORK: a sender holding nothing made {lookups} seat lookups across {ranks} ranks"
+        );
+        let (other, _) = many_seat_bundle(2 << 20, max_seats, 7_000);
+        let (outcome, lookups) = seat_lookups(|| by(3, other, b"a"));
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert!(
+            lookups <= max_seats,
+            "SEAL-SEAT-WORK: a sender holding a proof at one rank made {lookups} seat lookups"
         );
     }
 
