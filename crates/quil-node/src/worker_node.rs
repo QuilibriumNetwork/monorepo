@@ -49,7 +49,8 @@ pub(crate) async fn start(
     quil_store::large_vertex_index::start(&db.inner(), format!("worker {core_id}"));
     crate::storage_watch::start(&config.db);
     // This process's store, once it stops writing, is reopened by a restart
-    // of the process once its disk has room again.
+    // of the process once its disk has room again, or five minutes after a
+    // corrupt block (storage_watch::exit_when_store_reopenable).
     sup.run_until_cancelled("store-reopen", move |_token| {
         crate::storage_watch::exit_when_store_reopenable(quil_forest::StoreRole::Worker(core_id))
     });

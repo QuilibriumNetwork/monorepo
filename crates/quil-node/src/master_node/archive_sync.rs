@@ -1018,13 +1018,7 @@ async fn run_record_only_backfill(
                         frame = parent_num,
                         "record-only backfill: local candidate failed validation — skipping",
                     );
-                } else if let Err(e) = clock_store.put_global_frame(&parent, None) {
-                    warn!(
-                        error = %e,
-                        frame = parent_num,
-                        "record-only backfill: local candidate promote store failed",
-                    );
-                } else {
+                } else if put_backfill_frame(&clock_store, BACKFILL_PROMOTE, parent_num, &parent) {
                     promoted_local += 1;
                 }
             }
@@ -1122,12 +1116,11 @@ async fn run_record_only_backfill(
                     }
                     // RECORD-ONLY: store the clock-store record, never the
                     // execution side effects.
-                    if let Err(e) = clock_store.put_global_frame(&frame, None) {
-                        warn!(error = %e, frame = n, "record-only backfill: store failed");
+                    if put_backfill_frame(&clock_store, BACKFILL_STORE, n, &frame) {
+                        filled += 1;
+                    } else {
                         store_failed += 1;
                         still.push(n);
-                    } else {
-                        filled += 1;
                     }
                 }
                 Ok(Err(e)) => {
@@ -5776,9 +5769,72 @@ mod bootstrap_sync_tests {
     }
 }
 
+/// The duty of promoting a held local candidate to the canonical record.
+const BACKFILL_PROMOTE: &str = "record-only backfill: local candidate promote store";
+/// The duty of storing a fetched record-only backfill frame.
+const BACKFILL_STORE: &str = "record-only backfill: store";
+
+/// Write a backfilled hole's record canonically for `duty`, its outcome
+/// logged bounded: a store that refuses writes fails every hole of every
+/// round. Each failed hole stays a hole and is retried, so the condition
+/// ends at the write of its highest failed frame.
+fn put_backfill_frame(
+    clock_store: &quil_store::RocksClockStore,
+    duty: &'static str,
+    number: u64,
+    frame: &quil_types::proto::global::GlobalFrame,
+) -> bool {
+    let stored = clock_store.put_global_frame(frame, None);
+    quil_engine::bounded_warn::note_retry(duty, number, stored.as_ref().err());
+    stored.is_ok()
+}
+
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+
+    /// A store that refuses writes fails every backfilled hole of every
+    /// round: each backfill duty logs one line for 50 refused holes, and the
+    /// write of the highest failed hole ends it.
+    #[test]
+    fn a_store_refusing_writes_warns_once_per_backfill_duty() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let logs = crate::util::log_capture::Capture::default();
+        let _logs = logs.install();
+        let frame = |number: u64| GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![number as u8; 32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        db.inner().refuse_writes(
+            "Corruption: block checksum mismatch: stored = 0, computed = 1, type = 4 in 000001.sst",
+        );
+        let healthy_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let healthy = quil_store::RocksClockStore::new(healthy_db.inner());
+        for duty in [BACKFILL_PROMOTE, BACKFILL_STORE] {
+            for number in (10..60u64).rev() {
+                assert!(
+                    !put_backfill_frame(&clock, duty, number, &frame(number)),
+                    "premise: {duty}: frame {number} refused"
+                );
+            }
+            let started = logs.lines_with(&format!("{duty} failed; retrying"));
+            assert_eq!(started.len(), 1, "backfill_store_spew: {duty}: {started:?}");
+            assert_eq!(
+                quil_engine::bounded_warn::failing_attempts(duty),
+                Some(50),
+                "backfill_store_unbounded: {duty}"
+            );
+            assert!(put_backfill_frame(&healthy, duty, 59, &frame(59)));
+            let ended = logs.lines_with(&format!("{duty} succeeded after failures"));
+            assert_eq!(ended.len(), 1, "backfill_store_end_missing: {duty}");
+        }
+    }
     use std::collections::HashSet;
 
     /// Accepts every GLOBAL VDF: the checks after it are under test.
