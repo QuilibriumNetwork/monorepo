@@ -7,9 +7,14 @@
 //! The seal's job notes what refused it or that it sent the seal part
 //! ([`note_refusal`], [`note_published`]), the label store what disk it
 //! lacked ([`note_disk_short`]); the seat's engine notes each GLOBAL
-//! frame it checks ([`note_frame`]) and concludes the epoch once, at its
-//! first frame ([`conclude`]). Notes live in the process: one started
-//! after the seal's send window opened says so instead of guessing.
+//! frame it checks ([`note_frame`]) and concludes the epoch once
+//! ([`due`], [`conclude`]): at once for a sealed registration, else
+//! [`CONCLUDE_HOLD_FRAMES`] frames into the epoch or into a run begun
+//! later, re-reading the slot on each frame checked, as a seal sent late
+//! in the window reaches this node's view only with a later registry
+//! pull. Notes live in the
+//! process: one started after the seal's send window opened says so
+//! instead of guessing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -135,7 +140,30 @@ impl Outcome {
 pub struct SlotView {
     pub sealed_at: Option<u64>,
     pub has_leaves: bool,
+    /// The frame the seat registered at. A seal is sent only past the
+    /// next, so a run watching from the next saw every send.
+    pub registered_at: u64,
 }
+
+impl SlotView {
+    fn sealed(slot: Option<&Self>) -> bool {
+        slot.is_some_and(|slot| slot.has_leaves && slot.sealed_at.is_some())
+    }
+}
+
+/// GLOBAL frames past an epoch's first that a registration not sealed in
+/// this node's view waits before it is concluded. The view is the prover
+/// tree pulled from an archive every 300 s, and a pull begins only once
+/// the epoch's first frame has a successor: a seal GLOBAL took in the
+/// window's last frames shows only that late (up to 22 frames measured
+/// at 18.9 s a frame). Ends when the seat's engine checks a frame at or
+/// past the epoch's first plus this, or past the first frame this process
+/// checked plus this when later: a run begun in an epoch's last such
+/// frames logs no line for it.
+pub const CONCLUDE_HOLD_FRAMES: u64 = 32;
+
+/// The most of a refusal's error a line carries.
+const ERROR_CHARS: usize = 200;
 
 /// One seat's seal for one epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,7 +235,7 @@ impl fmt::Display for SealLine {
 /// Kept for the last [`KEPT_EPOCHS`] epochs.
 #[derive(Default)]
 pub struct Notes {
-    refusals: BTreeMap<(Vec<u8>, u64), (u32, String)>,
+    refusals: BTreeMap<(Vec<u8>, u64), (u32, Reason, String)>,
     disk: BTreeMap<u64, (u64, Option<u64>)>,
     published: BTreeSet<(Vec<u8>, u64)>,
     concluded: BTreeSet<(Vec<u8>, u64)>,
@@ -217,10 +245,20 @@ pub struct Notes {
 const KEPT_EPOCHS: u64 = 4;
 
 impl Notes {
+    /// Classified on the whole error; kept to [`ERROR_CHARS`] characters.
     pub fn note_refusal(&mut self, filter: &[u8], epoch: u64, error: &str) {
-        let entry = self.refusals.entry((filter.to_vec(), epoch)).or_default();
+        let kept = error
+            .char_indices()
+            .nth(ERROR_CHARS)
+            .map_or(error, |(at, _)| &error[..at]);
+        let entry = self.refusals.entry((filter.to_vec(), epoch)).or_insert((
+            0,
+            Reason::Other,
+            String::new(),
+        ));
         entry.0 = entry.0.saturating_add(1);
-        entry.1 = error.to_string();
+        entry.1 = Reason::classify(error);
+        entry.2 = kept.to_string();
     }
 
     pub fn note_disk_short(&mut self, epoch: u64, needed: u64, free: Option<u64>) {
@@ -237,22 +275,46 @@ impl Notes {
         self.watching_from.get_or_insert(frame);
     }
 
-    /// The line for `filter`'s seat in `epoch`, once; `slot` is GLOBAL's
-    /// registration, `window` the frames the seal is sent in (it ends at
-    /// the epoch's first frame), `unprovable` whether this process found
-    /// the registration cannot be sealed.
+    /// Whether `filter`'s seat in `epoch` concludes at GLOBAL `frame`: not
+    /// yet concluded, and its registration `slot` sealed in this node's
+    /// view or the hold over: [`CONCLUDE_HOLD_FRAMES`] past `window_end`,
+    /// the epoch's first frame, or past the first frame this process
+    /// checked when later, as a run begun then may hold an older view.
+    pub fn due(
+        &self,
+        filter: &[u8],
+        epoch: u64,
+        window_end: u64,
+        frame: u64,
+        slot: Option<&SlotView>,
+    ) -> bool {
+        let from = self
+            .watching_from
+            .map_or(window_end, |from| from.max(window_end));
+        !self.concluded.contains(&(filter.to_vec(), epoch))
+            && (SlotView::sealed(slot) || frame >= from.saturating_add(CONCLUDE_HOLD_FRAMES))
+    }
+
+    /// The line for `filter`'s seat in `epoch`, once, when [`Self::due`] at
+    /// GLOBAL `frame`; `slot` is GLOBAL's registration, `window` the frames
+    /// the seal is sent in (it ends at the epoch's first frame),
+    /// `unprovable` whether this process found the registration cannot be
+    /// sealed. Not due, the notes are kept for a later frame.
+    #[allow(clippy::too_many_arguments)] // each a distinct input of the one line
     pub fn conclude(
         &mut self,
         filter: &[u8],
         epoch: u64,
         window: std::ops::Range<u64>,
+        frame: u64,
         slot: Option<SlotView>,
         held: bool,
         unprovable: bool,
     ) -> Option<SealLine> {
-        if !self.concluded.insert((filter.to_vec(), epoch)) {
+        if !self.due(filter, epoch, window.end, frame, slot.as_ref()) {
             return None;
         }
+        self.concluded.insert((filter.to_vec(), epoch));
         let floor = epoch.saturating_sub(KEPT_EPOCHS);
         self.concluded.retain(|(_, e)| *e >= floor);
         self.disk.retain(|e, _| *e >= floor);
@@ -260,17 +322,20 @@ impl Notes {
         self.refusals.retain(|(_, e), _| *e >= floor);
         let published = self.published.remove(&(filter.to_vec(), epoch));
         self.published.retain(|(_, e)| *e >= floor);
-        // Begun after the window opened, this process may have missed a
-        // send by the one before it.
-        let restarted = self.watching_from.is_none_or(|from| from > window.start);
-        let disk = self.disk.get(&epoch).copied();
         let registered = slot.filter(|slot| slot.has_leaves);
+        // Begun after the first frame a seal could be sent in, this process
+        // may have missed a send by the one before it.
+        let first_send = registered.map_or(window.start, |slot| {
+            window.start.max(slot.registered_at.saturating_add(1))
+        });
+        let restarted = self.watching_from.is_none_or(|from| from > first_send);
+        let disk = self.disk.get(&epoch).copied();
         let sealed_at = registered.and_then(|slot| slot.sealed_at);
         let (outcome, reason) = match (registered, sealed_at, &refused) {
             (Some(_), Some(at), _) if at < window.end => (Outcome::Sealed, None),
             (Some(_), Some(_), _) => (Outcome::Sealed, Some(Reason::SealedLate)),
             (Some(_), None, _) if published => (Outcome::Sent, Some(Reason::Undelivered)),
-            (_, _, Some((_, error))) => (Outcome::Refused, Some(Reason::classify(error))),
+            (_, _, Some((_, reason, _))) => (Outcome::Refused, Some(*reason)),
             (Some(_), None, None) if unprovable => {
                 (Outcome::NotAttempted, Some(Reason::LabelNotRetained))
             }
@@ -285,8 +350,8 @@ impl Notes {
             filter: filter.to_vec(),
             outcome,
             reason,
-            refusals: refused.as_ref().map_or(0, |(n, _)| *n),
-            error: refused.map(|(_, error)| error),
+            refusals: refused.as_ref().map_or(0, |(n, _, _)| *n),
+            error: refused.map(|(_, _, error)| error),
             needed_bytes: disk.map(|(needed, _)| needed),
             free_bytes: disk.and_then(|(_, free)| free),
             sealed_at,
@@ -326,12 +391,27 @@ pub fn note_frame(frame: u64) {
     notes().note_frame(frame);
 }
 
-/// Log, once per seat and epoch, how the seat's seal for `epoch` ended.
-/// A seal for `epoch` is sent while its previous epoch runs.
-pub fn conclude(filter: &[u8], epoch: u64, slot: Option<SlotView>, held: bool, unprovable: bool) {
+/// Whether `filter`'s seat concludes its seal for `epoch` at GLOBAL
+/// `frame` ([`Notes::due`]); checked before the work [`conclude`] needs.
+pub fn due(filter: &[u8], epoch: u64, frame: u64, slot: Option<&SlotView>) -> bool {
+    let window_end = quil_types::consensus::epoch_start_frame(epoch);
+    notes().due(filter, epoch, window_end, frame, slot)
+}
+
+/// Log, once per seat and epoch, how the seat's seal for `epoch` ended,
+/// when due at GLOBAL `frame`. A seal for `epoch` is sent while its
+/// previous epoch runs.
+pub fn conclude(
+    filter: &[u8],
+    epoch: u64,
+    frame: u64,
+    slot: Option<SlotView>,
+    held: bool,
+    unprovable: bool,
+) {
     use quil_types::consensus::epoch_start_frame;
     let window = epoch_start_frame(epoch.saturating_sub(1))..epoch_start_frame(epoch);
-    let Some(line) = notes().conclude(filter, epoch, window, slot, held, unprovable) else {
+    let Some(line) = notes().conclude(filter, epoch, window, frame, slot, held, unprovable) else {
         return;
     };
     let (outcome, reason) = (
@@ -351,6 +431,10 @@ pub fn conclude(filter: &[u8], epoch: u64, slot: Option<SlotView>, held: bool, u
 mod tests {
     use super::*;
 
+    /// The first frame an unsealed seat of epoch 7 (window 600..700) is
+    /// concluded at.
+    const HOLD_END: u64 = 700 + CONCLUDE_HOLD_FRAMES;
+
     const DISK: &str = "persistent sector: a new sector's labels not admitted to certify it: too \
                         little free disk space, or the sector labelled already by another task";
 
@@ -363,9 +447,10 @@ mod tests {
         let slot = SlotView {
             sealed_at: None,
             has_leaves: true,
+            registered_at: 0,
         };
         let line = notes
-            .conclude(&[0xab], 7, 600..700, Some(slot), true, false)
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(slot), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -381,7 +466,7 @@ mod tests {
             )
         );
         assert_eq!(
-            notes.conclude(&[0xab], 7, 600..700, Some(slot), true, false),
+            notes.conclude(&[0xab], 7, 600..700, HOLD_END, Some(slot), true, false),
             None,
             "once"
         );
@@ -422,9 +507,10 @@ mod tests {
         let sealed = SlotView {
             sealed_at: Some(699),
             has_leaves: true,
+            registered_at: 0,
         };
         let line = notes
-            .conclude(&[1], 7, 600..700, Some(sealed), true, false)
+            .conclude(&[1], 7, 600..700, HOLD_END, Some(sealed), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason, line.warns()),
@@ -436,21 +522,21 @@ mod tests {
             ..sealed
         };
         let line = notes
-            .conclude(&[2], 7, 600..700, Some(late), true, false)
+            .conclude(&[2], 7, 600..700, HOLD_END, Some(late), true, false)
             .unwrap();
         assert_eq!(
             (line.reason, line.warns()),
             (Some(Reason::SealedLate), true)
         );
         let line = notes
-            .conclude(&[3], 7, 600..700, None, false, false)
+            .conclude(&[3], 7, 600..700, HOLD_END, None, false, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason, line.warns()),
             (Outcome::NotAttempted, Some(Reason::NotRegistered), false)
         );
         let line = notes
-            .conclude(&[4], 7, 600..700, None, true, false)
+            .conclude(&[4], 7, 600..700, HOLD_END, None, true, false)
             .unwrap();
         assert!(line.warns(), "a held seat with no registration warns");
         println!("seal-report reached: {line}");
@@ -459,6 +545,7 @@ mod tests {
     const UNSEALED: SlotView = SlotView {
         sealed_at: None,
         has_leaves: true,
+        registered_at: 0,
     };
 
     #[test]
@@ -467,7 +554,7 @@ mod tests {
         notes.note_frame(550);
         notes.note_published(&[0xab], 7);
         let line = notes
-            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -488,7 +575,7 @@ mod tests {
         notes.note_refusal(&[0xcd], 7, "sector initialization slots are occupied");
         notes.note_published(&[0xcd], 7);
         let line = notes
-            .conclude(&[0xcd], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xcd], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason, line.refusals),
@@ -496,7 +583,7 @@ mod tests {
         );
         // Watched from before the window opened and never sent.
         let line = notes
-            .conclude(&[0xef], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xef], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -507,11 +594,13 @@ mod tests {
 
     #[test]
     fn a_run_begun_after_the_send_window_opened_concludes_unknown() {
-        // Begun after the epoch began, as at a restart 367 frames in.
+        // Begun after the epoch began, as at a restart 67 frames in: held
+        // from its first frame.
+        let after = 767 + CONCLUDE_HOLD_FRAMES;
         let mut restarted = Notes::default();
         restarted.note_frame(767);
         let line = restarted
-            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xab], 7, 600..700, after, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -531,13 +620,13 @@ mod tests {
         let mut midway = Notes::default();
         midway.note_frame(650);
         let line = midway
-            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(line.outcome, Outcome::Unknown);
         // What this run itself saw still names its reason.
         restarted.note_refusal(&[0xcd], 7, "sector initialization slots are occupied");
         let line = restarted
-            .conclude(&[0xcd], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xcd], 7, 600..700, after, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
@@ -547,12 +636,156 @@ mod tests {
         let mut whole = Notes::default();
         whole.note_frame(600);
         let line = whole
-            .conclude(&[0xab], 7, 600..700, Some(UNSEALED), true, false)
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
             .unwrap();
         assert_eq!(
             (line.outcome, line.reason),
             (Outcome::NotAttempted, Some(Reason::Other))
         );
         println!("seal-report reached: {line}");
+    }
+
+    /// A seal GLOBAL took in the window's last frames reaches this node's
+    /// view a registry pull later: the seat is not concluded unsealed
+    /// before the hold ends, and a seal seen meanwhile concludes it sealed.
+    #[test]
+    fn an_unsealed_seat_is_not_concluded_before_the_hold_ends() {
+        let mut notes = Notes::default();
+        notes.note_frame(550);
+        notes.note_published(&[0xab], 7);
+        for frame in [700, HOLD_END - 1] {
+            assert_eq!(
+                notes.conclude(&[0xab], 7, 600..700, frame, Some(UNSEALED), true, false),
+                None,
+                "an unsealed seat is not concluded before the view can reach the epoch"
+            );
+        }
+        let sealed = SlotView {
+            sealed_at: Some(699),
+            ..UNSEALED
+        };
+        assert!(notes.due(&[0xab], 7, 700, 705, Some(&sealed)));
+        let line = notes
+            .conclude(&[0xab], 7, 600..700, 705, Some(sealed), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason, line.warns()),
+            (Outcome::Sealed, None, false)
+        );
+        assert!(!notes.due(&[0xab], 7, 700, HOLD_END, Some(&sealed)), "once");
+        println!("seal-report reached: {line}");
+    }
+
+    /// A run begun past the hold, as at a restart across the epoch's
+    /// first frame, may hold a view pulled before the epoch: its unsealed
+    /// seat is held from the first frame it checked, a sealed one not.
+    #[test]
+    fn a_run_begun_past_the_hold_holds_from_its_first_frame() {
+        let begun = HOLD_END + 8;
+        let mut notes = Notes::default();
+        notes.note_frame(begun);
+        for frame in [begun, begun + CONCLUDE_HOLD_FRAMES - 1] {
+            assert_eq!(
+                notes.conclude(&[0xab], 7, 600..700, frame, Some(UNSEALED), true, false),
+                None,
+                "a run begun past the hold waits for its view to reach the epoch"
+            );
+        }
+        let sealed = SlotView {
+            sealed_at: Some(699),
+            ..UNSEALED
+        };
+        assert!(notes.due(&[0xab], 7, 700, begun, Some(&sealed)));
+        let end = begun + CONCLUDE_HOLD_FRAMES;
+        let line = notes.conclude(&[0xab], 7, 600..700, end, Some(UNSEALED), true, false);
+        assert!(
+            line.is_some(),
+            "a run begun past the hold concludes once held from its first frame"
+        );
+        let line = line.unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::Unknown, Some(Reason::Restarted))
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    /// The hold ends: a seat still unsealed is concluded with what this
+    /// process noted during it, once.
+    #[test]
+    fn an_unsealed_seat_concludes_when_the_hold_ends() {
+        let mut notes = Notes::default();
+        notes.note_frame(550);
+        notes.note_refusal(&[0xab], 7, "sector initialization slots are occupied");
+        notes.note_published(&[0xab], 7);
+        let slot = Some(UNSEALED);
+        let line = notes.conclude(&[0xab], 7, 600..700, HOLD_END - 1, slot, true, false);
+        assert_eq!(line, None);
+        let line = notes.conclude(&[0xab], 7, 600..700, HOLD_END, slot, true, false);
+        assert!(
+            line.is_some(),
+            "a seat still unsealed when the hold ends is concluded"
+        );
+        let line = line.unwrap();
+        assert_eq!(
+            (line.outcome, line.reason, line.refusals),
+            (Outcome::Sent, Some(Reason::Undelivered), 1)
+        );
+        assert!(line.warns());
+        let again = notes.conclude(&[0xab], 7, 600..700, HOLD_END + 1, slot, true, false);
+        assert_eq!(again, None, "once");
+        println!("seal-report reached: {line}");
+    }
+
+    /// No seal is sent before the frame after the seat registered: a run
+    /// begun by then saw every send.
+    #[test]
+    fn a_run_begun_by_the_first_send_frame_saw_every_send() {
+        let slot = SlotView {
+            registered_at: 640,
+            ..UNSEALED
+        };
+        let mut first = Notes::default();
+        first.note_frame(641);
+        let line = first
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(slot), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::NotAttempted, Some(Reason::Other)),
+            "a run begun at the first send frame saw every send"
+        );
+        let mut later = Notes::default();
+        later.note_frame(642);
+        let line = later
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(slot), true, false)
+            .unwrap();
+        assert_eq!(
+            (line.outcome, line.reason),
+            (Outcome::Unknown, Some(Reason::Restarted))
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    /// A refusal's error is kept to a bounded length, cut on a character
+    /// boundary, and classified on the whole text.
+    #[test]
+    fn a_long_refusal_error_is_cut_and_still_classified() {
+        let long = format!("{}: {DISK}", "\u{e9}".repeat(5_000));
+        let mut notes = Notes::default();
+        notes.note_frame(550);
+        notes.note_refusal(&[0xab], 7, &long);
+        let line = notes
+            .conclude(&[0xab], 7, 600..700, HOLD_END, Some(UNSEALED), true, false)
+            .unwrap();
+        assert_eq!(line.reason, Some(Reason::DiskShort));
+        let error = line.error.clone().unwrap();
+        assert!(
+            error.chars().count() <= ERROR_CHARS && line.to_string().len() < 1_000,
+            "a refusal's error is kept to {ERROR_CHARS} characters: {} kept",
+            error.chars().count()
+        );
+        assert!(error.chars().all(|c| c == '\u{e9}'));
+        println!("seal-report reached: {} chars kept", error.chars().count());
     }
 }

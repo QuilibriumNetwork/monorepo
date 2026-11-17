@@ -4118,27 +4118,34 @@ impl StorageEpochCheck {
                 .ok()
                 .flatten()
         };
-        // How the seal of the epoch just begun ended, once per seat.
+        // How the seal of the epoch just begun ended, once per seat: at once
+        // when sealed, else once the view has had time to show a late seal
+        // (`seal_report::CONCLUDE_HOLD_FRAMES`).
         if hash_storage_proofs_at(current) {
             let ended = slot(current);
-            crate::seal_report::conclude(
-                shard,
-                current,
-                ended.as_ref().map(|slot| crate::seal_report::SlotView {
-                    sealed_at: slot.sealed_at,
-                    has_leaves: !slot.leaves.is_empty(),
-                }),
-                own_seat,
-                ended.as_ref().is_some_and(|slot| {
-                    crate::storage_epoch_batch::seal_unprovable(
-                        &member,
-                        shard,
-                        current.saturating_sub(2),
-                        slot.registered_at,
-                        &slot.leaves,
-                    )
-                }),
-            );
+            let view = ended.as_ref().map(|slot| crate::seal_report::SlotView {
+                sealed_at: slot.sealed_at,
+                has_leaves: !slot.leaves.is_empty(),
+                registered_at: slot.registered_at,
+            });
+            if crate::seal_report::due(shard, current, global_frame_number, view.as_ref()) {
+                crate::seal_report::conclude(
+                    shard,
+                    current,
+                    global_frame_number,
+                    view,
+                    own_seat,
+                    ended.as_ref().is_some_and(|slot| {
+                        crate::storage_epoch_batch::seal_unprovable(
+                            &member,
+                            shard,
+                            current.saturating_sub(2),
+                            slot.registered_at,
+                            &slot.leaves,
+                        )
+                    }),
+                );
+            }
         }
         // A registration this process found it cannot seal (its column
         // commitment is another labelling's) is not tried again: the
@@ -23052,6 +23059,61 @@ mod tests {
             !announced.iter().any(|key| key.filter == elsewhere),
             "a seat encoded from another shard's data was sealed here: {announced:?}"
         );
+    }
+
+    /// A seat's registration unsealed in this node's view at its epoch's
+    /// first frame is concluded only once the hold ends
+    /// (`seal_report::CONCLUDE_HOLD_FRAMES`), when a seal GLOBAL took late
+    /// in the window has had time to reach the view.
+    #[tokio::test]
+    async fn an_unsealed_seat_logs_its_seal_line_when_the_hold_ends() {
+        use quil_types::consensus::{epoch_start_frame, StorageSeatSlot};
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let current = 7;
+        let start = epoch_start_frame(current);
+        registry.set_storage_seat_slot(
+            &[1; 32],
+            &engine.filter,
+            StorageSeatSlot {
+                epoch: current,
+                leaves: vec![vec![0]],
+                registered_at: epoch_start_frame(current - 1) + 5,
+                sealed_at: None,
+                frames: 0,
+                accumulator: [0; 32],
+                chained: Vec::new(),
+                open: true,
+            },
+        );
+        let seal_lines = || {
+            String::from_utf8_lossy(&logs.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains("seal=epoch=7 "))
+                .count()
+        };
+        engine.prove_storage_epoch_if_due(start);
+        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES - 1);
+        let held = seal_lines();
+        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES);
+        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES + 1);
+        let ended = seal_lines();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            held, 0,
+            "an unsealed seat is not concluded before the view can reach the epoch"
+        );
+        assert_eq!(
+            ended, 1,
+            "a seat still unsealed when the hold ends is concluded"
+        );
+        println!("seal-report reached: app engine concluded at the hold's end");
     }
 
     /// A panic preparing a part is an error, so the part is withdrawn.
