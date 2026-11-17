@@ -2186,7 +2186,7 @@ pub(crate) fn quil_str(sub: u128) -> String {
 
 /// Big-endian bytes → u128, saturating if the value exceeds 128 bits (reward
 /// balances are stored as 32-byte BE `FillBytes`; realistic values fit u128).
-fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
+pub(crate) fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
     let start = bytes.len().saturating_sub(16);
     if bytes[..start].iter().any(|&b| b != 0) {
         return u128::MAX;
@@ -2199,7 +2199,7 @@ fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
 }
 
 /// The reserved (non-coin) vertex addresses under the token domain.
-fn is_reserved_token_addr(addr: &[u8]) -> bool {
+pub(crate) fn is_reserved_token_addr(addr: &[u8]) -> bool {
     use quil_execution::token_intrinsic::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
     use quil_execution::token_intrinsic::legacy_migration::MIGRATION_RECEIPT_ADDRESS;
     addr == MIGRATION_RECEIPT_ADDRESS.as_slice()
@@ -2327,6 +2327,24 @@ struct SupplyLive {
     scanned: usize,
 }
 
+impl From<crate::supply_index::SupplyCounts> for SupplyLive {
+    fn from(counts: crate::supply_index::SupplyCounts) -> Self {
+        let total = counts
+            .transparent_subunits
+            .saturating_add(counts.reward_subunits);
+        Self {
+            transparent_coins: counts.transparent_coins,
+            transparent_subunits: counts.transparent_subunits.to_string(),
+            reward_provers: counts.reward_provers,
+            reward_subunits: counts.reward_subunits.to_string(),
+            total_public_subunits: total.to_string(),
+            total_public_quil: quil_str(total),
+            value_hidden_coins: counts.value_hidden_coins,
+            scanned: counts.scanned,
+        }
+    }
+}
+
 pub async fn handle_token_supply(
     method: Method,
     State(state): State<ExplorerState>,
@@ -2338,8 +2356,8 @@ pub async fn handle_token_supply(
     let domain = quil_execution::domains::QUIL_TOKEN;
     let units = quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS;
 
-    // The `?scan=1` path is O(all coins) — serve a cached result (short TTL) so
-    // the full scan runs at most once per window, not per request.
+    // Keep the existing response cache and full-scan fallback. An archive with
+    // a ready supply index reads its running summary instead.
     let want_scan = params
         .get("scan")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2349,7 +2367,12 @@ pub async fn handle_token_supply(
             return build_response(StatusCode::OK, body, Some(CACHE_60));
         }
     }
-    let _scanning = if want_scan {
+    let indexed = if want_scan {
+        state.supply_index.as_ref().and_then(|index| index.read())
+    } else {
+        None
+    };
+    let _scanning = if want_scan && indexed.is_none() {
         let Ok(permit) = state.token_scan.try_acquire() else {
             return token_scan_busy();
         };
@@ -2378,7 +2401,9 @@ pub async fn handle_token_supply(
     // Optional (expensive) live PUBLIC-supply scan: transparent coins (QUIL_TOKEN
     // domain) + earned reward balances (GLOBAL intrinsic domain). Only shielded
     // (lattice) coins are value-hidden and left uncounted.
-    let live_public = if want_scan {
+    let live_public = if let Some(counts) = indexed {
+        Some(counts.into())
+    } else if want_scan {
         let transparent =
             quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
         let private = quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).ok();
@@ -3290,6 +3315,41 @@ mod tests {
             1,
             "a finished scan returns its permit"
         );
+    }
+
+    #[tokio::test]
+    async fn indexed_supply_does_not_take_full_scan_permit() {
+        let mut state = empty_state();
+        state.supply_index = Some(crate::supply_index::SupplyIndex::ready_for_test(
+            crate::supply_index::SupplyCounts::default(),
+        ));
+        let _held = state.token_scan.clone().try_acquire_owned().unwrap();
+        let response = handle_token_supply(
+            Method::GET,
+            State(state),
+            Query(HashMap::from([("scan".to_string(), "1".to_string())])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn indexed_supply_keeps_existing_response_shape() {
+        let scan = HashMap::from([("scan".to_string(), "1".to_string())]);
+        let old = handle_token_supply(Method::GET, State(empty_state()), Query(scan.clone())).await;
+        let mut indexed_state = empty_state();
+        indexed_state.supply_index = Some(crate::supply_index::SupplyIndex::ready_for_test(
+            crate::supply_index::SupplyCounts::default(),
+        ));
+        let indexed = handle_token_supply(Method::GET, State(indexed_state), Query(scan)).await;
+        assert_eq!(old.status(), indexed.status());
+        let old_body = axum::body::to_bytes(old.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let indexed_body = axum::body::to_bytes(indexed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(old_body, indexed_body);
     }
 
     /// An explorer over an empty in-memory store.

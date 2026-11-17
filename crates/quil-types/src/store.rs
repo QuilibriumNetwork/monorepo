@@ -38,6 +38,10 @@ pub struct RecordMutation {
 /// notifications are permitted: consumers must validate/rebuild their caches.
 pub trait LocalVertexCommitObserver: Send + Sync {
     fn committed<'a>(&self, vertices: &mut dyn std::iter::Iterator<Item = (&'a [u8], &'a [u8])>);
+    fn watches_sync(&self, _app: &[u8]) -> bool {
+        false
+    }
+    fn invalidated(&self) {}
 }
 
 /// A database's open point-in-time snapshots. Each keeps every key version
@@ -1309,6 +1313,14 @@ pub trait HypergraphStore: Send + Sync {
         shard_key: &ShardKey,
         callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<usize>;
+
+    /// Read candidate application domains from vertex-adds tree roots,
+    /// without walking their vertex data.
+    fn range_vertex_adds_domains(&self) -> Result<Vec<[u8; 32]>> {
+        Err(QuilError::Store(
+            "vertex-adds shard enumeration is unsupported by this backend".into(),
+        ))
+    }
 
     /// Enumerate only vertices accepted by `matches`, with the same newest-version
     /// and legacy precedence as `for_each_vertex_underlying`. Returns the number

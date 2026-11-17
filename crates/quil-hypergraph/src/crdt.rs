@@ -823,6 +823,37 @@ pub type LineageRecord = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
 /// before (`None`: absent).
 type SizePreImages = HashMap<Vec<u8>, Option<(u64, i128)>>;
 
+struct ChainedLocalVertexObserver {
+    first: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    second: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+}
+
+impl quil_types::store::LocalVertexCommitObserver for ChainedLocalVertexObserver {
+    fn committed<'a>(&self, vertices: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {
+        let mut consumed = Vec::new();
+        let mut first = (&mut *vertices).inspect(|vertex| consumed.push(*vertex));
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.first.committed(&mut first)
+        }))
+        .is_err()
+        {
+            tracing::warn!("first local vertex observer panicked after durable commit");
+        }
+        drop(first);
+        self.second
+            .committed(&mut consumed.into_iter().chain(vertices));
+    }
+
+    fn watches_sync(&self, app: &[u8]) -> bool {
+        self.first.watches_sync(app) || self.second.watches_sync(app)
+    }
+
+    fn invalidated(&self) {
+        self.first.invalidated();
+        self.second.invalidated();
+    }
+}
+
 /// The forest-native hypergraph CRDT.
 pub struct HypergraphCrdt {
     /// Key-value store: per-vertex blobs, the shard-commit cache, the cursor.
@@ -1111,6 +1142,34 @@ impl HypergraphCrdt {
         observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
     ) {
         *self.local_vertex_observer.write().unwrap() = Some(observer);
+    }
+
+    /// Add a local cache observer without replacing the existing witness
+    /// observer. The first observer may consume only a prefix of the stream;
+    /// the second still receives every committed vertex.
+    pub fn add_local_vertex_observer(
+        &self,
+        observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    ) {
+        let mut slot = self.local_vertex_observer.write().unwrap();
+        let previous = slot.take();
+        *slot = Some(match previous {
+            Some(first) => Arc::new(ChainedLocalVertexObserver {
+                first,
+                second: observer,
+            }),
+            None => observer,
+        });
+    }
+
+    fn invalidate_local_observer_after_sync(&self, app: &[u8], phase: usize) {
+        if phase == 0 {
+            if let Some(observer) = self.local_vertex_observer.read().unwrap().as_ref() {
+                if observer.watches_sync(app) {
+                    observer.invalidated();
+                }
+            }
+        }
     }
 
     /// Enable/disable [`unified_tree`](Self::unified_tree) mode. Flag-day gated in
@@ -2066,6 +2125,11 @@ impl HypergraphCrdt {
     ) -> Result<usize> {
         self.store
             .for_each_vertex_underlying(set_type, phase_type, shard, cb)
+    }
+
+    /// Read candidate application domains from persisted vertex-adds roots.
+    pub fn vertex_adds_domains(&self) -> Result<Vec<[u8; 32]>> {
+        self.store.range_vertex_adds_domains()
     }
 
     // ---- commit ---------------------------------------------------------
@@ -4230,6 +4294,7 @@ impl HypergraphCrdt {
         }
         mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, plan.phase_idx);
         staged
             .publish_memory()
             .map_err(|e| QuilError::Internal(format!("publish synced memory tree: {e}")))?;
@@ -4525,6 +4590,7 @@ impl HypergraphCrdt {
             return Ok(());
         }
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, 0);
         for (phase_idx, version, phase) in staged {
             phase
                 .publish_memory()
@@ -4605,6 +4671,7 @@ impl HypergraphCrdt {
         let txn = self.store.new_transaction(false)?;
         let leaves = self.stage_phase_wipe(&forest, txn.as_ref(), &shard, phase_idx, head)?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, phase_idx);
         self.finish_phase_wipe(&forest, &app, phase_idx)?;
         Ok(leaves)
     }
@@ -6189,6 +6256,7 @@ impl HypergraphCrdt {
             version,
         )?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&shard.l2, phase_idx);
         Ok(())
     }
 
@@ -6836,6 +6904,20 @@ impl HypergraphCrdt {
         });
         views.keep(Some(view.clone()));
         Ok(view)
+    }
+
+    /// Capture a fresh view after the active commit releases its lock. Local
+    /// indexes use this to align their snapshot with commit notifications.
+    pub fn capture_fresh_committed_snapshot(
+        &self,
+    ) -> Result<Arc<dyn quil_types::store::SnapshotReadable>> {
+        let _guard = self
+            .commit_lock
+            .lock_to_read()
+            .map_err(|_| QuilError::ExecutionUnavailable("snapshot commit lock poisoned".into()))?;
+        self.store.capture_tree_snapshot()?.ok_or_else(|| {
+            QuilError::ExecutionUnavailable("committed snapshots unsupported by this store".into())
+        })
     }
 
     /// Capture a full-filter checkpoint without interpreting read failures as

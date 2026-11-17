@@ -15,12 +15,20 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{extract::Request, middleware::Next, response::Response, routing::any, Router};
+use axum::{
+    extract::Request,
+    middleware::Next,
+    response::Response,
+    routing::{any, get},
+    Router,
+};
 use parking_lot::{Mutex, RwLock};
 
+pub mod discovery;
 pub mod handlers;
 pub mod message_ring;
 pub mod production;
+pub mod supply_index;
 
 pub use message_ring::{RecentMessage, RecentMessageRing};
 
@@ -87,6 +95,7 @@ pub struct ExplorerState {
     /// `/token/coins/:owner`) read every coin of the domain, so they run one
     /// at a time and a request arriving during one is answered 503.
     pub(crate) token_scan: Arc<tokio::sync::Semaphore>,
+    pub(crate) supply_index: Option<Arc<supply_index::SupplyIndex>>,
     /// Permits for shard-frame reads (`/shards/:filter/frames`): a frame
     /// can be megabytes, so only `handlers::MAX_SHARD_FRAME_READS` are read
     /// at once and a request beyond them is answered 503.
@@ -153,6 +162,7 @@ impl ExplorerState {
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
             token_scan: Arc::new(tokio::sync::Semaphore::new(1)),
+            supply_index: None,
             shard_frame_reads: Arc::new(tokio::sync::Semaphore::new(
                 handlers::MAX_SHARD_FRAME_READS,
             )),
@@ -198,6 +208,12 @@ impl ExplorerState {
         ));
         self
     }
+
+    /// Serve the background supply summary once its first scan ends.
+    pub fn with_supply_index(mut self, index: Arc<supply_index::SupplyIndex>) -> Self {
+        self.supply_index = Some(index);
+        self
+    }
 }
 
 /// Requests the explorer serves at once; a request beyond them is answered
@@ -236,6 +252,7 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/provers/kicked", any(handlers::handle_kicked))
         .route("/stats", any(handlers::handle_stats))
         .route("/shards/production", any(handlers::handle_shard_production))
+        .route("/shards/pending", get(discovery::pending_shards))
         .route(
             "/shards/production/history",
             any(handlers::handle_shard_production_history),
@@ -246,6 +263,8 @@ pub fn router(state: ExplorerState) -> Router {
             any(handlers::handle_shard_frame),
         )
         .route("/token/supply", any(handlers::handle_token_supply))
+        .route("/apps", get(discovery::apps))
+        .route("/apps/:address", get(discovery::app))
         .route("/token/coin/:address", any(handlers::handle_token_coin))
         .route("/token/coins/:owner", any(handlers::handle_token_coins))
         .route("/token/reward/:prover", any(handlers::handle_token_reward))

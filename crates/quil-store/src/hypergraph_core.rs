@@ -775,6 +775,56 @@ macro_rules! impl_hypergraph_storage {
                 )
             }
 
+            fn range_vertex_adds_domains(&self) -> Result<Vec<[u8; 32]>> {
+                let zero = ShardKey {
+                    l1: [0; 3],
+                    l2: [0; 32],
+                };
+                let mut tree_prefix =
+                    crate::encoding::hypergraph_tree_blob_key("vertex", "adds", &zero);
+                tree_prefix.truncate(3);
+                let old_prefix = vec![
+                    crate::encoding::HYPERGRAPH_SHARD,
+                    crate::encoding::HG_VERTEX_ADDS_TREE_ROOT,
+                ];
+                let mut found = std::collections::HashSet::new();
+                for prefix in [&tree_prefix, &old_prefix] {
+                    for entry in self.db.iterator(rocksdb::IteratorMode::From(
+                        prefix,
+                        rocksdb::Direction::Forward,
+                    )) {
+                        let (key, _) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+                        if !key.starts_with(prefix) {
+                            break;
+                        }
+                        if key.len() == prefix.len() + 35 {
+                            found.insert(key[prefix.len() + 3..].try_into().unwrap());
+                        }
+                    }
+                }
+                // The active JMT forest stores one head marker per app/phase:
+                // namespace, 0xfe, level, ID length, phase, then app ID.
+                let forest_prefix = [crate::FOREST_NAMESPACE[0], 0xfe, 3];
+                for entry in self.db.iterator(rocksdb::IteratorMode::From(
+                    &forest_prefix,
+                    rocksdb::Direction::Forward,
+                )) {
+                    let (key, _) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+                    if !key.starts_with(&forest_prefix) {
+                        break;
+                    }
+                    if key.len() >= 37
+                        && key.len() == 4 + key[3] as usize
+                        && key[4] == quil_forest::Phase::VertexAdds as u8
+                    {
+                        found.insert(key[5..37].try_into().unwrap());
+                    }
+                }
+                let mut domains: Vec<_> = found.into_iter().collect();
+                domains.sort();
+                Ok(domains)
+            }
+
             fn for_each_vertex_underlying_matching(
                 &self,
                 set_type: &str,
