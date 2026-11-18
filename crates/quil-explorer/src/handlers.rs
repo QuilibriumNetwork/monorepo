@@ -2479,7 +2479,7 @@ pub async fn handle_token_supply(
                the full PUBLIC supply: transparent coins (QUIL_TOKEN) + earned/mined \
                reward balances (public plaintext, GLOBAL intrinsic domain). Only SHIELDED \
                lattice coins are value-hidden and excluded — everything else is derivable. \
-               (?scan=1 is a full scan; result cached ~60s.)",
+               (?scan=1 uses the supply index when ready, otherwise scans; server result cached ~180s.)",
     };
     let body = json_value(&response);
     if want_scan {

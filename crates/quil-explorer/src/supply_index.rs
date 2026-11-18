@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use quil_hypergraph::{shard_key_for_location, HypergraphCrdt, Location};
@@ -15,9 +15,12 @@ use quil_types::store::{
 
 const QUIL: [u8; 32] = quil_execution::domains::QUIL_TOKEN;
 const GLOBAL: [u8; 32] = quil_execution::domains::GLOBAL;
-const INDEX_PREFIX: &[u8] = b"\0explorer-supply-v1/";
-const INDEX_END: &[u8] = b"\0explorer-supply-v2/";
-const EVENT_KEYS_LIMIT: usize = 8_192;
+const INDEX_PREFIX: &[u8] = &[quil_store::encoding::EXPLORER_SUPPLY, 1];
+const INDEX_END: &[u8] = &[quil_store::encoding::EXPLORER_SUPPLY, 2];
+const LEGACY_INDEX_PREFIX: &[u8] = b"\0explorer-supply-v1/";
+const LEGACY_INDEX_END: &[u8] = b"\0explorer-supply-v2/";
+const EVENT_KEYS_LIMIT: usize = 16_384;
+const EVENT_QUEUE_LIMIT: usize = 256;
 static TOKEN_TYPES: OnceLock<(Option<[u8; 32]>, Option<[u8; 32]>)> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,6 +120,30 @@ struct Event {
     keys: Vec<[u8; 64]>,
 }
 
+#[derive(Default)]
+struct RebuildBackoff {
+    last_finished: Option<Instant>,
+    retries: u32,
+}
+
+impl RebuildBackoff {
+    fn delay(&mut self, now: Instant) -> Duration {
+        let Some(last_finished) = self.last_finished else {
+            return Duration::ZERO;
+        };
+        if now.duration_since(last_finished) >= Duration::from_secs(120) {
+            self.retries = 0;
+            return Duration::ZERO;
+        }
+        self.retries = (self.retries + 1).min(6);
+        Duration::from_secs((1u64 << self.retries).min(60))
+    }
+
+    fn finished(&mut self, now: Instant) {
+        self.last_finished = Some(now);
+    }
+}
+
 pub struct SupplyIndex {
     counts: RwLock<Option<SupplyCounts>>,
     lost: AtomicBool,
@@ -130,7 +157,7 @@ impl SupplyIndex {
         store: Arc<dyn HypergraphStore>,
         db: Arc<dyn KvDb>,
     ) -> (Arc<Self>, SupplyIndexRunner) {
-        let (sender, receiver) = mpsc::sync_channel(4_096);
+        let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_LIMIT);
         let index = Arc::new(Self {
             counts: RwLock::new(None),
             lost: AtomicBool::new(false),
@@ -178,6 +205,9 @@ impl SupplyIndex {
 
 impl LocalVertexCommitObserver for SupplyIndex {
     fn committed<'a>(&self, vertices: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {
+        if self.lost.load(Ordering::Acquire) {
+            return;
+        }
         let mut keys = Vec::new();
         for (key, _) in vertices {
             if key.len() != 64 || (key[..32] != QUIL && key[..32] != GLOBAL) {
@@ -223,12 +253,27 @@ impl SupplyIndexRunner {
     /// summary; the next pass rebuilds it from a fresh committed snapshot.
     pub fn run(self, stop: &AtomicBool) {
         let mut counts = None;
+        let mut backoff = RebuildBackoff::default();
         while !stop.load(Ordering::Acquire) {
             if counts.is_none() || self.index.lost.load(Ordering::Acquire) {
+                let delay = backoff.delay(Instant::now());
+                let deadline = Instant::now() + delay;
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_secs(1)),
+                    );
+                }
                 counts = None;
                 self.index.lost.store(false, Ordering::Release);
                 *self.index.counts.write() = None;
-                match self.rebuild(stop) {
+                let rebuilt = self.rebuild(stop);
+                backoff.finished(Instant::now());
+                match rebuilt {
                     Ok(Some(rebuilt)) => {
                         counts = Some(rebuilt);
                         tracing::info!("explorer supply index ready");
@@ -236,7 +281,6 @@ impl SupplyIndexRunner {
                     Ok(None) => continue,
                     Err(error) => {
                         tracing::warn!(%error, "explorer supply index rebuild failed");
-                        std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
                 }
@@ -270,6 +314,16 @@ impl SupplyIndexRunner {
         let at_snapshot = self.index.sequence.load(Ordering::Acquire);
         if before != at_snapshot {
             return Ok(None);
+        }
+        // Observer writes are not atomic with CRDT commits, so rebuild from
+        // canonical state after a restart or a missed notification.
+        if self
+            .db
+            .first_key_in(LEGACY_INDEX_PREFIX, LEGACY_INDEX_END)?
+            .is_some()
+        {
+            self.db
+                .delete_range(LEGACY_INDEX_PREFIX, LEGACY_INDEX_END)?;
         }
         self.db.delete_range(INDEX_PREFIX, INDEX_END)?;
         let mut counts = SupplyCounts::default();
@@ -346,6 +400,7 @@ impl SupplyIndexRunner {
         let batch = self.db.new_batch(false)?;
         let mut next = *counts;
         let mut seen = std::collections::HashSet::new();
+        let mut changed = false;
         for key in keys {
             if !seen.insert(*key) {
                 continue;
@@ -364,13 +419,19 @@ impl SupplyIndexRunner {
                 .store
                 .load_vertex_underlying_raw("vertex", "adds", &shard, key)?
                 .map(|blob| classify(key, &blob));
+            if old == new {
+                continue;
+            }
+            changed = true;
             next.change(old, new);
             match new {
                 Some(value) => batch.set(&indexed, &value.encode())?,
                 None => batch.delete(&indexed)?,
             }
         }
-        batch.commit()?;
+        if changed {
+            batch.commit()?;
+        }
         *counts = next;
         Ok(())
     }
@@ -436,9 +497,129 @@ fn classify(key: &[u8; 64], blob: &[u8]) -> Contribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::{Query, State};
+    use axum::http::Method;
     use quil_execution::token_intrinsic::legacy_migration::{
         create_transparent_coin_tree, transparent_type_hash, TransparentCoin,
     };
+    use std::collections::HashMap;
+
+    #[test]
+    fn large_commits_keep_the_index_current() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let index = SupplyIndex {
+            counts: RwLock::new(Some(SupplyCounts::default())),
+            lost: AtomicBool::new(false),
+            sequence: AtomicU64::new(0),
+            sender,
+        };
+        // Observed mainnet GLOBAL syncs have reached 10,405 changed leaves.
+        let rows = (0..10_405)
+            .map(|number| {
+                let mut key = [0u8; 64];
+                key[..32].copy_from_slice(&QUIL);
+                key[32..40].copy_from_slice(&(number as u64).to_be_bytes());
+                (key.to_vec(), Vec::new())
+            })
+            .collect::<Vec<_>>();
+        index.committed(
+            &mut rows
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        );
+        assert!(!index.lost.load(Ordering::Acquire));
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|event| event.keys.len())
+                .sum::<usize>(),
+            10_405
+        );
+    }
+
+    #[test]
+    fn saturated_commit_queue_invalidates_without_collecting_more_keys() {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let raw = db.inner();
+        let store: Arc<dyn HypergraphStore> =
+            Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            raw,
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let (index, runner) = SupplyIndex::start(crdt.clone(), store, db);
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&QUIL);
+        for _ in 0..=256 {
+            index.committed(&mut std::iter::once((key.as_slice(), &[][..])));
+        }
+        assert!(index.lost.load(Ordering::Acquire));
+        let sequence = index.sequence.load(Ordering::Acquire);
+        index.committed(&mut std::iter::once((key.as_slice(), &[][..])));
+        assert_eq!(index.sequence.load(Ordering::Acquire), sequence);
+
+        add_coin(&crdt, 1, 16_000_000_000);
+        crdt.commit(1).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || runner.run(&worker_stop));
+        assert_eq!(wait_for(&index, 1).transparent_subunits, 16_000_000_000);
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn repeated_rebuilds_back_off_and_reset_after_a_quiet_period() {
+        let mut backoff = RebuildBackoff::default();
+        let now = std::time::Instant::now();
+        assert_eq!(backoff.delay(now), Duration::ZERO);
+        backoff.finished(now);
+        for seconds in [2, 4, 8, 16, 32, 60, 60] {
+            assert_eq!(backoff.delay(now), Duration::from_secs(seconds));
+            backoff.finished(now);
+        }
+        assert_eq!(
+            backoff.delay(now + Duration::from_secs(120)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn unchanged_contributions_do_not_write_to_store() {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let raw = db.inner();
+        let store: Arc<dyn HypergraphStore> =
+            Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            raw.clone(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        add_coin(&crdt, 1, 16_000_000_000);
+        crdt.commit(1).unwrap();
+
+        let (_, runner) = SupplyIndex::start(crdt, store, db);
+        let mut counts = runner.rebuild(&AtomicBool::new(false)).unwrap().unwrap();
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&QUIL);
+        key[32..].fill(1);
+        let before = raw.latest_sequence_number();
+        runner.apply_keys(&[key], &mut counts).unwrap();
+        assert_eq!(raw.latest_sequence_number(), before);
+        assert_eq!(counts.transparent_subunits, 16_000_000_000);
+
+        key[32..].fill(2);
+        runner.apply_keys(&[key], &mut counts).unwrap();
+        assert_eq!(raw.latest_sequence_number(), before);
+        assert_eq!(counts.scanned, 1);
+    }
 
     fn add_coin(crdt: &HypergraphCrdt, address: u8, amount: u128) {
         let coin = TransparentCoin {
@@ -458,6 +639,51 @@ mod tests {
         .unwrap();
     }
 
+    fn add_hidden_coin(crdt: &HypergraphCrdt, address: u8) {
+        let ty = quil_execution::token_intrinsic::materialize::coin_type_hash(&QUIL).unwrap();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xff; 32], &ty, &[], &num_bigint::BigInt::from(32))
+            .unwrap();
+        crdt.add_vertex(
+            &Location {
+                app_address: QUIL,
+                data_address: [address; 32],
+            },
+            &quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn add_reward(crdt: &HypergraphCrdt, address: u8, amount: u64) {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        let mut balance = [0u8; 32];
+        balance[24..].copy_from_slice(&amount.to_be_bytes());
+        quil_execution::global_intrinsic::materialize::set_reward_balance(&mut tree, &balance)
+            .unwrap();
+        crdt.add_vertex(
+            &Location {
+                app_address: GLOBAL,
+                data_address: [address; 32],
+            },
+            &quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn live_supply(state: crate::ExplorerState) -> serde_json::Value {
+        let response = crate::handlers::handle_token_supply(
+            Method::GET,
+            State(state),
+            Query(HashMap::from([("scan".to_string(), "1".to_string())])),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["live_public"].clone()
+    }
+
     fn wait_for(index: &SupplyIndex, coins: u64) -> SupplyCounts {
         for _ in 0..300 {
             if let Some(counts) = index.read() {
@@ -473,6 +699,9 @@ mod tests {
     #[test]
     fn committed_coins_build_and_update_the_supply_summary() {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let mut legacy_key = LEGACY_INDEX_PREFIX.to_vec();
+        legacy_key.extend_from_slice(&[0; 64]);
+        db.set(&legacy_key, &[0]).unwrap();
         let raw = db.inner();
         let store: Arc<dyn HypergraphStore> =
             Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
@@ -487,18 +716,92 @@ mod tests {
         add_coin(&crdt, 1, 16_000_000_000);
         crdt.commit(1).unwrap();
 
-        let (index, runner) = SupplyIndex::start(crdt.clone(), store, db);
+        let (index, runner) = SupplyIndex::start(crdt.clone(), store, db.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = std::thread::spawn(move || runner.run(&worker_stop));
         let first = wait_for(&index, 1);
         assert_eq!(first.transparent_subunits, 16_000_000_000);
+        assert!(db.get(&legacy_key).unwrap().is_none());
 
         add_coin(&crdt, 2, 8_000_000_000);
         crdt.commit(2).unwrap();
         let second = wait_for(&index, 2);
         assert_eq!(second.transparent_subunits, 24_000_000_000);
         assert_eq!(second.scanned, 2);
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexed_supply_matches_full_scan_after_coin_removal() {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let raw = db.inner();
+        let store: Arc<dyn HypergraphStore> =
+            Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            raw.clone(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        add_coin(&crdt, 1, 16_000_000_000);
+        add_hidden_coin(&crdt, 2);
+        add_reward(&crdt, 3, 8_000_000_000);
+        crdt.commit(1).unwrap();
+
+        let (index, runner) = SupplyIndex::start(crdt.clone(), store, db);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || runner.run(&worker_stop));
+        let initial = wait_for(&index, 1);
+        assert_eq!(initial.reward_subunits, 8_000_000_000);
+        assert_eq!(initial.value_hidden_coins, 1);
+
+        crdt.remove_vertex(&Location {
+            app_address: QUIL,
+            data_address: [1; 32],
+        })
+        .unwrap();
+        add_reward(&crdt, 3, 16_000_000_000);
+        crdt.commit(2).unwrap();
+        let updated = (0..300)
+            .find_map(|_| {
+                let counts = index.read();
+                if counts.is_some_and(|counts| counts.reward_subunits == 16_000_000_000) {
+                    counts
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("supply index did not apply the reward update");
+        assert_eq!(updated.transparent_subunits, 16_000_000_000);
+
+        let make_state = || {
+            crate::ExplorerState::new(
+                Arc::new(quil_store::RocksClockStore::new(raw.clone())),
+                crdt.clone(),
+                Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
+                Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
+                Arc::new(quil_store::RocksShardsStore::new(raw.clone())),
+                None,
+                None,
+                Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                Arc::new(crate::RecentMessageRing::new(16)),
+                Arc::new(AtomicU64::new(2)),
+            )
+        };
+        let full_scan = live_supply(make_state()).await;
+        let indexed = live_supply(make_state().with_supply_index(index)).await;
+        // The existing scan counts add blobs even when a remove tombstone exists.
+        assert_eq!(full_scan["transparent_coins"], 1);
+        assert_eq!(full_scan["value_hidden_coins"], 1);
+        assert_eq!(full_scan["reward_provers"], 1);
+        assert_eq!(full_scan["reward_subunits"], "16000000000");
+        assert_eq!(indexed, full_scan);
         stop.store(true, Ordering::Release);
         worker.join().unwrap();
     }

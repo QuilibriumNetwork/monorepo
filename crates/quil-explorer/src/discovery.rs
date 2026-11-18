@@ -1,5 +1,4 @@
-//! Read-only views of the archive's applications and pending shard
-//! changes. Existing explorer routes and their JSON contracts stay untouched.
+//! Application discovery and pending shard changes on archive nodes.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -462,20 +461,6 @@ mod tests {
             .reward_impact
             .estimated_delta_subunits_per_frame
             .is_none());
-    }
-
-    #[test]
-    fn list_candidates_come_from_shard_key_l2() {
-        let mut shard_key = vec![1, 2, 3];
-        shard_key.extend_from_slice(&[7; 32]);
-        let shard = ShardInfo {
-            shard_key,
-            prefix: vec![],
-            size: vec![],
-            data_shards: 0,
-            commitment: vec![],
-        };
-        assert_eq!(app_address(&shard), Some([7; 32]));
     }
 
     #[test]

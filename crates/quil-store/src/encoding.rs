@@ -24,6 +24,8 @@ pub const CONSENSUS: u8 = 0x0C;
 /// `[STORAGE_REPLICA][epoch:u64 BE][leaf_id]` (epoch-first so dropping a stale
 /// epoch is a single `delete_range`). Rust-only (no Go counterpart).
 pub const STORAGE_REPLICA: u8 = 0x0D;
+/// Explorer's per-vertex token supply contributions. Rust-only local index.
+pub const EXPLORER_SUPPLY: u8 = 0x0E;
 /// Sub-discriminators under CONSENSUS — match Go's
 /// `node/store/constants.go:178-179`. The Rust consensus store
 /// historically wrote these at top-level prefixes 0x01/0x02 which
