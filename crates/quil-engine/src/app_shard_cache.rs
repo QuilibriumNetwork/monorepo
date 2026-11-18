@@ -94,10 +94,7 @@ impl AppShardCache {
                     .flat_map(|c| c.iter().copied())
                     .collect(),
             };
-            debug!(
-                filter = hex::encode(&info.filter),
-                "cached shard info"
-            );
+            debug!(filter = hex::encode(&info.filter), "cached shard info");
             cache.put(info.filter.clone(), info);
         }
 

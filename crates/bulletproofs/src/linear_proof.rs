@@ -326,8 +326,8 @@ impl LinearProof {
             buf.extend_from_slice(r.as_bytes());
         }
         buf.extend_from_slice(self.S.as_bytes());
-        buf.extend_from_slice(self.a.as_bytes());
-        buf.extend_from_slice(self.r.as_bytes());
+        buf.extend_from_slice(&self.a.to_bytes());
+        buf.extend_from_slice(&self.r.to_bytes());
         buf
     }
 
@@ -339,16 +339,9 @@ impl LinearProof {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn to_bytes_iter(&self) -> impl Iterator<Item = u8> + '_ {
-        self.L_vec
-            .iter()
-            .zip(self.R_vec.iter())
-            .flat_map(|(l, r)| l.as_bytes().iter().chain(r.as_bytes()))
-            .chain(self.S.as_bytes())
-            .chain(self.a.as_bytes())
-            .chain(&[0u8])
-            .chain(self.r.as_bytes())
-            .chain(&[0u8])
-            .copied()
+        // Own scalar bytes and use the canonical layout. The former lazy
+        // iterator aliased a shared buffer and added obsolete padding bytes.
+        self.to_bytes().into_iter()
     }
 
     /// Deserializes the proof from a byte slice.
@@ -405,6 +398,35 @@ impl LinearProof {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scalar_serialization_keeps_distinct_witnesses() {
+        let proof = LinearProof {
+            L_vec: Vec::new(),
+            R_vec: Vec::new(),
+            S: Point::identity().compress(),
+            a: Scalar::from(3u64),
+            r: Scalar::from(7u64),
+        };
+        let mut expected = proof.S.as_bytes().to_vec();
+        expected.extend_from_slice(&proof.a.to_bytes());
+        expected.extend_from_slice(&proof.r.to_bytes());
+        assert_eq!(proof.to_bytes(), expected);
+
+        // Consume only after another serialization: an iterator must own its
+        // scalar bytes rather than borrow a process-wide scratch buffer.
+        let iter = proof.to_bytes_iter();
+        let mut other = proof.clone();
+        other.a = Scalar::from(11u64);
+        other.r = Scalar::from(13u64);
+        let _ = other.to_bytes();
+        let bytes = iter.collect::<Vec<_>>();
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len(), proof.serialized_size());
+        let decoded = LinearProof::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.a, proof.a);
+        assert_eq!(decoded.r, proof.r);
+    }
+
     fn test_helper(n: usize) {
         let mut rng = rand::thread_rng();
 
@@ -451,7 +473,8 @@ mod tests {
             .is_ok());
 
         // Test serialization and deserialization
-        let serialized_proof = proof.to_bytes();
+        let serialized_proof = proof.to_bytes_iter().collect::<Vec<_>>();
+        assert_eq!(serialized_proof, proof.to_bytes());
         assert_eq!(proof.serialized_size(), serialized_proof.len());
 
         let deserialized_proof = LinearProof::from_bytes(&serialized_proof).unwrap();

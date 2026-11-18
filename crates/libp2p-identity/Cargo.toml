@@ -36,6 +36,11 @@ repository = "https://github.com/libp2p/rust-libp2p"
 all-features = true
 
 [features]
+# Quilibrium fork: `falcon` (KeyType=5) is the mandatory network identity, so it
+# is ON BY DEFAULT here. A hard `compile_error!` in src/lib.rs additionally
+# refuses to build this crate without it — see the note there. Consumers that
+# pass `default-features = false` MUST re-add `falcon`.
+default = ["falcon"]
 ecdsa = [
     "dep:p256",
     "dep:zeroize",
@@ -56,6 +61,14 @@ ed448 = [
     "dep:rand",
     "dep:sha2",
     "dep:hkdf",
+    "dep:quick-protobuf",
+]
+falcon = [
+    "dep:fn-dsa",
+    "dep:rand",
+    "dep:sha2",
+    "dep:hkdf",
+    "dep:zeroize",
     "dep:quick-protobuf",
 ]
 peerid = [
@@ -113,6 +126,10 @@ optional = true
 
 [dependencies.ed448-rust]
 path = "../ed448-rust"
+optional = true
+
+[dependencies.fn-dsa]
+version = "0.3"
 optional = true
 
 [dependencies.hkdf]

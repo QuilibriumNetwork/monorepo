@@ -15,7 +15,7 @@ pub(crate) fn init() -> FramePipeline {
     let frame_prover: Arc<dyn quil_types::crypto::FrameProver> =
         Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
     let bls_for_verify: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_crypto::FalconKeyConstructor);
     let frame_validator = quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
         frame_prover.clone(),
         bls_for_verify,

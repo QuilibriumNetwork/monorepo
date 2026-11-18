@@ -276,18 +276,14 @@ impl PeerAuthenticator {
     pub fn authorize(&self, peer: &PeerId, policy: AllowedPeerPolicy) -> bool {
         match policy {
             AllowedPeerPolicy::AnyPeer => true,
-            AllowedPeerPolicy::OnlySelfPeer => {
-                self.self_peer_id.as_ref() == Some(peer)
-            }
+            AllowedPeerPolicy::OnlySelfPeer => self.self_peer_id.as_ref() == Some(peer),
             AllowedPeerPolicy::AnyProverPeer
             | AllowedPeerPolicy::OnlyGlobalProverPeer
             | AllowedPeerPolicy::OnlyShardProverPeer => {
                 // Placeholder: full prover-registry check will replace this.
                 self.is_authenticated(peer)
             }
-            AllowedPeerPolicy::OnlyWhitelistedPeers => {
-                self.whitelisted_peers.contains_key(peer)
-            }
+            AllowedPeerPolicy::OnlyWhitelistedPeers => self.whitelisted_peers.contains_key(peer),
         }
     }
 
@@ -518,9 +514,7 @@ mod tests {
         auth.authenticate(&peer, vec![0; 57]);
 
         auth.update_reputation(&peer, -10.0);
-        assert!(
-            (auth.get_reputation(&peer) - (DEFAULT_REPUTATION - 10.0)).abs() < f64::EPSILON
-        );
+        assert!((auth.get_reputation(&peer) - (DEFAULT_REPUTATION - 10.0)).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -5,32 +5,35 @@
 use crate::utils::*;
 
 use ed448_goldilocks_plus::elliptic_curve::Group;
-use rand::rngs::OsRng;
 use ed448_goldilocks_plus::EdwardsPoint as GGA;
 use ed448_goldilocks_plus::Scalar as FF;
+use rand::rngs::OsRng;
 
-const WINDOW_SIZE : usize = 7;
+const WINDOW_SIZE: usize = 7;
 
 #[derive(Clone)]
 pub struct Elgamal {
     pub(crate) params: CurveParams,
-    pub(crate) G : GGA
+    pub(crate) G: GGA,
 }
 
 #[derive(Copy, Clone, Default, Debug)]
 pub struct PKECipherText {
-    pub(crate) c1 : GGA,
-    pub(crate) c2 : FF,
+    pub(crate) c1: GGA,
+    pub(crate) c2: FF,
 }
 
 #[derive(Clone)]
 pub struct PKEPublicKey {
-    pub(crate) ek : GGA,
+    pub(crate) ek: GGA,
 }
 
 impl PKECipherText {
     pub fn zero() -> Self {
-        PKECipherText {c1: GGA::IDENTITY, c2: FF::ZERO}
+        PKECipherText {
+            c1: GGA::IDENTITY,
+            c2: FF::ZERO,
+        }
     }
 }
 
@@ -42,21 +45,23 @@ impl PKECipherText {
     }
 }
 
-
 impl Elgamal {
     pub fn setup(params: &CurveParams) -> Self {
         // we skip a lot of precomputation utilizing edwards curves
         let precomp_G = GGA::generator();
-        
-        Elgamal { params: params.clone(), G: precomp_G }
+
+        Elgamal {
+            params: params.clone(),
+            G: precomp_G,
+        }
     }
 
     pub fn kgen(&self) -> (PKEPublicKey, FF) {
         let x = FF::random(&mut OsRng);
         let Y = self.mul_G(x);
 
-        let pk = PKEPublicKey{ek: Y};
-        
+        let pk = PKEPublicKey { ek: Y };
+
         return (pk, x);
     }
 
@@ -64,10 +69,10 @@ impl Elgamal {
         self.encrypt_given_r(ek, msg, &FF::random(&mut OsRng))
     }
 
-    fn mul_G(&self, scalar : FF) -> GGA {
+    fn mul_G(&self, scalar: FF) -> GGA {
         self.G * scalar
     }
-    fn mul_ek(ek : &GGA, scalar : FF) -> GGA {
+    fn mul_ek(ek: &GGA, scalar: FF) -> GGA {
         ek * scalar
     }
 
@@ -77,7 +82,7 @@ impl Elgamal {
     }
 
     // Encryption where c1 = G^r is given
-    pub fn encrypt_given_c1(&self, ek: &PKEPublicKey, msg: &FF, r: &FF, c1 : GGA) -> PKECipherText {
+    pub fn encrypt_given_c1(&self, ek: &PKEPublicKey, msg: &FF, r: &FF, c1: GGA) -> PKECipherText {
         let keyseed = Self::mul_ek(&ek.ek, *r);
         let hash = hash_to_FF(&keyseed);
         let c2 = hash + msg;
@@ -89,7 +94,6 @@ impl Elgamal {
         let hash = hash_to_FF(&pt);
         ct.c2 - hash
     }
-
 }
 #[cfg(test)]
 mod tests {
@@ -100,7 +104,6 @@ mod tests {
         let pke = Elgamal::setup(&params);
         let (ek, dk) = pke.kgen();
         assert_eq!(params.G * dk, ek.ek);
-
     }
 
     #[test]

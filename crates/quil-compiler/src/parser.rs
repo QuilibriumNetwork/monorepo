@@ -36,10 +36,7 @@ impl Parser {
                 TokenType::Eof => break,
                 TokenType::SymImport => self.parse_import(pkg)?,
                 TokenType::SymFunc => {
-                    let annotations = self
-                        .lexer
-                        .annotations(&tok.from)
-                        .unwrap_or_default();
+                    let annotations = self.lexer.annotations(&tok.from).unwrap_or_default();
                     let func = self.parse_func(annotations)?;
                     pkg.functions.push(func);
                 }
@@ -393,7 +390,9 @@ impl Parser {
                         // Short declaration: name := value
                         let name = match &expr {
                             Expr::VariableRef { name, .. } => name.clone(),
-                            _ => return Err(format!("{}: expected variable name for :=", next.from)),
+                            _ => {
+                                return Err(format!("{}: expected variable name for :=", next.from))
+                            }
                         };
                         let value = self.parse_expr()?;
                         Ok(Stmt::ShortDecl {
@@ -418,9 +417,15 @@ impl Parser {
                         loc: tok.from,
                         expr,
                     }),
-                    TokenType::PlusEq | TokenType::MinusEq | TokenType::MultEq
-                    | TokenType::DivEq | TokenType::AndEq | TokenType::OrEq
-                    | TokenType::XorEq | TokenType::LshiftEq | TokenType::RshiftEq => {
+                    TokenType::PlusEq
+                    | TokenType::MinusEq
+                    | TokenType::MultEq
+                    | TokenType::DivEq
+                    | TokenType::AndEq
+                    | TokenType::OrEq
+                    | TokenType::XorEq
+                    | TokenType::LshiftEq
+                    | TokenType::RshiftEq => {
                         let op = match next.typ {
                             TokenType::PlusEq => BinaryType::Add,
                             TokenType::MinusEq => BinaryType::Sub,
@@ -497,12 +502,13 @@ impl Parser {
         }
 
         // Three-clause for.
-        let init = if !self.peek_is(TokenType::Char(b';'))? && !self.peek_is(TokenType::Char(b'{'))? {
-            let stmt = self.parse_stmt()?;
-            Some(Box::new(stmt))
-        } else {
-            None
-        };
+        let init =
+            if !self.peek_is(TokenType::Char(b';'))? && !self.peek_is(TokenType::Char(b'{'))? {
+                let stmt = self.parse_stmt()?;
+                Some(Box::new(stmt))
+            } else {
+                None
+            };
 
         if self.peek_is(TokenType::Char(b'{'))? {
             self.lexer.get()?;
@@ -690,8 +696,12 @@ impl Parser {
     fn parse_unary_expr(&mut self) -> Result<Expr, String> {
         let tok = self.lexer.get()?;
         match tok.typ {
-            TokenType::Char(b'-') | TokenType::Char(b'+') | TokenType::Char(b'!')
-            | TokenType::Char(b'^') | TokenType::Char(b'*') | TokenType::Char(b'&') => {
+            TokenType::Char(b'-')
+            | TokenType::Char(b'+')
+            | TokenType::Char(b'!')
+            | TokenType::Char(b'^')
+            | TokenType::Char(b'*')
+            | TokenType::Char(b'&') => {
                 let op = tok.typ.unary_type();
                 let expr = self.parse_unary_expr()?;
                 Ok(Expr::Unary {
@@ -839,7 +849,10 @@ impl Parser {
     fn expect_ident(&mut self) -> Result<Token, String> {
         let tok = self.lexer.get()?;
         if tok.typ != TokenType::Identifier {
-            return Err(format!("{}: expected identifier, got {}", tok.from, tok.typ));
+            return Err(format!(
+                "{}: expected identifier, got {}",
+                tok.from, tok.typ
+            ));
         }
         Ok(tok)
     }

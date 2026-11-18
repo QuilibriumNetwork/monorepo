@@ -24,3 +24,6 @@ uniffi = { version = "0.28.3", features = [ "build" ] }
 [[bench]]
 name = "bench_rpm"
 harness = false
+
+[lints]
+workspace = true

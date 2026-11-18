@@ -17,6 +17,16 @@ use quil_execution::ExecutionEngineManager;
 /// `bytes.Repeat([]byte{0xff}, 32)` in the materialize loop.
 const GLOBAL_ADDRESS: [u8; 32] = [0xFFu8; 32];
 
+/// A bundle of GLOBAL frame `frame_number` in canonical bytes, judged at
+/// that frame: the frame's number, not this process's history, decides
+/// which presence encodings it may carry.
+fn canonical_bundle(
+    bundle: &quil_types::proto::global::MessageBundle,
+    frame_number: u64,
+) -> Result<Vec<u8>> {
+    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number))
+}
+
 /// Process all `MessageBundle`s in a `GlobalFrame` through the
 /// execution manager. Returns (applied_count, skipped_count).
 ///
@@ -38,11 +48,8 @@ pub fn process_global_frame_with_rewards(
     reward_issuer: Option<&dyn RewardIssuance>,
     prover_registry: Option<&dyn ProverRegistry>,
 ) -> Result<(usize, usize)> {
-    let frame_number = frame
-        .header
-        .as_ref()
-        .map(|h| h.frame_number)
-        .unwrap_or(0);
+    let frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+    execution_manager.prepare_exact_state_sizes(frame_number)?;
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -60,9 +67,12 @@ pub fn process_global_frame_with_rewards(
         // `CanonicalMessageBundle::from_canonical_bytes`; feeding them
         // prost wire bytes silently fails the type-prefix check and
         // skips every message (matches Go's `ToCanonicalBytes()` path).
-        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+        let request_bytes = match canonical_bundle(bundle, frame_number) {
             Ok(b) => b,
             Err(e) => {
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -86,11 +96,12 @@ pub fn process_global_frame_with_rewards(
         // skipping validate would silently accept unsigned join /
         // kick / seniority_merge / shard_split / shard_merge /
         // frame_header messages.
-        if let Err(e) = execution_manager.validate_message(
-            frame_number,
-            &GLOBAL_ADDRESS,
-            &request_bytes,
-        ) {
+        if let Err(e) =
+            execution_manager.validate_message(frame_number, &GLOBAL_ADDRESS, &request_bytes)
+        {
+            if e.is_execution_unavailable() {
+                return Err(e);
+            }
             debug!(
                 frame = frame_number,
                 index = i,
@@ -111,6 +122,9 @@ pub fn process_global_frame_with_rewards(
                 applied += 1;
             }
             Err(e) => {
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -129,21 +143,34 @@ pub fn process_global_frame_with_rewards(
         let difficulty = header.map(|h| h.difficulty as u64).unwrap_or(0);
         // Build prover allocation maps from registry
         if let Ok(provers) = registry.get_all_active_app_shard_provers() {
-            let alloc_maps: Vec<std::collections::HashMap<String, quil_types::consensus::ProverAllocation>> =
-                provers.iter().map(|p| {
-                    p.allocations.iter()
+            let alloc_maps: Vec<
+                std::collections::HashMap<String, quil_types::consensus::ProverAllocation>,
+            > = provers
+                .iter()
+                .map(|p| {
+                    p.allocations
+                        .iter()
                         .filter(|a| a.status == quil_types::consensus::ProverStatus::Active)
                         .map(|a| {
-                            (hex::encode(&a.confirmation_filter), quil_types::consensus::ProverAllocation {
-                                ring: 0,
-                                shards: 1,
-                                state_size: 1,
-                            })
+                            (
+                                hex::encode(&a.confirmation_filter),
+                                quil_types::consensus::ProverAllocation {
+                                    ring: 0,
+                                    shards: 1,
+                                    state_size: 1,
+                                },
+                            )
                         })
                         .collect()
-                }).collect();
+                })
+                .collect();
 
-            match issuer.calculate(difficulty, 1, crate::provers::proposer::DEFAULT_UNITS, &alloc_maps) {
+            match issuer.calculate(
+                difficulty,
+                1,
+                crate::provers::proposer::DEFAULT_UNITS,
+                &alloc_maps,
+            ) {
                 Ok(rewards) => {
                     let total: BigInt = rewards.iter().sum();
                     if !total.is_zero() {
@@ -162,9 +189,9 @@ pub fn process_global_frame_with_rewards(
                     // call for each (prover_address, amount) pair:
                     //
                     //   state.set(
-                    //       &GLOBAL_ADDRESS,          // domain
-                    //       &prover_address,          // vertex address
-                    //       &vertex_adds_disc,        // discriminator
+                    //       &GLOBAL_ADDRESS, // domain
+                    //       &prover_address, // vertex address
+                    //       &vertex_adds_disc, // discriminator
                     //       frame_number,
                     //       serialized_reward_vertex, // RDF-encoded ProverReward
                     //   )
@@ -183,9 +210,7 @@ pub fn process_global_frame_with_rewards(
 
     debug!(
         frame = frame_number,
-        applied,
-        skipped,
-        "frame processing complete"
+        applied, skipped, "frame processing complete"
     );
 
     Ok((applied, skipped))
@@ -206,12 +231,13 @@ pub fn process_global_frame_with_fees(
     let header = frame.header.as_ref();
     let frame_number = header.map(|h| h.frame_number).unwrap_or(0);
     let difficulty = header.map(|h| h.difficulty).unwrap_or(0) as u64;
+    execution_manager.prepare_exact_state_sizes(frame_number)?;
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
 
     for (i, bundle) in frame.requests.iter().enumerate() {
-        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+        let request_bytes = match canonical_bundle(bundle, frame_number) {
             Ok(b) => b,
             Err(_) => {
                 skipped += 1;
@@ -226,35 +252,36 @@ pub fn process_global_frame_with_fees(
         // Compute per-bundle cost basis and fee multiplier
         let cost_basis = match execution_manager.get_cost(&request_bytes) {
             Ok(c) => c,
+            Err(e) => {
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let fee_multiplier = match crate::rewards::fee_multiplier_for_cost(
+            execution_manager.pricing_network(),
+            difficulty,
+            world_state_bytes,
+            &cost_basis,
+            1,
+        ) {
+            Ok(fee) => fee,
             Err(_) => {
                 skipped += 1;
                 continue;
             }
         };
 
-        let fee_multiplier = if cost_basis == BigInt::from(0) {
-            BigInt::from(0)
-        } else {
-            let cost_u64 = cost_basis.to_u64_digits().1.first().copied().unwrap_or(1);
-            let baseline = crate::rewards::get_baseline_fee(
-                difficulty,
-                world_state_bytes,
-                cost_u64,
-                crate::rewards::QUIL_TOKEN_UNITS,
-            );
-            if cost_basis != BigInt::from(0) {
-                &baseline / &cost_basis
-            } else {
-                BigInt::from(0)
-            }
-        };
-
         // Validate before processing.
-        if let Err(e) = execution_manager.validate_message(
-            frame_number,
-            &GLOBAL_ADDRESS,
-            &request_bytes,
-        ) {
+        if let Err(e) =
+            execution_manager.validate_message(frame_number, &GLOBAL_ADDRESS, &request_bytes)
+        {
+            if e.is_execution_unavailable() {
+                return Err(e);
+            }
             debug!(
                 frame = frame_number,
                 error = %e,
@@ -272,6 +299,9 @@ pub fn process_global_frame_with_fees(
         ) {
             Ok(_) => applied += 1,
             Err(e) => {
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(frame = frame_number, index = i, error = %e, "skipping");
                 skipped += 1;
             }
@@ -297,26 +327,24 @@ mod tests {
     use super::*;
     use quil_hypergraph::testing::MemStore;
     use quil_types::crypto::{InclusionProver, NoopInclusionProver};
-    use quil_types::proto::global::{GlobalFrameHeader, MessageBundle, MessageRequest};
+    use quil_types::proto::global::{GlobalFrameHeader, MessageBundle};
     use std::sync::Arc;
 
     fn mgr() -> ExecutionEngineManager {
         let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
-        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
-            Arc::new(MemStore::new());
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             hg_store,
             inclusion_prover.clone(),
         ));
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
-        let hg_resolver: std::sync::Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-            std::sync::Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        let hg_resolver: std::sync::Arc<
+            dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver,
+        > = std::sync::Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
         ExecutionEngineManager::new(
             inclusion_prover,
             stubs.key_manager.clone(),
             crdt,
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.circuit_compiler,
             stubs.clock_store,
             hg_resolver,
@@ -350,26 +378,101 @@ mod tests {
         }
     }
 
+    /// A fresh process (no frame decoded or committed before) re-processing
+    /// a frame past the presence exclusion frame converts its claim and its
+    /// nullify report, as every node does, and refuses them in a frame below
+    /// it: the frame's number decides, not the process's history.
+    #[test]
+    fn a_fresh_process_converts_post_activation_presence_encodings_by_the_frame() {
+        use quil_execution::global_intrinsic::handoff::{
+            self,
+            exclusion::PresenceClaim,
+            presence::{NullifyVote, PresenceReport},
+        };
+        use quil_types::proto::global::{message_request::Request, MessageRequest};
+        let report = PresenceReport {
+            session: [2; 32],
+            filter: vec![0x21; 32],
+            proposals: Vec::new(),
+            nullifies: vec![NullifyVote {
+                view: 1,
+                signer: 0,
+                signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+            }],
+        };
+        let claim = PresenceClaim {
+            filter: vec![0x21; 32],
+            member: vec![9; quil_crypto::FALCON_PUBLIC_KEY_LEN],
+            anchor: 5,
+            signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+        };
+        let bundle = |inner: Vec<u8>| MessageBundle {
+            requests: vec![MessageRequest {
+                request: Some(Request::PresenceReport(inner)),
+                ..Default::default()
+            }],
+            timestamp: 1,
+        };
+        handoff::set_presence_exclusion_frame_for_thread(Some(100));
+        for inner in [
+            report.to_canonical_bytes().unwrap(),
+            claim.to_canonical_bytes().unwrap(),
+        ] {
+            assert!(
+                canonical_bundle(&bundle(inner.clone()), 100).is_ok(),
+                "at the frame"
+            );
+            assert!(
+                canonical_bundle(&bundle(inner.clone()), 1_000).is_ok(),
+                "past it"
+            );
+            assert!(
+                canonical_bundle(&bundle(inner), 99).is_err(),
+                "below it, as a build without it"
+            );
+        }
+        handoff::set_presence_exclusion_frame_for_thread(None);
+    }
+
     #[test]
     fn process_empty_frame() {
-        let (applied, skipped) = process_global_frame(
-            &mgr(),
-            &empty_frame(1),
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame(&mgr(), &empty_frame(1), &BigInt::from(1)).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(skipped, 0);
     }
 
+    /// An overwritten vertex counts once: the size a node keeps
+    /// incrementally must equal the size a restarted or freshly synced node
+    /// rebuilds from committed state, or their world sizes and reward bases
+    /// differ. Runs at GLOBAL frame 943,920, the first frame of epoch 1311,
+    /// from which mainnet counts sizes exactly.
+    #[test]
+    fn reproduces_overwrite_size_drift() {
+        let manager = mgr();
+        let crdt = manager.crdt();
+        let app = [0x42; 32];
+        let vertex = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [0x07; 32],
+        };
+        process_global_frame(&manager, &empty_frame(943_920), &BigInt::from(1)).unwrap();
+        crdt.add_vertex(&vertex, b"original").unwrap();
+        crdt.add_vertex(&vertex, b"replaced").unwrap();
+        crdt.commit(943_920).unwrap();
+        let incremental = crdt.total_size();
+        crdt.rebucket_app(&app).unwrap();
+        let rebuilt = crdt.total_size();
+        assert_eq!(
+            incremental, rebuilt,
+            "incremental size {incremental} != rebuilt size {rebuilt} after overwriting one 8-byte vertex"
+        );
+    }
+
     #[test]
     fn process_frame_with_empty_bundles() {
-        let (applied, skipped) = process_global_frame(
-            &mgr(),
-            &frame_with_bundles(1, 3),
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame(&mgr(), &frame_with_bundles(1, 3), &BigInt::from(1)).unwrap();
         // Empty bundles produce prost-encoded bytes that the engine
         // will attempt to decode. The engine either processes them
         // (as no-ops) or skips them — either way no panic.
@@ -379,33 +482,21 @@ mod tests {
     #[test]
     fn process_frame_extracts_frame_number() {
         let frame = empty_frame(42);
-        assert_eq!(
-            frame.header.as_ref().unwrap().frame_number,
-            42
-        );
+        assert_eq!(frame.header.as_ref().unwrap().frame_number, 42);
     }
 
     #[test]
     fn process_frame_bytes_decodes_and_processes() {
         let frame = empty_frame(10);
         let bytes = frame.encode_to_vec();
-        let (applied, skipped) = process_global_frame_bytes(
-            &mgr(),
-            &bytes,
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame_bytes(&mgr(), &bytes, &BigInt::from(1)).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(skipped, 0);
     }
 
     #[test]
     fn process_frame_bytes_rejects_garbage() {
-        assert!(process_global_frame_bytes(
-            &mgr(),
-            &[0xDE, 0xAD],
-            &BigInt::from(1),
-        )
-        .is_err());
+        assert!(process_global_frame_bytes(&mgr(), &[0xDE, 0xAD], &BigInt::from(1),).is_err());
     }
 }

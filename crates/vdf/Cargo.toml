@@ -44,3 +44,17 @@ hex = "0.3"
 name = "classgroup-bench"
 harness = false
 path = "bench/bench.rs"
+
+# Clippy findings in code taken from poanetwork/vdf: allowed
+# here, not restyled. Unlisted lints keep their defaults.
+[lints.clippy]
+cloned_ref_to_slice_refs = "allow"
+empty_line_after_doc_comments = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+nonminimal_bool = "allow"
+precedence = "allow"
+ptr_arg = "allow"
+single_component_path_imports = "allow"
+unnecessary_cast = "allow"
+wrong_self_convention = "allow"

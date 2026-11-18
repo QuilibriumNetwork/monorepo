@@ -36,7 +36,11 @@ impl Int {
                 }
                 b += 1;
             }
-            if b > 32 { 64 } else { 32 }
+            if b > 32 {
+                64
+            } else {
+                32
+            }
         } else {
             bits
         };
@@ -52,7 +56,11 @@ impl Int {
     pub fn from_bigint(x: BigInt, bits: Size) -> Self {
         let bits = if bits == 0 {
             let bl = x.bits() as Size;
-            if bl > 32 { 64.max(bl) } else { 32.max(bl) }
+            if bl > 32 {
+                64.max(bl)
+            } else {
+                32.max(bl)
+            }
         } else {
             bits
         };

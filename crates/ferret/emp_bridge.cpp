@@ -248,7 +248,7 @@ int recv_rot_buffer(FerretCOT_Buffer_ptr ot, block_ptr br, bool* choices, size_t
 
 block_ptr allocate_blocks(size_t length) {
     block_ptr blocks_ptr = new block_t();
-    blocks_ptr->blocks = new block[length];
+    blocks_ptr->blocks = new block[length]();
     return blocks_ptr;
 }
 

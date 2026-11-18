@@ -1,8 +1,8 @@
-pub mod rdkgith;
-pub mod utils;
 pub mod pke;
-pub mod ve;
+pub mod rdkgith;
 pub mod seed_tree;
+pub mod utils;
+pub mod ve;
 
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -13,11 +13,11 @@ use ed448_goldilocks_plus::Scalar;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-pub use crate::rdkgith::*;
-pub use crate::utils::*;
 pub use crate::pke::*;
-pub use crate::ve::*;
+pub use crate::rdkgith::*;
 pub use crate::seed_tree::*;
+pub use crate::utils::*;
+pub use crate::ve::*;
 
 uniffi::include_scaffolding!("lib");
 
@@ -73,9 +73,12 @@ pub struct CompressedCiphertext {
     pub aux: Vec<Vec<u8>>,
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
-        return VerencProofAndBlindingKey{
+        return VerencProofAndBlindingKey {
             blinding_key: vec![],
             blinding_pubkey: vec![],
             decryption_key: vec![],
@@ -92,37 +95,61 @@ pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     let params = CurveParams::init(EdwardsPoint::GENERATOR * blind);
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
-    let vparams = RDkgithParams{ N, t, n };
+    let vparams = RDkgithParams { N, t, n };
     let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
 
     let dk = ve.kgen();
     let (stm, wit) = ve.igen(&data.try_into().unwrap());
     let pi = ve.prove(&stm, &wit);
-    
+
     return VerencProofAndBlindingKey {
         blinding_key: blind.to_bytes().to_vec(),
-        blinding_pubkey: (EdwardsPoint::GENERATOR * blind).compress().to_bytes().to_vec(),
+        blinding_pubkey: (EdwardsPoint::GENERATOR * blind)
+            .compress()
+            .to_bytes()
+            .to_vec(),
         decryption_key: dk.to_bytes().to_vec(),
-        encryption_key: (EdwardsPoint::GENERATOR * dk).compress().to_bytes().to_vec(),
+        encryption_key: (EdwardsPoint::GENERATOR * dk)
+            .compress()
+            .to_bytes()
+            .to_vec(),
         statement: stm.compress().to_bytes().to_vec(),
         challenge: pi.challenge,
-        polycom: pi.polycom.iter().map(|p| p.compress().to_bytes().to_vec()).collect(),
-        ctexts: pi.ctexts.iter().map(|c| VerencCiphertext {
-          c1: c.0.c1.compress().to_bytes().to_vec(),
-          c2: c.0.c2.to_bytes().to_vec(),
-          i: c.1 as u64,
-        }).collect(),
-        shares_rands: pi.shares_rands.iter().map(|s| VerencShare {
-          s1: s.0.to_bytes().to_vec(),
-          s2: s.1.to_bytes().to_vec(),
-          i: s.2 as u64,
-        }).collect(),
+        polycom: pi
+            .polycom
+            .iter()
+            .map(|p| p.compress().to_bytes().to_vec())
+            .collect(),
+        ctexts: pi
+            .ctexts
+            .iter()
+            .map(|c| VerencCiphertext {
+                c1: c.0.c1.compress().to_bytes().to_vec(),
+                c2: c.0.c2.to_bytes().to_vec(),
+                i: c.1 as u64,
+            })
+            .collect(),
+        shares_rands: pi
+            .shares_rands
+            .iter()
+            .map(|s| VerencShare {
+                s1: s.0.to_bytes().to_vec(),
+                s2: s.1.to_bytes().to_vec(),
+                i: s.2 as u64,
+            })
+            .collect(),
     };
 }
 
-pub fn new_verenc_proof_encrypt_only(data: Vec<u8>, encryption_key_bytes: Vec<u8>) -> VerencProofAndBlindingKey {
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
+pub fn new_verenc_proof_encrypt_only(
+    data: Vec<u8>,
+    encryption_key_bytes: Vec<u8>,
+) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
-        return VerencProofAndBlindingKey{
+        return VerencProofAndBlindingKey {
             blinding_key: vec![],
             blinding_pubkey: vec![],
             decryption_key: vec![],
@@ -137,7 +164,7 @@ pub fn new_verenc_proof_encrypt_only(data: Vec<u8>, encryption_key_bytes: Vec<u8
 
     let encryption_key = point_from_bytes(encryption_key_bytes.clone());
     if encryption_key.is_none() {
-        return VerencProofAndBlindingKey{
+        return VerencProofAndBlindingKey {
             blinding_key: vec![],
             blinding_pubkey: vec![],
             decryption_key: vec![],
@@ -154,59 +181,77 @@ pub fn new_verenc_proof_encrypt_only(data: Vec<u8>, encryption_key_bytes: Vec<u8
     let params = CurveParams::init(EdwardsPoint::GENERATOR * blind);
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
-    let vparams = RDkgithParams{ N, t, n };
+    let vparams = RDkgithParams { N, t, n };
     let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
-    
-    ve.set_ek(PKEPublicKey{
+
+    ve.set_ek(PKEPublicKey {
         ek: encryption_key.unwrap(),
     });
     let (stm, wit) = ve.igen(&data.try_into().unwrap());
     let pi = ve.prove(&stm, &wit);
-    
+
     return VerencProofAndBlindingKey {
         blinding_key: blind.to_bytes().to_vec(),
-        blinding_pubkey: (EdwardsPoint::GENERATOR * blind).compress().to_bytes().to_vec(),
+        blinding_pubkey: (EdwardsPoint::GENERATOR * blind)
+            .compress()
+            .to_bytes()
+            .to_vec(),
         decryption_key: vec![],
         encryption_key: encryption_key_bytes.clone(),
         statement: stm.compress().to_bytes().to_vec(),
         challenge: pi.challenge,
-        polycom: pi.polycom.iter().map(|p| p.compress().to_bytes().to_vec()).collect(),
-        ctexts: pi.ctexts.iter().map(|c| VerencCiphertext {
-          c1: c.0.c1.compress().to_bytes().to_vec(),
-          c2: c.0.c2.to_bytes().to_vec(),
-          i: c.1 as u64,
-        }).collect(),
-        shares_rands: pi.shares_rands.iter().map(|s| VerencShare {
-          s1: s.0.to_bytes().to_vec(),
-          s2: s.1.to_bytes().to_vec(),
-          i: s.2 as u64,
-        }).collect(),
+        polycom: pi
+            .polycom
+            .iter()
+            .map(|p| p.compress().to_bytes().to_vec())
+            .collect(),
+        ctexts: pi
+            .ctexts
+            .iter()
+            .map(|c| VerencCiphertext {
+                c1: c.0.c1.compress().to_bytes().to_vec(),
+                c2: c.0.c2.to_bytes().to_vec(),
+                i: c.1 as u64,
+            })
+            .collect(),
+        shares_rands: pi
+            .shares_rands
+            .iter()
+            .map(|s| VerencShare {
+                s1: s.0.to_bytes().to_vec(),
+                s2: s.1.to_bytes().to_vec(),
+                i: s.2 as u64,
+            })
+            .collect(),
     };
 }
 
 fn point_from_bytes(bytes: Vec<u8>) -> Option<EdwardsPoint> {
     if bytes.len() != 57 {
-      return None;
+        return None;
     }
 
     let key_bytes: Result<[u8; 57], _> = bytes.try_into();
     if key_bytes.is_err() {
-      return None;
+        return None;
     }
 
     let compressed_key = CompressedEdwardsY::try_from(key_bytes.unwrap());
     if compressed_key.is_err() {
-      return None;
+        return None;
     }
 
     let key = compressed_key.unwrap().decompress();
     if key.is_none().into() {
-      return None;
+        return None;
     }
 
     return Some(key.unwrap());
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_verify(proof: VerencProof) -> bool {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
@@ -245,7 +290,13 @@ pub fn verenc_verify(proof: VerencProof) -> bool {
         }
 
         let c2 = Scalar::from_bytes(&c.c2.try_into().unwrap());
-        ctexts.push((PKECipherText{c1: c1.unwrap(), c2: c2}, c.i as usize));
+        ctexts.push((
+            PKECipherText {
+                c1: c1.unwrap(),
+                c2: c2,
+            },
+            c.i as usize,
+        ));
     }
 
     let mut shares: Vec<(Scalar, Scalar, usize)> = Vec::new();
@@ -266,25 +317,30 @@ pub fn verenc_verify(proof: VerencProof) -> bool {
     let params = CurveParams::init(blinding_key.unwrap());
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
-    let vparams = RDkgithParams{ N, t, n };
+    let vparams = RDkgithParams { N, t, n };
     let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
-    ve.set_ek(PKEPublicKey{
+    ve.set_ek(PKEPublicKey {
         ek: encryption_key.unwrap(),
     });
 
-    return ve.verify(&statement.unwrap(), &RDkgithProof{
-        challenge: proof.challenge,
-        polycom: polycom,
-        ctexts: ctexts,
-        shares_rands: shares,
-    });
+    return ve.verify(
+        &statement.unwrap(),
+        &RDkgithProof {
+            challenge: proof.challenge,
+            polycom: polycom,
+            ctexts: ctexts,
+            shares_rands: shares,
+        },
+    );
 }
 
-
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
-        return CompressedCiphertext{
+        return CompressedCiphertext {
             ctexts: vec![],
             aux: vec![],
         };
@@ -292,7 +348,7 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
 
     let statement = point_from_bytes(proof.statement);
     if statement.is_none() {
-        return CompressedCiphertext{
+        return CompressedCiphertext {
             ctexts: vec![],
             aux: vec![],
         };
@@ -300,7 +356,7 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
 
     let encryption_key = point_from_bytes(proof.encryption_key);
     if encryption_key.is_none() {
-        return CompressedCiphertext{
+        return CompressedCiphertext {
             ctexts: vec![],
             aux: vec![],
         };
@@ -310,7 +366,7 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     for p in proof.polycom {
         let com = point_from_bytes(p);
         if com.is_none() {
-            return CompressedCiphertext{
+            return CompressedCiphertext {
                 ctexts: vec![],
                 aux: vec![],
             };
@@ -323,34 +379,40 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     for c in proof.ctexts {
         let c1 = point_from_bytes(c.c1);
         if c1.is_none() {
-            return CompressedCiphertext{
+            return CompressedCiphertext {
                 ctexts: vec![],
                 aux: vec![],
             };
         }
 
         if c.c2.len() != 56 {
-            return CompressedCiphertext{
+            return CompressedCiphertext {
                 ctexts: vec![],
                 aux: vec![],
             };
         }
 
         let c2 = Scalar::from_bytes(&c.c2.try_into().unwrap());
-        ctexts.push((PKECipherText{c1: c1.unwrap(), c2: c2}, c.i as usize));
+        ctexts.push((
+            PKECipherText {
+                c1: c1.unwrap(),
+                c2: c2,
+            },
+            c.i as usize,
+        ));
     }
 
     let mut shares: Vec<(Scalar, Scalar, usize)> = Vec::new();
     for s in proof.shares_rands {
         if s.s1.len() != 56 {
-            return CompressedCiphertext{
+            return CompressedCiphertext {
                 ctexts: vec![],
                 aux: vec![],
             };
         }
 
         if s.s2.len() != 56 {
-            return CompressedCiphertext{
+            return CompressedCiphertext {
                 ctexts: vec![],
                 aux: vec![],
             };
@@ -364,40 +426,66 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     let params = CurveParams::init(blinding_key.unwrap());
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
-    let vparams = RDkgithParams{ N, t, n };
+    let vparams = RDkgithParams { N, t, n };
     let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
-    ve.set_ek(PKEPublicKey{
+    ve.set_ek(PKEPublicKey {
         ek: encryption_key.unwrap(),
     });
-    let ve_ct = ve.compress(&statement.unwrap(), &RDkgithProof{
-        challenge: proof.challenge,
-        polycom: polycom,
-        ctexts: ctexts,
-        shares_rands: shares,
-    });
-    return CompressedCiphertext{
-        ctexts: ve_ct.ctexts.iter().map(|v| VerencCiphertext{
-            c1: v.c1.compress().to_bytes().to_vec(),
-            c2: v.c2.to_bytes().to_vec(),
-            i: 0,
-        }).collect(),
+    let ve_ct = ve.compress(
+        &statement.unwrap(),
+        &RDkgithProof {
+            challenge: proof.challenge,
+            polycom: polycom,
+            ctexts: ctexts,
+            shares_rands: shares,
+        },
+    );
+    return CompressedCiphertext {
+        ctexts: ve_ct
+            .ctexts
+            .iter()
+            .map(|v| VerencCiphertext {
+                c1: v.c1.compress().to_bytes().to_vec(),
+                c2: v.c2.to_bytes().to_vec(),
+                i: 0,
+            })
+            .collect(),
         aux: ve_ct.aux.iter().map(|a| a.to_bytes().to_vec()).collect(),
     };
 }
 
+/// Why [`verenc_try_recover`] recovered no witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverError {
+    /// A key, point, scalar or list in the request is malformed.
+    Malformed,
+    /// The request is well formed, but no ciphertext decrypts to the
+    /// statement's witness.
+    NotRecovered,
+}
+
+/// The recovered witness bytes, or none when recovery fails for any
+/// reason ([`verenc_try_recover`] tells the reasons apart).
 pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
+    verenc_try_recover(recovery).unwrap_or_default()
+}
+
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
+pub fn verenc_try_recover(recovery: VerencDecrypt) -> Result<Vec<u8>, RecoverError> {
     let blinding_key = point_from_bytes(recovery.blinding_pubkey);
     if blinding_key.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let statement = point_from_bytes(recovery.statement);
     if statement.is_none() {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     if recovery.decryption_key.len() != 56 {
-        return vec![];
+        return Err(RecoverError::Malformed);
     }
 
     let decryption_key = Scalar::from_bytes(&recovery.decryption_key.try_into().unwrap());
@@ -406,27 +494,30 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     for c in recovery.ciphertexts.ctexts {
         let c1 = point_from_bytes(c.c1);
         if c1.is_none() {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         if c.c2.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let c2 = Scalar::from_bytes(&c.c2.try_into().unwrap());
-        ctexts.push(PKECipherText{c1: c1.unwrap(), c2: c2});
+        ctexts.push(PKECipherText {
+            c1: c1.unwrap(),
+            c2: c2,
+        });
     }
 
     for c in recovery.ciphertexts.aux {
         if c.len() != 56 {
-            return vec![];
+            return Err(RecoverError::Malformed);
         }
 
         let a = Scalar::from_bytes(&c.try_into().unwrap());
         aux.push(a);
     }
 
-    let ve_ct = RDkgithCipherText{
+    let ve_ct = RDkgithCipherText {
         ctexts: ctexts,
         aux: aux,
     };
@@ -434,10 +525,14 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let params = CurveParams::init(blinding_key.unwrap());
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
-    let vparams = RDkgithParams{ N, t, n };
-    let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
-    let wit_recover = ve.recover(&statement.unwrap(), &decryption_key, &ve_ct);
-    return wit_recover.to_bytes().to_vec();
+    let vparams = RDkgithParams { N, t, n };
+    let ve = RDkgith::setup(&params, &vparams, pke.clone());
+    let short = ve_ct.ctexts.len() < n || ve_ct.aux.len() < n;
+    match ve.recover(&statement.unwrap(), &decryption_key, &ve_ct) {
+        Some(witness) => Ok(witness.to_bytes().to_vec()),
+        None if short => Err(RecoverError::Malformed),
+        None => Err(RecoverError::NotRecovered),
+    }
 }
 
 pub fn chunk_data_for_verenc(data: Vec<u8>) -> Vec<Vec<u8>> {
@@ -448,18 +543,22 @@ pub fn combine_chunked_data(chunks: Vec<Vec<u8>>) -> Vec<u8> {
     return decode_from_curve448_scalars(&chunks);
 }
 
-pub fn verenc_verify_statement(input: Vec<u8>, blinding_pubkey: Vec<u8>, statement: Vec<u8>) -> bool {
-  if input.len() != 56 || blinding_pubkey.len() != 57 || statement.len() != 57 {
-    return false
-  }
-  
-  let blind = point_from_bytes(blinding_pubkey);
-  if blind.is_none() {
-    return false;
-  }
+pub fn verenc_verify_statement(
+    input: Vec<u8>,
+    blinding_pubkey: Vec<u8>,
+    statement: Vec<u8>,
+) -> bool {
+    if input.len() != 56 || blinding_pubkey.len() != 57 || statement.len() != 57 {
+        return false;
+    }
 
-  let st = blind.unwrap() * Scalar::from_bytes(input.as_slice().try_into().unwrap());
-  return st.compress().to_bytes().to_vec() == statement;
+    let blind = point_from_bytes(blinding_pubkey);
+    if blind.is_none() {
+        return false;
+    }
+
+    let st = blind.unwrap() * Scalar::from_bytes(input.as_slice().try_into().unwrap());
+    return st.compress().to_bytes().to_vec() == statement;
 }
 
 #[cfg(test)]
@@ -470,18 +569,25 @@ mod tests {
 
     #[test]
     fn test_verenc() {
-        let data = vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0];
+        let data = vec![
+            'h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let proof = new_verenc_proof(data.clone());
         let proofdata = proof.clone();
-        let pubproof = VerencProof { blinding_pubkey: proof.blinding_pubkey, encryption_key: proof.encryption_key, statement: proof.statement, challenge: proof.challenge, polycom: proof.polycom, ctexts: proof.ctexts, shares_rands: proof.shares_rands };
+        let pubproof = VerencProof {
+            blinding_pubkey: proof.blinding_pubkey,
+            encryption_key: proof.encryption_key,
+            statement: proof.statement,
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        };
         assert!(verenc_verify(pubproof.clone()));
         let compressed = verenc_compress(pubproof);
-        let result = verenc_recover(VerencDecrypt{
+        let result = verenc_recover(VerencDecrypt {
             blinding_pubkey: proofdata.blinding_pubkey,
             decryption_key: proof.decryption_key,
             statement: proofdata.statement,
@@ -493,25 +599,25 @@ mod tests {
 
     #[test]
     fn test_chunking() {
-        let mut roundcheck: [u8; 1266] = [0u8;1266];
+        let mut roundcheck: [u8; 1266] = [0u8; 1266];
         OsRng::fill_bytes(&mut OsRng, &mut roundcheck);
         let rndch = chunk_data_for_verenc(roundcheck.to_vec());
         assert!(rndch.len() == 24);
-        for i in 0..1000 {
-            let mut data: [u8; 1265] = [0u8;1265];
+        for _i in 0..1000 {
+            let mut data: [u8; 1265] = [0u8; 1265];
             OsRng::fill_bytes(&mut OsRng, &mut data);
             let chunks = chunk_data_for_verenc(data.to_vec());
             assert!(chunks.len() == 23);
             for chunk in chunks.clone() {
-              let scalar_chunk = Scalar::from_bytes(&chunk.clone().try_into().unwrap());
-              assert!(scalar_chunk.to_bytes().to_vec() == chunk);
-              assert!(chunk[55] == 0);
+                let scalar_chunk = Scalar::from_bytes(&chunk.clone().try_into().unwrap());
+                assert!(scalar_chunk.to_bytes().to_vec() == chunk);
+                assert!(chunk[55] == 0);
             }
 
             let result = combine_chunked_data(chunks);
             let mut padded_data = data.to_vec();
             while result.len() > padded_data.len() {
-              padded_data.push(0);
+                padded_data.push(0);
             }
             assert!(padded_data == result);
         }
@@ -519,32 +625,157 @@ mod tests {
 
     #[test]
     fn test_full_verenc() {
-        let mut data: [u8; 110] = [0u8;110];
+        let mut data: [u8; 110] = [0u8; 110];
         OsRng::fill_bytes(&mut OsRng, &mut data);
         let chunks = chunk_data_for_verenc(data.to_vec());
         for chunk in chunks.clone() {
-          let proof = new_verenc_proof(chunk.clone());
-          let blind = Scalar::from_bytes(proof.blinding_key.as_slice().try_into().unwrap());
-          let st = EdwardsPoint::GENERATOR * blind * Scalar::from_bytes(chunk.as_slice().try_into().unwrap());
-          assert!(st.compress().to_bytes().to_vec() == proof.statement);
-          let proofdata = proof.clone();
-          let pubproof = VerencProof { blinding_pubkey: proof.blinding_pubkey, encryption_key: proof.encryption_key, statement: proof.statement, challenge: proof.challenge, polycom: proof.polycom, ctexts: proof.ctexts, shares_rands: proof.shares_rands };
-          assert!(verenc_verify(pubproof.clone()));
-          let compressed = verenc_compress(pubproof);
-          let result = verenc_recover(VerencDecrypt{
-              blinding_pubkey: proofdata.blinding_pubkey,
-              decryption_key: proof.decryption_key,
-              statement: proofdata.statement,
-              ciphertexts: compressed,
-          });
+            let proof = new_verenc_proof(chunk.clone());
+            let blind = Scalar::from_bytes(proof.blinding_key.as_slice().try_into().unwrap());
+            let st = EdwardsPoint::GENERATOR
+                * blind
+                * Scalar::from_bytes(chunk.as_slice().try_into().unwrap());
+            assert!(st.compress().to_bytes().to_vec() == proof.statement);
+            let proofdata = proof.clone();
+            let pubproof = VerencProof {
+                blinding_pubkey: proof.blinding_pubkey,
+                encryption_key: proof.encryption_key,
+                statement: proof.statement,
+                challenge: proof.challenge,
+                polycom: proof.polycom,
+                ctexts: proof.ctexts,
+                shares_rands: proof.shares_rands,
+            };
+            assert!(verenc_verify(pubproof.clone()));
+            let compressed = verenc_compress(pubproof);
+            let result = verenc_recover(VerencDecrypt {
+                blinding_pubkey: proofdata.blinding_pubkey,
+                decryption_key: proof.decryption_key,
+                statement: proofdata.statement,
+                ciphertexts: compressed,
+            });
 
-          assert!(chunk == result);
+            assert!(chunk == result);
         }
         let result = combine_chunked_data(chunks);
         let mut padded_data = data.to_vec();
         while result.len() > padded_data.len() {
-          padded_data.push(0);
+            padded_data.push(0);
         }
         assert!(padded_data == result);
+    }
+
+    /// A proof of `data` and the matching recovery request.
+    fn recovery_of(data: &[u8]) -> VerencDecrypt {
+        let mut chunk = data.to_vec();
+        chunk.resize(56, 0);
+        let proof = new_verenc_proof(chunk);
+        let compressed = verenc_compress(VerencProof {
+            blinding_pubkey: proof.blinding_pubkey.clone(),
+            encryption_key: proof.encryption_key,
+            statement: proof.statement.clone(),
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        });
+        VerencDecrypt {
+            blinding_pubkey: proof.blinding_pubkey,
+            decryption_key: proof.decryption_key,
+            statement: proof.statement,
+            ciphertexts: compressed,
+        }
+    }
+
+    #[test]
+    fn a_failed_recovery_returns_no_bytes() {
+        let mut request = recovery_of(b"hello");
+        request.decryption_key = recovery_of(b"other").decryption_key;
+        let result = verenc_recover(request);
+        assert!(
+            result.is_empty(),
+            "a failed recovery returned {} bytes",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_too_few_ciphertexts() {
+        let request = recovery_of(b"hello");
+        let mut few_ctexts = request.clone();
+        few_ctexts.ciphertexts.ctexts.clear();
+        let mut few_aux = request;
+        few_aux.ciphertexts.aux.clear();
+        for short in [few_ctexts, few_aux] {
+            let result = std::panic::catch_unwind(|| verenc_recover(short));
+            assert!(
+                matches!(&result, Ok(bytes) if bytes.is_empty()),
+                "recovery of a short ciphertext list did not refuse it"
+            );
+        }
+    }
+
+    /// A proof of a one-byte witness, as `verenc_verify` and
+    /// `verenc_compress` take it.
+    fn proof() -> VerencProof {
+        let mut chunk = vec![0u8; 56];
+        chunk[0] = 1;
+        let proof = new_verenc_proof(chunk);
+        VerencProof {
+            blinding_pubkey: proof.blinding_pubkey,
+            encryption_key: proof.encryption_key,
+            statement: proof.statement,
+            challenge: proof.challenge,
+            polycom: proof.polycom,
+            ctexts: proof.ctexts,
+            shares_rands: proof.shares_rands,
+        }
+    }
+
+    #[test]
+    fn verification_refuses_a_short_polynomial_commitment() {
+        let mut short = proof();
+        assert!(verenc_verify(short.clone()), "the untouched proof fails");
+        short.polycom.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_verify(short));
+        assert!(
+            matches!(result, Ok(false)),
+            "verification of a short polynomial commitment did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_a_short_challenge() {
+        let mut short = proof();
+        assert!(short.challenge.len() > 16, "the challenge is already short");
+        short.challenge.truncate(16);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of a short challenge did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_ciphertexts() {
+        let mut short = proof();
+        assert!(!short.ctexts.is_empty(), "the proof has no ciphertexts");
+        short.ctexts.truncate(1);
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few ciphertexts did not refuse it"
+        );
+    }
+
+    #[test]
+    fn compression_refuses_too_few_shares() {
+        let mut short = proof();
+        assert!(!short.shares_rands.is_empty(), "the proof has no shares");
+        short.shares_rands.pop();
+        let result = std::panic::catch_unwind(|| verenc_compress(short));
+        assert!(
+            matches!(&result, Ok(c) if c.ctexts.is_empty() && c.aux.is_empty()),
+            "compression of too few shares did not refuse it"
+        );
     }
 }

@@ -17,3 +17,6 @@ sha2 = "0.10"
 
 [build-dependencies]
 uniffi = { version = "0.28.3", features = ["build"] }
+
+[lints]
+workspace = true

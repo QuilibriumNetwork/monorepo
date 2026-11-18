@@ -15,8 +15,35 @@
 use super::proof_of_time::{iterate_squarings, serialize};
 use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, BigNumExt, ClassGroup};
 use sha2::{digest::FixedOutput, Digest, Sha256};
-use std::{cmp::Eq, collections::HashMap, hash::Hash, mem, u64, usize};
 use std::convert::TryInto;
+use std::{cmp::Eq, collections::HashMap, hash::Hash, mem};
+
+type NativeBigNum = <GmpClassGroup as ClassGroup>::BigNum;
+
+thread_local! {
+    static FRAME_DISCRIMINANT: std::cell::RefCell<Option<([u8; 32], NativeBigNum)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A proposer immediately verifies its own proof with the same challenge.
+/// Keep one 2048-bit frame discriminant per thread, keyed by all input bytes.
+/// Other sizes/challenge lengths bypass the cache so retained memory is bounded.
+fn frame_discriminant(challenge: &[u8], int_size_bits: u16) -> NativeBigNum {
+    if int_size_bits != 2048 || challenge.len() != 32 {
+        return super::create_discriminant(challenge, int_size_bits);
+    }
+    let key: [u8; 32] = challenge.try_into().unwrap();
+    FRAME_DISCRIMINANT.with(|cache| {
+        if let Some((prior, value)) = cache.borrow().as_ref() {
+            if *prior == key {
+                return value.clone();
+            }
+        }
+        let value: NativeBigNum = super::create_discriminant(challenge, int_size_bits);
+        *cache.borrow_mut() = Some((key, value.clone()));
+        value
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct WesolowskiVDF {
@@ -47,7 +74,9 @@ impl super::VDF for WesolowskiVDF {
                 <GmpClassGroup as ClassGroup>::BigNum,
                 GmpClassGroup,
             >(
-                challenge, difficulty as usize, self.int_size_bits
+                frame_discriminant(challenge, self.int_size_bits),
+                difficulty as usize,
+                self.int_size_bits,
             ))
         }
     }
@@ -58,13 +87,8 @@ impl super::VDF for WesolowskiVDF {
         difficulty: u64,
         alleged_solution: &[u8],
     ) -> Result<(), super::InvalidProof> {
-        check_proof_of_time_wesolowski::<<GmpClassGroup as ClassGroup>::BigNum, GmpClassGroup>(
-            challenge,
-            alleged_solution,
-            difficulty,
-            self.int_size_bits,
-        )
-        .map_err(|()| super::InvalidProof)
+        check_proof_of_time_wesolowski(challenge, alleged_solution, difficulty, self.int_size_bits)
+            .map_err(|()| super::InvalidProof)
     }
 }
 /// To quote the original Python code:
@@ -106,55 +130,55 @@ fn u64_to_bytes(q: u64) -> [u8; 8] {
 ///
 /// > Commit to a list of IDs so order cannot be mutated by the aggregator.
 pub fn commit_ids(ids: &[impl AsRef<[u8]>]) -> [u8; 32] {
-  let mut ids_sorted: Vec<&[u8]> = ids.iter().map(|x| x.as_ref()).collect();
-  ids_sorted.sort_unstable();
-  let mut hasher = Sha256::new();
-  hasher.input(b"wesolowski-ids-multicommit");
-  for id in ids_sorted {
-      hasher.input((id.len() as u64).to_be_bytes());
-      hasher.input(id);
-  }
-  hasher.fixed_result().into()
+    let mut ids_sorted: Vec<&[u8]> = ids.iter().map(|x| x.as_ref()).collect();
+    ids_sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.input(b"wesolowski-ids-multicommit");
+    for id in ids_sorted {
+        hasher.input((id.len() as u64).to_be_bytes());
+        hasher.input(id);
+    }
+    hasher.fixed_result().into()
 }
 
 /// Quote:
 ///
 /// > Creates a random prime based on input challenge and ids_commitment.
 pub fn hash_prime_fixed<T: BigNum>(
-  challenge: &[u8],
-  int_size_bits: u16,
-  t: u64,
-  ids_commitment: &[u8; 32],
+    challenge: &[u8],
+    int_size_bits: u16,
+    t: u64,
+    ids_commitment: &[u8; 32],
 ) -> T {
-  let mut j = 0u64;
-  loop {
-      let mut hasher = Sha256::new();
-      hasher.input(b"wesolowski-fixed-multicommit");
-      hasher.input(challenge);
-      hasher.input(int_size_bits.to_be_bytes());
-      hasher.input(u64_to_bytes(t));
-      hasher.input(ids_commitment);
-      hasher.input(u64_to_bytes(j));
-      let n = T::from(&hasher.fixed_result()[..16]);
-      if n.probab_prime(1) {
-          break n;
-      }
-      j += 1;
-  }
+    let mut j = 0u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.input(b"wesolowski-fixed-multicommit");
+        hasher.input(challenge);
+        hasher.input(int_size_bits.to_be_bytes());
+        hasher.input(u64_to_bytes(t));
+        hasher.input(ids_commitment);
+        hasher.input(u64_to_bytes(j));
+        let n = T::from(&hasher.fixed_result()[..16]);
+        if n.probab_prime(1) {
+            break n;
+        }
+        j += 1;
+    }
 }
 
 pub fn hash_to_exponent<T: BigNum>(challenge: &[u8], id: &[u8]) -> T {
-  let mut hasher = Sha256::new();
-  hasher.input(b"wesolowski-exp-multicommit");
-  hasher.input(challenge);
-  hasher.input((id.len() as u64).to_be_bytes());
-  hasher.input(id);
-  let bytes = hasher.fixed_result();
-  let mut val = T::from(&bytes[..]);
-  if val == T::from(0u64) {
-      val = T::from(1u64);
-  }
-  val
+    let mut hasher = Sha256::new();
+    hasher.input(b"wesolowski-exp-multicommit");
+    hasher.input(challenge);
+    hasher.input((id.len() as u64).to_be_bytes());
+    hasher.input(id);
+    let bytes = hasher.fixed_result();
+    let mut val = T::from(&bytes[..]);
+    if val == T::from(0u64) {
+        val = T::from(1u64);
+    }
+    val
 }
 
 /// Quote:
@@ -279,7 +303,7 @@ where
         .expect(super::INCORRECT_BUFFER_SIZE);
     let b = hash_prime(
         &[&x_buf[..], &y_buf[..]],
-        iterations.try_into().expect("iterations fit into u32")
+        iterations.try_into().expect("iterations fit into u32"),
     );
     eval_optimized(&x, &b, iterations as _, k, l, powers)
 }
@@ -301,7 +325,7 @@ pub fn verify_proof<T: BigNum, V: ClassGroup<BigNum = T>>(
         .expect(super::INCORRECT_BUFFER_SIZE);
     let b = hash_prime(
         &[&x_buf[..], &y_buf[..]],
-        t.try_into().expect("iterations fit into u32")
+        t.try_into().expect("iterations fit into u32"),
     );
     let mut r = T::from(0);
     r.mod_powm(&T::from(2u64), &T::from(t), &b);
@@ -316,7 +340,7 @@ pub fn verify_proof<T: BigNum, V: ClassGroup<BigNum = T>>(
 }
 
 pub fn create_proof_of_time_wesolowski<T: BigNumExt, V: ClassGroup<BigNum = T> + Eq + Hash>(
-    challenge: &[u8],
+    discriminant: T,
     iterations: usize,
     int_size_bits: u16,
 ) -> Vec<u8>
@@ -324,7 +348,6 @@ where
     for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
     for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
 {
-    let discriminant = super::create_discriminant::create_discriminant(&challenge, int_size_bits);
     let x = V::from_ab_discriminant(2.into(), 1.into(), discriminant);
     assert!((iterations as u128) < (1u128 << 53));
     let (l, k, _) = approximate_parameters(iterations as f64);
@@ -340,17 +363,36 @@ where
     serialize(&[proof], &powers[&(iterations as _)], int_size_bits.into())
 }
 
-pub fn check_proof_of_time_wesolowski<T: BigNum, V: ClassGroup<BigNum = T>>(
+pub fn check_proof_of_time_wesolowski(
     challenge: &[u8],
     proof_blob: &[u8],
     iterations: u64,
     int_size_bits: u16,
-) -> Result<(), ()>
-where
-    T: BigNumExt,
-{
-    let discriminant: T = super::create_discriminant::create_discriminant(challenge, int_size_bits);
-    let x = V::from_ab_discriminant(2.into(), 1.into(), discriminant.clone());
+) -> Result<(), ()> {
+    // SECURITY: a decoded proof/output form can be degenerate (e.g. `a == 0`) and
+    // panic deep in the class-group arithmetic on a `Mpz` division. This verify is
+    // on the synchronous consensus/frame-acceptance path with no upstream
+    // `catch_unwind`, so an attacker-crafted frame output could otherwise crash
+    // the validating task / poison a lock. Verification is a pure function of the
+    // inputs, so a caught panic is simply a verification failure.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_proof_of_time_wesolowski_inner(
+            frame_discriminant(challenge, int_size_bits),
+            proof_blob,
+            iterations,
+            int_size_bits,
+        )
+    }))
+    .unwrap_or(Err(()))
+}
+
+fn check_proof_of_time_wesolowski_inner(
+    discriminant: NativeBigNum,
+    proof_blob: &[u8],
+    iterations: u64,
+    int_size_bits: u16,
+) -> Result<(), ()> {
+    let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), discriminant.clone());
     if (usize::MAX - 16) < int_size_bits.into() {
         return Err(());
     }
@@ -359,24 +401,33 @@ where
         return Err(());
     }
     let (result_bytes, proof_bytes) = proof_blob.split_at(2 * int_size);
-    let proof = ClassGroup::from_bytes(proof_bytes, discriminant.clone());
-    let y = ClassGroup::from_bytes(result_bytes, discriminant);
+    let proof = GmpClassGroup::from_bytes(proof_bytes, discriminant.clone());
+    let y = GmpClassGroup::from_bytes(result_bytes, discriminant);
+    // An honest output and proof always decode to well-formed forms. Reject
+    // anything else before arithmetic; see `GmpClassGroup::is_well_formed`.
+    if !proof.is_well_formed() || !y.is_well_formed() {
+        return Err(());
+    }
 
     verify_proof(x, &y, proof, iterations, int_size_bits.into())
 }
 
-pub fn generate_proof_with_fixed_b<U, T: BigNumExt, V: ClassGroup<BigNum = T> + Eq + std::hash::Hash>(
-  x: &V,
-  iterations: u64,
-  k: u8,
-  l: usize,
-  powers: &U,
-  b: &T,
+pub fn generate_proof_with_fixed_b<
+    U,
+    T: BigNumExt,
+    V: ClassGroup<BigNum = T> + Eq + std::hash::Hash,
+>(
+    x: &V,
+    iterations: u64,
+    k: u8,
+    l: usize,
+    powers: &U,
+    b: &T,
 ) -> V
 where
-  U: for<'a> std::ops::Index<&'a u64, Output = V>,
+    U: for<'a> std::ops::Index<&'a u64, Output = V>,
 {
-  eval_optimized(x, b, iterations as _, k, l, powers)
+    eval_optimized(x, b, iterations as _, k, l, powers)
 }
 
 /// Per-worker proof on a distinct ID-bound base x_i = x^{h_i}.
@@ -384,76 +435,85 @@ where
 ///   y_i  = x_i^{2^t}
 ///   pi_i = x_i^{ floor(2^t / b) }  (Wesolowski quotient for fixed 'b')
 pub fn worker_prove_id_bound<TN, V>(
-  challenge: &[u8],
-  int_size_bits: u16,
-  iterations: u64,
-  id: &[u8],
-  b: &TN,
+    challenge: &[u8],
+    int_size_bits: u16,
+    iterations: u64,
+    id: &[u8],
+    b: &TN,
 ) -> (V /* y_i */, V /* pi_i */)
 where
-  TN: BigNumExt,
-  V: ClassGroup<BigNum = TN> + Eq + std::hash::Hash + Clone,
-  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
-  for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
+    TN: BigNumExt,
+    V: ClassGroup<BigNum = TN> + Eq + std::hash::Hash + Clone,
+    for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+    for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
 {
-  // Canonical base for discriminant
-  let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
-  let mut x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+    // Canonical base for discriminant
+    let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
+    let mut x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
 
-  // Distinct base: x_i = x^{h_i}
-  let h_i = hash_to_exponent::<TN>(challenge, id);
-  x.pow(h_i.clone());
-  let (l, k, _) = approximate_parameters(iterations as f64);
-  let q = l.checked_mul(k as _).expect("k*l overflow");
+    // Distinct base: x_i = x^{h_i}
+    let h_i = hash_to_exponent::<TN>(challenge, id);
+    x.pow(h_i.clone());
+    let (l, k, _) = approximate_parameters(iterations as f64);
+    let q = l.checked_mul(k as _).expect("k*l overflow");
 
-  // Squaring checkpoints (as in create_proof_of_time_wesolowski, but for x_i)
-  let powers = iterate_squarings(
-      x.clone(),
-      (0..= (iterations as usize)/q + 1)
-          .map(|i| (i * q) as u64)
-          .chain(Some(iterations)),
-  );
+    // Squaring checkpoints (as in create_proof_of_time_wesolowski, but for x_i)
+    let powers = iterate_squarings(
+        x.clone(),
+        (0..=(iterations as usize) / q + 1)
+            .map(|i| (i * q) as u64)
+            .chain(Some(iterations)),
+    );
 
-  let y_i  = powers[&iterations].clone();
-  let pi_i = generate_proof_with_fixed_b(&x, iterations, k, l, &powers, b);
-  (y_i, pi_i)
+    let y_i = powers[&iterations].clone();
+    let pi_i = generate_proof_with_fixed_b(&x, iterations, k, l, &powers, b);
+    (y_i, pi_i)
 }
 
+// ID-bound proof aggregation: implemented and unit-testable, but no caller
+// in this workspace produces multi-worker parts yet. Kept so the scheme
+// stays reviewable alongside the single-prover path above.
+#[allow(dead_code)]
 pub struct Aggregated<V: ClassGroup, T: BigNum> {
-  pub y_agg: V,              // ∏ y_i
-  pub pi_agg: V,             // ∏ pi_i
-  pub ids_commitment: [u8; 32],
-  pub m: u64,                // number of parts aggregated (optional metadata)
-  pub _phantom_b: std::marker::PhantomData<T>,
+    pub y_agg: V,  // ∏ y_i
+    pub pi_agg: V, // ∏ pi_i
+    pub ids_commitment: [u8; 32],
+    pub m: u64, // number of parts aggregated (optional metadata)
+    pub _phantom_b: std::marker::PhantomData<T>,
 }
 
+#[allow(dead_code)] // see the note on `Aggregated`
 pub fn aggregate_worker_parts<V, T>(parts: &[(V, V)], ids_commitment: [u8; 32]) -> Aggregated<V, T>
 where
-  V: ClassGroup<BigNum = T> + Clone,
-  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
-  T: BigNum,
+    V: ClassGroup<BigNum = T> + Clone,
+    for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+    T: BigNum,
 {
-  assert!(!parts.is_empty());
-  let id_elem = parts[0].0.identity();
-  let mut y_agg  = id_elem.clone();
-  let mut pi_agg = id_elem;
+    assert!(!parts.is_empty());
+    let id_elem = parts[0].0.identity();
+    let mut y_agg = id_elem.clone();
+    let mut pi_agg = id_elem;
 
-  for (y_i, pi_i) in parts {
-      y_agg  = &y_agg  * y_i;
-      pi_agg = &pi_agg * pi_i;
-  }
+    for (y_i, pi_i) in parts {
+        y_agg = &y_agg * y_i;
+        pi_agg = &pi_agg * pi_i;
+    }
 
-  Aggregated {
-      y_agg,
-      pi_agg,
-      ids_commitment,
-      m: parts.len() as u64,
-      _phantom_b: std::marker::PhantomData,
-  }
+    Aggregated {
+        y_agg,
+        pi_agg,
+        ids_commitment,
+        m: parts.len() as u64,
+        _phantom_b: std::marker::PhantomData,
+    }
 }
 
-pub fn serialize_aggregated<V: ClassGroup>(agg: &Aggregated<V, V::BigNum>, int_size_bits: usize) -> Vec<u8> {
-  super::proof_of_time::serialize(&[agg.pi_agg.clone()], &agg.y_agg, int_size_bits)
+#[allow(dead_code)] // see the note on `Aggregated`
+pub fn serialize_aggregated<V: ClassGroup>(
+    agg: &Aggregated<V, V::BigNum>,
+    int_size_bits: usize,
+) -> Vec<u8> {
+    super::proof_of_time::serialize(&[agg.pi_agg.clone()], &agg.y_agg, int_size_bits)
 }
 
 /// Verify a single aggregated proof built from ID-bound bases.
@@ -468,48 +528,120 @@ pub fn serialize_aggregated<V: ClassGroup>(agg: &Aggregated<V, V::BigNum>, int_s
 ///   b = HashPrimeFixed(challenge, int_size_bits, t, commit_ids(ids))
 ///   r = 2^t mod b
 ///   S = sum_i HashToExponent(challenge, id_i)
+#[allow(dead_code)] // see the note on `Aggregated`
 pub fn verify_aggregated<TN, V>(
-  challenge: &[u8],
-  int_size_bits: u16,
-  iterations: u64,
-  ids: &[impl AsRef<[u8]>],
-  y_agg: &V,
-  pi_agg: &V,
+    challenge: &[u8],
+    int_size_bits: u16,
+    iterations: u64,
+    ids: &[impl AsRef<[u8]>],
+    y_agg: &V,
+    pi_agg: &V,
 ) -> Result<(), ()>
 where
-  TN: BigNumExt,
-  V: ClassGroup<BigNum = TN> + Clone + Eq,
-  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
-  for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
+    TN: BigNumExt,
+    V: ClassGroup<BigNum = TN> + Clone + Eq,
+    for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+    for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
 {
-  // canonical base 'x' for the discriminant
-  let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
-  let x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+    // canonical base 'x' for the discriminant
+    let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
+    let x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
 
-  // derive shared prime 'b' from the committed ID set
-  let ids_commitment = commit_ids(ids);
-  let b = hash_prime_fixed::<TN>(challenge, int_size_bits, iterations, &ids_commitment);
+    // derive shared prime 'b' from the committed ID set
+    let ids_commitment = commit_ids(ids);
+    let b = hash_prime_fixed::<TN>(challenge, int_size_bits, iterations, &ids_commitment);
 
-  // r = 2^t mod b
-  let mut r = TN::from(0);
-  r.mod_powm(&TN::from(2u64), &TN::from(iterations), &b);
+    // r = 2^t mod b
+    let mut r = TN::from(0);
+    r.mod_powm(&TN::from(2u64), &TN::from(iterations), &b);
 
-  // S = sum_i h_i
-  let mut S = TN::from(0);
-  for id in ids {
-      let hi = hash_to_exponent::<TN>(challenge, id.as_ref());
-      S = S + hi;
-  }
+    // s_sum = sum_i h_i
+    let mut s_sum = TN::from(0);
+    for id in ids {
+        let hi = hash_to_exponent::<TN>(challenge, id.as_ref());
+        s_sum = s_sum + hi;
+    }
 
-  // lhs = pi_agg^b * x^{ r * S }
-  let mut lhs = pi_agg.clone();
-  lhs.pow(b.clone());
+    // lhs = pi_agg^b * x^{ r * S }
+    let mut lhs = pi_agg.clone();
+    lhs.pow(b.clone());
 
-  let rS = r * S;
-  let mut xrS = x.clone();
-  xrS.pow(rS);
+    let r_s = r * s_sum;
+    let mut x_rs = x.clone();
+    x_rs.pow(r_s);
 
-  lhs *= &xrS;
+    lhs *= &x_rs;
 
-  if &lhs == y_agg { Ok(()) } else { Err(()) }
+    if &lhs == y_agg {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
+
+    /// Bytes per coefficient, and per form, of a 2048-bit output.
+    const HALF: usize = 129;
+    const ELEMENT: usize = 2 * HALF;
+
+    #[test]
+    fn frame_discriminant_cache_matches_uncached_for_every_key() {
+        for (seed, bits, len) in [
+            (0, 2048, 32),
+            (1, 2048, 32),
+            (1, 1024, 32),
+            (1, 2048, 31),
+            (0, 2048, 32),
+        ] {
+            let challenge = vec![seed; len];
+            let expected: super::NativeBigNum = crate::create_discriminant(&challenge, bits);
+            assert_eq!(super::frame_discriminant(&challenge, bits), expected);
+            assert_eq!(super::frame_discriminant(&challenge, bits), expected);
+        }
+    }
+
+    #[test]
+    fn cached_discriminant_still_checks_the_proof_and_difficulty() {
+        let output = crate::wesolowski_solve(2048, &[0; 32], 50_000);
+        assert!(crate::wesolowski_verify(2048, &[0; 32], 50_000, &output));
+        assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_001, &output));
+        assert!(!crate::wesolowski_verify(
+            2048,
+            &[0; 32],
+            50_000,
+            &output[..515]
+        ));
+        // Use a different valid class-group element as the proof, keeping
+        // decoding and arithmetic valid while making the relation false.
+        let mut invalid = output.to_vec();
+        invalid.copy_within(..ELEMENT, ELEMENT);
+        assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_000, &invalid));
+    }
+
+    /// Without the decode check, a zero `a` in the proof aborts the process
+    /// with SIGFPE, and a sign-flipped `a` used to drive the native reducer
+    /// into an endless loop.
+    #[test]
+    fn verify_rejects_malformed_forms_before_arithmetic() {
+        let output = crate::wesolowski_solve(2048, &[0; 32], 50_000);
+        let discriminant: super::NativeBigNum = crate::create_discriminant(&[0; 32], 2048);
+        let decode = |bytes: &[u8]| GmpClassGroup::from_bytes(bytes, discriminant.clone());
+        for start in [0, ELEMENT] {
+            assert!(decode(&output[start..start + ELEMENT]).is_well_formed());
+            let mut zero_a = output.to_vec();
+            zero_a[start..start + HALF].fill(0);
+            let mut negative_a = output.to_vec();
+            negative_a[start] |= 0x80;
+            // b changes by two, so b² - D is no longer divisible by 4a.
+            let mut inexact = output.to_vec();
+            inexact[start + ELEMENT - 1] ^= 2;
+            for case in [zero_a, negative_a, inexact] {
+                assert!(!decode(&case[start..start + ELEMENT]).is_well_formed());
+                assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_000, &case));
+            }
+        }
+    }
 }

@@ -121,9 +121,8 @@ fn with_prefix(
         // Both sides should share their compressed prefix when in the
         // same logical position; if they diverge the extra nibbles are
         // logged through whichever side is longer.
-        let prefix = if l.prefix == r.prefix {
-            &l.prefix
-        } else if l.prefix.len() >= r.prefix.len() {
+        // Equal prefixes have equal lengths, so they take the first arm.
+        let prefix = if l.prefix.len() >= r.prefix.len() {
             &l.prefix
         } else {
             &r.prefix
@@ -302,7 +301,10 @@ mod tests {
             vec![(5, leaf_with_commitment(vec![0x22; 64]))],
         );
         let levels = compare_trees_at_height(Some(&left), Some(&right));
-        assert!(levels.len() >= 2, "expected at least 2 levels (root + child)");
+        assert!(
+            levels.len() >= 2,
+            "expected at least 2 levels (root + child)"
+        );
         // Root row records the root divergence.
         assert!(levels[0][0].differs);
         // Depth 1 row records the child-5 divergence with path [5].
@@ -323,10 +325,7 @@ mod tests {
         );
         let right = branch_with_children(
             vec![0xBB; 64],
-            vec![
-                (3, common_leaf),
-                (7, leaf_with_commitment(vec![0x55; 64])),
-            ],
+            vec![(3, common_leaf), (7, leaf_with_commitment(vec![0x55; 64]))],
         );
         let levels = compare_trees_at_height(Some(&left), Some(&right));
         let depth_one = &levels[1];

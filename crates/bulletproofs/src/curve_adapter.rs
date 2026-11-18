@@ -4,11 +4,11 @@ extern crate alloc;
 
 #[cfg(feature = "clear_on_drop")]
 use clear_on_drop::clear::Clear;
-use ed448_goldilocks_plus::elliptic_curve::hash2curve::ExpandMsgXmd;
-use ed448_goldilocks_plus::sha3::Sha3_256;
 use core::iter::Sum;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use digest::{ExtendableOutput, Input, XofReader};
+use ed448_goldilocks_plus::elliptic_curve::hash2curve::ExpandMsgXmd;
+use ed448_goldilocks_plus::sha3::Sha3_256;
 use ed448_goldilocks_plus::{
     CompressedDecaf, DecafPoint, Scalar as DecafScalar, ScalarBytes, WideScalarBytes,
 };
@@ -386,7 +386,7 @@ impl<'a> Sum<&'a Point> for Point {
 impl CompressedPoint {
     pub fn from_slice(bytes: &[u8]) -> Self {
         if bytes.len() != 56 {
-          return CompressedPoint(CompressedDecaf::IDENTITY)
+            return CompressedPoint(CompressedDecaf::IDENTITY);
         }
         let mut buf = [0u8; 56];
         buf[..56].copy_from_slice(&bytes[..56]);
@@ -494,14 +494,6 @@ impl Scalar {
 
     pub fn to_bytes(&self) -> [u8; 56] {
         self.0.to_bytes()
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        static mut CACHED_BYTES: [u8; 56] = [0u8; 56];
-        unsafe {
-            CACHED_BYTES.copy_from_slice(&self.0.to_bytes());
-            &CACHED_BYTES
-        }
     }
 
     pub fn zero() -> Self {

@@ -40,10 +40,7 @@ pub fn run_migrations(db: &rocksdb::DB, migrations: &[Migration]) -> Result<()> 
     }
 
     if stored_version == target_version {
-        info!(
-            version = target_version,
-            "database is up to date"
-        );
+        info!(version = target_version, "database is up to date");
         return Ok(());
     }
 
@@ -56,11 +53,7 @@ pub fn run_migrations(db: &rocksdb::DB, migrations: &[Migration]) -> Result<()> 
 
     for i in stored_version..target_version {
         let migration = &migrations[i as usize];
-        info!(
-            version = i + 1,
-            name = migration.name,
-            "applying migration"
-        );
+        info!(version = i + 1, name = migration.name, "applying migration");
 
         match (migration.apply)(db) {
             Ok(()) => {
@@ -148,9 +141,18 @@ mod tests {
     fn run_migrations_applies_all_pending() {
         let db = open_test_db();
         let migrations = vec![
-            Migration { name: "m1", apply: |_| Ok(()) },
-            Migration { name: "m2", apply: |_| Ok(()) },
-            Migration { name: "m3", apply: |_| Ok(()) },
+            Migration {
+                name: "m1",
+                apply: |_| Ok(()),
+            },
+            Migration {
+                name: "m2",
+                apply: |_| Ok(()),
+            },
+            Migration {
+                name: "m3",
+                apply: |_| Ok(()),
+            },
         ];
         run_migrations(&db, &migrations).unwrap();
         assert_eq!(get_migration_version(&db).unwrap(), 3);
@@ -159,14 +161,23 @@ mod tests {
     #[test]
     fn run_migrations_skips_already_applied() {
         let db = open_test_db();
-        let m1 = vec![Migration { name: "m1", apply: |_| Ok(()) }];
+        let m1 = vec![Migration {
+            name: "m1",
+            apply: |_| Ok(()),
+        }];
         run_migrations(&db, &m1).unwrap();
         assert_eq!(get_migration_version(&db).unwrap(), 1);
 
         // Add a second migration — only m2 should run
         let m2 = vec![
-            Migration { name: "m1", apply: |_| Ok(()) },
-            Migration { name: "m2", apply: |_| Ok(()) },
+            Migration {
+                name: "m1",
+                apply: |_| Ok(()),
+            },
+            Migration {
+                name: "m2",
+                apply: |_| Ok(()),
+            },
         ];
         run_migrations(&db, &m2).unwrap();
         assert_eq!(get_migration_version(&db).unwrap(), 2);
@@ -176,7 +187,10 @@ mod tests {
     fn run_migrations_rejects_downgrade() {
         let db = open_test_db();
         set_migration_version(&db, 10).unwrap();
-        let migrations = vec![Migration { name: "m1", apply: |_| Ok(()) }];
+        let migrations = vec![Migration {
+            name: "m1",
+            apply: |_| Ok(()),
+        }];
         let err = run_migrations(&db, &migrations).unwrap_err();
         assert!(err.to_string().contains("downgrade"));
     }
@@ -185,12 +199,18 @@ mod tests {
     fn run_migrations_stops_on_error() {
         let db = open_test_db();
         let migrations = vec![
-            Migration { name: "ok", apply: |_| Ok(()) },
+            Migration {
+                name: "ok",
+                apply: |_| Ok(()),
+            },
             Migration {
                 name: "fail",
                 apply: |_| Err(QuilError::Store("boom".into())),
             },
-            Migration { name: "never", apply: |_| Ok(()) },
+            Migration {
+                name: "never",
+                apply: |_| Ok(()),
+            },
         ];
         assert!(run_migrations(&db, &migrations).is_err());
         // Only the first migration should have been committed

@@ -120,7 +120,9 @@ where
     ///
     /// See [`OTESender`](super::ot::extension::OTESender) for explanation.
     #[must_use]
-    pub fn init_phase1(session_id: &[u8]) -> (OTReceiver, Vec<bool>, Vec<C::Scalar>, Vec<EncProof<C>>) {
+    pub fn init_phase1(
+        session_id: &[u8],
+    ) -> (OTReceiver, Vec<bool>, Vec<C::Scalar>, Vec<EncProof<C>>) {
         OTESender::init_phase1::<C>(session_id)
     }
 
@@ -150,7 +152,10 @@ where
         let mut counter = *nonce;
         for _ in 0..BATCH_SIZE {
             counter += C::Scalar::ONE;
-            public_gadget.push(hash_as_scalar::<C>(&scalar_to_bytes::<C>(&counter), session_id));
+            public_gadget.push(hash_as_scalar::<C>(
+                &scalar_to_bytes::<C>(&counter),
+                session_id,
+            ));
         }
 
         let mul_sender = MulSender {
@@ -238,7 +243,9 @@ where
 
         let ote_sid = ["OT Extension protocol".as_bytes(), session_id].concat();
 
-        let result = self.ote_sender.run::<C>(&ote_sid, OT_WIDTH, &correlations, data);
+        let result = self
+            .ote_sender
+            .run::<C>(&ote_sid, OT_WIDTH, &correlations, data);
 
         let ot_outputs: Vec<Vec<C::Scalar>>;
         let vector_of_tau: Vec<Vec<C::Scalar>>; // Used by the receiver to finish the OT protocol.
@@ -403,7 +410,10 @@ where
         let mut counter = *nonce;
         for _ in 0..BATCH_SIZE {
             counter += C::Scalar::ONE;
-            public_gadget.push(hash_as_scalar::<C>(&scalar_to_bytes::<C>(&counter), session_id));
+            public_gadget.push(hash_as_scalar::<C>(
+                &scalar_to_bytes::<C>(&counter),
+                session_id,
+            ));
         }
 
         let mul_receiver = MulReceiver {
@@ -631,7 +641,8 @@ mod tests {
         let (ot_sender, dlog_proof, nonce) = MulReceiver::<C>::init_phase1(&session_id);
 
         // Phase 1 - Sender
-        let (ot_receiver, correlation, vec_r, enc_proofs) = MulSender::<C>::init_phase1(&session_id);
+        let (ot_receiver, correlation, vec_r, enc_proofs) =
+            MulSender::<C>::init_phase1(&session_id);
 
         // Communication round
         // OT: Exchange the proofs and the seed.

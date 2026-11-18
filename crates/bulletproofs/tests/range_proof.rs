@@ -105,7 +105,10 @@ fn generate_test_vectors() {
     // generated reproducibly.
     let mut test_rng = ChaChaRng::from_seed([24u8; 32]);
 
-    let values: Vec<Scalar> = vec![0u64, 1, 2, 3, 4, 5, 6, 7].iter().map(|v| Scalar::from(*v)).collect();
+    let values: Vec<Scalar> = vec![0u64, 1, 2, 3, 4, 5, 6, 7]
+        .iter()
+        .map(|v| Scalar::from(*v))
+        .collect();
     let blindings = (0..8)
         .map(|_| Scalar::random(&mut test_rng))
         .collect::<Vec<_>>();

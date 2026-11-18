@@ -9,14 +9,12 @@ These notes explain how and why the proofs work:
 
 * [Inner product proof](::notes::inner_product_proof)
 * [Range proof](::notes::range_proof)
-* [Rank-1 constraint system proof](::notes::r1cs_proof)
 
 The description of what the protocols actually do is contained in these notes:
 
 * [`range_proof`](::range_proof): aggregated range proof protocol.
 * [`range_proof_mpc`](::range_proof_mpc): multi-party API for range proof aggregation.
 * [`inner_product_proof`](::inner_product_proof): inner product argument protocol.
-* [`r1cs`](::r1cs::notes): constraint system proof protocol.
 
 The types from the above modules are publicly re-exported from the crate root,
 so that the external documentation describes how to use the API, while the internal

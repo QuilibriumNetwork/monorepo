@@ -1,0 +1,1504 @@
+{
+  "source": "https://explorer-api.quilibrium.com",
+  "as_of_frame": 1002903,
+  "as_of_utc": "2026-11-04T13:41:20.356Z",
+  "note": "Reported live sizes and raw vertex-add counts, not exact canonical snapshot bytes. Shard active_seats are the effective summary census. Per-prover profiles retain raw active allocations on globally-active identities; the REST allocation rows omit epoch/eligibility and may include expired seats. Reads span a capture interval.",
+  "shards": [
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000530",
+      "live_bytes": 655728867,
+      "vertex_records": 986720,
+      "active_seats": 21
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d90005f8",
+      "live_bytes": 12344,
+      "vertex_records": 2,
+      "active_seats": 10
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900070c",
+      "live_bytes": 3344541858,
+      "vertex_records": 5033438,
+      "active_seats": 28
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000804",
+      "live_bytes": 1673413470,
+      "vertex_records": 2518084,
+      "active_seats": 28
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000805",
+      "live_bytes": 1674356540,
+      "vertex_records": 2519498,
+      "active_seats": 30
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000808",
+      "live_bytes": 1671696740,
+      "vertex_records": 2515735,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000809",
+      "live_bytes": 1670996014,
+      "vertex_records": 2514664,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900080a",
+      "live_bytes": 1673750197,
+      "vertex_records": 2518902,
+      "active_seats": 27
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900080b",
+      "live_bytes": 1673293168,
+      "vertex_records": 2518670,
+      "active_seats": 31
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900080e",
+      "live_bytes": 1672987988,
+      "vertex_records": 2517665,
+      "active_seats": 29
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900080f",
+      "live_bytes": 1674072414,
+      "vertex_records": 2518977,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900082b",
+      "live_bytes": 1673126822,
+      "vertex_records": 2518348,
+      "active_seats": 30
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090080",
+      "live_bytes": 836974898,
+      "vertex_records": 1259415,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090100",
+      "live_bytes": 836455314,
+      "vertex_records": 1258916,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090180",
+      "live_bytes": 835983708,
+      "vertex_records": 1258098,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090200",
+      "live_bytes": 838047036,
+      "vertex_records": 1260992,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090280",
+      "live_bytes": 837234330,
+      "vertex_records": 1259699,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090300",
+      "live_bytes": 836932992,
+      "vertex_records": 1259581,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090380",
+      "live_bytes": 837198244,
+      "vertex_records": 1259743,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090600",
+      "live_bytes": 836466958,
+      "vertex_records": 1258604,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090680",
+      "live_bytes": 837165386,
+      "vertex_records": 1259886,
+      "active_seats": 21
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090700",
+      "live_bytes": 837911364,
+      "vertex_records": 1260795,
+      "active_seats": 20
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900090780",
+      "live_bytes": 836658356,
+      "vertex_records": 1259000,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091000",
+      "live_bytes": 836770562,
+      "vertex_records": 1259192,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091100",
+      "live_bytes": 837318210,
+      "vertex_records": 1259818,
+      "active_seats": 27
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091180",
+      "live_bytes": 836397656,
+      "vertex_records": 1258576,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091200",
+      "live_bytes": 837706636,
+      "vertex_records": 1260494,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091280",
+      "live_bytes": 836144838,
+      "vertex_records": 1258303,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091300",
+      "live_bytes": 836517356,
+      "vertex_records": 1258773,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091380",
+      "live_bytes": 836467094,
+      "vertex_records": 1258781,
+      "active_seats": 22
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091400",
+      "live_bytes": 835677816,
+      "vertex_records": 1257698,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091480",
+      "live_bytes": 835039204,
+      "vertex_records": 1256867,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091500",
+      "live_bytes": 837418380,
+      "vertex_records": 1260244,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091600",
+      "live_bytes": 837435876,
+      "vertex_records": 1260285,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091680",
+      "live_bytes": 838612474,
+      "vertex_records": 1262080,
+      "active_seats": 29
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091700",
+      "live_bytes": 837306642,
+      "vertex_records": 1260014,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091780",
+      "live_bytes": 837027264,
+      "vertex_records": 1259701,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091800",
+      "live_bytes": 835560306,
+      "vertex_records": 1257362,
+      "active_seats": 28
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091880",
+      "live_bytes": 836470154,
+      "vertex_records": 1258953,
+      "active_seats": 27
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091900",
+      "live_bytes": 836519616,
+      "vertex_records": 1258767,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091980",
+      "live_bytes": 837388466,
+      "vertex_records": 1260336,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091c00",
+      "live_bytes": 836673510,
+      "vertex_records": 1259412,
+      "active_seats": 22
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091c80",
+      "live_bytes": 838422398,
+      "vertex_records": 1261641,
+      "active_seats": 28
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091e80",
+      "live_bytes": 836707419,
+      "vertex_records": 1259186,
+      "active_seats": 27
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091f00",
+      "live_bytes": 836306436,
+      "vertex_records": 1258470,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900091f80",
+      "live_bytes": 836224574,
+      "vertex_records": 1258353,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092000",
+      "live_bytes": 836180784,
+      "vertex_records": 1258150,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092100",
+      "live_bytes": 837174128,
+      "vertex_records": 1259646,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092180",
+      "live_bytes": 836514746,
+      "vertex_records": 1258722,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092200",
+      "live_bytes": 835235792,
+      "vertex_records": 1257003,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092280",
+      "live_bytes": 836899530,
+      "vertex_records": 1259585,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092300",
+      "live_bytes": 836420734,
+      "vertex_records": 1258435,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092380",
+      "live_bytes": 835725402,
+      "vertex_records": 1257732,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092400",
+      "live_bytes": 837206182,
+      "vertex_records": 1259824,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092480",
+      "live_bytes": 835535508,
+      "vertex_records": 1257423,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092500",
+      "live_bytes": 837356442,
+      "vertex_records": 1260089,
+      "active_seats": 27
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092580",
+      "live_bytes": 837278940,
+      "vertex_records": 1260034,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092600",
+      "live_bytes": 835542199,
+      "vertex_records": 1257201,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092680",
+      "live_bytes": 837319488,
+      "vertex_records": 1259935,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092700",
+      "live_bytes": 835759688,
+      "vertex_records": 1257792,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092780",
+      "live_bytes": 836025836,
+      "vertex_records": 1257970,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092800",
+      "live_bytes": 837020124,
+      "vertex_records": 1259254,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092880",
+      "live_bytes": 837790190,
+      "vertex_records": 1260873,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092900",
+      "live_bytes": 836809714,
+      "vertex_records": 1259365,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092980",
+      "live_bytes": 837310936,
+      "vertex_records": 1259738,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092a00",
+      "live_bytes": 836964592,
+      "vertex_records": 1259706,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092a80",
+      "live_bytes": 836787394,
+      "vertex_records": 1259232,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092c00",
+      "live_bytes": 836612845,
+      "vertex_records": 1259212,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092c80",
+      "live_bytes": 836204292,
+      "vertex_records": 1258607,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092d00",
+      "live_bytes": 837025608,
+      "vertex_records": 1259415,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092d80",
+      "live_bytes": 837222088,
+      "vertex_records": 1259917,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092e00",
+      "live_bytes": 837789400,
+      "vertex_records": 1260672,
+      "active_seats": 26
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092e80",
+      "live_bytes": 836899660,
+      "vertex_records": 1259286,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092f00",
+      "live_bytes": 835946554,
+      "vertex_records": 1257973,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d900092f80",
+      "live_bytes": 838043898,
+      "vertex_records": 1261117,
+      "active_seats": 28
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a0000",
+      "live_bytes": 418028782,
+      "vertex_records": 629204,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a0040",
+      "live_bytes": 418255350,
+      "vertex_records": 629155,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1080",
+      "live_bytes": 418685744,
+      "vertex_records": 630071,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a10c0",
+      "live_bytes": 419569568,
+      "vertex_records": 631310,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1580",
+      "live_bytes": 418822232,
+      "vertex_records": 630468,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a15c0",
+      "live_bytes": 418227790,
+      "vertex_records": 629397,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1a00",
+      "live_bytes": 418407980,
+      "vertex_records": 629592,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1a40",
+      "live_bytes": 419179116,
+      "vertex_records": 630768,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1a80",
+      "live_bytes": 418306786,
+      "vertex_records": 629562,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1ac0",
+      "live_bytes": 419105180,
+      "vertex_records": 630642,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1b00",
+      "live_bytes": 418923894,
+      "vertex_records": 630460,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1b40",
+      "live_bytes": 418663364,
+      "vertex_records": 630076,
+      "active_seats": 25
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1b80",
+      "live_bytes": 418670492,
+      "vertex_records": 630002,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1bc0",
+      "live_bytes": 418867966,
+      "vertex_records": 630177,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1e00",
+      "live_bytes": 417579726,
+      "vertex_records": 628421,
+      "active_seats": 22
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a1e40",
+      "live_bytes": 417489634,
+      "vertex_records": 628346,
+      "active_seats": 22
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a2080",
+      "live_bytes": 419331358,
+      "vertex_records": 631059,
+      "active_seats": 23
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000a20c0",
+      "live_bytes": 418629348,
+      "vertex_records": 629826,
+      "active_seats": 24
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d00",
+      "live_bytes": 104964353,
+      "vertex_records": 157882,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d10",
+      "live_bytes": 104103975,
+      "vertex_records": 156694,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d20",
+      "live_bytes": 104654205,
+      "vertex_records": 157553,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d30",
+      "live_bytes": 104278627,
+      "vertex_records": 156911,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d40",
+      "live_bytes": 105044893,
+      "vertex_records": 158042,
+      "active_seats": 18
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d50",
+      "live_bytes": 104167085,
+      "vertex_records": 156720,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d60",
+      "live_bytes": 104504805,
+      "vertex_records": 157328,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d70",
+      "live_bytes": 104657157,
+      "vertex_records": 157366,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d80",
+      "live_bytes": 104638495,
+      "vertex_records": 157499,
+      "active_seats": 15
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1d90",
+      "live_bytes": 104328427,
+      "vertex_records": 156986,
+      "active_seats": 15
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1da0",
+      "live_bytes": 104483119,
+      "vertex_records": 157265,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1db0",
+      "live_bytes": 104392835,
+      "vertex_records": 157083,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1dc0",
+      "live_bytes": 104892807,
+      "vertex_records": 157882,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1dd0",
+      "live_bytes": 104615693,
+      "vertex_records": 157495,
+      "active_seats": 17
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1de0",
+      "live_bytes": 104373589,
+      "vertex_records": 157031,
+      "active_seats": 16
+    },
+    {
+      "filter": "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9000c1df0",
+      "live_bytes": 104710901,
+      "vertex_records": 157539,
+      "active_seats": 19
+    }
+  ],
+  "provers": [
+    {
+      "seats": 32,
+      "live_bytes": 32963148274,
+      "vertex_records": 49605109
+    },
+    {
+      "seats": 28,
+      "live_bytes": 25858266771,
+      "vertex_records": 38913444
+    },
+    {
+      "seats": 98,
+      "live_bytes": 78575077032,
+      "vertex_records": 118244457
+    },
+    {
+      "seats": 109,
+      "live_bytes": 80983275865,
+      "vertex_records": 121868458
+    },
+    {
+      "seats": 23,
+      "live_bytes": 18330900020,
+      "vertex_records": 27585223
+    },
+    {
+      "seats": 18,
+      "live_bytes": 14976457492,
+      "vertex_records": 22538642
+    },
+    {
+      "seats": 31,
+      "live_bytes": 23350991114,
+      "vertex_records": 35140248
+    },
+    {
+      "seats": 31,
+      "live_bytes": 24196889522,
+      "vertex_records": 36413358
+    },
+    {
+      "seats": 16,
+      "live_bytes": 7668772072,
+      "vertex_records": 11540774
+    },
+    {
+      "seats": 70,
+      "live_bytes": 50972991823,
+      "vertex_records": 76706400
+    },
+    {
+      "seats": 18,
+      "live_bytes": 13415559117,
+      "vertex_records": 20188525
+    },
+    {
+      "seats": 9,
+      "live_bytes": 7766672296,
+      "vertex_records": 11687671
+    },
+    {
+      "seats": 7,
+      "live_bytes": 6095606923,
+      "vertex_records": 9173113
+    },
+    {
+      "seats": 94,
+      "live_bytes": 76062153850,
+      "vertex_records": 114463064
+    },
+    {
+      "seats": 107,
+      "live_bytes": 79308199115,
+      "vertex_records": 119347777
+    },
+    {
+      "seats": 81,
+      "live_bytes": 68115621396,
+      "vertex_records": 102504370
+    },
+    {
+      "seats": 59,
+      "live_bytes": 44287910630,
+      "vertex_records": 66645649
+    },
+    {
+      "seats": 31,
+      "live_bytes": 25749802736,
+      "vertex_records": 38750615
+    },
+    {
+      "seats": 32,
+      "live_bytes": 26699701214,
+      "vertex_records": 40180632
+    },
+    {
+      "seats": 31,
+      "live_bytes": 24711845394,
+      "vertex_records": 37187369
+    },
+    {
+      "seats": 92,
+      "live_bytes": 60908767624,
+      "vertex_records": 91658658
+    },
+    {
+      "seats": 55,
+      "live_bytes": 32243647134,
+      "vertex_records": 48522597
+    },
+    {
+      "seats": 23,
+      "live_bytes": 18749115393,
+      "vertex_records": 28215161
+    },
+    {
+      "seats": 22,
+      "live_bytes": 17496195068,
+      "vertex_records": 26329070
+    },
+    {
+      "seats": 31,
+      "live_bytes": 27021483863,
+      "vertex_records": 40663811
+    },
+    {
+      "seats": 63,
+      "live_bytes": 32449083820,
+      "vertex_records": 48830915
+    },
+    {
+      "seats": 31,
+      "live_bytes": 26284232814,
+      "vertex_records": 39554824
+    },
+    {
+      "seats": 92,
+      "live_bytes": 74293360427,
+      "vertex_records": 111800958
+    },
+    {
+      "seats": 109,
+      "live_bytes": 80983275865,
+      "vertex_records": 121868458
+    },
+    {
+      "seats": 27,
+      "live_bytes": 24496680065,
+      "vertex_records": 36864632
+    },
+    {
+      "seats": 6,
+      "live_bytes": 4182893946,
+      "vertex_records": 6295028
+    },
+    {
+      "seats": 108,
+      "live_bytes": 80327546998,
+      "vertex_records": 120881738
+    },
+    {
+      "seats": 33,
+      "live_bytes": 15996991563,
+      "vertex_records": 24073677
+    },
+    {
+      "seats": 108,
+      "live_bytes": 80327546998,
+      "vertex_records": 120881738
+    },
+    {
+      "seats": 51,
+      "live_bytes": 22584932118,
+      "vertex_records": 33987682
+    },
+    {
+      "seats": 108,
+      "live_bytes": 80327546998,
+      "vertex_records": 120881738
+    },
+    {
+      "seats": 13,
+      "live_bytes": 12969317199,
+      "vertex_records": 19516982
+    },
+    {
+      "seats": 12,
+      "live_bytes": 14741528860,
+      "vertex_records": 22184751
+    },
+    {
+      "seats": 20,
+      "live_bytes": 15684989214,
+      "vertex_records": 23604354
+    },
+    {
+      "seats": 23,
+      "live_bytes": 22577826770,
+      "vertex_records": 33977676
+    },
+    {
+      "seats": 16,
+      "live_bytes": 16321369092,
+      "vertex_records": 24561886
+    },
+    {
+      "seats": 28,
+      "live_bytes": 23634440079,
+      "vertex_records": 35564421
+    },
+    {
+      "seats": 4,
+      "live_bytes": 6693528822,
+      "vertex_records": 10072609
+    },
+    {
+      "seats": 63,
+      "live_bytes": 49164050606,
+      "vertex_records": 73984062
+    },
+    {
+      "seats": 11,
+      "live_bytes": 8050971590,
+      "vertex_records": 12116144
+    },
+    {
+      "seats": 16,
+      "live_bytes": 15054204615,
+      "vertex_records": 22654551
+    },
+    {
+      "seats": 7,
+      "live_bytes": 8781719247,
+      "vertex_records": 13216408
+    },
+    {
+      "seats": 79,
+      "live_bytes": 61504375311,
+      "vertex_records": 92555282
+    },
+    {
+      "seats": 31,
+      "live_bytes": 30121384577,
+      "vertex_records": 45329950
+    },
+    {
+      "seats": 2,
+      "live_bytes": 5015537872,
+      "vertex_records": 7548102
+    },
+    {
+      "seats": 27,
+      "live_bytes": 24469808629,
+      "vertex_records": 36824587
+    },
+    {
+      "seats": 31,
+      "live_bytes": 30627441535,
+      "vertex_records": 46091109
+    },
+    {
+      "seats": 23,
+      "live_bytes": 23010235493,
+      "vertex_records": 34627659
+    },
+    {
+      "seats": 15,
+      "live_bytes": 17986424089,
+      "vertex_records": 27067244
+    },
+    {
+      "seats": 47,
+      "live_bytes": 37969460253,
+      "vertex_records": 57138423
+    },
+    {
+      "seats": 46,
+      "live_bytes": 41535995896,
+      "vertex_records": 62506692
+    },
+    {
+      "seats": 31,
+      "live_bytes": 21958193734,
+      "vertex_records": 33044213
+    },
+    {
+      "seats": 16,
+      "live_bytes": 16319071583,
+      "vertex_records": 24558848
+    },
+    {
+      "seats": 11,
+      "live_bytes": 8680540329,
+      "vertex_records": 13063076
+    },
+    {
+      "seats": 96,
+      "live_bytes": 74573112405,
+      "vertex_records": 112222047
+    },
+    {
+      "seats": 92,
+      "live_bytes": 61506982503,
+      "vertex_records": 92557958
+    },
+    {
+      "seats": 9,
+      "live_bytes": 8676453639,
+      "vertex_records": 13056392
+    },
+    {
+      "seats": 16,
+      "live_bytes": 15474467252,
+      "vertex_records": 23288024
+    },
+    {
+      "seats": 8,
+      "live_bytes": 7532328166,
+      "vertex_records": 11334371
+    },
+    {
+      "seats": 56,
+      "live_bytes": 40074214383,
+      "vertex_records": 60305510
+    },
+    {
+      "seats": 22,
+      "live_bytes": 12658251465,
+      "vertex_records": 19047992
+    },
+    {
+      "seats": 70,
+      "live_bytes": 54811902317,
+      "vertex_records": 82483611
+    },
+    {
+      "seats": 8,
+      "live_bytes": 7949549182,
+      "vertex_records": 11962166
+    },
+    {
+      "seats": 8,
+      "live_bytes": 7948293675,
+      "vertex_records": 11960812
+    },
+    {
+      "seats": 13,
+      "live_bytes": 11087157816,
+      "vertex_records": 16685358
+    },
+    {
+      "seats": 31,
+      "live_bytes": 31057311959,
+      "vertex_records": 46737442
+    },
+    {
+      "seats": 8,
+      "live_bytes": 13383336813,
+      "vertex_records": 20141045
+    },
+    {
+      "seats": 26,
+      "live_bytes": 23846514936,
+      "vertex_records": 35885926
+    },
+    {
+      "seats": 23,
+      "live_bytes": 16724375246,
+      "vertex_records": 25169314
+    },
+    {
+      "seats": 29,
+      "live_bytes": 23115697405,
+      "vertex_records": 34784814
+    },
+    {
+      "seats": 31,
+      "live_bytes": 30645045215,
+      "vertex_records": 46117623
+    },
+    {
+      "seats": 19,
+      "live_bytes": 17680543801,
+      "vertex_records": 26605442
+    },
+    {
+      "seats": 11,
+      "live_bytes": 11718790960,
+      "vertex_records": 17635825
+    },
+    {
+      "seats": 18,
+      "live_bytes": 19659975866,
+      "vertex_records": 29586364
+    },
+    {
+      "seats": 15,
+      "live_bytes": 13918518321,
+      "vertex_records": 20945177
+    },
+    {
+      "seats": 31,
+      "live_bytes": 30953942106,
+      "vertex_records": 46581477
+    },
+    {
+      "seats": 16,
+      "live_bytes": 18412851998,
+      "vertex_records": 27708165
+    },
+    {
+      "seats": 25,
+      "live_bytes": 18927640254,
+      "vertex_records": 28482567
+    },
+    {
+      "seats": 23,
+      "live_bytes": 20912786996,
+      "vertex_records": 31471614
+    },
+    {
+      "seats": 9,
+      "live_bytes": 9199328812,
+      "vertex_records": 13844358
+    },
+    {
+      "seats": 26,
+      "live_bytes": 20605895780,
+      "vertex_records": 31009026
+    },
+    {
+      "seats": 25,
+      "live_bytes": 16933207824,
+      "vertex_records": 25483604
+    },
+    {
+      "seats": 86,
+      "live_bytes": 56484713283,
+      "vertex_records": 85000887
+    },
+    {
+      "seats": 7,
+      "live_bytes": 7529873228,
+      "vertex_records": 11330973
+    },
+    {
+      "seats": 31,
+      "live_bytes": 27818161082,
+      "vertex_records": 41863627
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2511241238,
+      "vertex_records": 3778479
+    },
+    {
+      "seats": 3,
+      "live_bytes": 4186218354,
+      "vertex_records": 6299147
+    },
+    {
+      "seats": 15,
+      "live_bytes": 17576183256,
+      "vertex_records": 26450743
+    },
+    {
+      "seats": 21,
+      "live_bytes": 15892832256,
+      "vertex_records": 23916344
+    },
+    {
+      "seats": 4,
+      "live_bytes": 4605389703,
+      "vertex_records": 6930482
+    },
+    {
+      "seats": 16,
+      "live_bytes": 11930228720,
+      "vertex_records": 17952947
+    },
+    {
+      "seats": 9,
+      "live_bytes": 7215392437,
+      "vertex_records": 10858789
+    },
+    {
+      "seats": 5,
+      "live_bytes": 7113422489,
+      "vertex_records": 10704197
+    },
+    {
+      "seats": 7,
+      "live_bytes": 5862315166,
+      "vertex_records": 8821608
+    },
+    {
+      "seats": 50,
+      "live_bytes": 29287025245,
+      "vertex_records": 44072779
+    },
+    {
+      "seats": 7,
+      "live_bytes": 8783949844,
+      "vertex_records": 13219144
+    },
+    {
+      "seats": 16,
+      "live_bytes": 15475339732,
+      "vertex_records": 23288107
+    },
+    {
+      "seats": 31,
+      "live_bytes": 27620637865,
+      "vertex_records": 41563612
+    },
+    {
+      "seats": 31,
+      "live_bytes": 29719276917,
+      "vertex_records": 44721499
+    },
+    {
+      "seats": 16,
+      "live_bytes": 14640610759,
+      "vertex_records": 22032590
+    },
+    {
+      "seats": 4,
+      "live_bytes": 5855055425,
+      "vertex_records": 8811381
+    },
+    {
+      "seats": 29,
+      "live_bytes": 26048804588,
+      "vertex_records": 39199159
+    },
+    {
+      "seats": 6,
+      "live_bytes": 6270254522,
+      "vertex_records": 9436537
+    },
+    {
+      "seats": 10,
+      "live_bytes": 9197449994,
+      "vertex_records": 13840951
+    },
+    {
+      "seats": 4,
+      "live_bytes": 4183182224,
+      "vertex_records": 6295061
+    },
+    {
+      "seats": 1,
+      "live_bytes": 1670996014,
+      "vertex_records": 2514664
+    },
+    {
+      "seats": 16,
+      "live_bytes": 14227460652,
+      "vertex_records": 21410494
+    },
+    {
+      "seats": 9,
+      "live_bytes": 8368689916,
+      "vertex_records": 12593386
+    },
+    {
+      "seats": 15,
+      "live_bytes": 11503887844,
+      "vertex_records": 17312106
+    },
+    {
+      "seats": 15,
+      "live_bytes": 12344378980,
+      "vertex_records": 18577462
+    },
+    {
+      "seats": 3,
+      "live_bytes": 3346047438,
+      "vertex_records": 5035960
+    },
+    {
+      "seats": 16,
+      "live_bytes": 13390282754,
+      "vertex_records": 20151069
+    },
+    {
+      "seats": 4,
+      "live_bytes": 4185193738,
+      "vertex_records": 6297810
+    },
+    {
+      "seats": 31,
+      "live_bytes": 25105537558,
+      "vertex_records": 37780742
+    },
+    {
+      "seats": 4,
+      "live_bytes": 4185445464,
+      "vertex_records": 6298028
+    },
+    {
+      "seats": 16,
+      "live_bytes": 13808309932,
+      "vertex_records": 20779691
+    },
+    {
+      "seats": 16,
+      "live_bytes": 12667479261,
+      "vertex_records": 19062495
+    },
+    {
+      "seats": 2,
+      "live_bytes": 2511983778,
+      "vertex_records": 3779772
+    },
+    {
+      "seats": 2,
+      "live_bytes": 2092894646,
+      "vertex_records": 3149445
+    },
+    {
+      "seats": 5,
+      "live_bytes": 5017622492,
+      "vertex_records": 7551593
+    },
+    {
+      "seats": 25,
+      "live_bytes": 19764145597,
+      "vertex_records": 29743458
+    },
+    {
+      "seats": 8,
+      "live_bytes": 7111019916,
+      "vertex_records": 10701927
+    },
+    {
+      "seats": 8,
+      "live_bytes": 6374582965,
+      "vertex_records": 9593598
+    },
+    {
+      "seats": 7,
+      "live_bytes": 6274974694,
+      "vertex_records": 9443796
+    },
+    {
+      "seats": 2,
+      "live_bytes": 2509936536,
+      "vertex_records": 3777713
+    },
+    {
+      "seats": 9,
+      "live_bytes": 7947362811,
+      "vertex_records": 11959498
+    },
+    {
+      "seats": 4,
+      "live_bytes": 3346421938,
+      "vertex_records": 5036078
+    },
+    {
+      "seats": 11,
+      "live_bytes": 9209488132,
+      "vertex_records": 13859382
+    },
+    {
+      "seats": 2,
+      "live_bytes": 1672921452,
+      "vertex_records": 2517388
+    },
+    {
+      "seats": 36,
+      "live_bytes": 23862797680,
+      "vertex_records": 35908229
+    },
+    {
+      "seats": 31,
+      "live_bytes": 25957395249,
+      "vertex_records": 39061218
+    },
+    {
+      "seats": 11,
+      "live_bytes": 9205615390,
+      "vertex_records": 13852698
+    },
+    {
+      "seats": 27,
+      "live_bytes": 19145407253,
+      "vertex_records": 28809989
+    },
+    {
+      "seats": 40,
+      "live_bytes": 29082034933,
+      "vertex_records": 43763266
+    },
+    {
+      "seats": 13,
+      "live_bytes": 10041747731,
+      "vertex_records": 15110907
+    },
+    {
+      "seats": 28,
+      "live_bytes": 17459541931,
+      "vertex_records": 26273208
+    },
+    {
+      "seats": 24,
+      "live_bytes": 18512109182,
+      "vertex_records": 27857836
+    },
+    {
+      "seats": 29,
+      "live_bytes": 21248947545,
+      "vertex_records": 31975589
+    },
+    {
+      "seats": 29,
+      "live_bytes": 17477753433,
+      "vertex_records": 26300689
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2511774628,
+      "vertex_records": 3779434
+    },
+    {
+      "seats": 1,
+      "live_bytes": 837234330,
+      "vertex_records": 1259699
+    },
+    {
+      "seats": 2,
+      "live_bytes": 1674239634,
+      "vertex_records": 2519595
+    },
+    {
+      "seats": 10,
+      "live_bytes": 7527528078,
+      "vertex_records": 11328548
+    },
+    {
+      "seats": 8,
+      "live_bytes": 5547991259,
+      "vertex_records": 8348090
+    },
+    {
+      "seats": 5,
+      "live_bytes": 4184669158,
+      "vertex_records": 6297066
+    },
+    {
+      "seats": 5,
+      "live_bytes": 2298867366,
+      "vertex_records": 3459451
+    },
+    {
+      "seats": 31,
+      "live_bytes": 21550796412,
+      "vertex_records": 32430373
+    },
+    {
+      "seats": 6,
+      "live_bytes": 3869703474,
+      "vertex_records": 5822907
+    },
+    {
+      "seats": 2,
+      "live_bytes": 1255321550,
+      "vertex_records": 1889036
+    },
+    {
+      "seats": 8,
+      "live_bytes": 6275396274,
+      "vertex_records": 9443413
+    },
+    {
+      "seats": 5,
+      "live_bytes": 3764391176,
+      "vertex_records": 5665185
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2511917696,
+      "vertex_records": 3779979
+    },
+    {
+      "seats": 9,
+      "live_bytes": 6060746924,
+      "vertex_records": 9121274
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2093287926,
+      "vertex_records": 3150144
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2094131674,
+      "vertex_records": 3151376
+    },
+    {
+      "seats": 2,
+      "live_bytes": 1674271234,
+      "vertex_records": 2519720
+    },
+    {
+      "seats": 4,
+      "live_bytes": 2925777808,
+      "vertex_records": 4403202
+    },
+    {
+      "seats": 2,
+      "live_bytes": 1255393163,
+      "vertex_records": 1889257
+    },
+    {
+      "seats": 3,
+      "live_bytes": 2510435040,
+      "vertex_records": 3777676
+    },
+    {
+      "seats": 4,
+      "live_bytes": 3347516892,
+      "vertex_records": 5037137
+    },
+    {
+      "seats": 1,
+      "live_bytes": 837222088,
+      "vertex_records": 1259917
+    },
+    {
+      "seats": 1,
+      "live_bytes": 417489634,
+      "vertex_records": 628346
+    },
+    {
+      "seats": 1,
+      "live_bytes": 104392835,
+      "vertex_records": 157083
+    }
+  ]
+}

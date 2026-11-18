@@ -44,30 +44,30 @@ pub enum TokenType {
     SymFor,
     SymRange,
     SymNil,
-    DefAssign,   // :=
-    MultEq,      // *=
-    DivEq,       // /=
-    LshiftEq,    // <<=
-    Lshift,      // <<
-    RshiftEq,    // >>=
-    Rshift,      // >>
-    PlusPlus,    // ++
-    PlusEq,      // +=
-    MinusMinus,  // --
-    MinusEq,     // -=
-    OrEq,        // |=
-    XorEq,       // ^=
-    AndEq,       // &=
-    Lt,          // <
-    Le,          // <=
-    Gt,          // >
-    Ge,          // >=
-    Eq,          // ==
-    Neq,         // !=
-    And,         // &&
-    Or,          // ||
-    BitClear,    // &^
-    Send,        // <-
+    DefAssign,  // :=
+    MultEq,     // *=
+    DivEq,      // /=
+    LshiftEq,   // <<=
+    Lshift,     // <<
+    RshiftEq,   // >>=
+    Rshift,     // >>
+    PlusPlus,   // ++
+    PlusEq,     // +=
+    MinusMinus, // --
+    MinusEq,    // -=
+    OrEq,       // |=
+    XorEq,      // ^=
+    AndEq,      // &=
+    Lt,         // <
+    Le,         // <=
+    Gt,         // >
+    Ge,         // >=
+    Eq,         // ==
+    Neq,        // !=
+    And,        // &&
+    Or,         // ||
+    BitClear,   // &^
+    Send,       // <-
     Eof,
 }
 
@@ -555,9 +555,7 @@ impl Lexer {
                             self.read_char();
                             self.read_hex_literal()?
                         }
-                        Some(c) if ('0'..='7').contains(&c) => {
-                            self.read_octal_literal()?
-                        }
+                        Some(c) if ('0'..='7').contains(&c) => self.read_octal_literal()?,
                         _ => mpa::Int::from_i64(0, 0),
                     };
                     let mut tok = self.token(TokenType::Constant);

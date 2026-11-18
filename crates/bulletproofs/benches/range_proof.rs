@@ -16,33 +16,36 @@ use bulletproofs::{BulletproofGens, PedersenGens};
 static AGGREGATION_SIZES: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
 fn generate_little_endian_number(bit_size: usize) -> [u8; 56] {
-  use self::rand::Rng;
+    use self::rand::Rng;
 
-  // Ensure bit_size is a power of two.
-  assert!(bit_size.is_power_of_two(), "bit_size must be a power of two");
+    // Ensure bit_size is a power of two.
+    assert!(
+        bit_size.is_power_of_two(),
+        "bit_size must be a power of two"
+    );
 
-  // Initialize the array with zeros.
-  let mut bytes = [0u8; 56];
-  let mut rng = rand::thread_rng();
+    // Initialize the array with zeros.
+    let mut bytes = [0u8; 56];
+    let mut rng = rand::thread_rng();
 
-  // Determine how many full bytes and extra bits are needed.
-  let full_bytes = bit_size / 8;
-  let rem_bits = bit_size % 8;
+    // Determine how many full bytes and extra bits are needed.
+    let full_bytes = bit_size / 8;
+    let rem_bits = bit_size % 8;
 
-  // Fill in the full bytes with random data.
-  for i in 0..full_bytes {
-      bytes[i] = rng.gen();
-  }
+    // Fill in the full bytes with random data.
+    for i in 0..full_bytes {
+        bytes[i] = rng.gen();
+    }
 
-  // If there is a partial byte (i.e. remaining bits not filling a whole byte),
-  // generate a random byte and mask off the bits above the required number.
-  if rem_bits > 0 && full_bytes < 56 {
-      let random_byte: u8 = rng.gen();
-      // Mask to keep only the lower `rem_bits` bits.
-      bytes[full_bytes] = random_byte & ((1 << rem_bits) - 1);
-  }
+    // If there is a partial byte (i.e. remaining bits not filling a whole byte),
+    // generate a random byte and mask off the bits above the required number.
+    if rem_bits > 0 && full_bytes < 56 {
+        let random_byte: u8 = rng.gen();
+        // Mask to keep only the lower `rem_bits` bits.
+        bytes[full_bytes] = random_byte & ((1 << rem_bits) - 1);
+    }
 
-  bytes
+    bytes
 }
 
 fn create_aggregated_rangeproof_helper(n: usize, c: &mut Criterion) {
@@ -55,7 +58,9 @@ fn create_aggregated_rangeproof_helper(n: usize, c: &mut Criterion) {
             let bp_gens = BulletproofGens::new(n, m);
             let mut rng = rand::thread_rng();
 
-            let values: Vec<Scalar> = (0..m).map(|_| Scalar::from_bits(generate_little_endian_number(n))).collect();
+            let values: Vec<Scalar> = (0..m)
+                .map(|_| Scalar::from_bits(generate_little_endian_number(n)))
+                .collect();
             let blindings: Vec<Scalar> = (0..m).map(|_| Scalar::random(&mut rng)).collect();
 
             b.iter(|| {
@@ -102,7 +107,9 @@ fn verify_aggregated_rangeproof_helper(n: usize, c: &mut Criterion) {
             let bp_gens = BulletproofGens::new(n, m);
             let mut rng = rand::thread_rng();
 
-            let values: Vec<Scalar> = (0..m).map(|_| Scalar::from_bits(generate_little_endian_number(n))).collect();
+            let values: Vec<Scalar> = (0..m)
+                .map(|_| Scalar::from_bits(generate_little_endian_number(n)))
+                .collect();
             let blindings: Vec<Scalar> = (0..m).map(|_| Scalar::random(&mut rng)).collect();
 
             let mut transcript = Transcript::new(b"AggregateRangeProofBenchmark");

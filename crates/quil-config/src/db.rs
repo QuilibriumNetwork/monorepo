@@ -17,10 +17,18 @@ pub struct DbConfig {
     pub terminate_percentage: i32,
 }
 
-fn default_worker_path_prefix() -> String { "worker-store/%d".into() }
-fn default_notice_pct() -> i32 { 70 }
-fn default_warn_pct() -> i32 { 90 }
-fn default_terminate_pct() -> i32 { 95 }
+fn default_worker_path_prefix() -> String {
+    "worker-store/%d".into()
+}
+fn default_notice_pct() -> i32 {
+    70
+}
+fn default_warn_pct() -> i32 {
+    90
+}
+fn default_terminate_pct() -> i32 {
+    95
+}
 
 impl Default for DbConfig {
     fn default() -> Self {

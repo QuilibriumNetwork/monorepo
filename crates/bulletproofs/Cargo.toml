@@ -2,7 +2,6 @@
 name = "ed448-bulletproofs"
 # Before doing a release:
 # - update version field 
-# - ensure yoloproofs was disabled in an atomic (revertable) commit
 # - update CHANGELOG
 version = "1.0.0"
 authors = ["Cassandra Heart <cassandra@quilibrium.com>"]
@@ -39,7 +38,6 @@ uniffi = { version = "0.28.3", features = ["build"], optional = true }
 
 [features]
 default = ["uniffi-bindings", "clear_on_drop"]
-yoloproofs = []
 uniffi-bindings = ["uniffi", "uniffi/build"]
 
 [dev-dependencies]
@@ -51,10 +49,6 @@ rand_chacha = "0.3"
 [[test]]
 name = "range_proof"
 
-[[test]]
-name = "r1cs"
-required-features = ["yoloproofs"]
-
 [[bench]]
 name = "range_proof"
 harness = false
@@ -64,11 +58,6 @@ name = "generators"
 harness = false
 
 [[bench]]
-name = "r1cs"
-harness = false
-required-features = ["yoloproofs"]
-
-[[bench]]
 name = "linear_proof"
 harness = false
 
@@ -76,3 +65,42 @@ harness = false
 crate-type = ["lib", "staticlib"]
 name = "bulletproofs"
 
+# Maintained fork of https://github.com/dalek-cryptography/bulletproofs.
+# Scope cosmetic warnings here; retain soundness diagnostics.
+[lints.rust]
+dead_code = "allow"
+deprecated = "allow"
+unused_imports = "allow"
+
+# Clippy findings in code taken from dalek-cryptography/bulletproofs: allowed
+# here, not restyled. Unlisted lints keep their defaults.
+[lints.clippy]
+assign_op_pattern = "allow"
+clone_on_copy = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+identity_op = "allow"
+into_iter_on_ref = "allow"
+legacy_numeric_constants = "allow"
+len_zero = "allow"
+manual_is_multiple_of = "allow"
+manual_repeat_n = "allow"
+needless_borrow = "allow"
+needless_range_loop = "allow"
+needless_return = "allow"
+new_ret_no_self = "allow"
+op_ref = "allow"
+precedence = "allow"
+redundant_closure = "allow"
+redundant_field_names = "allow"
+single_component_path_imports = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unit_arg = "allow"
+unnecessary_cast = "allow"
+unnecessary_lazy_evaluations = "allow"
+unnecessary_unwrap = "allow"
+useless_conversion = "allow"
+useless_vec = "allow"

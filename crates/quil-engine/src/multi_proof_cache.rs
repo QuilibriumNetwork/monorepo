@@ -51,10 +51,14 @@ impl ShardMultiProofPrecomputer {
         new_rank: u64,
         parent_selector: Vec<u8>,
         difficulty: u32,
+        frame_number: u64,
     ) {
         // Single-prover shards use the 74-byte aggregate path and
         // don't need multi-proofs.
-        let active = match self.prover_registry.get_active_provers(&self.filter) {
+        let active = match self
+            .prover_registry
+            .get_active_provers(&self.filter, frame_number)
+        {
             Ok(v) => v,
             Err(_) => return,
         };
@@ -82,13 +86,10 @@ impl ShardMultiProofPrecomputer {
         }
 
         let this = Arc::clone(self);
-        let active_addrs: Vec<Vec<u8>> =
-            active.iter().map(|p| p.address.clone()).collect();
+        let active_addrs: Vec<Vec<u8>> = active.iter().map(|p| p.address.clone()).collect();
         tokio::task::spawn_blocking(move || {
-            let challenge: [u8; 32] =
-                Sha3_256::digest(&parent_selector).into();
-            let id_refs: Vec<&[u8]> =
-                active_addrs.iter().map(|v| v.as_slice()).collect();
+            let challenge: [u8; 32] = Sha3_256::digest(&parent_selector).into();
+            let id_refs: Vec<&[u8]> = active_addrs.iter().map(|v| v.as_slice()).collect();
             let result = this.frame_prover.calculate_multi_proof(
                 &challenge,
                 difficulty,

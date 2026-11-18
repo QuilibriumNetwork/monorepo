@@ -1,0 +1,381 @@
+//! Real nodes on loopback: the listen address decides the address family, an
+//! IPv6 listener serves gossip, it still dials out over IPv4 (a DS-Lite host:
+//! IPv6 inbound, IPv4 only through its carrier's NAT), and an IPv4 config stays
+//! on IPv4. The IPv4 and IPv6 wildcards share a port, as the default config
+//! has them. A host without an IPv6 loopback skips with the reason.
+//!
+//! Every listener binds port 0 and the test reads the port the kernel gave
+//! it: a probed port is free only until the probe closes, and nextest runs
+//! each test in its own process, so two tests could take the same port.
+
+use std::time::Duration;
+
+use quil_p2p::{P2PHandle, P2PNode, ReceivedMessage};
+use tokio::sync::mpsc;
+
+type Supervisor = quil_lifecycle::Supervisor<anyhow::Error>;
+
+/// Whether this host has an IPv6 loopback; says so when it has none.
+fn ipv6_loopback(test: &str) -> bool {
+    match std::net::TcpListener::bind("[::1]:0") {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("SKIP {test}: no IPv6 loopback on this host: {e}");
+            false
+        }
+    }
+}
+
+/// The port in a listen address `prefix<port>...`, such as
+/// `/ip4/127.0.0.1/udp/` for a QUIC listener on the IPv4 loopback.
+fn port_after(addr: &str, prefix: &str) -> Option<u16> {
+    addr.strip_prefix(prefix)?.split('/').next()?.parse().ok()
+}
+
+/// The port the kernel gave a listener bound to port 0, once the node lists
+/// an address starting with `prefix`.
+async fn bound_port(node: &P2PHandle, prefix: &str) -> u16 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let addrs = node.listen_addresses();
+        if let Some(port) = addrs.iter().find_map(|a| port_after(a, prefix)) {
+            return port;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no listener on {prefix}: {addrs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn base_config() -> quil_config::P2PConfig {
+    let mut config = quil_config::P2PConfig::default();
+    config.network = 99;
+    config.bootstrap_peers = Vec::new();
+    config.direct_peers = Vec::new();
+    config
+}
+
+/// A shard's CW topic: `0x01 || appFilter`.
+fn topic() -> Vec<u8> {
+    let mut cw = vec![0x01u8];
+    cw.extend_from_slice(&[0x40u8; 32]);
+    cw
+}
+
+/// A receiving node on `listen`; its peer ID as text for the sender's dial.
+async fn start_receiver(
+    sup: &mut Supervisor,
+    listen: &str,
+    additional: &[String],
+) -> (P2PHandle, mpsc::Receiver<ReceivedMessage>, String) {
+    let mut config = base_config();
+    config.additional_listen_multiaddrs = additional.to_vec();
+    let node = P2PNode::new_with_options(&config, true, None).unwrap();
+    let id = node.peer_id.to_string();
+    let (handle, inbound) = node.start(sup, listen).await.unwrap();
+    handle.subscribe_confirmed(topic()).await.unwrap();
+    (handle, inbound, id)
+}
+
+/// A node on `listen` that dials `dial` and publishes one message, which
+/// `inbound` must deliver.
+async fn gossip_to(
+    sup: &mut Supervisor,
+    listen: &str,
+    dial: &str,
+    inbound: &mut mpsc::Receiver<ReceivedMessage>,
+    payload: &[u8],
+) {
+    let mut config = base_config();
+    config.bootstrap_peers = vec![dial.to_string()];
+    let node = P2PNode::new_with_options(&config, true, None).unwrap();
+    let (sender, _rx) = node.start(sup, listen).await.unwrap();
+    sender.subscribe_confirmed(topic()).await.unwrap();
+    // The sender dials its bootstrap peer on its first discovery tick, and
+    // publishing fails until it knows the receiver's subscription.
+    let data = [&[0x80u8][..], &[1u8; 8][..], payload].concat();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match sender.publish(topic(), data.clone()).await {
+            Ok(()) => break,
+            Err(e) if tokio::time::Instant::now() > deadline => {
+                panic!("not published over {dial}: {e}")
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    let message = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let message = inbound.recv().await.expect("the node is running");
+            if message.data == data {
+                return message;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("not delivered over {dial}"));
+    assert_eq!(message.bitmask, topic());
+}
+
+/// Whether the node lists `expected` within `wait`.
+async fn lists_within(node: &P2PHandle, expected: &str, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    while !node.listen_addresses().iter().any(|a| a == expected) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+/// The node's listen addresses once `expected` shows among them.
+async fn listening_on(node: &P2PHandle, expected: &str) -> Vec<String> {
+    let listed = lists_within(node, expected, Duration::from_secs(15)).await;
+    let addrs = node.listen_addresses();
+    assert!(listed, "not listening on {expected}: {addrs:?}");
+    addrs
+}
+
+/// A listen address family: the address a config names and the loopback a
+/// test dials on it.
+type Family = (&'static str, &'static str);
+const IPV4_WILDCARD: Family = ("/ip4/0.0.0.0", "/ip4/127.0.0.1");
+/// An IPv4 config naming a specific IP, which binds `0.0.0.0`.
+const IPV4_NAMED: Family = ("/ip4/192.0.2.10", "/ip4/127.0.0.1");
+const IPV6_WILDCARD: Family = ("/ip6/::", "/ip6/::1");
+
+/// Tries before a second listener that does not bind the first's port fails
+/// the test: another test process may hold that port in the second family.
+const SHARED_PORT_TRIES: u32 = 3;
+
+/// A node on the `first` family's wildcard binds port 0; a second node takes
+/// the port it got in the `second` family, as written, and both serve gossip
+/// on it. `transport` is `tcp` or `udp`, with `suffix` `/quic-v1` for QUIC.
+async fn second_family_takes_the_first_ones_port(
+    transport: &str,
+    suffix: &str,
+    first: Family,
+    second: Family,
+) {
+    // The node's warning names the error of a listener that did not bind.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("quil_p2p=warn"))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut sup = Supervisor::new();
+    for attempt in 1..=SHARED_PORT_TRIES {
+        let (a, mut a_inbound, a_id) =
+            start_receiver(&mut sup, &format!("{}/{transport}/0{suffix}", first.0), &[]).await;
+        let port = bound_port(&a, &format!("{}/{transport}/", first.1)).await;
+        let a_addr = format!("{}/{transport}/{port}{suffix}", first.1);
+        let (b, mut b_inbound, b_id) = start_receiver(
+            &mut sup,
+            &format!("{}/{transport}/{port}{suffix}", second.0),
+            &[],
+        )
+        .await;
+        let b_addr = format!("{}/{transport}/{port}{suffix}", second.1);
+        if !lists_within(&b, &b_addr, Duration::from_secs(10)).await {
+            let addrs = b.listen_addresses();
+            assert!(
+                attempt < SHARED_PORT_TRIES,
+                "no listener on {b_addr} beside one on {a_addr}, {attempt} tries: {addrs:?}"
+            );
+            eprintln!("try {attempt}: no listener on {b_addr} beside {a_addr}: {addrs:?}");
+            continue;
+        }
+        listening_on(&a, &a_addr).await;
+        for (family, addr, id, inbound) in [
+            (first, &a_addr, &a_id, &mut a_inbound),
+            (second, &b_addr, &b_id, &mut b_inbound),
+        ] {
+            gossip_to(
+                &mut sup,
+                &format!("{}/{transport}/0{suffix}", family.0),
+                &format!("{addr}/p2p/{id}"),
+                inbound,
+                addr.as_bytes(),
+            )
+            .await;
+        }
+        return;
+    }
+}
+
+#[tokio::test]
+async fn specific_ipv6_address_binds_as_written_and_serves_gossip_over_tcp() {
+    if !ipv6_loopback("specific_ipv6_address_binds_as_written_and_serves_gossip_over_tcp") {
+        return;
+    }
+    let mut sup = Supervisor::new();
+    let (node, mut inbound, id) = start_receiver(&mut sup, "/ip6/::1/tcp/0", &[]).await;
+    let bound = format!("/ip6/::1/tcp/{}", bound_port(&node, "/ip6/::1/tcp/").await);
+    assert_eq!(listening_on(&node, &bound).await, [bound.clone()]);
+    gossip_to(
+        &mut sup,
+        "/ip6/::1/tcp/0",
+        &format!("{bound}/p2p/{id}"),
+        &mut inbound,
+        b"over ipv6 tcp",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ipv6_wildcard_takes_ipv6_only_and_serves_gossip_over_quic() {
+    if !ipv6_loopback("ipv6_wildcard_takes_ipv6_only_and_serves_gossip_over_quic") {
+        return;
+    }
+    let mut sup = Supervisor::new();
+    let (node, mut inbound, id) = start_receiver(&mut sup, "/ip6/::/udp/0/quic-v1", &[]).await;
+    let port = bound_port(&node, "/ip6/::1/udp/").await;
+    let loopback = format!("/ip6/::1/udp/{port}/quic-v1");
+    let addrs = listening_on(&node, &loopback).await;
+    assert!(addrs.iter().all(|a| a.starts_with("/ip6/")), "{addrs:?}");
+    gossip_to(
+        &mut sup,
+        "/ip6/::/udp/0/quic-v1",
+        &format!("{loopback}/p2p/{id}"),
+        &mut inbound,
+        b"over ipv6 quic",
+    )
+    .await;
+}
+
+/// A DS-Lite host listens on IPv6 and still reaches IPv4 peers outbound.
+#[tokio::test]
+async fn ipv6_only_listener_dials_an_ipv4_peer() {
+    if !ipv6_loopback("ipv6_only_listener_dials_an_ipv4_peer") {
+        return;
+    }
+    for (prefix, transport, sender_listen) in [
+        ("/ip4/127.0.0.1/tcp/", "", "/ip6/::/tcp/0"),
+        ("/ip4/127.0.0.1/udp/", "/quic-v1", "/ip6/::/udp/0/quic-v1"),
+    ] {
+        let mut sup = Supervisor::new();
+        let (node, mut inbound, id) =
+            start_receiver(&mut sup, &format!("{prefix}0{transport}"), &[]).await;
+        let v4 = format!("{prefix}{}{transport}", bound_port(&node, prefix).await);
+        gossip_to(
+            &mut sup,
+            sender_listen,
+            &format!("{v4}/p2p/{id}"),
+            &mut inbound,
+            b"out over ipv4",
+        )
+        .await;
+    }
+}
+
+/// A dual-stack node names both families; an entry in the family it already
+/// has starts no listener.
+#[tokio::test]
+async fn additional_listener_serves_the_other_family() {
+    if !ipv6_loopback("additional_listener_serves_the_other_family") {
+        return;
+    }
+    let mut sup = Supervisor::new();
+    let additional = [
+        "/ip6/::/tcp/0".to_string(),
+        "/ip4/0.0.0.0/tcp/0".to_string(),
+    ];
+    let (node, mut inbound, id) = start_receiver(&mut sup, "/ip4/0.0.0.0/tcp/0", &additional).await;
+    let v4_port = bound_port(&node, "/ip4/127.0.0.1/tcp/").await;
+    let v4 = format!("/ip4/127.0.0.1/tcp/{v4_port}");
+    let v6 = format!("/ip6/::1/tcp/{}", bound_port(&node, "/ip6/::1/tcp/").await);
+    let addrs = listening_on(&node, &v6).await;
+    // The ignored IPv4 entry would have bound a second IPv4 port.
+    assert!(
+        addrs
+            .iter()
+            .filter(|a| a.starts_with("/ip4/"))
+            .all(|a| a.ends_with(&format!("/tcp/{v4_port}"))),
+        "{addrs:?}"
+    );
+    gossip_to(
+        &mut sup,
+        "/ip4/0.0.0.0/tcp/0",
+        &format!("{v4}/p2p/{id}"),
+        &mut inbound,
+        b"over the ipv4 listener",
+    )
+    .await;
+    gossip_to(
+        &mut sup,
+        "/ip6/::/tcp/0",
+        &format!("{v6}/p2p/{id}"),
+        &mut inbound,
+        b"over the additional ipv6 listener",
+    )
+    .await;
+}
+
+/// The default config's two QUIC wildcards share one port, each taking only
+/// its own family; in either order, and an IPv4 config naming a specific IP
+/// keeps its port when it binds `0.0.0.0`.
+#[tokio::test]
+async fn ipv4_and_ipv6_wildcards_share_a_port_over_quic() {
+    if !ipv6_loopback("ipv4_and_ipv6_wildcards_share_a_port_over_quic") {
+        return;
+    }
+    second_family_takes_the_first_ones_port("udp", "/quic-v1", IPV4_WILDCARD, IPV6_WILDCARD).await;
+    second_family_takes_the_first_ones_port("udp", "/quic-v1", IPV6_WILDCARD, IPV4_NAMED).await;
+}
+
+/// As over QUIC, the TCP wildcards share one port.
+#[tokio::test]
+async fn ipv4_and_ipv6_wildcards_share_a_port_over_tcp() {
+    if !ipv6_loopback("ipv4_and_ipv6_wildcards_share_a_port_over_tcp") {
+        return;
+    }
+    second_family_takes_the_first_ones_port("tcp", "", IPV4_WILDCARD, IPV6_WILDCARD).await;
+    second_family_takes_the_first_ones_port("tcp", "", IPV6_WILDCARD, IPV4_NAMED).await;
+}
+
+/// An IPv4 config, even one naming a specific IP, binds `0.0.0.0` and no IPv6
+/// socket, as it always did.
+#[tokio::test]
+async fn ipv4_config_stays_on_the_ipv4_wildcard() {
+    let mut sup = Supervisor::new();
+    let (node, _inbound, _id) = start_receiver(&mut sup, "/ip4/192.0.2.10/tcp/0", &[]).await;
+    let port = bound_port(&node, "/ip4/127.0.0.1/tcp/").await;
+    let addrs = listening_on(&node, &format!("/ip4/127.0.0.1/tcp/{port}")).await;
+    assert!(addrs.iter().all(|a| a.starts_with("/ip4/")), "{addrs:?}");
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok());
+    if ipv6_loopback("ipv4_config_stays_on_the_ipv4_wildcard, its IPv6 half") {
+        assert!(tokio::net::TcpStream::connect(("::1", port)).await.is_err());
+    }
+}
+
+/// A host without IPv6, here an IPv6 address no host holds, still starts:
+/// the IPv6 listener's failure is not fatal and the IPv4 one serves gossip.
+#[tokio::test]
+async fn an_ipv6_listener_that_cannot_bind_leaves_ipv4_serving() {
+    let mut sup = Supervisor::new();
+    let mut config = base_config();
+    config.additional_listen_multiaddrs = vec!["/ip6/2001:db8::1/udp/0/quic-v1".to_string()];
+    let node = P2PNode::new_with_options(&config, true, None).unwrap();
+    let id = node.peer_id.to_string();
+    let (node, mut inbound) = node
+        .start(&mut sup, "/ip4/127.0.0.1/udp/0/quic-v1")
+        .await
+        .expect("a failed IPv6 listener stopped the node");
+    node.subscribe_confirmed(topic()).await.unwrap();
+    let port = bound_port(&node, "/ip4/127.0.0.1/udp/").await;
+    let listen = format!("/ip4/127.0.0.1/udp/{port}/quic-v1");
+    let addrs = listening_on(&node, &listen).await;
+    assert!(addrs.iter().all(|a| a.starts_with("/ip4/")), "{addrs:?}");
+    gossip_to(
+        &mut sup,
+        "/ip4/127.0.0.1/udp/0/quic-v1",
+        &format!("{listen}/p2p/{id}"),
+        &mut inbound,
+        b"over ipv4 beside a failed ipv6 listener",
+    )
+    .await;
+}

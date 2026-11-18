@@ -25,16 +25,12 @@ fn main() {
         std::process::exit(2);
     }
     let primary = Path::new(&args[1]);
-    let scratch = std::env::temp_dir().join(format!(
-        "inspect-clock-{}",
-        std::process::id(),
-    ));
+    let scratch = std::env::temp_dir().join(format!("inspect-clock-{}", std::process::id(),));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
 
     let mut opts = rocksdb::Options::default();
     opts.set_max_open_files(64);
-    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch)
-        .expect("open as secondary");
+    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch).expect("open as secondary");
     let _ = db.try_catch_up_with_primary();
 
     println!("=== leading byte distribution ===");

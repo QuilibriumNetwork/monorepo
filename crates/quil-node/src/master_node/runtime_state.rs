@@ -1,7 +1,11 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use quil_forest::storage_health;
+use quil_forest::StoreRole;
 use quil_lifecycle::Supervisor;
 
 pub(crate) struct RuntimeState {
@@ -15,17 +19,125 @@ pub(crate) struct RuntimeState {
         Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
 }
 
+/// The node's GLOBAL message collector. Only a node taking part in GLOBAL
+/// consensus collects from it: elsewhere it refuses every message. Its ranks
+/// keep room for shard frame headers and storage epoch proofs, and cap
+/// persistent-sector capacity messages.
+fn global_message_collector(
+    consensus_participant: bool,
+) -> Arc<quil_engine::message_collector::MessageCollector> {
+    let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    collector.set_class_shares();
+    if !consensus_participant {
+        collector.set_no_proposer();
+    }
+    collector
+}
+
+/// The wait after the first failed startup load of the prover registry;
+/// it doubles after each failure up to [`REGISTRY_RETRY_MAX`].
+const REGISTRY_RETRY_MIN: Duration = Duration::from_secs(5);
+const REGISTRY_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Load the prover registry from the master store at startup with `load`
+/// (which returns the provers it loaded), retrying after a failure with a
+/// backoff from `retry.0` doubling up to `retry.1`, until a load succeeds
+/// or `token` is cancelled. A failed load never fails the task: every
+/// later refresh retries too, the work that reads the registry waits for
+/// its first load ([`super::archive_sync::await_registry_load`]), and each
+/// failure tells the operator what to check, or for a corrupt block which
+/// store to move aside. A panicking load fails the task, which stops the
+/// node: retrying it could only meet the lock the panic poisoned.
+async fn load_registry_at_startup<F>(
+    load: F,
+    token: CancellationToken,
+    retry: (Duration, Duration),
+) -> anyhow::Result<()>
+where
+    F: Fn() -> anyhow::Result<usize> + Send + Sync + 'static,
+{
+    let load = Arc::new(load);
+    let started = Instant::now();
+    let mut wait = retry.0;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let once = load.clone();
+        let error = match tokio::task::spawn_blocking(move || (*once)()).await {
+            Ok(Ok(provers)) if attempt == 1 => {
+                info!(provers, "prover registry loaded (background)");
+                return Ok(());
+            }
+            Ok(Ok(provers)) => {
+                info!(
+                    provers,
+                    attempts = attempt,
+                    waited_secs = started.elapsed().as_secs(),
+                    "prover registry loaded (background) after failed loads; the work that waited for it \
+                     resumes"
+                );
+                return Ok(());
+            }
+            Ok(Err(error)) => format!("{error:#}"),
+            // A panic may leave the registry's lock poisoned, and every
+            // retry would then fail on it: the task fails, which stops the
+            // node for its service manager to restart it.
+            Err(error) => {
+                return Err(anyhow::anyhow!("prover registry load panicked: {error}"));
+            }
+        };
+        let class = storage_health::error_class(&error);
+        let error = storage_health::redact_paths(&error);
+        let (retry_in_secs, waited_secs) = (wait.as_secs(), started.elapsed().as_secs());
+        if class == "CORRUPTION" {
+            error!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                attempt,
+                retry_in_secs,
+                waited_secs,
+                %error,
+                "prover registry load failed: a block of the master store {}, so consensus, worker allocation and \
+                 proving wait for the registry; {}; retrying meanwhile",
+                storage_health::CORRUPTION_CAUSE,
+                storage_health::corruption_next_step(Some(StoreRole::Master)),
+            );
+        } else {
+            error!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                attempt,
+                retry_in_secs,
+                waited_secs,
+                %error,
+                "prover registry load failed: consensus, worker allocation and proving wait for the registry; \
+                 check this node's disk and the error; retrying"
+            );
+        }
+        tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(wait) => {}
+        }
+        wait = wait.saturating_mul(2).min(retry.1);
+    }
+}
+
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
+    consensus_participant: bool,
     hg_store: Arc<quil_store::RocksHypergraphStore>,
-    shard_engines: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >>,
+    shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
 ) -> RuntimeState {
     // ---------------------------------------------------------------
     // 5c. Message collector + consensus event loop
     // ---------------------------------------------------------------
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    let message_collector = global_message_collector(consensus_participant);
 
     // The consensus event loop is optional — it runs only when this node
     // has a BLS proving key and is an active prover. For now we create
@@ -39,16 +151,18 @@ pub(crate) fn init(
         let hs = hg_store.clone();
         // Run in background — don't block P2P startup. The registry
         // populates asynchronously; consensus won't start until it's ready.
-        // Supervised as a startup task: a normal completion is expected
-        // and won't shut down the node; a panic or error will.
-        sup.spawn_startup_task("prover-registry-refresh", move |_token| async move {
-            tokio::task::spawn_blocking(move || {
-                pr.refresh_from_store(&hs);
-                let count = pr.read(|r| r.distinct_provers());
-                tracing::info!(provers = count, "prover registry loaded (background)");
-            })
-            .await
-            .map_err(anyhow::Error::from)
+        // Supervised as a startup task that retries a failed load rather
+        // than fail: a failure would stop the node, and its service manager
+        // would restart it into the same failure.
+        sup.spawn_startup_task("prover-registry-refresh", move |token| {
+            load_registry_at_startup(
+                move || {
+                    pr.refresh_from_store(hs.as_ref())?;
+                    Ok(pr.read(|r| r.distinct_provers()))
+                },
+                token,
+                (REGISTRY_RETRY_MIN, REGISTRY_RETRY_MAX),
+            )
         });
     }
 
@@ -58,10 +172,52 @@ pub(crate) fn init(
     let prover_only_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let global_event_distributor: Arc<dyn quil_types::consensus::EventDistributor> =
         Arc::new(quil_engine::event_distributor::InMemoryEventDistributor::new());
+    // Coverage thresholds. Mainnet defaults (max_provers=32) never trip the
+    // shard-split rebalance trigger on a small localnet (a handful of provers),
+    // so splits can't be exercised locally. DEV/localnet ONLY: `QUIL_SPLIT_MAX_PROVERS`
+    // lowers the split trigger's `max_provers` so a shard with more Active provers
+    // than the override proposes a split (→ ShardSplitEligible → orchestrator op →
+    // PendingShardChange → epoch-aligned flip at E+2). Env-gated exactly like
+    // `QUIL_EPOCH_LENGTH_FRAMES` — mainnet never sets it, so mainnet is untouched.
+    let coverage_thresholds = {
+        let mut t = quil_engine::coverage::CoverageThresholds::mainnet();
+        if let Some(n) = std::env::var("QUIL_SPLIT_MAX_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                max_provers = n,
+                "QUIL_SPLIT_MAX_PROVERS override active (dev/localnet only) — shards with more \
+                 than this many Active provers will propose a split"
+            );
+            t.max_provers = n;
+        }
+        // DEV/localnet ONLY: `QUIL_MIN_PROVERS` lowers the MERGE trigger's
+        // `min_provers`. A merge fires when BOTH halves of a pair look starved
+        // (`active_count < min_provers`), and the mainnet default of 6 is above
+        // anything a localnet fields — so a freshly split shard is merged straight
+        // back, and worse, a restart makes every shard look starved for a couple of
+        // epochs while allocations re-activate. Setting this to 0 makes the trigger
+        // unreachable (`active_count >= 0` always), which is what lets a localnet
+        // HOLD a split topology long enough to test anything on it. Env-gated
+        // exactly like `QUIL_SPLIT_MAX_PROVERS` — mainnet never sets it.
+        if let Some(n) = std::env::var("QUIL_MIN_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                min_provers = n,
+                "QUIL_MIN_PROVERS override active (dev/localnet only) — shard pairs with \
+                 fewer than this many Active provers each will propose a merge"
+            );
+            t.min_provers = n;
+        }
+        t
+    };
     let coverage_monitor = Arc::new(quil_engine::coverage::CoverageMonitor::new(
         prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         global_event_distributor.clone(),
-        quil_engine::coverage::CoverageThresholds::mainnet(),
+        coverage_thresholds,
         prover_only_flag.clone(),
     ));
 
@@ -236,9 +392,7 @@ pub(crate) fn init(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            mc_prover_only.set_prover_only_mode(
-                pof.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            mc_prover_only.set_prover_only_mode(pof.load(std::sync::atomic::Ordering::Relaxed));
         }
     });
 
@@ -250,5 +404,149 @@ pub(crate) fn init(
         coverage_monitor,
         halt_state,
         remote_worker_manager_for_halt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::log_capture::Capture;
+    use quil_engine::message_collector::{Refusal, SubmitOutcome};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const CORRUPT: &str =
+        "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+                           /var/lib/node/store/128010.sst offset 0 size 4011";
+
+    /// A corrupt block of the master store failed the startup load of the
+    /// prover registry, and with it the node, which its service manager
+    /// restarted into the same failure every 15 s. The load is retried
+    /// instead, each failure naming the store to move aside, without its
+    /// path.
+    #[tokio::test]
+    async fn a_failed_startup_registry_load_is_retried_not_fatal() {
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                    anyhow::bail!(CORRUPT);
+                }
+                Ok(7)
+            },
+            CancellationToken::new(),
+            (Duration::from_millis(1), Duration::from_millis(2)),
+        )
+        .await;
+        assert!(loaded.is_ok(), "startup_load_failed_the_task: {loaded:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let failed = capture.lines_with("prover registry load failed");
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        for line in &failed {
+            assert!(
+                line.contains("ERROR") && line.contains("CORRUPTION"),
+                "{line}"
+            );
+            assert!(
+                line.contains("move the master store's directory aside"),
+                "{line}"
+            );
+            assert!(
+                line.contains("db.path") && !line.contains("/var/lib/node"),
+                "{line}"
+            );
+        }
+        assert_eq!(capture.lines_with("prover registry loaded").len(), 1);
+    }
+
+    /// A load that keeps failing ends with the node's shutdown, not with
+    /// a task failure.
+    #[tokio::test]
+    async fn a_failing_startup_registry_load_ends_on_shutdown() {
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                cancel.cancel();
+                anyhow::bail!("IO error: Input/output error")
+            },
+            token,
+            (Duration::from_secs(60), Duration::from_secs(60)),
+        );
+        let loaded = tokio::time::timeout(Duration::from_secs(30), loaded)
+            .await
+            .expect("ends once the node shuts down");
+        assert!(loaded.is_ok(), "startup_load_failed_the_task: {loaded:?}");
+    }
+
+    /// A panic in the load can poison the registry's lock, so every retry
+    /// would fail on it for as long as the node ran: the first panic fails
+    /// the task, which stops the node for a clean restart, and is never
+    /// retried.
+    #[tokio::test]
+    async fn a_panicking_startup_registry_load_fails_the_task() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("installing the loaded registry");
+                }
+                Ok(7)
+            },
+            CancellationToken::new(),
+            (Duration::from_millis(1), Duration::from_millis(2)),
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "panicked_load_retried: {loaded:?}"
+        );
+        let error = loaded.expect_err("panicked_load_retried: the task did not fail");
+        assert!(format!("{error:#}").contains("panicked"), "{error:#}");
+    }
+
+    /// A regular node's collector told submitters "accepted", held what they
+    /// sent for good, and at its cap stayed full until a restart.
+    #[test]
+    fn only_a_consensus_participants_collector_holds_messages() {
+        let regular = global_message_collector(false);
+        assert_eq!(
+            regular.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Filtered(Refusal::NoProposer),
+            "a regular node accepted a message no frame of its would carry"
+        );
+        assert_eq!(regular.pending_totals(), (0, 0));
+
+        let participant = global_message_collector(true);
+        assert_eq!(
+            participant.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(participant.pending_count(1), 1);
+    }
+
+    /// The GLOBAL collector keeps class shares: shard frame headers and
+    /// storage epoch proofs keep room in each rank, which capacity messages
+    /// filled on 2026-11-08.
+    #[test]
+    fn the_global_collector_keeps_class_shares() {
+        for participant in [true, false] {
+            assert!(
+                global_message_collector(participant).class_shares(),
+                "class-share global-shares: the GLOBAL collector (participant: {participant}) keeps no room for shard headers and storage epoch proofs"
+            );
+        }
+    }
+
+    #[test]
+    fn archives_and_localnet_regulars_take_part_in_global_consensus() {
+        assert!(super::super::global_consensus_participant(true, 0));
+        assert!(super::super::global_consensus_participant(false, 99));
+        assert!(!super::super::global_consensus_participant(false, 0));
+        assert!(!super::super::global_consensus_participant(false, 1));
     }
 }

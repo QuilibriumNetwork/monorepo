@@ -16,9 +16,9 @@ use num_bigint::BigInt;
 use tempfile::TempDir;
 use tonic::Request;
 
-use quil_crypto::KzgInclusionProver;
 use quil_rpc::node_service::NodeRpcServer;
 use quil_store::{RocksDb, RocksHypergraphStore};
+use quil_tries::ShaInclusionProver;
 use quil_tries::{serialize_go_tree, LazyVectorCommitmentTree, VectorCommitmentTree};
 use quil_types::proto::node::{
     node_service_server::NodeService, GetHyperedgeDataRequest, GetVertexDataRequest,
@@ -40,7 +40,7 @@ fn build_and_serialize() -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
     for (k, v) in &leaves {
         tree.insert(k, v, &hash_target, &size).unwrap();
     }
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     tree.commit(&prover);
     let bytes = serialize_go_tree(tree.root.as_ref()).unwrap();
     (bytes, leaves)
@@ -78,8 +78,7 @@ async fn get_vertex_data_round_trips_inserted_leaves() {
         .save_vertex_underlying("vertex", "adds", &shard, &address, &serialized_tree)
         .unwrap();
 
-    let svc = NodeRpcServer::new()
-        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+    let svc = NodeRpcServer::new().with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
     // full_data=false: enumerated known-index entries.
     let resp = svc
@@ -127,8 +126,7 @@ async fn get_vertex_data_rejects_wrong_address_size() {
     let tmp = TempDir::new().unwrap();
     let db = RocksDb::open(tmp.path()).unwrap();
     let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
-    let svc = NodeRpcServer::new()
-        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+    let svc = NodeRpcServer::new().with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
     let err = svc
         .get_vertex_data(Request::new(GetVertexDataRequest {
@@ -165,12 +163,12 @@ async fn get_hyperedge_data_returns_known_indices() {
         .save_vertex_underlying("hyperedge", "adds", &shard, &address, &serialized_tree)
         .unwrap();
 
-    let svc = NodeRpcServer::new()
-        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+    let svc = NodeRpcServer::new().with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
     let resp = svc
         .get_hyperedge_data(Request::new(GetHyperedgeDataRequest {
             address: address.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -178,6 +176,7 @@ async fn get_hyperedge_data_returns_known_indices() {
     assert_eq!(resp.set_type, "hyperedge");
     assert_eq!(resp.phase_type, "adds");
     assert_eq!(resp.entries.len(), leaves.len());
+    assert!(resp.raw_data.is_empty());
     for (k, v) in &leaves {
         let found = resp
             .entries
@@ -186,6 +185,19 @@ async fn get_hyperedge_data_returns_known_indices() {
             .unwrap_or_else(|| panic!("missing entry for key {:?}", k));
         assert_eq!(&found.value, v);
     }
+
+    // `full_data` returns the stored tree itself, keys of any length
+    // included (a prover hyperedge keys allocations by 64-byte atom IDs).
+    let full = svc
+        .get_hyperedge_data(Request::new(GetHyperedgeDataRequest {
+            address: address.clone(),
+            full_data: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(full.raw_data, serialized_tree);
+    assert!(full.entries.is_empty());
 }
 
 #[tokio::test]
@@ -250,7 +262,7 @@ async fn get_vertex_data_round_trips_through_real_commit_path() {
     )
     .unwrap();
     let txn = store.new_transaction(false).unwrap();
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.commit().unwrap();
 
@@ -271,8 +283,7 @@ async fn get_vertex_data_round_trips_through_real_commit_path() {
         "mark_persisted after a confirmed commit must clear the dirty flag"
     );
 
-    let svc = NodeRpcServer::new()
-        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+    let svc = NodeRpcServer::new().with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
     let resp = svc
         .get_vertex_data(Request::new(GetVertexDataRequest {
@@ -365,7 +376,7 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
     )
     .unwrap();
     let txn = store.new_transaction(false).unwrap();
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.abort().unwrap(); // drop without committing
 
@@ -378,8 +389,7 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
         "an aborted commit must leave the tree dirty for a safe retry"
     );
 
-    let svc = NodeRpcServer::new()
-        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+    let svc = NodeRpcServer::new().with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
     // Nothing was committed, so the handler must see no vertex data.
     let resp = svc
@@ -408,4 +418,3 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
         "aborted commit must not leave a durable vertex underlying blob"
     );
 }
-

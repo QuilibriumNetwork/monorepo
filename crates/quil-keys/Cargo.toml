@@ -19,3 +19,6 @@ tracing = "0.1"
 sha2 = "0.10"
 ed448-rust = { path = "../ed448-rust" }
 ed448-goldilocks-plus = "0.16.0"
+
+[lints]
+workspace = true

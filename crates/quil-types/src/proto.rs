@@ -55,6 +55,14 @@ pub mod quilibrium {
                 include!(concat!(env!("OUT_DIR"), "/quilibrium.node.proxy.pb.rs"));
             }
         }
+        pub mod diagnostics {
+            pub mod pb {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/quilibrium.node.diagnostics.pb.rs"
+                ));
+            }
+        }
         pub mod ferretproxy {
             pub mod pb {
                 include!(concat!(
@@ -70,6 +78,7 @@ pub mod quilibrium {
 pub use quilibrium::node::application::pb as application;
 pub use quilibrium::node::channel::pb as channel;
 pub use quilibrium::node::compute::pb as compute;
+pub use quilibrium::node::diagnostics::pb as diagnostics;
 pub use quilibrium::node::ferretproxy::pb as ferret_proxy;
 pub use quilibrium::node::global::pb as global;
 pub use quilibrium::node::hypergraph::pb as hypergraph;
@@ -77,3 +86,35 @@ pub use quilibrium::node::keys::pb as keys;
 pub use quilibrium::node::node::pb as node;
 pub use quilibrium::node::proxy::pb as proxy;
 pub use quilibrium::node::token::pb as token;
+
+#[cfg(test)]
+mod tests {
+    /// The diagnostics schema carries no free text: no field holds a string
+    /// or a message of another package, so a report cannot carry paths,
+    /// addresses or log lines.
+    #[test]
+    fn the_diagnostics_schema_has_no_string_fields() {
+        const PACKAGE: &str = "quilibrium.node.diagnostics.pb";
+        let pool = crate::protojson::descriptor_pool();
+        let messages: Vec<_> = pool
+            .all_messages()
+            .filter(|m| m.package_name() == PACKAGE)
+            .collect();
+        assert!(
+            messages.len() >= 4,
+            "{} diagnostics messages",
+            messages.len()
+        );
+        for message in messages {
+            for field in message.fields() {
+                match field.kind() {
+                    prost_reflect::Kind::String => panic!("{} is a string", field.full_name()),
+                    prost_reflect::Kind::Message(nested) => {
+                        assert_eq!(nested.package_name(), PACKAGE, "{}", field.full_name())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}

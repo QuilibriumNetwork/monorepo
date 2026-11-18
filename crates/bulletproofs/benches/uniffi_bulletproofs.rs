@@ -22,10 +22,7 @@ fn benchmark_generate_input_commitments(c: &mut Criterion) {
         let values = generate_random_scalars(1);
         let blinding = generate_random_scalar();
         b.iter(|| {
-            generate_input_commitments(
-                black_box(values.clone()),
-                black_box(blinding.clone()),
-            )
+            generate_input_commitments(black_box(values.clone()), black_box(blinding.clone()))
         });
     });
 
@@ -33,10 +30,7 @@ fn benchmark_generate_input_commitments(c: &mut Criterion) {
         let values = generate_random_scalars(10);
         let blinding = generate_random_scalar();
         b.iter(|| {
-            generate_input_commitments(
-                black_box(values.clone()),
-                black_box(blinding.clone()),
-            )
+            generate_input_commitments(black_box(values.clone()), black_box(blinding.clone()))
         });
     });
 }
@@ -84,7 +78,7 @@ fn benchmark_verify_range_proof(c: &mut Criterion) {
     let values = generate_random_scalars(1);
     let blinding = generate_random_scalar();
     let proof_result = generate_range_proof(values, blinding, 32);
-    
+
     c.bench_function("verify_range_proof_32bit", |b| {
         b.iter(|| {
             verify_range_proof(
@@ -102,7 +96,7 @@ fn benchmark_sum_check(c: &mut Criterion) {
         let output_commitments = vec![generate_random_scalar(), generate_random_scalar()];
         let additional_inputs = vec![];
         let additional_outputs = vec![];
-        
+
         b.iter(|| {
             sum_check(
                 black_box(input_commitments.clone()),
@@ -118,7 +112,7 @@ fn benchmark_sum_check(c: &mut Criterion) {
         let output_commitments = generate_random_scalars(10);
         let additional_inputs = generate_random_scalars(5);
         let additional_outputs = generate_random_scalars(5);
-        
+
         b.iter(|| {
             sum_check(
                 black_box(input_commitments.clone()),
@@ -132,9 +126,7 @@ fn benchmark_sum_check(c: &mut Criterion) {
 
 fn benchmark_keygen(c: &mut Criterion) {
     c.bench_function("keygen", |b| {
-        b.iter(|| {
-            keygen()
-        });
+        b.iter(|| keygen());
     });
 }
 
@@ -143,42 +135,23 @@ fn benchmark_scalar_operations(c: &mut Criterion) {
     let scalar2 = generate_random_scalar();
 
     c.bench_function("scalar_mult", |b| {
-        b.iter(|| {
-            scalar_mult(
-                black_box(scalar1.clone()),
-                black_box(scalar2.clone()),
-            )
-        });
+        b.iter(|| scalar_mult(black_box(scalar1.clone()), black_box(scalar2.clone())));
     });
 
     c.bench_function("scalar_addition", |b| {
-        b.iter(|| {
-            scalar_addition(
-                black_box(scalar1.clone()),
-                black_box(scalar2.clone()),
-            )
-        });
+        b.iter(|| scalar_addition(black_box(scalar1.clone()), black_box(scalar2.clone())));
     });
 
     c.bench_function("scalar_subtraction", |b| {
-        b.iter(|| {
-            scalar_subtraction(
-                black_box(scalar1.clone()),
-                black_box(scalar2.clone()),
-            )
-        });
+        b.iter(|| scalar_subtraction(black_box(scalar1.clone()), black_box(scalar2.clone())));
     });
 
     c.bench_function("scalar_inverse", |b| {
-        b.iter(|| {
-            scalar_inverse(black_box(scalar1.clone()))
-        });
+        b.iter(|| scalar_inverse(black_box(scalar1.clone())));
     });
 
     c.bench_function("scalar_to_point", |b| {
-        b.iter(|| {
-            scalar_to_point(black_box(scalar1.clone()))
-        });
+        b.iter(|| scalar_to_point(black_box(scalar1.clone())));
     });
 }
 
@@ -188,30 +161,15 @@ fn benchmark_point_operations(c: &mut Criterion) {
     let point2 = scalar_to_point(generate_random_scalar());
 
     c.bench_function("scalar_mult_point", |b| {
-        b.iter(|| {
-            scalar_mult_point(
-                black_box(scalar.clone()),
-                black_box(point1.clone()),
-            )
-        });
+        b.iter(|| scalar_mult_point(black_box(scalar.clone()), black_box(point1.clone())));
     });
 
     c.bench_function("point_addition", |b| {
-        b.iter(|| {
-            point_addition(
-                black_box(point1.clone()),
-                black_box(point2.clone()),
-            )
-        });
+        b.iter(|| point_addition(black_box(point1.clone()), black_box(point2.clone())));
     });
 
     c.bench_function("point_subtraction", |b| {
-        b.iter(|| {
-            point_subtraction(
-                black_box(point1.clone()),
-                black_box(point2.clone()),
-            )
-        });
+        b.iter(|| point_subtraction(black_box(point1.clone()), black_box(point2.clone())));
     });
 }
 
@@ -221,18 +179,11 @@ fn benchmark_hash_operations(c: &mut Criterion) {
     let input_data = vec![1u8; 64];
 
     c.bench_function("scalar_mult_hash_to_scalar", |b| {
-        b.iter(|| {
-            scalar_mult_hash_to_scalar(
-                black_box(scalar.clone()),
-                black_box(point.clone()),
-            )
-        });
+        b.iter(|| scalar_mult_hash_to_scalar(black_box(scalar.clone()), black_box(point.clone())));
     });
 
     c.bench_function("hash_to_scalar", |b| {
-        b.iter(|| {
-            hash_to_scalar(black_box(input_data.clone()))
-        });
+        b.iter(|| hash_to_scalar(black_box(input_data.clone())));
     });
 }
 
@@ -241,18 +192,13 @@ fn benchmark_schnorr_simple(c: &mut Criterion) {
     let message = vec![1u8; 32];
     let keypair = keygen();
     let public_key = keypair[56..].to_vec();
-    
+
     c.bench_function("sign_simple", |b| {
-        b.iter(|| {
-            sign_simple(
-                black_box(secret.clone()),
-                black_box(message.clone()),
-            )
-        });
+        b.iter(|| sign_simple(black_box(secret.clone()), black_box(message.clone())));
     });
 
     let signature = sign_simple(secret, message.clone());
-    
+
     c.bench_function("verify_simple", |b| {
         b.iter(|| {
             verify_simple(
@@ -307,9 +253,7 @@ fn benchmark_schnorr_hidden(c: &mut Criterion) {
 
 fn benchmark_alt_generator(c: &mut Criterion) {
     c.bench_function("alt_generator", |b| {
-        b.iter(|| {
-            alt_generator()
-        });
+        b.iter(|| alt_generator());
     });
 }
 

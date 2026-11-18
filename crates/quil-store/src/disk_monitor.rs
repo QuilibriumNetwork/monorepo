@@ -144,8 +144,8 @@ fn get_disk_stats(path: &Path) -> std::result::Result<DiskStats, String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| format!("invalid path: {}", e))?;
+    let c_path =
+        CString::new(path.as_os_str().as_bytes()).map_err(|e| format!("invalid path: {}", e))?;
 
     unsafe {
         let mut stat: libc::statfs = std::mem::zeroed();
@@ -208,8 +208,8 @@ mod tests {
 
     #[test]
     fn disk_monitor_custom_interval() {
-        let monitor = DiskMonitor::new("/tmp", 80.0, 90.0, 95.0)
-            .with_check_interval(Duration::from_secs(30));
+        let monitor =
+            DiskMonitor::new("/tmp", 80.0, 90.0, 95.0).with_check_interval(Duration::from_secs(30));
         assert_eq!(monitor.check_interval, Duration::from_secs(30));
     }
 }

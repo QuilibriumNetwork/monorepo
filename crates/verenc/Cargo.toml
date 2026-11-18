@@ -22,3 +22,24 @@ zeroize = "1.7"
 
 [build-dependencies]
 uniffi = { version = "0.28.3", features = [ "build" ] }
+
+# Clippy findings in code taken from the RDKGitH paper implementation: allowed
+# here, not restyled. Unlisted lints keep their defaults.
+[lints.clippy]
+assign_op_pattern = "allow"
+char_lit_as_u8 = "allow"
+clone_on_copy = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+if_same_then_else = "allow"
+let_and_return = "allow"
+manual_div_ceil = "allow"
+needless_range_loop = "allow"
+needless_return = "allow"
+op_ref = "allow"
+print_with_newline = "allow"
+ptr_arg = "allow"
+redundant_field_names = "allow"
+redundant_pattern_matching = "allow"
+unnecessary_cast = "allow"
+unnecessary_unwrap = "allow"

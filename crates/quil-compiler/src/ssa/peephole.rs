@@ -36,8 +36,7 @@ impl PeepholeOptimizer {
                         if let Some(Operand::Value(a_id)) = instr.operands.get(0) {
                             let out = instr.out;
                             let a = *a_id;
-                            instrs[idx] = Instr::new(Opcode::Mov)
-                                .with_operand(Operand::Value(a));
+                            instrs[idx] = Instr::new(Opcode::Mov).with_operand(Operand::Value(a));
                             instrs[idx].out = out;
                             return true;
                         }
@@ -54,8 +53,7 @@ impl PeepholeOptimizer {
                         if let Some(Operand::Value(a_id)) = instr.operands.get(0) {
                             let out = instr.out;
                             let a = *a_id;
-                            instrs[idx] = Instr::new(Opcode::Mov)
-                                .with_operand(Operand::Value(a));
+                            instrs[idx] = Instr::new(Opcode::Mov).with_operand(Operand::Value(a));
                             instrs[idx].out = out;
                             return true;
                         }

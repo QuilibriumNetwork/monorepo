@@ -12,15 +12,6 @@ pub trait TranscriptProtocol {
     /// Append a domain separator for a length-`n` inner product proof.
     fn innerproduct_domain_sep(&mut self, n: u64);
 
-    /// Append a domain separator for a constraint system.
-    fn r1cs_domain_sep(&mut self);
-
-    /// Commit a domain separator for a CS without randomized constraints.
-    fn r1cs_1phase_domain_sep(&mut self);
-
-    /// Commit a domain separator for a CS with randomized constraints.
-    fn r1cs_2phase_domain_sep(&mut self);
-
     /// Append a `scalar` with the given `label`.
     fn append_scalar(&mut self, label: &'static [u8], scalar: &Scalar);
 
@@ -51,18 +42,6 @@ impl TranscriptProtocol for Transcript {
         self.append_u64(b"n", n);
     }
 
-    fn r1cs_domain_sep(&mut self) {
-        self.append_message(b"dom-sep", b"r1cs v1");
-    }
-
-    fn r1cs_1phase_domain_sep(&mut self) {
-        self.append_message(b"dom-sep", b"r1cs-1phase");
-    }
-
-    fn r1cs_2phase_domain_sep(&mut self) {
-        self.append_message(b"dom-sep", b"r1cs-2phase");
-    }
-
     fn append_scalar(&mut self, label: &'static [u8], scalar: &Scalar) {
         self.append_message(label, &scalar.to_bytes());
     }
@@ -89,7 +68,7 @@ impl TranscriptProtocol for Transcript {
     }
 
     fn challenge_scalar(&mut self, label: &'static [u8]) -> Scalar {
-        let mut buf = [0u8; 114 ];
+        let mut buf = [0u8; 114];
         self.challenge_bytes(label, &mut buf);
 
         Scalar::from_bytes_mod_order_wide(buf)

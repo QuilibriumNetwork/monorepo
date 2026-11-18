@@ -2,8 +2,8 @@
 //! on bitmask [0x00; 80] and logs anything received on that bitmask.
 //!
 //! Usage:
-//!   cargo run --release --bin blossom-chat -- --port 9100
-//!   cargo run --release --bin blossom-chat -- --port 9100 --peer /ip4/127.0.0.1/tcp/9000/p2p/<goNodePeerID>
+//! cargo run --release --bin blossom-chat -- --port 9100
+//! cargo run --release --bin blossom-chat -- --port 9100 --peer /ip4/127.0.0.1/tcp/9000/p2p/<goNodePeerID>
 
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -23,9 +23,7 @@ async fn main() -> anyhow::Result<()> {
     use clap::Parser;
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Build a minimal P2P config
     let mut p2p_config = quil_config::P2PConfig::default();
@@ -38,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Use Ed448 (Quilibrium's native identity type)
-    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&p2p_config, false)?;
+    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&p2p_config, false, None)?;
     let peer_id = p2p_node.peer_id;
     info!(%peer_id, port = args.port, "Rust node started");
 

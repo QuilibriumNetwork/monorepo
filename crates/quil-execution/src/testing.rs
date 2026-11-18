@@ -19,8 +19,7 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 
 use quil_types::crypto::{
-    BulletproofProver, DecafAgreement, DecafConstructor, KeyManager, KeyType,
-    RangeProofResult,
+    BulletproofProver, DecafAgreement, DecafConstructor, KeyManager, KeyType, RangeProofResult,
 };
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::CircuitCompiler;
@@ -87,20 +86,11 @@ impl BulletproofProver for NoopBulletproofProver {
         })
     }
 
-    fn generate_input_commitments(
-        &self,
-        _values: &[Vec<u8>],
-        _blinding: &[u8],
-    ) -> Vec<u8> {
+    fn generate_input_commitments(&self, _values: &[Vec<u8>], _blinding: &[u8]) -> Vec<u8> {
         Vec::new()
     }
 
-    fn verify_range_proof(
-        &self,
-        _proof: &[u8],
-        _commitment: &[u8],
-        _bit_size: u64,
-    ) -> bool {
+    fn verify_range_proof(&self, _proof: &[u8], _commitment: &[u8], _bit_size: u64) -> bool {
         false
     }
 
@@ -114,13 +104,7 @@ impl BulletproofProver for NoopBulletproofProver {
         false
     }
 
-    fn sign_hidden(
-        &self,
-        _x: &[u8],
-        _t: &[u8],
-        _a: &[u8],
-        _r: &[u8],
-    ) -> Vec<u8> {
+    fn sign_hidden(&self, _x: &[u8], _t: &[u8], _a: &[u8], _r: &[u8]) -> Vec<u8> {
         Vec::new()
     }
 
@@ -141,12 +125,7 @@ impl BulletproofProver for NoopBulletproofProver {
         Vec::new()
     }
 
-    fn simple_verify(
-        &self,
-        _message: &[u8],
-        _signature: &[u8],
-        _point: &[u8],
-    ) -> bool {
+    fn simple_verify(&self, _message: &[u8], _signature: &[u8], _point: &[u8]) -> bool {
         false
     }
 }
@@ -176,10 +155,7 @@ impl DecafConstructor for NoopDecafConstructor {
         Err(QuilError::Internal("noop decaf constructor".into()))
     }
 
-    fn new_from_scalar(
-        &self,
-        _scalar: &[u8],
-    ) -> Result<Box<dyn DecafAgreement>> {
+    fn new_from_scalar(&self, _scalar: &[u8]) -> Result<Box<dyn DecafAgreement>> {
         Err(QuilError::Internal("noop decaf constructor".into()))
     }
 
@@ -256,10 +232,7 @@ impl ClockStore for NoopClockStore {
     fn get_earliest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
-    fn get_global_clock_frame(
-        &self,
-        _frame_number: u64,
-    ) -> Result<proto::global::GlobalFrame> {
+    fn get_global_clock_frame(&self, _frame_number: u64) -> Result<proto::global::GlobalFrame> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
     fn put_global_clock_frame(
@@ -283,31 +256,20 @@ impl ClockStore for NoopClockStore {
     ) -> Result<proto::global::GlobalFrame> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
-    fn delete_global_clock_frame_range(
-        &self,
-        _min_frame: u64,
-        _max_frame: u64,
-    ) -> Result<()> {
+    fn delete_global_clock_frame_range(&self, _min_frame: u64, _max_frame: u64) -> Result<()> {
         Ok(())
     }
     fn reset_global_clock_frames(&self) -> Result<()> {
         Ok(())
     }
 
-    fn get_latest_certified_global_state(
-        &self,
-    ) -> Result<proto::global::GlobalProposal> {
+    fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
-    fn get_earliest_certified_global_state(
-        &self,
-    ) -> Result<proto::global::GlobalProposal> {
+    fn get_earliest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
-    fn get_certified_global_state(
-        &self,
-        _rank: u64,
-    ) -> Result<proto::global::GlobalProposal> {
+    fn get_certified_global_state(&self, _rank: u64) -> Result<proto::global::GlobalProposal> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
     fn put_certified_global_state(
@@ -360,10 +322,7 @@ impl ClockStore for NoopClockStore {
         Ok(())
     }
 
-    fn get_latest_shard_clock_frame(
-        &self,
-        _filter: &[u8],
-    ) -> Result<proto::global::AppShardFrame> {
+    fn get_latest_shard_clock_frame(&self, _filter: &[u8]) -> Result<proto::global::AppShardFrame> {
         Err(QuilError::NotFound("noop clock store".into()))
     }
     fn get_shard_clock_frame(
@@ -496,10 +455,7 @@ impl ClockStore for NoopClockStore {
     ) -> Result<()> {
         Ok(())
     }
-    fn get_peer_seniority_map(
-        &self,
-        _filter: &[u8],
-    ) -> Result<HashMap<String, u64>> {
+    fn get_peer_seniority_map(&self, _filter: &[u8]) -> Result<HashMap<String, u64>> {
         Ok(HashMap::new())
     }
     fn put_peer_seniority_map(
@@ -528,9 +484,14 @@ impl ClockStore for NoopClockStore {
 /// resolver that returns a real Ed448 public key for the test domain.
 pub struct NoopHypergraphConfigResolver;
 
-impl crate::hypergraph_intrinsic::HypergraphConfigResolver
-    for NoopHypergraphConfigResolver
-{
+impl crate::hypergraph_intrinsic::HypergraphConfigResolver for NoopHypergraphConfigResolver {
+    fn for_execution_context(
+        &self,
+        _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Result<Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>> {
+        Ok(Arc::new(Self))
+    }
+
     fn write_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
         None
     }

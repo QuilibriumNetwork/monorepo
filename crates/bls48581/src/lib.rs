@@ -21,30 +21,29 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::manual_memcpy)]
 #![allow(clippy::new_without_default)]
-pub mod bls48581;
-pub mod bls;
-pub mod rand;
 pub mod arch;
-pub mod hmac;
+pub mod bls;
+pub mod bls48581;
 pub mod hash256;
 pub mod hash384;
 pub mod hash512;
+pub mod hmac;
+pub mod rand;
 pub mod sha3;
 
-use std::error::Error;
-use std::fs;
+use ::rand::RngCore;
 use bls48581::big;
 use bls48581::ecp;
 use bls48581::ecp::ECP;
 use bls48581::ecp8;
-use bls48581::mpin256::SHA512;
-use bls48581::rom;
 use bls48581::pair8;
-use ::rand::rngs;
-use ::rand::RngCore;
+use bls48581::rom;
+use std::error::Error;
 
 uniffi::include_scaffolding!("lib");
 
+// `M` is the modulus in the FFT recurrence, named as in the KZG literature.
+#[allow(non_snake_case)]
 fn recurse_fft(
     values: &[big::BIG],
     offset: u64,
@@ -54,106 +53,101 @@ fn recurse_fft(
     fft_width: u64,
     inverse: bool,
 ) {
-  let M = &big::BIG::new_ints(&rom::CURVE_ORDER);
-  let roots = if inverse {
-    &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
-  } else {
-    &bls::singleton().RootsOfUnityBLS48581[&fft_width]
-  };
+    let roots = if inverse {
+        &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
+    } else {
+        &bls::singleton().RootsOfUnityBLS48581[&fft_width]
+    };
 
-  if out.len() == 1 {
-    // optimization: we're working in bls48-581, the first roots of unity
-    // value is always 1 no matter the fft width, so we can skip the
-    // multiplication:
-    out[0] = values[offset as usize].clone();
-    return;
-  }
-
-  let half = (out.len() as u64) >> 1;
-
-  // slide to the left
-  recurse_fft(
-    values,
-    offset,
-    stride << 1,
-    roots_stride << 1,
-    &mut out[..half as usize],
-    fft_width,
-    inverse,
-  );
-
-  // slide to the right
-  recurse_fft(
-    values,
-    offset + stride,
-    stride << 1,
-    roots_stride << 1,
-    &mut out[half as usize..],
-    fft_width,
-    inverse,
-  );
-
-  // cha cha now, y'all
-  for i in 0..half {
-    let mul = big::BIG::modmul(
-      &out[(i + half) as usize],
-      &roots[(i * roots_stride) as usize],
-      &big::BIG::new_ints(&rom::CURVE_ORDER),
-    );
-    let mul_add = big::BIG::modadd(
-      &out[i as usize],
-      &mul,
-      &big::BIG::new_ints(&rom::CURVE_ORDER),
-    );
-    out[(i + half) as usize] = big::BIG::modadd(
-      &out[i as usize],
-      &big::BIG::modneg(&mul, &big::BIG::new_ints(&rom::CURVE_ORDER)),
-      &big::BIG::new_ints(&rom::CURVE_ORDER),
-    );
-    out[i as usize] = mul_add;
-  }
-}
-
-pub fn fft(
-  values: &[big::BIG],
-  fft_width: u64,
-  inverse: bool,
-) -> Result<Vec<big::BIG>, String> {
-  let mut width = values.len() as u64;
-  if width > fft_width {
-    return Err("invalid width of values".into());
-  }
-
-  if width & (width - 1) != 0 {
-    width = nearest_power_of_two(width);
-  }
-
-  // We make a copy so we can mutate it during the work.
-  let mut working_values = vec![big::BIG::new(); width as usize];
-  for i in 0..values.len() {
-    working_values[i] = values[i].clone();
-  }
-  for i in values.len()..width as usize {
-    working_values[i] = big::BIG::new();
-  }
-
-  let mut out = vec![big::BIG::new(); width as usize];
-  let stride = fft_width / width;
-
-  if inverse {
-    let mut inv_len = big::BIG::new_int(width as isize);
-    inv_len.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-
-    recurse_fft(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
-    for i in 0..out.len() {
-      out[i] = big::BIG::modmul(&out[i], &inv_len, &big::BIG::new_ints(&rom::CURVE_ORDER));
+    if out.len() == 1 {
+        // optimization: we're working in bls48-581, the first roots of unity
+        // value is always 1 no matter the fft width, so we can skip the
+        // multiplication:
+        out[0] = values[offset as usize].clone();
+        return;
     }
 
-    Ok(out)
-  } else {
-    recurse_fft(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
-    Ok(out)
-  }
+    let half = (out.len() as u64) >> 1;
+
+    // slide to the left
+    recurse_fft(
+        values,
+        offset,
+        stride << 1,
+        roots_stride << 1,
+        &mut out[..half as usize],
+        fft_width,
+        inverse,
+    );
+
+    // slide to the right
+    recurse_fft(
+        values,
+        offset + stride,
+        stride << 1,
+        roots_stride << 1,
+        &mut out[half as usize..],
+        fft_width,
+        inverse,
+    );
+
+    // cha cha now, y'all
+    for i in 0..half {
+        let mul = big::BIG::modmul(
+            &out[(i + half) as usize],
+            &roots[(i * roots_stride) as usize],
+            &big::BIG::new_ints(&rom::CURVE_ORDER),
+        );
+        let mul_add = big::BIG::modadd(
+            &out[i as usize],
+            &mul,
+            &big::BIG::new_ints(&rom::CURVE_ORDER),
+        );
+        out[(i + half) as usize] = big::BIG::modadd(
+            &out[i as usize],
+            &big::BIG::modneg(&mul, &big::BIG::new_ints(&rom::CURVE_ORDER)),
+            &big::BIG::new_ints(&rom::CURVE_ORDER),
+        );
+        out[i as usize] = mul_add;
+    }
+}
+
+pub fn fft(values: &[big::BIG], fft_width: u64, inverse: bool) -> Result<Vec<big::BIG>, String> {
+    let mut width = values.len() as u64;
+    if width > fft_width {
+        return Err("invalid width of values".into());
+    }
+
+    if width & (width - 1) != 0 {
+        width = nearest_power_of_two(width);
+    }
+
+    // We make a copy so we can mutate it during the work.
+    let mut working_values = vec![big::BIG::new(); width as usize];
+    for i in 0..values.len() {
+        working_values[i] = values[i].clone();
+    }
+    for i in values.len()..width as usize {
+        working_values[i] = big::BIG::new();
+    }
+
+    let mut out = vec![big::BIG::new(); width as usize];
+    let stride = fft_width / width;
+
+    if inverse {
+        let mut inv_len = big::BIG::new_int(width as isize);
+        inv_len.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
+
+        recurse_fft(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
+        for i in 0..out.len() {
+            out[i] = big::BIG::modmul(&out[i], &inv_len, &big::BIG::new_ints(&rom::CURVE_ORDER));
+        }
+
+        Ok(out)
+    } else {
+        recurse_fft(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
+        Ok(out)
+    }
 }
 
 /// Optimized iterative in-place FFT with cached modulus.
@@ -165,426 +159,577 @@ pub fn fft(
 ///
 /// The existing `fft` is preserved unchanged for side-by-side benchmarking.
 pub fn fft_fast(
-  values: &[big::BIG],
-  fft_width: u64,
-  inverse: bool,
+    values: &[big::BIG],
+    fft_width: u64,
+    inverse: bool,
 ) -> Result<Vec<big::BIG>, String> {
-  let mut width = values.len() as u64;
-  if width > fft_width {
-    return Err("invalid width of values".into());
-  }
-
-  if width & (width - 1) != 0 {
-    width = nearest_power_of_two(width);
-  }
-
-  let n = width as usize;
-  let log_n = {
-    let mut l = 0usize;
-    let mut tmp = n;
-    while tmp > 1 {
-      tmp >>= 1;
-      l += 1;
+    let mut width = values.len() as u64;
+    if width > fft_width {
+        return Err("invalid width of values".into());
     }
-    l
-  };
 
-  // Cache the modulus once — this is the key optimization.
-  let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
-
-  // Select roots of unity
-  let roots = if inverse {
-    &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
-  } else {
-    &bls::singleton().RootsOfUnityBLS48581[&fft_width]
-  };
-  let stride = (fft_width / width) as usize;
-
-  // Single buffer: copy values then zero-pad
-  let mut data = vec![big::BIG::new(); n];
-  for i in 0..values.len() {
-    data[i] = values[i].clone();
-  }
-
-  // Bit-reversal permutation
-  for i in 0..n {
-    let j = bit_reverse(i, log_n);
-    if i < j {
-      let tmp = data[i].clone();
-      data[i] = data[j].clone();
-      data[j] = tmp;
+    if width & (width - 1) != 0 {
+        width = nearest_power_of_two(width);
     }
-  }
 
-  // Iterative butterfly stages
-  let mut len = 2usize;
-  while len <= n {
-    let half = len / 2;
-    let step = n / len;   // root-of-unity stride for this stage
+    let n = width as usize;
+    let log_n = {
+        let mut l = 0usize;
+        let mut tmp = n;
+        while tmp > 1 {
+            tmp >>= 1;
+            l += 1;
+        }
+        l
+    };
 
-    let mut start = 0;
-    while start < n {
-      for k in 0..half {
-        let twiddle_idx = k * step * stride;
-        let u = data[start + k].clone();
-        let t = big::BIG::modmul(
-          &data[start + k + half],
-          &roots[twiddle_idx],
-          &modulus,
-        );
-        data[start + k] = big::BIG::modadd(&u, &t, &modulus);
-        data[start + k + half] = big::BIG::modadd(
-          &u,
-          &big::BIG::modneg(&t, &modulus),
-          &modulus,
-        );
-      }
-      start += len;
+    // Cache the modulus once — this is the key optimization.
+    let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+
+    // Select roots of unity
+    let roots = if inverse {
+        &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
+    } else {
+        &bls::singleton().RootsOfUnityBLS48581[&fft_width]
+    };
+    let stride = (fft_width / width) as usize;
+
+    // Single buffer: copy values then zero-pad
+    let mut data = vec![big::BIG::new(); n];
+    for i in 0..values.len() {
+        data[i] = values[i].clone();
     }
-    len <<= 1;
-  }
 
-  // If inverse: multiply each element by 1/n mod M
-  if inverse {
-    let mut inv_len = big::BIG::new_int(n as isize);
-    inv_len.invmodp(&modulus);
+    // Bit-reversal permutation
     for i in 0..n {
-      data[i] = big::BIG::modmul(&data[i], &inv_len, &modulus);
+        let j = bit_reverse(i, log_n);
+        if i < j {
+            let tmp = data[i].clone();
+            data[i] = data[j].clone();
+            data[j] = tmp;
+        }
     }
-  }
 
-  Ok(data)
+    // Iterative butterfly stages
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let step = n / len; // root-of-unity stride for this stage
+
+        let mut start = 0;
+        while start < n {
+            for k in 0..half {
+                let twiddle_idx = k * step * stride;
+                let u = data[start + k].clone();
+                let t = big::BIG::modmul(&data[start + k + half], &roots[twiddle_idx], &modulus);
+                data[start + k] = big::BIG::modadd(&u, &t, &modulus);
+                data[start + k + half] =
+                    big::BIG::modadd(&u, &big::BIG::modneg(&t, &modulus), &modulus);
+            }
+            start += len;
+        }
+        len <<= 1;
+    }
+
+    // If inverse: multiply each element by 1/n mod M
+    if inverse {
+        let mut inv_len = big::BIG::new_int(n as isize);
+        inv_len.invmodp(&modulus);
+        for i in 0..n {
+            data[i] = big::BIG::modmul(&data[i], &inv_len, &modulus);
+        }
+    }
+
+    Ok(data)
 }
 
 /// Reverse the bottom `log_n` bits of `x`.
 fn bit_reverse(x: usize, log_n: usize) -> usize {
-  let mut result = 0usize;
-  let mut val = x;
-  for _ in 0..log_n {
-    result = (result << 1) | (val & 1);
-    val >>= 1;
-  }
-  result
+    let mut result = 0usize;
+    let mut val = x;
+    for _ in 0..log_n {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    result
 }
 
 fn recurse_fft_g1(
-  values: &[ecp::ECP],
-  offset: u64,
-  stride: u64,
-  roots_stride: u64,
-  out: &mut [ecp::ECP],
-  fft_width: u64,
-  inverse: bool,
+    values: &[ecp::ECP],
+    offset: u64,
+    stride: u64,
+    roots_stride: u64,
+    out: &mut [ecp::ECP],
+    fft_width: u64,
+    inverse: bool,
 ) {
-  let roots = if inverse {
-    &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
-  } else {
-    &bls::singleton().RootsOfUnityBLS48581[&fft_width]
-  };
+    let roots = if inverse {
+        &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
+    } else {
+        &bls::singleton().RootsOfUnityBLS48581[&fft_width]
+    };
 
-  if out.len() == 1 {
-    out[0] = values[offset as usize].clone();
-    return;
-  }
-
-  let half = (out.len() as u64) >> 1;
-
-  // slide to the left
-  recurse_fft_g1(
-    values,
-    offset,
-    stride << 1,
-    roots_stride << 1,
-    &mut out[..half as usize],
-    fft_width,
-    inverse,
-  );
-
-  // slide to the right
-  recurse_fft_g1(
-    values,
-    offset + stride,
-    stride << 1,
-    roots_stride << 1,
-    &mut out[half as usize..],
-    fft_width,
-    inverse,
-  );
-
-  // cha cha now, y'all
-  for i in 0..half {
-    let mul = out[(i + half) as usize].clone().mul(
-      &roots[(i * roots_stride) as usize].clone(),
-    );
-    let mut mul_add = out[i as usize].clone();
-    mul_add.add(&mul.clone());
-    out[(i + half) as usize] = out[i as usize].clone();
-    out[(i + half) as usize].sub(&mul);
-    out[i as usize] = mul_add;
-  }
-}
-
-pub fn fft_g1(
-  values: &[ecp::ECP],
-  fft_width: u64,
-  inverse: bool,
-) -> Result<Vec<ecp::ECP>, String> {
-  let mut width = values.len() as u64;
-  if width > fft_width {
-    return Err("invalid width of values".into());
-  }
-
-  if width & (width - 1) != 0 {
-    width = nearest_power_of_two(width);
-  }
-
-  let mut working_values = vec![ecp::ECP::new(); width as usize];
-  for i in 0..values.len() {
-    working_values[i] = values[i].clone();
-  }
-  for i in values.len()..width as usize {
-    working_values[i] = ecp::ECP::generator();
-  }
-
-  let mut out = vec![ecp::ECP::new(); width as usize];
-  let stride = fft_width / width;
-
-  if inverse {
-    let mut inv_len = big::BIG::new_int(width as isize);
-    inv_len.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-
-    recurse_fft_g1(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
-    for i in 0..out.len() {
-      out[i] = out[i].clone().mul(&inv_len);
+    if out.len() == 1 {
+        out[0] = values[offset as usize].clone();
+        return;
     }
 
-    Ok(out)
-  } else {
-    recurse_fft_g1(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
-    Ok(out)
-  }
+    let half = (out.len() as u64) >> 1;
+
+    // slide to the left
+    recurse_fft_g1(
+        values,
+        offset,
+        stride << 1,
+        roots_stride << 1,
+        &mut out[..half as usize],
+        fft_width,
+        inverse,
+    );
+
+    // slide to the right
+    recurse_fft_g1(
+        values,
+        offset + stride,
+        stride << 1,
+        roots_stride << 1,
+        &mut out[half as usize..],
+        fft_width,
+        inverse,
+    );
+
+    // cha cha now, y'all
+    for i in 0..half {
+        let mul = out[(i + half) as usize]
+            .clone()
+            .mul(&roots[(i * roots_stride) as usize].clone());
+        let mut mul_add = out[i as usize].clone();
+        mul_add.add(&mul.clone());
+        out[(i + half) as usize] = out[i as usize].clone();
+        out[(i + half) as usize].sub(&mul);
+        out[i as usize] = mul_add;
+    }
+}
+
+pub fn fft_g1(values: &[ecp::ECP], fft_width: u64, inverse: bool) -> Result<Vec<ecp::ECP>, String> {
+    let mut width = values.len() as u64;
+    if width > fft_width {
+        return Err("invalid width of values".into());
+    }
+
+    if width & (width - 1) != 0 {
+        width = nearest_power_of_two(width);
+    }
+
+    let mut working_values = vec![ecp::ECP::new(); width as usize];
+    for i in 0..values.len() {
+        working_values[i] = values[i].clone();
+    }
+    for i in values.len()..width as usize {
+        working_values[i] = ecp::ECP::generator();
+    }
+
+    let mut out = vec![ecp::ECP::new(); width as usize];
+    let stride = fft_width / width;
+
+    if inverse {
+        let mut inv_len = big::BIG::new_int(width as isize);
+        inv_len.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
+
+        recurse_fft_g1(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
+        for i in 0..out.len() {
+            out[i] = out[i].clone().mul(&inv_len);
+        }
+
+        Ok(out)
+    } else {
+        recurse_fft_g1(&working_values, 0, 1, stride, &mut out, fft_width, inverse);
+        Ok(out)
+    }
 }
 
 fn nearest_power_of_two(number: u64) -> u64 {
-  let mut power = 1;
-  while number > power {
-    power <<= 1;
-  }
-  power
+    let mut power = 1;
+    while number > power {
+        power <<= 1;
+    }
+    power
 }
 
-fn bytes_to_polynomial(
-  bytes: &[u8],
-) -> Vec<big::BIG> {
-  let size = bytes.len() / 64;
-  let trunc_last = bytes.len() % 64 > 0;
+fn bytes_to_polynomial(bytes: &[u8]) -> Vec<big::BIG> {
+    let size = bytes.len() / 64;
+    let trunc_last = bytes.len() % 64 > 0;
 
-  let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
+    let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
 
-  for i in 0..size {
-    let scalar = big::BIG::frombytes(&bytes[i * 64..(i + 1) * 64]);
-    poly.push(scalar);
-  }
+    for i in 0..size {
+        let scalar = big::BIG::frombytes(&bytes[i * 64..(i + 1) * 64]);
+        poly.push(scalar);
+    }
 
-  if trunc_last {
-    let scalar = big::BIG::frombytes(&bytes[size * 64..]);
-    poly.push(scalar);
-  }
+    if trunc_last {
+        let scalar = big::BIG::frombytes(&bytes[size * 64..]);
+        poly.push(scalar);
+    }
 
-  return poly;
+    return poly;
 }
 
 pub fn point_linear_combination(
-  points: &[ecp::ECP],
-  scalars: &Vec<big::BIG>,
+    points: &[ecp::ECP],
+    scalars: &Vec<big::BIG>,
 ) -> Result<ecp::ECP, Box<dyn Error>> {
-  if points.len() != scalars.len() {
-    return Err(format!(
-      "length mismatch between arguments, points: {}, scalars: {}",
-      points.len(),
-      scalars.len(),
-    ).into());
-  }
+    if points.len() != scalars.len() {
+        return Err(format!(
+            "length mismatch between arguments, points: {}, scalars: {}",
+            points.len(),
+            scalars.len(),
+        )
+        .into());
+    }
 
-  let result = ecp::ECP::muln(points.len(), points, scalars.as_slice());
+    let result = ecp::ECP::muln(points.len(), points, scalars.as_slice());
 
-  Ok(result)
+    Ok(result)
 }
 
 pub fn point8_linear_combination(
-  points: &[ecp8::ECP8],
-  scalars: &Vec<big::BIG>,
+    points: &[ecp8::ECP8],
+    scalars: &Vec<big::BIG>,
 ) -> Result<ecp8::ECP8, Box<dyn Error>> {
-  if points.len() != scalars.len() {
-    return Err(format!(
-      "length mismatch between arguments, points: {}, scalars: {}",
-      points.len(),
-      scalars.len(),
-    ).into());
-  }
-
-  let mut result = points[0].mul(&scalars[0]);
-  for i in 1..points.len() {
-    result.add(&points[i].mul(&scalars[i]));
-  }
-
-  Ok(result)
-}
-
-fn verify(
-  commitment: &ecp::ECP,
-  z: &big::BIG,
-  y: &big::BIG,
-  proof: &ecp::ECP,
-) -> bool {
-  let z2 = ecp8::ECP8::generator().mul(z);
-  let y1 = ecp::ECP::generator().mul(y);
-  let mut xz = bls::singleton().CeremonyBLS48581G2[1].clone();
-  xz.sub(&z2);
-  let mut cy = commitment.clone();
-  cy.sub(&y1);
-  cy.neg();
-
-  let mut r = pair8::initmp();
-
-  pair8::another(&mut r, &xz, &proof);
-  pair8::another(&mut r, &ecp8::ECP8::generator(), &cy);
-  let mut v = pair8::miller(&mut r);
-  v = pair8::fexp(&v);
-  return v.isunity();
-}
-
-pub fn commit_raw(
-  data: &[u8],
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = bytes_to_polynomial(data);
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
-  match point_linear_combination_fast(
-		&bls::singleton().FFTBLS48581[&poly_size],
-		&poly,
-	) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      return b.to_vec();
+    if points.len() != scalars.len() {
+        return Err(format!(
+            "length mismatch between arguments, points: {}, scalars: {}",
+            points.len(),
+            scalars.len(),
+        )
+        .into());
     }
-    Err(_e) => {
-      return [].to_vec();
+
+    let mut result = points[0].mul(&scalars[0]);
+    for i in 1..points.len() {
+        result.add(&points[i].mul(&scalars[i]));
     }
-  }
+
+    Ok(result)
 }
 
-pub fn prove_raw(
-  data: &[u8],
-  index: u64,
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = bytes_to_polynomial(data);
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
+fn verify(commitment: &ecp::ECP, z: &big::BIG, y: &big::BIG, proof: &ecp::ECP) -> bool {
+    let z2 = ecp8::ECP8::generator().mul(z);
+    let y1 = ecp::ECP::generator().mul(y);
+    let mut xz = bls::singleton().CeremonyBLS48581G2[1].clone();
+    xz.sub(&z2);
+    let mut cy = commitment.clone();
+    cy.sub(&y1);
+    cy.neg();
 
-  let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+    let mut r = pair8::initmp();
 
-  match fft_fast(
-    &poly,
-    poly_size,
-    true,
-  ) {
-    Ok(eval_poly) => {
-      let mut subz = big::BIG::new_int(0);
-      subz = big::BIG::modadd(&subz, &big::BIG::modneg(&z, &big::BIG::new_ints(&rom::CURVE_ORDER)), &big::BIG::new_ints(&rom::CURVE_ORDER));
-      let mut subzinv = subz.clone();
-      subzinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-      let o = big::BIG::new_int(1);
-      let mut oinv = o.clone();
-      oinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-      let divisors: Vec<big::BIG> = vec![
-        subz,
-        o
-      ];
-      let invdivisors: Vec<big::BIG> = vec![
-        subzinv,
-        oinv
-      ];
-    
-      let mut a: Vec<big::BIG> = eval_poly.iter().map(|x| x.clone()).collect();
-    
-      // Adapted from Feist's amortized proofs:
-      let mut a_pos = a.len() - 1;
-      let b_pos = divisors.len() - 1;
-      let mut diff = a_pos as isize - b_pos as isize;
-      let mut out: Vec<big::BIG> = vec![big::BIG::new(); (diff + 1) as usize];
-      while diff >= 0 {
-        out[diff as usize] = a[a_pos].clone();
-        out[diff as usize] = big::BIG::modmul(&out[diff as usize], &invdivisors[b_pos], &big::BIG::new_ints(&rom::CURVE_ORDER));
-        for i in (0..=b_pos).rev() {
-          let den = &out[diff as usize].clone();
-          a[diff as usize + i] = a[diff as usize + i].clone();
-          a[diff as usize + i] = big::BIG::modadd(
-            &a[diff as usize + i],
-            &big::BIG::modneg(
-              &big::BIG::modmul(&den, &divisors[i], &big::BIG::new_ints(&rom::CURVE_ORDER)),
-              &big::BIG::new_ints(&rom::CURVE_ORDER)
-            ),
-            &big::BIG::new_ints(&rom::CURVE_ORDER)
-          );
-        }
+    pair8::another(&mut r, &xz, &proof);
+    pair8::another(&mut r, &ecp8::ECP8::generator(), &cy);
+    let mut v = pair8::miller(&mut r);
+    v = pair8::fexp(&v);
+    return v.isunity();
+}
 
-        a_pos -= 1;
-        diff -= 1;
-      }
-    
-      match point_linear_combination_fast(
-        &bls::singleton().CeremonyBLS48581G1[..(poly_size as usize - 1)],
-        &out,
-      ) {
-        Ok(proof) => {
-          let mut b = [0u8; 74];
-          proof.tobytes(&mut b, true);
-          return b.to_vec();
+pub fn commit_raw(data: &[u8], poly_size: u64) -> Vec<u8> {
+    let mut poly = bytes_to_polynomial(data);
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
+    }
+    match point_linear_combination_fast(&bls::singleton().FFTBLS48581[&poly_size], &poly) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            return b.to_vec();
         }
         Err(_e) => {
-          return [].to_vec();
+            return [].to_vec();
         }
-      }
-    },
-    Err(_e) => {
-      return [].to_vec();
     }
-  }
 }
 
-pub fn verify_raw(
-  data: &[u8],
-  commit: &[u8],
-  index: u64,
-  proof: &[u8],
-  poly_size: u64,
+pub fn prove_raw(data: &[u8], index: u64, poly_size: u64) -> Vec<u8> {
+    let mut poly = bytes_to_polynomial(data);
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
+    }
+
+    let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+
+    match fft_fast(&poly, poly_size, true) {
+        Ok(eval_poly) => {
+            let mut subz = big::BIG::new_int(0);
+            subz = big::BIG::modadd(
+                &subz,
+                &big::BIG::modneg(&z, &big::BIG::new_ints(&rom::CURVE_ORDER)),
+                &big::BIG::new_ints(&rom::CURVE_ORDER),
+            );
+            let mut subzinv = subz.clone();
+            subzinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
+            let o = big::BIG::new_int(1);
+            let mut oinv = o.clone();
+            oinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
+            let divisors: Vec<big::BIG> = vec![subz, o];
+            let invdivisors: Vec<big::BIG> = vec![subzinv, oinv];
+
+            let mut a: Vec<big::BIG> = eval_poly.iter().map(|x| x.clone()).collect();
+
+            // Adapted from Feist's amortized proofs:
+            let mut a_pos = a.len() - 1;
+            let b_pos = divisors.len() - 1;
+            let mut diff = a_pos as isize - b_pos as isize;
+            let mut out: Vec<big::BIG> = vec![big::BIG::new(); (diff + 1) as usize];
+            while diff >= 0 {
+                out[diff as usize] = a[a_pos].clone();
+                out[diff as usize] = big::BIG::modmul(
+                    &out[diff as usize],
+                    &invdivisors[b_pos],
+                    &big::BIG::new_ints(&rom::CURVE_ORDER),
+                );
+                for i in (0..=b_pos).rev() {
+                    let den = &out[diff as usize].clone();
+                    a[diff as usize + i] = a[diff as usize + i].clone();
+                    a[diff as usize + i] = big::BIG::modadd(
+                        &a[diff as usize + i],
+                        &big::BIG::modneg(
+                            &big::BIG::modmul(
+                                &den,
+                                &divisors[i],
+                                &big::BIG::new_ints(&rom::CURVE_ORDER),
+                            ),
+                            &big::BIG::new_ints(&rom::CURVE_ORDER),
+                        ),
+                        &big::BIG::new_ints(&rom::CURVE_ORDER),
+                    );
+                }
+
+                a_pos -= 1;
+                diff -= 1;
+            }
+
+            match point_linear_combination_fast(
+                &bls::singleton().CeremonyBLS48581G1[..(poly_size as usize - 1)],
+                &out,
+            ) {
+                Ok(proof) => {
+                    let mut b = [0u8; 74];
+                    proof.tobytes(&mut b, true);
+                    return b.to_vec();
+                }
+                Err(_e) => {
+                    return [].to_vec();
+                }
+            }
+        }
+        Err(_e) => {
+            return [].to_vec();
+        }
+    }
+}
+
+/// A G1 point from untrusted bytes; `None` when they are shorter than
+/// `ECP::frombytes` reads (73 bytes after a compressed tag, 146 after `0x04`),
+/// which it indexes without a length check and would panic on. Bytes long
+/// enough decode exactly as before, so only a crash becomes a rejection.
+fn g1_from_untrusted(b: &[u8]) -> Option<ecp::ECP> {
+    let mb = big::MODBYTES;
+    let needed = match b.first()? {
+        0x04 => 2 * mb + 1,
+        _ => mb + 1,
+    };
+    (b.len() >= needed).then(|| ecp::ECP::frombytes(b))
+}
+
+pub fn verify_raw(data: &[u8], commit: &[u8], index: u64, proof: &[u8], poly_size: u64) -> bool {
+    let Some(&z) = bls::singleton()
+        .RootsOfUnityBLS48581
+        .get(&poly_size)
+        .and_then(|roots| roots.get(index as usize))
+    else {
+        return false;
+    };
+
+    let y = big::BIG::frombytes(data);
+
+    let Some(c) = g1_from_untrusted(commit) else {
+        return false;
+    };
+    if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
+        return false;
+    }
+
+    let Some(p) = g1_from_untrusted(proof) else {
+        return false;
+    };
+    if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+        return false;
+    }
+
+    return verify(&c, &z, &y, &p);
+}
+
+/// Aggregate-verify a batch of KZG openings with ONE pairing check.
+///
+/// Every opening shares the global SRS, so the `K` individual checks
+/// `e(π_k, [s−z_k]₂) == e(C_k − y_k·[1]₁, [1]₂)` fold under a single
+/// Fiat-Shamir scalar `γ` into:
+///   A = Σ γ^k·π_k
+///   B = Σ γ^k·C_k − (Σ γ^k·y_k)·[1]₁ + Σ (γ^k·z_k)·π_k
+///   accept ⇔ e(A, [s]₂) == e(B, [1]₂)         (which is `verify(B, 0, 0, A)`)
+///
+/// Inputs are parallel slices of length `K`: `commits[k]`/`proofs[k]` are
+/// compressed G1 points, `indices[k]` selects `z_k = RootsOfUnity[poly_size]
+/// [index]`, `values[k]` is `y_k` (scalar bytes). `gamma` is the caller's
+/// transcript-bound FS scalar (any length; reduced mod the curve order).
+///
+/// Soundness: if any single opening is invalid the LHS−RHS is a non-zero
+/// degree-`K` polynomial in `γ`, so it passes with probability ≤ K/order
+/// (Schwartz–Zippel) over a uniformly-derived `γ`. `gamma` MUST be bound to
+/// every `(C_k, z_k, y_k, π_k)` by the caller, or the batch is forgeable.
+pub fn aggregate_verify_openings(
+    commits: &[Vec<u8>],
+    indices: &[u64],
+    values: &[Vec<u8>],
+    proofs: &[Vec<u8>],
+    poly_size: u64,
+    gamma: &[u8],
 ) -> bool {
-  let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+    let k = commits.len();
+    if k == 0 {
+        return true; // vacuous: no openings to satisfy. Caller enforces quorum.
+    }
+    if indices.len() != k || values.len() != k || proofs.len() != k {
+        return false;
+    }
 
-  let y = big::BIG::frombytes(data);
+    let order = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let roots = match bls::singleton().RootsOfUnityBLS48581.get(&poly_size) {
+        Some(r) => r,
+        None => return false,
+    };
 
-  let c = ecp::ECP::frombytes(commit);
-  if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
-    return false;
-  }
+    // Parse points + scalars; reject degenerate group elements (matches
+    // verify_raw's infinity/generator guard).
+    let mut commit_pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+    let mut proof_pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+    let mut zs: Vec<big::BIG> = Vec::with_capacity(k);
+    let mut ys: Vec<big::BIG> = Vec::with_capacity(k);
+    for i in 0..k {
+        let Some(c) = g1_from_untrusted(&commits[i]) else {
+            return false;
+        };
+        if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
+            return false;
+        }
+        let Some(p) = g1_from_untrusted(&proofs[i]) else {
+            return false;
+        };
+        if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+            return false;
+        }
+        let idx = indices[i] as usize;
+        if idx >= roots.len() {
+            return false;
+        }
+        commit_pts.push(c);
+        proof_pts.push(p);
+        zs.push(roots[idx]);
+        ys.push(big::BIG::frombytes(&values[i]));
+    }
 
-  let p = ecp::ECP::frombytes(proof);
-  if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
-    return false;
-  }
+    // γ reduced mod the curve order (accept any-length input, big-endian).
+    let mut gbuf = [0u8; big::MODBYTES];
+    let n = gamma.len().min(big::MODBYTES);
+    gbuf[big::MODBYTES - n..].copy_from_slice(&gamma[gamma.len() - n..]);
+    let mut g = big::BIG::frombytes(&gbuf);
+    g.rmod(&order);
 
-  return verify(
-    &c,
-    &z,
-    &y,
-    &p,
-  );
+    // γ powers [1, γ, γ², …, γ^{K−1}].
+    let mut gpows: Vec<big::BIG> = Vec::with_capacity(k);
+    let mut cur = big::BIG::new_int(1);
+    for _ in 0..k {
+        gpows.push(cur);
+        cur = big::BIG::modmul(&cur, &g, &order);
+    }
+
+    // A = Σ γ^k π_k
+    let a = match point_linear_combination_parallel(&proof_pts, &gpows) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // term1 = Σ γ^k C_k
+    let term1 = match point_linear_combination_parallel(&commit_pts, &gpows) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // term2 = (Σ γ^k y_k)·G1
+    let mut sum_gy = big::BIG::new_int(0);
+    for i in 0..k {
+        let t = big::BIG::modmul(&gpows[i], &ys[i], &order);
+        sum_gy = big::BIG::modadd(&sum_gy, &t, &order);
+    }
+    let term2 = ecp::ECP::generator().mul(&sum_gy);
+    // term3 = Σ (γ^k z_k) π_k
+    let gz: Vec<big::BIG> = (0..k)
+        .map(|i| big::BIG::modmul(&gpows[i], &zs[i], &order))
+        .collect();
+    let term3 = match point_linear_combination_parallel(&proof_pts, &gz) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // B = term1 − term2 + term3
+    let mut b = term1.clone();
+    b.sub(&term2);
+    b.add(&term3);
+
+    // e(A, [s]₂) == e(B, [1]₂)  ⇔  verify(C = B, z = 0, y = 0, proof = A)
+    let zero = big::BIG::new_int(0);
+    verify(&b, &zero, &zero, &a)
+}
+
+/// Aggregate proof point `A = Σ_k γ^k · π_k` from compressed-G1 proof bytes
+/// (`proofs`, in the caller's canonical order) and a Fiat-Shamir challenge
+/// `gamma` (big-endian, any length, reduced mod the curve order). This is the
+/// 74-byte compressed G1 element used as a storage-attestation root: it IS the
+/// frame's aggregate possession proof and binds the opening set, because `gamma`
+/// is FS over the full opening transcript (changing any opening changes `A`).
+/// `proofs` must be the SAME proof bytes, in the SAME order, that
+/// [`aggregate_verify_openings`] receives, so producer and verifier agree.
+/// Returns `None` on an empty set or a malformed / degenerate proof point.
+pub fn aggregate_proof_point(proofs: &[Vec<u8>], gamma: &[u8]) -> Option<Vec<u8>> {
+    let k = proofs.len();
+    if k == 0 {
+        return None;
+    }
+    let order = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let mut pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+    for pb in proofs {
+        let p = g1_from_untrusted(pb)?;
+        if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+            return None;
+        }
+        pts.push(p);
+    }
+    // γ reduced mod the curve order (any-length big-endian input), matching
+    // `aggregate_verify_openings`.
+    let mut gbuf = [0u8; big::MODBYTES];
+    let n = gamma.len().min(big::MODBYTES);
+    gbuf[big::MODBYTES - n..].copy_from_slice(&gamma[gamma.len() - n..]);
+    let mut g = big::BIG::frombytes(&gbuf);
+    g.rmod(&order);
+    // γ powers [1, γ, γ², …, γ^{K−1}].
+    let mut gpows: Vec<big::BIG> = Vec::with_capacity(k);
+    let mut cur = big::BIG::new_int(1);
+    for _ in 0..k {
+        gpows.push(cur);
+        cur = big::BIG::modmul(&cur, &g, &order);
+    }
+    let a = point_linear_combination(&pts, &gpows).ok()?;
+    let mut b = [0u8; 74];
+    a.tobytes(&mut b, true);
+    Some(b.to_vec())
 }
 
 // ── Full-width scalar API ───────────────────────────────────────────────────
@@ -597,26 +742,24 @@ pub fn verify_raw(
 /// Bytes per scalar in the full-width encoding (= MODBYTES = 73).
 pub const FULL_BYTES_PER_SCALAR: usize = big::MODBYTES;
 
-fn bytes_to_polynomial_full(
-  bytes: &[u8],
-) -> Vec<big::BIG> {
-  let size = bytes.len() / FULL_BYTES_PER_SCALAR;
-  let trunc_last = bytes.len() % FULL_BYTES_PER_SCALAR > 0;
+fn bytes_to_polynomial_full(bytes: &[u8]) -> Vec<big::BIG> {
+    let size = bytes.len() / FULL_BYTES_PER_SCALAR;
+    let trunc_last = bytes.len() % FULL_BYTES_PER_SCALAR > 0;
 
-  let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
+    let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
 
-  for i in 0..size {
-    let start = i * FULL_BYTES_PER_SCALAR;
-    let scalar = big::BIG::frombytes(&bytes[start..start + FULL_BYTES_PER_SCALAR]);
-    poly.push(scalar);
-  }
+    for i in 0..size {
+        let start = i * FULL_BYTES_PER_SCALAR;
+        let scalar = big::BIG::frombytes(&bytes[start..start + FULL_BYTES_PER_SCALAR]);
+        poly.push(scalar);
+    }
 
-  if trunc_last {
-    let scalar = big::BIG::frombytes(&bytes[size * FULL_BYTES_PER_SCALAR..]);
-    poly.push(scalar);
-  }
+    if trunc_last {
+        let scalar = big::BIG::frombytes(&bytes[size * FULL_BYTES_PER_SCALAR..]);
+        poly.push(scalar);
+    }
 
-  poly
+    poly
 }
 
 /// Commit to a polynomial in evaluation form using full-width (MODBYTES per
@@ -624,60 +767,48 @@ fn bytes_to_polynomial_full(
 ///
 /// Like [`commit_raw`] but reads 73 bytes per scalar instead of 64,
 /// preserving the full field element without truncation.
-pub fn commit_raw_full(
-  data: &[u8],
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = bytes_to_polynomial_full(data);
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
-  match point_linear_combination_fast(
-    &bls::singleton().FFTBLS48581[&poly_size],
-    &poly,
-  ) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      b.to_vec()
+pub fn commit_raw_full(data: &[u8], poly_size: u64) -> Vec<u8> {
+    let mut poly = bytes_to_polynomial_full(data);
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
     }
-    Err(_) => vec![],
-  }
+    match point_linear_combination_fast(&bls::singleton().FFTBLS48581[&poly_size], &poly) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            b.to_vec()
+        }
+        Err(_) => vec![],
+    }
 }
 
 /// Create an opening proof at a domain-point index using full-width scalars.
 ///
 /// Like [`prove_raw`] but reads 73 bytes per scalar. Uses the existing
 /// [`div_by_linear`] helper and monomial-basis SRS for the quotient commitment.
-pub fn prove_raw_full(
-  data: &[u8],
-  index: u64,
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = bytes_to_polynomial_full(data);
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
+pub fn prove_raw_full(data: &[u8], index: u64, poly_size: u64) -> Vec<u8> {
+    let mut poly = bytes_to_polynomial_full(data);
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
+    }
 
-  let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+    let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
 
-  match fft_fast(&poly, poly_size, true) {
-    Ok(coeffs) => {
-      let q = div_by_linear(&coeffs, &z);
-      match point_linear_combination_fast(
-        &bls::singleton().CeremonyBLS48581G1[..q.len()],
-        &q,
-      ) {
-        Ok(proof) => {
-          let mut b = [0u8; 74];
-          proof.tobytes(&mut b, true);
-          b.to_vec()
+    match fft_fast(&poly, poly_size, true) {
+        Ok(coeffs) => {
+            let q = div_by_linear(&coeffs, &z);
+            match point_linear_combination_fast(&bls::singleton().CeremonyBLS48581G1[..q.len()], &q)
+            {
+                Ok(proof) => {
+                    let mut b = [0u8; 74];
+                    proof.tobytes(&mut b, true);
+                    b.to_vec()
+                }
+                Err(_) => vec![],
+            }
         }
         Err(_) => vec![],
-      }
     }
-    Err(_) => vec![],
-  }
 }
 
 /// Commit to a polynomial given directly as `BIG` scalars in evaluation form.
@@ -685,25 +816,19 @@ pub fn prove_raw_full(
 /// Uses the Lagrange-basis SRS (`FFTBLS48581`) to compute
 /// `C = Σ scalars[i] · [Lᵢ(τ)]₁`.  No byte serialization — avoids the
 /// 64-byte truncation inherent in [`commit_raw`].
-pub fn commit_scalars(
-  scalars: &[big::BIG],
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = scalars.to_vec();
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
-  match point_linear_combination_fast(
-    &bls::singleton().FFTBLS48581[&poly_size],
-    &poly,
-  ) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      b.to_vec()
+pub fn commit_scalars(scalars: &[big::BIG], poly_size: u64) -> Vec<u8> {
+    let mut poly = scalars.to_vec();
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
     }
-    Err(_) => vec![],
-  }
+    match point_linear_combination_fast(&bls::singleton().FFTBLS48581[&poly_size], &poly) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            b.to_vec()
+        }
+        Err(_) => vec![],
+    }
 }
 
 /// Commit to a polynomial given as `BIG` scalars in coefficient form.
@@ -712,78 +837,110 @@ pub fn commit_scalars(
 /// `C = Σ coeffs[i] · [τⁱ]₁`.  Useful when you already have coefficient-form
 /// polynomials (e.g. quotients from synthetic division) and want to skip the
 /// FFT that would be needed to convert to evaluation form first.
-pub fn commit_scalars_monomial(
-  coeffs: &[big::BIG],
-) -> Vec<u8> {
-  match point_linear_combination_fast(
-    &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
-    &coeffs.to_vec(),
-  ) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      b.to_vec()
+pub fn commit_scalars_monomial(coeffs: &[big::BIG]) -> Vec<u8> {
+    match point_linear_combination_fast(
+        &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
+        &coeffs.to_vec(),
+    ) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            b.to_vec()
+        }
+        Err(_) => vec![],
     }
-    Err(_) => vec![],
-  }
 }
 
 /// Like [`point_linear_combination`] but uses `ECP::muln_fast` (signed-digit
 /// adaptive-window Pippenger with mixed addition).
 pub fn point_linear_combination_fast(
-  points: &[ecp::ECP],
-  scalars: &Vec<big::BIG>,
+    points: &[ecp::ECP],
+    scalars: &Vec<big::BIG>,
 ) -> Result<ecp::ECP, Box<dyn Error>> {
-  if points.len() != scalars.len() {
-    return Err(format!(
-      "length mismatch between arguments, points: {}, scalars: {}",
-      points.len(),
-      scalars.len(),
-    ).into());
-  }
+    if points.len() != scalars.len() {
+        return Err(format!(
+            "length mismatch between arguments, points: {}, scalars: {}",
+            points.len(),
+            scalars.len(),
+        )
+        .into());
+    }
 
-  let result = ecp::ECP::muln_fast(points.len(), points, scalars.as_slice());
+    let result = ecp::ECP::muln_fast(points.len(), points, scalars.as_slice());
 
-  Ok(result)
+    Ok(result)
+}
+
+/// Parallel multi-scalar multiplication: split into per-core chunks, run the
+/// adaptive-window Pippenger (`muln_fast`) on each chunk concurrently, then sum
+/// the partials. Near-linear speedup in cores for large `n`.
+///
+/// The per-frame storage-attestation batch (`aggregate_verify_openings` over
+/// K = Σ_shards Σ_members openings) is exactly this shape, so a validator with
+/// C cores verifies the whole batch in ~K/C time — which is what lets the
+/// 32–768-core global validators verify EVERY prover's possession proof every
+/// frame, rather than sampling.
+pub fn point_linear_combination_parallel(
+    points: &[ecp::ECP],
+    scalars: &[big::BIG],
+) -> Result<ecp::ECP, Box<dyn Error>> {
+    use rayon::prelude::*;
+    if points.len() != scalars.len() {
+        return Err(format!(
+            "length mismatch between arguments, points: {}, scalars: {}",
+            points.len(),
+            scalars.len(),
+        )
+        .into());
+    }
+    let n = points.len();
+    if n == 0 {
+        return Ok(ecp::ECP::new());
+    }
+    // One window-amortized Pippenger pass per core.
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = ((n + threads - 1) / threads).max(1);
+    let partials: Vec<ecp::ECP> = points
+        .par_chunks(chunk)
+        .zip(scalars.par_chunks(chunk))
+        .map(|(p, s)| ecp::ECP::muln_fast(p.len(), p, s))
+        .collect();
+    let mut acc = ecp::ECP::new();
+    for p in &partials {
+        acc.add(p);
+    }
+    Ok(acc)
 }
 
 /// Like [`commit_scalars_monomial`] but uses the optimized `muln_fast`.
-pub fn commit_scalars_monomial_fast(
-  coeffs: &[big::BIG],
-) -> Vec<u8> {
-  match point_linear_combination_fast(
-    &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
-    &coeffs.to_vec(),
-  ) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      b.to_vec()
+pub fn commit_scalars_monomial_fast(coeffs: &[big::BIG]) -> Vec<u8> {
+    match point_linear_combination_fast(
+        &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
+        &coeffs.to_vec(),
+    ) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            b.to_vec()
+        }
+        Err(_) => vec![],
     }
-    Err(_) => vec![],
-  }
 }
 
 /// Like [`commit_scalars`] but uses the optimized `muln_fast`.
-pub fn commit_scalars_fast(
-  scalars: &[big::BIG],
-  poly_size: u64,
-) -> Vec<u8> {
-  let mut poly = scalars.to_vec();
-  while poly.len() < poly_size as usize {
-    poly.push(big::BIG::new());
-  }
-  match point_linear_combination_fast(
-    &bls::singleton().FFTBLS48581[&poly_size],
-    &poly,
-  ) {
-    Ok(commit) => {
-      let mut b = [0u8; 74];
-      commit.tobytes(&mut b, true);
-      b.to_vec()
+pub fn commit_scalars_fast(scalars: &[big::BIG], poly_size: u64) -> Vec<u8> {
+    let mut poly = scalars.to_vec();
+    while poly.len() < poly_size as usize {
+        poly.push(big::BIG::new());
     }
-    Err(_) => vec![],
-  }
+    match point_linear_combination_fast(&bls::singleton().FFTBLS48581[&poly_size], &poly) {
+        Ok(commit) => {
+            let mut b = [0u8; 74];
+            commit.tobytes(&mut b, true);
+            b.to_vec()
+        }
+        Err(_) => vec![],
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -808,104 +965,209 @@ pub struct BlsAggregateOutput {
 }
 
 pub fn bls_keygen() -> BlsKeygenOutput {
-  init();
-  let mut ikm = [0u8;64];
-  ::rand::thread_rng().fill_bytes(&mut ikm);
-  let mut s = [0u8;73];
-  let mut pk = [0u8;585];
-  let is_ok = bls48581::bls256::key_pair_generate(&ikm, &mut s, &mut pk);
-  if is_ok != bls48581::bls256::BLS_OK {
-    return BlsKeygenOutput{
-      proof_of_possession_sig: vec![],
-      public_key: vec![],
-      secret_key: vec![],
-    };
-  }
+    init();
+    let mut ikm = [0u8; 64];
+    ::rand::thread_rng().fill_bytes(&mut ikm);
+    let mut s = [0u8; 73];
+    let mut pk = [0u8; 585];
+    let is_ok = bls48581::bls256::key_pair_generate(&ikm, &mut s, &mut pk);
+    if is_ok != bls48581::bls256::BLS_OK {
+        return BlsKeygenOutput {
+            proof_of_possession_sig: vec![],
+            public_key: vec![],
+            secret_key: vec![],
+        };
+    }
 
-  let mut msg = b"BLS48_POP_SK".to_vec();
-  msg.extend_from_slice(&pk);
+    let mut msg = b"BLS48_POP_SK".to_vec();
+    msg.extend_from_slice(&pk);
 
-  let mut sig = [0u8; 74];
-  let is_sig_ok = bls48581::bls256::core_sign(&mut sig, &msg, &s);
-  if is_sig_ok != bls48581::bls256::BLS_OK {
-    return BlsKeygenOutput{
-      proof_of_possession_sig: vec![],
-      public_key: vec![],
-      secret_key: vec![],
-    };
-  }
+    let mut sig = [0u8; 74];
+    let is_sig_ok = bls48581::bls256::core_sign(&mut sig, &msg, &s);
+    if is_sig_ok != bls48581::bls256::BLS_OK {
+        return BlsKeygenOutput {
+            proof_of_possession_sig: vec![],
+            public_key: vec![],
+            secret_key: vec![],
+        };
+    }
 
-  BlsKeygenOutput{
-    secret_key: s.to_vec(),
-    public_key: pk.to_vec(),
-    proof_of_possession_sig: sig.to_vec(),
-  }
+    BlsKeygenOutput {
+        secret_key: s.to_vec(),
+        public_key: pk.to_vec(),
+        proof_of_possession_sig: sig.to_vec(),
+    }
 }
 
 pub fn bls_sign(sk: &[u8], msg: &[u8], domain: &[u8]) -> Vec<u8> {
-  let mut fullmsg = domain.to_vec();
-  fullmsg.extend_from_slice(&msg);
+    let mut fullmsg = domain.to_vec();
+    fullmsg.extend_from_slice(&msg);
 
-  let mut sig = [0u8; 74];
-  let is_sig_ok = bls48581::bls256::core_sign(&mut sig, &fullmsg, &sk);
-  if is_sig_ok != bls48581::bls256::BLS_OK {
-    return vec![];
-  }
+    let mut sig = [0u8; 74];
+    let is_sig_ok = bls48581::bls256::core_sign(&mut sig, &fullmsg, &sk);
+    if is_sig_ok != bls48581::bls256::BLS_OK {
+        return vec![];
+    }
 
-  return sig.to_vec();
+    return sig.to_vec();
 }
 
 pub fn bls_verify(pk: &[u8], sig: &[u8], msg: &[u8], domain: &[u8]) -> bool {
-  let mut fullmsg = domain.to_vec();
-  fullmsg.extend_from_slice(&msg);
-
-  let is_sig_ok = bls48581::bls256::core_verify(&sig, &fullmsg, &pk);
-  is_sig_ok == bls48581::bls256::BLS_OK
-}
-
-pub fn bls_verify_msig_mmsg(pks: &Vec<Vec<u8>>, sig: &[u8], msgs: &Vec<Vec<u8>>, domain: &[u8]) -> bool {
-  let mut fullmsgs = Vec::<Vec::<u8>>::new();
-  for msg in msgs {
     let mut fullmsg = domain.to_vec();
     fullmsg.extend_from_slice(&msg);
-    fullmsgs.push(fullmsg);
-  }
 
-  let is_sig_ok = bls48581::bls256::core_msig_verify(&sig, &fullmsgs, &pks);
-  is_sig_ok == bls48581::bls256::BLS_OK
+    let is_sig_ok = bls48581::bls256::core_verify(&sig, &fullmsg, &pk);
+    is_sig_ok == bls48581::bls256::BLS_OK
+}
+
+/// Derive a 128-bit batch coefficient `rᵢ = SHA-256(seed ‖ i)[..16]` as a
+/// `BIG`. 128 bits gives ~2⁻¹²⁸ batch soundness; keeping the scalar small
+/// keeps the per-signature G1 multiplications cheap.
+fn bls_batch_coeff(seed: &[u8], i: usize) -> bls48581::big::BIG {
+    let mut h = hash256::HASH256::new();
+    h.process_array(seed);
+    h.process_array(&(i as u64).to_be_bytes());
+    let digest = h.hash();
+    // Zero-pad into a fixed buffer so `frombytes` reads a clean 128-bit value.
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&digest[..16]);
+    bls48581::big::BIG::frombytes(&buf)
+}
+
+/// Batch-verify N BLS48-581 signatures, each over its own `domain‖msg`
+/// with its own (aggregate) public key. Returns `true` iff EVERY
+/// signature verifies.
+///
+/// Uses the random-linear-combination batch check: with secret random
+/// coefficients `rᵢ` derived from `seed`,
+///
+/// ```text
+///   e(G2, -Σ rᵢ·sigᵢ) · Πᵢ e(pkᵢ, rᵢ·H(domainᵢ‖msgᵢ)) == 1
+/// ```
+///
+/// This collapses N individual verifications (each a Miller loop + a
+/// final exponentiation) into ONE multi-Miller loop over N+1 pairs + ONE
+/// final exponentiation. The Fp48 final exponentiation is the dominant
+/// cost, so collapsing N→1 is the main win; the pairing count also drops
+/// from 2N to N+1.
+///
+/// **All-or-nothing.** A `false` result only means "at least one
+/// signature is invalid" — the caller must fall back to per-signature
+/// `bls_verify` to identify which. **`seed` MUST be fresh, unpredictable
+/// entropy per call** (OS randomness): the coefficients must be unknowable
+/// to whoever produced the signatures, or a cancellation forgery is
+/// possible.
+///
+/// `items`: `(public_key_g2, signature_g1, message, domain)` per
+/// signature — identical inputs and hashing to `bls_verify`.
+pub fn bls_verify_batch(items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)], seed: &[u8]) -> bool {
+    use bls48581::ecp::ECP;
+    use bls48581::ecp8::ECP8;
+    use bls48581::pair8;
+
+    if items.is_empty() {
+        return true;
+    }
+
+    let mut acc = pair8::initmp();
+    // Σ rᵢ·sigᵢ accumulated in G1.
+    let mut agg_sig = ECP::new(); // point at infinity
+
+    for (i, (pk, sig, msg, domain)) in items.iter().enumerate() {
+        let r = bls_batch_coeff(seed, i);
+
+        // Signature point (G1), subgroup-checked, scaled by rᵢ.
+        let s = ECP::frombytes(sig);
+        if s.is_infinity() || !pair8::g1member(&s) {
+            return false;
+        }
+        agg_sig.add(&s.mul(&r));
+
+        // Public key (G2), subgroup-checked.
+        let pk_pt = ECP8::frombytes(pk);
+        if !pair8::g2member(&pk_pt) {
+            return false;
+        }
+        // rᵢ·H(domain‖msg) in G1 → e(pkᵢ, rᵢ·Hᵢ).
+        let mut fullmsg = domain.clone();
+        fullmsg.extend_from_slice(msg);
+        let hm = bls48581::bls256::bls_hash_to_point(&fullmsg);
+        pair8::another(&mut acc, &pk_pt, &hm.mul(&r));
+    }
+
+    // LHS: e(G2_generator, -Σ rᵢ·sigᵢ).
+    agg_sig.neg();
+    pair8::another(&mut acc, &ECP8::generator(), &agg_sig);
+
+    let v = pair8::fexp(&pair8::miller(&mut acc));
+    v.isunity()
+}
+
+pub fn bls_verify_msig_mmsg(
+    pks: &Vec<Vec<u8>>,
+    sig: &[u8],
+    msgs: &Vec<Vec<u8>>,
+    domain: &[u8],
+) -> bool {
+    let mut fullmsgs = Vec::<Vec<u8>>::new();
+    for msg in msgs {
+        let mut fullmsg = domain.to_vec();
+        fullmsg.extend_from_slice(&msg);
+        fullmsgs.push(fullmsg);
+    }
+
+    let is_sig_ok = bls48581::bls256::core_msig_verify(&sig, &fullmsgs, &pks);
+    is_sig_ok == bls48581::bls256::BLS_OK
 }
 
 pub fn bls_aggregate(pks: &Vec<Vec<u8>>, sigs: &Vec<Vec<u8>>) -> BlsAggregateOutput {
-  if pks.len() != sigs.len() {
-    return BlsAggregateOutput{
-      aggregate_public_key: vec![],
-      aggregate_signature: vec![],
-    };
-  }
+    if pks.len() != sigs.len() {
+        return BlsAggregateOutput {
+            aggregate_public_key: vec![],
+            aggregate_signature: vec![],
+        };
+    }
 
-  let sig_all = sigs.iter().fold(ecp::ECP::new(), |acc, sig| {
-    let mut a = ecp::ECP::frombytes(&sig);
-    a.add(&acc);
-    a
-  });
-  let pk_all = pks.iter().fold(ecp8::ECP8::new(), |acc, pk| {
-    let mut a = ecp8::ECP8::frombytes(&pk);
-    a.add(&acc);
-    a
-  });
-  let mut sigbytes = [0u8;74];
-  sig_all.tobytes(&mut sigbytes, true);
-  let mut pkbytes = [0u8;585];
-  pk_all.tobytes(&mut pkbytes, true);
+    let sig_all = sigs.iter().fold(ecp::ECP::new(), |acc, sig| {
+        let mut a = ecp::ECP::frombytes(&sig);
+        a.add(&acc);
+        a
+    });
+    let pk_all = pks.iter().fold(ecp8::ECP8::new(), |acc, pk| {
+        let mut a = ecp8::ECP8::frombytes(&pk);
+        a.add(&acc);
+        a
+    });
+    let mut sigbytes = [0u8; 74];
+    sig_all.tobytes(&mut sigbytes, true);
+    let mut pkbytes = [0u8; 585];
+    pk_all.tobytes(&mut pkbytes, true);
 
-  BlsAggregateOutput{
-    aggregate_public_key: pkbytes.to_vec(),
-    aggregate_signature: sigbytes.to_vec(),
-  }
+    BlsAggregateOutput {
+        aggregate_public_key: pkbytes.to_vec(),
+        aggregate_signature: sigbytes.to_vec(),
+    }
+}
+
+/// Aggregate G8 (G2) public keys ONLY — the public-key half of
+/// [`bls_aggregate`], without any signatures. Folds each `frombytes`-decoded
+/// `ECP8` into the running sum and returns the 585-byte compressed aggregate.
+/// An empty input folds to the identity point. Callers MUST pass full-length
+/// (585-byte) compressed keys; `ECP8::frombytes` indexes without a length
+/// guard, so short input OOB-panics.
+pub fn bls_aggregate_pubkeys(pks: &[Vec<u8>]) -> Vec<u8> {
+    let pk_all = pks.iter().fold(ecp8::ECP8::new(), |acc, pk| {
+        let mut a = ecp8::ECP8::frombytes(pk);
+        a.add(&acc);
+        a
+    });
+    let mut pkbytes = [0u8; 585];
+    pk_all.tobytes(&mut pkbytes, true);
+    pkbytes.to_vec()
 }
 
 pub fn init() {
-  bls::singleton();
+    bls::singleton();
 }
 
 // ============================================================
@@ -929,134 +1191,161 @@ const G1_COMPRESSED_BYTES: usize = 74;
 const G8_COMPRESSED_BYTES: usize = 585;
 
 fn parse_scalar(bytes: &[u8]) -> Option<big::BIG> {
-  if bytes.len() != SCALAR_BYTES {
-    return None;
-  }
-  let mut s = big::BIG::frombytes(bytes);
-  // Defensive: callers may hand us bytes that aren't reduced; the modular
-  // ops below all do their own reduction, but normalising here gives us a
-  // canonical 73-byte serialisation on the way out.
-  s.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
-  Some(s)
+    if bytes.len() != SCALAR_BYTES {
+        return None;
+    }
+    let mut s = big::BIG::frombytes(bytes);
+    // Defensive: callers may hand us bytes that aren't reduced; the modular
+    // ops below all do their own reduction, but normalising here gives us a
+    // canonical 73-byte serialisation on the way out.
+    s.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
+    Some(s)
 }
 
 fn scalar_to_bytes(s: &big::BIG) -> Vec<u8> {
-  let mut s_copy = s.clone();
-  s_copy.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
-  let mut out = vec![0u8; SCALAR_BYTES];
-  s_copy.tobytes(&mut out);
-  out
+    let mut s_copy = s.clone();
+    s_copy.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
+    let mut out = vec![0u8; SCALAR_BYTES];
+    s_copy.tobytes(&mut out);
+    out
 }
 
 /// Generate a uniformly random scalar in [0, q), serialized as 73 BE bytes.
 pub fn bls_scalar_random() -> Vec<u8> {
-  init();
-  let mut raw_seed = [0u8; 128];
-  ::rand::thread_rng().fill_bytes(&mut raw_seed);
-  let mut rng = rand::RAND::new();
-  rng.clean();
-  rng.seed(raw_seed.len(), &raw_seed);
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  let s = big::BIG::randomnum(&q, &mut rng);
-  scalar_to_bytes(&s)
+    init();
+    let mut raw_seed = [0u8; 128];
+    ::rand::thread_rng().fill_bytes(&mut raw_seed);
+    let mut rng = rand::RAND::new();
+    rng.clean();
+    rng.seed(raw_seed.len(), &raw_seed);
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let s = big::BIG::randomnum(&q, &mut rng);
+    scalar_to_bytes(&s)
 }
 
 /// Modular multiplication on the BLS48-581 scalar field: returns `(a * b) mod q`.
 pub fn bls_scalar_mul(a: &[u8], b: &[u8]) -> Vec<u8> {
-  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
-  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  let r = big::BIG::modmul(&aa, &bb, &q);
-  scalar_to_bytes(&r)
+    let aa = match parse_scalar(a) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let bb = match parse_scalar(b) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let r = big::BIG::modmul(&aa, &bb, &q);
+    scalar_to_bytes(&r)
 }
 
 /// Modular addition on the BLS48-581 scalar field: returns `(a + b) mod q`.
 pub fn bls_scalar_add(a: &[u8], b: &[u8]) -> Vec<u8> {
-  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
-  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  let r = big::BIG::modadd(&aa, &bb, &q);
-  scalar_to_bytes(&r)
+    let aa = match parse_scalar(a) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let bb = match parse_scalar(b) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let r = big::BIG::modadd(&aa, &bb, &q);
+    scalar_to_bytes(&r)
 }
 
 /// Modular subtraction on the BLS48-581 scalar field: returns `(a - b) mod q`.
 pub fn bls_scalar_sub(a: &[u8], b: &[u8]) -> Vec<u8> {
-  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
-  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  let neg_b = big::BIG::modneg(&bb, &q);
-  let r = big::BIG::modadd(&aa, &neg_b, &q);
-  scalar_to_bytes(&r)
+    let aa = match parse_scalar(a) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let bb = match parse_scalar(b) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let neg_b = big::BIG::modneg(&bb, &q);
+    let r = big::BIG::modadd(&aa, &neg_b, &q);
+    scalar_to_bytes(&r)
 }
 
 /// Modular negation: `-a mod q`.
 pub fn bls_scalar_neg(a: &[u8]) -> Vec<u8> {
-  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  let r = big::BIG::modneg(&aa, &q);
-  scalar_to_bytes(&r)
+    let aa = match parse_scalar(a) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let r = big::BIG::modneg(&aa, &q);
+    scalar_to_bytes(&r)
 }
 
 /// Modular inverse: `a^{-1} mod q`. Returns empty vec on non-invertible input
 /// (a == 0).
 pub fn bls_scalar_inv(a: &[u8]) -> Vec<u8> {
-  let mut aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
-  if aa.iszilch() {
-    return Vec::new();
-  }
-  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
-  aa.invmodp(&q);
-  scalar_to_bytes(&aa)
+    let mut aa = match parse_scalar(a) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if aa.iszilch() {
+        return Vec::new();
+    }
+    let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+    aa.invmodp(&q);
+    scalar_to_bytes(&aa)
 }
 
 /// Convert a uint64 to a 73-byte BE scalar — used by clients to lift small
 /// integers (party ids) into the scalar field for Lagrange-coefficient
 /// arithmetic without having to hard-code MODBYTES on the JS side.
 pub fn bls_scalar_from_u64(v: u64) -> Vec<u8> {
-  // BIG::new_int takes isize. Constrain to a sane range; party ids are well
-  // below 2^31 in practice.
-  let s = if v <= isize::MAX as u64 {
-    big::BIG::new_int(v as isize)
-  } else {
-    // Build the BIG by hand from a 73-byte BE buffer.
-    let mut buf = vec![0u8; SCALAR_BYTES];
-    buf[SCALAR_BYTES - 8] = (v >> 56) as u8;
-    buf[SCALAR_BYTES - 7] = (v >> 48) as u8;
-    buf[SCALAR_BYTES - 6] = (v >> 40) as u8;
-    buf[SCALAR_BYTES - 5] = (v >> 32) as u8;
-    buf[SCALAR_BYTES - 4] = (v >> 24) as u8;
-    buf[SCALAR_BYTES - 3] = (v >> 16) as u8;
-    buf[SCALAR_BYTES - 2] = (v >> 8) as u8;
-    buf[SCALAR_BYTES - 1] = v as u8;
-    big::BIG::frombytes(&buf)
-  };
-  scalar_to_bytes(&s)
+    // BIG::new_int takes isize. Constrain to a sane range; party ids are well
+    // below 2^31 in practice.
+    let s = if v <= isize::MAX as u64 {
+        big::BIG::new_int(v as isize)
+    } else {
+        // Build the BIG by hand from a 73-byte BE buffer.
+        let mut buf = vec![0u8; SCALAR_BYTES];
+        buf[SCALAR_BYTES - 8] = (v >> 56) as u8;
+        buf[SCALAR_BYTES - 7] = (v >> 48) as u8;
+        buf[SCALAR_BYTES - 6] = (v >> 40) as u8;
+        buf[SCALAR_BYTES - 5] = (v >> 32) as u8;
+        buf[SCALAR_BYTES - 4] = (v >> 24) as u8;
+        buf[SCALAR_BYTES - 3] = (v >> 16) as u8;
+        buf[SCALAR_BYTES - 2] = (v >> 8) as u8;
+        buf[SCALAR_BYTES - 1] = v as u8;
+        big::BIG::frombytes(&buf)
+    };
+    scalar_to_bytes(&s)
 }
 
 /// Compute the G1 point `g^scalar` (i.e. `scalar * G1.generator()`),
 /// returned as 74-byte compressed bytes. Used for Feldman commitments
 /// in BLS-N DKG.
 pub fn bls_scalar_to_g1(scalar: &[u8]) -> Vec<u8> {
-  let s = match parse_scalar(scalar) { Some(v) => v, None => return Vec::new() };
-  let g = ECP::generator();
-  let p = g.mul(&s);
-  let mut out = vec![0u8; G1_COMPRESSED_BYTES];
-  p.tobytes(&mut out, true);
-  out
+    let s = match parse_scalar(scalar) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let g = ECP::generator();
+    let p = g.mul(&s);
+    let mut out = vec![0u8; G1_COMPRESSED_BYTES];
+    p.tobytes(&mut out, true);
+    out
 }
 
 /// Add two G1 points (compressed input/output, 74 bytes each). Used by
 /// BLS-N to aggregate G1 partial signatures.
 pub fn bls_g1_add(a: &[u8], b: &[u8]) -> Vec<u8> {
-  if a.len() != G1_COMPRESSED_BYTES || b.len() != G1_COMPRESSED_BYTES {
-    return Vec::new();
-  }
-  let mut pa = ECP::frombytes(a);
-  let pb = ECP::frombytes(b);
-  pa.add(&pb);
-  let mut out = vec![0u8; G1_COMPRESSED_BYTES];
-  pa.tobytes(&mut out, true);
-  out
+    if a.len() != G1_COMPRESSED_BYTES || b.len() != G1_COMPRESSED_BYTES {
+        return Vec::new();
+    }
+    let mut pa = ECP::frombytes(a);
+    let pb = ECP::frombytes(b);
+    pa.add(&pb);
+    let mut out = vec![0u8; G1_COMPRESSED_BYTES];
+    pa.tobytes(&mut out, true);
+    out
 }
 
 /// Compute the G8 / ECP8 point `g^scalar` (the BLS48-581 public-key group).
@@ -1064,27 +1353,30 @@ pub fn bls_g1_add(a: &[u8], b: &[u8]) -> Vec<u8> {
 /// `bls_keygen` produces for `public_key` and `bls_verify` accepts.
 /// Used for BLS-N DKG Feldman commitments and master verification key.
 pub fn bls_scalar_to_g8(scalar: &[u8]) -> Vec<u8> {
-  let s = match parse_scalar(scalar) { Some(v) => v, None => return Vec::new() };
-  let g = ecp8::ECP8::generator();
-  let p = g.mul(&s);
-  let mut out = vec![0u8; G8_COMPRESSED_BYTES];
-  p.tobytes(&mut out, true);
-  out
+    let s = match parse_scalar(scalar) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let g = ecp8::ECP8::generator();
+    let p = g.mul(&s);
+    let mut out = vec![0u8; G8_COMPRESSED_BYTES];
+    p.tobytes(&mut out, true);
+    out
 }
 
 /// Add two G8 / ECP8 points (compressed input/output, 585 bytes each).
 /// Used by BLS-N DKG to sum commitment[0] across all parties into the
 /// master public key.
 pub fn bls_g8_add(a: &[u8], b: &[u8]) -> Vec<u8> {
-  if a.len() != G8_COMPRESSED_BYTES || b.len() != G8_COMPRESSED_BYTES {
-    return Vec::new();
-  }
-  let mut pa = ecp8::ECP8::frombytes(a);
-  let pb = ecp8::ECP8::frombytes(b);
-  pa.add(&pb);
-  let mut out = vec![0u8; G8_COMPRESSED_BYTES];
-  pa.tobytes(&mut out, true);
-  out
+    if a.len() != G8_COMPRESSED_BYTES || b.len() != G8_COMPRESSED_BYTES {
+        return Vec::new();
+    }
+    let mut pa = ecp8::ECP8::frombytes(a);
+    let pb = ecp8::ECP8::frombytes(b);
+    pa.add(&pb);
+    let mut out = vec![0u8; G8_COMPRESSED_BYTES];
+    pa.tobytes(&mut out, true);
+    out
 }
 
 const BYTES_PER_SCALAR: usize = 64;
@@ -1093,7 +1385,7 @@ const BYTES_PER_SCALAR: usize = 64;
 fn hash_to_scalar(payload: &[u8]) -> big::BIG {
     let mut h = sha3::SHA3::new(sha3::HASH512);
     h.process_array(payload);
-    let mut digest = [0u8;64];
+    let mut digest = [0u8; 64];
     h.hash(&mut digest);
     // reduce 512‑bit buffer modulo the BLS48‑581 scalar field order
     let mut s = big::BIG::frombytes(&digest[..BYTES_PER_SCALAR]);
@@ -1106,18 +1398,12 @@ fn hash_to_scalar(payload: &[u8]) -> big::BIG {
 fn div_by_linear(poly: &[big::BIG], x0: &big::BIG) -> Vec<big::BIG> {
     let b = big::BIG::modneg(x0, &big::BIG::new_ints(&rom::CURVE_ORDER));
     let a = big::BIG::new_int(1);
-    let divisors: Vec<big::BIG> = vec![
-      b.clone(),
-      a.clone()
-    ];
+    let divisors: Vec<big::BIG> = vec![b.clone(), a.clone()];
     let mut invb = b.clone();
     invb.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
     let mut inva = a.clone();
     inva.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-    let invdivisors: Vec<big::BIG> = vec![
-      invb,
-      inva
-    ];
+    let invdivisors: Vec<big::BIG> = vec![invb, inva];
 
     let mut a: Vec<big::BIG> = poly.iter().map(|x| x.clone()).collect();
 
@@ -1127,25 +1413,29 @@ fn div_by_linear(poly: &[big::BIG], x0: &big::BIG) -> Vec<big::BIG> {
     let mut diff = a_pos as isize - b_pos as isize;
     let mut out: Vec<big::BIG> = vec![big::BIG::new(); (diff + 1) as usize];
     while diff >= 0 {
-      out[diff as usize] = a[a_pos].clone();
-      out[diff as usize] = big::BIG::modmul(&out[diff as usize], &invdivisors[b_pos], &big::BIG::new_ints(&rom::CURVE_ORDER));
-      for i in (0..=b_pos).rev() {
-        let den = &out[diff as usize].clone();
-        a[diff as usize + i] = a[diff as usize + i].clone();
-        a[diff as usize + i] = big::BIG::modadd(
-          &a[diff as usize + i],
-          &big::BIG::modneg(
-            &big::BIG::modmul(&den, &divisors[i], &big::BIG::new_ints(&rom::CURVE_ORDER)),
-            &big::BIG::new_ints(&rom::CURVE_ORDER)
-          ),
-          &big::BIG::new_ints(&rom::CURVE_ORDER)
+        out[diff as usize] = a[a_pos].clone();
+        out[diff as usize] = big::BIG::modmul(
+            &out[diff as usize],
+            &invdivisors[b_pos],
+            &big::BIG::new_ints(&rom::CURVE_ORDER),
         );
-      }
-      let mut b = [0u8;73];
-      out[diff as usize].tobytes(&mut b);
+        for i in (0..=b_pos).rev() {
+            let den = &out[diff as usize].clone();
+            a[diff as usize + i] = a[diff as usize + i].clone();
+            a[diff as usize + i] = big::BIG::modadd(
+                &a[diff as usize + i],
+                &big::BIG::modneg(
+                    &big::BIG::modmul(&den, &divisors[i], &big::BIG::new_ints(&rom::CURVE_ORDER)),
+                    &big::BIG::new_ints(&rom::CURVE_ORDER),
+                ),
+                &big::BIG::new_ints(&rom::CURVE_ORDER),
+            );
+        }
+        let mut b = [0u8; 73];
+        out[diff as usize].tobytes(&mut b);
 
-      a_pos -= 1;
-      diff -= 1;
+        a_pos -= 1;
+        diff -= 1;
     }
     out
 }
@@ -1156,79 +1446,85 @@ pub fn prove_multiple(
     polys: &Vec<Vec<u8>>,       // fᵢ(x)
     indices: &Vec<u64>,         // zᵢ  = ω_{indices[i]}
     poly_size: u64,
-) -> Multiproof {               // (D, π)
+) -> Multiproof {
+    // (D, π)
     assert_eq!(polys.len(), indices.len());
     let m = polys.len();
 
     // 0. Pre‑work: commitments Cᵢ and values yᵢ = fᵢ(zᵢ)
     let mut commits: Vec<ecp::ECP> = Vec::with_capacity(m);
-    let mut y:      Vec<big::BIG> = Vec::with_capacity(m);
+    let mut y: Vec<big::BIG> = Vec::with_capacity(m);
     for (i, (blob, &idx)) in polys.iter().zip(indices).enumerate() {
         commits.push(ecp::ECP::frombytes(&commitments[i]));
         let eval_vec = bytes_to_polynomial(blob);
-        y.push( eval_vec[idx as usize].clone() );
+        y.push(eval_vec[idx as usize].clone());
     }
 
     // 1. Fiat–Shamir challenge  ρ
     let mut fs_input = Vec::<u8>::new();
-    for (i, c) in commits.iter().enumerate() {
+    for c in commits.iter() {
         let mut tmp = [0u8; 74];
         c.tobytes(&mut tmp, true);
         fs_input.extend_from_slice(&tmp);
     }
-    for (i, s) in y.iter().enumerate() {
+    for s in y.iter() {
         let mut tmp = [0u8; 73];
         s.tobytes(&mut tmp);
         fs_input.extend_from_slice(&tmp);
     }
-    for (i, &idx) in indices.iter().enumerate() { 
-        fs_input.extend_from_slice(&idx.to_le_bytes()); 
+    for &idx in indices.iter() {
+        fs_input.extend_from_slice(&idx.to_le_bytes());
     }
     let rho = hash_to_scalar(&fs_input);
 
     // 2. Build  Q(X) = Σ ρᶦ · (fᵢ(X) − yᵢ)/(X − zᵢ)
     // Note – the yᵢ term is removed from the polynomial when performing polynomial division, as it is the remainder.
     let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
-    let mut q_coeffs = vec![vec![big::BIG::new(); poly_size as usize-1]; m];
-    let mut h_coeffs = vec![vec![big::BIG::new(); poly_size as usize-1]; m];
+    let mut q_coeffs = vec![vec![big::BIG::new(); poly_size as usize - 1]; m];
+    let mut h_coeffs = vec![vec![big::BIG::new(); poly_size as usize - 1]; m];
     let mut f_evals = Vec::new();
     let mut yrho: Vec<big::BIG> = Vec::with_capacity(m);
     let mut acc_pow = big::BIG::new_int(1);
     for ((index, blob), (&idx, y_i)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
         let mut f_eval = bytes_to_polynomial(blob);
-        while f_eval.len() < poly_size as usize { f_eval.push(big::BIG::new()); }
-        let coeffs = fft_fast(&f_eval, poly_size, true).unwrap();    // coeff form
+        while f_eval.len() < poly_size as usize {
+            f_eval.push(big::BIG::new());
+        }
+        let coeffs = fft_fast(&f_eval, poly_size, true).unwrap(); // coeff form
         f_evals.push(coeffs.clone());
 
         // 2a. divide by (X − zᵢ)
         let f = coeffs.clone();
         let z_i = bls::singleton().RootsOfUnityBLS48581[&poly_size][idx as usize].clone();
         let q_i = div_by_linear(&f, &z_i);
-        
+
         // 2b. scale by ρᶦ  and accumulate into Q
         q_coeffs[index] = q_i;
         for dst in q_coeffs[index].iter_mut() {
-          *dst = big::BIG::modmul(&acc_pow, &dst, &modulus);
+            *dst = big::BIG::modmul(&acc_pow, &dst, &modulus);
         }
 
         yrho.push(big::BIG::modmul(y_i, &acc_pow, &modulus));
-        
+
         // next power of ρ
         acc_pow = big::BIG::modmul(&acc_pow, &rho, &modulus); // ρ←ρ·ρ   (cheap pow‑chain)
     }
 
     // 3. Commit to  Q (H check added for debugging)
-    let mut qx = q_coeffs.iter().fold(
-      vec![big::BIG::new(); poly_size as usize],
-      |acc, q| acc.iter().zip(q).map(|(a,b)| big::BIG::modadd(a,b,&modulus)).collect(),
-    );
+    let mut qx = q_coeffs
+        .iter()
+        .fold(vec![big::BIG::new(); poly_size as usize], |acc, q| {
+            acc.iter()
+                .zip(q)
+                .map(|(a, b)| big::BIG::modadd(a, b, &modulus))
+                .collect()
+        });
     qx.push(big::BIG::new());
 
-    let c_q = &point_linear_combination_fast(
-      &bls::singleton().CeremonyBLS48581G1[..(qx.len())],
-      &qx,
-    ).unwrap();
-    
+    let c_q =
+        &point_linear_combination_fast(&bls::singleton().CeremonyBLS48581G1[..(qx.len())], &qx)
+            .unwrap();
+
     let mut c_q_bytes = [0u8; 74];
     c_q.tobytes(&mut c_q_bytes, true);
 
@@ -1237,28 +1533,35 @@ pub fn prove_multiple(
 
     // 5. Compute h(x) =  Σ ρᶦ · (fᵢ(X))/(t − zᵢ)
     let mut acc_pow = big::BIG::new_int(1);
-    for ((index, blob), (&idx, y_i)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
+    for ((index, _), (&idx, _)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
         let mut coeffs = f_evals[index].clone();
         let z_i = bls::singleton().RootsOfUnityBLS48581[&poly_size][idx as usize].clone();
         let mut den = big::BIG::modadd(&t, &big::BIG::modneg(&z_i, &modulus), &modulus);
         den.invmodp(&modulus);
-        for (i, dst) in coeffs.iter_mut().enumerate() {
-          *dst = big::BIG::modmul(dst, &acc_pow, &modulus);
-          *dst = big::BIG::modmul(dst, &den, &modulus);
+        for dst in coeffs.iter_mut() {
+            *dst = big::BIG::modmul(dst, &acc_pow, &modulus);
+            *dst = big::BIG::modmul(dst, &den, &modulus);
         }
         h_coeffs[index] = coeffs.clone();
-        
+
         acc_pow = big::BIG::modmul(&acc_pow, &rho, &modulus);
     }
-    let hx = h_coeffs.iter().fold(
-      vec![big::BIG::new(); poly_size as usize],
-      |acc, q| acc.iter().zip(q).map(|(a,b)| big::BIG::modadd(a,b,&modulus)).collect(),
-    );
-    let c_h = &point_linear_combination_fast(
-      &bls::singleton().CeremonyBLS48581G1[..(hx.len())],
-      &hx,
-    ).unwrap();
-    let mut g2x: Vec<big::BIG> = hx.iter().zip(qx).map(|(h, q)| big::BIG::modadd(h, &big::BIG::modneg(&q, &modulus), &modulus)).collect();
+    let hx = h_coeffs
+        .iter()
+        .fold(vec![big::BIG::new(); poly_size as usize], |acc, q| {
+            acc.iter()
+                .zip(q)
+                .map(|(a, b)| big::BIG::modadd(a, b, &modulus))
+                .collect()
+        });
+    let c_h =
+        &point_linear_combination_fast(&bls::singleton().CeremonyBLS48581G1[..(hx.len())], &hx)
+            .unwrap();
+    let g2x: Vec<big::BIG> = hx
+        .iter()
+        .zip(qx)
+        .map(|(h, q)| big::BIG::modadd(h, &big::BIG::modneg(&q, &modulus), &modulus))
+        .collect();
 
     let mut c_h_bytes = [0u8; 74];
     c_h.tobytes(&mut c_h_bytes, true);
@@ -1268,73 +1571,80 @@ pub fn prove_multiple(
     for (idx, coeff) in yrho.iter().enumerate() {
         let root_idx = *indices.get(idx).unwrap() as usize;
         let root = bls::singleton().RootsOfUnityBLS48581[&poly_size][root_idx].clone();
-        
+
         let mut div = big::BIG::modadd(&t, &big::BIG::modneg(&root, &modulus), &modulus);
-        
+
         div.invmodp(&modulus);
-        
+
         let term = big::BIG::modmul(coeff, &div, &modulus);
-        
+
         y = big::BIG::modadd(&y, &term, &modulus);
     }
-    
+
     // (g2 − q_t)/(X − t)
     let g2div = div_by_linear(&g2x, &t);
 
-    let proof = point_linear_combination_fast(
-        &bls::singleton().CeremonyBLS48581G1[..g2div.len()],
-        &g2div
-    ).unwrap();
+    let proof =
+        point_linear_combination_fast(&bls::singleton().CeremonyBLS48581G1[..g2div.len()], &g2div)
+            .unwrap();
     let mut proof_bytes = [0u8; 74];
     proof.tobytes(&mut proof_bytes, true);
 
     let mut q_t_bytes = [0u8; 73];
     y.tobytes(&mut q_t_bytes);
 
-    Multiproof{
-      proof: proof_bytes.to_vec(),
-      d: c_q_bytes.to_vec(),
+    Multiproof {
+        proof: proof_bytes.to_vec(),
+        d: c_q_bytes.to_vec(),
     }
 }
 
 pub fn verify_multiple(
-    commits: &Vec<Vec<u8>>,  // Cᵢ
-    y_bytes: &Vec<Vec<u8>>,  // yᵢ
+    commits: &Vec<Vec<u8>>, // Cᵢ
+    y_bytes: &Vec<Vec<u8>>, // yᵢ
     indices: &Vec<u64>,
     poly_size: u64,
-    c_q_bytes: &Vec<u8>,    // D
-    proof_bytes: &Vec<u8>,  // π
+    c_q_bytes: &Vec<u8>,   // D
+    proof_bytes: &Vec<u8>, // π
 ) -> bool {
-    assert_eq!(commits.len(), indices.len());
-    assert_eq!(commits.len(), y_bytes.len());
+    if commits.len() != indices.len() || commits.len() != y_bytes.len() {
+        return false;
+    }
     let m = commits.len();
 
     // 0. Decode input
-    let c_q = ecp::ECP::frombytes(c_q_bytes.as_slice()); // D
-    let proof = ecp::ECP::frombytes(proof_bytes); // π
+    let Some(c_q) = g1_from_untrusted(c_q_bytes.as_slice()) else {
+        return false;
+    }; // D
+    let Some(proof) = g1_from_untrusted(proof_bytes) else {
+        return false;
+    }; // π
 
     let mut c_points: Vec<ecp::ECP> = Vec::with_capacity(m); // Cᵢ
     let mut y_scalars: Vec<big::BIG> = Vec::with_capacity(m); // yᵢ
-    for (i, (c_bytes, y_b)) in commits.iter().zip(y_bytes).enumerate() {
-        c_points.push(ecp::ECP::frombytes(&c_bytes));
+    for (c_bytes, y_b) in commits.iter().zip(y_bytes) {
+        let Some(c) = g1_from_untrusted(c_bytes) else {
+            return false;
+        };
+        c_points.push(c);
         y_scalars.push(big::BIG::frombytes(&y_b));
     }
 
     // 1. Re‑derive ρ
     let mut fs_input = Vec::<u8>::new();
-    for (i, b) in commits.iter().enumerate() {
-      fs_input.extend_from_slice(b);
+    for b in commits.iter() {
+        fs_input.extend_from_slice(b);
     }
-    for (i, b) in y_bytes.iter().enumerate() {
-      fs_input.extend_from_slice(&[0u8;9]);
-      fs_input.extend_from_slice(b);
+    for b in y_bytes.iter() {
+        fs_input.extend_from_slice(&[0u8; 9]);
+        fs_input.extend_from_slice(b);
     }
-    for (i, &idx) in indices.iter().enumerate() { 
-      fs_input.extend_from_slice(&idx.to_le_bytes()); 
+    for &idx in indices.iter() {
+        fs_input.extend_from_slice(&idx.to_le_bytes());
     }
-    
+
     let rho = hash_to_scalar(&fs_input);
-    
+
     let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
     let t = hash_to_scalar(c_q_bytes);
 
@@ -1342,17 +1652,21 @@ pub fn verify_multiple(
     let mut scalars: Vec<big::BIG> = Vec::with_capacity(m + 1);
     let mut acc_pow = big::BIG::new_int(1);
     let mut y = big::BIG::new();
-    
-    for ((c_i, y_i), &idx) in c_points.iter().zip(y_scalars.iter()).zip(indices) {
+
+    for ((_, y_i), &idx) in c_points.iter().zip(y_scalars.iter()).zip(indices) {
         let z_i = bls::singleton().RootsOfUnityBLS48581[&poly_size][idx as usize].clone();
-        
+
         let mut denom = big::BIG::modadd(&t, &big::BIG::modneg(&z_i, &modulus), &modulus);
-        
+
         // 1/(t−zᵢ)
         denom.invmodp(&modulus);
-        
+
         let numerator = big::BIG::modmul(&acc_pow, y_i, &modulus);
-        y = big::BIG::modadd(&y, &big::BIG::modmul(&numerator, &denom, &modulus), &modulus);
+        y = big::BIG::modadd(
+            &y,
+            &big::BIG::modmul(&numerator, &denom, &modulus),
+            &modulus,
+        );
 
         let coeff = big::BIG::modmul(&acc_pow, &denom, &modulus);
         scalars.push(coeff);
@@ -1382,20 +1696,20 @@ mod tests {
 
     #[test]
     fn fft_matches_fft_g1_when_raised() {
-      init();
-      let mut rand = rand::RAND::new();
-      let mut v = vec![big::BIG::new(); 16];
-      let mut vp = vec![ECP::new(); 16];
-      for i in 0..16 {
-        v[i] = big::BIG::random(&mut rand);
-        vp[i] = ECP::generator().mul(&v[i]);
-      }
-      let scalars = fft(v.as_slice(), 16, false).unwrap();
-      let points = fft_g1(vp.as_slice(), 16, false).unwrap();
-      for (i, s) in scalars.iter().enumerate() {
-        let sp = ECP::generator().mul(&s);
-        assert!(points[i].equals(&sp));
-      }
+        init();
+        let mut rand = rand::RAND::new();
+        let mut v = vec![big::BIG::new(); 16];
+        let mut vp = vec![ECP::new(); 16];
+        for i in 0..16 {
+            v[i] = big::BIG::random(&mut rand);
+            vp[i] = ECP::generator().mul(&v[i]);
+        }
+        let scalars = fft(v.as_slice(), 16, false).unwrap();
+        let points = fft_g1(vp.as_slice(), 16, false).unwrap();
+        for (i, s) in scalars.iter().enumerate() {
+            let sp = ECP::generator().mul(&s);
+            assert!(points[i].equals(&sp));
+        }
     }
 
     #[test]
@@ -1404,54 +1718,119 @@ mod tests {
         let outs: Vec<BlsKeygenOutput> = (0..20).into_iter().map(|_| bls_keygen()).collect();
         let mut sigs = Vec::<Vec<u8>>::new();
         for out in outs.clone() {
-          assert!(bls_verify(&out.public_key, &out.proof_of_possession_sig, &out.public_key, b"BLS48_POP_SK"));
-          let sig = bls_sign(&out.secret_key, b"test msg", b"test domain");
-          sigs.push(sig);
+            assert!(bls_verify(
+                &out.public_key,
+                &out.proof_of_possession_sig,
+                &out.public_key,
+                b"BLS48_POP_SK"
+            ));
+            let sig = bls_sign(&out.secret_key, b"test msg", b"test domain");
+            sigs.push(sig);
         }
-        let blsAggregateOutput = bls_aggregate(
-          &outs.iter().map(|out| out.public_key.clone()).collect::<Vec<Vec<u8>>>(),
-          &sigs,
+        let bls_aggregate_output = bls_aggregate(
+            &outs
+                .iter()
+                .map(|out| out.public_key.clone())
+                .collect::<Vec<Vec<u8>>>(),
+            &sigs,
         );
-        assert!(bls_verify(&blsAggregateOutput.aggregate_public_key, &blsAggregateOutput.aggregate_signature, b"test msg", b"test domain"));
+        assert!(bls_verify(
+            &bls_aggregate_output.aggregate_public_key,
+            &bls_aggregate_output.aggregate_signature,
+            b"test msg",
+            b"test domain"
+        ));
+    }
+
+    #[test]
+    fn bls_verify_batch_matches_individual() {
+        init();
+        let n = 12usize;
+        let outs: Vec<BlsKeygenOutput> = (0..n).map(|_| bls_keygen()).collect();
+        let domain = b"appshard-test-domain".to_vec();
+        let mut items: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (i, out) in outs.iter().enumerate() {
+            let msg = format!("frame-header-{i}").into_bytes();
+            let sig = bls_sign(&out.secret_key, &msg, &domain);
+            // Each must verify individually (ground truth).
+            assert!(
+                bls_verify(&out.public_key, &sig, &msg, &domain),
+                "item {i} individual verify"
+            );
+            items.push((out.public_key.clone(), sig, msg, domain.clone()));
+        }
+        let seed = b"fresh-unpredictable-per-call-entropy";
+
+        // All valid → batch passes; empty + single-item edge cases.
+        assert!(bls_verify_batch(&items, seed), "all-valid batch");
+        assert!(bls_verify_batch(&[], seed), "empty batch is vacuously true");
+        assert!(bls_verify_batch(&items[..1], seed), "single-item batch");
+
+        // Substitute a VALID signature point from another item (so it passes
+        // the subgroup check) but for the wrong message → the batch equation
+        // must reject. This exercises the pairing check, not just decoding.
+        let mut bad = items.clone();
+        bad[3].1 = bad[4].1.clone();
+        assert!(
+            !bls_verify(&bad[3].0, &bad[3].1, &bad[3].2, &bad[3].3),
+            "tampered item now individually invalid"
+        );
+        assert!(
+            !bls_verify_batch(&bad, seed),
+            "batch must reject when one sig is invalid"
+        );
     }
 
     #[test]
     fn bls_multi_message_sign() {
         init();
         let outs: Vec<BlsKeygenOutput> = (0..20).into_iter().map(|_| bls_keygen()).collect();
-        let mut pks = Vec::<Vec::<u8>>::new();
-        let mut messages = Vec::<Vec::<u8>>::new();
-        let mut sigs = Vec::<Vec::<u8>>::new();
+        let mut pks = Vec::<Vec<u8>>::new();
+        let mut messages = Vec::<Vec<u8>>::new();
+        let mut sigs = Vec::<Vec<u8>>::new();
         for (i, out) in outs.clone().iter().enumerate() {
-          assert!(bls_verify(&out.public_key.clone(), &out.proof_of_possession_sig, &out.public_key, b"BLS48_POP_SK"));
-          let msg = format!("test msg {i}");
-          let sig = bls_sign(&out.secret_key, msg.as_bytes(), b"test domain");
-          pks.push(out.public_key.clone());
-          messages.push(msg.as_bytes().to_vec());
-          sigs.push(sig);
+            assert!(bls_verify(
+                &out.public_key.clone(),
+                &out.proof_of_possession_sig,
+                &out.public_key,
+                b"BLS48_POP_SK"
+            ));
+            let msg = format!("test msg {i}");
+            let sig = bls_sign(&out.secret_key, msg.as_bytes(), b"test domain");
+            pks.push(out.public_key.clone());
+            messages.push(msg.as_bytes().to_vec());
+            sigs.push(sig);
         }
-        let blsAggregateOutput = bls_aggregate(
-          &outs.iter().map(|out| out.public_key.clone()).collect::<Vec<Vec<u8>>>(),
-          &sigs,
+        let bls_aggregate_output = bls_aggregate(
+            &outs
+                .iter()
+                .map(|out| out.public_key.clone())
+                .collect::<Vec<Vec<u8>>>(),
+            &sigs,
         );
-        assert!(bls_verify_msig_mmsg(&pks, &blsAggregateOutput.aggregate_signature, &messages, b"test domain"));
+        assert!(bls_verify_msig_mmsg(
+            &pks,
+            &bls_aggregate_output.aggregate_signature,
+            &messages,
+            b"test domain"
+        ));
     }
 
     #[test]
     fn multiproof_roundtrip() {
-        init();                        // sets up the global BLS48‑581 constants
-        let poly_size: u64 = 256;      // evaluation domain Ω₆₄
-        let m = 256;            // number of openings in this test
+        init(); // sets up the global BLS48‑581 constants
+        let poly_size: u64 = 256; // evaluation domain Ω₆₄
+        let m = 256; // number of openings in this test
 
         let mut rng = rand::RAND::new();
         rng.clean();
         rng.seed(32, &[0xA5; 32]);
 
         // test fixtures to be filled
-        let mut blobs:     Vec<Vec<u8>> = Vec::with_capacity(m);
-        let mut commits:   Vec<Vec<u8>> = Vec::with_capacity(m);
-        let mut y_bytes:   Vec<Vec<u8>> = Vec::with_capacity(m);
-        let mut indices:   Vec<u64>     = Vec::with_capacity(m);
+        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(m);
+        let mut commits: Vec<Vec<u8>> = Vec::with_capacity(m);
+        let mut y_bytes: Vec<Vec<u8>> = Vec::with_capacity(m);
+        let mut indices: Vec<u64> = Vec::with_capacity(m);
 
         for idx in 0..m {
             // pick a unique evaluation point  z_i  (just use 0,1,2,3,4,5,... here)
@@ -1459,13 +1838,13 @@ mod tests {
             indices.push(z_index);
 
             // make 64 random field elements (evaluation form)
-            let evals: Vec<[u8;64]> = (0..poly_size)
+            let evals: Vec<[u8; 64]> = (0..poly_size)
                 .map(|_| {
-                  let mut b = [0u8; 64];
-                  for i in 0..64 {
-                    b[i] = rng.getbyte();
-                  }
-                  b
+                    let mut b = [0u8; 64];
+                    for i in 0..64 {
+                        b[i] = rng.getbyte();
+                    }
+                    b
                 })
                 .collect();
 
@@ -1486,10 +1865,10 @@ mod tests {
 
         let now = Instant::now();
         let commit_refs: Vec<Vec<u8>> = commits;
-        let blob_refs:   Vec<Vec<u8>> = blobs;
+        let blob_refs: Vec<Vec<u8>> = blobs;
         let multiproof = prove_multiple(&commit_refs, &blob_refs, &indices, poly_size);
         println!("prove: {:?} elapsed", now.elapsed());
-        let y_refs:      Vec<Vec<u8>> = y_bytes;
+        let y_refs: Vec<Vec<u8>> = y_bytes;
         let now = Instant::now();
 
         assert!(
@@ -1605,18 +1984,31 @@ mod tests {
             // Forward FFT
             let out_orig = fft(&values, size, false).unwrap();
             let out_fast = fft_fast(&values, size, false).unwrap();
-            assert_eq!(out_orig.len(), out_fast.len(), "size mismatch for n={}", size);
+            assert_eq!(
+                out_orig.len(),
+                out_fast.len(),
+                "size mismatch for n={}",
+                size
+            );
             for i in 0..out_orig.len() {
-                assert!(big::BIG::comp(&out_orig[i], &out_fast[i]) == 0,
-                    "forward FFT mismatch at index {} for n={}", i, size);
+                assert!(
+                    big::BIG::comp(&out_orig[i], &out_fast[i]) == 0,
+                    "forward FFT mismatch at index {} for n={}",
+                    i,
+                    size
+                );
             }
 
             // Inverse FFT
             let inv_orig = fft(&values, size, true).unwrap();
             let inv_fast = fft_fast(&values, size, true).unwrap();
             for i in 0..inv_orig.len() {
-                assert!(big::BIG::comp(&inv_orig[i], &inv_fast[i]) == 0,
-                    "inverse FFT mismatch at index {} for n={}", i, size);
+                assert!(
+                    big::BIG::comp(&inv_orig[i], &inv_fast[i]) == 0,
+                    "inverse FFT mismatch at index {} for n={}",
+                    i,
+                    size
+                );
             }
         }
     }
@@ -1642,8 +2034,11 @@ mod tests {
         let evals = fft_fast(&values, size, false).unwrap();
         let recovered = fft_fast(&evals, size, true).unwrap();
         for i in 0..values.len() {
-            assert!(big::BIG::comp(&values[i], &recovered[i]) == 0,
-                "roundtrip mismatch at index {}", i);
+            assert!(
+                big::BIG::comp(&values[i], &recovered[i]) == 0,
+                "roundtrip mismatch at index {}",
+                i
+            );
         }
     }
 
@@ -1696,7 +2091,7 @@ mod tests {
             for _ in 0..n {
                 let mut s = big::BIG::random(&mut rng);
                 s.rmod(&modulus);
-                let p = g.mul(&s);  // random point
+                let p = g.mul(&s); // random point
                 let mut e = big::BIG::random(&mut rng);
                 e.rmod(&modulus);
                 points.push(p);
@@ -1735,12 +2130,219 @@ mod tests {
 
         let c_orig = commit_scalars(&scalars, poly_size);
         let c_fast = commit_scalars_fast(&scalars, poly_size);
-        assert_eq!(c_orig, c_fast, "commit_scalars_fast must match commit_scalars");
+        assert_eq!(
+            c_orig, c_fast,
+            "commit_scalars_fast must match commit_scalars"
+        );
 
         // Also test monomial commitment
         let coeffs = fft(&scalars, poly_size, true).unwrap();
         let cm_orig = commit_scalars_monomial(&coeffs);
         let cm_fast = commit_scalars_monomial_fast(&coeffs);
         assert_eq!(cm_orig, cm_fast, "commit_scalars_monomial_fast must match");
+    }
+
+    /// Aggregate batch verification: a batch of honest KZG openings (3 distinct
+    /// commitments, 2 points each = 6 openings) verifies under ONE pairing
+    /// check, and any tampered value / proof / point is rejected.
+    #[test]
+    fn aggregate_verify_batch_golden_and_forgery() {
+        init();
+        let poly_size: u64 = 16;
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x5C; 32]);
+
+        let indices_per: [[u64; 2]; 3] = [[1, 7], [3, 11], [5, 13]];
+        let mut commits: Vec<Vec<u8>> = Vec::new();
+        let mut idxs: Vec<u64> = Vec::new();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut proofs: Vec<Vec<u8>> = Vec::new();
+
+        for m in 0..3usize {
+            // One "member" = one distinct evaluation-form polynomial.
+            let mut scalars = Vec::with_capacity(poly_size as usize);
+            for _ in 0..poly_size {
+                let mut s = big::BIG::random(&mut rng);
+                s.rmod(&modulus);
+                scalars.push(s);
+            }
+            let mut full = Vec::with_capacity(poly_size as usize * big::MODBYTES);
+            for s in &scalars {
+                let mut buf = [0u8; big::MODBYTES];
+                s.tobytes(&mut buf);
+                full.extend_from_slice(&buf);
+            }
+            let commit = commit_scalars(&scalars, poly_size);
+            for &ix in &indices_per[m] {
+                let proof = prove_raw_full(&full, ix, poly_size);
+                let mut y = [0u8; big::MODBYTES];
+                scalars[ix as usize].tobytes(&mut y);
+                // Sanity: each opening verifies individually.
+                assert!(
+                    verify_raw(&y, &commit, ix, &proof, poly_size),
+                    "single verify failed (m={m}, ix={ix})"
+                );
+                commits.push(commit.clone());
+                idxs.push(ix);
+                values.push(y.to_vec());
+                proofs.push(proof);
+            }
+        }
+
+        let gamma = [0xABu8; 48];
+        // Golden: the whole batch passes one aggregate pairing check.
+        assert!(
+            aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma),
+            "honest batch must aggregate-verify"
+        );
+
+        // Forgery: tamper one value.
+        let mut bad_v = values.clone();
+        bad_v[2][0] ^= 0x01;
+        assert!(
+            !aggregate_verify_openings(&commits, &idxs, &bad_v, &proofs, poly_size, &gamma),
+            "tampered value must be rejected"
+        );
+
+        // Forgery: tamper one proof.
+        let mut bad_p = proofs.clone();
+        bad_p[4][2] ^= 0x01;
+        assert!(
+            !aggregate_verify_openings(&commits, &idxs, &values, &bad_p, poly_size, &gamma),
+            "tampered proof must be rejected"
+        );
+
+        // Forgery: open at the wrong point (proof no longer matches z).
+        let mut bad_i = idxs.clone();
+        bad_i[0] = idxs[1];
+        assert!(
+            !aggregate_verify_openings(&commits, &bad_i, &values, &proofs, poly_size, &gamma),
+            "wrong opening point must be rejected"
+        );
+
+        // γ is a verification randomizer, not part of the statement: any γ
+        // accepts the honest batch.
+        let gamma2 = [0x11u8; 32];
+        assert!(
+            aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma2),
+            "honest batch verifies under any γ"
+        );
+    }
+
+    /// Benchmark `aggregate_verify_openings` (the whole shard-storage
+    /// attestation of a global frame folds into ONE of these) at the mainnet
+    /// curve for a range of total opening counts K = Σ_shards Σ_members q.
+    /// Real openings are generated once and replicated to size K, so the timing
+    /// reflects the K-point multiexp + 2 pairings the verifier actually runs.
+    ///   cargo test -p bls48581 --release bench_aggregate_verify -- --ignored --nocapture
+    #[test]
+    #[ignore = "BLS48-581 aggregate-verify benchmark; run with --release --ignored --nocapture"]
+    fn bench_aggregate_verify_scaling() {
+        init();
+        let poly_size: u64 = 256;
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x7E; 32]);
+
+        // One real polynomial, opened at all 256 domain points → a pool of
+        // genuine (commitment, index, value, proof) tuples to replicate.
+        let mut scalars = Vec::with_capacity(poly_size as usize);
+        for _ in 0..poly_size {
+            let mut s = big::BIG::random(&mut rng);
+            s.rmod(&modulus);
+            scalars.push(s);
+        }
+        let mut full = Vec::with_capacity(poly_size as usize * big::MODBYTES);
+        for s in &scalars {
+            let mut buf = [0u8; big::MODBYTES];
+            s.tobytes(&mut buf);
+            full.extend_from_slice(&buf);
+        }
+        let commit = commit_scalars(&scalars, poly_size);
+        let mut base_idx: Vec<u64> = Vec::new();
+        let mut base_val: Vec<Vec<u8>> = Vec::new();
+        let mut base_proof: Vec<Vec<u8>> = Vec::new();
+        for ix in 0..poly_size {
+            let proof = prove_raw_full(&full, ix, poly_size);
+            let mut y = [0u8; big::MODBYTES];
+            scalars[ix as usize].tobytes(&mut y);
+            base_idx.push(ix);
+            base_val.push(y.to_vec());
+            base_proof.push(proof);
+        }
+        let pool = base_idx.len();
+        let gamma = [0xCDu8; 48];
+
+        for &kk in &[256usize, 1024, 4096, 16384, 65536] {
+            let commits: Vec<Vec<u8>> = (0..kk).map(|_| commit.clone()).collect();
+            let idxs: Vec<u64> = (0..kk).map(|i| base_idx[i % pool]).collect();
+            let values: Vec<Vec<u8>> = (0..kk).map(|i| base_val[i % pool].clone()).collect();
+            let proofs: Vec<Vec<u8>> = (0..kk).map(|i| base_proof[i % pool].clone()).collect();
+            assert!(
+                aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma),
+                "replicated honest batch must verify (K={kk})"
+            );
+            let iters = 3u32;
+            let start = Instant::now();
+            for _ in 0..iters {
+                assert!(aggregate_verify_openings(
+                    &commits, &idxs, &values, &proofs, poly_size, &gamma
+                ));
+            }
+            let per = start.elapsed() / iters;
+            println!("K={kk:>6}  aggregate_verify={per:?}");
+        }
+    }
+
+    /// Parallel vs serial multiexp: asserts equality (correctness) and reports
+    /// the core speedup. The aggregate-verify batch is dominated by these
+    /// multiexps, so this is the lever that lets a many-core validator verify
+    /// every prover's possession proof per frame.
+    ///   cargo test -p bls48581 --release bench_parallel_multiexp -- --ignored --nocapture
+    #[test]
+    #[ignore = "parallel multiexp benchmark; run with --release --ignored --nocapture"]
+    fn bench_parallel_multiexp() {
+        init();
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x9A; 32]);
+        let g = ecp::ECP::generator();
+        println!("cores={}", rayon::current_num_threads());
+
+        for &k in &[4096usize, 16384, 65536] {
+            let mut pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+            let mut sca: Vec<big::BIG> = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut s = big::BIG::random(&mut rng);
+                s.rmod(&modulus);
+                pts.push(g.mul(&s));
+                let mut t = big::BIG::random(&mut rng);
+                t.rmod(&modulus);
+                sca.push(t);
+            }
+
+            // Correctness: parallel result must equal serial.
+            let ser_val = point_linear_combination_fast(&pts, &sca).unwrap();
+            let par_val = point_linear_combination_parallel(&pts, &sca).unwrap();
+            assert!(
+                ser_val.equals(&par_val),
+                "parallel multiexp must equal serial (K={k})"
+            );
+
+            let t0 = Instant::now();
+            let _ = point_linear_combination_fast(&pts, &sca).unwrap();
+            let serial = t0.elapsed();
+            let t1 = Instant::now();
+            let _ = point_linear_combination_parallel(&pts, &sca).unwrap();
+            let parallel = t1.elapsed();
+            println!(
+                "K={k:>6}  serial={serial:?}  parallel={parallel:?}  speedup={:.1}x",
+                serial.as_secs_f64() / parallel.as_secs_f64()
+            );
+        }
     }
 }
