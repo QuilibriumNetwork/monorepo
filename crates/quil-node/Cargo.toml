@@ -5,6 +5,10 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Quilibrium node binary"
 
+[lib]
+name = "quil_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "quil-node"
 path = "src/main.rs"
