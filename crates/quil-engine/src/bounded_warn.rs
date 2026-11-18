@@ -119,6 +119,11 @@ impl<K: Ord + Clone> WarnLimiter<K> {
             duration: now.saturating_duration_since(stream.since),
         })
     }
+
+    /// The failures of `key`'s ongoing condition.
+    fn attempts(&self, key: &K) -> Option<u64> {
+        self.streams.get(key).map(|stream| stream.attempts)
+    }
 }
 
 /// Which retried duty a condition belongs to, its shard filter and two
@@ -141,6 +146,81 @@ pub fn succeeded(key: &Key, position: u64) -> Option<Report> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .succeeded_at(key, position, Instant::now())
+}
+
+/// [`note_retry_at`] at the current time.
+pub fn note_retry<E: std::fmt::Display + ?Sized>(
+    duty: &'static str,
+    frame: u64,
+    error: Option<&E>,
+) {
+    note_retry_at(duty, frame, error, Instant::now());
+}
+
+/// Log the outcome of one attempt of `duty` (a store write retried by the
+/// next frame or retry) for `frame` at `now`. A store that refuses writes
+/// fails every attempt: an operator sees one line at the first failure, one
+/// per [`WARN_REPEAT`] with the failures since, and one at the next attempt
+/// that succeeds at or above the highest failed frame. Without a success
+/// the condition ends with the process (a latched store exits or stays
+/// refused until it is reopened).
+pub fn note_retry_at<E: std::fmt::Display + ?Sized>(
+    duty: &'static str,
+    frame: u64,
+    error: Option<&E>,
+    now: Instant,
+) {
+    let key: Key = (duty, Vec::new(), 0, 0);
+    let report = {
+        let mut conditions = CONDITIONS.lock().unwrap_or_else(|e| e.into_inner());
+        match error {
+            Some(_) => conditions.failed_at(&key, frame, now),
+            None => conditions.succeeded_at(&key, frame, now),
+        }
+    };
+    match (report, error) {
+        (Some(Report::Failing { attempts, duration }), Some(error)) if duration.is_zero() => {
+            tracing::warn!(
+                frame,
+                attempts,
+                %error,
+                scope = "this node",
+                until = "an attempt succeeds; a store that refuses writes needs the node restarted \
+                         (see its \"store write failed\" line)",
+                repeat_every_s = WARN_REPEAT.as_secs(),
+                "{duty} failed; retrying"
+            );
+        }
+        (Some(Report::Failing { attempts, duration }), Some(error)) => {
+            tracing::warn!(
+                frame,
+                attempts,
+                duration_s = duration.as_secs(),
+                %error,
+                scope = "this node",
+                "{duty} still failing; retrying"
+            );
+        }
+        (Some(Report::Recovered { attempts, duration }), _) => {
+            tracing::info!(
+                frame,
+                attempts,
+                duration_s = duration.as_secs(),
+                "{duty} succeeded after failures"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// The failures of `duty` since its condition started, or None when none
+/// is ongoing: what tests of a duty's callers in other crates check.
+#[doc(hidden)]
+pub fn failing_attempts(duty: &'static str) -> Option<u64> {
+    CONDITIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .attempts(&(duty, Vec::new(), 0, 0))
 }
 
 #[cfg(test)]

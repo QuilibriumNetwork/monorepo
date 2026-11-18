@@ -4,7 +4,7 @@
 
 use super::*;
 use quil_execution::global_intrinsic::storage_epoch_proof::{
-    SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    SeatProof, StorageEpochProof, MAX_PROOF_LEN, TYPE_STORAGE_EPOCH_PROOF,
 };
 use quil_execution::global_intrinsic::storage_seat::settlement_window;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -88,7 +88,9 @@ fn holds(mc: &MessageCollector, bytes: &[u8]) -> bool {
 }
 
 /// Fill `provenance`'s share at `rank` with `make(id)` proofs, ids from
-/// `first` on; how many it holds.
+/// `first` on; how many it holds. The provers' proofs are this node's;
+/// each other sender is a peer of its own, within its share
+/// ([`SEAL_BYTES_PER_SENDER`]).
 fn fill(
     mc: &MessageCollector,
     rank: u64,
@@ -97,7 +99,13 @@ fn fill(
     make: impl Fn(u32) -> Vec<u8>,
 ) -> usize {
     for id in first..first + 40 {
-        match mc.add_message_outcome_from(rank, make(id), provenance) {
+        let outcome = match provenance {
+            Provenance::Prover => mc.add_message_outcome_from(rank, make(id), provenance),
+            Provenance::Other => {
+                mc.add_message_outcome_by(rank, make(id), provenance, &id.to_be_bytes())
+            }
+        };
+        match outcome {
             SubmitOutcome::Accepted => {}
             SubmitOutcome::Filtered(Refusal::RankFull) => return (id - first) as usize,
             other => panic!("proof {id}: {other:?}"),
@@ -308,6 +316,44 @@ fn an_other_senders_full_share_makes_room_for_a_proof_due_sooner() {
     assert_eq!(mc.pending_count(1), held, "one seal left for it");
 }
 
+/// Another sender's proof over a frame's seal budget due sooner takes the
+/// room of one held due later, as any proof does: other senders' share
+/// holds one such proof by its bytes alone, so a far-window one keeps
+/// no sooner one out until it ends. Each carries the longest proof field
+/// a proof decodes with, so its window end is read: one longer decodes as
+/// no proof, and a proof of unknown window takes no room.
+#[test]
+fn an_other_senders_proof_over_a_frame_due_sooner_takes_a_later_ones_room() {
+    let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+    let longest = MAX_PROOF_LEN as usize;
+    let mc = knowing(now());
+    let later = sized(1, EPOCH + 1, false, longest);
+    let sooner = sized(2, EPOCH, true, longest);
+    for message in [&later, &sooner] {
+        assert!(
+            message.len() > budget && storage_kinds(message).window_end.is_some(),
+            "a proof over a frame's seal budget that decodes, of {} bytes",
+            message.len()
+        );
+    }
+    assert_eq!(
+        mc.add_message_outcome_by(1, later.clone(), Provenance::Other, b"o"),
+        SubmitOutcome::Accepted,
+        "another sender's proof over a frame's seal budget, due later, held first"
+    );
+    let outcome = mc.add_message_outcome_by(1, sooner.clone(), Provenance::Other, b"p");
+    eprintln!("REACH seal-deadline other-oversize-evict outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "SEAL-SEAT-OTHERS: another sender's proof over a frame's seal budget due sooner waited for one due later"
+    );
+    assert!(
+        holds(&mc, &sooner) && !holds(&mc, &later),
+        "the one due later left for it"
+    );
+}
+
 /// A full share makes room only from its own proofs: a proof due sooner
 /// than the other share's takes none of its room.
 #[test]
@@ -454,6 +500,87 @@ fn a_promotion_into_a_full_share_makes_room_for_a_proof_due_sooner() {
         .snapshot_for_proposal(1, SEAL_BYTES_PER_PROPOSAL, 10_000, None, &[])
         .unwrap();
     assert_eq!(ids(&taken, &of), [101], "the settlement rides first");
+}
+
+/// A sender over its share of held proofs makes no room in a full share:
+/// its proofs due sooner would otherwise drop every member's proof due
+/// later, one submit at a time. Its proofs within its share make room.
+#[test]
+fn a_sender_over_its_share_makes_no_room() {
+    let mc = knowing(now());
+    let held = fill(&mc, 1, Provenance::Prover, 1, late);
+    let sender = b"one prover";
+    let mut made_room = 0;
+    let outcome = loop {
+        let outcome =
+            mc.add_message_outcome_by(1, soon(101 + made_room), Provenance::Prover, sender);
+        if outcome != SubmitOutcome::Accepted || made_room == 8 {
+            break outcome;
+        }
+        made_room += 1;
+    };
+    eprintln!("REACH seal-deadline sender-evict made_room={made_room} outcome={outcome:?}");
+    assert!(
+        (1..8).contains(&made_room),
+        "the sender's proofs within its share make room"
+    );
+    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    let late_held = (1..=held as u32)
+        .filter(|&id| holds(&mc, &late(id)))
+        .count();
+    assert_eq!(
+        late_held,
+        held - made_room as usize,
+        "SEAL-EVICT-SENDER: a proof over its sender's share dropped a held proof"
+    );
+}
+
+/// A prover's copy over its own share promotes nothing and makes no room
+/// in the provers' full share: its copies of other senders' proofs due
+/// sooner would otherwise drop every member's proof due later.
+#[test]
+fn a_promotion_over_its_senders_share_makes_no_room() {
+    let mc = knowing(now());
+    let promoted = soon(101);
+    assert_eq!(
+        mc.add_message_outcome_by(1, promoted.clone(), Provenance::Other, b"relay"),
+        SubmitOutcome::Accepted
+    );
+    let prover = b"one prover";
+    let mut own = 0;
+    let refused = loop {
+        let outcome = mc.add_message_outcome_by(1, late(1 + own), Provenance::Prover, prover);
+        if outcome != SubmitOutcome::Accepted || own == 8 {
+            break outcome;
+        }
+        own += 1;
+    };
+    assert!(
+        (1..8).contains(&own) && refused == SubmitOutcome::Filtered(Refusal::RankFull),
+        "the prover holds its share of proofs due later"
+    );
+    let filled = fill(&mc, 1, Provenance::Prover, 100, late);
+    let late_held = || {
+        (1..=own)
+            .chain(100..100 + filled as u32)
+            .filter(|&id| holds(&mc, &late(id)))
+            .count()
+    };
+    let before = late_held();
+    assert_eq!(
+        before,
+        own as usize + filled,
+        "the provers' share is full of later proofs"
+    );
+    let outcome = mc.add_message_outcome_by(1, promoted.clone(), Provenance::Prover, prover);
+    eprintln!("REACH seal-deadline promote-sender outcome={outcome:?}");
+    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        late_held(),
+        before,
+        "SEAL-PROMOTE-EVICT-SENDER: a copy over its sender's share dropped a held proof"
+    );
+    assert!(holds(&mc, &promoted), "the other sender's proof stays held");
 }
 
 /// A shard frame header for shard `addr`, about `len` bytes.

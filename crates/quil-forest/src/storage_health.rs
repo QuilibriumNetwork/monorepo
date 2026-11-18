@@ -165,6 +165,10 @@ pub fn error_class(cause: &str) -> &'static str {
         ("read-only file system", "EROFS"),
         ("too many open files", "EMFILE"),
         ("file too large", "EFBIG"),
+        // RocksDB's `Corruption:` status: a block whose stored checksum
+        // differs from its bytes on disk (faulty RAM or disk).
+        ("corruption:", "CORRUPTION"),
+        ("checksum mismatch", "CORRUPTION"),
     ]
     .iter()
     .find(|(text, _)| lowered.contains(text))
@@ -176,6 +180,71 @@ pub fn error_class(cause: &str) -> &'static str {
 /// writes when free space fell below [`FLOOR_FREE_BYTES`]).
 pub fn space_class(class: &str) -> bool {
     matches!(class, "ENOSPC" | "EDQUOT" | "FLOOR")
+}
+
+/// How long a process whose own store stopped for a corrupt block keeps
+/// running before it exits, so its service manager restarts it and the
+/// store is reopened: long enough to log the failure and not restart in
+/// a tight loop when the block is met again soon after.
+pub const CORRUPTION_EXIT_DELAY: Duration = Duration::from_secs(300);
+
+/// Where the operator finds the directory of the store of `role` (the
+/// directory itself is never logged).
+fn store_location(role: Option<StoreRole>) -> &'static str {
+    match role {
+        Some(StoreRole::Worker(_)) => {
+            "the worker's directory under db.workerPaths or db.workerPathPrefix (default worker-store/<core>)"
+        }
+        _ => "the directory set as db.path (default store in the node's config directory)",
+    }
+}
+
+/// Why a store reports a corrupt block, completing "a block of its files":
+/// the one cause text every log line about such a store gives.
+pub const CORRUPTION_CAUSE: &str =
+    "no longer matches its checksum, so its bytes on disk changed after they were written (often faulty \
+     RAM or disk)";
+
+/// Whether this process belongs to an archive node (`--archive` or
+/// `engine.archiveMode`), set once at startup ([`set_archive_node`]).
+static ARCHIVE_NODE: AtomicBool = AtomicBool::new(false);
+
+/// Record whether this process belongs to an archive node, before it opens
+/// a store. An archive's store is the copy other nodes sync from, so its
+/// operator is never told to discard it or sync it again.
+pub fn set_archive_node(archive: bool) {
+    ARCHIVE_NODE.store(archive, Ordering::Relaxed);
+}
+
+/// What the operator does about a store of `role` with a corrupt block
+/// that reopening it does not get past: the one text every log line about
+/// such a store ends with. A restart alone meets the same block again.
+pub fn corruption_next_step(role: Option<StoreRole>) -> String {
+    corruption_next_step_as(role, ARCHIVE_NODE.load(Ordering::Relaxed))
+}
+
+/// [`corruption_next_step`] for a node that is an archive or not. A regular
+/// node moves the store aside and syncs it again from the network; an
+/// archive keeps its store, copies it before any repair and checks the
+/// hardware first.
+fn corruption_next_step_as(role: Option<StoreRole>, archive: bool) -> String {
+    let store = match role {
+        Some(StoreRole::Master) => "the master store's",
+        Some(StoreRole::Worker(_)) => "the worker store's",
+        None => "the store's",
+    };
+    if archive {
+        return format!(
+            "stop the node and keep {store} directory ({}): copy it before any repair, check the disk and the \
+             RAM, then restart the node",
+            store_location(role)
+        );
+    }
+    format!(
+        "stop the node, move {store} directory aside ({}) and start the node: it syncs the store again from the \
+         network; check the RAM and the disk",
+        store_location(role)
+    )
 }
 
 /// Below this much free space, or [`FLOOR_FREE_INODES`] free inodes, a
@@ -301,7 +370,13 @@ pub(crate) struct StoreState {
     /// The error the next write fails with, for tests of the write path.
     #[cfg(test)]
     fault: Mutex<Option<rocksdb::Error>>,
+    /// Run by [`Self::latch`] once the flag is set, before the record.
+    #[cfg(test)]
+    on_flag: Mutex<Option<FlagHook>>,
 }
+
+#[cfg(test)]
+type FlagHook = Box<dyn Fn(&StoreState) + Send + Sync>;
 
 impl StoreState {
     pub(crate) fn new(path: PathBuf) -> Self {
@@ -312,6 +387,8 @@ impl StoreState {
             failure: Mutex::new(None),
             #[cfg(test)]
             fault: Mutex::new(None),
+            #[cfg(test)]
+            on_flag: Mutex::new(None),
         }
     }
 
@@ -323,11 +400,17 @@ impl StoreState {
         self.failed.load(Ordering::Acquire)
     }
 
-    /// Refuse every later write, and report the first cause once.
+    /// Refuse every later write, and report the first cause once. The flag
+    /// is set under the record's lock, so a reader that sees it waits for
+    /// the record instead of reading a latched store with no failure.
     pub(crate) fn latch(&self, cause: String) {
-        self.failed.store(true, Ordering::Release);
         let now = Instant::now();
         let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        self.failed.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let Some(hook) = self.on_flag.lock().unwrap().as_ref() {
+            hook(self);
+        }
         if failure.is_some() {
             return;
         }
@@ -426,6 +509,9 @@ fn action(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
             "it ran out of space although its filesystem shows room: check the disk quota and the filesystem's \
              metadata space"
         }
+        "CORRUPTION" => {
+            return format!("a block of its files {CORRUPTION_CAUSE}; {}", next_step(class, no_room, role));
+        }
         _ => "check the disk and the store files",
     };
     format!("{operator}; {}", next_step(class, no_room, role))
@@ -439,17 +525,32 @@ pub fn recovers_with_space(class: &str, no_room: bool) -> bool {
 
 /// What the node does next about a store of `role` stopped for `class`. A
 /// thread worker is restarted, at most a few times in a row. A process
-/// whose own store it is exits only for a space error, once that space
+/// whose own store it is exits for a corrupt block after
+/// [`CORRUPTION_EXIT_DELAY`], and for a space error once that space
 /// returns: when its filesystem showed room, only once space can also be
 /// reserved next to the store ([`can_reserve`]), since a disk quota or a
 /// metadata limit would fail the restarted process again at once. Other
-/// errors leave it to the operator, who restarts the node.
+/// errors leave it to the operator, who restarts the node. A corrupt block
+/// that a reopen does not get past also ends with the operator
+/// ([`corruption_next_step`]).
 fn next_step(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
     let headroom = headroom_text();
     match role {
+        Some(StoreRole::Worker(_)) if master_in_process() && class == "CORRUPTION" => format!(
+            "the node stops the worker, keeping its allocation, and restarts it to reopen the store once the disk \
+             has {headroom}, at most three times in a row; if the store stops again after those, {}",
+            corruption_next_step(role)
+        ),
         Some(StoreRole::Worker(_)) if master_in_process() => format!(
             "the node stops the worker, keeping its allocation, and restarts it to reopen the store once the disk \
              has {headroom}, at most three times in a row"
+        ),
+        Some(_) if class == "CORRUPTION" => format!(
+            "this process exits in {}s for its service manager to restart it and reopen the store (the service \
+             needs a restart policy: systemd Restart=on-failure, launchd KeepAlive); if the error returns after \
+             the restart, {}",
+            CORRUPTION_EXIT_DELAY.as_secs(),
+            corruption_next_step(role)
         ),
         Some(_) if !space_class(class) => "then restart the node".to_string(),
         Some(_) if !recovers_with_space(class, no_room) => format!(
@@ -563,7 +664,9 @@ fn open_databases() -> Vec<(Arc<StoreState>, Weak<DatabaseInner>)> {
 }
 
 /// The error class of the open store of `role` that stopped writing, and
-/// whether its filesystem showed no room then; `None` until both are known.
+/// whether its filesystem showed no room then; `None` while no open store
+/// of `role` is latched. The latch sets its flag under the lock read here,
+/// so a store that reads as latched never lacks its record.
 pub fn store_failure(role: StoreRole) -> Option<(&'static str, bool)> {
     open_stores()
         .into_iter()
@@ -1451,8 +1554,54 @@ mod tests {
         );
         assert_eq!(error_class("IO error: Disk quota exceeded"), "EDQUOT");
         assert_eq!(error_class("IO error: Storage full"), "ENOSPC");
-        assert_eq!(error_class("Corruption: bad block"), "other");
+        assert_eq!(
+            error_class("Invalid argument: Column family not found"),
+            "other"
+        );
         assert!(space_class("ENOSPC") && space_class("EDQUOT") && !space_class("EIO"));
+    }
+
+    /// A block whose checksum fails is classed CORRUPTION, whether the
+    /// failure is RocksDB's `Corruption:` status or its message alone, and
+    /// no space or I/O error is.
+    #[test]
+    fn a_corrupt_block_is_classed_corruption() {
+        for cause in [
+            "Corruption: block checksum mismatch: stored = 2324967102, computed = 2953275080, type = 1 in \
+             /var/lib/node/store/128010.sst offset 34957 size 4011",
+            "Corruption: Corrupted compressed block contents: Snappy",
+            "block checksum mismatch: stored = 1, computed = 2",
+        ] {
+            assert_eq!(error_class(cause), "CORRUPTION", "corruption_not_classed: {cause}");
+        }
+        assert!(!space_class("CORRUPTION"));
+        assert_eq!(error_class("IO error: Input/output error"), "EIO");
+        assert_eq!(error_class("IO error: No space left on device"), "ENOSPC");
+    }
+
+    /// An archive's store is the copy other nodes sync from: its corrupt
+    /// block advice keeps and copies the store and never moves it aside or
+    /// syncs it again, while a regular node's keeps that advice.
+    #[test]
+    fn an_archive_is_never_told_to_discard_or_resync_a_corrupt_store() {
+        for role in [Some(StoreRole::Master), Some(StoreRole::Worker(3)), None] {
+            let archive = corruption_next_step_as(role, true);
+            for discard in ["aside", "sync", "move"] {
+                assert!(
+                    !archive.contains(discard),
+                    "archive_told_to_resync: {role:?}: {archive}"
+                );
+            }
+            assert!(
+                archive.contains("keep") && archive.contains("copy it before any repair"),
+                "archive_not_told_to_keep: {role:?}: {archive}"
+            );
+            let regular = corruption_next_step_as(role, false);
+            assert!(
+                regular.contains("directory aside") && regular.contains("syncs the store again"),
+                "regular_resync_lost: {role:?}: {regular}"
+            );
+        }
     }
 
     #[test]
@@ -1532,5 +1681,43 @@ mod tests {
             Some(sst(&first)),
             "a closed store is not counted"
         );
+    }
+
+    /// A reader on another thread that sees a store latched either finds
+    /// its failure or waits on the lock that is writing it: a latched store
+    /// read without its failure reads as no class, and a corrupt worker
+    /// store was given up with a restart as its next step.
+    #[test]
+    fn a_latched_store_is_never_read_without_its_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StoreState::new(dir.path().to_path_buf());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        *state.on_flag.lock().unwrap() = Some(Box::new(move |state: &StoreState| {
+            let read = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        // As store_failure reads: the flag, then the record.
+                        state.is_latched().then(|| match state.failure.try_lock() {
+                            Ok(failure) => failure.is_some(),
+                            Err(std::sync::TryLockError::Poisoned(failure)) => {
+                                failure.into_inner().is_some()
+                            }
+                            // Held: a reader waits until the record is written.
+                            Err(std::sync::TryLockError::WouldBlock) => true,
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            record.lock().unwrap().push(read);
+        }));
+        state.latch("Corruption: block checksum mismatch".to_string());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some(true)],
+            "latched_without_failure: the flag was readable before the record"
+        );
+        assert!(state.is_latched() && state.failure.lock().unwrap().is_some());
     }
 }

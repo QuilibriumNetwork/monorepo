@@ -246,10 +246,12 @@ fn a_sender_not_an_active_prover_rides_in_arrival_order() {
         mc.add_message_outcome_from(1, ahead.clone(), Provenance::Prover),
         SubmitOutcome::Accepted
     );
-    // Then proofs from senders no one names fill it but for 1,000 bytes.
+    // Then proofs from senders no one names, each within its share
+    // ([`SEAL_BYTES_PER_SENDER`]), fill it but for 1,000 bytes.
     let bytes = SEAL_BYTES_PER_PROPOSAL - LEN - 1_000;
-    let others = one_seat_proofs(1, bytes, |_, proof| {
-        mc.add_message_outcome_from(1, proof, Provenance::Other)
+    let others = one_seat_proofs(1, bytes, |id, proof| {
+        let sender = [&b"other"[..], &id.to_be_bytes()].concat();
+        mc.add_message_outcome_by(1, proof, Provenance::Other, &sender)
     }) - 1;
     let named = sized(101, five(), 300_000);
     assert_eq!(

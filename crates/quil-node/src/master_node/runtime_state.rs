@@ -1,7 +1,11 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use quil_forest::storage_health;
+use quil_forest::StoreRole;
 use quil_lifecycle::Supervisor;
 
 pub(crate) struct RuntimeState {
@@ -28,6 +32,96 @@ fn global_message_collector(
         collector.set_no_proposer();
     }
     collector
+}
+
+/// The wait after the first failed startup load of the prover registry;
+/// it doubles after each failure up to [`REGISTRY_RETRY_MAX`].
+const REGISTRY_RETRY_MIN: Duration = Duration::from_secs(5);
+const REGISTRY_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Load the prover registry from the master store at startup with `load`
+/// (which returns the provers it loaded), retrying after a failure with a
+/// backoff from `retry.0` doubling up to `retry.1`, until a load succeeds
+/// or `token` is cancelled. A failed load never fails the task: every
+/// later refresh retries too, the work that reads the registry waits for
+/// its first load ([`super::archive_sync::await_registry_load`]), and each
+/// failure tells the operator what to check, or for a corrupt block which
+/// store to move aside. A panicking load fails the task, which stops the
+/// node: retrying it could only meet the lock the panic poisoned.
+async fn load_registry_at_startup<F>(
+    load: F,
+    token: CancellationToken,
+    retry: (Duration, Duration),
+) -> anyhow::Result<()>
+where
+    F: Fn() -> anyhow::Result<usize> + Send + Sync + 'static,
+{
+    let load = Arc::new(load);
+    let started = Instant::now();
+    let mut wait = retry.0;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let once = load.clone();
+        let error = match tokio::task::spawn_blocking(move || (*once)()).await {
+            Ok(Ok(provers)) if attempt == 1 => {
+                info!(provers, "prover registry loaded (background)");
+                return Ok(());
+            }
+            Ok(Ok(provers)) => {
+                info!(
+                    provers,
+                    attempts = attempt,
+                    waited_secs = started.elapsed().as_secs(),
+                    "prover registry loaded (background) after failed loads; the work that waited for it \
+                     resumes"
+                );
+                return Ok(());
+            }
+            Ok(Err(error)) => format!("{error:#}"),
+            // A panic may leave the registry's lock poisoned, and every
+            // retry would then fail on it: the task fails, which stops the
+            // node for its service manager to restart it.
+            Err(error) => {
+                return Err(anyhow::anyhow!("prover registry load panicked: {error}"));
+            }
+        };
+        let class = storage_health::error_class(&error);
+        let error = storage_health::redact_paths(&error);
+        let (retry_in_secs, waited_secs) = (wait.as_secs(), started.elapsed().as_secs());
+        if class == "CORRUPTION" {
+            error!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                attempt,
+                retry_in_secs,
+                waited_secs,
+                %error,
+                "prover registry load failed: a block of the master store {}, so consensus, worker allocation and \
+                 proving wait for the registry; {}; retrying meanwhile",
+                storage_health::CORRUPTION_CAUSE,
+                storage_health::corruption_next_step(Some(StoreRole::Master)),
+            );
+        } else {
+            error!(
+                scope = "this node",
+                store = "master",
+                error_class = class,
+                attempt,
+                retry_in_secs,
+                waited_secs,
+                %error,
+                "prover registry load failed: consensus, worker allocation and proving wait for the registry; \
+                 check this node's disk and the error; retrying"
+            );
+        }
+        tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(wait) => {}
+        }
+        wait = wait.saturating_mul(2).min(retry.1);
+    }
 }
 
 pub(crate) fn init(
@@ -57,17 +151,18 @@ pub(crate) fn init(
         let hs = hg_store.clone();
         // Run in background — don't block P2P startup. The registry
         // populates asynchronously; consensus won't start until it's ready.
-        // Supervised as a startup task: a normal completion is expected
-        // and won't shut down the node; a panic or error will.
-        sup.spawn_startup_task("prover-registry-refresh", move |_token| async move {
-            tokio::task::spawn_blocking(move || {
-                pr.refresh_from_store(hs.as_ref())?;
-                let count = pr.read(|r| r.distinct_provers());
-                tracing::info!(provers = count, "prover registry loaded (background)");
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .map_err(anyhow::Error::from)?
+        // Supervised as a startup task that retries a failed load rather
+        // than fail: a failure would stop the node, and its service manager
+        // would restart it into the same failure.
+        sup.spawn_startup_task("prover-registry-refresh", move |token| {
+            load_registry_at_startup(
+                move || {
+                    pr.refresh_from_store(hs.as_ref())?;
+                    Ok(pr.read(|r| r.distinct_provers()))
+                },
+                token,
+                (REGISTRY_RETRY_MIN, REGISTRY_RETRY_MAX),
+            )
         });
     }
 
@@ -315,7 +410,104 @@ pub(crate) fn init(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::log_capture::Capture;
     use quil_engine::message_collector::{Refusal, SubmitOutcome};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const CORRUPT: &str =
+        "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 1 in \
+                           /var/lib/node/store/128010.sst offset 0 size 4011";
+
+    /// A corrupt block of the master store failed the startup load of the
+    /// prover registry, and with it the node, which its service manager
+    /// restarted into the same failure every 15 s. The load is retried
+    /// instead, each failure naming the store to move aside, without its
+    /// path.
+    #[tokio::test]
+    async fn a_failed_startup_registry_load_is_retried_not_fatal() {
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                    anyhow::bail!(CORRUPT);
+                }
+                Ok(7)
+            },
+            CancellationToken::new(),
+            (Duration::from_millis(1), Duration::from_millis(2)),
+        )
+        .await;
+        assert!(loaded.is_ok(), "startup_load_failed_the_task: {loaded:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let failed = capture.lines_with("prover registry load failed");
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        for line in &failed {
+            assert!(
+                line.contains("ERROR") && line.contains("CORRUPTION"),
+                "{line}"
+            );
+            assert!(
+                line.contains("move the master store's directory aside"),
+                "{line}"
+            );
+            assert!(
+                line.contains("db.path") && !line.contains("/var/lib/node"),
+                "{line}"
+            );
+        }
+        assert_eq!(capture.lines_with("prover registry loaded").len(), 1);
+    }
+
+    /// A load that keeps failing ends with the node's shutdown, not with
+    /// a task failure.
+    #[tokio::test]
+    async fn a_failing_startup_registry_load_ends_on_shutdown() {
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                cancel.cancel();
+                anyhow::bail!("IO error: Input/output error")
+            },
+            token,
+            (Duration::from_secs(60), Duration::from_secs(60)),
+        );
+        let loaded = tokio::time::timeout(Duration::from_secs(30), loaded)
+            .await
+            .expect("ends once the node shuts down");
+        assert!(loaded.is_ok(), "startup_load_failed_the_task: {loaded:?}");
+    }
+
+    /// A panic in the load can poison the registry's lock, so every retry
+    /// would fail on it for as long as the node ran: the first panic fails
+    /// the task, which stops the node for a clean restart, and is never
+    /// retried.
+    #[tokio::test]
+    async fn a_panicking_startup_registry_load_fails_the_task() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let loaded = load_registry_at_startup(
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("installing the loaded registry");
+                }
+                Ok(7)
+            },
+            CancellationToken::new(),
+            (Duration::from_millis(1), Duration::from_millis(2)),
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "panicked_load_retried: {loaded:?}"
+        );
+        let error = loaded.expect_err("panicked_load_retried: the task did not fail");
+        assert!(format!("{error:#}").contains("panicked"), "{error:#}");
+    }
 
     /// A regular node's collector told submitters "accepted", held what they
     /// sent for good, and at its cap stayed full until a restart.

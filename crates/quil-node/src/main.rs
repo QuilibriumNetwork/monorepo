@@ -466,6 +466,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         .proof_worker
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid proofWorker configuration: {e}"))?;
+    // An archive's corrupt-store advice keeps its store; set before any
+    // store opens. The same role test as the master's start below. A
+    // worker of an archive started without either gets the regular advice
+    // for its own store, which serves no history even under an archive
+    // master (worker_node.rs).
+    quil_forest::storage_health::set_archive_node(args.archive || config.engine.archive_mode);
 
     // Initialize logging in tab-separated console format:
     //   ts \t level \t target:line \t msg \t {fields}.

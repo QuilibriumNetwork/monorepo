@@ -8,16 +8,18 @@
 //! and refuses one carrying more than [`MAX_APP_FRAME_ITEMS`] bundles and
 //! requests or [`MAX_APP_FRAME_OPENINGS`] storage openings, or whose
 //! decode would take more than [`MAX_APP_FRAME_DECODED`] bytes;
-//! [`check_bundle`] refuses a submitted bundle that could not fit a frame.
+//! [`check_bundle`] refuses a submitted bundle that no leader proposes.
 //!
-//! A leader proposes at most [`MAX_APP_FRAME_ITEMS`] bundles and requests
-//! and defers the rest ([`FrameItemBudget`]); members refuse a proposal
-//! past either bound, as followers and archives refuse the frame.
+//! A leader proposes at most [`MAX_COLLECTED_ITEMS`] collected bundles and
+//! requests, keeping room for its coin deliveries, and defers the rest
+//! ([`FrameItemBudget`]); members refuse a proposal past either bound, as
+//! followers and archives refuse the frame.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use quil_cw_consensus::handoff::MAX_MEMBERS;
+use quil_execution::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME;
 use quil_types::consensus::STORAGE_QUERIES_PER_LEAF;
 use quil_types::decode_cost::{CostRefusal, DecodeCost};
 use quil_types::proto::global::AppShardFrame;
@@ -35,6 +37,13 @@ use tracing::warn;
 /// collector holds at most 65,536 messages a rank (`message_collector`).
 /// This is 16 times the mirror's and a quarter of GLOBAL's.
 pub const MAX_APP_FRAME_ITEMS: usize = 16_384;
+
+/// Collected bundles and requests a leader proposes in one frame: 16,256,
+/// the frame's [`MAX_APP_FRAME_ITEMS`] less the room its coin deliveries
+/// take, each a bundle of one request (`MAX_DELIVERIES_PER_FRAME`,
+/// quil-execution `delivery`). A submitted bundle past it is refused
+/// ([`check_bundle`]): no leader proposes it.
+pub const MAX_COLLECTED_ITEMS: usize = MAX_APP_FRAME_ITEMS - 2 * MAX_DELIVERIES_PER_FRAME;
 
 /// Storage openings one application shard frame may carry: 8,192, the
 /// [`STORAGE_QUERIES_PER_LEAF`] (2) a member opens a leaf with for each of
@@ -87,6 +96,10 @@ pub enum FrameRefusal {
     /// A decode taking more than [`MAX_APP_FRAME_DECODED`]: at least
     /// `decoded` bytes.
     TooLarge { items: FrameItems, decoded: u64 },
+    /// A submitted bundle within a frame's bound but past what a leader
+    /// proposes ([`MAX_COLLECTED_ITEMS`]), well-formed as far as
+    /// [`check_bundle`] reads it.
+    Unproposable { requests: usize },
 }
 
 impl FrameRefusal {
@@ -95,6 +108,11 @@ impl FrameRefusal {
         match self {
             Self::Malformed => FrameItems::default(),
             Self::TooMany(items) | Self::TooLarge { items, .. } => *items,
+            Self::Unproposable { requests } => FrameItems {
+                bundles: 1,
+                requests: *requests,
+                openings: 0,
+            },
         }
     }
 }
@@ -114,6 +132,11 @@ impl std::fmt::Display for FrameRefusal {
                 f,
                 "a decode of at least {decoded} bytes, past the \
                  {MAX_APP_FRAME_DECODED} a frame may take"
+            ),
+            Self::Unproposable { requests } => write!(
+                f,
+                "a bundle of {requests} requests, past the {} a leader proposes",
+                MAX_COLLECTED_ITEMS - 1
             ),
         }
     }
@@ -192,9 +215,11 @@ pub fn decode_frame(source: &'static str, data: &[u8]) -> Option<AppShardFrame> 
 }
 
 /// Counts the requests of the canonical message bundle `data`, without
-/// allocating, and refuses one that could not fit a frame (with its own
-/// item, over [`MAX_APP_FRAME_ITEMS`]) or that ends before its requests
-/// do. The type and timestamp are left to its decoder. A zero-length
+/// allocating, and refuses one that ends before its requests do, one that
+/// could not fit a frame (with its own item, over [`MAX_APP_FRAME_ITEMS`],
+/// refused unread) and one no leader proposes (over
+/// [`MAX_COLLECTED_ITEMS`], [`FrameRefusal::Unproposable`]: releases before
+/// that bound take it). The type and timestamp are left to its decoder. A zero-length
 /// request counts as any other: it is how a request of a type no
 /// converter reads is re-encoded (`consensus_wire`), and nodes decode
 /// that form again.
@@ -214,6 +239,9 @@ pub fn check_bundle(data: &[u8]) -> Result<usize, FrameRefusal> {
             .checked_add(len)
             .filter(|&next| next <= data.len())
             .ok_or(FrameRefusal::Malformed)?;
+    }
+    if declared.saturating_add(1) > MAX_COLLECTED_ITEMS {
+        return Err(FrameRefusal::Unproposable { requests: declared });
     }
     Ok(declared)
 }
@@ -437,6 +465,10 @@ fn note_refused(
         return;
     };
     let counted = refusal.counted();
+    let limit = match refusal {
+        FrameRefusal::Unproposable { .. } => MAX_COLLECTED_ITEMS,
+        _ => MAX_APP_FRAME_ITEMS,
+    };
     let peer = peer.map_or_else(
         || "not known here".to_owned(),
         |peer| bs58::encode(peer).into_string(),
@@ -448,7 +480,7 @@ fn note_refused(
         bundles = counted.bundles,
         requests = counted.requests,
         openings = counted.openings,
-        limit = MAX_APP_FRAME_ITEMS,
+        limit,
         openings_limit = MAX_APP_FRAME_OPENINGS,
         decoded_limit = MAX_APP_FRAME_DECODED,
         refused_since_last_line = refused,
@@ -763,8 +795,8 @@ mod tests {
     }
 
     /// A submitted bundle is counted, zero-length requests included; one
-    /// that could not fit a frame or that ends early is refused, without
-    /// panic.
+    /// that no leader proposes, could not fit a frame or ends early is
+    /// refused, without panic.
     #[test]
     fn checks_submitted_bundles_and_counts_empty_requests() {
         assert_eq!(
@@ -779,13 +811,28 @@ mod tests {
             Ok(2),
             "{zero}"
         );
-        let at: Vec<_> = (0..MAX_APP_FRAME_ITEMS as u32 - 1).map(operation).collect();
-        assert_eq!(check_bundle(&canonical(at)), Ok(MAX_APP_FRAME_ITEMS - 1));
+        let at: Vec<_> = (0..MAX_COLLECTED_ITEMS as u32 - 1).map(operation).collect();
+        assert_eq!(check_bundle(&canonical(at)), Ok(MAX_COLLECTED_ITEMS - 1));
+        // Past what a leader proposes, to the last count a frame could hold.
+        for requests in [MAX_COLLECTED_ITEMS, MAX_APP_FRAME_ITEMS - 1] {
+            let past: Vec<_> = (0..requests as u32).map(operation).collect();
+            assert_eq!(
+                check_bundle(&canonical(past)),
+                Err(FrameRefusal::Unproposable { requests }),
+                "BUNDLE-BOUND: a bundle of {requests} requests no leader proposes was admitted"
+            );
+        }
         let over: Vec<_> = (0..MAX_APP_FRAME_ITEMS as u32).map(operation).collect();
         assert!(matches!(
             check_bundle(&canonical(over)),
             Err(FrameRefusal::TooMany(_))
         ));
+        // Past a leader's bound but cut short: malformed.
+        let cut = canonical((0..MAX_COLLECTED_ITEMS as u32).map(operation).collect());
+        assert_eq!(
+            check_bundle(&cut[..cut.len() - 9]),
+            Err(FrameRefusal::Malformed)
+        );
         // A count past the bound is refused unread.
         let mut declared = canonical(Vec::new());
         declared[4..8].copy_from_slice(&u32::MAX.to_be_bytes());

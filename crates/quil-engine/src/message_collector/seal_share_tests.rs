@@ -199,7 +199,8 @@ fn an_archive_holds_one_proposals_share_of_other_senders_storage_epoch_proofs() 
     for id in 1..=40u32 {
         let proof = seal(id);
         let len = proof.len();
-        match mc.add_message_outcome_from(1, proof, Provenance::Other) {
+        // Each sender is a peer of its own, within its share.
+        match mc.add_message_outcome_by(1, proof, Provenance::Other, &id.to_be_bytes()) {
             SubmitOutcome::Accepted => held += len,
             SubmitOutcome::Filtered(Refusal::RankFull) => break,
             other => panic!("seal {id}: {other:?}"),
