@@ -26,7 +26,7 @@ pub const STATES: [&str; 9] = [
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
-pub const BLOCKERS: [&str; 17] = [
+pub const BLOCKERS: [&str; 22] = [
     "waiting for transport",
     "restarting consensus host",
     "engine exited",
@@ -44,6 +44,11 @@ pub const BLOCKERS: [&str; 17] = [
     "session identity unavailable",
     "session state unavailable",
     STORAGE_WRITE_FAILED,
+    "predecessor state unrecovered",
+    "predecessor history unrecovered",
+    "outgoing history unrecovered",
+    "session chain unresolvable",
+    "shard state not ready",
 ];
 
 /// The blocker of a worker whose own store stopped writing: after a failed
@@ -2587,7 +2592,7 @@ mod tests",
         assert!(written.len() >= 8, "{written:?}");
         written.extend(literals(phase, "(", ')'));
         let chained = literals(chain, "{", '}');
-        assert_eq!(chained.len(), 4, "{chain}");
+        assert_eq!(chained.len(), 11, "{chain}");
         written.extend(
             chained
                 .into_iter()
