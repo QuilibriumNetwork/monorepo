@@ -709,6 +709,34 @@ fn proof_verifies(
     protocol::verify_certificate(member, &cert.sector, epoch, cert.n, &root, beacon, bytes).is_ok()
 }
 
+/// Fail unless every leaf of `captured` has a certified sector to be
+/// encoded into ([`reserve`]), before any leaf asks for memory. The leaves
+/// of a seat encode side by side, and one without such a sector fails the
+/// seat's encode: a sibling waiting for memory meanwhile would make sector
+/// labelling ahead, that of the very sector it lacks perhaps, give its
+/// memory back for nothing (2026-11-18: on a 9-seat node, encodes held
+/// memory for up to 2928 s and then failed on a sibling's uncertified
+/// sector, while sector labelling stopped 25 times to give memory back).
+pub(super) fn sectors_certified(
+    captured: &Captured,
+    member: &[u8],
+    store: Option<&LabelStore>,
+) -> Result<()> {
+    let store = store
+        .ok_or_else(|| unavailable("persistent storage requires a sector directory".into()))?;
+    for prefix in &captured.prefixes {
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+        let exact = captured.node_count(prefix)?;
+        let (dir, _, _) = reserve(store, member, &leaf, captured.epoch, exact)?;
+        if !Sector::load(dir)?.is_some_and(|sector| sector.certified) {
+            return Err(unavailable(
+                "sector certification must finish before data registration".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn encode_leaf(
     captured: &Captured,
     member: &[u8],
@@ -2146,6 +2174,74 @@ mod tests {
             "same-epoch leases cannot count one sector twice"
         );
         assert!(Sector::load(other).unwrap().is_none());
+        gates(false);
+    }
+    /// A seat's encode with one leaf in a certified sector and one in a
+    /// sector still being labelled asks for no memory: it would fail at the
+    /// second leaf anyway, and its ask would make the labelling, holding
+    /// what the memory share has room for, give its memory back. The
+    /// labelling then completes. The certified leaf is first, and one slot
+    /// runs the leaves one after another, so it is tried first.
+    #[test]
+    fn an_encode_with_a_leaf_not_certified_takes_no_labelling_memory() {
+        crate::storage_jobs::set_job_slots_for_test(1);
+        const GIB: u64 = 1 << 30;
+        crate::storage_jobs::set_available_for_test(Some(
+            GIB * 100 / crate::storage_jobs::MEMORY_SHARE_PERCENT,
+        ));
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([24; 32], [25; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let snap = super::super::tests::split(
+            capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap(),
+        );
+        let leaf =
+            |i: usize| quil_execution::global_intrinsic::leaf_id_bytes(&app, &snap.prefixes[i]);
+        let exact = |i: usize| snap.node_count(&snap.prefixes[i]).unwrap();
+        let (certified, id, n) = reserve(&store, &member, &leaf(0), 1500, exact(0)).unwrap();
+        initialize(&store, &member, 1500, certified.clone(), id, n, &|| false).unwrap();
+        let mut sector = Sector::load(certified).unwrap().unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        let (labelling, id, n) = reserve(&store, &member, &leaf(1), 1500, exact(1)).unwrap();
+        // The labelling holds all the share but a MiB; the encode needs more.
+        let held = GIB - (1 << 20);
+        assert!(proof::encoding_owned_with_labels_bytes(n) > GIB - held);
+        let memory = crate::storage_jobs::reserve_ahead(
+            held,
+            crate::storage_jobs::AheadOrder {
+                deferrable: false,
+                seat_leaves: 1,
+                seat: 0,
+                leaf: 0,
+            },
+            1500,
+            &|| false,
+        )
+        .expect("the labelling fits the share alone");
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        println!("REACH pending-slots");
+        let encoded =
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| {
+                memory.yield_requested()
+            });
+        let text = encoded.expect_err("a leaf without a certified sector fails the encode");
+        assert!(
+            !memory.yield_requested(),
+            "PENDING-ENCODE-ASK: an encode that fails for a leaf not certified asked the \
+             sector's labelling for its memory ({text})"
+        );
+        initialize(&store, &member, 1500, labelling.clone(), id, n, &|| {
+            memory.yield_requested()
+        })
+        .expect("the labelling completes");
+        assert!(Sector::load(labelling).unwrap().is_some());
+        drop(memory);
+        crate::storage_jobs::set_available_for_test(None);
         gates(false);
     }
     /// A leaf reserving its certified sector again, as it does at every

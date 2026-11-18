@@ -1154,6 +1154,10 @@ fn encode_member_until(
     {
         store.sweep(captured.epoch);
     }
+    // No leaf asks for memory while another has no certified sector.
+    if quil_types::consensus::persistent_storage_at(captured.epoch) {
+        persistent::sectors_certified(captured, member, store)?;
+    }
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
         captured.plan.clone(),
@@ -6017,7 +6021,7 @@ pub(crate) mod tests {
     }
 
     /// A shard of `app` of 32 values of 300 bytes, committed.
-    fn shard_of_leaves(app: [u8; 32]) -> Arc<HypergraphCrdt> {
+    pub(super) fn shard_of_leaves(app: [u8; 32]) -> Arc<HypergraphCrdt> {
         let crdt = test_crdt();
         for lead in 0u8..32 {
             crdt.add_vertex(
@@ -6035,7 +6039,7 @@ pub(crate) mod tests {
 
     /// `captured` split into leaves of at most a fifth of its data: five or
     /// more.
-    fn split(mut captured: Captured) -> Captured {
+    pub(super) fn split(mut captured: Captured) -> Captured {
         let whole = captured.size(&[]).unwrap();
         captured.prefixes = captured
             .partition(whole / 5)
