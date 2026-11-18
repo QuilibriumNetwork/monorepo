@@ -5,8 +5,9 @@ use crate::overlay::{
     PageCursor, PageSnapshot,
 };
 
+use quil_forest::VersionedValue;
 use quil_types::error::{QuilError, Result};
-use quil_types::store::ShardKey;
+use quil_types::store::{ShardKey, VertexBatchRead, VERTEX_READ_BATCH};
 
 use crate::encoding::{
     hypergraph_alt_shard_address_index_key, hypergraph_alt_shard_address_prefix,
@@ -37,6 +38,18 @@ struct OverlayHypergraphSnapshot {
 }
 
 impl OverlayHypergraphSnapshot {
+    fn version_batch(
+        &self,
+        prefix: &[u8],
+        addresses: &[[u8; 32]],
+        max_value: usize,
+    ) -> Result<Vec<VersionedValue>> {
+        self.snapshot
+            .read_view()?
+            .latest_version_batch(prefix, addresses, max_value)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         self.snapshot.scan_point()
     }
@@ -46,7 +59,84 @@ impl OverlayHypergraphSnapshot {
     }
 }
 
+/// A full committee scan accepts any 64-byte vertex key in this shard.
+/// Registry rows cover keys beginning with the GLOBAL domain (all 0xff).
+/// Every other domain sorts before it, in each physical namespace.
+fn registry_prefix_bounds() -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+    crate::encoding::prover_registry_key_prefixes()
+        .into_iter()
+        .map(|fixed| (fixed[..fixed.len() - 32].to_vec(), fixed))
+}
+
+/// The canonical view can reuse decoded registry rows only when there are
+/// no additional domains in the ranges the authoritative scan would visit.
+pub fn committee_capture_point(
+    db: &quil_forest::CoordinatedDb,
+) -> Result<Option<quil_types::store::CapturePoint>> {
+    let Some((snapshot, point)) = db
+        .watched_snapshot(&crate::encoding::prover_registry_key_prefixes())
+        .map_err(|e| QuilError::Store(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    for (lower, fixed) in registry_prefix_bounds() {
+        let mut options = sweep_read_options();
+        options.set_iterate_upper_bound(fixed);
+        let mut iter = snapshot.raw_iterator_opt(options);
+        iter.seek(&lower);
+        iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        if iter.valid() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(point))
+}
+
+/// A pinned branch view and the physical keys whose committed rows must be
+/// re-read to reproduce a committee scan of that view.
+pub struct CommitteeOverlayRows {
+    pub snapshot: Arc<dyn SnapshotReadable>,
+    pub written: Vec<Vec<u8>>,
+}
+
 impl OverlayHypergraphStore {
+    /// Pin one view for the coverage probes, the cumulative write list and
+    /// every replacement row. Decline when a deleted range cannot be listed.
+    pub fn committee_rows(&self, indexed_generation: u64) -> Result<Option<CommitteeOverlayRows>> {
+        let snapshot = self.db.snapshot();
+        let view = snapshot.read_view()?;
+        let prefixes = crate::encoding::prover_registry_key_prefixes();
+        if !view.watches_all(&prefixes) {
+            return Ok(None);
+        }
+        let written = if view.delta_generation() == indexed_generation {
+            Vec::new()
+        } else {
+            let Some(keys) = view.written_keys_under(&prefixes) else {
+                return Ok(None);
+            };
+            keys
+        };
+        fn error(e: impl std::fmt::Display) -> QuilError {
+            QuilError::ExecutionUnavailable(e.to_string())
+        }
+        for (lower, fixed) in registry_prefix_bounds() {
+            let upper = prefix_range_upper_bound(&lower).expect("tagged vertex prefix");
+            // Even a reused row is a read: retain the ordinary scan's range
+            // in the conflict ledger before this branch can publish.
+            view.depend_on_range(&fixed, &upper).map_err(error)?;
+            let mut foreign = view.cursor(&lower, &fixed).map_err(error)?;
+            foreign.seek(&lower).map_err(error)?;
+            if foreign.valid() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(CommitteeOverlayRows {
+            snapshot: Arc::new(OverlayHypergraphSnapshot { snapshot }),
+            written,
+        }))
+    }
+
     fn backing_store_identity_backend(&self) -> quil_types::store::BackingStoreIdentity {
         quil_types::store::BackingStoreIdentity::of(&self.db.0)
     }
@@ -832,6 +922,40 @@ pub struct RocksHypergraphSnapshot {
 }
 
 impl RocksHypergraphSnapshot {
+    fn version_batch(
+        &self,
+        prefix: &[u8],
+        addresses: &[[u8; 32]],
+        max_value: usize,
+    ) -> Result<Vec<VersionedValue>> {
+        let Some(min) = addresses.iter().min() else {
+            return Ok(Vec::new());
+        };
+        let max = addresses.iter().max().expect("nonempty batch");
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_lower_bound([prefix, min].concat());
+        options.set_iterate_upper_bound([prefix, max, &[0xff; 8], &[0]].concat());
+        let mut iterator = self.snapshot.raw_iterator_opt(options);
+        addresses
+            .iter()
+            .map(|address| {
+                let start = [prefix, address].concat();
+                let last = [start.as_slice(), &[0xff; 8]].concat();
+                if !quil_forest::seek_latest_in_range(&mut iterator, &start, &last, || Ok(()))
+                    .map_err(|e| QuilError::Store(e.to_string()))?
+                {
+                    return Ok(VersionedValue::Missing);
+                }
+                match iterator.key().zip(iterator.value()) {
+                    Some((key, value)) if key.len() == last.len() => {
+                        Ok(VersionedValue::from_bytes(value, max_value))
+                    }
+                    _ => Ok(VersionedValue::Unresolved),
+                }
+            })
+            .collect()
+    }
+
     /// Capture a RocksDB point-in-time snapshot. Cheap — pins the current
     /// sequence number; copies no data.
     pub fn capture(db: quil_forest::CoordinatedDb) -> Result<Self> {
@@ -1080,8 +1204,58 @@ fn page_fixed_vertices_at_snapshot(
 }
 
 macro_rules! impl_hypergraph_snapshot {
-    ($snapshot:ty) => {
+    ($snapshot:ty $(, $method:item)*) => {
         impl SnapshotReadable for $snapshot {
+            $($method)*
+
+            fn vertex_batch(
+                &self,
+                phase: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                addresses: &[[u8; 32]],
+                kind: VertexBatchRead,
+            ) -> Result<Vec<Option<Vec<u8>>>> {
+                if addresses.len() > VERTEX_READ_BATCH {
+                    return Err(QuilError::InvalidArgument("vertex read batch limit".into()));
+                }
+                let max_value = match kind {
+                    VertexBatchRead::Registry { max_bytes } => max_bytes.checked_sub(64)
+                        .ok_or_else(|| QuilError::InvalidArgument("invalid vertex page limits".into()))?,
+                    VertexBatchRead::Execution => usize::MAX,
+                };
+                let prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+                    "vertex", phase, shard, domain,
+                );
+                let versions = self.version_batch(&prefix, addresses, max_value)?;
+                let oversized = || QuilError::InvalidArgument("vertex row exceeds page byte limit".into());
+                addresses.iter().zip(versions).map(|(address, version)| {
+                    match version {
+                        VersionedValue::Present(value) => Ok(Some(value)),
+                        VersionedValue::Oversized => Err(oversized()),
+                        VersionedValue::Missing => {
+                            let vertex = [domain.as_slice(), address].concat();
+                            let key = hypergraph_vertex_data_key("vertex", phase, shard, &vertex);
+                            let value = self.snapshot.get(key)
+                                .map_err(|e| QuilError::Store(e.to_string()))?;
+                            if value.as_ref().is_some_and(|v| v.len() > max_value) {
+                                return Err(oversized());
+                            }
+                            Ok(value)
+                        }
+                        VersionedValue::Unresolved => match kind {
+                            VertexBatchRead::Registry { max_bytes } => self.get_vertex_underlying_fixed(
+                                "vertex", phase, shard, domain, address, max_bytes,
+                            ),
+                            VertexBatchRead::Execution => {
+                                let vertex = [domain.as_slice(), address].concat();
+                                self.load_vertex_underlying_raw("vertex", phase, shard, &vertex)
+                            }
+                        },
+                    }
+                }).collect()
+            }
+
             fn has_snapshot_vertex_reads(&self) -> bool {
                 true
             }
@@ -1309,7 +1483,67 @@ macro_rules! impl_hypergraph_snapshot {
     };
 }
 impl_hypergraph_snapshot!(RocksHypergraphSnapshot);
-impl_hypergraph_snapshot!(OverlayHypergraphSnapshot);
+impl_hypergraph_snapshot!(
+    OverlayHypergraphSnapshot,
+    fn written_registry_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        let view = self.snapshot.read_view()?;
+        let prefixes = crate::encoding::prover_registry_key_prefixes();
+        if !view.watches_all(&prefixes) {
+            return Ok(None);
+        }
+        // Reusing unchanged rows is also a read of their namespaces. Keep
+        // those dependencies in the branch's publication conflict check.
+        for prefix in &prefixes {
+            let upper = prefix_range_upper_bound(prefix).expect("tagged registry prefix");
+            view.depend_on_range(prefix, &upper)
+                .map_err(|e| QuilError::ExecutionUnavailable(e.to_string()))?;
+        }
+        Ok(view.written_keys_under(&prefixes))
+    },
+    fn get_vertex_underlying_fixed(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard: &ShardKey,
+        domain: &[u8; 32],
+        address: &[u8; 32],
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let max_value = max_bytes
+            .checked_sub(64)
+            .ok_or_else(|| QuilError::InvalidArgument("invalid vertex page limits".into()))?;
+        let mut vertex = [0; 64];
+        vertex[..32].copy_from_slice(domain);
+        vertex[32..].copy_from_slice(address);
+        let prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+            set_type, phase_type, shard, &vertex,
+        );
+        let mut last = prefix.clone();
+        last.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut upper = last.clone();
+        upper.push(0);
+        let mut versions = self.snapshot.raw_iterator_within(prefix, upper);
+        versions.seek_for_prev(&last);
+        let value = loop {
+            versions.status()?;
+            let Some(key) = versions.key() else {
+                let legacy = hypergraph_vertex_data_key(set_type, phase_type, shard, &vertex);
+                break self.snapshot.get(legacy)?;
+            };
+            // Variable-length vertex keys can sort between this address's versions.
+            if key.len() == last.len() {
+                break versions.into_value();
+            }
+            versions.prev();
+        };
+        if value.as_ref().is_some_and(|bytes| bytes.len() > max_value) {
+            return Err(QuilError::InvalidArgument(
+                "vertex row exceeds page byte limit".into(),
+            ));
+        }
+        Ok(value)
+    }
+);
 
 /// Live-store adapter — lets the sync server call the same
 /// `SnapshotReadable` interface against the current DB when no

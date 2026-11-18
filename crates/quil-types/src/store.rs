@@ -49,6 +49,10 @@ pub struct OpenSnapshots {
     pub oldest_age_secs: u64,
 }
 
+/// Local, rebuildable QCT3 witness index. GLOBAL execution records also use
+/// ASCII keys beginning with `quil/` but live outside this namespace.
+pub const LOCAL_WITNESS_INDEX_PREFIX: &[u8] = b"quil/local/qct3-witness/v3/";
+
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -61,6 +65,12 @@ pub trait KvDb: Send + Sync {
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
+    /// An unindexed batch for extending the local witness index. Stores that
+    /// track conflicts can check and record its complete key namespace.
+    /// Other stores use an ordinary atomic batch.
+    fn new_witness_index_batch(&self) -> Result<Box<dyn Transaction>> {
+        self.new_batch(false)
+    }
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
     /// The first key in `[lower, upper)`, or `None`: a probe of a range
     /// whose values are too large to read, which RocksDB answers without
@@ -124,6 +134,8 @@ pub trait KvDb: Send + Sync {
 pub trait Transaction: Send + std::any::Any {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    /// Attribute a conflicting database write to the committing operation.
+    #[track_caller]
     fn commit(self: Box<Self>) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn abort(self: Box<Self>) -> Result<()>;
@@ -302,6 +314,7 @@ pub trait ClockStore: Send + Sync {
                 ))
             })
     }
+    #[track_caller]
     fn put_global_clock_frame(
         &self,
         frame: &proto::global::GlobalFrame,
@@ -1624,6 +1637,16 @@ pub struct ChangeRecord {
     pub frame: u64,
 }
 
+/// Fixed registry rows skip interleaved keys of other lengths. An execution
+/// read uses the legacy value when its latest physical key has the wrong length.
+#[derive(Clone, Copy)]
+pub enum VertexBatchRead {
+    Registry { max_bytes: usize },
+    Execution,
+}
+
+pub const VERTEX_READ_BATCH: usize = 32;
+
 /// Point-in-time read interface for hypergraph trees, used by the
 /// snapshot manager. A `SnapshotReadable` reflects the state of the
 /// hypergraph store at the moment it was captured: subsequent writes
@@ -1636,6 +1659,40 @@ pub struct ChangeRecord {
 /// paths require them; in the meantime callers must still go to the
 /// live store for anything not covered here.
 pub trait SnapshotReadable: Send + Sync {
+    /// All physical registry keys changed since this branch's immutable base,
+    /// including inherited edits, at the sequence this snapshot reads. None
+    /// requests a full refresh when the changes cannot be enumerated.
+    fn written_registry_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        Ok(None)
+    }
+
+    /// Read at most `VERTEX_READ_BATCH` fixed-width addresses, in request
+    /// order, from this captured view. Backends can share a version iterator.
+    fn vertex_batch(
+        &self,
+        phase: &str,
+        shard: &ShardKey,
+        domain: &[u8; 32],
+        addresses: &[[u8; 32]],
+        kind: VertexBatchRead,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if addresses.len() > VERTEX_READ_BATCH {
+            return Err(QuilError::InvalidArgument("vertex read batch limit".into()));
+        }
+        addresses
+            .iter()
+            .map(|address| match kind {
+                VertexBatchRead::Registry { max_bytes } => self.get_vertex_underlying_fixed(
+                    "vertex", phase, shard, domain, address, max_bytes,
+                ),
+                VertexBatchRead::Execution => {
+                    let key = [domain.as_slice(), address].concat();
+                    self.load_vertex_underlying_raw("vertex", phase, shard, &key)
+                }
+            })
+            .collect()
+    }
+
     /// Read a metadata key at the same captured sequence as the tree data.
     /// Consumers of commit cursors must not substitute a live-store read.
     fn read_record(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1659,6 +1716,47 @@ pub trait SnapshotReadable: Send + Sync {
         Err(QuilError::Store(
             "fixed vertex snapshot paging is unsupported by this backend".into(),
         ))
+    }
+
+    /// Read one fixed domain/address row at the captured sequence, charging
+    /// its 64-byte key and value against the same byte limit as a page.
+    fn get_vertex_underlying_fixed(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard: &ShardKey,
+        domain: &[u8; 32],
+        address: &[u8; 32],
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let after = address.iter().rposition(|&byte| byte != 0).map(|index| {
+            let mut before = *address;
+            before[index] -= 1;
+            before[index + 1..].fill(0xff);
+            before
+        });
+        let page = self.page_vertex_underlying_fixed(
+            set_type,
+            phase_type,
+            shard,
+            domain,
+            after.as_ref(),
+            VertexPageLimits {
+                max_entries: 1,
+                max_bytes,
+            },
+        )?;
+        if page.has_more && page.entries.is_empty() {
+            return Err(QuilError::Store(
+                "fixed vertex page made no progress".into(),
+            ));
+        }
+        Ok(page
+            .entries
+            .into_iter()
+            .next()
+            .filter(|(found, _)| found == address)
+            .map(|(_, data)| data))
     }
 
     /// [`Self::page_vertex_underlying_fixed`], passing over the rows whose

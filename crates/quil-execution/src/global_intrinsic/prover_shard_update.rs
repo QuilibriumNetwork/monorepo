@@ -1365,7 +1365,9 @@ fn hold_storage_shares(
     use super::storage_seat;
     let filter = &frame_header.address;
     let epoch = storage.epoch;
+    let mut seats = storage_seat::ParticipantSeats::default();
     let touch = |address: &[u8],
+                 seats: &mut storage_seat::ParticipantSeats,
                  storage: &mut StorageFrame,
                  work: &mut SeatWork,
                  counts: &mut ShardUpdateCounts,
@@ -1375,7 +1377,7 @@ fn hold_storage_shares(
             return Ok(false);
         };
         let started = Instant::now();
-        let read = storage_seat::read_sized(state, &member, filter)?;
+        let read = seats.read(state, &member, filter)?;
         let read_at = Instant::now();
         work.read += read_at - started;
         let Some((mut seat, bytes)) = read else {
@@ -1394,7 +1396,8 @@ fn hold_storage_shares(
         let updated_at = Instant::now();
         work.update += updated_at - read_at;
         if seat != before {
-            storage_seat::write(state, current_frame_number, &seat)?;
+            let written = storage_seat::write_record(state, current_frame_number, &seat)?;
+            seats.invalidate(&written);
             counts.seats_written += 1;
             work.write += updated_at.elapsed();
         }
@@ -1409,6 +1412,7 @@ fn hold_storage_shares(
         let mut work = SeatWork::default();
         let first = touch(
             &frame_header.prover,
+            &mut seats,
             storage,
             &mut work,
             &mut timing.counts,
@@ -1437,33 +1441,53 @@ fn hold_storage_shares(
     let mut held = HeldShares::default();
     let none = BigInt::from(0);
     let mut work = SeatWork::default();
+    let archive = crate::archive_frame::active(current_frame_number);
+    let batch_size = if archive {
+        quil_types::store::VERTEX_READ_BATCH
+    } else {
+        usize::MAX
+    };
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring).unwrap_or(&none);
-        for &idx in participants {
-            let prover = &ctx.active_provers[idx];
-            let mut sealed = false;
-            if touch(
-                &prover.address,
-                storage,
-                &mut work,
-                &mut timing.counts,
-                &mut |seat| {
-                    sealed = seat.sealed_for(epoch);
-                    seat.earns_in(epoch)
-                        && seat.hold(
-                            epoch,
-                            current_frame_number,
-                            frame_header.frame_number,
-                            share,
-                            committee,
-                        )
-                },
-            )? {
-                held.provers += 1;
-                held.total += share;
+        for group in participants.chunks(batch_size) {
+            if archive {
+                let started = Instant::now();
+                seats.prefetch(
+                    state,
+                    filter,
+                    group.iter().filter_map(|&idx| {
+                        ctx.active_provers[idx].address.as_slice().try_into().ok()
+                    }),
+                )?;
+                work.read += started.elapsed();
             }
-            if sealed {
-                held.sealed.insert(idx);
+            for &idx in group {
+                let prover = &ctx.active_provers[idx];
+                let mut sealed = false;
+                if touch(
+                    &prover.address,
+                    &mut seats,
+                    storage,
+                    &mut work,
+                    &mut timing.counts,
+                    &mut |seat| {
+                        sealed = seat.sealed_for(epoch);
+                        seat.earns_in(epoch)
+                            && seat.hold(
+                                epoch,
+                                current_frame_number,
+                                frame_header.frame_number,
+                                share,
+                                committee,
+                            )
+                    },
+                )? {
+                    held.provers += 1;
+                    held.total += share;
+                }
+                if sealed {
+                    held.sealed.insert(idx);
+                }
             }
         }
     }
@@ -1581,6 +1605,11 @@ impl ShardUpdateTiming {
 
     fn finish(self, header: &FrameHeader, frame: u64) {
         let total = self.started.elapsed();
+        crate::step_timing::record_steps(
+            self.steps
+                .iter()
+                .map(|&(name, us)| (name, Duration::from_micros(us))),
+        );
         let Some(line) = self.line(total, frame) else {
             return;
         };
@@ -2098,6 +2127,10 @@ fn accrue_active_seniority(
     public_key: &[u8],
     frame_number: u64,
 ) -> Result<()> {
+    if crate::archive_frame::already_credited(state, public_key, frame_number) {
+        crate::step_timing::note_cached_seniority(frame_number);
+        return Ok(());
+    }
     let prover_addr = prover_address_from_pubkey(public_key)?;
     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
     let va_disc = vertex_adds_discriminator()?;
@@ -2105,13 +2138,26 @@ fn accrue_active_seniority(
     // Only accrue for a prover that actually has a vertex (has joined).
     let existing = match state.get(domain, &prover_addr, &va_disc)? {
         Some(blob) if !blob.is_empty() => blob,
-        _ => return Ok(()),
+        _ => {
+            crate::step_timing::note_seniority_check(None, frame_number);
+            return Ok(());
+        }
     };
     let mut prover_tree = rebuild_vertex_tree_from_blob(&existing);
     let cls = "prover:Prover";
 
     let last = read_prover_u64(&prover_tree, cls, "LastSeniorityFrameNumber");
+    crate::step_timing::note_seniority_check(Some(last), frame_number);
     if frame_number <= last {
+        if frame_number == last && crate::archive_frame::active(frame_number) {
+            crate::archive_frame::remember_credit(
+                state,
+                public_key,
+                prover_addr,
+                frame_number,
+                existing,
+            );
+        }
         return Ok(()); // already accrued for this frame (idempotent)
     }
 
@@ -2131,7 +2177,13 @@ fn accrue_active_seniority(
     )?;
 
     let blob = vertex_tree_to_blob(&prover_tree);
-    state.set(domain, &prover_addr, &va_disc, frame_number, blob)
+    if crate::archive_frame::active(frame_number) {
+        state.set(domain, &prover_addr, &va_disc, frame_number, blob.clone())?;
+        crate::archive_frame::remember_credit(state, public_key, prover_addr, frame_number, blob);
+        Ok(())
+    } else {
+        state.set(domain, &prover_addr, &va_disc, frame_number, blob)
+    }
 }
 
 /// Read an 8-byte big-endian u64 field from a vertex tree, defaulting to 0.
@@ -2557,6 +2609,7 @@ mod tests {
             )
         };
 
+        let activity = crate::step_timing::collect_for_archive(true);
         // First active frame → +10.
         accrue_active_seniority(&state, &prover.public_key, 100).unwrap();
         assert_eq!(read("Seniority"), 10);
@@ -2582,6 +2635,141 @@ mod tests {
 
         // A prover with no vertex (never joined) is a silent no-op.
         accrue_active_seniority(&state, &vec![0xEEu8; 585], 100).unwrap();
+        let (_, activity) = activity.finish_with_activity();
+        let activity = activity.unwrap();
+        assert_eq!(
+            (activity.seniority_checks, activity.seniority_same_frame),
+            (5, 1)
+        );
+    }
+
+    #[test]
+    fn archive_seniority_rechecks_replaced_discarded_and_branch_local_credit() {
+        use crate::archive_frame::ArchiveFrame;
+        use crate::global_intrinsic::materialize::materialize_prover_join;
+        let state = make_state();
+        let other = make_state();
+        let key = vec![8; 585];
+        let join = materialize_prover_join(&key, &[vec![1; 32]], 1, 0).unwrap();
+        let addr = join.prover_address;
+        let add = vertex_adds_discriminator().unwrap();
+        let original = vertex_tree_to_blob(&join.prover_tree);
+        let seed = |s: &HypergraphState| {
+            s.set(&GLOBAL_INTRINSIC_ADDRESS, &addr, &add, 1, original.clone())
+                .unwrap()
+        };
+        let check = |s: &HypergraphState, expected: Option<u64>| {
+            let actual = s
+                .get(&GLOBAL_INTRINSIC_ADDRESS, &addr, &add)
+                .unwrap()
+                .map(|b| {
+                    read_prover_u64(
+                        &rebuild_vertex_tree_from_blob(&b),
+                        "prover:Prover",
+                        "Seniority",
+                    )
+                });
+            assert_eq!(actual, expected);
+        };
+        let activity = crate::step_timing::collect_for_archive(true);
+        let scope = ArchiveFrame::begin(100);
+        seed(&state);
+        let before = state.changeset_len();
+        accrue_active_seniority(&state, &key, 100).unwrap();
+        accrue_active_seniority(&state, &key, 100).unwrap(); // same message
+        state.rollback_to(before);
+        check(&state, Some(0));
+        accrue_active_seniority(&state, &key, 100).unwrap();
+        check(&state, Some(10));
+        state.commit().unwrap();
+        state.abort();
+        accrue_active_seniority(&state, &key, 100).unwrap(); // a previous message's accepted stage
+        assert_eq!(state.changeset_len(), 0);
+        seed(&state); // a different write to the same address overrides the memo
+        accrue_active_seniority(&state, &key, 100).unwrap();
+        check(&state, Some(10));
+        state.abort();
+        state.crdt().discard_staged_mutations().unwrap();
+        accrue_active_seniority(&state, &key, 100).unwrap();
+        check(&state, None);
+        seed(&other);
+        accrue_active_seniority(&other, &key, 100).unwrap();
+        check(&other, Some(10));
+        drop(scope);
+        accrue_active_seniority(&other, &key, 100).unwrap(); // ordinary path
+        assert_eq!(
+            activity
+                .finish_with_activity()
+                .1
+                .unwrap()
+                .seniority_reads_skipped,
+            2
+        );
+    }
+
+    #[test]
+    fn archive_participant_batch_observes_overwrites_tombstones_and_rollback() {
+        use super::super::storage_seat::{self, ParticipantSeats, Seat};
+        let state = make_state();
+        let filter = &[0x77; 32];
+        let members = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let mut first = Seat::new(members[0], filter.to_vec());
+        let second = Seat::new(members[1], filter.to_vec());
+        storage_seat::write(&state, 1, &first).unwrap();
+        storage_seat::write(&state, 1, &second).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        let addr = storage_seat::seat_address(&members[1], filter).unwrap();
+        state
+            .delete(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &addr,
+                &crate::hypergraph_state::vertex_removes_discriminator().unwrap(),
+                2,
+            )
+            .unwrap();
+        state.commit().unwrap();
+        state.abort();
+        let mut batch = ParticipantSeats::default();
+        let check = |batch: &mut ParticipantSeats| {
+            batch.prefetch(&state, filter, members.iter()).unwrap();
+            for member in &members {
+                assert_eq!(
+                    batch.read(&state, member, filter).unwrap(),
+                    storage_seat::read_sized(&state, member, filter).unwrap()
+                );
+            }
+        };
+        check(&mut batch);
+        assert!(storage_seat::read(&state, &members[1], filter)
+            .unwrap()
+            .is_none());
+        batch.prefetch(&state, filter, members.iter()).unwrap();
+        first.register(2, &[vec![1]], 3);
+        let written = storage_seat::write_record(&state, 3, &first).unwrap();
+        batch.invalidate(&written);
+        assert_eq!(
+            batch.read(&state, &members[0], filter).unwrap().unwrap().0,
+            first
+        );
+        // A second occurrence of the participant and a prefetched miss that
+        // is filled by an intervening write must both see the new bytes.
+        assert_eq!(
+            batch.read(&state, &members[0], filter).unwrap().unwrap().0,
+            first
+        );
+        let third = Seat::new(members[2], filter.to_vec());
+        let written = storage_seat::write_record(&state, 3, &third).unwrap();
+        batch.invalidate(&written);
+        assert_eq!(
+            batch.read(&state, &members[2], filter).unwrap().unwrap().0,
+            third
+        );
+        state.rollback_to(0);
+        check(&mut batch);
+        assert!(storage_seat::read(&state, &members[2], filter)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3816,32 +4004,60 @@ mod tests {
         storage_seat::write(&state, 12, &seat).unwrap();
 
         let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
-        let mut storage = StorageFrame {
+        let storage = StorageFrame {
             epoch: quil_types::consensus::epoch_for_frame(frame),
             commitment: None,
             kicks: Vec::new(),
         };
         let header = fake_header(filter.clone(), 60);
-        let mut timing = ShardUpdateTiming::start();
-        materialize_shard_update_timed(
-            &header,
-            frame,
-            &state,
-            &reward_issuance,
-            4096,
-            provers.clone(),
-            &[0, 1],
-            ShardMetadata {
-                state_size: 1024,
-                shard_count: 1,
-            },
-            0,
-            None,
-            Some(&mut storage),
-            HeaderIssuance::claimed(&header),
-            &mut timing,
-        )
-        .unwrap();
+        let before = state.changeset_len();
+        let execute = |archive: bool| {
+            let _frame = archive.then(|| crate::archive_frame::ArchiveFrame::begin(frame));
+            let activity = crate::step_timing::collect_for_archive(true);
+            let mut storage = storage.clone();
+            let mut timing = ShardUpdateTiming::start();
+            materialize_shard_update_timed(
+                &header,
+                frame,
+                &state,
+                &reward_issuance,
+                4096,
+                provers.clone(),
+                &[0, 1],
+                ShardMetadata {
+                    state_size: 1024,
+                    shard_count: 1,
+                },
+                0,
+                None,
+                Some(&mut storage),
+                HeaderIssuance::claimed(&header),
+                &mut timing,
+            )
+            .unwrap();
+            let (_, activity) = activity.finish_with_activity();
+            (
+                timing,
+                activity.unwrap(),
+                state
+                    .pending_vertex_adds(&GLOBAL_INTRINSIC_ADDRESS)
+                    .unwrap(),
+                storage.kicks,
+            )
+        };
+        let (baseline, regular, writes, kicks) = execute(false);
+        state.rollback_to(before);
+        let (timing, activity, archive_writes, archive_kicks) = execute(true);
+        assert_eq!(archive_writes, writes);
+        assert_eq!(archive_kicks, kicks);
+        assert_eq!(timing.counts, baseline.counts);
+        assert_eq!(
+            (regular.seat_batch_lookups, activity.seat_batch_lookups),
+            (0, 2)
+        );
+        assert_eq!((activity.seat_lookups, activity.seat_misses), (2, 1));
+        assert!(activity.seat_lookup > std::time::Duration::ZERO);
+        assert!(activity.seat_decode > std::time::Duration::ZERO);
         let counts = timing.counts;
         assert!(counts.seat_bytes > 0, "the seat's stored size is counted");
         assert_eq!(

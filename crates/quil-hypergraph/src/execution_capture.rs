@@ -67,8 +67,20 @@ impl HypergraphCrdt {
     /// `None` when they cannot all be listed, this forest is over another
     /// database or none, or the forest is being replaced.
     pub fn watched_writes_since(&self, database: u64, sequence: u64) -> Option<Vec<Vec<u8>>> {
+        self.watched_writes_since_for(database, sequence, &[])
+    }
+
+    /// List writes only when this database journals every namespace the reader needs.
+    pub fn watched_writes_since_for(
+        &self,
+        database: u64,
+        sequence: u64,
+        prefixes: &[Vec<u8>],
+    ) -> Option<Vec<Vec<u8>>> {
         let forest = self.forest.try_read().ok()?;
-        let db = forest.db().filter(|db| db.instance() == database)?;
+        let db = forest
+            .db()
+            .filter(|db| db.instance() == database && db.watches_all(prefixes))?;
         db.watched_writes_since(sequence).ok()?
     }
 

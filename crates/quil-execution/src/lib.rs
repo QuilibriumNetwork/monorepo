@@ -1,3 +1,16 @@
+static ARCHIVE_EXECUTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable archive execution caches before the master creates its stores and registries.
+pub fn enable_archive_execution() {
+    global_intrinsic::storage_seat::enable_archive_seat_address_cache();
+    ARCHIVE_EXECUTION.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn archive_execution() -> bool {
+    ARCHIVE_EXECUTION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub mod archive_frame;
 pub mod canonical_cursor;
 pub mod compute_domain;
 pub mod compute_engine;

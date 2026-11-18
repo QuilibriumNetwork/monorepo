@@ -240,6 +240,7 @@ impl ExecutionTally {
             budget,
             kinds,
             due_changes,
+            activity: None,
             sections,
         }
     }
@@ -249,6 +250,7 @@ impl ExecutionTally {
 /// first), in due shard changes, and by section (longest first).
 #[derive(Debug)]
 pub(crate) struct ExecutionSummary {
+    pub activity: Option<quil_execution::step_timing::ArchiveActivity>,
     pub total: Duration,
     pub budget: Duration,
     pub kinds: Vec<(String, KindTotals)>,
@@ -678,6 +680,14 @@ fn log(frame: u64, role: ExecutionRole, summary: &ExecutionSummary, report: Repo
             due_changes_ms,
             by_kind = %summary.by_kind(),
             sections = %summary.top_sections(),
+            seniority_checks = summary.activity.as_ref().map(|a| a.seniority_checks),
+            seniority_reads_skipped = summary.activity.as_ref().map(|a| a.seniority_reads_skipped),
+            seat_batch_lookups = summary.activity.as_ref().map(|a| a.seat_batch_lookups),
+            seniority_same_frame = summary.activity.as_ref().map(|a| a.seniority_same_frame),
+            seat_lookups = summary.activity.as_ref().map(|a| a.seat_lookups),
+            seat_misses = summary.activity.as_ref().map(|a| a.seat_misses),
+            seat_lookup_ms = summary.activity.as_ref().map(|a| a.seat_lookup.as_millis() as u64),
+            seat_decode_ms = summary.activity.as_ref().map(|a| a.seat_decode.as_millis() as u64),
             "GLOBAL frame execution overran its pacing budget: the next proposal waits on it, so \
              the frame interval grows by the excess; top_kind took the most time. Nodes executing \
              GLOBAL frames run the same messages: a total far above other such nodes' points at \
@@ -695,6 +705,15 @@ fn log(frame: u64, role: ExecutionRole, summary: &ExecutionSummary, report: Repo
             top_detail = %summary.top_detail(),
             due_changes_ms,
             by_kind = %summary.by_kind(),
+            sections = %summary.top_sections(),
+            seniority_checks = summary.activity.as_ref().map(|a| a.seniority_checks),
+            seniority_reads_skipped = summary.activity.as_ref().map(|a| a.seniority_reads_skipped),
+            seat_batch_lookups = summary.activity.as_ref().map(|a| a.seat_batch_lookups),
+            seniority_same_frame = summary.activity.as_ref().map(|a| a.seniority_same_frame),
+            seat_lookups = summary.activity.as_ref().map(|a| a.seat_lookups),
+            seat_misses = summary.activity.as_ref().map(|a| a.seat_misses),
+            seat_lookup_ms = summary.activity.as_ref().map(|a| a.seat_lookup.as_millis() as u64),
+            seat_decode_ms = summary.activity.as_ref().map(|a| a.seat_decode.as_millis() as u64),
             since_frame = episode.first_frame,
             overruns = episode.overruns,
             executions = episode.executions,

@@ -68,6 +68,15 @@ impl GlobalFrameCache {
         self.bytes = 0;
     }
 
+    /// An upsert can leave stored request rows beyond its supplied body.
+    /// Let the next reader fill this height from the complete durable frame.
+    fn invalidate_height(&mut self, height: u64) {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some((_, size)) = self.frames.remove(&height) {
+            self.bytes -= size;
+        }
+    }
+
     fn get(&self, frame_number: u64) -> Option<Arc<global::GlobalFrame>> {
         self.frames
             .get(&frame_number)
@@ -161,6 +170,7 @@ impl GlobalFrameCache {
 #[derive(Default)]
 struct GlobalFrameMemory {
     cache: RwLock<GlobalFrameCache>,
+    duplicate_writes: std::sync::atomic::AtomicU64,
     // Cache hits take neither lock. Separate heights can load concurrently;
     // generations prevent a fill racing a commit/reset from caching old data.
     loads: [Mutex<()>; 32],
@@ -506,56 +516,14 @@ impl RocksClockStore {
     /// header + all request keys + latest/earliest indices into a
     /// single atomic Rocks write. Mirrors Go's batched
     /// `PutGlobalClockFrame`. Falls back to direct writes for
-    /// non-RocksClockTxn impls (tests).
+    /// transactions without a clock batch (including the consensus no-op transaction).
+    #[track_caller]
     pub fn put_global_frame_via_txn(
         &self,
         frame: &global::GlobalFrame,
         txn: &dyn store::Transaction,
     ) -> Result<()> {
-        let header = frame
-            .header
-            .as_ref()
-            .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
-        let frame_number = header.frame_number;
-        let header_key = encoding::clock_global_frame_key(frame_number);
-        let header_bytes = header.encode_to_vec();
-
-        if let Some(rt) = txn.as_any().downcast_ref::<RocksClockTxn>() {
-            let mut batch = rt.batch.lock().unwrap();
-            batch.put(&header_key, &header_bytes);
-            for (i, request) in frame.requests.iter().enumerate() {
-                let req_key = encoding::clock_global_frame_request_key(frame_number, i as u16);
-                batch.put(&req_key, request.encode_to_vec());
-            }
-            let current_latest = self.get_latest_frame_number();
-            // Match `put_global_frame` (and the earliest check below):
-            // when no frames exist yet, this IS the latest. The previous
-            // form `> unwrap_or(0)` silently dropped the latest-index
-            // update for genesis at frame 0 on an empty store.
-            if current_latest.is_none() || frame_number > current_latest.unwrap() {
-                batch.put(
-                    encoding::clock_global_latest_index(),
-                    frame_number.to_be_bytes(),
-                );
-            }
-            let current_earliest = self.get_earliest_frame_number();
-            if current_earliest.is_none() || frame_number < current_earliest.unwrap() {
-                batch.put(
-                    encoding::clock_global_earliest_index(),
-                    frame_number.to_be_bytes(),
-                );
-            }
-            rt.global_frames
-                .lock()
-                .unwrap()
-                .push((self.global_memory.clone(), Arc::new(frame.clone())));
-            return Ok(());
-        }
-
-        // Fallback: caller passed a non-Rocks txn (test stub). Write
-        // directly; the writes won't be atomic but the test impls
-        // don't care.
-        self.put_global_frame(frame, None)
+        self.put_global_frame(frame, txn.as_any().is::<RocksClockTxn>().then_some(txn))
     }
 
     /// Store a global frame.
@@ -566,6 +534,7 @@ impl RocksClockStore {
     /// `addCertifiedState`). When called with `None`, a local batch
     /// is used so the 2+N+2 keys (header, N requests, latest index,
     /// earliest index) still land in one atomic Rocks write.
+    #[track_caller]
     pub fn put_global_frame(
         &self,
         frame: &global::GlobalFrame,
@@ -577,8 +546,16 @@ impl RocksClockStore {
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
 
         let frame_number = header.frame_number;
-        let header_key = encoding::clock_global_frame_key(frame_number);
+        if frame.requests.len() > usize::from(u16::MAX) + 1 {
+            return Err(QuilError::InvalidArgument(
+                "too many GLOBAL request bundles".into(),
+            ));
+        }
         let header_bytes = header.encode_to_vec();
+        let Some(t) = txn else {
+            return self.put_standalone_global_frame(frame, frame_number, &header_bytes);
+        };
+        let header_key = encoding::clock_global_frame_key(frame_number);
 
         // Pre-compute all writes.
         let latest_key = encoding::clock_global_latest_index();
@@ -598,63 +575,143 @@ impl RocksClockStore {
         // If the caller provided a RocksClockTxn, stage into it so the
         // whole frame + any sibling writes (QC, certified state, etc.)
         // commit atomically as one batch.
-        if let Some(t) = txn {
-            if let Some(rt) = t.as_any().downcast_ref::<RocksClockTxn>() {
-                let mut batch = rt.batch.lock().unwrap();
-                batch.put(&header_key, &header_bytes);
-                for (i, request) in frame.requests.iter().enumerate() {
-                    let req_key = encoding::clock_global_frame_request_key(frame_number, i as u16);
-                    batch.put(&req_key, request.encode_to_vec());
-                }
-                if update_latest {
-                    batch.put(&latest_key, frame_number.to_be_bytes());
-                }
-                if update_earliest {
-                    batch.put(&earliest_key, frame_number.to_be_bytes());
-                }
-                rt.global_frames
-                    .lock()
-                    .unwrap()
-                    .push((self.global_memory.clone(), Arc::new(frame.clone())));
-                return Ok(());
-            }
-            // Non-Rocks txn (test stub). Fall through to the `set`
-            // interface — this preserves the old behavior for test
-            // impls while still being self-atomic on real DBs.
-            t.set(&header_key, &header_bytes)?;
+        if let Some(rt) = t.as_any().downcast_ref::<RocksClockTxn>() {
+            let mut batch = rt.batch.lock().unwrap();
+            batch.put(&header_key, &header_bytes);
             for (i, request) in frame.requests.iter().enumerate() {
                 let req_key = encoding::clock_global_frame_request_key(frame_number, i as u16);
-                t.set(&req_key, &request.encode_to_vec())?;
+                batch.put(&req_key, request.encode_to_vec());
             }
             if update_latest {
-                t.set(&latest_key, &frame_number.to_be_bytes())?;
+                batch.put(&latest_key, frame_number.to_be_bytes());
             }
             if update_earliest {
-                t.set(&earliest_key, &frame_number.to_be_bytes())?;
+                batch.put(&earliest_key, frame_number.to_be_bytes());
             }
+            rt.global_frames
+                .lock()
+                .unwrap()
+                .push((self.global_memory.clone(), Arc::new(frame.clone())));
             return Ok(());
         }
-
-        let _writes = self.global_memory.lock_writes("GLOBAL frame store");
-        // No caller txn: use a local batch so 2+N+2 writes are atomic.
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put(&header_key, &header_bytes);
+        // Non-Rocks txn (test stub). Fall through to the `set`
+        // interface — this preserves the old behavior for test
+        // impls while still being self-atomic on real DBs.
+        t.set(&header_key, &header_bytes)?;
         for (i, request) in frame.requests.iter().enumerate() {
             let req_key = encoding::clock_global_frame_request_key(frame_number, i as u16);
-            batch.put(&req_key, request.encode_to_vec());
+            t.set(&req_key, &request.encode_to_vec())?;
         }
         if update_latest {
-            batch.put(&latest_key, frame_number.to_be_bytes());
+            t.set(&latest_key, &frame_number.to_be_bytes())?;
         }
         if update_earliest {
-            batch.put(&earliest_key, frame_number.to_be_bytes());
+            t.set(&earliest_key, &frame_number.to_be_bytes())?;
         }
-        self.db
-            .write(batch)
-            .map_err(|e| QuilError::Store(e.to_string()))?;
-        let cached = Arc::new(frame.clone());
-        self.global_memory.write_cache().publish(cached);
         Ok(())
+    }
+
+    #[track_caller]
+    fn put_standalone_global_frame(
+        &self,
+        frame: &global::GlobalFrame,
+        height: u64,
+        header: &[u8],
+    ) -> Result<()> {
+        let _writes = self.global_memory.lock_writes("GLOBAL frame store");
+        let changes = |snapshot: &rocksdb::Snapshot<'_>| {
+            Self::canonical_frame_changes(snapshot, height, header, &frame.requests)
+                .map_err(|e| QuilError::Store(e.to_string()))
+        };
+        // Read large request bodies outside the database-wide write barrier.
+        // A second store handle, publication or pruning batch may race this
+        // snapshot. In that case compare the current rows under the barrier.
+        let (snapshot, point) = self.db.snapshot_with_scan_point();
+        let (mut batch, mut retained_requests) = changes(&snapshot)?;
+        drop(snapshot);
+        let mut guard = self
+            .db
+            .lock_writes()
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        if self.db.latest_sequence_number() != point.from {
+            (batch, retained_requests) = changes(&self.db.snapshot())?;
+        }
+        let changed_keys = batch.len();
+        let duplicate = changed_keys == 0;
+        guard
+            .write_global_frame(batch, height)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        drop(guard);
+
+        if duplicate {
+            let skipped = self
+                .global_memory
+                .duplicate_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if skipped % 64 == 1 {
+                tracing::info!(incoming_frame = height, caller = %std::panic::Location::caller(), skipped, retained_requests, "skipped identical canonical GLOBAL frame write");
+            }
+        } else {
+            tracing::debug!(incoming_frame = height, caller = %std::panic::Location::caller(), changed_keys, retained_requests, "stored canonical GLOBAL frame");
+        }
+        let mut cache = self.global_memory.write_cache();
+        if retained_requests {
+            cache.invalidate_height(height);
+        } else if !duplicate || (cache.enabled && cache.get(height).as_deref() != Some(frame)) {
+            cache.publish(Arc::new(frame.clone()));
+        }
+        Ok(())
+    }
+
+    /// Diff the indices, header (including its certificate), and supplied request
+    /// rows at one sequence. Omitted rows survive an upsert. Report any such rows
+    /// so a partial input cannot replace a full frame in the read cache.
+    fn canonical_frame_changes(
+        snapshot: &rocksdb::Snapshot<'_>,
+        height: u64,
+        header: &[u8],
+        requests: &[global::MessageBundle],
+    ) -> std::result::Result<(rocksdb::WriteBatch, bool), rocksdb::Error> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let latest = encoding::clock_global_latest_index();
+        if Self::decode_u64_index(snapshot.get(&latest)?).is_none_or(|n| height > n) {
+            batch.put(latest, height.to_be_bytes());
+        }
+        let earliest = encoding::clock_global_earliest_index();
+        if Self::decode_u64_index(snapshot.get(&earliest)?).is_none_or(|n| height < n) {
+            batch.put(earliest, height.to_be_bytes());
+        }
+        let header_key = encoding::clock_global_frame_key(height);
+        if snapshot.get_pinned(&header_key)?.as_deref() != Some(header) {
+            batch.put(header_key, header);
+        }
+        let mut rows = snapshot.raw_iterator_opt(Self::request_read_options(height));
+        rows.seek_to_first();
+        let mut retained = false;
+        let mut encoded = Vec::new();
+        for (i, request) in requests.iter().enumerate() {
+            let key = encoding::clock_global_frame_request_key(height, i as u16);
+            // An interleaved key of another width also survives this upsert.
+            if rows.key().is_some_and(|k| k < key.as_slice()) {
+                retained = true;
+                rows.seek(&key);
+            }
+            encoded.clear();
+            request
+                .encode(&mut encoded)
+                .expect("encoding into a Vec cannot fail");
+            if rows.key() == Some(key.as_slice()) {
+                if rows.value() != Some(encoded.as_slice()) {
+                    batch.put(&key, &encoded);
+                }
+                rows.next();
+            } else {
+                batch.put(&key, &encoded);
+            }
+        }
+        rows.status()?;
+        Ok((batch, retained || rows.valid()))
     }
 
     /// Get the latest global frame.
@@ -862,12 +919,25 @@ impl RocksClockStore {
     /// transient read error as `None` makes `update_latest` true and
     /// overwrites the index with a lower frame number, regressing the cursor.
     fn read_u64_index_checked(&self, key: &[u8]) -> Result<Option<u64>> {
-        Ok(self
-            .db
+        self.db
             .get(key)
-            .map_err(|e| QuilError::Store(e.to_string()))?
-            .filter(|v| v.len() == 8)
-            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap())))
+            .map(Self::decode_u64_index)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    fn decode_u64_index(value: Option<Vec<u8>>) -> Option<u64> {
+        Some(u64::from_be_bytes(value?.as_slice().try_into().ok()?))
+    }
+
+    fn request_read_options(height: u64) -> rocksdb::ReadOptions {
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_lower_bound(encoding::clock_global_frame_request_key(height, 0));
+        let mut end = encoding::clock_global_frame_request_key(height, u16::MAX);
+        // RocksDB excludes the upper bound. Include the last u16 index, even
+        // at height u64::MAX where advancing the height would overflow.
+        end.push(0);
+        options.set_iterate_upper_bound(end);
+        options
     }
 
     fn read_frame_requests(
@@ -876,14 +946,10 @@ impl RocksClockStore {
         frame_number: u64,
     ) -> Result<Vec<global::MessageBundle>> {
         let mut requests = Vec::new();
-        let prefix_start = encoding::clock_global_frame_request_key(frame_number, 0);
-        let prefix_end = encoding::clock_global_frame_request_key(frame_number, u16::MAX);
-
-        let mut opts = rocksdb::ReadOptions::default();
-        opts.set_iterate_lower_bound(prefix_start);
-        opts.set_iterate_upper_bound(prefix_end);
-
-        let iter = snapshot.iterator_opt(rocksdb::IteratorMode::Start, opts);
+        let iter = snapshot.iterator_opt(
+            rocksdb::IteratorMode::Start,
+            Self::request_read_options(frame_number),
+        );
         for item in iter {
             match item {
                 Ok((_key, value)) => {
@@ -3042,8 +3108,13 @@ impl store::ClockStore for RocksClockStore {
         if with_clock_batch(t, |b| b.put(&key, &data)) {
             return Ok(());
         }
-        self.db
-            .put(&key, &data)
+        let mut batch = quil_forest::DisjointBatch::new(encoding::CLOCK_SHARD_STAGED_PREFIXES);
+        batch
+            .put(key, data)
+            .and_then(|()| {
+                self.db
+                    .write_disjoint(batch, &rocksdb::WriteOptions::default())
+            })
             .map_err(|e| QuilError::Store(e.to_string()))
     }
     fn store_shard_clock_frame_for_serving(
@@ -3484,5 +3555,30 @@ mod serving_tests {
             .store_shard_clock_frame_for_serving(&[0xaa; 32], &frame(&address, 1))
             .unwrap();
         assert_eq!(latest(&clock), Some(2));
+    }
+
+    #[test]
+    fn direct_staging_conflicts_only_with_a_branch_that_touched_staged_frames() {
+        use quil_types::store::KvDb;
+        let db = crate::RocksDb::open_in_memory().unwrap();
+        let inner = db.inner();
+        let clock = super::RocksClockStore::new(inner.clone());
+        let selector = [0xa5; 32];
+        let key = crate::encoding::clock_shard_staged_key(&selector, 7);
+        let touching = quil_forest::ExecutionOverlay::capture(inner.clone(), limits()).unwrap();
+        let independent = quil_forest::ExecutionOverlay::capture(inner.clone(), limits()).unwrap();
+        assert!(touching.get(&key).unwrap().is_none());
+        // A non-clock transaction selects the direct writer.
+        let direct = db.new_batch(false).unwrap();
+        clock
+            .stage_shard_clock_frame(&selector, &frame(&[1; 32], 7), direct.as_ref())
+            .unwrap();
+        assert!(matches!(touching.prepare_commit().unwrap().commit(&inner),
+            Err(quil_forest::DatabaseCommitError::Stale { prefix: Some(prefix), .. }) if key.starts_with(prefix)));
+        independent
+            .prepare_commit()
+            .unwrap()
+            .commit(&inner)
+            .unwrap();
     }
 }

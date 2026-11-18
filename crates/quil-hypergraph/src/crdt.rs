@@ -6328,6 +6328,21 @@ impl HypergraphCrdt {
         self.get_vertex_data(location).is_some()
     }
 
+    /// A matching staged add supplies the visible bytes unless a tombstone
+    /// hides the vertex. Never use a drained or discarded stage as evidence.
+    pub fn staged_vertex_matches(&self, location: &Location, expected: &[u8]) -> bool {
+        let shard = shard_key_for_location(location);
+        let id = location.to_id();
+        let staged = self.pending_blobs.read().unwrap();
+        !staged
+            .get(&(shard.clone(), 1))
+            .is_some_and(|rows| rows.contains_key(id.as_slice()))
+            && staged
+                .get(&(shard, 0))
+                .and_then(|rows| rows.get(id.as_slice()))
+                .is_some_and(|blob| blob == expected)
+    }
+
     pub fn get_vertex_data(&self, location: &Location) -> Option<Vec<u8>> {
         self.get_vertex_data_checked(location).ok().flatten()
     }
@@ -6342,6 +6357,96 @@ impl HypergraphCrdt {
         Ok(self
             .read_blob_checked(&shard, 0, &id)?
             .filter(|b| !b.is_empty()))
+    }
+
+    /// Read a bounded group in one application shard. Pin the durable view
+    /// and its pending adds/removes together, then release the commit lock
+    /// before doing any database seeks.
+    pub fn get_vertex_data_batch(
+        &self,
+        domain: &[u8; 32],
+        addresses: &[[u8; 32]],
+    ) -> Result<BTreeMap<[u8; 32], Vec<u8>>> {
+        use quil_types::store::{VertexBatchRead, VERTEX_READ_BATCH};
+        let Some(&first) = addresses.first() else {
+            return Ok(BTreeMap::new());
+        };
+        if addresses.len() > VERTEX_READ_BATCH {
+            return Err(QuilError::InvalidArgument("vertex read batch limit".into()));
+        }
+        let shard = shard_key_for_location(&Location {
+            app_address: *domain,
+            data_address: first,
+        });
+        let id = |address| {
+            Location {
+                app_address: *domain,
+                data_address: address,
+            }
+            .to_id()
+        };
+        let (snapshot, candidates, mut rows) = {
+            let _guard = self.commit_lock.lock_to_read().map_err(|_| {
+                QuilError::ExecutionUnavailable("CRDT mutation/commit lock poisoned".into())
+            })?;
+            let staged = self.pending_blobs.read().unwrap();
+            let removes = staged.get(&(shard.clone(), 1));
+            let adds = staged.get(&(shard.clone(), 0));
+            let mut candidates = Vec::with_capacity(addresses.len());
+            let mut rows = BTreeMap::new();
+            for &address in addresses {
+                let key = id(address);
+                if removes.is_some_and(|r| r.contains_key(key.as_slice())) {
+                    continue;
+                }
+                candidates.push(address);
+                if let Some(blob) = adds.and_then(|r| r.get(key.as_slice())) {
+                    rows.insert(address, blob.clone());
+                }
+            }
+            if candidates.is_empty() {
+                return Ok(rows);
+            }
+            (self.store.capture_tree_snapshot()?, candidates, rows)
+        };
+        let read = |phase: &str, keys: &[[u8; 32]]| -> Result<Vec<Option<Vec<u8>>>> {
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(snap) = snapshot.as_ref().filter(|s| s.has_snapshot_vertex_reads()) {
+                let values =
+                    snap.vertex_batch(phase, &shard, domain, keys, VertexBatchRead::Execution)?;
+                if values.len() != keys.len() {
+                    return Err(QuilError::Store("incomplete vertex read batch".into()));
+                }
+                Ok(values)
+            } else {
+                keys.iter()
+                    .map(|a| {
+                        self.store
+                            .load_vertex_underlying_raw("vertex", phase, &shard, &id(*a))
+                    })
+                    .collect()
+            }
+        };
+        let removes = read("removes", &candidates)?;
+        let mut missing = Vec::new();
+        for (address, removed) in candidates.into_iter().zip(removes) {
+            if removed.is_some() {
+                rows.remove(&address);
+            } else if !rows.contains_key(&address) {
+                missing.push(address);
+            }
+        }
+        let adds = read("adds", &missing)?;
+        rows.extend(
+            missing
+                .into_iter()
+                .zip(adds)
+                .filter_map(|(a, v)| v.map(|blob| (a, blob))),
+        );
+        rows.retain(|_, blob| !blob.is_empty());
+        Ok(rows)
     }
 
     pub fn get_vertex_underlying_tree_bytes(&self, location: &Location) -> Option<Vec<u8>> {

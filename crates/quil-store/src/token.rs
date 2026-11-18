@@ -91,10 +91,7 @@ impl RocksTokenIterator {
 
 impl store::TokenStore for RocksTokenStore {
     fn new_transaction(&self, _indexed: bool) -> Result<Box<dyn store::Transaction>> {
-        Ok(Box::new(crate::RocksTransaction {
-            db: self.db.clone(),
-            batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
-        }))
+        Ok(Box::new(crate::RocksTransaction::new(self.db.clone())))
     }
 
     // -----------------------------------------------------------------

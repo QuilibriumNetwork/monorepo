@@ -162,9 +162,9 @@ struct SessionPassTiming {
     steps: Vec<(&'static str, u64)>,
     filters: usize,
     allocations: Option<usize>,
-    /// Time spent in `CommittedProverScan::try_scan`, shared with the
+    /// Time and source of the committed scan, shared with the
     /// eligibility closure that may scan lazily.
-    scan_ms: std::rc::Rc<std::cell::Cell<u64>>,
+    scan: std::rc::Rc<ScanTiming>,
 }
 
 /// How a committee session pass is logged.
@@ -210,15 +210,31 @@ fn classify_session_pass(
     }
 }
 
-/// The prover scan, timed into `scan_ms`.
+#[derive(Default)]
+struct ScanTiming {
+    millis: std::cell::Cell<u64>,
+    source: std::cell::Cell<Option<&'static str>>,
+}
+
+/// The prover scan, timed for the session pass.
 fn timed_prover_scan(
+    registry: Option<&dyn quil_types::consensus::ProverRegistry>,
     hg: &Arc<quil_hypergraph::HypergraphCrdt>,
-    scan_ms: &std::cell::Cell<u64>,
+    timing: &ScanTiming,
 ) -> Result<crate::prover_registry::CommittedProverScan> {
     let started = std::time::Instant::now();
-    let scan = crate::prover_registry::CommittedProverScan::try_scan(hg);
-    scan_ms.set(scan_ms.get() + started.elapsed().as_millis() as u64);
-    scan
+    let result = crate::prover_registry::CommittedProverScan::for_committee(
+        hg,
+        registry,
+        crate::archive_execution(),
+    );
+    timing
+        .millis
+        .set(timing.millis.get() + started.elapsed().as_millis() as u64);
+    result.map(|(scan, source)| {
+        timing.source.set(source);
+        scan
+    })
 }
 
 impl SessionPassTiming {
@@ -231,7 +247,7 @@ impl SessionPassTiming {
             steps: Vec::new(),
             filters: 0,
             allocations: None,
-            scan_ms: Default::default(),
+            scan: Default::default(),
         }
     }
 
@@ -246,7 +262,7 @@ impl SessionPassTiming {
 impl Drop for SessionPassTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis() as u64;
-        let scan_ms = self.scan_ms.get();
+        let scan_ms = self.scan.millis.get();
         let reconcile_ms = self
             .steps
             .iter()
@@ -255,10 +271,10 @@ impl Drop for SessionPassTiming {
         match classify_session_pass(total, scan_ms, self.allocations) {
             SessionPassLevel::Quiet => {}
             SessionPassLevel::Info => tracing::info!(frame = self.frame, total_ms = total,
-                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                scan_ms, scan_source = self.scan.source.get(), reconcile_ms, filters = self.filters, allocations = ?self.allocations,
                 "committee session pass scanned the prover shard"),
             SessionPassLevel::Warn => tracing::warn!(frame = self.frame, total_ms = total,
-                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                scan_ms, scan_source = self.scan.source.get(), reconcile_ms, filters = self.filters, allocations = ?self.allocations,
                 steps = ?self.steps, "committee session pass is slow"),
         }
     }
@@ -5737,8 +5753,9 @@ impl GlobalIntrinsic {
         // and fences those sessions early.
         let mut absent: Vec<super::handoff::exclusion::Decision> = Vec::new();
         if super::handoff::exclusion::evaluates(frame_number) {
-            let scan: &crate::prover_registry::CommittedProverScan =
-                scanned.insert(timed_prover_scan(hg, &timing.scan_ms)?);
+            let scan: &crate::prover_registry::CommittedProverScan = scanned.insert(
+                timed_prover_scan(self.prover_registry.as_deref(), hg, &timing.scan)?,
+            );
             let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
                 Ok(super::handoff::schedule::desired_members(
                     scan,
@@ -5772,7 +5789,11 @@ impl GlobalIntrinsic {
             timing.lap("silent stalls");
             if !stalled.is_empty() {
                 if scanned.is_none() {
-                    scanned = Some(timed_prover_scan(hg, &timing.scan_ms)?);
+                    scanned = Some(timed_prover_scan(
+                        self.prover_registry.as_deref(),
+                        hg,
+                        &timing.scan,
+                    )?);
                 }
                 let scan = scanned.as_ref().expect("scanned above");
                 let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
@@ -5808,10 +5829,14 @@ impl GlobalIntrinsic {
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
         // compares against: the same scan, read only once a fence needs it.
-        let eligible_scan_ms = timing.scan_ms.clone();
+        let eligible_scan_ms = timing.scan.clone();
         let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
             if scanned.is_none() {
-                scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
+                scanned = Some(timed_prover_scan(
+                    self.prover_registry.as_deref(),
+                    hg,
+                    &eligible_scan_ms,
+                )?);
             }
             let Some(scan) = scanned.as_ref() else {
                 return Ok(Vec::new());
@@ -5878,7 +5903,7 @@ impl GlobalIntrinsic {
         }
         let mut scan = match scanned {
             Some(scan) => scan,
-            None => timed_prover_scan(hg, &timing.scan_ms)?,
+            None => timed_prover_scan(self.prover_registry.as_deref(), hg, &timing.scan)?,
         };
         timing.allocations = Some(scan.allocations.len());
         timing.lap("prover scan");

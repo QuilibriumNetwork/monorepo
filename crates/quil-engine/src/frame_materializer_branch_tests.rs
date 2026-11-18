@@ -376,6 +376,87 @@ fn captured_materializer_matches_durable_execution_without_publication() {
     assert_eq!(primary.db.inner().latest_sequence_number(), sequence);
 }
 
+#[test]
+fn archive_epoch_frame_uses_changed_registry_rows_and_publishes_across_a_parent_replay() {
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let fixture = Fixture::new(Some(&key));
+    let shard = quil_store::encoding::prover_registry_shard();
+    let vertex = |id: u8| [[0xff; 32], [id; 32]].concat();
+    let txn = fixture.store.new_transaction(false).unwrap();
+    for id in 1..=128 {
+        let row =
+            quil_store::encoding::hypergraph_vertex_data_key("vertex", "adds", &shard, &vertex(id));
+        txn.set(&row, b"unrelated vertex").unwrap();
+    }
+    txn.commit().unwrap();
+    fixture
+        .source
+        .eviction_registry
+        .as_ref()
+        .unwrap()
+        .refresh_from_store(fixture.store.as_ref())
+        .unwrap();
+    let boundary = quil_types::consensus::epoch_length_frames();
+    fixture.advance_checkpoint(boundary - 1);
+    fixture
+        .source
+        .last_eviction_pass_epoch
+        .store(0, Ordering::SeqCst);
+    let root = fixture
+        .source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
+    let parent = frame(boundary - 1, root);
+    fixture.clock.put_global_frame(&parent, None).unwrap();
+
+    let mut archive = fixture.source.capture_execution_branch(limits()).unwrap();
+    let mut regular = fixture.source.capture_execution_branch(limits()).unwrap();
+    regular.materializer.archive_mode = false;
+    let tree =
+        quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(&[0xcd; 57], 0)
+            .unwrap();
+    let blob = quil_execution::prover_registry::vertex_tree_to_blob(&tree);
+    let input = frame(boundary, root);
+    let execute = |branch: &mut MaterializerBranch| {
+        let store = branch.execution.hypergraph_store();
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vertex(0xa5), &blob)
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(branch
+            .execution
+            .registry()
+            .read(|r| r.get_prover_info(&[0xa5; 32]).is_none()));
+        let before = branch.storage_usage().read_operations;
+        let result = branch.materialize(&input).unwrap();
+        assert!(branch
+            .execution
+            .registry()
+            .read(|r| r.get_prover_info(&[0xa5; 32]).is_some()));
+        (result, branch.storage_usage().read_operations - before)
+    };
+    let (fast, archive_reads) = execute(&mut archive);
+    let (full, regular_reads) = execute(&mut regular);
+    assert_eq!(fast.checkpoint, full.checkpoint);
+    assert_eq!(fast.prover_root, full.prover_root);
+    assert!(
+        archive_reads + 128 < regular_reads,
+        "archive {archive_reads}, regular {regular_reads} reads"
+    );
+    let plan = archive.execution.overlay().prepare_commit().unwrap();
+    let mut replay = parent.clone();
+    replay.requests.clear();
+    fixture.clock.put_global_frame(&replay, None).unwrap();
+    plan.commit(&fixture.db.inner()).unwrap();
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), boundary);
+    assert_eq!(
+        fixture.clock.get_global_frame(boundary - 1).unwrap(),
+        parent
+    );
+}
+
 /// A GLOBAL frame executed atomically touches no key an archive stores its
 /// served application frames under: storing one between capture and commit
 /// leaves the execution publishable.

@@ -107,6 +107,49 @@ fn guarded_publication_retains_writer_barriers_and_adopts_all_manager_caches() {
 }
 
 #[test]
+fn stale_publication_skips_registry_reads_and_attributes_the_writer() {
+    let f = Fixture::new(true);
+    f.seed_prover(1, 1);
+    let registry = SharedProverRegistry::new();
+    registry.refresh_from_store(f.store.as_ref()).unwrap();
+    let (mut branch, mut guard) = f.source.capture_execution_branch_guarded(limits()).unwrap();
+    let txn = branch.hypergraph_store().new_transaction(false).unwrap();
+    branch
+        .hypergraph_store()
+        .save_vertex_underlying(
+            txn.as_ref(),
+            "vertex",
+            "adds",
+            &registry_shard(),
+            &vertex(2),
+            &prover_blob(1),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+    let competing = f.clock.new_transaction(false).unwrap();
+    competing.set(b"concurrent", b"writer").unwrap();
+    competing.commit().unwrap();
+    let reads = branch.overlay().stats().read_operations;
+    let sequence = f.db.inner().latest_sequence_number();
+    let err = guard
+        .publish(
+            &mut branch,
+            publication_context(&f, &registry),
+            &registry,
+            |_| panic!("stale branch adopted"),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("general write") && err.to_string().contains(file!()),
+        "{err}"
+    );
+    assert_eq!(branch.overlay().stats().read_operations, reads);
+    assert!(branch.overlay().stats().closed);
+    assert_eq!(f.db.inner().latest_sequence_number(), sequence);
+    assert!(registry.get_prover_info(&[2; 32]).unwrap().is_none());
+}
+
+#[test]
 fn guarded_publication_rejects_foreign_providers_before_durable_changes() {
     let f = Fixture::new(true);
     let foreign = Fixture::new(true);

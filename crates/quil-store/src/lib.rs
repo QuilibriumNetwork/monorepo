@@ -26,8 +26,8 @@ pub use clock::{
 pub use clock_overlay::OverlayClockStore;
 pub use dispatch::{InboxUsage, RocksInboxStore, INBOX_MESSAGE_KEY_LEN};
 pub use hypergraph::{
-    OverlayHypergraphStore, RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite,
-    FOREST_NAMESPACE,
+    committee_capture_point, CommitteeOverlayRows, OverlayHypergraphStore, RocksHypergraphSnapshot,
+    RocksHypergraphStore, VertexWrite, FOREST_NAMESPACE,
 };
 pub use key::RocksKeyStore;
 pub use rocksdb_store::{

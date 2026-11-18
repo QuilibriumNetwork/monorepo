@@ -205,6 +205,74 @@ impl HypergraphState {
         ))
     }
 
+    /// Resolve GLOBAL vertex adds just as `get` does. One reverse pass
+    /// supplies the latest message-local write for each requested address.
+    pub(crate) fn global_vertex_batch(
+        &self,
+        addresses: &[[u8; 32]],
+    ) -> Result<std::collections::BTreeMap<[u8; 32], Vec<u8>>> {
+        use crate::global_schema::GLOBAL_INTRINSIC_ADDRESS as DOMAIN;
+        use std::collections::{BTreeMap, BTreeSet};
+        let add = vertex_adds_discriminator()?;
+        let mut needed: BTreeSet<_> = addresses.iter().copied().collect();
+        let mut rows = BTreeMap::new();
+        for change in self.changeset.lock().unwrap().iter().rev() {
+            if needed.is_empty() {
+                break;
+            }
+            let ExecutionChange::State(change) = change else {
+                continue;
+            };
+            if change.domain != DOMAIN || change.discriminator != add {
+                continue;
+            }
+            let Ok(address) = <[u8; 32]>::try_from(change.address.as_slice()) else {
+                continue;
+            };
+            if needed.remove(&address) && !change.value.is_empty() {
+                rows.insert(address, change.value.clone());
+            }
+        }
+        rows.extend(
+            self.crdt
+                .get_vertex_data_batch(&DOMAIN, &needed.into_iter().collect::<Vec<_>>())?,
+        );
+        Ok(rows)
+    }
+
+    /// Verify a seniority memo against the newest message write, or the
+    /// CRDT stage after an accepted message. A savepoint rollback, discard,
+    /// or different prover write automatically removes the proof of credit.
+    pub(crate) fn staged_global_vertex_matches(&self, address: &[u8; 32], expected: &[u8]) -> bool {
+        let domain = &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        let (Ok(add), Ok(remove)) = (vertex_adds_discriminator(), vertex_removes_discriminator())
+        else {
+            return false;
+        };
+        let changes = self.changeset.lock().unwrap();
+        for change in changes.iter().rev() {
+            if let ExecutionChange::State(change) = change {
+                if change.domain.as_slice() == domain.as_slice()
+                    && change.address.as_slice() == address
+                {
+                    if change.discriminator == add {
+                        return change.value == expected;
+                    }
+                    if change.discriminator == remove {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.crdt.staged_vertex_matches(
+            &Location {
+                app_address: *domain,
+                data_address: *address,
+            },
+            expected,
+        )
+    }
+
     /// Set (create or update) a state entry. Appends to the changeset.
     ///
     /// The change is labelled `Update` whether or not the entry exists: every

@@ -26,6 +26,19 @@ pub(super) enum CommittedRing {
     Invalid,
 }
 
+/// Only archive registries retain committee inputs. The ordinary row already
+/// holds the prover, allocation and decoded seat. Allocation ring keys and
+/// releases are the only fields the ordinary registry does not keep.
+#[derive(Clone)]
+enum CommitteeRow {
+    Prover,
+    Seat,
+    Allocation(
+        Option<crate::global_intrinsic::prover_rings::RingKey>,
+        Option<crate::global_intrinsic::prover_release::Release>,
+    ),
+}
+
 /// What one `adds` row contributes to each pass of a refresh.
 #[derive(Clone)]
 pub(super) struct DecodedRow {
@@ -59,7 +72,7 @@ enum FirstPass {
 }
 
 /// Decode one `adds` row as both passes of `decode_vertices` read it.
-fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
+fn decode_row(vk: &[u8], data: &[u8], committee: Option<&mut Option<CommitteeRow>>) -> DecodedRow {
     let root = match deserialize_go_tree(data) {
         Ok(Some(root)) => root,
         _ => {
@@ -113,11 +126,68 @@ fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
     } else {
         CommittedRing::Invalid
     };
+    if let Some(entry) = committee {
+        *entry = match (&first, &allocation) {
+            (FirstPass::Prover { info: Some(_), .. }, _) => Some(CommitteeRow::Prover),
+            (FirstPass::Seat(Some(_)), _) => Some(CommitteeRow::Seat),
+            (_, Some(Some(_))) => Some(CommitteeRow::Allocation(
+                decode_ring_key(&root),
+                crate::global_intrinsic::prover_release::Release::from_bytes(&read_bytes(
+                    &root,
+                    "allocation:ProverAllocation",
+                    "Release",
+                )),
+            )),
+            _ => None,
+        };
+    }
     DecodedRow {
         first,
         allocation,
         committed_ring,
     }
+}
+
+fn append_committee_row(
+    scan: &mut CommittedProverScan,
+    row: &DecodedRow,
+    kind: &CommitteeRow,
+) -> Option<()> {
+    match kind {
+        CommitteeRow::Prover => {
+            let FirstPass::Prover {
+                info: Some(info), ..
+            } = &row.first
+            else {
+                return None;
+            };
+            scan.seniority.insert(info.address.clone(), info.seniority);
+            scan.addr_to_pubkey
+                .insert(info.address.clone(), info.public_key.clone());
+        }
+        CommitteeRow::Allocation(ring, release) => {
+            scan.allocations
+                .push(row.allocation.as_ref()?.as_ref()?.clone());
+            scan.ring_keys.push(*ring);
+            scan.releases.push(*release);
+        }
+        CommitteeRow::Seat => {
+            let FirstPass::Seat(Some((key, slots))) = &row.first else {
+                return None;
+            };
+            let epochs = crate::global_intrinsic::storage_seat::sealed_epochs(
+                slots
+                    .iter()
+                    .map(|s| (s.epoch, s.sealed_at, !s.leaves.is_empty())),
+            );
+            // The full scan visits versioned seats before legacy seats.
+            // Preserve its winner if two records name the same seat.
+            if scan.seats.insert(key.clone(), epochs).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 fn vertex_key(address: &[u8; 32]) -> Vec<u8> {
@@ -134,6 +204,7 @@ struct AddedRow {
 
 #[derive(Clone, Default)]
 pub(super) struct RegistryRows {
+    committee: Option<BTreeMap<[u8; 32], CommitteeRow>>,
     adds: BTreeMap<[u8; 32], AddedRow>,
     /// `removes` rows: their value lengths. They hide the `adds` row there.
     removes: BTreeMap<[u8; 32], usize>,
@@ -152,6 +223,87 @@ pub(super) struct RegistryRows {
 }
 
 impl RegistryRows {
+    pub(super) fn new(archive: bool) -> Self {
+        Self {
+            committee: archive.then(BTreeMap::new),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn committee_indexed(&self) -> bool {
+        self.committee.is_some()
+    }
+
+    pub(super) fn committee_scan(
+        &self,
+        overlay: Option<quil_store::CommitteeOverlayRows>,
+    ) -> QuilResult<Option<CommittedProverScan>> {
+        let Some(index) = self.committee.as_ref() else {
+            return Ok(None);
+        };
+        let mut scan = CommittedProverScan::default();
+        let mut cached = index.iter().peekable();
+        // Merge branch-local rows into the ordered base. No tentative row
+        // escapes the pass or becomes visible to a sibling after rollback.
+        let mut append_before = |until: Option<&[u8; 32]>, scan: &mut CommittedProverScan| {
+            while let Some((address, kind)) =
+                cached.next_if(|(address, _)| until.is_none_or(|end| *address < end))
+            {
+                if let Some(row) = self.effective(address) {
+                    append_committee_row(scan, row, kind)?;
+                }
+            }
+            if until.is_some_and(|end| cached.peek().is_some_and(|(address, _)| *address == end)) {
+                cached.next();
+            }
+            Some(())
+        };
+        if let Some(overlay) = overlay {
+            let shard = quil_store::encoding::prover_registry_shard();
+            for (address, phases) in rows_of_keys(overlay.written) {
+                if append_before(Some(&address), &mut scan).is_none() {
+                    return Ok(None);
+                }
+                let read = |phase| {
+                    overlay.snapshot.get_vertex_underlying_fixed(
+                        "vertex",
+                        phase,
+                        &shard,
+                        &shard.l2,
+                        &address,
+                        usize::MAX,
+                    )
+                };
+                let removed = if phases.removes {
+                    read("removes")?.is_some()
+                } else {
+                    self.removes.contains_key(&address)
+                };
+                if removed {
+                    continue;
+                }
+                if !phases.adds {
+                    // Removing a tombstone can reveal the cached add.
+                    if let (Some(kind), Some(row)) = (index.get(&address), self.adds.get(&address))
+                    {
+                        if append_committee_row(&mut scan, &row.decoded, kind).is_none() {
+                            return Ok(None);
+                        }
+                    }
+                } else if let Some(data) = read("adds")? {
+                    let mut kind = None;
+                    let row = decode_row(&vertex_key(&address), &data, Some(&mut kind));
+                    if let Some(kind) = kind {
+                        if append_committee_row(&mut scan, &row, &kind).is_none() {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(append_before(None, &mut scan).map(|_| scan))
+    }
+
     pub(super) fn committed_ring(&self, address: &[u8]) -> CommittedRing {
         <[u8; 32]>::try_from(address)
             .ok()
@@ -161,16 +313,33 @@ impl RegistryRows {
     }
 
     /// Record an `adds` row the refresh read (and charged).
-    pub(super) fn add(&mut self, address: [u8; 32], data: &[u8]) {
-        self.note_size(data.len());
-        let decoded = decode_row(&vertex_key(&address), data);
-        self.adds.insert(
-            address,
-            AddedRow {
-                value_len: data.len(),
-                decoded,
-            },
-        );
+    pub(super) fn add(
+        &mut self,
+        address: [u8; 32],
+        data: &[u8],
+        timing: Option<&RegistryUpdateTiming>,
+    ) {
+        let mut entry = None;
+        let decoded = measure(timing.map(|t| &t.decode), || {
+            decode_row(
+                &vertex_key(&address),
+                data,
+                self.committee.as_ref().map(|_| &mut entry),
+            )
+        });
+        measure(timing.map(|t| &t.rebuild), || {
+            self.note_size(data.len());
+            if let (Some(index), Some(entry)) = (&mut self.committee, entry) {
+                index.insert(address, entry);
+            }
+            self.adds.insert(
+                address,
+                AddedRow {
+                    value_len: data.len(),
+                    decoded,
+                },
+            );
+        });
     }
 
     /// Record a `removes` row the refresh read (and charged).
@@ -342,33 +511,60 @@ fn read_row(
     address: &[u8; 32],
     limits: VertexPageLimits,
 ) -> QuilResult<Option<Vec<u8>>> {
-    // The page starts after `after`; the address before this one.
-    let after = address.iter().rposition(|byte| *byte != 0).map(|index| {
-        let mut before = *address;
-        before[index] -= 1;
-        before[index + 1..].fill(0xFF);
-        before
-    });
-    let page = snapshot.page_vertex_underlying_fixed(
+    snapshot.get_vertex_underlying_fixed(
         "vertex",
         phase,
         shard,
         &shard.l2,
-        after.as_ref(),
-        VertexPageLimits {
-            max_entries: 1,
-            ..limits
-        },
-    )?;
-    if page.has_more && page.entries.is_empty() {
-        return Err(QuilError::Store("registry page made no progress".into()));
+        address,
+        limits.max_bytes,
+    )
+}
+
+/// Consume one phase in address order. Archive row indexes share the
+/// snapshot's version iterator across each page of changed addresses.
+fn phase_reader<'a>(
+    snapshot: &'a dyn SnapshotReadable,
+    shard: &'a ShardKey,
+    phase: &'static str,
+    written: &'a BTreeMap<[u8; 32], Written>,
+    limits: VertexPageLimits,
+    batch: bool,
+) -> impl FnMut(&[u8; 32]) -> QuilResult<Option<Vec<u8>>> + 'a {
+    let mut remaining = written
+        .iter()
+        .filter(move |(_, w)| if phase == "adds" { w.adds } else { w.removes })
+        .map(|(a, _)| *a);
+    let mut buffered = Vec::new().into_iter();
+    move |address| {
+        if !batch {
+            return read_row(snapshot, phase, shard, address, limits);
+        }
+        if let Some(row) = buffered.next() {
+            return Ok(row);
+        }
+        let addresses: Vec<_> = remaining
+            .by_ref()
+            .take(quil_types::store::VERTEX_READ_BATCH)
+            .collect();
+        debug_assert_eq!(addresses.first(), Some(address));
+        let rows = snapshot.vertex_batch(
+            phase,
+            shard,
+            &shard.l2,
+            &addresses,
+            quil_types::store::VertexBatchRead::Registry {
+                max_bytes: limits.max_bytes,
+            },
+        )?;
+        if rows.len() != addresses.len() {
+            return Err(QuilError::Store("incomplete registry row batch".into()));
+        }
+        buffered = rows.into_iter();
+        buffered
+            .next()
+            .ok_or_else(|| QuilError::Store("empty registry row batch".into()))
     }
-    Ok(page
-        .entries
-        .into_iter()
-        .next()
-        .filter(|(found, _)| found == address)
-        .map(|(_, data)| data))
 }
 
 /// Which phases of one address a branch wrote.
@@ -376,15 +572,6 @@ fn read_row(
 pub(super) struct Written {
     pub adds: bool,
     pub removes: bool,
-}
-
-/// The registry rows `overlay` wrote, by address; `None` when a range
-/// deletion reaches them, so they cannot be listed.
-pub(super) fn written_rows(
-    overlay: &quil_forest::ExecutionOverlay,
-) -> Option<BTreeMap<[u8; 32], Written>> {
-    let all = quil_store::encoding::prover_registry_key_prefixes();
-    Some(rows_of_keys(overlay.written_keys_under(&all)?))
 }
 
 /// The registry rows, by address and phase, that writes of `keys` changed.
@@ -413,6 +600,7 @@ pub(super) fn rows_of_keys(keys: impl IntoIterator<Item = Vec<u8>>) -> BTreeMap<
 /// One address's rows after the update: `Some` for a phase it re-read.
 struct Change {
     address: [u8; 32],
+    committee: Option<CommitteeRow>,
     adds: Option<Option<(usize, DecodedRow)>>,
     removes: Option<Option<usize>>,
 }
@@ -512,6 +700,7 @@ impl InMemoryProverRegistry {
         snapshot: &dyn SnapshotReadable,
         written: &BTreeMap<[u8; 32], Written>,
         limits: RegistryLimits,
+        mut timing: Option<&mut RegistryUpdateTiming>,
     ) -> QuilResult<bool> {
         if self.diverged || !self.from_rows {
             return Ok(false);
@@ -521,24 +710,55 @@ impl InMemoryProverRegistry {
         };
         let shard = quil_store::encoding::prover_registry_shard();
         let page = limits.page();
+        let mut read_add = phase_reader(
+            snapshot,
+            &shard,
+            "adds",
+            written,
+            page,
+            rows.committee_indexed(),
+        );
+        let mut read_remove = phase_reader(
+            snapshot,
+            &shard,
+            "removes",
+            written,
+            page,
+            rows.committee_indexed(),
+        );
         // Read and decode first, so a failure changes nothing.
         let mut changes = Vec::with_capacity(written.len());
         for (address, phases) in written {
+            let mut committee = None;
             let adds = if phases.adds {
                 Some(
-                    read_row(snapshot, "adds", &shard, address, page)?
-                        .map(|data| (data.len(), decode_row(&vertex_key(address), &data))),
+                    measure(timing.as_ref().map(|t| &t.read), || read_add(address))?.map(|data| {
+                        (
+                            data.len(),
+                            measure(timing.as_ref().map(|t| &t.decode), || {
+                                decode_row(
+                                    &vertex_key(address),
+                                    &data,
+                                    rows.committee.as_ref().map(|_| &mut committee),
+                                )
+                            }),
+                        )
+                    }),
                 )
             } else {
                 None
             };
             let removes = if phases.removes {
-                Some(read_row(snapshot, "removes", &shard, address, page)?.map(|data| data.len()))
+                Some(
+                    measure(timing.as_ref().map(|t| &t.read), || read_remove(address))?
+                        .map(|data| data.len()),
+                )
             } else {
                 None
             };
             changes.push(Change {
                 address: *address,
+                committee,
                 adds,
                 removes,
             });
@@ -577,7 +797,13 @@ impl InMemoryProverRegistry {
         }
 
         let mut rows_arc = self.rows.take().expect("checked above");
-        let rows = Arc::make_mut(&mut rows_arc);
+        if let Some(t) = timing.as_mut() {
+            t.copied = Some(Arc::strong_count(&rows_arc) > 1);
+        }
+        let rows = measure(timing.as_ref().map(|t| &t.copy), || {
+            Arc::make_mut(&mut rows_arc)
+        });
+        let rebuild = timing.as_ref().map(|_| std::time::Instant::now());
         // The provers and leaf-root keys any changed row feeds, before or
         // after, and each such prover's allocation filters before.
         let mut provers: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -631,6 +857,13 @@ impl InMemoryProverRegistry {
                 rows.unindex(&change.address, &old);
             }
             if let Some(adds) = change.adds {
+                if let Some(index) = &mut rows.committee {
+                    if let Some(entry) = change.committee {
+                        index.insert(change.address, entry);
+                    } else {
+                        index.remove(&change.address);
+                    }
+                }
                 if let Some(old) = rows.adds.remove(&change.address) {
                     rows.forget_size(old.value_len);
                 }
@@ -721,6 +954,9 @@ impl InMemoryProverRegistry {
             self.recompose_prover(rows, prover, &filters_before[prover]);
         }
         (self.largest_row, self.largest_value) = rows.largest();
+        if let (Some(t), Some(start)) = (timing, rebuild) {
+            t.rebuild.set(t.rebuild.get() + start.elapsed());
+        }
         self.rows = Some(rows_arc);
         self.resource_usage = usage;
         // These caches now hold the branch's rows, not a database scan.
