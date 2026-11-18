@@ -80,6 +80,18 @@ mod required_anchor_tests;
 #[cfg(test)]
 mod fh_anchor_repro_tests;
 
+/// The worker count storage memory policy sizes by: a master running its
+/// workers in its process derives it ([`master_node::worker_manager::derived_worker_count`]),
+/// the count its thread manager and allocation capacity use; any other
+/// process keeps `dataWorkerCount` (0: its CPUs).
+fn memory_worker_count(config: &quil_config::Config, args: &Args) -> i32 {
+    let archive = args.archive || config.engine.archive_mode;
+    master_node::worker_manager::derived_worker_count(config, args.core, archive, args.dht_only)
+        .map_or(config.engine.data_worker_count, |derived| {
+            i32::try_from(derived.count).unwrap_or(i32::MAX)
+        })
+}
+
 fn main() -> anyhow::Result<ExitCode> {
     // A native lattice build compiled for CPU features this host lacks dies
     // with SIGILL in its first proof: refuse before anything runs, the proof
@@ -1042,16 +1054,22 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     }
 
     // Resolve memory policy from local worker density before any storage
-    // jobs start, including those in standalone worker processes.
-    quil_engine::storage_jobs::set_memory_worker_count(config.engine.data_worker_count);
+    // jobs start, including those in standalone worker processes. A master
+    // running its workers in its process derives their count here, once.
+    quil_engine::storage_jobs::set_memory_worker_count(memory_worker_count(&config, &args));
 
     // What this process runs with, as used: defaults applied, `QUIL_*`
     // overrides resolved. The master and each standalone worker log their own.
     {
         let archive =
             args.core == 0 && !args.dht_only && (args.archive || config.engine.archive_mode);
-        let runtime =
-            effective_config::Runtime::detect(args.core, args.network, archive, args.dht_only);
+        let runtime = effective_config::Runtime::detect(
+            &config,
+            args.core,
+            args.network,
+            archive,
+            args.dht_only,
+        );
         effective_config::EffectiveConfig::resolve(&config, &runtime).log();
     }
 

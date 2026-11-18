@@ -104,6 +104,19 @@ mod frame_verifier_tests;
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 
+/// Memory one proof verifier child is given: the largest resident size
+/// recorded for a depth-32 child (2.73 GB) plus margin. A Mac reserves it
+/// per check from the job admission, and its worker count leaves room for
+/// one beside the node's seats ([`crate::worker_count`]).
+pub const VERIFIER_RESERVE_BYTES: u64 = 3 << 30;
+
+/// Memory a Mac's admission leaves to the system beyond wired memory, by
+/// physical size: 1/32 of it, from 256 MiB to 1 GiB. The worker count
+/// leaves it too ([`crate::worker_count`]).
+pub fn memory_floor(total: u64) -> u64 {
+    (total / 32).clamp(256 << 20, 1 << 30)
+}
+
 /// Percent of the memory available to the node the jobs may hold together;
 /// the rest is headroom for the node and for the estimates' error.
 pub const MEMORY_SHARE_PERCENT: u64 = 75;
@@ -764,7 +777,9 @@ pub fn set_memory_worker_count(configured: i32) {
     MEMORY_WORKERS.store(configured.max(0) as usize, Ordering::Relaxed);
 }
 
-fn memory_worker_count() -> usize {
+/// The worker count storage memory policy sizes by: the one set by
+/// [`set_memory_worker_count`], else the job slots.
+pub fn memory_worker_count() -> usize {
     match MEMORY_WORKERS.load(Ordering::Relaxed) {
         0 => job_slots(),
         configured => configured,
@@ -1198,14 +1213,26 @@ fn needs_available(bytes: u64) -> u64 {
 
 /// Bytes of memory the node has at all: the host's, or its container's limit
 /// when less. `None` when the host does not say.
-fn total_memory() -> Option<u64> {
+pub(crate) fn total_memory() -> Option<u64> {
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     let host = system.total_memory();
+    let container = system.cgroup_limits().map(|limits| limits.total_memory);
+    node_memory(host, container)
+}
+
+/// A Mac's physical and wired memory.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_total_and_wired() -> Option<(u64, u64)> {
+    macos_memory::total_and_wired()
+}
+
+/// The memory of a host of `host` bytes (0: unknown) under a container
+/// limit of `container` bytes, if any: the smaller.
+pub(crate) fn node_memory(host: u64, container: Option<u64>) -> Option<u64> {
     if host == 0 {
         return None;
     }
-    let container = system.cgroup_limits().map(|limits| limits.total_memory);
     Some(container.map_or(host, |container| container.min(host)))
 }
 

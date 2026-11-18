@@ -62,7 +62,7 @@ impl Snapshot {
     }
 
     pub(super) fn floor(self) -> u64 {
-        (self.total / 32).clamp(256 << 20, 1 << 30)
+        super::memory_floor(self.total)
     }
 
     fn unowned(self) -> u64 {
@@ -124,6 +124,13 @@ pub(super) fn host_memory() -> super::HostMemory {
         pressure: Some(snapshot.pressure),
         capacity: Some(snapshot.capacity()),
     })
+}
+
+/// Physical and wired memory, for the worker count
+/// (`crate::worker_count`).
+#[cfg(target_os = "macos")]
+pub(super) fn total_and_wired() -> Option<(u64, u64)> {
+    snapshot().map(|snapshot| (snapshot.total, snapshot.wired))
 }
 
 #[cfg(target_os = "macos")]
@@ -357,7 +364,7 @@ mod tests {
     #[test]
     fn an_operators_16_gib_mac_runs_a_frames_check_alone_within_capacity() {
         const PAGE: u64 = 16 << 10;
-        const CHECK: u64 = 3 * GIB;
+        const CHECK: u64 = super::super::VERIFIER_RESERVE_BYTES;
         let mac = Snapshot {
             total: 17_179_869_184,
             wired: 94_950 * PAGE,
