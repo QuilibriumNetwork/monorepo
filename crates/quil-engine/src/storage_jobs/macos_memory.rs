@@ -32,25 +32,98 @@ impl Snapshot {
             // Known pressure is zero headroom, not a failed measurement.
             return 0;
         }
-        self.total
-            .saturating_sub(self.wired)
-            .saturating_sub(self.footprint)
+        self.unowned()
             .min(self.reclaimable)
             // Admission leaves another 25% of this budget unused. This
             // additional floor covers host growth while a job starts.
-            .saturating_sub((self.total / 32).clamp(256 << 20, 1 << 30))
+            .saturating_sub(self.floor())
+    }
+
+    /// Physical memory neither wired nor this process's footprint, less
+    /// [`Self::floor`], whatever the pressure: the most a job running alone
+    /// may take without growing wired and own memory past physical memory
+    /// (other applications' pages compress or swap instead).
+    pub(super) fn capacity(self) -> u64 {
+        self.unowned().saturating_sub(self.floor())
+    }
+
+    /// Which input made [`Self::headroom`] zero, for its log line: `None`
+    /// when it is not.
+    pub(super) fn no_headroom_cause(self) -> Option<&'static str> {
+        if self.pressure != 1 {
+            Some("pressure: the kernel reports warning or critical memory pressure")
+        } else if self.unowned() <= self.floor() {
+            Some("footprint: wired memory plus this process's footprint fill physical memory")
+        } else if self.reclaimable <= self.floor() {
+            Some("reclaimable: free, file-backed and purgeable pages are within the floor")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn floor(self) -> u64 {
+        (self.total / 32).clamp(256 << 20, 1 << 30)
+    }
+
+    fn unowned(self) -> u64 {
+        self.total
+            .saturating_sub(self.wired)
+            .saturating_sub(self.footprint)
     }
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn available() -> Option<u64> {
-    snapshot().map(Snapshot::headroom)
+    let snapshot = snapshot()?;
+    if let Some(cause) = snapshot.no_headroom_cause() {
+        log_no_headroom(snapshot, cause);
+    }
+    Some(snapshot.headroom())
 }
 
-/// The kernel's memory pressure level (normal 1, warning 2, critical 4).
+/// At most one line per this interval says why the host has no headroom.
 #[cfg(target_os = "macos")]
-pub(super) fn pressure() -> Option<u32> {
-    snapshot().map(|snapshot| snapshot.pressure)
+const NO_HEADROOM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[cfg(target_os = "macos")]
+fn log_no_headroom(snapshot: Snapshot, cause: &'static str) {
+    use std::sync::{Mutex, PoisonError};
+    static LINE: Mutex<super::LineEvery> = Mutex::new(super::LineEvery(None));
+    let Some(skipped) = LINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(std::time::Instant::now(), NO_HEADROOM_LOG_EVERY)
+    else {
+        return;
+    };
+    tracing::info!(
+        cause,
+        pressure = snapshot.pressure,
+        total = snapshot.total,
+        wired = snapshot.wired,
+        footprint = snapshot.footprint,
+        reclaimable = snapshot.reclaimable,
+        floor = snapshot.floor(),
+        capacity = snapshot.capacity(),
+        more_since_last_line = skipped,
+        action = "jobs and proof checks admitted by memory wait (a check a finalized frame \
+                  waits on may run alone within capacity, past it once checks starve); check `memory_pressure` and \
+                  `vm_stat`, quit other applications, or lower the database cache or the \
+                  worker count",
+        "macOS memory admission has no headroom: pressure normal is 1, warning 2, critical 4; \
+         headroom is total less wired and footprint, at most reclaimable, less floor; logged \
+         at most once per 5 minutes"
+    );
+}
+
+/// The kernel's memory pressure level (normal 1, warning 2, critical 4)
+/// and [`Snapshot::capacity`], from one snapshot.
+#[cfg(target_os = "macos")]
+pub(super) fn host_memory() -> super::HostMemory {
+    snapshot().map_or_else(super::HostMemory::default, |snapshot| super::HostMemory {
+        pressure: Some(snapshot.pressure),
+        capacity: Some(snapshot.capacity()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -230,5 +303,121 @@ mod tests {
             snapshot.pressure,
             snapshot.headroom()
         );
+    }
+
+    /// The line logged at no headroom names the input that made it zero, and
+    /// the capacity a check alone is bounded by ignores pressure and
+    /// reclaimable pages, but not wired memory, the footprint or the floor.
+    #[test]
+    fn no_headroom_names_its_cause_and_capacity_ignores_pressure() {
+        let mac = Snapshot {
+            total: 16 * GIB,
+            wired: 2 * GIB,
+            footprint: 4 * GIB,
+            reclaimable: 3 * GIB,
+            pressure: 1,
+        };
+        assert_eq!(mac.no_headroom_cause(), None);
+        assert_eq!(mac.capacity(), 10 * GIB - GIB / 2);
+        let warned = Snapshot { pressure: 2, ..mac };
+        assert_eq!(warned.headroom(), 0);
+        assert!(
+            warned
+                .no_headroom_cause()
+                .is_some_and(|cause| cause.starts_with("pressure")),
+            "no_headroom_cause_missed: warning pressure gave {:?}",
+            warned.no_headroom_cause()
+        );
+        assert_eq!(warned.capacity(), mac.capacity());
+        let full = Snapshot {
+            footprint: 14 * GIB - (GIB / 2),
+            ..mac
+        };
+        assert_eq!(full.capacity(), 0);
+        assert!(full
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("footprint")));
+        let drained = Snapshot {
+            reclaimable: GIB / 2,
+            ..mac
+        };
+        assert_eq!(drained.headroom(), 0);
+        assert!(drained
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("reclaimable")));
+    }
+
+    /// An operator's 16 GiB Mac at normal pressure (`vm_stat`, `top`): the
+    /// node, its data workers in process, owns 8122 MiB; 16 KiB pages, 94950
+    /// wired, free 5800 plus 352 speculative, 282560 file-backed and 2971
+    /// purgeable. Its headroom is short of a 3 GiB check's share, so only a
+    /// check a frame waits on starts, alone, while the node's footprint
+    /// leaves room for it (here up to about 11.05 GiB), else once checks
+    /// have starved.
+    #[test]
+    fn an_operators_16_gib_mac_runs_a_frames_check_alone_within_capacity() {
+        const PAGE: u64 = 16 << 10;
+        const CHECK: u64 = 3 * GIB;
+        let mac = Snapshot {
+            total: 17_179_869_184,
+            wired: 94_950 * PAGE,
+            footprint: 8122 << 20,
+            reclaimable: (5800 + 352 + 282_560 + 2971) * PAGE,
+            pressure: 1,
+        };
+        assert_eq!(mac.headroom(), 4_242_063_360);
+        assert!(mac.headroom() < super::super::needs_available(CHECK));
+        assert_eq!(mac.no_headroom_cause(), None);
+        assert_eq!(mac.capacity(), 6_570_803_200);
+        use super::super::{frame_alone_allowed, FrameAlone, HostMemory, VERIFIER_STARVED_WARN};
+        use std::time::Duration;
+        let alone = |snapshot: Snapshot, starved_for| {
+            frame_alone_allowed(
+                0,
+                HostMemory {
+                    pressure: Some(snapshot.pressure),
+                    capacity: Some(snapshot.capacity()),
+                },
+                CHECK,
+                starved_for,
+                VERIFIER_STARVED_WARN,
+                false,
+            )
+        };
+        assert_eq!(alone(mac, Duration::ZERO), FrameAlone::Fits);
+        let edge = mac.total - mac.wired - mac.floor() - CHECK;
+        let at_edge = Snapshot {
+            footprint: edge,
+            ..mac
+        };
+        assert_eq!(at_edge.capacity(), CHECK);
+        assert_eq!(alone(at_edge, Duration::ZERO), FrameAlone::Fits);
+        // Its compressor (6531 MiB) counted in the footprint too: refused
+        // until checks have starved the bound, then alone past capacity, as
+        // nothing in the node shrinks that footprint while frames wait.
+        let just_short = VERIFIER_STARVED_WARN - Duration::from_secs(1);
+        for footprint in [edge + 1, (8122 + 6531) << 20] {
+            let full = Snapshot { footprint, ..mac };
+            assert_eq!(
+                alone(full, just_short),
+                FrameAlone::Refused,
+                "frame_alone_past_capacity: a 3 GiB check ran alone at a {footprint} byte \
+                 footprint"
+            );
+            assert_eq!(
+                alone(full, VERIFIER_STARVED_WARN),
+                FrameAlone::Starved,
+                "frame_alone_refused_forever: starved, a 3 GiB check stayed refused at a \
+                 {footprint} byte footprint"
+            );
+        }
+        let full = Snapshot {
+            footprint: (8122 + 6531) << 20,
+            ..mac
+        };
+        assert_eq!((full.headroom(), full.capacity()), (0, 0));
+        assert!(full
+            .no_headroom_cause()
+            .is_some_and(|cause| cause.starts_with("footprint")));
     }
 }
