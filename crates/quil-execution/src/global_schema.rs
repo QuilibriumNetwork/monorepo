@@ -904,13 +904,23 @@ pub fn write_field(
         .map_err(|e| quil_types::error::QuilError::Internal(format!("write_field insert: {}", e)))
 }
 
+/// `class`'s type hash: a verified constant or one computed once per
+/// process; computed here only for a class outside both tables.
+fn type_hash(class: &str) -> [u8; 32] {
+    TYPE_HASH_TABLE
+        .iter()
+        .chain(RUNTIME_TYPE_HASHES.iter())
+        .find(|(_, name)| *name == class)
+        .map_or_else(|| compute_type_hash(class), |(hash, _)| *hash)
+}
+
 /// Write the type hash at key `[0xFF; 32]` into a vertex tree.
 pub fn write_type(
     tree: &mut quil_tries::VectorCommitmentTree,
     class: &str,
 ) -> quil_types::error::Result<()> {
     use num_bigint::BigInt;
-    let hash = compute_type_hash(class);
+    let hash = type_hash(class);
     tree.insert(&[0xFFu8; 32], &hash, &[], &BigInt::from(32))
         .map_err(|e| quil_types::error::QuilError::Internal(format!("write_type insert: {}", e)))
 }
