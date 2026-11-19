@@ -126,9 +126,8 @@ fn gits_error_is_one_line() {
     let dir = tempfile::tempdir().unwrap();
     checkout(dir.path());
     // Plain git as another owner: an error over several lines.
-    let mut refused = Command::new("git");
+    let mut refused = plain_git(dir.path());
     refused.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
-    refused.arg("-C").arg(dir.path());
     let error = commit::reply(refused.args(["rev-parse", "HEAD"]).output()).unwrap_err();
     assert!(
         error.starts_with("fatal: detected dubious ownership")
@@ -142,6 +141,17 @@ fn gits_error_is_one_line() {
         error.starts_with("git did not run: "),
         "GIT-ERROR {error:?}"
     );
+}
+
+/// Plain git in `dir` that trusts no directory unless told: no system or
+/// global config (a CI runner's system config trusts every directory).
+fn plain_git(dir: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("-C")
+        .arg(dir);
+    git
 }
 
 /// Runs git in `dir` for a test's checkout: an author, no signing.
@@ -181,9 +191,7 @@ fn another_owners_checkout_names_its_head() {
     let dir = tempfile::tempdir().unwrap();
     let head = checkout(dir.path());
     // The premise: plain git refuses this checkout for its owner.
-    let refused = Command::new("git")
-        .arg("-C")
-        .arg(dir.path())
+    let refused = plain_git(dir.path())
         .args(["rev-parse", "HEAD"])
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
         .output()
@@ -202,6 +210,49 @@ fn another_owners_checkout_names_its_head() {
     );
 }
 
+/// Plain git refuses another owner's checkout on a machine whose system or
+/// global config trusts every directory, as a CI runner's does.
+#[test]
+fn plain_git_ignores_the_machines_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    checkout(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let trusting = home.path().join(".gitconfig");
+    fs::write(&trusting, "[safe]\n\tdirectory = *\n").unwrap();
+    let run = |git: &mut Command| {
+        git.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+    };
+    // The premises: each config alone trusts the checkout.
+    let mut system = Command::new("git");
+    system
+        .env("GIT_CONFIG_SYSTEM", &trusting)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("-C")
+        .arg(dir.path());
+    assert!(run(&mut system).status.success(), "TRUST-SYSTEM");
+    let mut global = Command::new("git");
+    global
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env("HOME", home.path())
+        .arg("-C")
+        .arg(dir.path());
+    assert!(run(&mut global).status.success(), "TRUST-GLOBAL");
+    let mut plain = plain_git(dir.path());
+    plain
+        .env("GIT_CONFIG_SYSTEM", &trusting)
+        .env("HOME", home.path());
+    let refused = run(&mut plain);
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("dubious ownership"),
+        "UNTRUSTED {refused:?}"
+    );
+}
+
 /// Source inside another checkout (an archive unpacked there) is not that
 /// checkout's commit.
 #[test]
@@ -211,10 +262,8 @@ fn a_checkout_around_the_source_names_no_commit() {
     let source = dir.path().join("source");
     fs::create_dir(&source).unwrap();
     // The premise: git climbs to the checkout around it unless stopped.
-    let climbed = Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(&source)
-        .args(["rev-parse", "HEAD"])
+    let climbed = plain_git(&source)
+        .args(["-c", "safe.directory=*", "rev-parse", "HEAD"])
         .env_remove("GIT_CEILING_DIRECTORIES")
         .output()
         .unwrap();
