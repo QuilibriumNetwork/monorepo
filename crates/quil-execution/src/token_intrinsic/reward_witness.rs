@@ -93,6 +93,52 @@ pub fn newest_retained_global_root(
     clock: &dyn ClockStore,
     max_frame: Option<u64>,
 ) -> Result<([u8; 32], quil_types::proto::global::GlobalFrameHeader)> {
+    newest_global_root(clock, max_frame, |root| {
+        state.crdt().global_root_available(root)
+    })
+}
+
+/// [`newest_retained_global_root`] for a serving read: the newest root its
+/// committed view retains, so the root, its version and the blob proved at it
+/// all come from that view and none waits for the commit lock.
+pub fn newest_served_global_root(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
+    clock: &dyn ClockStore,
+    max_frame: Option<u64>,
+) -> Result<([u8; 32], quil_types::proto::global::GlobalFrameHeader)> {
+    newest_global_root(clock, max_frame, |root| reads.root_available(root))
+}
+
+/// The GLOBAL vertex at `data_address` as a serving read cites it: the newest
+/// root at or below `max_frame` that `reads` retains
+/// ([`newest_served_global_root`]), its header, and the vertex's membership
+/// proof at that root (`None`: absent there). Root and proof come from one
+/// view, so a root committed after it was taken is never cited. `root_error`
+/// maps a failure to choose the root.
+pub(crate) fn served_vertex_at_newest_root(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
+    clock: &dyn ClockStore,
+    max_frame: Option<u64>,
+    data_address: &[u8; 32],
+    root_error: impl FnOnce(QuilError) -> QuilError,
+) -> Result<ServedVertex> {
+    let (root, header) = newest_served_global_root(reads, clock, max_frame).map_err(root_error)?;
+    let proof = reads.membership(&root, data_address)?;
+    Ok((root, header, proof))
+}
+
+/// `(root, its header, the membership proof at it)`.
+pub(crate) type ServedVertex = (
+    [u8; 32],
+    quil_types::proto::global::GlobalFrameHeader,
+    Option<quil_forest::VertexMembershipProof>,
+);
+
+fn newest_global_root(
+    clock: &dyn ClockStore,
+    max_frame: Option<u64>,
+    retained: impl Fn(&[u8; 32]) -> Result<bool>,
+) -> Result<([u8; 32], quil_types::proto::global::GlobalFrameHeader)> {
     let latest = clock
         .get_latest_global_clock_frame()?
         .header
@@ -111,24 +157,29 @@ pub fn newest_retained_global_root(
                 None => continue,
             }
         };
-        if let Some(root) = retained_header_root(state, &header)? {
+        let root = header_root(&header)?;
+        if retained(&root)? {
             return Ok((root, header));
         }
     }
     Err(unavailable("historical global reward root unavailable"))
 }
 
-/// The global root `header` names, when this node retains it.
-pub(crate) fn retained_header_root(
-    state: &HypergraphState,
+/// The global root `header` names, when `reads` retains it.
+pub(crate) fn served_header_root(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     header: &quil_types::proto::global::GlobalFrameHeader,
 ) -> Result<Option<[u8; 32]>> {
-    let root: [u8; 32] = header
+    let root = header_root(header)?;
+    Ok(reads.root_available(&root)?.then_some(root))
+}
+
+fn header_root(header: &quil_types::proto::global::GlobalFrameHeader) -> Result<[u8; 32]> {
+    header
         .prover_tree_commitment
         .as_slice()
         .try_into()
-        .map_err(|_| unavailable("global reward root is not 32 bytes"))?;
-    Ok(state.crdt().global_root_available(&root)?.then_some(root))
+        .map_err(|_| unavailable("global reward root is not 32 bytes"))
 }
 
 pub fn quil_reward_witness(
@@ -136,12 +187,21 @@ pub fn quil_reward_witness(
     clock: &dyn ClockStore,
     owner: &[u8; 32],
 ) -> Result<RewardWitnessData> {
-    let (root, header) = newest_retained_global_root(state, clock, None)?;
+    // A client read: served from one committed view, so a GLOBAL
+    // finalization holding the commit lock does not hold it up.
+    reward_witness_from(&state.crdt().served_global_reads()?, clock, owner)
+}
+
+/// [`quil_reward_witness`] over the view of `reads`.
+fn reward_witness_from(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
+    clock: &dyn ClockStore,
+    owner: &[u8; 32],
+) -> Result<RewardWitnessData> {
     let address = crate::global_intrinsic::materialize::reward_address(owner)?;
-    let membership = match state
-        .crdt()
-        .global_vertex_membership_at_root(&root, &address)?
-    {
+    let (root, header, membership) =
+        served_vertex_at_newest_root(reads, clock, None, &address, |e| e)?;
+    let membership = match membership {
         Some(proof) => proof,
         None => return Ok(RewardWitnessData::default()),
     };
@@ -227,6 +287,157 @@ mod tests {
     use quil_hypergraph::addressing::{shard_key_for_location, Location};
     use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
     use std::sync::Arc;
+
+    /// A client's reward witness read answers while a GLOBAL finalization
+    /// holds the commit lock, with the witness it gave before the holder
+    /// took it.
+    #[test]
+    fn the_reward_witness_answers_while_a_finalization_holds_the_commit_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let state = HypergraphState::new(crdt.clone());
+        let clock = quil_store::testing::InMemoryClockStore::new();
+        let owner = [7; 32];
+        let address = crate::global_intrinsic::materialize::reward_address(&owner).unwrap();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        global_schema::write_type(&mut tree, REWARD).unwrap();
+        global_schema::write_field(&mut tree, REWARD, "DelegateAddress", &owner).unwrap();
+        let mut balance = [0; 32];
+        balance[31] = 5;
+        global_schema::write_field(&mut tree, REWARD, "Balance", &balance).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let disc = vertex_adds_discriminator().unwrap();
+        state
+            .set(&domains::GLOBAL, &address, &disc, 1, blob)
+            .unwrap();
+        state.commit().unwrap();
+        crdt.commit(1).unwrap();
+        let shard = shard_key_for_location(&Location {
+            app_address: domains::GLOBAL,
+            data_address: address,
+        });
+        clock.seed_frame(GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 2,
+                prover_tree_commitment: crdt.compute_shard_root("vertex", "adds", &shard),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // A running node's master loop captures a committed view every 5 s.
+        crdt.committed_global_view().unwrap();
+        let before = quil_reward_witness(&state, &clock, &owner).unwrap();
+        assert!(before.found, "premise: the reward is witnessed");
+        let held = crdt.hold_commit_lock();
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(quil_reward_witness(&state, &clock, &owner));
+            });
+            // It answers in milliseconds; a read waiting for the holder never
+            // does, so the generous bound only ends a failing run.
+            let answered = answers.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            let now = answered
+                .expect("reward_witness_blocked_by_commit_lock: no answer while the lock was held")
+                .unwrap();
+            assert_eq!(
+                (
+                    now.found,
+                    now.value,
+                    now.cited_frame,
+                    now.reward_root,
+                    now.forest_proof
+                ),
+                (
+                    before.found,
+                    before.value,
+                    before.cited_frame,
+                    before.reward_root,
+                    before.forest_proof
+                )
+            );
+        });
+    }
+
+    /// A reward witness cites the newest root of the view its proof is read
+    /// from, never a root committed after the view was taken.
+    #[test]
+    fn the_reward_witness_cites_the_newest_root_of_its_own_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let state = HypergraphState::new(crdt.clone());
+        let clock = quil_store::testing::InMemoryClockStore::new();
+        let owner = [7; 32];
+        let address = crate::global_intrinsic::materialize::reward_address(&owner).unwrap();
+        let shard = shard_key_for_location(&Location {
+            app_address: domains::GLOBAL,
+            data_address: address,
+        });
+        let disc = vertex_adds_discriminator().unwrap();
+        // Frame `frame` writes a balance of `balance`; header `frame + 1`
+        // names the root after it.
+        let execute = |frame: u64, balance: u8| {
+            let mut tree = quil_tries::VectorCommitmentTree::new();
+            global_schema::write_type(&mut tree, REWARD).unwrap();
+            global_schema::write_field(&mut tree, REWARD, "DelegateAddress", &owner).unwrap();
+            let mut value = [0; 32];
+            value[31] = balance;
+            global_schema::write_field(&mut tree, REWARD, "Balance", &value).unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            state
+                .set(&domains::GLOBAL, &address, &disc, frame, blob)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(frame).unwrap();
+            clock.seed_frame(GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: frame + 1,
+                    prover_tree_commitment: crdt.compute_shard_root("vertex", "adds", &shard),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        };
+        execute(1, 5);
+        let reads = crdt.served_global_reads().unwrap();
+        // Committed after the view was taken: in the live index (as between
+        // a commit and its view's publish), not in the view.
+        execute(2, 6);
+        let (_, live) = newest_retained_global_root(&state, &clock, None).unwrap();
+        assert_eq!(live.frame_number, 3, "premise: the live index holds 3");
+        let witness = reward_witness_from(&reads, &clock, &owner)
+            .expect("reward_witness_root_outside_view: no witness from the view's roots");
+        assert_eq!(
+            (witness.found, witness.cited_frame, witness.value),
+            (true, 2, 5),
+            "reward_witness_root_outside_view"
+        );
+        let root = clock
+            .get_global_clock_frame(2)
+            .unwrap()
+            .header
+            .unwrap()
+            .prover_tree_commitment;
+        assert_eq!(witness.reward_root, root);
+        verify_reward_membership(
+            &owner,
+            5,
+            &root.as_slice().try_into().unwrap(),
+            &witness.forest_proof,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn reward_witness_binds_committed_state_to_cited_root_without_truncation() {
