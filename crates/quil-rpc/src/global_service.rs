@@ -821,13 +821,16 @@ async fn bounded_forest_read<T: Send + 'static>(
         Ok(permit) => permit,
         Err(_) if wait.is_zero() => return Err(busy()),
         Err(_) => {
-            if FOREST_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_FOREST_READ_WAITERS {
-                FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+            // A cancelled RPC drops this future mid-wait; the place still
+            // leaves.
+            let Some(place) =
+                crate::queue_place::QueuePlace::take(&FOREST_READ_WAITERS, MAX_FOREST_READ_WAITERS)
+            else {
                 return Err(busy());
-            }
+            };
             FOREST_READ_QUEUED.fetch_add(1, Ordering::Relaxed);
             let acquired = tokio::time::timeout(wait, workers.acquire()).await;
-            FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+            place.leave();
             match acquired {
                 Ok(Ok(permit)) => permit,
                 _ => return Err(busy()),
@@ -1455,9 +1458,9 @@ impl GlobalService for GlobalRpcServer {
             let topology = {
                 let version = version.as_ref().and_then(|version| version());
                 let slot = kept_topology(&topologies, &key, version);
-                APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let place = crate::queue_place::QueuePlace::take(&APP_SHARDS_WAITING, usize::MAX);
                 let mut kept = slot.lock_owned().await;
-                APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                drop(place);
                 lock_wait = started.elapsed();
                 match (version, kept.as_ref()) {
                     (Some(version), Some((at, rows))) if *at == version => rows.clone(),
@@ -3155,6 +3158,47 @@ mod forest_read_tests {
                 .await
                 .unwrap(),
             42
+        );
+    }
+
+    /// A syncing peer that resets its stream while its forest read waits for
+    /// a slot gives its queue place back; a place once stayed counted, and 64
+    /// of them refused every later read at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiting_forest_read_gives_its_queue_place_back() {
+        use std::sync::atomic::Ordering;
+        static NO_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+        let wait = std::time::Duration::from_secs(60);
+        let until_counted = |want: usize| async move {
+            while FOREST_READ_WAITERS.load(Ordering::Relaxed) != want {
+                tokio::task::yield_now().await;
+            }
+        };
+        let waiting: Vec<_> = (0..MAX_FOREST_READ_WAITERS)
+            .map(|_| tokio::spawn(bounded_forest_read(&NO_SLOT, wait, None, || ())))
+            .collect();
+        until_counted(MAX_FOREST_READ_WAITERS).await;
+        let full = bounded_forest_read(&NO_SLOT, wait, None, || ()).await;
+        assert_eq!(full.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        for read in &waiting {
+            read.abort();
+        }
+        for read in waiting {
+            assert!(read.await.unwrap_err().is_cancelled());
+        }
+        println!("REACH forest-read-queue cancelled waiters");
+        assert_eq!(
+            FOREST_READ_WAITERS.load(Ordering::Relaxed),
+            0,
+            "cancelled forest reads still hold their queue places"
+        );
+        let next = tokio::spawn(bounded_forest_read(&NO_SLOT, wait, None, || 7));
+        until_counted(1).await;
+        NO_SLOT.add_permits(1);
+        assert_eq!(
+            next.await.unwrap().unwrap(),
+            7,
+            "a later read waits for a slot"
         );
     }
 

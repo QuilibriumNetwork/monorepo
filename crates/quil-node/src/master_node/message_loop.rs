@@ -2649,6 +2649,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             "forest reads served",
                         );
                     }
+                    // Coin reads served to wallets: slots, queue and
+                    // refusals, every few minutes.
+                    quil_rpc::node_service::log_coin_reads();
                     // Memory snapshot. Logged separately so the size
                     // fields don't crowd `node status`; growth between
                     // ticks is the diagnosis signal.
