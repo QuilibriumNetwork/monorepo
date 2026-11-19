@@ -715,6 +715,15 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     selection
 }
 
+/// What a proposal's executed ancestors did
+/// ([`GlobalLeaderProvider::for_execution_branch`]).
+pub(crate) struct ExecutedAncestors<'a> {
+    /// The bundles they consumed.
+    pub consumed: &'a [Vec<u8>],
+    /// The storage seat parts they applied.
+    pub seat_parts: &'a [quil_types::execution::SeatPartChange],
+}
+
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
 /// `parent_selector`. Produces frames by collecting messages, computing
@@ -781,7 +790,7 @@ pub struct GlobalLeaderProvider {
     /// The public mempool an execution-branch leader's `message_collector`
     /// copied ([`Self::for_execution_branch`]): what its validation drops
     /// leaves only the copy, except a proof a finalized frame applied
-    /// ([`MessageCollector::drop_applied`]). `None` for a leader over the
+    /// ([`MessageCollector::learn_committed`]). `None` for a leader over the
     /// mempool itself.
     mempool: Option<Arc<MessageCollector>>,
 }
@@ -821,8 +830,8 @@ impl GlobalLeaderProvider {
 
     /// A leader over a private execution branch proposing `frame_number` at
     /// `rank`, with a copy of the pending messages within the proposal budget
-    /// ([`MessageCollector::snapshot_for_proposal`]); what `consumed`, the
-    /// executed ancestors, carried is left out.
+    /// ([`MessageCollector::proposal_copy`]); what the executed `ancestors`
+    /// carried or applied is left out.
     pub(crate) fn for_execution_branch(
         &self,
         branch: &quil_execution::ExecutionBranch,
@@ -830,24 +839,16 @@ impl GlobalLeaderProvider {
         frame_number: u64,
         max_bytes: usize,
         max_items: usize,
-        consumed: &[Vec<u8>],
+        ancestors: ExecutedAncestors<'_>,
     ) -> Result<Self> {
-        let collector = Arc::new(MessageCollector::new());
-        let messages = self.message_collector.snapshot_for_proposal(
+        let collector = Arc::new(self.message_collector.proposal_copy(
             rank,
             max_bytes,
             max_items,
-            Some(frame_number),
-            consumed,
-        )?;
-        for (bytes, verified) in messages {
-            if verified {
-                collector.add_verified_message(rank, bytes);
-            } else {
-                collector.add_message(rank, bytes);
-            }
-        }
-        collector.mark_finalized(consumed);
+            frame_number,
+            ancestors.consumed,
+            ancestors.seat_parts,
+        )?);
         let mut leader = Self::new(
             Arc::new(branch.registry().clone()),
             self.frame_prover.clone(),
@@ -1628,9 +1629,6 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // With each message's collection index, to restore that order.
                 let mut valid: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handoff.remaining());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
-                // Refusals naming a seal or settlement GLOBAL applied, by
-                // their index in `invalid`.
-                let mut applied: Vec<(usize, String)> = Vec::new();
                 // Categorized drop breakdown: `"<msg_type> :: <reason>" -> count`,
                 // logged with the summary below. The per-message reason is otherwise
                 // debug-only, hiding WHICH message types + reasons dominate the drops
@@ -1803,11 +1801,6 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                 error = %e,
                                 "dropping protocol-invalid message from this proposal's inputs",
                             );
-                            if error.contains(
-                                quil_execution::global_intrinsic::storage_epoch_proof::REFUSED_DUPLICATE,
-                            ) {
-                                applied.push((invalid.len(), error));
-                            }
                             invalid.push(raw);
                         }
                     }
@@ -1995,15 +1988,21 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         .collect::<Vec<_>>()
                         .join(" | ");
                     // A branch leader's collector is its proposal's copy;
-                    // of what it drops, only proofs a finalized frame
-                    // applied leave the mempool.
-                    let left_mempool = self.mempool.as_ref().map_or(invalid.len(), |mempool| {
-                        mempool.drop_applied(
-                            applied
-                                .iter()
-                                .map(|(index, error)| (invalid[*index].as_slice(), error.as_str())),
-                        )
-                    });
+                    // of what it drops, only proofs of seat parts a
+                    // finalized frame applied leave the mempool. Read from
+                    // the state validation ran on, they re-teach a mempool
+                    // that restarted and never saw those frames applied.
+                    let applied: Vec<quil_types::execution::SeatPartChange> = invalid
+                        .iter()
+                        .flat_map(|raw| validator.applied_seat_parts(raw))
+                        .collect();
+                    let mempool = self.mempool.as_ref().unwrap_or(&self.message_collector);
+                    let learned = mempool.learn_committed(&applied);
+                    let left_mempool = if self.mempool.is_some() {
+                        learned
+                    } else {
+                        invalid.len()
+                    };
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),

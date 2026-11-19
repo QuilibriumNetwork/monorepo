@@ -4336,6 +4336,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                             mc.mark_finalized(&result.consumed_bundles);
                                                         }
                                                         mc.mark_skipped(&result.skipped_bundles);
+                                                        mc.mark_applied(&result.seat_parts);
                                                         if let Some(header) = frame.header.as_ref() {
                                                             mc.note_finalized_frame(header.frame_number);
                                                             if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
@@ -4409,6 +4410,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                         mc.mark_finalized(&result.consumed_bundles);
                                                     }
                                                     mc.mark_skipped(&result.skipped_bundles);
+                                                    mc.mark_applied(&result.seat_parts);
                                                     if let Some(header) = frame.header.as_ref() {
                                                         mc.note_finalized_frame(header.frame_number);
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
@@ -4449,6 +4451,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     mc.mark_finalized(&result.finalized_bundles);
                                                 }
                                                 mc.mark_skipped(&result.skipped_bundles);
+                                                mc.mark_applied(&result.seat_parts);
                                                 if m.last_materialized_frame() >= frame_number {
                                                     catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {

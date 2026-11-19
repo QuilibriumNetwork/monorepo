@@ -448,71 +448,21 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             return Ok(ProcessMessageResult {
                 messages: Vec::new(),
                 state: Vec::new(),
+                seat_parts: Vec::new(),
             });
         }
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&message[..4]);
-        let tp = u32::from_be_bytes(buf);
-
-        let checkpoint = self.state.as_ref().map_or(0, |state| state.changeset_len());
-        let invoke = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
-            if (inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
-                || inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT
-                || inner_tp
-                    == crate::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF)
-                && (self.intrinsic.is_none() || self.state.is_none())
-            {
-                return Err(QuilError::ExecutionUnavailable(
-                    "handoff execution requires authenticated global state".into(),
-                ));
-            }
-            if !crate::global_engine::is_global_type_prefix_at(inner_tp, _frame_number) {
-                return Ok(());
-            }
-            if let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) {
-                let step_checkpoint = state.changeset_len();
-                if let Err(error) = intrinsic.invoke_step(_frame_number, inner_bytes, state) {
-                    return finish_global_step(
-                        state,
-                        step_checkpoint,
-                        _frame_number,
-                        inner_bytes,
-                        inner_tp,
-                        error,
-                    );
-                }
-            }
-            Ok(())
-        };
-        let result =
-            match tp {
-                TYPE_MESSAGE_BUNDLE => {
-                    let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                    bundle.requests.iter().flatten().try_for_each(|request| {
-                        invoke(&request.inner_bytes, request.inner_type_prefix)
-                    })
-                }
-                TYPE_MESSAGE_REQUEST => {
-                    let request = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                    invoke(&request.inner_bytes, request.inner_type_prefix)
-                }
-                _ => Err(QuilError::InvalidArgument(
-                    "global: unsupported message type".into(),
-                )),
-            };
-        if let Err(error) = result {
-            if let Some(state) = &self.state {
-                state.rollback_to(checkpoint);
-            }
-            return Err(error);
-        }
+        let state = self.state.as_deref();
+        let checkpoint = state.map_or(0, |state| state.changeset_len());
+        let seat_parts =
+            invoke_global_message(self.intrinsic.as_ref(), state, _frame_number, message)?;
         // Staging failure must abort frame processing. Successful publication
         // clears the changeset so later requests do not reapply prior writes.
         let _timing = crate::step_timing::section("stage changes");
-        publish_execution_changes(self.state.as_deref(), checkpoint)?;
+        publish_execution_changes(state, checkpoint)?;
         Ok(ProcessMessageResult {
             messages: Vec::new(),
             state: Vec::new(),
+            seat_parts,
         })
     }
 
@@ -1117,6 +1067,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             return Ok(ProcessMessageResult {
                 messages: Vec::new(),
                 state: Vec::new(),
+                seat_parts: Vec::new(),
             });
         }
         let mut buf = [0u8; 4];
@@ -1565,6 +1516,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
                     state: Vec::new(),
+                    seat_parts: Vec::new(),
                 })
             }
             TYPE_MESSAGE_REQUEST => {
@@ -1611,6 +1563,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
                     state: Vec::new(),
+                    seat_parts: Vec::new(),
                 })
             }
             _ => Err(QuilError::InvalidArgument(
@@ -1939,6 +1892,78 @@ fn rejection_line_due(
             true
         }
     }
+}
+
+/// Run a GLOBAL message's requests on `state`, without publishing: a
+/// refused request's writes roll back to its own savepoint, a failed
+/// message's to the message's. Returns the storage seat parts the
+/// message's standing steps applied.
+pub(crate) fn invoke_global_message(
+    intrinsic: Option<&crate::global_intrinsic::intrinsic::GlobalIntrinsic>,
+    state: Option<&crate::hypergraph_state::HypergraphState>,
+    frame_number: u64,
+    message: &[u8],
+) -> Result<Vec<quil_types::execution::SeatPartChange>> {
+    if message.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&message[..4]);
+    let tp = u32::from_be_bytes(buf);
+
+    let checkpoint = state.map_or(0, |state| state.changeset_len());
+    let invoke = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
+        if (inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
+            || inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT
+            || inner_tp == crate::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF)
+            && (intrinsic.is_none() || state.is_none())
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "handoff execution requires authenticated global state".into(),
+            ));
+        }
+        if !crate::global_engine::is_global_type_prefix_at(inner_tp, frame_number) {
+            return Ok(());
+        }
+        if let (Some(intrinsic), Some(state)) = (intrinsic, state) {
+            let step_checkpoint = state.changeset_len();
+            if let Err(error) = intrinsic.invoke_step(frame_number, inner_bytes, state) {
+                return finish_global_step(
+                    state,
+                    step_checkpoint,
+                    frame_number,
+                    inner_bytes,
+                    inner_tp,
+                    error,
+                );
+            }
+        }
+        Ok(())
+    };
+    let result = match tp {
+        TYPE_MESSAGE_BUNDLE => {
+            let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
+            bundle
+                .requests
+                .iter()
+                .flatten()
+                .try_for_each(|request| invoke(&request.inner_bytes, request.inner_type_prefix))
+        }
+        TYPE_MESSAGE_REQUEST => {
+            let request = CanonicalMessageRequest::from_canonical_bytes(message)?;
+            invoke(&request.inner_bytes, request.inner_type_prefix)
+        }
+        _ => Err(QuilError::InvalidArgument(
+            "global: unsupported message type".into(),
+        )),
+    };
+    if let Err(error) = result {
+        if let Some(state) = state {
+            state.rollback_to(checkpoint);
+        }
+        return Err(error);
+    }
+    Ok(state.map_or_else(Vec::new, |state| state.seat_parts_since(checkpoint)))
 }
 
 /// Global lifecycle rejections remain per-operation skips. Infrastructure
@@ -2321,6 +2346,7 @@ impl ComputeExecutionEngine {
             return Ok(ProcessMessageResult {
                 messages: Vec::new(),
                 state: Vec::new(),
+                seat_parts: Vec::new(),
             });
         }
         let mut buf = [0u8; 4];
@@ -2586,6 +2612,7 @@ impl ComputeExecutionEngine {
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
                     state: Vec::new(),
+                    seat_parts: Vec::new(),
                 })
             }
             TYPE_MESSAGE_REQUEST => {
@@ -2594,6 +2621,7 @@ impl ComputeExecutionEngine {
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
                     state: Vec::new(),
+                    seat_parts: Vec::new(),
                 })
             }
             _ => Err(QuilError::InvalidArgument(
@@ -3274,6 +3302,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
         Ok(ProcessMessageResult {
             messages: Vec::new(),
             state: Vec::new(),
+            seat_parts: Vec::new(),
         })
     }
 

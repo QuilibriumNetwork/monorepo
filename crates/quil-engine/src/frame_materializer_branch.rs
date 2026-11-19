@@ -60,6 +60,9 @@ pub struct TentativeFrameResult {
     pub consumed_bundles: Vec<Vec<u8>>,
     /// The bundles execution skipped (`MaterializeResult::skipped_bundles`).
     pub skipped_bundles: Vec<Vec<u8>>,
+    /// The storage seat parts execution applied
+    /// (`MaterializeResult::seat_parts`).
+    pub seat_parts: Vec<quil_types::execution::SeatPartChange>,
     pub checkpoint: GlobalExecutionCheckpoint,
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
     /// A publication's execution, recorded once its batch commits.
@@ -240,6 +243,7 @@ impl MaterializerBranch {
             prover_root: root,
             consumed_bundles: result.finalized_bundles,
             skipped_bundles: result.skipped_bundles,
+            seat_parts: result.seat_parts,
             checkpoint,
             prover_ops: result.prover_ops,
             execution: result.execution,
