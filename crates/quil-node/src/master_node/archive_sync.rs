@@ -3280,6 +3280,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         {
             let pool = archive_pool.clone();
             let cs = clock_store.clone();
+            let verifier = frame_verifier.clone();
             // A blocked poller fetches and executes no GLOBAL frame; the
             // watchdog names where it is blocked.
             let poller_probe = super::stall_watch::watch(
@@ -3291,7 +3292,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 let seed = seed.clone();
                 move |cancel| {
                     probe::task_probed(poller_probe, async move {
-                        quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
+                        quil_rpc::run_archive_poller(
+                            pool,
+                            cs,
+                            seed,
+                            poller_config,
+                            verifier,
+                            cancel,
+                        )
+                        .await;
                         Ok(())
                     })
                 }

@@ -468,6 +468,47 @@ impl RocksClockStore {
         Ok(frame)
     }
 
+    /// Whether the canonical record at `frame`'s height already holds its
+    /// block: the frame itself, or the same header and requests under
+    /// another finalization certificate while the stored record carries one
+    /// that `verified` accepts. Each committee member aggregates its own
+    /// certificate of a block and any of them authenticates it, so storing
+    /// another changes no state; it only advances the store's sequence under
+    /// an in-flight atomic GLOBAL execution, which then falls back and
+    /// executes again. A record stored without checking its certificate (no
+    /// committee known then, or a legacy signature) is not held, so a later
+    /// copy still replaces it. `verified` sees the stored header only.
+    pub fn holds_global_block(
+        &self,
+        frame: &global::GlobalFrame,
+        verified: impl FnOnce(&global::GlobalFrameHeader) -> bool,
+    ) -> bool {
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        let Ok(stored) = self.get_global_frame(header.frame_number) else {
+            return false;
+        };
+        if stored == *frame {
+            return true;
+        }
+        let Some(stored_header) = stored.header.as_ref() else {
+            return false;
+        };
+        let certified = stored_header
+            .public_key_signature_bls48581
+            .as_ref()
+            .is_some_and(|s| !s.signature.is_empty());
+        let uncertified = |h: &global::GlobalFrameHeader| global::GlobalFrameHeader {
+            public_key_signature_bls48581: None,
+            ..h.clone()
+        };
+        certified
+            && stored.requests == frame.requests
+            && uncertified(stored_header) == uncertified(header)
+            && verified(stored_header)
+    }
+
     /// The canonical global frame's header alone: from the frame cache when
     /// it holds the frame, else the header key, never its request bundles.
     pub fn get_global_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader> {
@@ -3580,5 +3621,73 @@ mod serving_tests {
             .unwrap()
             .commit(&inner)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod global_block_tests {
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
+    use quil_types::proto::keys::Bls48581AggregateSignature;
+
+    use super::RocksClockStore;
+
+    fn block(output: u8, certificate: &[u8]) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 9,
+                rank: 9,
+                output: vec![output; 516],
+                public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                    signature: certificate.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle::default()],
+        }
+    }
+
+    /// Committee members certify one block with different signer sets: the
+    /// canonical record holds the block under any of them, so a copy under
+    /// another certificate is no new write; a different header or body at
+    /// that height, a record without a certificate, or one whose certificate
+    /// was not verified, is not held.
+    #[test]
+    fn a_block_under_another_certificate_is_held() {
+        let db = crate::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        let stored = block(1, b"local");
+        clock.put_global_frame(&stored, None).unwrap();
+        let identical = clock.holds_global_block(&stored, |_| true);
+        eprintln!("REACH global-block checked");
+        assert!(identical, "identical");
+        assert!(
+            clock.holds_global_block(&block(1, b"leader"), |_| true),
+            "same block, another certificate"
+        );
+        assert!(
+            !clock.holds_global_block(&block(2, b"local"), |_| true),
+            "other block"
+        );
+        let mut body = block(1, b"leader");
+        body.requests.clear();
+        assert!(!clock.holds_global_block(&body, |_| true), "other body");
+        let mut timestamp = block(1, b"leader");
+        timestamp.header.as_mut().unwrap().timestamp = 7;
+        assert!(
+            !clock.holds_global_block(&timestamp, |_| true),
+            "other header field"
+        );
+        assert!(
+            !clock.holds_global_block(&block(1, b"leader"), |_| false),
+            "an unverified record is not held"
+        );
+
+        let bare = block(1, b"");
+        clock.put_global_frame(&bare, None).unwrap();
+        assert!(
+            !clock.holds_global_block(&block(1, b"leader"), |_| true),
+            "a record without a certificate takes one"
+        );
     }
 }

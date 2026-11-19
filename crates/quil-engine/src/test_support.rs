@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
-use quil_types::error::Result;
+use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
@@ -927,4 +927,126 @@ pub fn certify_proposal(
         proposal,
         certificate,
     })
+}
+
+/// A `FrameProver` that proves nothing and accepts every VDF, for tests
+/// that check GLOBAL frames by their finalization certificates alone.
+pub struct NoVdfFrameProver;
+
+impl quil_types::crypto::FrameProver for NoVdfFrameProver {
+    fn prove_frame_header(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[Vec<u8>],
+        _: &[u8],
+        _: i64,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: &[u8],
+        _: u64,
+    ) -> Result<quil_types::proto::global::FrameHeader> {
+        Err(QuilError::Internal("no VDF prover".into()))
+    }
+    fn prove_global_frame_header(
+        &self,
+        _: &quil_types::proto::global::GlobalFrameHeader,
+        _: &[Vec<u8>],
+        _: &[u8],
+        _: &[Vec<u8>],
+        _: &[u8],
+        _: u64,
+        _: &dyn quil_types::crypto::Signer,
+        _: i64,
+        _: u32,
+        _: u8,
+    ) -> Result<quil_types::proto::global::GlobalFrameHeader> {
+        Err(QuilError::Internal("no VDF prover".into()))
+    }
+    fn verify_global_frame_header(
+        &self,
+        header: &quil_types::proto::global::GlobalFrameHeader,
+    ) -> Result<Vec<u8>> {
+        Ok(header.output.clone())
+    }
+    fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> {
+        Err(QuilError::Internal("no VDF prover".into()))
+    }
+    fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+/// A verifier of GLOBAL frames finalized by `committee` (epoch 0 below the
+/// succession frame), checking no VDF.
+pub fn global_committee_verifier(
+    committee: Vec<Vec<u8>>,
+) -> crate::frame_validator::GlobalFrameVerifier {
+    crate::frame_validator::GlobalFrameVerifier::new(std::sync::Arc::new(NoVdfFrameProver))
+        .with_global_committee(committee)
+}
+
+/// GLOBAL frame `number` at rank `number`, carrying `signer`'s one-member
+/// finalization of it in epoch 0 at view `view` over parent view
+/// `number - 1`. A view other than `number` is a certificate the gossip
+/// check accepts and execution refuses as its base.
+pub fn global_frame_finalized_at(
+    signer: &quil_crypto::FalconSigner,
+    number: u64,
+    view: u64,
+) -> quil_types::proto::global::GlobalFrame {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{
+                scheme::Namespace,
+                types::{Finalization, Proposal, Subject},
+            },
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::{encode_finalization, wrap_cert_for_header},
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let output = vec![3; 32];
+    let key = FalconPrivateKey::from_bytes(signer.private_key(), signer.public_key()).unwrap();
+    let participants: Set<_> = vec![key.public_key()].try_into().unwrap();
+    let scheme = Generic::<Namespace>::signer(b"global", participants, key).unwrap();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(0), View::new(view)),
+        View::new(number.saturating_sub(1)),
+        Digest(quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap()),
+    );
+    let vote = scheme
+        .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+            proposal: &proposal,
+        })
+        .unwrap();
+    let certificate = scheme
+        .assemble::<SimplexFalconScheme, _, N3f1>(vec![vote])
+        .unwrap();
+    let signature = wrap_cert_for_header(&encode_finalization(&Finalization {
+        proposal,
+        certificate,
+    }));
+    quil_types::proto::global::GlobalFrame {
+        header: Some(quil_types::proto::global::GlobalFrameHeader {
+            frame_number: number,
+            rank: number,
+            public_key_signature_bls48581: Some(
+                quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature,
+                    ..Default::default()
+                },
+            ),
+            output,
+            ..Default::default()
+        }),
+        requests: Vec::new(),
+    }
 }

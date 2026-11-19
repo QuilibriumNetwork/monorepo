@@ -1844,6 +1844,59 @@ fn a_global_frame_verifies_only_against_the_committee_of_its_frame() {
     assert!(no_successor.verify_global_finalization_cert(&signed(last, &genesis, 0)));
 }
 
+/// A stored GLOBAL block is held against a copy under another certificate
+/// only while its own certificate passes the execution base's check: by
+/// its frame's committee, in its epoch, at the header's view. A record
+/// finalized at another view passes the gossip certificate check, yet
+/// execution refuses it, so a later copy must still replace it.
+#[test]
+fn a_stored_block_is_held_only_while_it_can_be_an_execution_base() {
+    quil_types::consensus::set_global_committee_succession_frame(TEST_SUCCESSION);
+    let member = quil_crypto::FalconSigner::generate();
+    let outsider = quil_crypto::FalconSigner::generate();
+    let verifier = GlobalFrameVerifier::new(Arc::new(TestFrameProver))
+        .with_global_committee(vec![member.public_key().to_vec()]);
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let clock = quil_store::RocksClockStore::new(db.inner());
+    let block = |signer: &quil_crypto::FalconSigner, view: u64| {
+        let output = vec![3; 32];
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 9,
+                rank: 9,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: finalization_certificate(b"global", signer, 0, view, 8, &output),
+                        ..Default::default()
+                    },
+                ),
+                output,
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    };
+    let held = |stored: &GlobalFrame, copy: &GlobalFrame| {
+        clock.put_global_frame(stored, None).unwrap();
+        verifier.holds_global_block(&clock, copy)
+    };
+    let copy = block(&outsider, 9);
+    let finalized = block(&member, 9);
+    eprintln!("REACH global-block checked");
+    assert!(held(&finalized, &finalized), "the same frame");
+    assert!(held(&finalized, &copy), "same block, another certificate");
+    let other_view = block(&member, 10);
+    assert!(
+        verifier.verify_global_finalization_cert(other_view.header.as_ref().unwrap()),
+        "premise: the gossip check passes another view"
+    );
+    assert!(!held(&other_view, &copy), "held at another view");
+    assert!(
+        !held(&copy, &finalized),
+        "held under an outsider's certificate"
+    );
+}
+
 /// A consensus instance builds and votes only on its own committee's frames,
 /// and the frame it starts from is its view 0, whatever that frame's rank.
 #[test]
