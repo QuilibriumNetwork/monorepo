@@ -484,7 +484,7 @@ pub(crate) trait PageSnapshot {
     type Cursor<'a>: PageCursor
     where
         Self: 'a;
-    fn raw_cursor(&self) -> Self::Cursor<'_>;
+    fn raw_cursor(&self, fill_cache: bool) -> Self::Cursor<'_>;
 }
 
 impl PageSnapshot for rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB> {
@@ -492,8 +492,10 @@ impl PageSnapshot for rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB> {
         = rocksdb::DBRawIterator<'a>
     where
         Self: 'a;
-    fn raw_cursor(&self) -> Self::Cursor<'_> {
-        self.raw_iterator()
+    fn raw_cursor(&self, fill_cache: bool) -> Self::Cursor<'_> {
+        let mut options = rocksdb::ReadOptions::default();
+        options.fill_cache(fill_cache);
+        self.raw_iterator_opt(options)
     }
 }
 impl PageSnapshot for OverlayDbSnapshot {
@@ -501,7 +503,7 @@ impl PageSnapshot for OverlayDbSnapshot {
         = OverlayRawCursor
     where
         Self: 'a;
-    fn raw_cursor(&self) -> Self::Cursor<'_> {
+    fn raw_cursor(&self, _fill_cache: bool) -> Self::Cursor<'_> {
         self.raw_iterator()
     }
 }

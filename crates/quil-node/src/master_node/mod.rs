@@ -2173,11 +2173,23 @@ pub(crate) async fn start(
                 sup.spawn("explorer-token-supply", move |token| async move {
                     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let worker_stop = stop.clone();
-                    let worker =
+                    let mut worker =
                         tokio::task::spawn_blocking(move || supply_runner.run(&worker_stop));
-                    token.cancelled().await;
-                    stop.store(true, std::sync::atomic::Ordering::Release);
-                    worker.await.map_err(anyhow::Error::from)
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                            if let Err(error) = worker.await {
+                                warn!(%error, "explorer supply worker failed during shutdown");
+                            }
+                        }
+                        result = &mut worker => {
+                            warn!(?result, "explorer supply worker stopped; full-scan fallback remains available");
+                            // This is an optional cache. Report its failure now,
+                            // but do not turn it into a canonical node shutdown.
+                            token.cancelled().await;
+                        }
+                    }
+                    Ok(())
                 });
                 // App-shard production index for `/shards/production`; it
                 // saves the history rows on cancellation.

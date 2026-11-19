@@ -166,8 +166,40 @@ pub(crate) async fn apps(
     State(state): State<ExplorerState>,
     Query(query): Query<AppsQuery>,
 ) -> Result<Json<AppsResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || apps_committed(state, query))
+        .await
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+}
+
+fn committed_app_blob(
+    snapshot: &dyn quil_types::store::SnapshotReadable,
+    address: &[u8; 32],
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let mut id = [0xff; 64];
+    id[..32].copy_from_slice(address);
+    let shard = quil_hypergraph::shard_key_for_location(&quil_hypergraph::Location::from_id(&id));
+    let read_error =
+        |e: quil_types::error::QuilError| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
+    if snapshot
+        .load_vertex_underlying_raw("vertex", "removes", &shard, &id)
+        .map_err(read_error)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(snapshot
+        .load_vertex_underlying_raw("vertex", "adds", &shard, &id)
+        .map_err(read_error)?
+        .filter(|blob| !blob.is_empty()))
+}
+
+fn apps_committed(state: ExplorerState, query: AppsQuery) -> Result<Json<AppsResponse>, ApiError> {
     let after = query.after.as_deref().map(parse_address).transpose()?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let snapshot = state
+        .crdt
+        .capture_fresh_committed_snapshot()
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     let mut grouped = grouped_apps(&state)?;
     for address in state
         .crdt
@@ -177,15 +209,7 @@ pub(crate) async fn apps(
         if address == quil_execution::domains::GLOBAL || grouped.contains_key(&address) {
             continue;
         }
-        let mut id = [0xff; 64];
-        id[..32].copy_from_slice(&address);
-        let location = quil_hypergraph::Location::from_id(&id);
-        if state
-            .crdt
-            .get_vertex_data_checked(&location)
-            .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
-            .is_some()
-        {
+        if committed_app_blob(snapshot.as_ref(), &address)?.is_some() {
             grouped.insert(address, Vec::new());
         }
     }
@@ -327,16 +351,20 @@ pub(crate) async fn app(
     State(state): State<ExplorerState>,
     Path(address_hex): Path<String>,
 ) -> Result<Json<AppDetail>, ApiError> {
+    tokio::task::spawn_blocking(move || app_committed(state, address_hex))
+        .await
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+}
+
+fn app_committed(state: ExplorerState, address_hex: String) -> Result<Json<AppDetail>, ApiError> {
     let address = parse_address(&address_hex)?;
     let mut shards = grouped_apps(&state)?.remove(&address).unwrap_or_default();
     shards.sort_by(|a, b| a.prefix.cmp(&b.prefix));
-    let mut id = [0xff; 64];
-    id[..32].copy_from_slice(&address);
-    let location = quil_hypergraph::Location::from_id(&id);
-    let blob = state
+    let snapshot = state
         .crdt
-        .get_vertex_data_checked(&location)
+        .capture_fresh_committed_snapshot()
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let blob = committed_app_blob(snapshot.as_ref(), &address)?;
     if shards.is_empty() && blob.is_none() {
         return Err(error(StatusCode::NOT_FOUND, "application not found"));
     }
@@ -384,7 +412,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn deployed_app_without_registered_shard_has_detail() {
+    async fn deployed_app_metadata_excludes_uncommitted_changes() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let raw = db.inner();
         let crdt = std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
@@ -405,11 +433,9 @@ mod tests {
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
         crdt.add_vertex(&quil_hypergraph::Location::from_id(&id), &blob)
             .unwrap();
-        crdt.commit(1).unwrap();
-        assert_eq!(crdt.vertex_adds_domains().unwrap(), vec![address]);
         let state = crate::ExplorerState::new(
             std::sync::Arc::new(quil_store::RocksClockStore::new(raw.clone())),
-            crdt,
+            crdt.clone(),
             std::sync::Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
             std::sync::Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
             std::sync::Arc::new(quil_store::RocksShardsStore::new(raw)),
@@ -419,6 +445,15 @@ mod tests {
             std::sync::Arc::new(crate::RecentMessageRing::new(16)),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         );
+        assert!(
+            matches!(
+                app(State(state.clone()), Path(hex::encode(address))).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "pending deployment was reported as a deployed application"
+        );
+        crdt.commit(1).unwrap();
+        assert_eq!(crdt.vertex_adds_domains().unwrap(), vec![address]);
         let Json(detail) = match app(State(state.clone()), Path(hex::encode(address))).await {
             Ok(detail) => detail,
             Err((status, _)) => panic!("unexpected status {status}"),
@@ -428,7 +463,7 @@ mod tests {
         assert_eq!(detail.metadata.unwrap().kind, "token");
 
         let Json(list) = apps(
-            State(state),
+            State(state.clone()),
             Query(AppsQuery {
                 after: None,
                 limit: None,
@@ -439,6 +474,43 @@ mod tests {
         assert_eq!(list.total, 1);
         assert_eq!(list.apps[0].address, hex::encode(address));
         assert_eq!(list.apps[0].shard_count, 0);
+
+        let mut draft = quil_tries::VectorCommitmentTree::new();
+        draft
+            .insert(
+                &[0xff; 32],
+                &quil_execution::domains::COMPUTE,
+                &[],
+                &num_bigint::BigInt::from(32),
+            )
+            .unwrap();
+        let draft = quil_tries::serialize_go_tree(draft.root.as_ref()).unwrap();
+        crdt.add_vertex(&quil_hypergraph::Location::from_id(&id), &draft)
+            .unwrap();
+        let Json(detail) = app(State(state.clone()), Path(hex::encode(address)))
+            .await
+            .unwrap_or_else(|(status, _)| panic!("unexpected status {status}"));
+        assert_eq!(
+            detail.metadata.unwrap().kind,
+            "token",
+            "pending metadata escaped before durable publication"
+        );
+        crdt.discard_staged_mutations().unwrap();
+        crdt.remove_vertex(&quil_hypergraph::Location::from_id(&id))
+            .unwrap();
+        let Json(detail) = app(State(state.clone()), Path(hex::encode(address)))
+            .await
+            .unwrap_or_else(|(status, _)| panic!("unexpected status {status}"));
+        assert_eq!(
+            detail.metadata.unwrap().kind,
+            "token",
+            "pending removal hid a committed app"
+        );
+        crdt.commit(2).unwrap();
+        assert!(matches!(
+            app(State(state), Path(hex::encode(address))).await,
+            Err((StatusCode::NOT_FOUND, _))
+        ));
     }
 
     #[test]

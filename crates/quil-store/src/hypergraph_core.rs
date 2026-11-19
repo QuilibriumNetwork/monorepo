@@ -351,6 +351,7 @@ macro_rules! impl_hypergraph_storage {
                     after,
                     limits,
                     &|_| false,
+                    true,
                 )
             }
         }
@@ -789,27 +790,35 @@ macro_rules! impl_hypergraph_storage {
                 ];
                 let mut found = std::collections::HashSet::new();
                 for prefix in [&tree_prefix, &old_prefix] {
-                    for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                        prefix,
-                        rocksdb::Direction::Forward,
-                    )) {
-                        let (key, _) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+                    // The legacy tree value can contain an entire shard.
+                    // Inspect only borrowed keys and stop at this prefix's end.
+                    let mut options = sweep_read_options();
+                    if let Some(upper) = prefix_successor(prefix) {
+                        options.set_iterate_upper_bound(upper);
+                    }
+                    let mut iter = self.db.raw_iterator_opt(options);
+                    iter.seek(prefix);
+                    while let Some(key) = iter.key() {
                         if !key.starts_with(prefix) {
                             break;
                         }
                         if key.len() == prefix.len() + 35 {
                             found.insert(key[prefix.len() + 3..].try_into().unwrap());
                         }
+                        iter.next();
                     }
+                    iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
                 }
                 // The active JMT forest stores one head marker per app/phase:
                 // namespace, 0xfe, level, ID length, phase, then app ID.
                 let forest_prefix = [crate::FOREST_NAMESPACE[0], 0xfe, 3];
-                for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                    &forest_prefix,
-                    rocksdb::Direction::Forward,
-                )) {
-                    let (key, _) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+                let mut options = sweep_read_options();
+                if let Some(upper) = prefix_successor(&forest_prefix) {
+                    options.set_iterate_upper_bound(upper);
+                }
+                let mut iter = self.db.raw_iterator_opt(options);
+                iter.seek(&forest_prefix);
+                while let Some(key) = iter.key() {
                     if !key.starts_with(&forest_prefix) {
                         break;
                     }
@@ -819,7 +828,9 @@ macro_rules! impl_hypergraph_storage {
                     {
                         found.insert(key[5..37].try_into().unwrap());
                     }
+                    iter.next();
                 }
+                iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
                 let mut domains: Vec<_> = found.into_iter().collect();
                 domains.sort();
                 Ok(domains)

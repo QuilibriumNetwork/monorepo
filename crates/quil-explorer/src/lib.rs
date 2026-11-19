@@ -211,6 +211,7 @@ impl ExplorerState {
 
     /// Serve the background supply summary once its first scan ends.
     pub fn with_supply_index(mut self, index: Arc<supply_index::SupplyIndex>) -> Self {
+        self.token_scan = index.scan_gate.clone();
         self.supply_index = Some(index);
         self
     }

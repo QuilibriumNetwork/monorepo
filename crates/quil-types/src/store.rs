@@ -38,6 +38,23 @@ pub struct RecordMutation {
 /// notifications are permitted: consumers must validate/rebuild their caches.
 pub trait LocalVertexCommitObserver: Send + Sync {
     fn committed<'a>(&self, vertices: &mut dyn std::iter::Iterator<Item = (&'a [u8], &'a [u8])>);
+    /// Addresses whose vertex-remove tombstones became durable. Kept separate
+    /// from adds blobs so existing observers never interpret a removal as data.
+    fn removed<'a>(&self, _keys: &mut dyn std::iter::Iterator<Item = &'a [u8]>) {}
+    /// Immutable app domains for keys-only notifications after atomic adoption.
+    /// Captured once per journal, so private commits invoke no observer code.
+    /// Empty by default: legacy observers allocate no journal and retain their
+    /// committed-payload behavior. Must not block, perform I/O, or reenter the
+    /// CRDT, and must return the same domains for this observer's lifetime.
+    fn execution_key_domains(&self) -> &'static [[u8; 32]] {
+        &[]
+    }
+    /// Changed vertex addresses (adds and removes) after canonical adoption.
+    /// Only opted-in apps are included. No payloads or tentative execution
+    /// records are replayed as legacy `committed` notifications.
+    fn committed_keys(&self, _keys: Vec<[u8; 64]>) {
+        self.invalidated();
+    }
     fn watches_sync(&self, _app: &[u8]) -> bool {
         false
     }
@@ -65,7 +82,54 @@ pub trait KvDb: Send + Sync {
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
+    /// Atomically write only the declared two-byte key prefixes. Coordinated
+    /// stores keep these writes independent of execution branches which never
+    /// touched those prefixes; branches that did touch them still conflict.
+    /// Other stores retain ordinary transaction semantics. Validate the entire
+    /// batch before writing, including on stores without a conflict ledger.
+    fn write_disjoint(
+        &self,
+        prefixes: &'static [[u8; 2]],
+        mutations: &[RecordMutation],
+    ) -> Result<()> {
+        if mutations.iter().any(|m| {
+            m.key
+                .get(..2)
+                .is_none_or(|prefix| !prefixes.iter().any(|p| p.as_slice() == prefix))
+        }) {
+            return Err(QuilError::Store(
+                "disjoint write outside declared prefixes".into(),
+            ));
+        }
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let batch = self.new_batch(false)?;
+        for mutation in mutations {
+            match &mutation.value {
+                Some(value) => batch.set(&mutation.key, value)?,
+                None => batch.delete(&mutation.key)?,
+            }
+        }
+        batch.commit()
+    }
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
+    /// At most `limit` keys in ascending order from `[lower, upper)`. Values
+    /// are not needed; persistent adapters should avoid materializing them.
+    fn key_page(&self, lower: &[u8], upper: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        if lower >= upper || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut iter = self.new_iter(lower, upper)?;
+        let mut keys = Vec::new();
+        let mut valid = iter.first();
+        while valid && keys.len() < limit {
+            keys.push(iter.key().to_vec());
+            valid = iter.next();
+        }
+        iter.close()?;
+        Ok(keys)
+    }
     /// The first key in `[lower, upper)`, or `None`: a probe of a range
     /// whose values are too large to read, which RocksDB answers without
     /// reading them out. Elsewhere through [`Self::new_iter`], which may
@@ -1671,6 +1735,22 @@ pub trait SnapshotReadable: Send + Sync {
         Err(QuilError::Store(
             "fixed vertex snapshot paging is unsupported by this backend".into(),
         ))
+    }
+
+    /// Fixed-key paging for a full scan, with the same snapshot, limits and
+    /// results as [`Self::page_vertex_underlying_fixed`]. Backends may keep
+    /// scanned blocks out of their point-read cache. The default delegates
+    /// without changing cache policy.
+    fn page_vertex_underlying_fixed_for_scan(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard: &ShardKey,
+        domain: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        limits: VertexPageLimits,
+    ) -> Result<VertexDataPage> {
+        self.page_vertex_underlying_fixed(set_type, phase_type, shard, domain, after, limits)
     }
 
     /// [`Self::page_vertex_underlying_fixed`], passing over the rows whose

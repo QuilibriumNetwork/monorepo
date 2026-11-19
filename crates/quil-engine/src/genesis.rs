@@ -750,6 +750,7 @@ pub fn reset_prover_tree_to_genesis_with_guard(
     //    nothing (tree node or flat blob) resurrects a dropped record.
     hypergraph.reset_shard_forest_trees_with_guard(guard, &prover_l2)?;
     store.clear_shard_underlying(&shard)?;
+    hypergraph.invalidate_local_vertex_observer_for_app(&prover_l2);
 
     // 2. REBUILD via the established genesis seeders (Falcon-keyed, exact addresses).
     let seeded = if network == 0 {

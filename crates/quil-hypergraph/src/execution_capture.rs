@@ -13,7 +13,9 @@ pub use adoption::PreparedCrdtAdoption;
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionForkLimits {
     pub overlay: quil_forest::OverlayLimits,
-    /// Map entries and nested vector allocations, checked before cloning.
+    /// Canonical map entries and nested vectors, checked before cloning.
+    /// Optional observer key journals use remaining headroom and degrade to
+    /// invalidation instead of contributing to consensus execution budgets.
     pub max_metadata_entries: usize,
     /// Conservative logical allocation estimate, not an allocator/RSS limit.
     pub max_metadata_bytes: usize,
@@ -140,12 +142,30 @@ impl MetadataBudget {
     }
 }
 
+// Observer descriptors are bounded by the explicitly registered local
+// observers (the existing observer chain has the same bound). Key storage is
+// optional telemetry: share the canonical metadata headroom conservatively,
+// allowing tree and notification-vector overhead, without making observers
+// cause a consensus execution budget failure.
+fn observer_key_limit(
+    limits: ExecutionForkLimits,
+    usage: ExecutionMetadataUsage,
+    observers: usize,
+) -> usize {
+    if observers == 0 {
+        return 0;
+    }
+    MAX_EXECUTION_OBSERVER_KEYS
+        .min(limits.max_metadata_entries.saturating_sub(usage.entries) / observers)
+        .min(limits.max_metadata_bytes.saturating_sub(usage.bytes) / 256 / observers)
+}
+
 impl ExecutionCapture<'_> {
     /// Fork committed CRDT state with a new record-store wrapper over exactly
     /// the captured overlay. The factory must only construct that wrapper; it
     /// must not reenter/mutate the source or perform execution. Metadata limits
-    /// are checked before allocation. No snapshot cache or local observer is
-    /// inherited. The caller owns the overlay lifetime and aggregate budgets.
+    /// are checked before allocation. No snapshot cache or active local observer is
+    /// inherited; optional bounded keys-only journals remain private. The caller owns the overlay lifetime and aggregate budgets.
     pub fn fork(
         &self,
         limits: ExecutionForkLimits,
@@ -353,6 +373,39 @@ impl ExecutionCapture<'_> {
                 size_warm_lock: std::sync::Mutex::new(()),
                 snapshot_mgr: SnapshotManager::new(),
                 local_vertex_observer: RwLock::new(None),
+                local_vertex_key_observers: RwLock::new(Vec::new()),
+                execution_vertex_changes: match &source.execution_vertex_changes {
+                    Some(changes) => {
+                        let changes = changes.lock().unwrap_or_else(|e| e.into_inner());
+                        let max_keys = observer_key_limit(limits, budget.usage, changes.len());
+                        Some(std::sync::Mutex::new(
+                            changes
+                                .iter()
+                                .map(|change| change.clone_bounded(max_keys))
+                                .collect(),
+                        ))
+                    }
+                    None => {
+                        let observers = source
+                            .local_vertex_key_observers
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let mut changes: Vec<_> = observers
+                            .iter()
+                            .cloned()
+                            .filter_map(ExecutionVertexChanges::new)
+                            .collect();
+                        if changes.is_empty() {
+                            None
+                        } else {
+                            let max_keys = observer_key_limit(limits, budget.usage, changes.len());
+                            for change in &mut changes {
+                                change.max_keys = max_keys;
+                            }
+                            Some(std::sync::Mutex::new(changes))
+                        }
+                    }
+                },
                 covered_prefix: RwLock::new(covered.to_vec()),
                 commit_lock: Default::default(),
                 unified_tree: AtomicBool::new(source.unified_tree.load(Ordering::Acquire)),

@@ -2345,6 +2345,37 @@ impl From<crate::supply_index::SupplyCounts> for SupplyLive {
     }
 }
 
+fn migration_supply_baseline(crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Option<SupplyBaseline> {
+    let hstate = quil_execution::hypergraph_state::HypergraphState::new(crdt);
+    quil_execution::token_intrinsic::legacy_migration::read_migration_receipt(
+        &hstate,
+        &quil_execution::domains::QUIL_TOKEN,
+    )
+    .ok()
+    .flatten()
+    .map(|(coins, total)| SupplyBaseline {
+        coins,
+        total_subunits: total.to_string(),
+        total_quil: quil_str(total),
+    })
+}
+
+fn token_supply_body(
+    migration_baseline: Option<SupplyBaseline>,
+    counts: Option<crate::supply_index::SupplyCounts>,
+) -> Vec<u8> {
+    json_value(&SupplyResponse {
+        units_per_quil: quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS,
+        migration_baseline,
+        live_public: counts.map(Into::into),
+        note: "migration_baseline is the audited transparent total at migration. ?scan=1 sums \
+               the full PUBLIC supply: transparent coins (QUIL_TOKEN) + earned/mined \
+               reward balances (public plaintext, GLOBAL intrinsic domain). Only SHIELDED \
+               lattice coins are value-hidden and excluded — everything else is derivable. \
+               (?scan=1 uses the supply index when ready, otherwise scans; server result cached ~180s.)",
+    })
+}
+
 pub async fn handle_token_supply(
     method: Method,
     State(state): State<ExplorerState>,
@@ -2353,11 +2384,8 @@ pub async fn handle_token_supply(
     if !is_get(&method) {
         return method_not_allowed();
     }
-    let domain = quil_execution::domains::QUIL_TOKEN;
-    let units = quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS;
 
-    // Keep the existing response cache and full-scan fallback. An archive with
-    // a ready supply index reads its running summary instead.
+    // Serve cached scans first, then a ready index or a full-scan fallback.
     let want_scan = params
         .get("scan")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2373,7 +2401,7 @@ pub async fn handle_token_supply(
         None
     };
     let _scanning = if want_scan && indexed.is_none() {
-        let Ok(permit) = state.token_scan.try_acquire() else {
+        let Ok(permit) = state.token_scan.clone().try_acquire_owned() else {
             return token_scan_busy();
         };
         // A scan that ended while this request waited for the cache read.
@@ -2385,105 +2413,42 @@ pub async fn handle_token_supply(
         None
     };
 
-    // Audited baseline: the migration receipt (count, Σ). Read via the canonical
-    // reader so it matches how the intrinsic wrote it.
-    let hstate = quil_execution::hypergraph_state::HypergraphState::new(state.crdt.clone());
-    let migration_baseline =
-        quil_execution::token_intrinsic::legacy_migration::read_migration_receipt(&hstate, &domain)
-            .ok()
-            .flatten()
-            .map(|(coins, total)| SupplyBaseline {
-                coins,
-                total_subunits: total.to_string(),
-                total_quil: quil_str(total),
-            });
-
     // Optional (expensive) live PUBLIC-supply scan: transparent coins (QUIL_TOKEN
     // domain) + earned reward balances (GLOBAL intrinsic domain). Only shielded
     // (lattice) coins are value-hidden and left uncounted.
-    let live_public = if let Some(counts) = indexed {
-        Some(counts.into())
-    } else if want_scan {
-        let transparent =
-            quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
-        let private = quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).ok();
-        // 1. Transparent coins + value-hidden coin count (QUIL_TOKEN domain).
-        let (mut tcoins, mut tsum, mut hidden) = (0u64, 0u128, 0u64);
-        let mut coin_cb = |vk: Vec<u8>, blob: Vec<u8>| {
-            if vk.len() < 64 || is_reserved_token_addr(&vk[32..64]) {
-                return;
-            }
-            let root = quil_tries::deserialize_go_tree(&blob).ok().flatten();
-            let tree = quil_tries::VectorCommitmentTree { root };
-            let ty = match tree.get(&[0xFFu8; 32]) {
-                Some(t) => t.to_vec(),
-                None => return,
-            };
-            if Some(ty.as_slice()) == transparent.as_ref().map(|h| h.as_slice()) {
-                if let Some(a) = tree.get(&[1u8 << 2]) {
-                    let mut b = [0u8; 16];
-                    let n = a.len().min(16);
-                    b[..n].copy_from_slice(&a[..n]);
-                    tsum = tsum.saturating_add(u128::from_le_bytes(b));
-                    tcoins += 1;
-                }
-            } else if Some(ty.as_slice()) == private.as_ref().map(|h| h.as_slice()) {
-                hidden += 1;
-            }
-        };
-        let mut scanned = state
-            .crdt
-            .for_each_vertex_adds_blob(&domain, &mut coin_cb)
-            .unwrap_or(0);
-        // 2. Earned/mined reward balances (GLOBAL intrinsic domain, plaintext).
-        let (mut rprovers, mut rsum) = (0u64, 0u128);
-        let mut reward_cb = |_vk: Vec<u8>, blob: Vec<u8>| {
-            let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-            if quil_execution::global_schema::read_type(&tree) != Some("reward:ProverReward") {
-                return;
-            }
-            let bal = quil_execution::global_intrinsic::materialize::read_reward_balance(&tree);
-            if bal.is_empty() {
-                return;
-            }
-            let v = be_bytes_to_u128(&bal);
-            if v > 0 {
-                rsum = rsum.saturating_add(v);
-                rprovers += 1;
-            }
-        };
-        scanned += state
-            .crdt
-            .for_each_vertex_adds_blob(&quil_execution::domains::GLOBAL, &mut reward_cb)
-            .unwrap_or(0);
-        let total_public = tsum.saturating_add(rsum);
-        Some(SupplyLive {
-            transparent_coins: tcoins,
-            transparent_subunits: tsum.to_string(),
-            reward_provers: rprovers,
-            reward_subunits: rsum.to_string(),
-            total_public_subunits: total_public.to_string(),
-            total_public_quil: quil_str(total_public),
-            value_hidden_coins: hidden,
-            scanned,
+    let body = if want_scan && indexed.is_none() {
+        let crdt = state.crdt.clone();
+        let cache_state = state.clone();
+        // Keep the scan off the async executor; its owned permit survives cancellation.
+        match tokio::task::spawn_blocking(move || {
+            let _permit = _scanning;
+            let baseline = migration_supply_baseline(crdt.clone());
+            let counts = crate::supply_index::scan_supply(&crdt)?;
+            let body = token_supply_body(baseline, Some(counts));
+            // Cache before releasing the permit, even if the request was cancelled.
+            cache_put(&cache_state, "token_supply_scan".to_string(), body.clone());
+            Ok::<_, QuilError>(body)
         })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                return self::error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+            }
+            Err(error) => {
+                return self::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("supply scan failed: {error}"),
+                )
+            }
+        }
     } else {
-        None
+        token_supply_body(migration_supply_baseline(state.crdt.clone()), indexed)
     };
-
-    let response = SupplyResponse {
-        units_per_quil: units,
-        migration_baseline,
-        live_public,
-        note: "migration_baseline is the audited transparent total at migration. ?scan=1 sums \
-               the full PUBLIC supply: transparent coins (QUIL_TOKEN) + earned/mined \
-               reward balances (public plaintext, GLOBAL intrinsic domain). Only SHIELDED \
-               lattice coins are value-hidden and excluded — everything else is derivable. \
-               (?scan=1 uses the supply index when ready, otherwise scans; server result cached ~180s.)",
-    };
-    let body = json_value(&response);
     if want_scan {
-        cache_put(&state, "token_supply_scan".to_string(), body.clone());
+        if indexed.is_some() {
+            cache_put(&state, "token_supply_scan".to_string(), body.clone());
+        }
         return build_response(StatusCode::OK, body, Some(CACHE_60));
     }
     build_response(StatusCode::OK, body, None)
@@ -3270,6 +3235,56 @@ mod tests {
         let later = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
         cache_insert(&mut cache, later, "fresh".into(), vec![3]);
         assert_eq!(cache.len(), 1, "expired entries make room");
+    }
+
+    #[tokio::test]
+    async fn cancelled_supply_scan_yields_and_preserves_its_result() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let state = empty_state();
+        let crdt = state.crdt.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = crdt.lock_execution_capture().unwrap();
+            held_tx.send(()).unwrap();
+            // Watchdog only: the test releases the lock after the first poll.
+            release_rx.recv_timeout(Duration::from_secs(30)).is_ok()
+        });
+        held_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let mut request = Box::pin(handle_token_supply(
+            Method::GET,
+            State(state.clone()),
+            Query(HashMap::from([("scan".to_string(), "1".to_string())])),
+        ));
+        let pending = std::future::poll_fn(|cx| {
+            Poll::Ready(matches!(request.as_mut().poll(cx), Poll::Pending))
+        })
+        .await;
+        drop(request);
+        let permits_while_blocked = state.token_scan.available_permits();
+        let _ = release_tx.send(());
+        assert!(
+            holder.join().unwrap(),
+            "scan blocked the runtime until the lock watchdog expired"
+        );
+        assert!(pending, "full scan must yield to the Tokio executor");
+        assert_eq!(
+            permits_while_blocked, 0,
+            "cancelled request released its running scan's permit"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while state.token_scan.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            cache_get(&state, "token_supply_scan").is_some(),
+            "cancelled request discarded its completed full-scan result"
+        );
     }
 
     #[tokio::test]
