@@ -778,6 +778,12 @@ pub struct GlobalLeaderProvider {
     /// proposal copied it ([`MessageCollector::take_proposal_pool`]), for
     /// the proposal line.
     pool: Option<crate::proposal_pool::ProposalPool>,
+    /// The public mempool an execution-branch leader's `message_collector`
+    /// copied ([`Self::for_execution_branch`]): what its validation drops
+    /// leaves only the copy, except a proof a finalized frame applied
+    /// ([`MessageCollector::drop_applied`]). `None` for a leader over the
+    /// mempool itself.
+    mempool: Option<Arc<MessageCollector>>,
 }
 
 impl GlobalLeaderProvider {
@@ -860,6 +866,7 @@ impl GlobalLeaderProvider {
         leader.body_fetch = self.body_fetch.clone();
         leader.proof_settlement = self.proof_settlement.clone();
         leader.pool = self.message_collector.take_proposal_pool();
+        leader.mempool = Some(self.message_collector.clone());
         Ok(leader)
     }
 
@@ -893,6 +900,7 @@ impl GlobalLeaderProvider {
             body_fetch: None,
             proof_settlement: None,
             pool: None,
+            mempool: None,
         }
     }
 
@@ -1620,6 +1628,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // With each message's collection index, to restore that order.
                 let mut valid: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handoff.remaining());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
+                // Refusals naming a seal or settlement GLOBAL applied, by
+                // their index in `invalid`.
+                let mut applied: Vec<(usize, String)> = Vec::new();
                 // Categorized drop breakdown: `"<msg_type> :: <reason>" -> count`,
                 // logged with the summary below. The per-message reason is otherwise
                 // debug-only, hiding WHICH message types + reasons dominate the drops
@@ -1681,7 +1692,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                 .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
-                                "dropping out-of-lockstep shard frame proof from global mempool",
+                                "dropping out-of-lockstep shard frame proof from this proposal's inputs",
                             );
                             invalid.push(raw);
                         }
@@ -1790,8 +1801,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
-                                "dropping protocol-invalid message from global mempool",
+                                "dropping protocol-invalid message from this proposal's inputs",
                             );
+                            if error.contains(
+                                quil_execution::global_intrinsic::storage_epoch_proof::REFUSED_DUPLICATE,
+                            ) {
+                                applied.push((invalid.len(), error));
+                            }
                             invalid.push(raw);
                         }
                     }
@@ -1978,11 +1994,23 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         .map(|(k, n)| format!("{n}× {k}"))
                         .collect::<Vec<_>>()
                         .join(" | ");
+                    // A branch leader's collector is its proposal's copy;
+                    // of what it drops, only proofs a finalized frame
+                    // applied leave the mempool.
+                    let left_mempool = self.mempool.as_ref().map_or(invalid.len(), |mempool| {
+                        mempool.drop_applied(
+                            applied
+                                .iter()
+                                .map(|(index, error)| (invalid[*index].as_slice(), error.as_str())),
+                        )
+                    });
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
+                        from = if self.mempool.is_some() { "proposal copy" } else { "global mempool" },
+                        left_mempool,
                         by_reason = %by_reason,
-                        "dropped protocol-invalid messages from global mempool",
+                        "dropped protocol-invalid messages",
                     );
                     self.message_collector.remove(&invalid);
                 }

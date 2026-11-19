@@ -111,6 +111,9 @@ struct CollectedMessage {
     sender: Option<[u8; 32]>,
     /// The seats the storage epoch proofs it carries prove ([`seat_identity`]).
     seat_keys: Vec<[u8; 32]>,
+    /// Each seal and settlement its storage epoch proofs carry
+    /// ([`StorageKinds::seat_parts`]).
+    seat_parts: Vec<([u8; 32], u64)>,
     /// Its storage epoch proofs prove more seats than one proof covers
     /// ([`StorageKinds::too_many_seats`]).
     too_many_seats: bool,
@@ -190,6 +193,7 @@ impl CollectedMessage {
             passed: None,
             sender: None,
             seat_keys: kinds.seat_keys,
+            seat_parts: kinds.seat_parts,
             too_many_seats: kinds.too_many_seats,
         }
     }
@@ -303,6 +307,9 @@ struct StorageKinds {
     /// messages prove ([`seat_identity`]), up to one proof's
     /// (`storage_epoch_proof::MAX_SEATS`).
     seat_keys: Vec<[u8; 32]>,
+    /// Each seal and settlement of those seats ([`seat_part`]), with the
+    /// end of its window.
+    seat_parts: Vec<([u8; 32], u64)>,
     /// They prove more seats than that; the rest are not in `seat_keys`.
     too_many_seats: bool,
 }
@@ -349,6 +356,7 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
         member: None,
         seats: Default::default(),
         seat_keys: Vec::new(),
+        seat_parts: Vec::new(),
         too_many_seats: false,
     };
     let Ok(bundle) =
@@ -396,6 +404,12 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
                     .seats
                     .iter()
                     .map(|seat| seat_identity(&proof.member, seat)),
+            );
+            kinds.seat_parts.extend(
+                proof
+                    .seats
+                    .iter()
+                    .flat_map(|seat| seat_parts(&proof.member, seat)),
             );
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
@@ -449,6 +463,93 @@ fn seat_identity(
     h.update(seat.epoch.to_be_bytes());
     h.update([u8::from(seat.seals), u8::from(seat.settles)]);
     h.finalize().into()
+}
+
+/// One seal or one settlement of a seat: its member, shard, which and the
+/// epoch it seals or settles. GLOBAL applies each once, and refuses every
+/// later proof carrying it ([`MessageCollector::drop_applied`]).
+fn seat_part(member: &[u8; 32], shard: &[u8], seals: bool, epoch: u64) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/collector/seat-part/v1");
+    h.update(member);
+    h.update((shard.len() as u64).to_be_bytes());
+    h.update(shard);
+    h.update([u8::from(seals)]);
+    h.update(epoch.to_be_bytes());
+    h.finalize().into()
+}
+
+/// The seat parts `seat` proves ([`seat_part`]), each with the GLOBAL frame
+/// its window ends at ([`storage_window_end`]).
+fn seat_parts(
+    member: &[u8; 32],
+    seat: &quil_execution::global_intrinsic::storage_epoch_proof::SeatProof,
+) -> Vec<([u8; 32], u64)> {
+    use quil_execution::global_intrinsic::storage_seat::settlement_window;
+    let seals = seat.seals.then(|| {
+        let epoch = seat.seal_epoch();
+        let end = quil_types::consensus::epoch_start_frame(epoch);
+        (seat_part(member, &seat.shard_filter, true, epoch), end)
+    });
+    let settles = seat.settles.then(|| {
+        let end = settlement_window(seat.epoch).1;
+        (
+            seat_part(member, &seat.shard_filter, false, seat.epoch),
+            end,
+        )
+    });
+    seals.into_iter().chain(settles).collect()
+}
+
+/// What a validation refusal (`storage_epoch_proof::check`) says GLOBAL
+/// already applied: a seal (`true`) or a settlement, the frame that applied
+/// it and, if named, the seat's shard.
+fn applied_refusal(reason: &str) -> Option<(bool, u64, Option<Vec<u8>>)> {
+    use quil_execution::global_intrinsic::storage_epoch_proof::REFUSED_DUPLICATE;
+    let rest = &reason[reason.find(REFUSED_DUPLICATE)? + REFUSED_DUPLICATE.len()..];
+    let (seals, rest) = match rest.strip_prefix(", sealed at frame ") {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix(", settled at frame ")?),
+    };
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let at = rest[..digits].parse().ok()?;
+    let shard = reason.rfind("(shard ").and_then(|start| {
+        let named = &reason[start + "(shard ".len()..];
+        hex::decode(&named[..named.find(')')?]).ok()
+    });
+    Some((seals, at, shard))
+}
+
+/// The one seat part of `raw`'s storage epoch proofs on `shard` that seals
+/// (`seals`) or settles, with the end of its window; `None` when there is
+/// none or more than one.
+fn applied_part(raw: &[u8], seals: bool, shard: &[u8]) -> Option<([u8; 32], u64)> {
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    let bundle =
+        quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw).ok()?;
+    let mut found = None;
+    for request in bundle.requests.iter().flatten() {
+        if request.inner_type_prefix != TYPE_STORAGE_EPOCH_PROOF {
+            continue;
+        }
+        let Ok(proof) = StorageEpochProof::from_canonical_bytes(&request.inner_bytes) else {
+            continue;
+        };
+        for seat in proof.seats.iter().filter(|seat| seat.shard_filter == shard) {
+            if (seals && seat.seals) || (!seals && seat.settles) {
+                let parts = seat_parts(&proof.member, seat);
+                let part = if seals { parts.first() } else { parts.last() };
+                if found.replace(*part?).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The share of held storage epoch proofs a proof from `sender` counts
@@ -1634,6 +1735,9 @@ pub enum Refusal {
     /// share or proving more seats than one proof covers
     /// ([`CollectedMessage::unsendable_seal`]).
     UnsendableSeal,
+    /// A storage epoch proof carrying a seal or settlement a finalized GLOBAL
+    /// frame applied: GLOBAL refuses it whole ([`MessageCollector::drop_applied`]).
+    AppliedSeatPart,
 }
 
 impl Refusal {
@@ -1648,6 +1752,7 @@ impl Refusal {
             Self::InvalidAltShardUpdate => "alt shard update failed verification",
             Self::ShieldClaimed => "another shield of this coin signed by the same key is pending here or awaits its GLOBAL decision",
             Self::UnsendableSeal => "storage epoch proof larger than a GLOBAL proposal's seal share, or proving more seats than one proof covers",
+            Self::AppliedSeatPart => "storage epoch proof seals or settles a seat part a finalized GLOBAL frame already applied, so GLOBAL refuses it whole",
         }
     }
 
@@ -2236,6 +2341,10 @@ pub struct MessageCollector {
     /// ([`Self::next_seal_frame`]). A proposal's frame does not count: one
     /// built on ancestors not yet finalized may be abandoned.
     finalized_frame: std::sync::atomic::AtomicU64,
+    /// Seat parts ([`seat_part`]) a finalized frame applied, learned from a
+    /// leader's refusals ([`Self::drop_applied`]), with the frame their
+    /// window ends at.
+    applied: std::sync::Mutex<HashMap<[u8; 32], u64>>,
     /// Set while shard-frame submits are being rejected, so an admitted
     /// shard frame takes `rejects` only to end the stretch.
     rejects_active: std::sync::atomic::AtomicBool,
@@ -2946,6 +3055,7 @@ impl MessageCollector {
             windows_ended: Default::default(),
             seal_drops: Default::default(),
             finalized_frame: std::sync::atomic::AtomicU64::new(0),
+            applied: Default::default(),
             rejects_active: std::sync::atomic::AtomicBool::new(false),
             rejects: std::sync::Mutex::new(RejectLog::new()),
             intake: Default::default(),
@@ -3362,6 +3472,18 @@ impl MessageCollector {
         // work under the buffers' lock: retried, it would never be held.
         if message.sender.is_some() && self.class_shares() && message.unsendable_seal() {
             return SubmitOutcome::Filtered(Refusal::UnsendableSeal);
+        }
+        // A proof of a seat part a finalized frame applied is refused for
+        // good, before it takes a share: no branch accepts it.
+        if message.held_seal() && !message.seat_parts.is_empty() {
+            let applied = self.applied.lock().unwrap();
+            if message
+                .seat_parts
+                .iter()
+                .any(|(part, _)| applied.contains_key(part))
+            {
+                return SubmitOutcome::Filtered(Refusal::AppliedSeatPart);
+            }
         }
         // Already included in a finalized frame → never re-accept. This
         // is what stops a message from re-entering the mempool after it
@@ -4331,6 +4453,8 @@ impl MessageCollector {
     pub fn note_finalized_frame(&self, frame: u64) {
         self.finalized_frame
             .fetch_max(frame, std::sync::atomic::Ordering::AcqRel);
+        // A proof past its window leaves anyway ([`Self::prune_after_finalization`]).
+        self.applied.lock().unwrap().retain(|_, end| *end > frame);
         // The window line's tally begins at the first frame seen finalized
         // ([`window_seats::WindowSeats::begin`]).
         let next = self.next_seal_frame();
@@ -4785,6 +4909,65 @@ impl MessageCollector {
         // The coins they held stay held by the other messages carrying the
         // same shields ([`ShieldClaims`]).
         self.shield_claims.lock().unwrap().forget(&hashes);
+    }
+
+    /// Drop the storage epoch proofs among `refused`, each with the reason a
+    /// branch leader's validation refused it, that seal or settle what a
+    /// frame at or below the finalized one applied
+    /// (`storage_epoch_proof::REFUSED_DUPLICATE`): every branch refuses them,
+    /// and a leader's copy of the mempool
+    /// ([`Self::snapshot_for_proposal`]) dropping them left them held here,
+    /// to take a proposal's seal share and this collector's held share again
+    /// (2026-11-19: about 7 such proofs a proposal). The applied seat part
+    /// named is remembered until its window ends: held proofs carrying it
+    /// leave too, and submits of one are refused ([`Refusal::AppliedSeatPart`]).
+    /// Returns how many messages left.
+    pub(crate) fn drop_applied<'a>(
+        &self,
+        refused: impl IntoIterator<Item = (&'a [u8], &'a str)>,
+    ) -> usize {
+        let finalized = self
+            .finalized_frame
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut keys = HashSet::new();
+        let mut learned = Vec::new();
+        for (raw, reason) in refused {
+            let Some((seals, at, shard)) = applied_refusal(reason) else {
+                continue;
+            };
+            if finalized == 0 || at > finalized {
+                continue;
+            }
+            keys.insert(message_key(raw));
+            learned.extend(shard.and_then(|shard| applied_part(raw, seals, &shard)));
+        }
+        if keys.is_empty() {
+            return 0;
+        }
+        let applied: HashSet<[u8; 32]> = {
+            let mut applied = self.applied.lock().unwrap();
+            applied.extend(learned);
+            applied.keys().copied().collect()
+        };
+        let dropped: HashSet<[u8; 32]> = {
+            let mut buffers = self.buffers.write().unwrap();
+            let dropped: HashSet<[u8; 32]> = buffers
+                .values()
+                .flat_map(|buffer| buffer.messages.values())
+                .filter(|m| {
+                    keys.contains(&m.hash)
+                        || m.seat_parts.iter().any(|(part, _)| applied.contains(part))
+                })
+                .map(|m| m.hash)
+                .collect();
+            for buffer in buffers.values_mut() {
+                buffer.retain(|m| !dropped.contains(&m.hash));
+            }
+            buffers.retain(|_, b| !b.is_empty());
+            dropped
+        };
+        self.shield_claims.lock().unwrap().forget(&dropped);
+        dropped.len()
     }
 
     /// Take back `data`, a message a finalized frame consumed that has to run
@@ -6764,6 +6947,94 @@ mod tests {
             by(seat_proof(7, 9, 1500, true, 4, 1_000), b"a"),
             SubmitOutcome::Accepted,
             "the sender's held proof of the part left"
+        );
+    }
+
+    /// What a branch leader whose validation refused `raw` with `reason`
+    /// leaves of it in `mempool`, the collector its proposal copied: it drops
+    /// a proof a finalized frame applied ([`MessageCollector::drop_applied`]).
+    fn branch_refuses(mempool: &MessageCollector, raw: &[u8], reason: &str) {
+        mempool.drop_applied([(raw, reason)]);
+    }
+
+    /// How a branch leader's validation refuses a proof sealing what
+    /// `frame` applied, on shard `shard` (`storage_epoch_proof::check`).
+    fn sealed_refusal(frame: u64, shard: u8) -> String {
+        use quil_execution::global_intrinsic::storage_epoch_proof::REFUSED_DUPLICATE;
+        format!(
+            "storage epoch proof: the seat's registration for epoch 1501 is sealed: \
+             {REFUSED_DUPLICATE}, sealed at frame {frame} (shard {})",
+            hex::encode([shard; 32])
+        )
+    }
+
+    /// A held proof a branch leader refused as a copy of a seal a finalized
+    /// frame applied leaves the mempool and its sender's share: the
+    /// sender's next proof is held. Another copy of the seal, in other
+    /// bytes, is refused for good, and the seat's settlement stays.
+    #[test]
+    fn a_refused_copy_of_a_finalized_seal_leaves_the_mempool() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let dead = seat_proof(7, 9, 1500, true, 1, 3 << 20);
+        assert!(dead.len() > SEAL_BYTES_PER_SENDER);
+        assert_eq!(by(dead.clone(), b"a"), SubmitOutcome::Accepted);
+        let settles = seat_proof(7, 9, 1500, false, 2, 1_000);
+        assert_eq!(by(settles.clone(), b"b"), SubmitOutcome::Accepted);
+        let next = seat_proof(8, 8, 1500, true, 3, 1_000);
+        assert_eq!(
+            by(next.clone(), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "premise: the dead proof takes its sender's share"
+        );
+        branch_refuses(&mc, &dead, &sealed_refusal(8_999, 9));
+        assert_eq!(
+            mc.pending_count(1),
+            1,
+            "APPLIED-LEFT: a proof refused as a copy of a finalized seal stayed in the mempool"
+        );
+        assert_eq!(
+            by(next, b"a"),
+            SubmitOutcome::Accepted,
+            "APPLIED-SHARE: the dropped proof still held its sender's share"
+        );
+        assert_ne!(
+            by(seat_proof(7, 9, 1500, true, 4, 1_000), b"c"),
+            SubmitOutcome::Accepted,
+            "APPLIED-INGEST: another copy of a finalized seal was held"
+        );
+        assert_eq!(
+            by(settles, b"b"),
+            SubmitOutcome::Duplicate,
+            "the seat's settlement stays held"
+        );
+    }
+
+    /// A proof refused as a copy of a seal applied above the finalized frame
+    /// stays: the frame that applied it may be abandoned, and the proof
+    /// ride another branch.
+    #[test]
+    fn a_refused_copy_of_a_seal_above_the_finalized_frame_stays() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let copy = seat_proof(7, 9, 1500, true, 1, 1_000);
+        assert_eq!(by(copy.clone(), b"a"), SubmitOutcome::Accepted);
+        branch_refuses(&mc, &copy, &sealed_refusal(9_001, 9));
+        assert_eq!(
+            by(copy, b"a"),
+            SubmitOutcome::Duplicate,
+            "APPLIED-UNFINAL: a proof whose seal is not yet final left the mempool"
+        );
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, true, 2, 1_000), b"b"),
+            SubmitOutcome::Accepted,
+            "APPLIED-UNFINAL-INGEST: another copy of a seal not yet final was refused"
         );
     }
 
