@@ -14373,6 +14373,114 @@ mod proposal_loop_tests {
         );
     }
 
+    /// A node holding 9 seats restarts on a host whose memory holds 6
+    /// (`crate::worker_count`): it joins nothing, the surplus leave proposes
+    /// the 3 surplus seats once and none again through its cooldown, the
+    /// draining seat whose shard sits at halt risk stays (the halt-risk
+    /// shield), and once the leaves depart the node holds its count: no
+    /// join, no leave, only the drained workers retired.
+    #[test]
+    fn a_restart_at_a_memory_bound_count_sheds_its_surplus_once_and_keeps_the_shield() {
+        use crate::worker_count as wc;
+        const GIB: u64 = 1 << 30;
+        let mac = wc::Memory {
+            total: 16 * GIB,
+            wired: Some(2 * GIB),
+        };
+        let derived = wc::derive(
+            0,
+            &wc::Inputs {
+                cpus: 10,
+                memory: Some(mac),
+                disk: None,
+            },
+        );
+        assert_eq!(
+            (derived.count, derived.binding),
+            (6, wc::Binding::Ram),
+            "the host's memory holds 6 seats"
+        );
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let seat = |core: u32| filter_bytes(0xC0 + core as u8);
+        let mut allocs: Vec<ProverAllocationInfo> = Vec::new();
+        for core in 1..=9u32 {
+            wm.add(allocated_worker(core, seat(core)));
+            allocs.push(alloc(seat(core), ProverStatus::Active, 10));
+        }
+        wm.set_configured_count(derived.count);
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        // Core 9 drains, and its shard has HALT_RISK_PROVER_COUNT + 1
+        // active provers: leaving would put it at halt risk. Every other
+        // shard has 10. Shard 10, held by no one here, is open to a join.
+        let actives = |core: u32| if core == 9 { 4 } else { 10 };
+        reg.set_summaries(
+            (1..=10u32)
+                .map(|core| shard_summary(seat(core), actives(core)))
+                .collect(),
+        );
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        let start = 100;
+        lifecycle.set_prover_root_verified_frame(start);
+        let actions = lifecycle
+            .evaluate(start, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(count_proposed_joins(&actions), 0, "no join: {actions:?}");
+        let left = proposed_leave_filters(&actions);
+        assert!(
+            !left.contains(&seat(9)),
+            "the halt-risk shield keeps the draining seat of shard 9: {actions:?}"
+        );
+        assert_eq!(left.len(), 3, "the 3 surplus seats leave: {actions:?}");
+        assert!(
+            left.contains(&seat(7)) && left.contains(&seat(8)),
+            "the unshielded draining seats leave first: {actions:?}"
+        );
+        for frame in start + 1..start + JOIN_COOLDOWN_FRAMES {
+            lifecycle.set_prover_root_verified_frame(frame);
+            let again = lifecycle
+                .evaluate(frame, 1, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            assert_eq!(
+                (count_proposed_joins(&again), count_proposed_leaves(&again)),
+                (0, 0),
+                "nothing more through the cooldown, frame {frame}: {again:?}"
+            );
+        }
+        // The proposed leaves depart and their workers go idle.
+        let left_cores: Vec<u32> = (1..=9u32).filter(|c| left.contains(&seat(*c))).collect();
+        allocs.retain(|a| !left.contains(&a.confirmation_filter));
+        reg.set_prover(prover(address, allocs));
+        for core in &left_cores {
+            wm.deallocate_worker(*core).unwrap();
+        }
+        let after = start + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(after);
+        let actions = lifecycle
+            .evaluate(after, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            (
+                count_proposed_joins(&actions),
+                count_proposed_leaves(&actions)
+            ),
+            (0, 0),
+            "at its count the node neither joins nor leaves: {actions:?}"
+        );
+        let mut retired = wm.retired();
+        retired.sort_unstable();
+        assert_eq!(
+            retired,
+            vec![7, 8],
+            "the drained workers retire; core 9 keeps its shielded seat: {actions:?}"
+        );
+    }
+
     /// At the confirm boundary, the capacity rule confirms a draining
     /// worker's pending leave before a kept worker's of lower reward; the
     /// kept one goes through the score rule, which rejects it with no better

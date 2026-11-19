@@ -34,7 +34,7 @@ const REGULAR_MAX_CONCURRENT_CAP: usize = 16;
 /// its slots: the largest resident size recorded for one depth-32 child
 /// (2.73 GB, see `proofWorker.maxResidentBytes`) plus margin, so busy slots
 /// fit the memory they were sized to.
-const ARCHIVE_CHILD_MEMORY_BYTES: u64 = 3 << 30;
+const ARCHIVE_CHILD_MEMORY_BYTES: u64 = quil_engine::storage_jobs::VERIFIER_RESERVE_BYTES;
 /// Available memory a regular node sets aside per verifier child when it
 /// sizes its slots: as much as an archive, and that much again for its own
 /// growth, since it reads this at startup, before its stores load (one node's
@@ -383,8 +383,12 @@ pub(crate) fn build_node_worker_as(
         // The measured depth-32 child peak is 2.73 GB; reserve 3 GiB from
         // the same scheduler and host ledger as storage creation. Keep the
         // permit through process exit, including failures and timeouts.
-        quil_engine::storage_jobs::reserve_verifier_until(3 << 30, deadline, frame)
-            .map(|permit| Box::new(permit) as _)
+        quil_engine::storage_jobs::reserve_verifier_until(
+            quil_engine::storage_jobs::VERIFIER_RESERVE_BYTES,
+            deadline,
+            frame,
+        )
+        .map(|permit| Box::new(permit) as _)
     }));
     let base = if config.db.path.is_empty() {
         PathBuf::from(".config/store")
