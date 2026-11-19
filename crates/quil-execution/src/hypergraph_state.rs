@@ -970,6 +970,31 @@ mod tests {
         );
     }
 
+    /// A seat part noted after a savepoint leaves with a rollback to it,
+    /// as the writes it describes do; one noted before stays.
+    #[test]
+    fn a_rolled_back_seat_part_is_not_reported() {
+        use quil_types::execution::{SeatPartChange, SeatPartKind};
+        let s = stub_state();
+        let part = |shard: u8| SeatPartChange {
+            member: [7; 32],
+            shard: vec![shard; 32],
+            kind: SeatPartKind::Sealed,
+            epoch: 1502,
+            frame: 9_000,
+        };
+        s.note_seat_part(part(1));
+        let savepoint = s.changeset_len();
+        s.note_seat_part(part(2));
+        assert_eq!(s.seat_parts_since(0), vec![part(1), part(2)], "premise");
+        s.rollback_to(savepoint);
+        assert_eq!(
+            s.seat_parts_since(0),
+            vec![part(1)],
+            "SEAT-PART-ROLLBACK: a seat part noted past a savepoint survived a rollback to it"
+        );
+    }
+
     // -----------------------------------------------------------------
     // State operations
     // -----------------------------------------------------------------

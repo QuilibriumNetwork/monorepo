@@ -715,6 +715,33 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     selection
 }
 
+/// Remove `invalid`, the messages a leader's validation dropped, from its
+/// `collector`. A branch leader's collector is its proposal's copy of the
+/// public `mempool`: of what it drops, only proofs of seat parts a
+/// finalized frame applied leave the mempool ([`MessageCollector::learn_committed`]).
+/// `applied_of` reads those parts from the state validation ran on, so they
+/// re-teach a mempool that restarted and never saw those frames applied.
+/// Returns how many messages left the mempool: all of `invalid` for a
+/// leader over the mempool itself (`mempool` `None`).
+pub(crate) fn release_applied(
+    collector: &MessageCollector,
+    mempool: Option<&MessageCollector>,
+    invalid: &[Vec<u8>],
+    applied_of: impl Fn(&[u8]) -> Vec<quil_types::execution::SeatPartChange>,
+) -> usize {
+    let applied: Vec<quil_types::execution::SeatPartChange> =
+        invalid.iter().flat_map(|raw| applied_of(raw)).collect();
+    let left = match mempool {
+        Some(mempool) => mempool.learn_committed(&applied),
+        None => {
+            collector.learn_committed(&applied);
+            invalid.len()
+        }
+    };
+    collector.remove(invalid);
+    left
+}
+
 /// What a proposal's executed ancestors did
 /// ([`GlobalLeaderProvider::for_execution_branch`]).
 pub(crate) struct ExecutedAncestors<'a> {
@@ -1987,22 +2014,12 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         .map(|(k, n)| format!("{n}× {k}"))
                         .collect::<Vec<_>>()
                         .join(" | ");
-                    // A branch leader's collector is its proposal's copy;
-                    // of what it drops, only proofs of seat parts a
-                    // finalized frame applied leave the mempool. Read from
-                    // the state validation ran on, they re-teach a mempool
-                    // that restarted and never saw those frames applied.
-                    let applied: Vec<quil_types::execution::SeatPartChange> = invalid
-                        .iter()
-                        .flat_map(|raw| validator.applied_seat_parts(raw))
-                        .collect();
-                    let mempool = self.mempool.as_ref().unwrap_or(&self.message_collector);
-                    let learned = mempool.learn_committed(&applied);
-                    let left_mempool = if self.mempool.is_some() {
-                        learned
-                    } else {
-                        invalid.len()
-                    };
+                    let left_mempool = release_applied(
+                        &self.message_collector,
+                        self.mempool.as_deref(),
+                        &invalid,
+                        |raw| validator.applied_seat_parts(raw),
+                    );
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
@@ -2011,7 +2028,6 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         by_reason = %by_reason,
                         "dropped protocol-invalid messages",
                     );
-                    self.message_collector.remove(&invalid);
                 }
                 valid
             }
@@ -2030,6 +2046,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 pool_anchored_parent = pool.anchored_parent,
                 pool_anchored_earlier = pool.anchored_earlier,
                 pool_out_of_window = pool.out_of_window,
+                pool_applied_skipped = pool.applied_skipped,
                 pool_verified = pool.verified,
                 pool_unverified = pool.unverified,
                 verifying = pool.verifying,
