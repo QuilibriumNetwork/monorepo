@@ -2141,14 +2141,19 @@ mod fee_relay_tests {
         Arc,
     };
 
-    struct Incoming(tokio::net::TcpListener);
-    impl tonic::codegen::tokio_stream::Stream for Incoming {
+    /// A listener's connections as a stream; `L` is the listener or a
+    /// shared handle to it (see [`go_down`]).
+    struct Incoming<L = tokio::net::TcpListener>(L);
+    impl<L: std::borrow::Borrow<tokio::net::TcpListener>> tonic::codegen::tokio_stream::Stream
+        for Incoming<L>
+    {
         type Item = std::io::Result<tokio::net::TcpStream>;
         fn poll_next(
             self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
             self.0
+                .borrow()
                 .poll_accept(cx)
                 .map(|result| Some(result.map(|(stream, _)| stream)))
         }
@@ -2859,7 +2864,7 @@ mod fee_relay_tests {
     }
 
     fn serve_assigned(
-        listener: tokio::net::TcpListener,
+        listener: impl std::borrow::Borrow<tokio::net::TcpListener> + Send + 'static,
         worker: AssignedWorker,
     ) -> (
         tokio::sync::oneshot::Sender<()>,
@@ -2892,6 +2897,51 @@ mod fee_relay_tests {
             serving.abort();
             let _ = serving.await;
         }
+    }
+
+    /// A worker's port while the worker is down (see [`go_down`]).
+    struct Down {
+        back: tokio::sync::oneshot::Sender<()>,
+        holding: tokio::task::JoinHandle<Arc<tokio::net::TcpListener>>,
+    }
+
+    /// Stop serving but keep the port bound: a task accepts each connection
+    /// and drops it, so RPCs fail as they would against a stopped worker.
+    /// Freed here and bound again when the worker comes back, the port could
+    /// be taken in between by any other socket on the host (a parallel
+    /// test): `AddrInUse`.
+    async fn go_down(
+        listener: Arc<tokio::net::TcpListener>,
+        stop: tokio::sync::oneshot::Sender<()>,
+        serving: tokio::task::JoinHandle<()>,
+    ) -> Down {
+        stop_serving(stop, serving).await;
+        let (back, mut coming_back) = tokio::sync::oneshot::channel::<()>();
+        let holding = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut coming_back => return listener,
+                    accepted = listener.accept() => drop(accepted),
+                }
+            }
+        });
+        Down { back, holding }
+    }
+
+    /// Serve `worker` again on the port `down` held; the listener is
+    /// returned for the next [`go_down`].
+    async fn come_back(
+        down: Down,
+        worker: AssignedWorker,
+    ) -> (
+        Arc<tokio::net::TcpListener>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let _ = down.back.send(());
+        let listener = down.holding.await.unwrap();
+        let (stop, serving) = serve_assigned(listener.clone(), worker);
+        (listener, stop, serving)
     }
 
     /// Wait up to five seconds for `done`.
@@ -2935,15 +2985,15 @@ mod fee_relay_tests {
     async fn a_respawn_lost_while_the_worker_was_down_is_sent_again() {
         let logs = crate::outage::test_logs::CapturedLogs::default();
         let _guard = logs.install();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let address = listener.local_addr().unwrap();
         let worker = AssignedWorker::default();
-        let (stop, serving) = serve_assigned(listener, worker.clone());
+        let (stop, serving) = serve_assigned(listener.clone(), worker.clone());
         let manager =
             RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
         manager.connect_all().await;
         assert_eq!(manager.check_workers_connected().unwrap(), vec![1]);
-        stop_serving(stop, serving).await;
+        let down = go_down(listener, stop, serving).await;
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         assert!(
@@ -2952,8 +3002,7 @@ mod fee_relay_tests {
         );
         assert!(worker.respawns.lock().unwrap().is_empty());
 
-        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        let (stop, serving) = serve_assigned(listener, worker.clone());
+        let (_, stop, serving) = come_back(down, worker.clone()).await;
         manager
             .reconcile_respawns_at(std::time::Instant::now())
             .await;
@@ -3140,14 +3189,14 @@ mod fee_relay_tests {
     /// allocation, nothing.
     #[tokio::test]
     async fn an_owed_respawn_follows_the_assignment() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let address = listener.local_addr().unwrap();
         let worker = AssignedWorker::default();
-        let (stop, serving) = serve_assigned(listener, worker.clone());
+        let (stop, serving) = serve_assigned(listener.clone(), worker.clone());
         let manager =
             RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
         manager.connect_all().await;
-        stop_serving(stop, serving).await;
+        let down = go_down(listener, stop, serving).await;
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         assert!(
@@ -3160,19 +3209,7 @@ mod fee_relay_tests {
             "the reassignment's failed Respawn is owed"
         );
         let mut later = std::time::Instant::now();
-        let restart = {
-            let worker = worker.clone();
-            move || {
-                let worker = worker.clone();
-                async move {
-                    serve_assigned(
-                        tokio::net::TcpListener::bind(address).await.unwrap(),
-                        worker,
-                    )
-                }
-            }
-        };
-        let (stop, serving) = restart().await;
+        let (listener, stop, serving) = come_back(down, worker.clone()).await;
         for _ in 0..5 {
             later += std::time::Duration::from_secs(600);
             manager.reconcile_respawns_at(later).await;
@@ -3185,12 +3222,12 @@ mod fee_relay_tests {
             vec![vec![8u8; 32]],
             "only the current filter"
         );
-        stop_serving(stop, serving).await;
+        let down = go_down(listener, stop, serving).await;
 
         manager.set_worker_filter(1, &[9; 32], true).unwrap();
         assert!(eventually(|| manager.respawn_state(1) == (true, 0)).await);
         manager.deallocate_worker(1).unwrap();
-        let (stop, serving) = restart().await;
+        let (listener, stop, serving) = come_back(down, worker.clone()).await;
         for _ in 0..3 {
             later += std::time::Duration::from_secs(600);
             manager.reconcile_respawns_at(later).await;
@@ -3200,12 +3237,12 @@ mod fee_relay_tests {
             vec![vec![8u8; 32]],
             "nothing after a deallocation"
         );
-        stop_serving(stop, serving).await;
+        let down = go_down(listener, stop, serving).await;
 
         manager.set_worker_filter(1, &[10; 32], true).unwrap();
         assert!(eventually(|| manager.respawn_state(1) == (true, 0)).await);
         manager.set_allocated(1, false).unwrap();
-        let (stop, serving) = restart().await;
+        let (_, stop, serving) = come_back(down, worker.clone()).await;
         for _ in 0..3 {
             later += std::time::Duration::from_secs(600);
             manager.reconcile_respawns_at(later).await;
