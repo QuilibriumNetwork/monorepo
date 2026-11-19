@@ -896,9 +896,14 @@ impl store::KvDb for RocksDb {
     }
 
     fn new_batch(&self, _indexed: bool) -> Result<Box<dyn store::Transaction>> {
+        Ok(Box::new(RocksTransaction::new(self.db.clone())))
+    }
+
+    fn new_witness_index_batch(&self) -> Result<Box<dyn store::Transaction>> {
+        let batch = quil_forest::DisjointBatch::local_witness_index();
         Ok(Box::new(RocksTransaction {
             db: self.db.clone(),
-            batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
+            batch: std::sync::Mutex::new(TransactionBatch::Disjoint(batch)),
         }))
     }
 
@@ -1037,8 +1042,22 @@ impl store::KvDb for RocksDb {
 
 /// A write batch acting as a transaction.
 pub struct RocksTransaction {
-    pub(crate) db: quil_forest::CoordinatedDb,
-    pub(crate) batch: std::sync::Mutex<rocksdb::WriteBatch>,
+    db: quil_forest::CoordinatedDb,
+    batch: std::sync::Mutex<TransactionBatch>,
+}
+
+enum TransactionBatch {
+    General(rocksdb::WriteBatch),
+    Disjoint(quil_forest::DisjointBatch),
+}
+
+impl RocksTransaction {
+    pub(crate) fn new(db: quil_forest::CoordinatedDb) -> Self {
+        Self {
+            db,
+            batch: std::sync::Mutex::new(TransactionBatch::General(rocksdb::WriteBatch::default())),
+        }
+    }
 }
 
 impl store::Transaction for RocksTransaction {
@@ -1049,19 +1068,32 @@ impl store::Transaction for RocksTransaction {
     }
 
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.batch.lock().unwrap().put(key, value);
+        match &mut *self.batch.lock().unwrap() {
+            TransactionBatch::General(batch) => batch.put(key, value),
+            TransactionBatch::Disjoint(batch) => batch
+                .put(key, value)
+                .map_err(|e| QuilError::Store(e.to_string()))?,
+        }
         Ok(())
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
-        let batch = self.batch.into_inner().unwrap();
-        self.db
-            .write(batch)
-            .map_err(|e| QuilError::Store(e.to_string()))
+        match self.batch.into_inner().unwrap() {
+            TransactionBatch::General(batch) => self.db.write(batch),
+            TransactionBatch::Disjoint(batch) => self
+                .db
+                .write_disjoint(batch, &rocksdb::WriteOptions::default()),
+        }
+        .map_err(|e| QuilError::Store(e.to_string()))
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
-        self.batch.lock().unwrap().delete(key);
+        match &mut *self.batch.lock().unwrap() {
+            TransactionBatch::General(batch) => batch.delete(key),
+            TransactionBatch::Disjoint(batch) => batch
+                .delete(key)
+                .map_err(|e| QuilError::Store(e.to_string()))?,
+        }
         Ok(())
     }
 
@@ -1074,7 +1106,12 @@ impl store::Transaction for RocksTransaction {
     }
 
     fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
-        self.batch.lock().unwrap().delete_range(lower, upper);
+        match &mut *self.batch.lock().unwrap() {
+            TransactionBatch::General(batch) => batch.delete_range(lower, upper),
+            TransactionBatch::Disjoint(batch) => batch
+                .delete_range(lower, upper)
+                .map_err(|e| QuilError::Store(e.to_string()))?,
+        }
         Ok(())
     }
 
@@ -1271,6 +1308,23 @@ mod first_key_tests {
         assert_eq!(db.key_page(b"a1\0", b"b", 2).unwrap(), vec![b"a3".to_vec()]);
         assert!(db.key_page(b"a", b"b", 0).unwrap().is_empty());
         assert!(db.key_page(b"b", b"a", 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prefix_batch_checks_full_keys_and_both_range_endpoints() {
+        let db = RocksDb::open_in_memory().unwrap();
+        let batch = db.new_witness_index_batch().unwrap();
+        let a = [store::LOCAL_WITNESS_INDEX_PREFIX, b"a"].concat();
+        let z = [store::LOCAL_WITNESS_INDEX_PREFIX, b"z"].concat();
+        batch.set(&a, b"staged").unwrap();
+        assert!(batch.set(b"quil/other/b", b"no").is_err());
+        assert!(batch.delete(b"quil/local/qct3-witness/v2/a").is_err());
+        assert!(batch.delete_range(&a, b"quil/u").is_err());
+        assert!(batch.delete_range(b"quil/global/", &z).is_err());
+        assert!(batch.delete_range(&z, &a).is_err());
+        batch.abort().unwrap();
+        assert!(db.get(&a).unwrap().is_none());
+        assert!(db.get(b"quil/other/b").unwrap().is_none());
     }
 
     /// A range's first key is its first live one: keys a range deletion

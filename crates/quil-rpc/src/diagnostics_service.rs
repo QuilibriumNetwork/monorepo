@@ -71,7 +71,7 @@ const PHASES: [(&str, Phase); 11] = [
     ("joining", Phase::Joining),
 ];
 
-const BLOCKERS: [(&str, Blocker); 17] = [
+const BLOCKERS: [(&str, Blocker); 22] = [
     ("waiting for transport", Blocker::WaitingForTransport),
     (
         "restarting consensus host",
@@ -116,6 +116,23 @@ const BLOCKERS: [(&str, Blocker); 17] = [
         Blocker::SessionStateUnavailable,
     ),
     ("storage writes stopped", Blocker::StorageWriteFailed),
+    (
+        "predecessor state unrecovered",
+        Blocker::PredecessorStateUnrecovered,
+    ),
+    (
+        "predecessor history unrecovered",
+        Blocker::PredecessorHistoryUnrecovered,
+    ),
+    (
+        "outgoing history unrecovered",
+        Blocker::OutgoingHistoryUnrecovered,
+    ),
+    (
+        "session chain unresolvable",
+        Blocker::SessionChainUnresolvable,
+    ),
+    ("shard state not ready", Blocker::ShardStateNotReady),
 ];
 
 const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [

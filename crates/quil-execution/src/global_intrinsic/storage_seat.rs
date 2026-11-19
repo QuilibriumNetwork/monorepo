@@ -42,6 +42,8 @@
 
 use quil_types::error::{QuilError, Result};
 use sha3::{Digest as _, Sha3_256};
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
 
 use crate::canonical_cursor::{put_u32, put_u64, read_bytes, read_u32, read_u64};
 use crate::global_schema::{read_field, write_field, write_type, GLOBAL_INTRINSIC_ADDRESS};
@@ -260,13 +262,42 @@ pub struct Seat {
     pub slots: Vec<SeatSlot>,
 }
 
+type SeatAddresses = Mutex<lru::LruCache<Vec<u8>, [u8; 32]>>;
+static ARCHIVE_SEAT_ADDRESSES: OnceLock<SeatAddresses> = OnceLock::new();
+
+/// Share immutable address derivations across the archive master's branch executions.
+/// Seat contents always come from the executing branch.
+pub fn enable_archive_seat_address_cache() {
+    ARCHIVE_SEAT_ADDRESSES
+        .get_or_init(|| Mutex::new(lru::LruCache::new(NonZeroUsize::new(32_768).unwrap())));
+}
+
 /// `poseidon("STORAGE_SEAT" || member || filter)`.
 pub fn seat_address(member: &[u8], filter: &[u8]) -> Result<[u8; 32]> {
     let mut preimage = Vec::with_capacity(12 + member.len() + filter.len());
     preimage.extend_from_slice(b"STORAGE_SEAT");
     preimage.extend_from_slice(member);
     preimage.extend_from_slice(filter);
-    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+    derive_seat_address(preimage, ARCHIVE_SEAT_ADDRESSES.get())
+}
+
+fn derive_seat_address(preimage: Vec<u8>, cache: Option<&SeatAddresses>) -> Result<[u8; 32]> {
+    // Bound retained key bytes as well as entry count. Longer filters still hash normally.
+    let Some(cache) = cache.filter(|_| preimage.len() <= 128) else {
+        return quil_crypto::poseidon::hash_bytes_to_32(&preimage);
+    };
+    let entries = || {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(address) = entries().get(&preimage).copied() {
+        return Ok(address);
+    }
+    // Other threads can use the cache during the hash. Concurrent misses agree.
+    let address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+    entries().put(preimage, address);
+    Ok(address)
 }
 
 /// Fold one committed frame into a seat's chain.
@@ -542,7 +573,7 @@ impl Seat {
 
 /// The seat of `member` on `filter` in committed `state`.
 pub fn read(state: &HypergraphState, member: &[u8; 32], filter: &[u8]) -> Result<Option<Seat>> {
-    Ok(read_sized(state, member, filter)?.map(|(seat, _)| seat))
+    read_address(state, &seat_address(member, filter)?)
 }
 
 /// [`read`], with the size in bytes of the seat's stored record.
@@ -551,26 +582,96 @@ pub fn read_sized(
     member: &[u8; 32],
     filter: &[u8],
 ) -> Result<Option<(Seat, usize)>> {
-    read_address_sized(state, &seat_address(member, filter)?)
+    read_address_sized(state, &seat_address(member, filter)?, true)
+}
+
+/// Raw records for the next group of participants. A buffered miss is
+/// distinct from an address which has already been consumed or changed.
+#[derive(Default)]
+pub(super) struct ParticipantSeats(std::collections::BTreeMap<[u8; 32], Option<Vec<u8>>>);
+
+impl ParticipantSeats {
+    pub(super) fn prefetch<'a>(
+        &mut self,
+        state: &HypergraphState,
+        filter: &[u8],
+        members: impl Iterator<Item = &'a [u8; 32]>,
+    ) -> Result<()> {
+        let mut addresses = std::collections::BTreeSet::new();
+        for member in members {
+            addresses.insert(seat_address(member, filter)?);
+        }
+        let addresses: Vec<_> = addresses.into_iter().collect();
+        let started = crate::step_timing::participant_lookup_start();
+        let mut rows = state.global_vertex_batch(&addresses)?;
+        if let Some(start) = started {
+            crate::step_timing::participant_batch_done(
+                start,
+                addresses.len(),
+                addresses.len() - rows.len(),
+            );
+        }
+        self.0 = addresses
+            .into_iter()
+            .map(|address| (address, rows.remove(&address)))
+            .collect();
+        Ok(())
+    }
+
+    pub(super) fn read(
+        &mut self,
+        state: &HypergraphState,
+        member: &[u8; 32],
+        filter: &[u8],
+    ) -> Result<Option<(Seat, usize)>> {
+        if self.0.is_empty() {
+            return read_sized(state, member, filter);
+        }
+        let address = seat_address(member, filter)?;
+        match self.0.remove(&address) {
+            Some(Some(blob)) => {
+                decode_seat(&blob, crate::step_timing::participant_lookup_start()).map(Some)
+            }
+            Some(None) => Ok(None),
+            None => read_address_sized(state, &address, true),
+        }
+    }
+
+    pub(super) fn invalidate(&mut self, address: &[u8; 32]) {
+        self.0.remove(address);
+    }
 }
 
 /// The seat at `address` in committed `state`.
 pub fn read_address(state: &HypergraphState, address: &[u8; 32]) -> Result<Option<Seat>> {
-    Ok(read_address_sized(state, address)?.map(|(seat, _)| seat))
+    Ok(read_address_sized(state, address, false)?.map(|(seat, _)| seat))
 }
 
 fn read_address_sized(
     state: &HypergraphState,
     address: &[u8; 32],
+    participant: bool,
 ) -> Result<Option<(Seat, usize)>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-    match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)? {
-        Some(blob) if !blob.is_empty() => Seat::from_tree(
-            &crate::prover_registry::rebuild_vertex_tree_from_blob(&blob),
-        )
-        .map(|seat| Some((seat, blob.len()))),
-        _ => Ok(None),
+    let lookup = participant
+        .then(crate::step_timing::participant_lookup_start)
+        .flatten();
+    let blob = state
+        .get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)?
+        .filter(|blob| !blob.is_empty());
+    let decode =
+        lookup.and_then(|start| crate::step_timing::participant_lookup_done(start, blob.is_some()));
+    blob.as_deref()
+        .map(|blob| decode_seat(blob, decode))
+        .transpose()
+}
+
+fn decode_seat(blob: &[u8], decode: Option<std::time::Instant>) -> Result<(Seat, usize)> {
+    let seat = Seat::from_tree(&crate::prover_registry::rebuild_vertex_tree_from_blob(blob));
+    if let Some(start) = decode {
+        crate::step_timing::participant_decode_done(start);
     }
+    seat.map(|seat| (seat, blob.len()))
 }
 
 /// Whether GLOBAL frame `frame` forgives `member`'s kick at GLOBAL frame
@@ -630,6 +731,10 @@ pub fn kick_forgiven(
 
 /// Write `seat` at GLOBAL frame `frame`.
 pub fn write(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<()> {
+    write_record(state, frame, seat).map(|_| ())
+}
+
+pub(super) fn write_record(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<[u8; 32]> {
     let address = seat_address(&seat.member, &seat.filter)?;
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     let blob = crate::prover_registry::vertex_tree_to_blob(&seat.to_tree()?);
@@ -639,7 +744,8 @@ pub fn write(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<()> {
         &va_disc,
         frame,
         blob,
-    )
+    )?;
+    Ok(address)
 }
 
 /// Epochs whose queues are kept: a queue is swept two epochs after its own,
@@ -851,22 +957,26 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
 /// Committee scheduling only needs sealed epochs, not copies of every
 /// committed frame's chain. Keep validation identical to full decoding.
 pub(crate) fn decode_sealed_epochs(data: &[u8]) -> Result<Vec<u64>> {
+    Ok(sealed_epochs(
+        decode_slots_inner(data, false)?
+            .iter()
+            .map(|s| (s.epoch, s.sealed_at, !s.leaves.is_empty())),
+    ))
+}
+
+pub(crate) fn sealed_epochs(slots: impl Iterator<Item = (u64, Option<u64>, bool)>) -> Vec<u64> {
     let mut seen = Vec::new();
     let mut sealed = Vec::new();
-    for slot in decode_slots_inner(data, false)? {
-        if seen.contains(&slot.epoch) {
+    for (epoch, at, has_leaves) in slots {
+        if seen.contains(&epoch) {
             continue;
         }
-        seen.push(slot.epoch);
-        if slot.is_sealed()
-            && slot
-                .sealed_at
-                .is_some_and(|at| at < quil_types::consensus::epoch_start_frame(slot.epoch))
-        {
-            sealed.push(slot.epoch);
+        seen.push(epoch);
+        if has_leaves && at.is_some_and(|at| at < quil_types::consensus::epoch_start_frame(epoch)) {
+            sealed.push(epoch);
         }
     }
-    Ok(sealed)
+    sealed
 }
 
 fn decode_slots_inner(data: &[u8], details: bool) -> Result<Vec<SeatSlot>> {
@@ -1021,6 +1131,36 @@ fn unzigzag(value: u64) -> i64 {
 mod tests {
     use super::*;
     use num_bigint::BigInt;
+
+    #[test]
+    fn cached_seat_addresses_match_poseidon_across_hits_eviction_and_long_filters() {
+        let cache = Mutex::new(lru::LruCache::new(NonZeroUsize::new(2).unwrap()));
+        let input = |member: u8, filter: &[u8]| {
+            [b"STORAGE_SEAT".as_slice(), &[member; 32], filter].concat()
+        };
+        let a = input(1, &[2; 35]);
+        let b = input(1, &[2; 36]);
+        let c = input(2, &[2; 35]);
+        for key in [&a, &b, &a, &c] {
+            let expected = quil_crypto::poseidon::hash_bytes_to_32(key).unwrap();
+            assert_eq!(
+                derive_seat_address(key.clone(), Some(&cache)).unwrap(),
+                expected
+            );
+        }
+        assert!(!cache.lock().unwrap().contains(&b));
+        assert_eq!(
+            seat_address(&[1; 32], &[2; 35]).unwrap(),
+            *cache.lock().unwrap().peek(&a).unwrap()
+        );
+        let long = input(1, &[7; 256]);
+        assert_eq!(
+            derive_seat_address(long.clone(), Some(&cache)).unwrap(),
+            derive_seat_address(long.clone(), None).unwrap()
+        );
+        assert!(!cache.lock().unwrap().contains(&long));
+        assert_eq!(cache.lock().unwrap().len(), 2);
+    }
 
     fn sealed_seat(epoch: u64) -> Seat {
         let mut seat = Seat::new([7; 32], vec![1, 2, 3]);

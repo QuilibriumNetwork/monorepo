@@ -4652,13 +4652,15 @@ impl AppConsensusEngine {
                         frame = frame_number,
                         operations = unverified.len(),
                         waited_secs = waited.as_secs(),
+                        memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
                         estimate_secs = estimate_secs.round() as u64,
                         queued_ahead,
                         scope = "this node's proof worker",
-                        action = "the frame keeps waiting and materializes once its proofs verify; this node \
-                                  verifies confidential proofs slower than its shards' frames carry them: check \
-                                  its CPU and proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 \
-                                  at once)",
+                        action = "the frame keeps waiting and materializes once its proofs verify; \
+                                  memory_starved_secs above 0 says its checks wait for memory or a slot (see \
+                                  the line on proof checks starved); else this node verifies confidential \
+                                  proofs slower than its shards' frames carry them: check its CPU and \
+                                  proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 at once)",
                         "app-shard frame materialization still waits for its proof verification on a background thread"
                     );
                 }
@@ -6110,6 +6112,7 @@ impl AppConsensusEngine {
     /// next frame it needs is `missing_from`, and it holds or was handed
     /// frames up to `highest`.
     fn log_behind(&mut self, gap: bool, missing_from: u64, highest: u64, now: std::time::Instant) {
+        self.behind_shard.applied(self.last_materialized_frame, now);
         let Some(line) = self.behind_shard.behind(gap, now) else {
             return;
         };
@@ -6120,6 +6123,14 @@ impl AppConsensusEngine {
         };
         let cursor = self.last_materialized_frame;
         let behind_frames = highest.saturating_sub(cursor);
+        let mark = CatchUpMark {
+            at: now,
+            cursor,
+            highest,
+        };
+        let pace = CatchUp::since(self.behind_shard.mark.replace(mark), mark);
+        let or_none =
+            |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
         match line {
             Behind::Started => info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                 cursor, missing_from, highest, behind_frames, seen_by,
@@ -6130,7 +6141,15 @@ impl AppConsensusEngine {
                 "this worker is behind its shard and is catching up"),
             Behind::Overdue(lasted) => warn!(core_id = self.core_id,
                 filter = hex::encode(&self.filter), cursor, missing_from, highest, behind_frames,
-                seen_by, behind_secs = lasted.as_secs(), scope = "this node's worker",
+                seen_by, behind_secs = lasted.as_secs(),
+                applied_per_hour = %or_none(pace.map(|p| p.applied_per_hour)),
+                shard_per_hour = %or_none(pace.map(|p| p.grown_per_hour)),
+                pace = pace.map_or("first line: measured from the next", |p| p.pace),
+                eta_secs = %or_none(pace.and_then(|p| p.eta_secs)),
+                idle_secs = self.behind_shard.idle(now).as_secs(),
+                recovery = %recovery_wait(self.execution.snapshot().recovery.as_ref(),
+                    crate::worker_execution::now_ms()),
+                scope = "this node's worker",
                 action = "run `qclient node diagnostics health --self` and compare this worker's \
                           LOCAL with COMMITTEE and its RECOVERY failures; if every worker is behind, \
                           check this node's archive connections ('archive connection still \
@@ -6651,14 +6670,28 @@ impl AppConsensusEngine {
             }
             _ => 0,
         };
-        info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
-            waited_secs = now.saturating_duration_since(wait.since).as_secs(),
-            cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
-            scope = "this node's proof worker",
-            action = "an expected wait: the frame is authenticated and committed, and materializes once its \
-                proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
-                failure; if it lasts hours, check this node's CPU and proofWorker settings",
-            "archive replay frame waits for its proof verification");
+        let waited = now.saturating_duration_since(wait.since);
+        if proof_wait_overruns(waited) {
+            warn!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+                waited_secs = waited.as_secs(),
+                memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
+                cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+                scope = "this node's proof worker",
+                action = "the frame is committed and materializes once its proofs verify; its recovery \
+                    defers meanwhile; memory_starved_secs above 0 says this node's proof checks wait for \
+                    memory or a slot (see the line on proof checks starved), else check this node's CPU \
+                    and proofWorker settings",
+                "archive replay frame still waits for its proof verification");
+        } else {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+                waited_secs = waited.as_secs(),
+                cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+                scope = "this node's proof worker",
+                action = "an expected wait: the frame is authenticated and committed, and materializes once its \
+                    proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
+                    failure; if it lasts hours, check this node's CPU and proofWorker settings",
+                "archive replay frame waits for its proof verification");
+        }
         if let Some(wait) = self.proof_wait.as_mut() {
             wait.logged = Some(now);
         }
@@ -7286,6 +7319,18 @@ impl AppConsensusEngine {
             (Some(seal), Some(cursor)) => seal.through.saturating_sub(cursor).to_string(),
             _ => "unknown".to_string(),
         };
+        // The replay's pace toward the seal frame since the previous line.
+        let pace = match (seal.as_ref(), committed_cursor) {
+            (Some(seal), Some(cursor)) => {
+                let mark = CatchUpMark {
+                    at: now,
+                    cursor,
+                    highest: seal.through,
+                };
+                CatchUp::since(self.predecessor_block.mark.replace(mark), mark)
+            }
+            _ => None,
+        };
         // A recovery that failed before reaching this engine (an archive
         // lacking the frame, a failed connection) is recorded only by the
         // worker's execution record.
@@ -7345,6 +7390,9 @@ impl AppConsensusEngine {
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
             local_frame = self.last_materialized_frame,
             committed_cursor = %or_none(committed_cursor), missing_frames = %missing_frames, recovery = %recovery,
+            applied_per_hour = %or_none(pace.map(|p| p.applied_per_hour)),
+            pace = pace.map_or("first line: measured from the next", |p| p.pace),
+            eta_secs = %or_none(pace.and_then(|p| p.eta_secs)),
             anchor_frame = %or_none(refusal.and_then(|r| r.frame)),
             anchored_global_frame = %or_none(refusal.and_then(|r| r.global_frame)),
             cause = refusal.map_or("no recovery refusal recorded yet", |r| r.cause),
@@ -7445,25 +7493,27 @@ impl AppConsensusEngine {
         let generation = or_none(self.start_context.generation);
         let members = or_none(self.start_context.members.map(|n| n as u64));
         let scope = refusal.scope.label();
+        // The worker's status names the same blocker.
+        let blocker = refusal.record().1;
         match log {
             StartLog::Refused => {
                 info!(core_id = self.core_id, filter = %filter, session_generation = %generation,
-                members = %members, scope = scope, reason = %refusal.reason, action = refusal.action,
-                "app consensus cannot start")
+                members = %members, scope = scope, blocker = blocker, reason = %refusal.reason,
+                action = refusal.action, "app consensus cannot start")
             }
             StartLog::Continues {
                 blocked,
                 warn: true,
             } => warn!(core_id = self.core_id, filter = %filter,
-                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
-                action = refusal.action, blocked_secs = blocked.as_secs(),
+                session_generation = %generation, members = %members, scope = scope, blocker = blocker,
+                reason = %refusal.reason, action = refusal.action, blocked_secs = blocked.as_secs(),
                 "app consensus still cannot start"),
             StartLog::Continues {
                 blocked,
                 warn: false,
             } => info!(core_id = self.core_id, filter = %filter,
-                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
-                action = refusal.action, blocked_secs = blocked.as_secs(),
+                session_generation = %generation, members = %members, scope = scope, blocker = blocker,
+                reason = %refusal.reason, action = refusal.action, blocked_secs = blocked.as_secs(),
                 "app consensus still waiting to start"),
         }
     }
@@ -11029,9 +11079,7 @@ impl AppConsensusEngine {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
             if !recovered? {
-                return Err(QuilError::ExecutionUnavailable(
-                    "outgoing history recovery is still in progress".into(),
-                ));
+                return Err(QuilError::ExecutionUnavailable(OWN_HISTORY_PENDING.into()));
             }
         }
 
@@ -16989,6 +17037,15 @@ fn predecessor_history_pending(error: &QuilError) -> bool {
         if reason == "predecessor outgoing history recovery is still in progress")
 }
 
+/// Why a start waits on this worker's own outgoing history, which it
+/// rebuilds before its first session start.
+const OWN_HISTORY_PENDING: &str = "outgoing history recovery is still in progress";
+
+/// Whether `error` is the wait for this worker's own outgoing history.
+fn own_history_pending(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason) if reason == OWN_HISTORY_PENDING)
+}
+
 /// How long a successor waits on its predecessor's state before it warns.
 /// The retry requests a shard sync every 10 s, and a sync's GLOBAL anchor
 /// and storage-proof fetches are bounded at 12 s and 15 s, so a recovery that
@@ -17269,6 +17326,8 @@ struct PredecessorBlock {
     /// Why the last anchor validation had no storage history, which names a
     /// GLOBAL anchor fetch that failed.
     history_error: Option<String>,
+    /// The committed cursor at the last warning, toward the seal frame.
+    mark: Option<CatchUpMark>,
 }
 
 impl PredecessorBlock {
@@ -17292,6 +17351,7 @@ impl PredecessorBlock {
     /// A start no longer refused for it: how long it was, if that was
     /// warned about. The anchor refusal is kept for a later wait.
     fn cleared(&mut self, now: std::time::Instant) -> Option<Duration> {
+        self.mark = None;
         let since = self.since.take()?;
         self.warned
             .take()
@@ -17481,13 +17541,29 @@ enum Awaited {
 }
 
 /// The start check that refused a start, as the execution record names it.
-fn refused_check(text: &str) -> &'static str {
+/// Each wait a successor or a recovering worker sees has its own name, so a
+/// seat whose renewal this node withholds shows what its worker waits on.
+fn refused_check(error: &QuilError, text: &str) -> &'static str {
     if text.contains("sealed checkpoint") {
         "checkpoint mismatch"
     } else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") {
         "state unavailable"
     } else if text.contains("committee build failed") {
         "committee admission unavailable"
+    } else if crate::app_handoff::predecessor_unrecovered(error) {
+        "predecessor state unrecovered"
+    } else if predecessor_history_pending(error) {
+        "predecessor history unrecovered"
+    } else if own_history_pending(error) {
+        "outgoing history unrecovered"
+    } else if text.contains("to look through") {
+        "session chain unresolvable"
+    } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
+        "awaiting GLOBAL state sync"
+    } else if text.contains(REANCHOR_IN_PROGRESS) {
+        "awaiting shard re-anchor"
+    } else if matches!(error, QuilError::ExecutionUnavailable(_)) {
+        "shard state not ready"
     } else {
         "consensus startup unavailable"
     }
@@ -17720,7 +17796,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
     use quil_types::consensus::EffectiveStatus;
     use StartScope::{CommittedGlobal, ExpectedWait, ThisNode};
     let text = error.to_string();
-    let check = refused_check(&text);
+    let check = refused_check(error, &text);
     let refusal =
         |key: String, reason: String, scope: StartScope, action: &'static str, repeats: bool| {
             StartRefusal {
@@ -19211,6 +19287,10 @@ struct BehindShard {
     warned: Option<std::time::Instant>,
     gap: bool,
     deferred: bool,
+    /// The cursor and frames known at the last line.
+    mark: Option<CatchUpMark>,
+    /// The cursor as these checks last saw it, and since when it stands.
+    moved: Option<(u64, std::time::Instant)>,
 }
 
 /// What a [`BehindShard`] check logs.
@@ -19258,8 +19338,114 @@ impl BehindShard {
             return None;
         }
         self.warned = None;
+        self.mark = None;
+        self.moved = None;
         Some(now.saturating_duration_since(self.since.take()?))
     }
+
+    /// The worker's cursor at a check at `now`.
+    fn applied(&mut self, cursor: u64, now: std::time::Instant) {
+        if self.moved.is_none_or(|(seen, _)| seen != cursor) {
+            self.moved = Some((cursor, now));
+        }
+    }
+
+    /// How long the cursor has stood where these checks last saw it.
+    fn idle(&self, now: std::time::Instant) -> Duration {
+        self.moved
+            .map_or(Duration::ZERO, |(_, at)| now.saturating_duration_since(at))
+    }
+}
+
+/// A worker's catch-up at one line: its cursor and the frame it catches
+/// up to (its shard's highest known frame, or a seal frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatchUpMark {
+    at: std::time::Instant,
+    cursor: u64,
+    highest: u64,
+}
+
+/// A worker's catch-up between two lines: whether its replay stalls, runs
+/// slower than its shard grows, or ends, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatchUp {
+    /// Frames applied per hour since the earlier line.
+    applied_per_hour: u64,
+    /// Frames the target moved per hour since the earlier line.
+    grown_per_hour: u64,
+    pace: &'static str,
+    /// When it catches up at this pace.
+    eta_secs: Option<u64>,
+}
+
+impl CatchUp {
+    /// From `earlier` to `now`; none without an earlier line, or within a
+    /// second of it.
+    fn since(earlier: Option<CatchUpMark>, now: CatchUpMark) -> Option<Self> {
+        let earlier = earlier?;
+        let secs = now.at.saturating_duration_since(earlier.at).as_secs();
+        if secs == 0 {
+            return None;
+        }
+        let applied = now.cursor.saturating_sub(earlier.cursor);
+        let grown = now.highest.saturating_sub(earlier.highest);
+        let per_hour = |frames: u64| frames.saturating_mul(3600) / secs;
+        let (pace, eta_secs) = if applied == 0 {
+            ("stalled: no frame applied since the last line", None)
+        } else if applied <= grown {
+            (
+                "losing ground: the shard grows as fast as this worker applies frames",
+                None,
+            )
+        } else {
+            let behind = now.highest.saturating_sub(now.cursor);
+            (
+                "catching up",
+                Some(behind.saturating_mul(secs) / (applied - grown)),
+            )
+        };
+        Some(Self {
+            applied_per_hour: per_hour(applied),
+            grown_per_hour: per_hour(grown),
+            pace,
+            eta_secs,
+        })
+    }
+}
+
+/// What a worker's archive recovery waits on, from its execution record at
+/// `now_ms`: its phase and for how long, the source it reads, and its
+/// failures.
+fn recovery_wait(record: Option<&quil_types::proto::node::ShardRecovery>, now_ms: u64) -> String {
+    let Some(r) = record else {
+        return "no archive recovery attempt recorded on this worker".to_string();
+    };
+    let or = |text: &str, none: &'static str| {
+        if text.is_empty() {
+            none.to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    let phase_for = if r.phase_since_unix_ms == 0 {
+        String::new()
+    } else {
+        format!(
+            " for {}s",
+            now_ms.saturating_sub(r.phase_since_unix_ms) / 1000
+        )
+    };
+    format!(
+        "phase {}{phase_for}, source {}, last permit wait {}s, {} attempts, {} consecutive \
+         failures, last error {}",
+        or(&r.phase, "idle"),
+        or(&r.source, "none"),
+        r.permit_wait_ms / 1000,
+        r.attempts,
+        r.consecutive_failures,
+        or(&r.last_error, "none"),
+    )
 }
 
 #[cfg(test)]
@@ -19267,6 +19453,139 @@ mod behind_shard_tests {
     use super::*;
 
     const MINUTE: Duration = Duration::from_secs(60);
+
+    /// Each reason a start waits on its own or its predecessor's state has
+    /// its own name, which the worker's status maps; only a refusal of no
+    /// known kind keeps the catch-all (i964: a successor recovering its
+    /// predecessor read as "consensus startup unavailable" for hours).
+    #[test]
+    fn each_startup_wait_names_its_reason() {
+        let unavailable = |text: &str| QuilError::ExecutionUnavailable(text.into());
+        let rows = [
+            (
+                unavailable(
+                    "app committee session: predecessor state has not been recovered through its seal",
+                ),
+                "predecessor state unrecovered",
+            ),
+            (
+                unavailable("predecessor outgoing history recovery is still in progress"),
+                "predecessor history unrecovered",
+            ),
+            (unavailable(OWN_HISTORY_PENDING), "outgoing history unrecovered"),
+            (
+                QuilError::Consensus(
+                    "app committee session: too many sessions sealed at their base to look through"
+                        .into(),
+                ),
+                "session chain unresolvable",
+            ),
+            (
+                unavailable("shard engine stopped before archive replay"),
+                "shard state not ready",
+            ),
+            (
+                QuilError::Consensus("app consensus host failed".into()),
+                "consensus startup unavailable",
+            ),
+        ];
+        let mut names = std::collections::HashSet::new();
+        for (error, name) in rows {
+            assert_eq!(
+                refused_check(&error, &error.to_string()),
+                name,
+                "reason_unnamed {error}"
+            );
+            assert!(crate::worker_execution::BLOCKERS.contains(&name), "{name}");
+            assert!(names.insert(name), "{name} named twice");
+        }
+    }
+
+    fn mark(start: std::time::Instant, minutes: u32, cursor: u64, highest: u64) -> CatchUpMark {
+        CatchUpMark {
+            at: start + MINUTE * minutes,
+            cursor,
+            highest,
+        }
+    }
+
+    /// The pace between two lines separates a replay that applies nothing,
+    /// one the shard outgrows (mainnet 2026-11-13: about 5 frames a minute
+    /// applied as the shard grew 4) and one that ends, with its end.
+    #[test]
+    fn the_pace_separates_a_stall_from_a_slow_replay() {
+        let start = std::time::Instant::now();
+        let first = mark(start, 0, 1_000, 2_000);
+        assert_eq!(CatchUp::since(None, first), None, "first line");
+        assert_eq!(CatchUp::since(Some(first), first), None, "no time passed");
+        let stalled = CatchUp::since(Some(first), mark(start, 10, 1_000, 2_040)).unwrap();
+        assert!(stalled.pace.starts_with("stalled"), "{stalled:?}");
+        assert_eq!((stalled.applied_per_hour, stalled.grown_per_hour), (0, 240));
+        assert_eq!(stalled.eta_secs, None);
+        let losing = CatchUp::since(Some(first), mark(start, 10, 1_040, 2_040)).unwrap();
+        assert!(
+            losing.pace.starts_with("losing ground"),
+            "losing_ground_unnamed {losing:?}"
+        );
+        assert_eq!(losing.eta_secs, None);
+        let slow = CatchUp::since(Some(first), mark(start, 18, 1_087, 2_078)).unwrap();
+        assert_eq!(slow.pace, "catching up");
+        assert_eq!((slow.applied_per_hour, slow.grown_per_hour), (290, 260));
+        // 991 frames behind, closing 9 frames in 18 minutes.
+        assert_eq!(slow.eta_secs, Some(991 * 18 * 60 / 9), "eta_net_of_growth");
+        let seal = CatchUp::since(Some(first), mark(start, 10, 1_600, 2_000)).unwrap();
+        assert_eq!(seal.eta_secs, Some(400));
+    }
+
+    /// The idle time is how long the cursor has stood, timed afresh by each
+    /// move and by a new condition.
+    #[test]
+    fn the_idle_time_counts_from_the_last_move() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut behind = BehindShard::default();
+        assert_eq!(behind.idle(at(0)), Duration::ZERO, "nothing seen");
+        behind.applied(10, at(0));
+        behind.applied(10, at(4));
+        assert_eq!(behind.idle(at(5)), MINUTE * 5, "idle_since_move");
+        behind.applied(11, at(6));
+        assert_eq!(behind.idle(at(9)), MINUTE * 3);
+        behind.behind(true, at(9));
+        behind.caught_up(true, at(10));
+        assert_eq!(behind.idle(at(11)), Duration::ZERO, "a new condition");
+    }
+
+    /// The recovery a stalled worker waits on is named: its phase and for
+    /// how long, its source and its failures.
+    #[test]
+    fn the_recovery_wait_names_its_source() {
+        assert_eq!(
+            recovery_wait(None, 0),
+            "no archive recovery attempt recorded on this worker"
+        );
+        let record = quil_types::proto::node::ShardRecovery {
+            phase: "waiting_for_permit".into(),
+            phase_since_unix_ms: 1_000,
+            source: "archive-a".into(),
+            permit_wait_ms: 7_400,
+            attempts: 3,
+            consecutive_failures: 1,
+            last_error: "engine stopped".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            recovery_wait(Some(&record), 61_000),
+            "phase waiting_for_permit for 60s, source archive-a, last permit wait 7s, 3 attempts, \
+             1 consecutive failures, last error engine stopped",
+            "recovery_wait_text"
+        );
+        let idle = quil_types::proto::node::ShardRecovery::default();
+        assert_eq!(
+            recovery_wait(Some(&idle), 5),
+            "phase idle, source none, last permit wait 0s, 0 attempts, 0 consecutive \
+             failures, last error none"
+        );
+    }
 
     /// The frame-gap and deferral checks of one worker log one condition:
     /// a start at info, nothing more inside the bound, then a warning at
@@ -19532,8 +19851,15 @@ impl UnrewindableFenceBlock {
 }
 
 /// How often an archive recovery that keeps finding its frame waiting for
-/// this node's proof verification logs the wait again.
+/// this node's proof verification logs the wait again; a wait this long
+/// warns ([`proof_wait_overruns`]).
 const PROOF_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// Whether an archive replay frame waiting `waited` for this node's proof
+/// verification warns: from [`PROOF_WAIT_REPEAT`], its second line on.
+fn proof_wait_overruns(waited: Duration) -> bool {
+    waited >= PROOF_WAIT_REPEAT
+}
 
 /// The frame after the cursor whose materialization stopped to wait for this
 /// node's proof verification: its proofs verify in the background
@@ -21786,6 +22112,21 @@ mod frame_gap_tests {
 mod tests {
     use super::*;
 
+    /// An archive replay frame waiting for this node's proof verification
+    /// logs its first line as an expected wait and warns from its second,
+    /// [`PROOF_WAIT_REPEAT`] in.
+    #[test]
+    fn a_replay_frames_proof_wait_warns_from_its_second_line() {
+        assert!(!proof_wait_overruns(Duration::ZERO));
+        assert!(!proof_wait_overruns(
+            PROOF_WAIT_REPEAT - Duration::from_secs(1)
+        ));
+        assert!(
+            proof_wait_overruns(PROOF_WAIT_REPEAT),
+            "proof_wait_warned_late: a wait of {PROOF_WAIT_REPEAT:?} did not warn"
+        );
+    }
+
     /// A successor whose start waits on its predecessor's state takes the
     /// next recovery turn, though its recovery queued before the refusal.
     /// An engine for tests over `registry`, with its handle and the
@@ -23557,7 +23898,7 @@ mod tests {
             report(&engine, &predecessor),
             (
                 "waiting".to_string(),
-                "consensus startup unavailable".to_string(),
+                "predecessor state unrecovered".to_string(),
                 Some(920_000)
             )
         );
@@ -23574,7 +23915,7 @@ mod tests {
             report(&engine, &predecessor),
             (
                 "blocked".to_string(),
-                "consensus startup unavailable".to_string(),
+                "predecessor state unrecovered".to_string(),
                 None
             )
         );
@@ -23681,7 +24022,7 @@ mod tests {
                 "seat event",
                 unavailable(GLOBAL_SYNC_IN_PROGRESS),
                 seat(vec![EffectiveStatus::Active], None, boundary),
-                ("waiting", "consensus startup unavailable", Some(919_440)),
+                ("waiting", "awaiting GLOBAL state sync", Some(919_440)),
             ),
             (
                 "joining seat",
@@ -23698,6 +24039,36 @@ mod tests {
             (
                 "unresolvable chain",
                 consensus("app committee session: too many sessions sealed at their base to look through"),
+                none(),
+                ("blocked", "session chain unresolvable", None),
+            ),
+            (
+                "predecessor state",
+                unavailable("app committee session: predecessor state has not been recovered through its seal"),
+                none(),
+                ("blocked", "predecessor state unrecovered", None),
+            ),
+            (
+                "predecessor history",
+                unavailable("predecessor outgoing history recovery is still in progress"),
+                none(),
+                ("blocked", "predecessor history unrecovered", None),
+            ),
+            (
+                "own history",
+                unavailable(OWN_HISTORY_PENDING),
+                none(),
+                ("blocked", "outgoing history unrecovered", None),
+            ),
+            (
+                "shard state",
+                unavailable("shard engine stopped before archive replay"),
+                none(),
+                ("blocked", "shard state not ready", None),
+            ),
+            (
+                "anything else",
+                consensus("app consensus host failed"),
                 none(),
                 ("blocked", "consensus startup unavailable", None),
             ),

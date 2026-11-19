@@ -386,6 +386,26 @@ struct Delta {
 }
 
 impl Delta {
+    fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        if self
+            .ranges
+            .iter()
+            .any(|(start, end)| crate::database::range_meets(prefixes, start, end))
+        {
+            return None;
+        }
+        let mut keys = Vec::new();
+        for prefix in prefixes {
+            keys.extend(
+                self.points
+                    .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
+                    .take_while(|(key, _)| key.starts_with(prefix))
+                    .map(|(key, _)| key.clone()),
+            );
+        }
+        Some(keys)
+    }
+
     fn entries(&self) -> usize {
         self.points.len() + self.ranges.len()
     }
@@ -651,6 +671,23 @@ impl ExecutionOverlay {
         })
     }
 
+    /// Check the current footprint before preparing publication. The durable
+    /// commit checks again under its write barrier with the final footprint.
+    pub fn check_commit_base(&self, destination: &crate::CoordinatedDb) -> Result<()> {
+        let (source, sequence, touched) = {
+            let inner = self.lock_inner()?;
+            let base = inner
+                .base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            (base._db.clone(), base.sequence, inner.touched.clone())
+        };
+        destination
+            .lock_writes()?
+            .check_execution_base(&source, sequence, &touched)?;
+        Ok(())
+    }
+
     /// Freeze and close a healthy branch for one atomic durable write. No
     /// further reads, writes or forks can use this owner; existing independent
     /// children retain their original base and will conflict after publication.
@@ -824,27 +861,7 @@ impl ExecutionOverlay {
     /// Every key this branch put or deleted under `prefixes`; `None` when a
     /// deleted range reaches into one of them, whose keys cannot be listed.
     pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
-        let inner = self.lock_cleanup();
-        if inner
-            .delta
-            .ranges
-            .iter()
-            .any(|(start, end)| crate::database::range_meets(prefixes, start, end))
-        {
-            return None;
-        }
-        let mut keys = Vec::new();
-        for prefix in prefixes {
-            keys.extend(
-                inner
-                    .delta
-                    .points
-                    .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
-                    .take_while(|(key, _)| key.starts_with(prefix))
-                    .map(|(key, _)| key.clone()),
-            );
-        }
-        Some(keys)
+        self.lock_cleanup().delta.written_keys_under(prefixes)
     }
 
     /// Sticky storage-failure evidence, independent of whether a caller
@@ -920,6 +937,7 @@ impl ExecutionOverlay {
         Ok(OverlayReadView {
             overlay: self.clone(),
             delta: inner.delta.clone(),
+            generation: inner.generation,
         })
     }
 
@@ -1033,12 +1051,7 @@ impl ExecutionOverlay {
         self.observe(self.cursor_at_inner(lower, upper, captured))
     }
 
-    fn cursor_at_inner(
-        &self,
-        lower: &[u8],
-        upper: &[u8],
-        captured: Option<&Arc<Delta>>,
-    ) -> Result<OverlayCursor<'_>> {
+    fn mark_read_range(&self, lower: &[u8], upper: &[u8]) -> Result<MutexGuard<'_, Inner>> {
         ensure!(lower < upper, "overlay empty or reversed cursor bounds");
         ensure!(
             lower.len().saturating_add(upper.len()) <= self.limits.max_record_bytes,
@@ -1046,11 +1059,21 @@ impl ExecutionOverlay {
         );
         let mut inner = self.lock_inner()?;
         ensure!(inner.base.is_some(), "execution overlay closed");
+        inner.touched.mark_range(lower, upper);
+        Ok(inner)
+    }
+
+    fn cursor_at_inner(
+        &self,
+        lower: &[u8],
+        upper: &[u8],
+        captured: Option<&Arc<Delta>>,
+    ) -> Result<OverlayCursor<'_>> {
+        let mut inner = self.mark_read_range(lower, upper)?;
         ensure!(
             inner.cursors < self.limits.max_cursors,
             "overlay cursor limit"
         );
-        inner.touched.mark_range(lower, upper);
         inner.cursors += 1;
         Ok(OverlayCursor {
             overlay: self,
@@ -1063,13 +1086,198 @@ impl ExecutionOverlay {
     }
 }
 
+/// How a bounded version lookup was resolved. Interleaved key widths and
+/// deletion ranges are resolved by the caller's original single-row reader.
+pub enum VersionedValue {
+    Present(Vec<u8>),
+    Oversized,
+    Missing,
+    Unresolved,
+}
+
+impl VersionedValue {
+    pub fn from_bytes(bytes: &[u8], max_value: usize) -> Self {
+        if bytes.len() > max_value {
+            Self::Oversized
+        } else {
+            Self::Present(bytes.to_vec())
+        }
+    }
+}
+
+/// Position on the greatest base key in [lower, last]. A reverse seek is safe
+/// only when there are two base keys in the interval: landing on its floor
+/// can otherwise walk tombstoned history below the requested vertex.
+pub fn seek_latest_in_range(
+    iter: &mut rocksdb::DBRawIterator<'_>,
+    lower: &[u8],
+    last: &[u8],
+    mut extra_step: impl FnMut() -> Result<()>,
+) -> Result<bool> {
+    if lower > last {
+        return Ok(false);
+    }
+    iter.seek(lower);
+    iter.status()?;
+    let Some(first) = iter.key().filter(|k| *k <= last) else {
+        return Ok(false);
+    };
+    if first == last {
+        return Ok(true);
+    }
+    let first = first.to_vec();
+    extra_step()?;
+    iter.next();
+    iter.status()?;
+    extra_step()?;
+    if iter.key().is_some_and(|k| k <= last) {
+        iter.seek_for_prev(last);
+    } else {
+        iter.seek(&first);
+    }
+    iter.status()?;
+    Ok(true)
+}
+
 /// Stable reads of both the captured RocksDB sequence and one overlay delta.
 pub struct OverlayReadView {
+    generation: u64,
     overlay: Arc<ExecutionOverlay>,
     delta: Arc<Delta>,
 }
 
 impl OverlayReadView {
+    pub fn delta_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Resolve one bounded batch of MVCC addresses against this exact delta
+    /// and base. The physical iterator is shared; conflicts and read charges
+    /// are recorded for each logical query rather than the gaps between them.
+    pub fn latest_version_batch(
+        &self,
+        prefix: &[u8],
+        addresses: &[[u8; 32]],
+        max_value: usize,
+    ) -> Result<Vec<VersionedValue>> {
+        self.overlay
+            .observe(self.latest_version_batch_inner(prefix, addresses, max_value))
+    }
+
+    fn latest_version_batch_inner(
+        &self,
+        prefix: &[u8],
+        addresses: &[[u8; 32]],
+        max_value: usize,
+    ) -> Result<Vec<VersionedValue>> {
+        ensure!(
+            addresses.len() <= quil_types::store::VERTEX_READ_BATCH,
+            "vertex read batch limit"
+        );
+        let mut inner = self.overlay.lock_inner()?;
+        let limits = self.overlay.limits;
+        ensure!(inner.cursors < limits.max_cursors, "overlay cursor limit");
+        let Inner {
+            base,
+            reads,
+            touched,
+            ..
+        } = &mut *inner;
+        let base = base
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+        let view = base.view()?;
+        let Some(min) = addresses.iter().min() else {
+            return Ok(Vec::new());
+        };
+        let max = addresses.iter().max().expect("nonempty batch");
+        let lower = [prefix, min].concat();
+        let upper = [prefix, max, &[0xff; 8], &[0]].concat();
+        ensure!(
+            lower.len().saturating_add(upper.len()) <= limits.max_record_bytes,
+            "overlay cursor bound byte limit"
+        );
+        let mut parked = base.take_iterator(&view, &lower, &upper)?;
+        let iter = &mut parked.iterator;
+        let mut values = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let start = [prefix, address].concat();
+            let last = [start.as_slice(), &[0xff; 8]].concat();
+            let end = [last.as_slice(), &[0]].concat();
+            touched.mark_range(&start, &end);
+            reads.operation(limits)?;
+            if self
+                .delta
+                .ranges
+                .range(..end.clone())
+                .next_back()
+                .is_some_and(|(_, hi)| hi > &start)
+            {
+                values.push(VersionedValue::Unresolved);
+                continue;
+            }
+            let staged = self
+                .delta
+                .points
+                .range(start.clone()..=last.clone())
+                .next_back();
+            let mut after = Vec::new();
+            let candidate = match staged {
+                Some((key, Some(value))) if key.len() == last.len() => {
+                    reads.operation(limits)?;
+                    after.extend_from_slice(key);
+                    after.push(0); // first key strictly above the staged version
+                    Some((key.as_slice(), value.as_ref()))
+                }
+                Some(_) => {
+                    values.push(VersionedValue::Unresolved);
+                    continue;
+                }
+                None => None,
+            };
+            let seek = if candidate.is_some() {
+                after.as_slice()
+            } else {
+                &start
+            };
+            let found = if seek_latest_in_range(iter, seek, &last, || reads.operation(limits))? {
+                iter.key().zip(iter.value())
+            } else {
+                candidate
+            };
+            let value = match found {
+                Some((key, blob)) if key.len() == last.len() => {
+                    reads.record(key, blob, limits)?;
+                    VersionedValue::from_bytes(blob, max_value)
+                }
+                Some(_) => VersionedValue::Unresolved,
+                None => VersionedValue::Missing,
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    /// The writes in this pinned view, including writes inherited from its parent.
+    pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        self.delta.written_keys_under(prefixes)
+    }
+
+    pub fn watches_all(&self, prefixes: &[Vec<u8>]) -> bool {
+        self.overlay
+            .lock_cleanup()
+            .base
+            .as_ref()
+            .is_some_and(|base| base._db.watches_all(prefixes))
+    }
+
+    /// Keep the same publication dependency as a range scan when its contents
+    /// come from a verified cache. No iterator or extra read handle is needed.
+    pub fn depend_on_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
+        self.overlay
+            .observe(self.overlay.mark_read_range(lower, upper).map(drop))
+    }
+
     /// Let a bound adapter report an unsupported or failed scan even when it
     /// cannot return the error through its legacy iterator interface.
     pub fn record_execution_failure(&self) {
@@ -1641,6 +1849,50 @@ mod tests {
             max_read_operations: 2_000_000,
             max_cursors: 4,
         }
+    }
+
+    #[test]
+    fn version_batch_shares_one_iterator_and_charges_each_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let addresses: Vec<_> = (0..32).map(|n| [n; 32]).collect();
+        let version =
+            |address: &[u8; 32], v: u64| [b"rows".as_slice(), address, &v.to_be_bytes()].concat();
+        for address in &addresses {
+            db.put(version(address, 1), [10]).unwrap();
+        }
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+        let view = overlay.read_view().unwrap();
+        let base = overlay.lock_inner().unwrap().base.clone().unwrap();
+        let before = base.iterators_created.load(Ordering::Relaxed);
+        let values = view
+            .latest_version_batch(b"rows", &addresses, usize::MAX)
+            .unwrap();
+        assert!(values
+            .iter()
+            .all(|v| matches!(v, VersionedValue::Present(blob) if blob == &[10])));
+        assert_eq!(base.iterators_created.load(Ordering::Relaxed) - before, 1);
+        assert_eq!(overlay.stats().read_bytes, 32 * (4 + 32 + 8 + 1));
+        let before = base.iterators_created.load(Ordering::Relaxed);
+        for address in &addresses {
+            let lower = [b"rows".as_slice(), address].concat();
+            let last = version(address, u64::MAX);
+            let upper = [last.as_slice(), &[0]].concat();
+            let mut cursor = view.floor_guarded_cursor(&lower, &upper).unwrap();
+            cursor.seek_for_prev(&last).unwrap();
+            assert_eq!(cursor.value(), Some([10].as_slice()));
+        }
+        assert_eq!(base.iterators_created.load(Ordering::Relaxed) - before, 32);
+
+        let mut budget = limits();
+        budget.max_read_operations = 31;
+        let capped = Arc::new(ExecutionOverlay::capture(db, budget).unwrap());
+        assert!(capped
+            .read_view()
+            .unwrap()
+            .latest_version_batch(b"rows", &addresses, usize::MAX)
+            .is_err());
+        assert!(!capped.execution_healthy());
     }
 
     fn database(path: &std::path::Path) -> crate::CoordinatedDb {

@@ -66,6 +66,200 @@ fn put(store: &dyn ClockStore, f: &g::GlobalFrame) {
     store.put_global_clock_frame(f, t.as_ref()).unwrap();
     t.commit().unwrap();
 }
+
+#[test]
+fn canonical_frame_replay_preserves_publication_and_real_writes_name_the_caller() {
+    use quil_types::store::KvDb;
+    let rocks = crate::RocksDb::open_in_memory().unwrap();
+    let db = rocks.inner();
+    let clock = RocksClockStore::new(db.clone());
+    let store: &dyn ClockStore = &clock;
+    let direct = rocks.new_batch(false).unwrap();
+    let original = frame(7);
+    clock.put_global_frame(&original, None).unwrap();
+    let execution = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+    execution.get(&e::clock_global_frame_key(7)).unwrap();
+    clock.warm_global_frame_cache().unwrap();
+    let before = db.latest_sequence_number();
+    let mut prefix = original.clone();
+    for take in [2, 1, 0] {
+        prefix.requests.truncate(take);
+        store
+            .put_global_clock_frame(&prefix, direct.as_ref())
+            .unwrap();
+        assert_eq!(db.latest_sequence_number(), before);
+        assert_eq!(clock.get_global_frame(7).unwrap(), original);
+    }
+    execution.prepare_commit().unwrap().commit(&db).unwrap();
+
+    let execution = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+    let mut certified = original.clone();
+    certified
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 =
+        Some(quil_types::proto::keys::Bls48581AggregateSignature {
+            signature: vec![5; 64],
+            ..Default::default()
+        });
+    // A new certificate alone must invalidate the private execution, while the
+    // old body remains readable through the cache and by a fresh store handle.
+    prefix.header.clone_from(&certified.header);
+    let before = db.latest_sequence_number();
+    let caller_line = line!() + 1;
+    let written = store.put_global_clock_frame(&prefix, direct.as_ref());
+    written.unwrap();
+    assert_eq!(db.latest_sequence_number(), before + 1);
+    assert_eq!(
+        RocksClockStore::new(db.clone())
+            .get_global_frame(7)
+            .unwrap(),
+        certified
+    );
+    let stale = execution.prepare_commit().unwrap().commit(&db).unwrap_err();
+    assert!(
+        matches!(&stale, quil_forest::DatabaseCommitError::Stale {
+        writer, global_frame: Some(7), prefix: None, ..
+    } if writer.file() == file!() && writer.line() == caller_line),
+        "{stale}"
+    );
+    assert!(stale.to_string().contains("canonical GLOBAL frame 7"));
+    assert_eq!(clock.get_global_frame(7).unwrap(), certified);
+
+    // An explicit clock transaction may contain other canonical work even
+    // when its frame is identical.
+    let txn = store.new_transaction(false).unwrap();
+    store
+        .put_global_clock_frame(&certified, txn.as_ref())
+        .unwrap();
+    txn.set(b"sibling", b"in the same transaction").unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        db.get(b"sibling").unwrap().unwrap(),
+        b"in the same transaction"
+    );
+}
+
+#[test]
+fn canonical_frame_replay_checks_durable_bundles_and_both_indices() {
+    let (_dir, db) = database();
+    let clock = RocksClockStore::new(db.clone());
+    let mut f = frame(0);
+    f.requests[0].timestamp = 123;
+    clock.put_global_frame(&f, None).unwrap();
+    clock.warm_global_frame_cache().unwrap();
+    let body = e::clock_global_frame_request_key(0, 0);
+    let changed = g::MessageBundle {
+        timestamp: 999,
+        ..Default::default()
+    };
+    db.put(&body, changed.encode_to_vec()).unwrap();
+    let mut prefix = f.clone();
+    prefix.requests.truncate(1);
+    let before = db.latest_sequence_number();
+    clock.put_global_frame(&prefix, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before + 1);
+    assert_eq!(clock.get_global_frame(0).unwrap(), f);
+    assert_eq!(
+        db.get(&body).unwrap().unwrap(),
+        f.requests[0].encode_to_vec()
+    );
+
+    db.delete(&body).unwrap(); // a hole with the following row still intact
+    let before = db.latest_sequence_number();
+    clock.put_global_frame(&f, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before + 1);
+    assert_eq!(
+        db.get(&body).unwrap().unwrap(),
+        f.requests[0].encode_to_vec()
+    );
+    for key in [
+        e::clock_global_earliest_index(),
+        e::clock_global_latest_index(),
+    ] {
+        db.put(&key, b"malformed").unwrap();
+        let before = db.latest_sequence_number();
+        clock.put_global_frame(&prefix, None).unwrap();
+        assert_eq!(db.latest_sequence_number(), before + 1);
+        assert_eq!(db.get(&key).unwrap().unwrap(), 0u64.to_be_bytes());
+    }
+
+    // A header-only worker write must not delete an already stored body.
+    let before = db.latest_sequence_number();
+    prefix.requests.clear();
+    clock.put_global_frame(&prefix, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before);
+    assert_eq!(clock.get_global_frame(0).unwrap(), f);
+    assert_eq!(
+        RocksClockStore::new(db.clone())
+            .get_global_frame(0)
+            .unwrap(),
+        f
+    );
+}
+
+#[test]
+fn canonical_request_comparison_includes_the_last_encodable_index_and_height() {
+    let (_dir, db) = database();
+    let clock = RocksClockStore::new(db.clone());
+    let mut f = frame(u64::MAX);
+    f.requests.clear();
+    clock.put_global_frame(&f, None).unwrap();
+    let last = g::MessageBundle {
+        timestamp: 7,
+        ..Default::default()
+    };
+    db.put(
+        e::clock_global_frame_request_key(u64::MAX, u16::MAX),
+        last.encode_to_vec(),
+    )
+    .unwrap();
+    let before = db.latest_sequence_number();
+    clock.put_global_frame(&f, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before);
+    assert_eq!(
+        clock.get_global_frame(u64::MAX).unwrap().requests,
+        vec![last.clone()]
+    );
+
+    f.requests
+        .resize(usize::from(u16::MAX) + 1, g::MessageBundle::default());
+    *f.requests.last_mut().unwrap() = last;
+    clock.put_global_frame(&f, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before + u64::from(u16::MAX));
+    let before = db.latest_sequence_number();
+    f.requests.last_mut().unwrap().timestamp += 1;
+    clock.put_global_frame(&f, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before + 1);
+    clock.put_global_frame(&f, None).unwrap();
+    assert_eq!(db.latest_sequence_number(), before + 1);
+    assert_eq!(clock.get_global_frame(u64::MAX).unwrap(), f);
+}
+
+#[test]
+fn concurrent_canonical_frame_replays_write_once_across_store_handles() {
+    let (_dir, db) = database();
+    let start = std::sync::Barrier::new(8);
+    let f = frame(11);
+    let before = db.latest_sequence_number();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let clock = RocksClockStore::new(db.clone());
+            let (start, f) = (&start, &f);
+            scope.spawn(move || {
+                start.wait();
+                clock.put_global_frame(f, None).unwrap();
+            });
+        }
+    });
+    // Header, two indices and one row per bundle.
+    assert_eq!(
+        db.latest_sequence_number() - before,
+        3 + f.requests.len() as u64
+    );
+}
+
 fn proposal(n: u64) -> g::GlobalProposal {
     g::GlobalProposal {
         state: Some(frame(n)),

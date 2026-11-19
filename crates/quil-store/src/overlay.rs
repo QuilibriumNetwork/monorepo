@@ -123,6 +123,10 @@ impl OverlayDbSnapshot {
         }
     }
 
+    pub(crate) fn read_view(&self) -> Result<&OverlayReadView> {
+        self.view.as_deref().map_err(error)
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         self.view.as_ref().map(|_| ()).map_err(error)
     }
@@ -183,6 +187,9 @@ impl OverlayRawCursor {
     }
     pub(crate) fn value(&self) -> Option<&[u8]> {
         self.row.as_ref().map(|(_, v)| v.as_slice())
+    }
+    pub(crate) fn into_value(self) -> Option<Vec<u8>> {
+        self.row.map(|(_, value)| value)
     }
     pub(crate) fn status(&self) -> Result<()> {
         self.snapshot.check()?;

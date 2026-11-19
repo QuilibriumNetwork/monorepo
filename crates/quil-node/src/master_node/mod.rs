@@ -193,6 +193,9 @@ pub(crate) async fn start(
     // the join→confirm→activate lifecycle runs in minutes. Every epoch timing
     // rule reads `epoch_length_frames()`, so this one call scales them all.
     crate::consensus_settings::initialize(network);
+    if archive_mode {
+        quil_execution::enable_archive_execution();
+    }
     if network != 0 {
         info!(
             network,

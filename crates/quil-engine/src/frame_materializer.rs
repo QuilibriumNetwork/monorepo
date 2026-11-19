@@ -992,7 +992,10 @@ impl FrameMaterializer {
         // The epoch-boundary lifecycle wave spent 90-190 ms per message here
         // against ~30 ms validating.
         let execution_started = std::time::Instant::now();
-        let sections = quil_execution::step_timing::collect();
+        let archive_reads = self
+            .archive_mode
+            .then(|| quil_execution::archive_frame::ArchiveFrame::begin(frame_number));
+        let sections = quil_execution::step_timing::collect_for_archive(self.archive_mode);
         let mut prover_ops = crate::prover_op_tally::ProverOpTally::default();
         let mut execution_tally = crate::execution_summary::ExecutionTally::default();
         let mut record_execution = |raw: &[u8], validate_us: u64, process_us: u64| {
@@ -1207,7 +1210,8 @@ impl FrameMaterializer {
                 }
             }
         }
-        let sections = sections.finish();
+        drop(archive_reads);
+        let (sections, activity) = sections.finish_with_activity();
         let executed = execution_started.elapsed();
         if executed >= crate::stage_clock::SLOW_EXECUTION {
             crate::stage_clock::note_slow("GLOBAL message execution", executed);
@@ -1215,14 +1219,16 @@ impl FrameMaterializer {
         // Recorded once this execution's effects commit: below for one in
         // place, after its batch for a publication. Abandoned before that,
         // it counts only as abandoned.
+        let mut summary = execution_tally.summarize(
+            executed,
+            crate::execution_summary::execution_budget(frame_number),
+            sections,
+        );
+        summary.activity = activity;
         let execution = crate::execution_summary::PendingExecution::new(
             frame_number,
             self.execution_role,
-            execution_tally.summarize(
-                executed,
-                crate::execution_summary::execution_budget(frame_number),
-                sections,
-            ),
+            summary,
         );
         // Persist the per-bundle outcomes for this frame (best-effort on the
         // canonical path; required for a complete tentative delta). Aligned by index to
@@ -1406,20 +1412,14 @@ impl FrameMaterializer {
                 "MAT stage: shard grid changed — re-partitioned CRDT prefixes + size buckets"
             );
         }
-        // Run the expensive registry refresh + eviction census INLINE only at
-        // epoch boundaries (and the first frame after boot). `refresh_from_store`
-        // rebuilds the registry from one captured store view with a
-        // double blob-deserialize (~2s/frame); since allocations are epoch-stable
-        // (`effective_status` is epoch-quantized), per-frame freshness bought
-        // nothing on the hot path. Consensus reads of the shared registry stay
-        // epoch-fresh via the recv-loop (`message_loop`) and archive poller
-        // (`archive_sync`) refreshers, which already run on this same cadence.
+        // The epoch census and penalties need the registry as of this commit.
+        // Archives can usually bring it current from just the changed rows.
         let cur_eviction_epoch = quil_types::consensus::epoch_for_frame(frame_number);
         let mut run_eviction_pass =
             self.last_eviction_pass_epoch.load(Ordering::SeqCst) != cur_eviction_epoch;
         if run_eviction_pass {
             if let Some(eviction_reg) = self.eviction_registry.as_ref() {
-                match eviction_reg.refresh_from_store(self.hypergraph_store.as_ref()) {
+                match self.refresh_epoch_registry(frame_number, eviction_reg, "census") {
                     Ok(()) => self
                         .last_eviction_pass_epoch
                         .store(cur_eviction_epoch, Ordering::SeqCst),
@@ -2065,6 +2065,45 @@ impl FrameMaterializer {
         *self.coverage_halt_durations.lock().unwrap() = durations;
     }
 
+    fn refresh_epoch_registry(
+        &self,
+        frame: u64,
+        registry: &ConcreteProverRegistry,
+        pass: &str,
+    ) -> Result<()> {
+        let store = self.hypergraph_store.as_ref();
+        if !self.archive_mode {
+            return registry.refresh_from_store(store);
+        }
+        let started = std::time::Instant::now();
+        let outcome = registry.refresh_archive_epoch(store, |database, sequence| {
+            self.hypergraph.watched_writes_since_for(
+                database,
+                sequence,
+                &quil_store::encoding::prover_registry_key_prefixes(),
+            )
+        })?;
+        use quil_execution::prover_registry::RegistryCatchUp;
+        let rows = match outcome {
+            RegistryCatchUp::Current => Some(0),
+            RegistryCatchUp::Updated { rows } => Some(rows),
+            _ => None,
+        };
+        info!(
+            frame,
+            pass,
+            registry_refresh_ms = started.elapsed().as_millis() as u64,
+            registry_mode = if rows.is_some() {
+                "incremental"
+            } else {
+                "full"
+            },
+            registry_changed_rows = rows,
+            "archive epoch registry refresh"
+        );
+        Ok(())
+    }
+
     /// Extract AltShardUpdate messages from the frame and persist each
     /// to the hypergraph store under its poseidon-hashed BLS public key
     /// (the shard address). Mirrors Go's `persistAltShardUpdates` at
@@ -2115,7 +2154,7 @@ impl FrameMaterializer {
             }
             warn!(frame = frame_number, error = %e, pass, "registry pass re-commit (flush) failed");
         }
-        if let Err(error) = eviction_reg.refresh_from_store(self.hypergraph_store.as_ref()) {
+        if let Err(error) = self.refresh_epoch_registry(frame_number, eviction_reg, pass) {
             if self.tentative_execution {
                 return Err(error);
             }

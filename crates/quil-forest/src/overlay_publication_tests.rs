@@ -119,6 +119,9 @@ fn disjoint_writes_outside_the_branch_footprint_do_not_invalidate_publication() 
         .unwrap();
     candidate_write(&db, b"\x00\x0fnext").unwrap();
     candidate_write(&db, b"\x00\xf8next-body").unwrap();
+    // An otherwise empty clock transaction can finish after these writes.
+    db.write(rocksdb::WriteBatch::default()).unwrap();
+    overlay.check_commit_base(&db).unwrap();
     overlay.prepare_commit().unwrap().commit(&db).unwrap();
     assert_eq!(
         rows(&db),
@@ -132,15 +135,32 @@ fn disjoint_writes_outside_the_branch_footprint_do_not_invalidate_publication() 
     // A later general write still invalidates a new plan.
     let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
     overlay.apply(&[put(b"\x00\x09cursor", b"2")]).unwrap();
+    // A write that races a successful preflight must still fail the final check.
+    overlay.check_commit_base(&db).unwrap();
     db.put(b"unrelated", b"general").unwrap();
-    assert!(matches!(
-        overlay.prepare_commit().unwrap().commit(&db),
-        Err(DatabaseCommitError::Stale { .. })
-    ));
+    let err = overlay.prepare_commit().unwrap().commit(&db).unwrap_err();
+    assert!(
+        matches!(&err, DatabaseCommitError::Stale { prefix: None, writer, .. } if writer.file() == file!())
+    );
+    assert!(err.to_string().contains("general write"));
     assert_eq!(
         db.get(b"\x00\x09cursor").unwrap().as_deref(),
         Some(b"1".as_slice())
     );
+}
+
+#[test]
+fn an_empty_publication_keeps_its_sequence_as_a_general_write_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let sibling = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+    let publishing = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+    candidate_write(&db, b"\x00\x0fnext").unwrap();
+    publishing.prepare_commit().unwrap().commit(&db).unwrap();
+    assert!(matches!(
+        sibling.prepare_commit().unwrap().commit(&db),
+        Err(DatabaseCommitError::Stale { prefix: None, .. })
+    ));
 }
 
 #[test]
@@ -182,11 +202,57 @@ fn disjoint_write_to_a_read_scanned_written_or_inherited_prefix_rejects_publicat
     let child = parent.fork(limits()).unwrap();
     child.apply(&[put(b"\x00\x09cursor", b"1")]).unwrap();
     candidate_write(&db, b"\x00\x0fparent").unwrap();
+    let stale = child.check_commit_base(&db).unwrap_err();
+    assert!(matches!(stale.downcast_ref::<DatabaseCommitError>(),
+        Some(DatabaseCommitError::Stale { prefix: Some([0, 15]), writer, .. }) if writer.file() == file!()));
+    assert!(stale.to_string().contains("overlapping prefix 0x000f"));
     assert!(matches!(
         child.prepare_commit().unwrap().commit(&db),
         Err(DatabaseCommitError::Stale { .. })
     ));
     assert_eq!(db.get(b"\x00\x09cursor").unwrap(), None);
+}
+
+#[test]
+fn witness_index_conflicts_follow_full_namespace_and_half_open_ranges() {
+    use quil_types::store::LOCAL_WITNESS_INDEX_PREFIX as PREFIX;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let key = [PREFIX, b"a"].concat();
+    let end = [PREFIX, b"z"].concat();
+    let capture = || ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+    let independent = capture();
+    // A scan ending at the first key, or starting at the prefix successor,
+    // cannot see an index record. Both still share its two-byte tag.
+    independent.cursor(b"quil/global/", PREFIX).unwrap();
+    independent
+        .cursor(b"quil/local/qct3-witness/v30", b"quil/z")
+        .unwrap();
+    let scan = capture();
+    scan.cursor(b"quil/", b"quil/z").unwrap();
+    let deletes = capture();
+    deletes
+        .apply(&[OverlayMutation::DeleteRange(key.clone(), end)])
+        .unwrap();
+    let parent = capture();
+    parent.get(&key).unwrap();
+    let child = parent.fork(limits()).unwrap();
+
+    let mut index = crate::DisjointBatch::local_witness_index();
+    index.put(&key, b"record").unwrap();
+    db.write_disjoint(index, &rocksdb::WriteOptions::default())
+        .unwrap();
+    for overlay in [scan, deletes, child] {
+        let error = overlay.prepare_commit().unwrap().commit(&db).unwrap_err();
+        assert!(matches!(
+            error,
+            DatabaseCommitError::Stale {
+                prefix: Some(PREFIX),
+                ..
+            }
+        ));
+    }
+    independent.prepare_commit().unwrap().commit(&db).unwrap();
 }
 
 #[test]

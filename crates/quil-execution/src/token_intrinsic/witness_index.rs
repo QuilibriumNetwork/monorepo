@@ -16,7 +16,7 @@ use quil_lattice_ct::confidential::{
 };
 use quil_types::{
     error::{QuilError, Result},
-    store::{KvDb, Transaction},
+    store::{KvDb, Transaction, LOCAL_WITNESS_INDEX_PREFIX},
 };
 
 use super::{coin_blocks, roots::BlockSummary};
@@ -73,7 +73,7 @@ impl LocalWitnessIndex {
             return Err(unavailable("invalid index depth"));
         }
         let reader = std::sync::OnceLock::new();
-        let mut prefix = b"quil/local/qct3-witness/v3/".to_vec();
+        let mut prefix = LOCAL_WITNESS_INDEX_PREFIX.to_vec();
         prefix.extend_from_slice(context);
         prefix.push(b'/');
         Ok(Self {
@@ -107,7 +107,7 @@ impl LocalWitnessIndex {
         db.delete_range(&prefix, &upper)
     }
     fn metadata_key(context: &[u8; 32], kind: u8) -> Vec<u8> {
-        let mut key = b"quil/local/qct3-witness/v3/".to_vec();
+        let mut key = LOCAL_WITNESS_INDEX_PREFIX.to_vec();
         key.extend_from_slice(context);
         key.extend_from_slice(&[b'/', kind]);
         key
@@ -173,7 +173,7 @@ impl LocalWitnessIndex {
         let mut summary = index
             .summary_for(&ready.root)?
             .ok_or_else(|| unavailable("index does not hold its published tip"))?;
-        let batch = index.db.new_batch(false)?;
+        let batch = index.db.new_witness_index_batch()?;
         index.append_blocks(batch.as_ref(), &mut summary, coins)?;
         if index.fold(&summary)? != next.root || summary.coins() != next.coins {
             return Err(unavailable("index extension does not match canonical root"));
@@ -869,7 +869,48 @@ mod tests {
             // A refused extension leaves nothing of the block it would open.
             assert!(db.get(&index.frontier_key(second_block)).unwrap().is_none());
             assert!(LocalWitnessIndex::advance_ready(db.clone(), &root(4), &coins[3..]).is_err());
+
+            let inner = db.inner();
+            let ready_key = LocalWitnessIndex::metadata_key(&context, b'a');
+            let record_bytes =
+                ready_key.len() + 2 * quil_lattice_ct::confidential::coin_tree::ROOT_RECORD_BYTES;
+            let capture = || {
+                quil_forest::ExecutionOverlay::capture(
+                    inner.clone(),
+                    quil_forest::OverlayLimits {
+                        max_delta_bytes: 4096,
+                        max_delta_entries: 8,
+                        max_record_bytes: record_bytes,
+                        max_read_bytes: record_bytes as u64,
+                        max_read_operations: 16,
+                        max_cursors: 1,
+                    },
+                )
+                .unwrap()
+            };
+            let independent = capture();
+            // GLOBAL shard headers read and write this raw key each frame.
+            let due = b"quil/global/due-shard-changes/frame/v1";
+            independent.get(due).unwrap();
+            independent
+                .apply(&[quil_forest::OverlayMutation::Put(due.to_vec(), vec![1])])
+                .unwrap();
+            let reader = capture();
+            reader.get(&ready_key).unwrap();
             assert!(LocalWitnessIndex::advance_ready(db.clone(), &root(3), &coins[2..3]).unwrap());
+            assert!(matches!(
+                reader.prepare_commit().unwrap().commit(&inner),
+                Err(quil_forest::DatabaseCommitError::Stale {
+                    prefix: Some(LOCAL_WITNESS_INDEX_PREFIX),
+                    ..
+                })
+            ));
+            independent
+                .prepare_commit()
+                .unwrap()
+                .commit(&inner)
+                .unwrap();
+            assert_eq!(inner.get(due).unwrap(), Some(vec![1]));
             assert!(!LocalWitnessIndex::advance_ready(db.clone(), &root(3), &coins[2..3]).unwrap());
             assert!(LocalWitnessIndex::advance_ready(db, &root(4), &coins[3..]).unwrap());
         }

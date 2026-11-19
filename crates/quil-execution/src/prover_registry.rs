@@ -332,10 +332,24 @@ impl InMemoryProverRegistry {
         hg_store: &dyn HypergraphStore,
         limits: RegistryLimits,
     ) -> QuilResult<()> {
+        self.refresh_with_timing(hg_store, limits, None)
+    }
+
+    fn refresh_with_timing(
+        &mut self,
+        hg_store: &dyn HypergraphStore,
+        limits: RegistryLimits,
+        timing: Option<&RegistryUpdateTiming>,
+    ) -> QuilResult<()> {
         let snapshot = hg_store.capture_tree_snapshot()?.ok_or_else(|| {
             QuilError::Store("prover registry requires a consistent store snapshot".into())
         })?;
-        self.refresh_from_snapshot_with_limits(snapshot.as_ref(), limits)
+        self.refresh_rows(
+            snapshot.as_ref(),
+            limits,
+            crate::archive_execution(),
+            timing,
+        )
     }
 
     /// Read additions, removals and the legacy fallback at one captured store
@@ -351,6 +365,16 @@ impl InMemoryProverRegistry {
         snapshot: &dyn SnapshotReadable,
         limits: RegistryLimits,
     ) -> QuilResult<()> {
+        self.refresh_rows(snapshot, limits, crate::archive_execution(), None)
+    }
+
+    fn refresh_rows(
+        &mut self,
+        snapshot: &dyn SnapshotReadable,
+        limits: RegistryLimits,
+        archive: bool,
+        timing: Option<&RegistryUpdateTiming>,
+    ) -> QuilResult<()> {
         let mut budget = RegistryBudget::new(limits)?;
         // The rows every store watches (`prover_registry_key_prefixes`).
         let shard = quil_store::encoding::prover_registry_shard();
@@ -365,15 +389,26 @@ impl InMemoryProverRegistry {
         // every leaf there on every commit, and the RPC sync path
         // populates it too. One row per `(set, phase, shard, vk)` so
         // no dedup is required.
-        let mut rows = RegistryRows::default();
-        visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
-            budget.input(vk.len(), data.len(), true)?;
-            row(vk.len(), data.len());
-            rows.add(vk[32..].try_into().expect("64-byte registry key"), &data);
-            // Rows retain the decoded data. Release serialized blobs with each
-            // page instead of holding another whole registry until publication.
-            Ok(())
-        })?;
+        let mut rows = RegistryRows::new(archive);
+        visit_registry_vertices(
+            snapshot,
+            "adds",
+            &shard,
+            limits.page(),
+            timing,
+            |vk, data| {
+                budget.input(vk.len(), data.len(), true)?;
+                row(vk.len(), data.len());
+                rows.add(
+                    vk[32..].try_into().expect("64-byte registry key"),
+                    &data,
+                    timing,
+                );
+                // Rows retain the decoded data. Release serialized blobs with each
+                // page instead of holding another whole registry until publication.
+                Ok(())
+            },
+        )?;
         let from_rows = rows.has_adds();
 
         // Transitional bootstrap: stores from before the per-vertex
@@ -384,13 +419,18 @@ impl InMemoryProverRegistry {
         // range, after which this branch is a no-op.
         let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         if !from_rows {
-            if let Some(blob) = snapshot.load_tree_blob("vertex", "adds", &shard)? {
+            if let Some(blob) = measure(timing.map(|t| &t.read), || {
+                snapshot.load_tree_blob("vertex", "adds", &shard)
+            })? {
                 budget.input(0, blob.len(), false)?;
-                if let Some(root) = quil_tries::deserialize_tree(&blob)
-                    .map_err(|e| QuilError::Store(format!("registry legacy tree: {e}")))?
-                {
-                    collect_legacy(&root, &mut leaves, &mut budget)?;
-                }
+                measure(timing.map(|t| &t.decode), || -> QuilResult<()> {
+                    if let Some(root) = quil_tries::deserialize_tree(&blob)
+                        .map_err(|e| QuilError::Store(format!("registry legacy tree: {e}")))?
+                    {
+                        collect_legacy(&root, &mut leaves, &mut budget)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
 
@@ -408,16 +448,23 @@ impl InMemoryProverRegistry {
         // shard in steady state (leaves/kicks flip Status in place, they don't
         // delete).
         let mut removed_vks: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        visit_registry_vertices(snapshot, "removes", &shard, limits.page(), |vk, data| {
-            budget.input(vk.len(), data.len(), true)?;
-            row(vk.len(), data.len());
-            rows.remove(
-                vk[32..].try_into().expect("64-byte registry key"),
-                data.len(),
-            );
-            removed_vks.insert(vk);
-            Ok(())
-        })?;
+        visit_registry_vertices(
+            snapshot,
+            "removes",
+            &shard,
+            limits.page(),
+            timing,
+            |vk, data| {
+                budget.input(vk.len(), data.len(), true)?;
+                row(vk.len(), data.len());
+                rows.remove(
+                    vk[32..].try_into().expect("64-byte registry key"),
+                    data.len(),
+                );
+                removed_vks.insert(vk);
+                Ok(())
+            },
+        )?;
         if !removed_vks.is_empty() {
             leaves.retain(|(vk, _)| !removed_vks.contains(vk));
         }
@@ -426,10 +473,14 @@ impl InMemoryProverRegistry {
         if from_rows {
             // The same rows, passes and charges as `decode_vertices`, indexed
             // so a later change to some rows updates only what they feed.
-            replacement.compose_from_rows(&mut rows, &mut budget)?;
+            measure(timing.map(|t| &t.rebuild), || {
+                replacement.compose_from_rows(&mut rows, &mut budget)
+            })?;
             replacement.rows = Some(Arc::new(rows));
         } else {
-            replacement.decode_vertices(&leaves, &mut budget)?;
+            measure(timing.map(|t| &t.rebuild), || {
+                replacement.decode_vertices(&leaves, &mut budget)
+            })?;
         }
         replacement.resource_usage = budget.usage;
         replacement.from_rows = from_rows;
@@ -1690,6 +1741,8 @@ pub enum RegistryCatchUp {
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
     execution_binding: Option<(quil_types::store::BackingStoreIdentity, RegistryLimits)>,
+    /// The private branch and the revision at which its initial rows were built.
+    committee_overlay: Option<(std::sync::Weak<quil_forest::ExecutionOverlay>, u64)>,
     /// Set once a full refresh of the canonical cache from the store has
     /// succeeded. A node starts with an empty cache and loads it in the
     /// background, so a reader that decides something once at startup waits
@@ -1773,6 +1826,27 @@ const SLOW_REFRESH_WARN_INTERVAL: std::time::Duration = std::time::Duration::fro
 struct SlowRefreshes {
     warned: Option<std::time::Instant>,
     since_warn: u64,
+}
+
+/// Collected only for archive publication. Timings include a failed incremental
+/// attempt if the same publication also needs a full refresh.
+#[derive(Default)]
+pub(crate) struct RegistryUpdateTiming {
+    pub mode: &'static str,
+    pub changed_rows: Option<usize>,
+    pub copied: Option<bool>,
+    pub read: std::cell::Cell<std::time::Duration>,
+    pub decode: std::cell::Cell<std::time::Duration>,
+    pub copy: std::cell::Cell<std::time::Duration>,
+    pub rebuild: std::cell::Cell<std::time::Duration>,
+}
+
+fn measure<T>(time: Option<&std::cell::Cell<std::time::Duration>>, work: impl FnOnce() -> T) -> T {
+    let Some(time) = time else { return work() };
+    let start = std::time::Instant::now();
+    let result = work();
+    time.set(time.get() + start.elapsed());
+    result
 }
 
 /// Where a full refresh of the canonical registry spent its time.
@@ -1879,6 +1953,7 @@ impl SharedProverRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
+            committee_overlay: None,
             execution_binding: None,
             initial_load: initial_load_signal(false),
             refresh: Arc::default(),
@@ -1927,6 +2002,7 @@ impl SharedProverRegistry {
         let read = seeded.is_none();
         let mut registry = Self {
             inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
+            committee_overlay: None,
             execution_binding: Some((identity.clone(), read_limits)),
             // Read or copied whole before it is returned.
             initial_load: initial_load_signal(true),
@@ -1968,7 +2044,7 @@ impl SharedProverRegistry {
     /// a branch that wrote prover rows has no capture point of its own; when
     /// `seed` holds a scan of the view beneath those writes, its cache is
     /// copied and brought up to date with the rows the fork carries
-    /// ([`Self::update_written_rows`]), which is what reading every prover
+    /// ([`Self::update_written_rows_timed`]), which is what reading every prover
     /// vertex through the fork gives. Forking a kept GLOBAL execution read
     /// them all again: 184 MB per fork, 6 s on one archive and 13–18 s on
     /// another, as long as executing its frames once more (2026-10-11).
@@ -2001,13 +2077,81 @@ impl SharedProverRegistry {
         let bound = limits.above(seeded.resource_usage(), seeded.largest_row);
         let registry = Self {
             inner: Arc::new(RwLock::new(seeded)),
+            committee_overlay: None,
             execution_binding: Some((identity, bound)),
             // Read or copied whole before it is returned.
             initial_load: initial_load_signal(true),
             refresh: Arc::default(),
         };
-        registry.update_written_rows(store, overlay)?;
+        registry.update_written_rows_timed(store, None)?;
         Ok(registry)
+    }
+
+    pub(crate) fn for_materialization_overlay(
+        store: &dyn HypergraphStore,
+        limits: RegistryLimits,
+        seed: Option<&SharedProverRegistry>,
+        overlay: &Arc<quil_forest::ExecutionOverlay>,
+        archive: bool,
+    ) -> QuilResult<Self> {
+        let source = archive.then(|| (Arc::downgrade(overlay), overlay.delta_generation()));
+        let mut registry = Self::for_execution_overlay(store, limits, seed, overlay)?;
+        registry.committee_overlay = source;
+        Ok(registry)
+    }
+
+    /// Only raw, snapshot-backed rows participate. Logical registry edits,
+    /// untracked stores and ambiguous rows send the caller to the full scan.
+    pub(crate) fn committee_scan(
+        &self,
+        hg: &quil_hypergraph::HypergraphCrdt,
+    ) -> QuilResult<Option<CommittedProverScan>> {
+        let (rows, scanned) = {
+            let Ok(registry) = self.inner.try_read() else {
+                return Ok(None);
+            };
+            if registry.diverged || !registry.from_rows {
+                return Ok(None);
+            }
+            let Some(rows) = registry
+                .rows
+                .as_ref()
+                .filter(|rows| rows.committee_indexed())
+            else {
+                return Ok(None);
+            };
+            (rows.clone(), registry.scanned)
+        };
+        let identity = hg.backing_store_identity();
+        if let Some((expected, _)) = &self.execution_binding {
+            let Some((weak, generation)) = &self.committee_overlay else {
+                return Ok(None);
+            };
+            let Some(overlay) = weak.upgrade() else {
+                return Ok(None);
+            };
+            if identity.as_ref() != Some(expected)
+                || identity != Some(quil_types::store::BackingStoreIdentity::of(&overlay))
+            {
+                return Ok(None);
+            }
+            let store = quil_store::OverlayHypergraphStore::new(overlay);
+            let Some(view) = store.committee_rows(*generation)? else {
+                return Ok(None);
+            };
+            return rows.committee_scan(Some(view));
+        }
+        let Some(scan) = scanned else { return Ok(None) };
+        let Some(db) = hg.forest_store() else {
+            return Ok(None);
+        };
+        if identity != Some(db.backing_store_identity()) {
+            return Ok(None);
+        }
+        match quil_store::committee_capture_point(&db)? {
+            Some(point) if point.sees_watched_keys_of(&scan) => rows.committee_scan(None),
+            _ => Ok(None),
+        }
     }
 
     fn check_execution_store(
@@ -2037,6 +2181,14 @@ impl SharedProverRegistry {
     /// across a refresh, giving operators visibility into the join → confirm
     /// lifecycle (e.g. a freshly-materialized join appearing as `status=Joining`).
     pub fn refresh_from_store(&self, hg_store: &dyn HypergraphStore) -> QuilResult<()> {
+        self.refresh_from_store_timed(hg_store, None)
+    }
+
+    fn refresh_from_store_timed(
+        &self,
+        hg_store: &dyn HypergraphStore,
+        timing: Option<&RegistryUpdateTiming>,
+    ) -> QuilResult<()> {
         self.check_execution_store(hg_store.backing_store_identity())?;
         if let Some((_, limits)) = self.execution_binding.as_ref() {
             // Tentative state must not emit public local-prover lifecycle logs.
@@ -2044,7 +2196,7 @@ impl SharedProverRegistry {
                 .inner
                 .write()
                 .map_err(|_| QuilError::ExecutionUnavailable("registry lock poisoned".into()))?
-                .refresh_with_limits(hg_store, *limits)
+                .refresh_with_timing(hg_store, *limits, timing)
                 .map_err(|error| {
                     QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}"))
                 });
@@ -2164,49 +2316,89 @@ impl SharedProverRegistry {
         Ok(timing)
     }
 
-    /// Bring an execution branch's registry up to date with the registry rows
-    /// `overlay` wrote, updating only the records they feed. A full refresh
-    /// runs only when that cannot match one exactly (see
-    /// `InMemoryProverRegistry::update_rows`) or the writes cannot be listed.
-    pub(crate) fn update_written_rows(
+    /// Refresh the epoch census from the same committed rows as a full scan.
+    /// A private branch enumerates edits in its pinned overlay snapshot. An
+    /// archive executing in place uses its canonical store's write journal.
+    pub fn refresh_archive_epoch(
         &self,
         store: &dyn HypergraphStore,
-        overlay: &quil_forest::ExecutionOverlay,
-    ) -> QuilResult<()> {
+        written_since: impl FnOnce(u64, u64) -> Option<Vec<Vec<u8>>>,
+    ) -> QuilResult<RegistryCatchUp> {
+        if self.execution_binding.is_some() {
+            return self.update_written_rows_timed(store, None);
+        }
+        let outcome = self.catch_up(store, written_since)?;
+        if outcome == RegistryCatchUp::Skipped {
+            self.refresh_from_store(store)?;
+            return Ok(RegistryCatchUp::Refreshed);
+        }
+        Ok(outcome)
+    }
+
+    /// Bring a branch's registry up to its captured view. Read the cumulative
+    /// write list, replacement rows and any full-scan fallback at one revision.
+    pub(crate) fn update_written_rows_timed(
+        &self,
+        store: &dyn HypergraphStore,
+        mut timing: Option<&mut RegistryUpdateTiming>,
+    ) -> QuilResult<RegistryCatchUp> {
+        if let Some(t) = timing.as_mut() {
+            t.mode = "full";
+        }
         self.check_execution_store(store.backing_store_identity())?;
         let Some((_, limits)) = self.execution_binding.as_ref() else {
-            return self.refresh_from_store(store);
+            self.refresh_from_store_timed(store, timing.as_deref())?;
+            return Ok(RegistryCatchUp::Refreshed);
         };
-        let Some(written) = registry_rows::written_rows(overlay) else {
-            return self.refresh_from_store(store);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| QuilError::ExecutionUnavailable("registry lock poisoned".into()))?;
+        let unavailable = |error: QuilError| {
+            QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}"))
         };
-        {
-            let mut guard = self
-                .inner
-                .write()
-                .map_err(|_| QuilError::ExecutionUnavailable("registry lock poisoned".into()))?;
-            // Rows from the legacy tree, or a cache edited directly: a refresh
-            // would differ even where no row changed.
+        let snapshot = store
+            .capture_tree_snapshot()
+            .map_err(unavailable)?
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable(
+                    "prover registry requires a consistent store snapshot".into(),
+                )
+            })?;
+        if let Some(keys) = snapshot.written_registry_keys().map_err(unavailable)? {
+            let written = registry_rows::rows_of_keys(keys);
+            if let Some(t) = timing.as_mut() {
+                t.changed_rows = Some(written.len());
+            }
             if !guard.diverged && guard.rows.is_some() {
                 if written.is_empty() {
-                    return Ok(());
+                    if let Some(t) = timing.as_mut() {
+                        t.mode = "incremental";
+                    }
+                    return Ok(RegistryCatchUp::Current);
                 }
-                let snapshot = store.capture_tree_snapshot()?.ok_or_else(|| {
-                    QuilError::Store("prover registry requires a consistent store snapshot".into())
-                })?;
                 if guard
-                    .update_rows(snapshot.as_ref(), &written, *limits)
-                    .map_err(|error| {
-                        QuilError::ExecutionUnavailable(format!(
-                            "execution registry refresh: {error}"
-                        ))
-                    })?
+                    .update_rows(snapshot.as_ref(), &written, *limits, timing.as_deref_mut())
+                    .map_err(unavailable)?
                 {
-                    return Ok(());
+                    if let Some(t) = timing.as_mut() {
+                        t.mode = "incremental";
+                    }
+                    return Ok(RegistryCatchUp::Updated {
+                        rows: written.len(),
+                    });
                 }
             }
         }
-        self.refresh_from_store(store)
+        guard
+            .refresh_rows(
+                snapshot.as_ref(),
+                *limits,
+                crate::archive_execution(),
+                timing.as_deref(),
+            )
+            .map_err(unavailable)?;
+        Ok(RegistryCatchUp::Refreshed)
     }
 
     /// Bring this canonical registry up to the prover rows `store` holds now
@@ -2255,7 +2447,7 @@ impl SharedProverRegistry {
                     Some((point, RegistryCatchUp::Current))
                 }
                 (Some(point), Some(written)) => guard
-                    .update_rows(snapshot.as_ref(), written, RegistryLimits::UNBOUNDED)?
+                    .update_rows(snapshot.as_ref(), written, RegistryLimits::UNBOUNDED, None)?
                     .then_some((
                         point,
                         RegistryCatchUp::Updated {
@@ -2970,18 +3162,21 @@ fn visit_registry_vertices(
     phase: &str,
     shard: &ShardKey,
     limits: VertexPageLimits,
+    timing: Option<&RegistryUpdateTiming>,
     mut visit: impl FnMut(Vec<u8>, Vec<u8>) -> QuilResult<()>,
 ) -> QuilResult<()> {
     let mut after = None;
     loop {
-        let page = snapshot.page_vertex_underlying_fixed(
-            "vertex",
-            phase,
-            shard,
-            &shard.l2,
-            after.as_ref(),
-            limits,
-        )?;
+        let page = measure(timing.map(|t| &t.read), || {
+            snapshot.page_vertex_underlying_fixed(
+                "vertex",
+                phase,
+                shard,
+                &shard.l2,
+                after.as_ref(),
+                limits,
+            )
+        })?;
         if page.has_more && page.entries.is_empty() {
             return Err(QuilError::Store("registry page made no progress".into()));
         }
@@ -3231,7 +3426,10 @@ fn decode_allocation(
 /// come due at an epoch boundary (the 48s materialize spikes). This stays
 /// COMMITTED-state (deterministic — every node scans the identical tree) and
 /// MUST NOT be replaced by the async registry cache, which can differ across
-/// nodes and would diverge the prover tree.
+/// nodes and would diverge the prover tree. Archive committee passes may
+/// reconstruct this same input from decoded raw rows after verifying the
+/// store snapshot and folding in the private branch's writes.
+#[derive(Default)]
 pub struct CommittedProverScan {
     addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
@@ -3246,6 +3444,26 @@ pub struct CommittedProverScan {
 }
 
 impl CommittedProverScan {
+    /// Select committee inputs for this execution. The archive projection is
+    /// optional, so any view it cannot establish takes the full committed scan.
+    pub(crate) fn for_committee(
+        hg: &quil_hypergraph::HypergraphCrdt,
+        registry: Option<&dyn ProverRegistryTrait>,
+        archive: bool,
+    ) -> QuilResult<(Self, Option<&'static str>)> {
+        if archive {
+            if let Some(registry) = registry
+                .and_then(|r| r.as_any())
+                .and_then(|r| r.downcast_ref::<SharedProverRegistry>())
+            {
+                if let Some(scan) = registry.committee_scan(hg)? {
+                    return Ok((scan, Some("indexed")));
+                }
+            }
+        }
+        Ok((Self::try_scan(hg)?, archive.then_some("full")))
+    }
+
     /// One destructive pass over the committed global prover shard, collecting
     /// prover pubkeys (by address) and every allocation.
     pub fn scan(hg: &quil_hypergraph::HypergraphCrdt) -> Self {
@@ -8694,6 +8912,9 @@ mod tests {
     }
 
     include!("prover_registry_storage_tests.rs");
+    mod committee_scan_tests {
+        include!("committee_scan_tests.rs");
+    }
     include!("prover_registry_penalties_tests.rs");
     include!("registry_rows_tests.rs");
     #[test]

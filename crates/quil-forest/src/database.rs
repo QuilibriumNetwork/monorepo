@@ -7,13 +7,16 @@
 
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
+use std::panic::Location;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::storage_health::{StoreRole, StoreState};
-use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
+use quil_types::store::{
+    BackingStoreIdentity, CapturePoint, ScanPoint, LOCAL_WITNESS_INDEX_PREFIX,
+};
 use rocksdb::{
     DBIterator, DBRawIterator, IteratorMode, ReadOptions, Snapshot, WriteBatch, WriteOptions, DB,
 };
@@ -28,12 +31,46 @@ pub enum DatabaseCommitError {
     PriorWriteFailed,
     #[error("execution publication belongs to another database")]
     ForeignDatabase,
-    #[error("execution base changed (captured sequence {expected}, current {actual})")]
-    Stale { expected: u64, actual: u64 },
+    #[error("execution base changed (captured sequence {expected}, current {actual}, {} at sequence {written} by {writer})", conflict_scope(*.prefix, *.global_frame))]
+    Stale {
+        expected: u64,
+        actual: u64,
+        written: u64,
+        writer: &'static Location<'static>,
+        prefix: Option<&'static [u8]>,
+        global_frame: Option<u64>,
+    },
     #[error("disjoint write outside its declared key prefixes")]
     OutsideKeyspace,
     #[error(transparent)]
     Storage(#[from] rocksdb::Error),
+}
+
+fn conflict_scope(prefix: Option<&[u8]>, global_frame: Option<u64>) -> String {
+    match (prefix, global_frame) {
+        (Some([a, b]), _) => format!("overlapping prefix 0x{a:02x}{b:02x}"),
+        (Some(prefix), _) => format!("overlapping prefix {}", String::from_utf8_lossy(prefix)),
+        (_, Some(frame)) => format!("general write of canonical GLOBAL frame {frame}"),
+        _ => "general write".into(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WriteStamp {
+    sequence: u64,
+    writer: &'static Location<'static>,
+    global_frame: Option<u64>,
+}
+
+impl WriteStamp {
+    #[track_caller]
+    fn at(sequence: u64) -> Self {
+        Self {
+            sequence,
+            writer: Location::caller(),
+            global_frame: None,
+        }
+    }
 }
 
 pub(crate) struct DatabaseInner {
@@ -264,12 +301,11 @@ pub fn take_all_stores_write_times() -> WriteTimesSample {
 }
 
 /// Sequence numbers recorded under the write barrier. A write confined to
-/// declared two-byte prefixes is recorded per prefix; every other write is
+/// declared prefixes is recorded per prefix; every other write is
 /// general. Execution publication compares these against its own footprint.
-#[derive(Default)]
 struct WriteLedger {
-    general: u64,
-    disjoint: BTreeMap<[u8; 2], u64>,
+    general: WriteStamp,
+    disjoint: BTreeMap<&'static [u8], WriteStamp>,
     /// Sequence after the last write that may have written a watched key.
     watched: u64,
     /// The watched keys those writes wrote, once a reader has asked for them
@@ -328,14 +364,20 @@ impl WatchedJournal {
     }
 }
 
-/// Two-byte key prefixes a branch read, scanned or wrote. Marking is
-/// conservative: any key or range that could fall in a prefix marks it.
+/// The binary key tags and local witness namespace a branch read, scanned
+/// or wrote. A fork inherits both from its parent.
 #[derive(Clone)]
-pub struct KeyPrefixSet(Box<[u64; 1024]>);
+pub struct KeyPrefixSet {
+    tags: Box<[u64; 1024]>,
+    witness_index: bool,
+}
 
 impl Default for KeyPrefixSet {
     fn default() -> Self {
-        Self(Box::new([0; 1024]))
+        Self {
+            tags: Box::new([0; 1024]),
+            witness_index: false,
+        }
     }
 }
 
@@ -345,7 +387,7 @@ impl KeyPrefixSet {
     }
 
     fn set(&mut self, index: usize) {
-        self.0[index >> 6] |= 1 << (index & 63);
+        self.tags[index >> 6] |= 1 << (index & 63);
     }
 
     /// Inclusive, one word at a time: a wide cursor costs at most 1,024 ORs.
@@ -353,13 +395,21 @@ impl KeyPrefixSet {
         for word in start >> 6..=end >> 6 {
             let low = if word == start >> 6 { start & 63 } else { 0 };
             let high = if word == end >> 6 { end & 63 } else { 63 };
-            self.0[word] |= (u64::MAX >> (63 - high)) & (u64::MAX << low);
+            self.tags[word] |= (u64::MAX >> (63 - high)) & (u64::MAX << low);
         }
     }
 
     pub fn contains(&self, prefix: [u8; 2]) -> bool {
         let index = Self::index(prefix[0], prefix[1]);
-        self.0[index >> 6] & (1 << (index & 63)) != 0
+        self.tags[index >> 6] & (1 << (index & 63)) != 0
+    }
+
+    fn touches(&self, prefix: &[u8]) -> bool {
+        match prefix {
+            [a, b] => self.contains([*a, *b]),
+            LOCAL_WITNESS_INDEX_PREFIX => self.witness_index,
+            _ => true,
+        }
     }
 
     /// A key shorter than two bytes conservatively marks the first prefix
@@ -367,11 +417,15 @@ impl KeyPrefixSet {
     pub fn mark_key(&mut self, key: &[u8]) {
         let first = key.first().copied().unwrap_or(0);
         self.set(Self::index(first, key.get(1).copied().unwrap_or(0)));
+        if first == b'q' && key.starts_with(LOCAL_WITNESS_INDEX_PREFIX) {
+            self.witness_index = true;
+        }
     }
 
     /// Half-open range. Every prefix from the lower bound's prefix through the
     /// upper bound's prefix is marked, including one the upper bound excludes.
     pub fn mark_range(&mut self, lower: &[u8], upper: &[u8]) {
+        self.witness_index |= range_meets_prefix(lower, upper, LOCAL_WITNESS_INDEX_PREFIX);
         let start = Self::index(
             lower.first().copied().unwrap_or(0),
             lower.get(1).copied().unwrap_or(0),
@@ -385,37 +439,57 @@ impl KeyPrefixSet {
 }
 
 /// A batch whose keys and range endpoints are checked, as they are added, to
-/// lie within declared two-byte prefixes. Use it only for records execution
+/// lie within declared prefixes. Use it only for records execution
 /// does not need (for example consensus candidate bodies). The declaration
 /// does not have to be trusted: a plan that touched a written prefix still
 /// conflicts.
 pub struct DisjointBatch {
-    allowed: &'static [[u8; 2]],
-    touched: Vec<[u8; 2]>,
+    allowed: BatchKeyspace,
+    touched: Vec<&'static [u8]>,
     batch: WriteBatch,
+}
+
+enum BatchKeyspace {
+    Tags(&'static [[u8; 2]]),
+    WitnessIndex,
 }
 
 impl DisjointBatch {
     pub fn new(allowed: &'static [[u8; 2]]) -> Self {
         Self {
-            allowed,
+            allowed: BatchKeyspace::Tags(allowed),
             touched: Vec::new(),
             batch: WriteBatch::default(),
         }
     }
 
-    fn prefix(&mut self, key: &[u8]) -> Result<[u8; 2], DatabaseCommitError> {
-        let prefix = match key {
-            [first, second, ..] => [*first, *second],
-            _ => return Err(DatabaseCommitError::OutsideKeyspace),
-        };
-        if !self.allowed.contains(&prefix) {
-            return Err(DatabaseCommitError::OutsideKeyspace);
+    /// Every key must belong to the local witness index. A GLOBAL branch can
+    /// still access quil/global/ records without overlapping it.
+    pub fn local_witness_index() -> Self {
+        Self {
+            allowed: BatchKeyspace::WitnessIndex,
+            touched: Vec::new(),
+            batch: WriteBatch::default(),
         }
+    }
+
+    fn prefix(&self, key: &[u8]) -> Result<&'static [u8], DatabaseCommitError> {
+        match self.allowed {
+            BatchKeyspace::Tags(tags) => tags
+                .iter()
+                .map(|tag| tag.as_slice())
+                .find(|tag| key.starts_with(tag)),
+            BatchKeyspace::WitnessIndex => key
+                .starts_with(LOCAL_WITNESS_INDEX_PREFIX)
+                .then_some(LOCAL_WITNESS_INDEX_PREFIX),
+        }
+        .ok_or(DatabaseCommitError::OutsideKeyspace)
+    }
+
+    fn record(&mut self, prefix: &'static [u8]) {
         if !self.touched.contains(&prefix) {
             self.touched.push(prefix);
         }
-        Ok(prefix)
     }
 
     pub fn put(
@@ -423,13 +497,13 @@ impl DisjointBatch {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<(), DatabaseCommitError> {
-        self.prefix(key.as_ref())?;
+        self.record(self.prefix(key.as_ref())?);
         self.batch.put(key, value);
         Ok(())
     }
 
     pub fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<(), DatabaseCommitError> {
-        self.prefix(key.as_ref())?;
+        self.record(self.prefix(key.as_ref())?);
         self.batch.delete(key);
         Ok(())
     }
@@ -442,9 +516,11 @@ impl DisjointBatch {
         end: impl AsRef<[u8]>,
     ) -> Result<(), DatabaseCommitError> {
         let (start, end) = (start.as_ref(), end.as_ref());
-        if start > end || self.prefix(start)? != self.prefix(end)? {
+        let prefix = self.prefix(start)?;
+        if start > end || prefix != self.prefix(end)? {
             return Err(DatabaseCommitError::OutsideKeyspace);
         }
+        self.record(prefix);
         self.batch.delete_range(start, end);
         Ok(())
     }
@@ -490,7 +566,7 @@ impl CoordinatedDb {
         let inner = Arc::new(DatabaseInner {
             db: ManuallyDrop::new(db),
             writes: Mutex::new(WriteLedger {
-                general,
+                general: WriteStamp::at(general),
                 disjoint: BTreeMap::new(),
                 // Nothing written before the watch is known to be unwatched.
                 watched: general,
@@ -514,6 +590,34 @@ impl CoordinatedDb {
 
     pub(crate) fn watched_prefixes(&self) -> Option<&[Vec<u8>]> {
         self.0.watched.as_deref()
+    }
+
+    /// Whether every write under these prefixes advances the watched sequence.
+    pub fn watches_all(&self, prefixes: &[Vec<u8>]) -> bool {
+        self.watched_prefixes()
+            .is_some_and(|watched| prefixes.iter().all(|prefix| key_under(watched, prefix)))
+    }
+
+    /// The watched-write stamp and the snapshot it describes, taken together
+    /// under the write barrier. A reader can verify a decoded index against it.
+    pub fn watched_snapshot(
+        &self,
+        prefixes: &[Vec<u8>],
+    ) -> Result<Option<(Snapshot<'_>, CapturePoint)>, DatabaseCommitError> {
+        if !self.watches_all(prefixes) {
+            return Ok(None);
+        }
+        let (snapshot, sequence, watched) = self.execution_snapshot()?;
+        Ok(watched.map(|watched| {
+            (
+                snapshot,
+                CapturePoint {
+                    database: self.instance(),
+                    sequence,
+                    watched,
+                },
+            )
+        }))
     }
 
     pub fn backing_store_identity(&self) -> BackingStoreIdentity {
@@ -605,10 +709,12 @@ impl CoordinatedDb {
         self.0.state.arm_fault(error);
     }
 
+    #[track_caller]
     pub fn write(&self, batch: WriteBatch) -> Result<(), DatabaseCommitError> {
         self.write_opt(batch, &WriteOptions::default())
     }
 
+    #[track_caller]
     pub fn write_opt(
         &self,
         batch: WriteBatch,
@@ -617,6 +723,7 @@ impl CoordinatedDb {
         self.lock_writes()?.write_batch(batch, options)
     }
 
+    #[track_caller]
     pub fn put(
         &self,
         key: impl AsRef<[u8]>,
@@ -627,6 +734,7 @@ impl CoordinatedDb {
         self.write(batch)
     }
 
+    #[track_caller]
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<(), DatabaseCommitError> {
         let mut batch = WriteBatch::default();
         batch.delete(key);
@@ -635,6 +743,7 @@ impl CoordinatedDb {
 
     /// Write a batch confined to its declared prefixes. It invalidates only
     /// execution plans that touched one of the prefixes it wrote.
+    #[track_caller]
     pub fn write_disjoint(
         &self,
         batch: DisjointBatch,
@@ -642,9 +751,9 @@ impl CoordinatedDb {
     ) -> Result<(), DatabaseCommitError> {
         let mut guard = self.lock_writes()?;
         guard.write_raw(batch.batch, options)?;
-        let sequence = self.0.db.latest_sequence_number();
+        let stamp = WriteStamp::at(self.0.db.latest_sequence_number());
         for prefix in batch.touched {
-            guard.ledger.disjoint.insert(prefix, sequence);
+            guard.ledger.disjoint.insert(prefix, stamp);
         }
         Ok(())
     }
@@ -790,6 +899,7 @@ impl CoordinatedDb {
     ) {
         self.0.db.compact_range_opt(start, end, opts);
     }
+    #[track_caller]
     pub fn try_catch_up_with_primary(&self) -> Result<(), DatabaseCommitError> {
         let mut guard = self.lock_writes()?;
         let caught_up = self.0.db.try_catch_up_with_primary();
@@ -799,7 +909,7 @@ impl CoordinatedDb {
             *journal = WatchedJournal::starting_at(sequence);
         }
         caught_up?;
-        guard.ledger.general = sequence;
+        guard.ledger.general = WriteStamp::at(sequence);
         Ok(())
     }
 }
@@ -888,18 +998,73 @@ impl DatabaseWriteGuard<'_> {
             .map(|_| self.ledger.watched)
     }
 
+    #[track_caller]
     fn write_batch(
         &mut self,
         batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<(), DatabaseCommitError> {
+        let has_writes = !batch.is_empty();
         self.write_raw(batch, options)?;
-        self.ledger.general = self.database.0.db.latest_sequence_number();
+        // An empty transaction must not relabel a previous disjoint write.
+        if has_writes {
+            self.ledger.general = WriteStamp::at(self.database.latest_sequence_number());
+        }
+        Ok(())
+    }
+
+    /// A canonical frame changes the general execution base. Attach its
+    /// incoming height and the original caller to the same conflict stamp.
+    #[track_caller]
+    pub fn write_global_frame(
+        &mut self,
+        batch: WriteBatch,
+        frame_number: u64,
+    ) -> Result<(), DatabaseCommitError> {
+        if !batch.is_empty() {
+            self.write_batch(batch, &WriteOptions::default())?;
+            self.ledger.general.global_frame = Some(frame_number);
+        }
         Ok(())
     }
 
     /// Accept the plan when nothing was written since its capture, or when
     /// every intervening write was confined to prefixes it never touched.
+    pub(crate) fn check_execution_base(
+        &self,
+        source: &CoordinatedDb,
+        expected: u64,
+        touched: &KeyPrefixSet,
+    ) -> Result<(), DatabaseCommitError> {
+        if !self.database.same_database(source) {
+            return Err(DatabaseCommitError::ForeignDatabase);
+        }
+        let actual = self.database.latest_sequence_number();
+        if actual == expected {
+            return Ok(());
+        }
+        let conflict = if self.ledger.general.sequence > expected {
+            Some((None, self.ledger.general))
+        } else {
+            self.ledger
+                .disjoint
+                .iter()
+                .find(|(prefix, stamp)| stamp.sequence > expected && touched.touches(prefix))
+                .map(|(prefix, stamp)| (Some(*prefix), *stamp))
+        };
+        if let Some((prefix, stamp)) = conflict {
+            return Err(DatabaseCommitError::Stale {
+                expected,
+                actual,
+                prefix,
+                written: stamp.sequence,
+                writer: stamp.writer,
+                global_frame: stamp.global_frame,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn commit_execution(
         &mut self,
         source: &CoordinatedDb,
@@ -907,23 +1072,14 @@ impl DatabaseWriteGuard<'_> {
         touched: &KeyPrefixSet,
         batch: WriteBatch,
     ) -> Result<(), DatabaseCommitError> {
-        if !self.database.same_database(source) {
-            return Err(DatabaseCommitError::ForeignDatabase);
-        }
-        let actual = self.database.latest_sequence_number();
-        if actual != expected
-            && (self.ledger.general > expected
-                || self
-                    .ledger
-                    .disjoint
-                    .iter()
-                    .any(|(prefix, sequence)| *sequence > expected && touched.contains(*prefix)))
-        {
-            return Err(DatabaseCommitError::Stale { expected, actual });
-        }
+        self.check_execution_base(source, expected, touched)?;
         let mut options = WriteOptions::default();
         options.set_sync(true);
-        self.write_batch(batch, &options)
+        self.write_raw(batch, &options)?;
+        // Publication adopts execution metadata even when its storage delta
+        // is empty. Keep the publication sequence as a general write fence.
+        self.ledger.general = WriteStamp::at(self.database.latest_sequence_number());
+        Ok(())
     }
 }
 
@@ -946,18 +1102,11 @@ pub(crate) fn key_under(prefixes: &[Vec<u8>], key: &[u8]) -> bool {
 /// `[p, successor(p))` exactly when begin < successor(p) and end > p; every key
 /// in that interval starts with p.
 pub(crate) fn range_meets(prefixes: &[Vec<u8>], begin: &[u8], end: &[u8]) -> bool {
-    begin < end
-        && prefixes.iter().any(|p| {
-            let below_successor = match p.iter().rposition(|&b| b != 0xff) {
-                Some(i) => {
-                    let mut successor = p[..=i].to_vec();
-                    successor[i] += 1;
-                    begin < successor.as_slice()
-                }
-                None => true,
-            };
-            below_successor && end > p.as_slice()
-        })
+    prefixes.iter().any(|p| range_meets_prefix(begin, end, p))
+}
+
+fn range_meets_prefix(begin: &[u8], end: &[u8], prefix: &[u8]) -> bool {
+    begin < end && end > prefix && (begin < prefix || begin.starts_with(prefix))
 }
 
 /// What a write batch wrote under the watched prefixes.

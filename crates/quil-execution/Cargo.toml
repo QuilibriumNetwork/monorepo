@@ -31,6 +31,7 @@ quil-storage-stark = { path = "../quil-storage-stark" }
 # app-shard frames). Acyclic: quil-cw-consensus doesn't depend on us.
 quil-cw-consensus = { path = "../quil-cw-consensus" }
 once_cell = "1"
+lru = "0.12"
 quil-tries = { path = "../quil-tries" }
 quil-forest = { path = "../quil-forest" }
 quil-hypergraph = { path = "../quil-hypergraph" }

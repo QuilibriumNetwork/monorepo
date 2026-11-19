@@ -179,6 +179,239 @@ fn tentative_vertex_walk_seeks_past_retained_versions() {
 fn open(path: &std::path::Path) -> quil_forest::CoordinatedDb {
     quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(path).unwrap())
 }
+
+#[test]
+fn exact_registry_lookup_matches_paging_and_stays_within_the_requested_address() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(directory.path());
+    let sk = shard();
+    let legacy = |n| hypergraph_vertex_data_key("vertex", "adds", &sk, &vertex(n));
+    let version =
+        |n, v| crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &sk, &vertex(n), v);
+    db.put(legacy(0), vec![1; 512]).unwrap();
+    db.put(version(0, 1), b"first").unwrap();
+    db.put(version(0, 2), b"new").unwrap();
+    let mut interleaved = version(0, 3);
+    interleaved.push(0);
+    db.put(interleaved, b"variable length").unwrap();
+    db.put(legacy(2), vec![2; 1024]).unwrap();
+    db.put(legacy(3), b"legacy").unwrap();
+    db.put(version(255, u64::MAX), b"").unwrap();
+    let durable = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+    let store = OverlayHypergraphStore::new(overlay.clone());
+    let captured = store.capture_tree_snapshot().unwrap().unwrap();
+    let read = |view: &dyn SnapshotReadable, n, bytes| {
+        view.get_vertex_underlying_fixed("vertex", "adds", &sk, &sk.l2, &[n; 32], bytes)
+    };
+    for n in [0, 1, 2, 3, 254, 255] {
+        assert_eq!(
+            read(captured.as_ref(), n, 4096).unwrap(),
+            read(&durable, n, 4096).unwrap()
+        );
+    }
+    assert_eq!(read(captured.as_ref(), 1, 64).unwrap(), None);
+    assert_eq!(read(captured.as_ref(), 255, 64).unwrap(), Some(vec![]));
+    assert!(read(captured.as_ref(), 0, 66).is_err());
+    assert!(read(captured.as_ref(), 3, 69).is_err());
+    assert!(read(captured.as_ref(), 255, 63).is_err());
+    // The old one-entry page widened both cursors and copied neighboring rows.
+    let before = overlay.stats().read_operations;
+    let expected = captured
+        .page_vertex_underlying_fixed(
+            "vertex",
+            "adds",
+            &sk,
+            &sk.l2,
+            None,
+            VertexPageLimits {
+                max_entries: 1,
+                max_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let after_page = overlay.stats().read_operations;
+    assert_eq!(
+        read(captured.as_ref(), 0, 67).unwrap().as_ref(),
+        Some(&expected.entries[0].1)
+    );
+    assert!(overlay.stats().read_operations - after_page < after_page - before);
+
+    use quil_forest::OverlayMutation::{Delete, Put};
+    overlay
+        .apply(&[Delete(legacy(3)), Put(version(0, 4), b"branch".to_vec())])
+        .unwrap();
+    db.put(version(0, 5), b"later durable write").unwrap();
+    let current = store.capture_tree_snapshot().unwrap().unwrap();
+    assert_eq!(read(current.as_ref(), 3, 70).unwrap(), None);
+    assert_eq!(
+        read(captured.as_ref(), 3, 70).unwrap(),
+        Some(b"legacy".to_vec())
+    );
+    assert_eq!(
+        read(current.as_ref(), 0, 70).unwrap(),
+        Some(b"branch".to_vec())
+    );
+    assert_eq!(
+        read(captured.as_ref(), 0, 67).unwrap(),
+        Some(b"new".to_vec())
+    );
+}
+#[test]
+fn vertex_batches_match_individual_reads_on_pinned_and_forked_views() {
+    use quil_forest::OverlayMutation::{Delete, DeleteRange, Put};
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let shard = shard();
+    let version = |n, v| {
+        crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &vertex(n), v)
+    };
+    let legacy = |n| hypergraph_vertex_data_key("vertex", "adds", &shard, &vertex(n));
+    for n in 0..32 {
+        db.put(legacy(n), [n]).unwrap();
+        if n % 2 == 0 {
+            db.put(version(n, 2), [n, 2]).unwrap();
+        }
+        if n % 3 == 0 {
+            db.put(version(n, 6), [n, 6]).unwrap();
+        }
+    }
+    let mut mixed = version(0, 7);
+    mixed.push(1);
+    db.put(mixed, b"interleaved").unwrap();
+    db.put(version(255, u64::MAX), []).unwrap();
+    let addresses: Vec<_> = [255, 0, 77, 4, 0]
+        .into_iter()
+        .chain(1..28)
+        .map(|n| [n; 32])
+        .collect();
+    let compare = |snap: &dyn SnapshotReadable| {
+        for kind in [
+            VertexBatchRead::Registry { max_bytes: 128 },
+            VertexBatchRead::Execution,
+        ] {
+            let scalar: Vec<_> = addresses
+                .iter()
+                .map(|address| match kind {
+                    VertexBatchRead::Registry { max_bytes } => snap.get_vertex_underlying_fixed(
+                        "vertex", "adds", &shard, &shard.l2, address, max_bytes,
+                    ),
+                    VertexBatchRead::Execution => snap.load_vertex_underlying_raw(
+                        "vertex",
+                        "adds",
+                        &shard,
+                        &vertex(address[0]),
+                    ),
+                })
+                .collect::<Result<_>>()
+                .unwrap();
+            let batch = snap
+                .vertex_batch("adds", &shard, &shard.l2, &addresses, kind)
+                .unwrap();
+            assert_eq!(batch, scalar);
+        }
+    };
+    let durable = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+    let store = OverlayHypergraphStore::new(overlay.clone());
+    let original = store.capture_tree_snapshot().unwrap().unwrap();
+    compare(&durable);
+    compare(original.as_ref());
+    assert_eq!(
+        original
+            .vertex_batch(
+                "adds",
+                &shard,
+                &shard.l2,
+                &[[0; 32]],
+                VertexBatchRead::Execution
+            )
+            .unwrap(),
+        [Some(vec![0])]
+    );
+    assert_eq!(
+        original
+            .vertex_batch(
+                "adds",
+                &shard,
+                &shard.l2,
+                &[[0; 32]],
+                VertexBatchRead::Registry { max_bytes: 66 }
+            )
+            .unwrap(),
+        [Some(vec![0, 6])]
+    );
+    overlay
+        .apply(&[
+            Put(version(0, 5), vec![88]), // base has a newer version
+            Put(version(2, 2), vec![90]), // same version in the overlay wins
+            Delete(version(3, 6)),        // reveals the legacy value
+            DeleteRange(version(4, 0), version(4, 9)),
+            Put(version(4, 3), vec![91]), // a point survives its preceding range deletion
+            Put(version(7, 1), vec![1; 128]),
+            Delete(legacy(5)),
+        ])
+        .unwrap();
+    let edited = store.capture_tree_snapshot().unwrap().unwrap();
+    let child = Arc::new(overlay.fork(limits()).unwrap());
+    child
+        .apply(&[Put(version(4, 10), vec![92]), Delete(version(7, 1))])
+        .unwrap();
+    let child_store = OverlayHypergraphStore::new(child);
+    let child_view = child_store.capture_tree_snapshot().unwrap().unwrap();
+    db.put(version(2, 99), b"later").unwrap();
+    assert!(edited
+        .vertex_batch(
+            "adds",
+            &shard,
+            &shard.l2,
+            &addresses,
+            VertexBatchRead::Registry { max_bytes: 128 }
+        )
+        .is_err());
+    // With the oversized row excluded, both registry and execution views
+    // agree with scalar reads on the old base, overlay and its child.
+    overlay.apply(&[Delete(version(7, 1))]).unwrap();
+    compare(&durable);
+    compare(original.as_ref());
+    compare(store.capture_tree_snapshot().unwrap().unwrap().as_ref());
+    compare(child_view.as_ref());
+    assert_eq!(
+        edited
+            .vertex_batch(
+                "adds",
+                &shard,
+                &shard.l2,
+                &[[4; 32]],
+                VertexBatchRead::Execution
+            )
+            .unwrap(),
+        [Some(vec![91])]
+    );
+    assert_eq!(
+        child_view
+            .vertex_batch(
+                "adds",
+                &shard,
+                &shard.l2,
+                &[[4; 32]],
+                VertexBatchRead::Execution
+            )
+            .unwrap(),
+        [Some(vec![92])]
+    );
+    overlay.close();
+    assert!(edited
+        .vertex_batch(
+            "adds",
+            &shard,
+            &shard.l2,
+            &addresses,
+            VertexBatchRead::Execution
+        )
+        .is_err());
+}
+
 fn shard() -> ShardKey {
     let l2 = [7; 32];
     ShardKey {

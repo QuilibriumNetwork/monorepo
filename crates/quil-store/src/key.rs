@@ -321,10 +321,7 @@ impl RocksKeyStore {
 
 impl store::KeyStore for RocksKeyStore {
     fn new_transaction(&self) -> Result<Box<dyn store::Transaction>> {
-        Ok(Box::new(crate::RocksTransaction {
-            db: self.db.clone(),
-            batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
-        }))
+        Ok(Box::new(crate::RocksTransaction::new(self.db.clone())))
     }
 
     // ---------------------------------------------------------------

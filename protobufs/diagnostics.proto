@@ -64,6 +64,20 @@ enum Blocker {
   BLOCKER_AWAITING_SHARD_REANCHOR = 17;
   // Waits: this node installs a GLOBAL state sync from an archive.
   BLOCKER_AWAITING_GLOBAL_STATE_SYNC = 18;
+  // The start reasons BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE covered before;
+  // readers that predate them see an unknown blocker.
+  // The successor session's predecessor state is not yet recovered through
+  // its seal frame.
+  BLOCKER_PREDECESSOR_STATE_UNRECOVERED = 19;
+  // The predecessor's outgoing history is still being rebuilt.
+  BLOCKER_PREDECESSOR_HISTORY_UNRECOVERED = 20;
+  // The worker's own outgoing history is still being rebuilt.
+  BLOCKER_OUTGOING_HISTORY_UNRECOVERED = 21;
+  // Committed GLOBAL state holds a session chain this build cannot resolve.
+  BLOCKER_SESSION_CHAIN_UNRESOLVABLE = 22;
+  // The worker's shard state is not ready for another reason (sync or
+  // recovery in progress).
+  BLOCKER_SHARD_STATE_NOT_READY = 23;
 }
 
 // The phase of a worker's archive recovery (`ShardRecovery.phase`).

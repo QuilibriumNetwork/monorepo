@@ -164,7 +164,7 @@ fn row_updates_leave_what_a_full_refresh_leaves() {
         }
         let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
         let fresh = refreshed(&store, limits);
-        if updated.update_rows(snapshot.as_ref(), &written, limits).unwrap() {
+        if updated.update_rows(snapshot.as_ref(), &written, limits, None).unwrap() {
             updates += 1;
             assert_eq!(updated.content(), fresh.content(), "round {round}");
             assert!(updated.scanned.is_none(), "an update is not a database scan");
@@ -199,7 +199,7 @@ fn rows_carry_storage_seats() {
     put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&seat.to_tree().unwrap())));
     let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(registry.update_rows(snapshot.as_ref(), &written, limits).unwrap());
+    assert!(registry.update_rows(snapshot.as_ref(), &written, limits, None).unwrap());
     assert_eq!(registry.get_storage_seat_slot(&member, &filter, 4).unwrap().sealed_at, Some(205));
     assert_eq!(registry.content(), refreshed(&store, limits).content());
 }
@@ -223,7 +223,7 @@ fn rows_carry_storage_snapshots() {
     put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot(9, 2)).unwrap())));
     let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
     let captured = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(registry.update_rows(captured.as_ref(), &written, limits).unwrap());
+    assert!(registry.update_rows(captured.as_ref(), &written, limits, None).unwrap());
     assert_eq!(registry.get_storage_snapshot(&filter, 9), Some(&snapshot(9, 2)));
     assert_eq!(registry.get_storage_snapshot(&filter, 5), None);
     assert_eq!(registry.content(), refreshed(&store, limits).content());
@@ -243,7 +243,7 @@ fn a_row_update_past_a_limit_fails_like_a_refresh_and_changes_nothing() {
     put_row(&store, "adds", &row_address(3), Some(&vec![0xEE; 8192]));
     let written = [(row_address(3), registry_rows::Written { adds: true, removes: false })].into();
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(registry.update_rows(snapshot.as_ref(), &written, limits).is_err());
+    assert!(registry.update_rows(snapshot.as_ref(), &written, limits, None).is_err());
     assert!(InMemoryProverRegistry::new().refresh_with_limits(store.as_ref(), limits).is_err());
     assert_eq!(registry.content(), before);
 }
@@ -265,10 +265,10 @@ fn a_row_update_declines_after_a_direct_edit_or_with_no_rows_left() {
     let mut edited = refreshed(&store, limits);
     assert_eq!(edited.update_prover_activity(&only, &[0xA1; 32], 50), 1);
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(!edited.update_rows(snapshot.as_ref(), &written, limits).unwrap());
+    assert!(!edited.update_rows(snapshot.as_ref(), &written, limits, None).unwrap());
 
     let mut emptied = refreshed(&store, limits);
     put_row(&store, "adds", &only, None);
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(!emptied.update_rows(snapshot.as_ref(), &written, limits).unwrap(), "a refresh would read the legacy tree");
+    assert!(!emptied.update_rows(snapshot.as_ref(), &written, limits, None).unwrap(), "a refresh would read the legacy tree");
 }

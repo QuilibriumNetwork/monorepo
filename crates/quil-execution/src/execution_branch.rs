@@ -237,11 +237,12 @@ impl ExecutionEngineManager {
             .shards_store
             .as_ref()
             .map(|_| Arc::new(OverlayShardsStore::new(storage.0.clone())));
-        let registry = SharedProverRegistry::for_execution_overlay(
+        let registry = SharedProverRegistry::for_materialization_overlay(
             store.as_ref(),
             limits.registry,
             seed,
             &storage.0,
+            crate::archive_execution(),
         )?;
         let global_clock_store: Arc<dyn ClockStore> = match &anchor {
             Some((_, view)) => view.clone(),
@@ -370,13 +371,16 @@ impl ExecutionPublicationGuard<'_> {
             ));
         }
         let mut timing = PublicationSteps::start();
+        branch.overlay().check_commit_base(&db).map_err(|e| {
+            QuilError::ExecutionUnavailable(format!("canonical execution commit: {e}"))
+        })?;
         // A newly accepted registration must be visible after this frame, even
         // if the branch's once-per-epoch maintenance refresh preceded it. Only
         // the records the branch's registry rows feed are re-read.
         let refreshed = branch.overlay().delta_generation();
         branch
             .registry
-            .update_written_rows(branch.store.as_ref(), branch.overlay())?;
+            .update_written_rows_timed(branch.store.as_ref(), timing.registry.as_mut())?;
         timing.mark("update registry");
         let branch_engines = branch.manager.engines.try_read().map_err(|_| {
             QuilError::ExecutionUnavailable("private execution engines are busy or poisoned".into())
@@ -484,6 +488,7 @@ impl ExecutionPublicationGuard<'_> {
 /// One publication's steps, logged together when it took a second or more:
 /// its caller holds the node's frame lock and GLOBAL execution lease.
 struct PublicationSteps {
+    registry: Option<crate::prover_registry::RegistryUpdateTiming>,
     started: std::time::Instant,
     last: std::time::Instant,
     steps: Vec<(&'static str, u128)>,
@@ -493,6 +498,12 @@ impl PublicationSteps {
     fn start() -> Self {
         let now = std::time::Instant::now();
         Self {
+            registry: crate::archive_execution().then(|| {
+                crate::prover_registry::RegistryUpdateTiming {
+                    mode: "pending",
+                    ..Default::default()
+                }
+            }),
             started: now,
             last: now,
             steps: Vec::new(),
@@ -514,6 +525,13 @@ impl Drop for PublicationSteps {
             tracing::warn!(
                 total_ms = total.as_millis() as u64,
                 steps = ?self.steps,
+                registry_mode = self.registry.as_ref().map(|t| t.mode),
+                registry_changed_rows = self.registry.as_ref().and_then(|t| t.changed_rows),
+                registry_row_read_ms = self.registry.as_ref().map(|t| t.read.get().as_millis() as u64),
+                registry_decode_ms = self.registry.as_ref().map(|t| t.decode.get().as_millis() as u64),
+                registry_copied = self.registry.as_ref().and_then(|t| t.copied),
+                registry_copy_ms = self.registry.as_ref().map(|t| t.copy.get().as_millis() as u64),
+                registry_index_ms = self.registry.as_ref().map(|t| t.rebuild.get().as_millis() as u64),
                 after_last_step_ms = self.last.elapsed().as_millis() as u64,
                 "slow execution publication"
             );
