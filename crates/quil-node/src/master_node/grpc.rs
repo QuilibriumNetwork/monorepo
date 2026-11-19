@@ -4862,6 +4862,7 @@ fn health_inputs(
             quil_engine::storage_labels::installed().map(|labels| labels.space()),
         ),
         machine: Some(quil_rpc::machine::current()),
+        build_commit: Some((crate::build_commit::id_bytes(), crate::build_commit::DIRTY)),
     }
 }
 

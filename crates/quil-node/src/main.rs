@@ -19,6 +19,7 @@ use quil_lifecycle::{ShutdownReason, Supervisor};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod build_commit;
 mod effective_config;
 mod logging;
 
@@ -492,6 +493,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     info!(
         version = quil_config::VERSION_STRING,
         subpatch = quil_config::SUBPATCH,
+        build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
+        build_commit = build_commit::label(),
         core = args.core,
         network = args.network,
         "starting quil-node"

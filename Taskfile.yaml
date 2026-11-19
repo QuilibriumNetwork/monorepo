@@ -16,7 +16,10 @@ vars:
   GIT_BRANCH:
     sh: git rev-parse --abbrev-ref HEAD
   GIT_COMMIT:
-    sh: git log -1 --format=%h
+    sh: git rev-parse HEAD
+  # The full commit the node reports, `+dirty` when tracked files differ.
+  BUILD_COMMIT:
+    sh: c=$(git rev-parse HEAD); git diff --quiet HEAD -- || c="$c+dirty"; echo "$c"
   MAX_KEY_ID: 17
 
 tasks:
@@ -27,7 +30,7 @@ tasks:
       - echo -n "Version   :" && echo " {{.VERSION}}"
       - echo -n "Repo      :" && echo " {{.GIT_REPO}}"
       - echo -n "Branch    :" && echo " {{.GIT_BRANCH}}"
-      - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
+      - echo -n "Commit    :" && echo " {{.BUILD_COMMIT}}"
       - echo -n "Max Key ID:" && echo " {{.MAX_KEY_ID}}"
     silent: true
 
@@ -108,17 +111,17 @@ tasks:
       # --ulimit stack=-1:-1 keeps rustc from segfaulting under qemu when
       # cross-building (e.g. arm64 image on an amd64 host or vice versa).
       # No effect on native builds.
-      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_qclient_arm64_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for ARM64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
 
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
 
   test_rust_amd64_linux:
     desc: >-
@@ -154,17 +157,17 @@ tasks:
   build_node_amd64_avx512_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
 
   build_qclient_amd64_avx512_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux with AVX-512 extensions. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
@@ -176,6 +179,7 @@ tasks:
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-source \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:source \
         .
@@ -197,6 +201,7 @@ tasks:
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-release \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:release \
         .
@@ -246,6 +251,7 @@ tasks:
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        --build-arg QUIL_BUILD_COMMIT={{.BUILD_COMMIT}} \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-node-only \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
         .

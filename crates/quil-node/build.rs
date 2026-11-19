@@ -1,3 +1,5 @@
+#[path = "build_support/commit.rs"]
+mod commit;
 #[path = "build_support/fingerprint.rs"]
 mod fingerprint;
 
@@ -53,4 +55,22 @@ fn main() {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     println!("cargo:rustc-env=QUIL_BUILD_FINGERPRINT={digest}");
+
+    // The source commit: not part of the fingerprint, which names what the
+    // binary is built from, not where that source was recorded.
+    println!("cargo:rerun-if-env-changed={}", commit::OVERRIDE);
+    let git = |args: &[&str]| commit::reply(commit::git(root).args(args).output());
+    let named = env::var(commit::OVERRIDE).ok();
+    let source = commit::resolve(named.as_deref(), git).unwrap_or_else(|error| panic!("{error}"));
+    if named.as_deref().unwrap_or_default().trim().is_empty() {
+        for path in commit::watched_by(root, git) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    if let Some(warning) = source.warning() {
+        println!("cargo:warning={warning}");
+    }
+    println!("cargo:rustc-env=QUIL_SOURCE_COMMIT={}", source.id);
+    let dirty = if source.dirty { "+dirty" } else { "" };
+    println!("cargo:rustc-env=QUIL_SOURCE_DIRTY={dirty}");
 }
