@@ -14,12 +14,15 @@
 //!
 //! The inputs are read once, at start, from total memory and disk space
 //! rather than what is available now: the count must not follow load, or
-//! seats would join and leave with it. Lowering the count proposes no leave
-//! at once: seats above it leave through the lifecycle's surplus leave, one
-//! an epoch, never a shard's last needed ones.
+//! seats would join and leave with it. Seats above a lowered count leave
+//! through the lifecycle's surplus leave: the whole surplus proposed in one
+//! cycle (at most `MAX_PROPOSALS_PER_CYCLE`), then none through its
+//! cooldown, draining workers' seats first, never a seat the halt-risk
+//! shield holds.
 
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -51,6 +54,10 @@ pub const PER_SEAT_DISK_BYTES: u64 = 7680 << 20;
 
 /// The fewest workers a node runs.
 pub const FLOOR: u32 = 1;
+
+/// The longest the walk of the kept labels may take before the line at
+/// start warns: the node's start waits on it, on its starting thread.
+pub const LABELS_WALK_BOUND: Duration = Duration::from_secs(5);
 
 /// What the count is derived from, read once at start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +136,10 @@ pub struct Disk {
     pub free: u64,
     /// Bytes of storage labels kept: a cache the node releases for room.
     pub labels: u64,
+    /// Files the walk of the kept labels counted.
+    pub labels_files: u64,
+    /// How long that walk took.
+    pub labels_walk: Duration,
     /// Worker stores present: each already holds its seat's data.
     pub stores: u32,
 }
@@ -243,28 +254,34 @@ pub fn detect_memory() -> Option<Memory> {
 pub fn detect_disk(base: &Path, labels_dir: &Path, stores: u32) -> Option<Disk> {
     let existing = base.ancestors().find(|dir| dir.is_dir())?;
     let usage = quil_forest::storage_health::fs_usage(existing)?;
+    let started = Instant::now();
+    let (labels, labels_files) = dir_bytes(labels_dir);
     Some(Disk {
         total: usage.total_bytes,
         free: usage.free_bytes,
-        labels: dir_bytes(labels_dir),
+        labels,
+        labels_files,
+        labels_walk: started.elapsed(),
         stores,
     })
 }
 
-/// Bytes of the files under `dir`, symbolic links not followed; 0 where it
-/// cannot be read.
-pub fn dir_bytes(dir: &Path) -> u64 {
+/// Bytes and number of the files under `dir`, symbolic links not followed;
+/// none where it cannot be read.
+pub fn dir_bytes(dir: &Path) -> (u64, u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return (0, 0);
     };
     entries
         .flatten()
         .map(|entry| match entry.file_type() {
             Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
-            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
-            _ => 0,
+            Ok(kind) if kind.is_file() => (entry.metadata().map_or(0, |meta| meta.len()), 1),
+            _ => (0, 0),
         })
-        .fold(0, u64::saturating_add)
+        .fold((0, 0), |(bytes, files), (more, count)| {
+            (bytes.saturating_add(more), files.saturating_add(count))
+        })
 }
 
 /// Whether `dir` is a directory holding anything.
@@ -327,13 +344,23 @@ fn term(seats: Option<u32>) -> String {
 
 impl WorkerCount {
     /// Whether the line at start warns: memory or disk hold fewer seats
-    /// than the CPUs, or `dataWorkerCount` asks more than the terms hold.
+    /// than the CPUs, `dataWorkerCount` asks more than the terms hold, or
+    /// the walk of the kept labels overran [`LABELS_WALK_BOUND`].
     pub fn warns(&self) -> bool {
-        match self.binding {
-            Binding::Ram | Binding::Disk => true,
-            Binding::Configured => self.count > self.auto,
-            Binding::Cpu => false,
-        }
+        self.walk_overran()
+            || match self.binding {
+                Binding::Ram | Binding::Disk => true,
+                Binding::Configured => self.count > self.auto,
+                Binding::Cpu => false,
+            }
+    }
+
+    /// Whether the walk of the kept labels took longer than
+    /// [`LABELS_WALK_BOUND`].
+    pub fn walk_overran(&self) -> bool {
+        self.inputs
+            .disk
+            .is_some_and(|disk| disk.labels_walk > LABELS_WALK_BOUND)
     }
 
     /// One line at start: the count, the term that set it and every input;
@@ -366,7 +393,19 @@ impl WorkerCount {
             Binding::Configured => "dataWorkerCount is set: it wins over every term".to_string(),
             Binding::Cpu => "none: the CPUs bind".to_string(),
         };
+        let action = match disk.filter(|_| self.walk_overran()) {
+            Some(disk) => format!(
+                "{action}; the start waited {} ms, above the {} s bound, walking {} files of \
+                 kept storage labels: the disk under the worker stores is slow or holds many \
+                 labels; check its load and health",
+                disk.labels_walk.as_millis(),
+                LABELS_WALK_BOUND.as_secs(),
+                disk.labels_files
+            ),
+            None => action,
+        };
         let floor = disk.map_or(0, |disk| crate::storage_labels::disk_floor(disk.total));
+        let walk_ms = disk.map_or(0, |disk| disk.labels_walk.as_millis() as u64);
         macro_rules! emit {
             ($level:ident) => {
                 $level!(
@@ -387,6 +426,8 @@ impl WorkerCount {
                     disk_total = disk.map_or(0, |disk| disk.total),
                     disk_free = disk.map_or(0, |disk| disk.free),
                     disk_labels = disk.map_or(0, |disk| disk.labels),
+                    disk_labels_files = disk.map_or(0, |disk| disk.labels_files),
+                    disk_labels_walk_ms = walk_ms,
                     disk_stores = disk.map_or(0, |disk| disk.stores),
                     disk_floor = floor,
                     action = %action,
@@ -395,7 +436,7 @@ impl WorkerCount {
                      check) / per seat; a Mac: check 3 GiB, seat 512 MiB; else: check 0, \
                      seat 256 MiB) and disk (worker stores held + (free + labels - floor) / \
                      7.5 GiB), at least 1; dataWorkerCount above 0 wins; read once at start; \
-                     bytes"
+                     bytes; the labels walk's files and milliseconds"
                 )
             };
         }
@@ -514,6 +555,8 @@ mod tests {
             total: 100 * GIB,
             free: 40 * GIB,
             labels: 0,
+            labels_files: 0,
+            labels_walk: Duration::ZERO,
             stores: 0,
         };
         let count = derive(0, &host(16, linux(64), Some(disk)));
@@ -530,6 +573,8 @@ mod tests {
             total: 228 * GIB,
             free: 248 * GIB / 10,
             labels: 0,
+            labels_files: 0,
+            labels_walk: Duration::ZERO,
             stores: 9,
         };
         assert_eq!(disk.seats(), 9, "held stores keep their seats");
@@ -559,8 +604,62 @@ mod tests {
         std::fs::write(dir.path().join("a"), [0u8; 10]).unwrap();
         std::fs::create_dir(dir.path().join("b")).unwrap();
         std::fs::write(dir.path().join("b/c"), [0u8; 5]).unwrap();
-        assert_eq!(dir_bytes(dir.path()), 15);
+        assert_eq!(dir_bytes(dir.path()), (15, 2));
         assert!(holds_store(dir.path()));
         assert!(!holds_store(&dir.path().join("missing")));
+    }
+
+    /// The line at start carries the labels walk's files and duration, at
+    /// info within [`LABELS_WALK_BOUND`] and as a warning naming the bound
+    /// past it, whichever term binds.
+    #[test]
+    fn the_count_line_carries_the_labels_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let labels = dir.path().join("storage-labels");
+        std::fs::create_dir_all(labels.join("epoch")).unwrap();
+        for name in ["a", "b", "epoch/c"] {
+            std::fs::write(labels.join(name), [0u8; 4]).unwrap();
+        }
+        let walked = detect_disk(dir.path(), &labels, 0).expect("the tempdir's filesystem");
+        let got = (walked.labels, walked.labels_files);
+        assert_eq!(got, (12, 3), "the walk counts");
+        let disk = Disk {
+            total: 1000 * GIB,
+            free: 500 * GIB,
+            labels: 12,
+            labels_files: 3,
+            labels_walk: Duration::from_millis(1234),
+            stores: 0,
+        };
+        let within = derive(0, &host(16, linux(64), Some(disk)));
+        assert_eq!(within.binding, Binding::Cpu);
+        assert!(!within.warns(), "a walk within the bound is quiet");
+        let slow = Disk {
+            labels_walk: LABELS_WALK_BOUND + Duration::from_millis(1),
+            ..disk
+        };
+        let over = derive(0, &host(16, linux(64), Some(slow)));
+        assert!(over.warns(), "a walk past the bound warns");
+
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        within.log();
+        over.log();
+        let lines = logs.lines_with("worker count:");
+        assert_eq!(lines.len(), 2, "one line each: {lines:?}");
+        assert!(
+            lines[0].contains("INFO")
+                && lines[0].contains("disk_labels_files=3")
+                && lines[0].contains("disk_labels_walk_ms=1234"),
+            "the line carries the walk: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("WARN")
+                && lines[1].contains("disk_labels_walk_ms=5001")
+                && lines[1].contains("above the 5 s bound"),
+            "past the bound the line warns: {}",
+            lines[1]
+        );
     }
 }

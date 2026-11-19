@@ -1767,6 +1767,8 @@ mod tests {
                 total: 1000 * GIB,
                 free: 500 * GIB,
                 labels: 0,
+                labels_files: 0,
+                labels_walk: std::time::Duration::ZERO,
                 stores: 0,
             }),
         });
