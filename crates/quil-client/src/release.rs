@@ -442,10 +442,11 @@ const START_HINT: &str = "a release the official signatories do not sign starts 
      enable --release-source <URL> --release-key <HEX>', which also turns the auto-update job on \
      ('qclient node auto-update disable' turns it off and keeps the source)";
 
-/// Fail unless the node's and qclient's startup check,
-/// [`verify_release`](quil_crypto::release_check::verify_release) itself,
-/// starts the release at `bin`, reading its install root's stored release
-/// source with `stat`.
+/// Fail unless [`verify_release`](quil_crypto::release_check::verify_release),
+/// the node's and qclient's startup check under the file name, starts the
+/// release at `bin`, reading its install root's stored release source with
+/// `stat`. A release it passes, they start; their check also passes a label
+/// naming their own compiled release.
 pub(crate) fn check_starts(bin: &Path, stat: Stat) -> anyhow::Result<()> {
     quil_crypto::release_check::verify_release(bin, &SIGNATORIES, stat)
         .map(|_| ())
@@ -458,11 +459,11 @@ pub(crate) fn check_starts(bin: &Path, stat: Stat) -> anyhow::Result<()> {
 }
 
 /// Install a verified `release` from a custom source into `dest_dir` only
-/// if the startup check ([`check_starts`]) starts it there: it is written
-/// into a staging directory beside `dest_dir`, in the same install root,
-/// checked, moved in and checked again before the caller links it. A
-/// release the check refuses is neither linked nor written over an
-/// installed one: linked, it would stop the node at its next start and
+/// if [`check_starts`] passes it there: it is written into a staging
+/// directory beside `dest_dir`, in the same install root, checked, moved
+/// in and checked again before the caller links it. A release the check
+/// refuses is neither linked nor written over an
+/// installed one: linked, it could stop the node at its next start and
 /// qclient at its next command; the directories made for it are removed
 /// again while empty. Returns the installed binary path.
 fn install_startable(release: &Release, dest_dir: &Path, stat: Stat) -> anyhow::Result<PathBuf> {
@@ -804,6 +805,18 @@ mod tests {
         let sum = digest_checksum(f).unwrap();
         assert_eq!(sum.len(), 32);
         assert_eq!(sum[0], 0xaa);
+    }
+
+    /// The node's self-check names its release as qclient names the file
+    /// it installs, so a release qclient installs passes it.
+    #[test]
+    fn the_node_self_check_names_the_release_qclient_installs() {
+        for kind in [system::RELEASE_TYPE_NODE, system::RELEASE_TYPE_QCLIENT] {
+            let named = quil_crypto::release_check::release_file_name(kind);
+            let installed = release_filename(kind, quil_config::VERSION_STRING).unwrap();
+            println!("REACH release label check: {named} beside {installed}");
+            assert_eq!(named, installed, "names_differ");
+        }
     }
 
     #[test]

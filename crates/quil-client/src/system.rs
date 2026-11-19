@@ -208,24 +208,14 @@ pub fn node_env_path() -> PathBuf {
 }
 
 /// Normalized OS name — `darwin` or `linux` (matches Go `runtime.GOOS`).
+/// Others pass through unchanged; `system_info` refuses them.
 pub fn os_type() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "darwin"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        // Unsupported; validated by `system_info`.
-        std::env::consts::OS
-    }
+    quil_crypto::release_check::go_os(std::env::consts::OS)
 }
 
 /// Normalized architecture — `amd64` or `arm64` (matches Go `runtime.GOARCH`).
 pub fn arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
+    quil_crypto::release_check::go_arch(std::env::consts::ARCH)
 }
 
 /// Validate + return `(os, arch)`. Port of `GetSystemInfo`

@@ -74,13 +74,16 @@ fn wants_signature_check(cli: &Cli) -> bool {
 }
 
 /// The release self-check, as the node runs it at startup: verify this binary
-/// against its `.dgst` and `.dgst.sig.N` files, failing closed. A binary
-/// the official signatories do not verify passes when the release source
-/// stored in its install root does, so the auto-update job runs the
-/// qclient it installed.
+/// against its `.dgst` and `.dgst.sig.N` files, failing closed. The signed
+/// label names this build's release (`qclient-<version>-<os>-<arch>`) or
+/// the executable's file name, so a release installed under another name
+/// passes. A binary the official signatories do not verify passes when the
+/// release source stored in its install root does, so the auto-update job
+/// runs the qclient it installed.
 fn signature_check(cli: &Cli) -> anyhow::Result<()> {
-    use quil_crypto::release_check::{self_check, SelfCheck, SELF_CHECK_HINT};
-    match self_check(wants_signature_check(cli)) {
+    use quil_crypto::release_check::{release_file_name, self_check_as, SelfCheck};
+    let release = release_file_name("qclient");
+    match self_check_as(wants_signature_check(cli), &release) {
         Ok(SelfCheck::Verified(count)) => tracing::info!(
             valid_signatures = count,
             total_signatories = quil_config::SIGNATORIES.len(),
@@ -95,11 +98,17 @@ fn signature_check(cli: &Cli) -> anyhow::Result<()> {
             tracing::info!("signature check not available for windows yet, skipping")
         }
         Ok(SelfCheck::Disabled) => tracing::info!("signature check disabled, skipping"),
+        // A label refusal is a signed release of another file, never a
+        // build from source or a release missing its files.
+        Err(e) if e.is_name_mismatch() => {
+            anyhow::bail!("signature check failed: {e} — {}", e.hint())
+        }
         Err(e) => anyhow::bail!(
-            "signature check failed: {e} — {SELF_CHECK_HINT}; a release keeps its .dgst and \
+            "signature check failed: {e} — {}; a release keeps its .dgst and \
              .dgst.sig.N files beside it, which 'qclient download-signatures' fetches for an \
              official release; a release from another source starts only under the source \
-             stored with 'qclient node auto-update enable --release-source'"
+             stored with 'qclient node auto-update enable --release-source'",
+            e.hint()
         ),
     }
     Ok(())
