@@ -319,6 +319,7 @@ impl EffectiveConfig {
     pub(crate) fn log(&self) {
         info!(
             build_fingerprint = self.build_fingerprint,
+            build_commit = crate::build_commit::label(),
             core = self.core,
             network = self.network,
             mode = self.mode,
