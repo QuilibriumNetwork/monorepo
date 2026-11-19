@@ -2307,6 +2307,53 @@ mod tests {
         );
         gates(false);
     }
+    /// A seat's encode waiting on its sector's certification logs only
+    /// its wait, through its storage job, at info: neither an encode start
+    /// nor an encode end, at each retry (2026-11-19: up to 1,080 such lines
+    /// an hour on a 9-seat node).
+    #[test]
+    fn a_waiting_seat_encode_logs_only_its_wait() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let (member, app) = ([0x2E; 32], [0x2F; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, 1500);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            1500,
+            vec![source],
+        );
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        gates(false);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lane = format!("lane={}", hex::encode(app));
+        assert!(
+            !logs.contains("storage snapshot taken") && !logs.contains("encode ended"),
+            "ENCODE-START-LOGGED: a seat waiting on its sector logged an encode start or end:\n{logs}"
+        );
+        let waits: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("storage job waits for what") && line.contains(&lane))
+            .collect();
+        assert!(
+            waits.len() == 1 && waits[0].contains(UNCERTIFIED) && waits[0].contains(" INFO "),
+            "WAIT-NOT-LOGGED: the seat's wait was not logged once at info by its job:\n{logs}"
+        );
+        assert!(!logs.contains("WARN"), "{logs}");
+    }
     /// A leaf reserving its certified sector again, as it does at every
     /// GLOBAL frame, leaves its lease and mapping as they are: rewritten,
     /// each took a sync of its file and of its directory (2026-11-11). A

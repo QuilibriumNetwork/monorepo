@@ -1756,7 +1756,7 @@ pub fn request_member(
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
     let shown_lane = hex::encode(lane);
-    request(lane, key, "member", move || {
+    request(lane, key, "member", epoch, move || {
         use quil_crypto::storage_proof::data_node_count;
         let past_grace = || {
             info!(epoch, filter = %hex::encode(&filter), scope = "local",
@@ -1772,6 +1772,18 @@ pub fn request_member(
             return Ok(());
         }
         let captured = capture_at(&crdt, &filter, epoch, &sources)?;
+        // A seat waiting on its sectors logs only its wait, through its
+        // job: each retry, once a minute, logged an encode start and end
+        // besides (2026-11-19: up to 1,080 lines an hour on 9 seats).
+        if quil_types::consensus::persistent_storage_at(epoch) {
+            if let Err(wait @ QuilError::StorageWaiting(_)) = persistent::sectors_certified(
+                &captured,
+                &member,
+                crate::storage_labels::installed(),
+            ) {
+                return Err(wait);
+            }
+        }
         let started = std::time::Instant::now();
         // Its leaves' fewest nodes, from their values: labelled side by side,
         // the largest bounds the encode.
@@ -2367,15 +2379,17 @@ impl JobState {
     }
 }
 
-/// Run the snapshot job for `key` in `lane` (`crate::storage_jobs::spawn`)
-/// unless one is queued or running, or the last failed less than its wait
-/// ago ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
+/// Run the snapshot job for `key` in `lane`, for `epoch`
+/// (`crate::storage_jobs::spawn_in_epoch`), unless one is queued or
+/// running, or the last failed less than its wait ago
+/// ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
 /// it fails on a local disk error. A job that succeeds leaves its record
 /// behind, so its caller stops asking.
 pub fn request(
     lane: &[u8],
     key: Vec<u8>,
     label: &'static str,
+    epoch: u64,
     job: impl FnOnce() -> Result<()> + Send + 'static,
 ) {
     use std::collections::HashMap;
@@ -2403,7 +2417,7 @@ pub fn request(
             }
         }
     }
-    crate::storage_jobs::spawn(lane, label, move || {
+    crate::storage_jobs::spawn_in_epoch(lane, label, Some(epoch), move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
             .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
         if let Ok(mut jobs) = state.lock() {

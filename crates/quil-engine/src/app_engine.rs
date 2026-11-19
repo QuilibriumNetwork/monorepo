@@ -4015,7 +4015,7 @@ impl StorageEpochCheck {
             &self.filter,
         ]
         .concat();
-        crate::storage_snapshot::request(&lane, key, "storage labels", move || {
+        crate::storage_snapshot::request(&lane, key, "storage labels", epoch, move || {
             crate::storage_labels::precompute(store, &crdt, &member, &filter, epoch)
         });
     }

@@ -625,6 +625,36 @@ fn first_unregistered_renewal(member: &[u8], filter: &[u8], epoch: u64) -> bool 
     logged.insert((member.to_vec(), filter.to_vec(), epoch))
 }
 
+/// Why a seat on `filter` renews for `epoch` without a storage
+/// registration, and what to check: past the renewal's grace frame
+/// (`past_grace`), what its snapshot's encode waited on last, if it waited
+/// ([`crate::storage_jobs::take_wait`]), rather than load (2026-11-19: a
+/// seat waiting on GLOBAL certifying its sector was told to check CPU and
+/// disk load).
+fn unregistered_reason(filter: &[u8], epoch: u64, past_grace: bool) -> (String, &'static str) {
+    const LOAD: &str = "check this node's CPU and disk load and how many seats it labels at \
+                        once; the next epoch's snapshot starts again";
+    if !past_grace {
+        return (
+            "no snapshot sources known for a shard a recorded change creates".into(),
+            LOAD,
+        );
+    }
+    match crate::storage_jobs::take_wait(filter, epoch) {
+        Some(why) => (
+            format!("the snapshot's encode still waited by the renewal's grace frame: {why}"),
+            "nothing to fix in this node's load: it waits for what it cannot hurry (GLOBAL \
+             certifying the seat's sector, or a sector initialization slot freeing); check the \
+             'storage job waits' lines of this seat's lane if it repeats each epoch; the next \
+             epoch's snapshot starts again",
+        ),
+        None => (
+            "the snapshot did not finish by the renewal's grace frame".into(),
+            LOAD,
+        ),
+    }
+}
+
 /// A hash-proof epoch's registrations: the leaves the member's snapshot for
 /// `epoch` encoded (`crate::storage_snapshot`), never the live data, which has
 /// moved on from the state archives commit to. A snapshot not encoded yet is
@@ -683,15 +713,10 @@ fn snapshot_storage_confirm(
                         when it happened ('storage snapshot given up')",
                         "renewing a seat without a storage registration: its snapshot was given up");
                 } else {
-                    let reason = if frame_number >= grace_frame {
-                        "the snapshot did not finish by the renewal's grace frame"
-                    } else {
-                        "no snapshot sources known for a shard a recorded change creates"
-                    };
+                    let (reason, action) =
+                        unregistered_reason(filter, epoch, frame_number >= grace_frame);
                     tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
-                        grace_frame, scope = "local", reason,
-                        action = "check this node's CPU and disk load and how many seats it labels \
-                                  at once; the next epoch's snapshot starts again",
+                        grace_frame, scope = "local", %reason, action,
                         "renewing a seat without a storage registration: this seat's frames carry no \
                          storage attestation this epoch");
                 }
@@ -944,6 +969,50 @@ mod tests {
         // Epochs more than two back are forgotten, so the set stays small.
         assert!(first_unregistered_renewal(&member, &a, 44));
         assert!(first_unregistered_renewal(&member, &a, 40));
+    }
+
+    /// A seat whose snapshot's encode still waited at the renewal's grace
+    /// frame, on GLOBAL certifying its sector say, renews with a warning
+    /// naming that wait, not the node's load (2026-11-19: it said to
+    /// check CPU and disk load). The wait is read once and ends there.
+    #[test]
+    fn a_renewal_after_a_wait_names_the_wait_not_load() {
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let (member, filter, epoch) = (vec![0x3A; 32], vec![0x3B; 32], 77);
+        let why = "sector certification must finish before data registration";
+        crate::storage_jobs::spawn_in_epoch(&filter, "member", Some(epoch), move || {
+            Err(quil_types::error::QuilError::StorageWaiting(why.into()))
+        });
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &filter,
+            std::time::Duration::from_secs(30)
+        ));
+        let grace_frame =
+            quil_types::consensus::storage_snapshot_frame(epoch) + storage_snapshot_grace();
+        let replicas = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        let confirmed = snapshot_storage_confirm(
+            &make_crdt(),
+            &replicas,
+            std::slice::from_ref(&filter),
+            &member,
+            epoch,
+            grace_frame,
+            &[],
+        )
+        .unwrap();
+        assert!(confirmed.iter().all(|confirm| confirm.entries.is_empty()));
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let warned = logs
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("renewing a seat without"))
+            .expect("the renewal without a registration was not warned");
+        assert!(
+            warned.contains(why) && !warned.contains("CPU and disk load"),
+            "WAIT-REASON-LOST: the renewal's warning does not name its seat's wait: {warned}"
+        );
+        assert_eq!(crate::storage_jobs::take_wait(&filter, epoch), None);
     }
 
     use quil_hypergraph::testing::{MemStore, StubProver};
