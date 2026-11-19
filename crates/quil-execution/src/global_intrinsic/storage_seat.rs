@@ -281,10 +281,28 @@ pub fn seat_address(member: &[u8], filter: &[u8]) -> Result<[u8; 32]> {
     derive_seat_address(preimage, ARCHIVE_SEAT_ADDRESSES.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Seat addresses this thread hashed (address cache hits excluded).
+    static SEAT_ADDRESSES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The seat addresses this thread has hashed.
+#[cfg(test)]
+pub(crate) fn seat_addresses_hashed() -> usize {
+    SEAT_ADDRESSES_HASHED.with(std::cell::Cell::get)
+}
+
+fn hash_seat_preimage(preimage: &[u8]) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    SEAT_ADDRESSES_HASHED.with(|hashed| hashed.set(hashed.get() + 1));
+    quil_crypto::poseidon::hash_bytes_to_32(preimage)
+}
+
 fn derive_seat_address(preimage: Vec<u8>, cache: Option<&SeatAddresses>) -> Result<[u8; 32]> {
     // Bound retained key bytes as well as entry count. Longer filters still hash normally.
     let Some(cache) = cache.filter(|_| preimage.len() <= 128) else {
-        return quil_crypto::poseidon::hash_bytes_to_32(&preimage);
+        return hash_seat_preimage(&preimage);
     };
     let entries = || {
         cache
@@ -295,7 +313,7 @@ fn derive_seat_address(preimage: Vec<u8>, cache: Option<&SeatAddresses>) -> Resu
         return Ok(address);
     }
     // Other threads can use the cache during the hash. Concurrent misses agree.
-    let address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+    let address = hash_seat_preimage(&preimage)?;
     entries().put(preimage, address);
     Ok(address)
 }

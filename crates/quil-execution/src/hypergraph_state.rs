@@ -113,6 +113,10 @@ pub fn seal_metadata_state_at_index(
 // HypergraphState
 // =====================================================================
 
+/// A state change's `(domain, address, discriminator, value)`.
+#[cfg(test)]
+pub(crate) type StateEntry = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 enum ExecutionChange {
     State(StateChange),
     Record(quil_types::store::RecordMutation),
@@ -557,6 +561,25 @@ impl HypergraphState {
     /// Number of pending changes.
     pub fn changeset_len(&self) -> usize {
         self.changeset.lock().unwrap().len()
+    }
+
+    /// Every pending state change, in application order.
+    #[cfg(test)]
+    pub(crate) fn state_changes(&self) -> Vec<StateEntry> {
+        self.changeset
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|change| match change {
+                ExecutionChange::State(change) => Some((
+                    change.domain.clone(),
+                    change.address.clone(),
+                    change.discriminator.clone(),
+                    change.value.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Snapshot staged vertex-adds writes for a domain in application order.
