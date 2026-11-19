@@ -691,15 +691,13 @@ pub(crate) fn init_worker_count(
             )
         };
         let first = store(1);
-        let stores = (1..=cpus)
-            .filter(|&core| wc::holds_store(&store(core)))
-            .count();
+        let stores: Vec<_> = (1..=cpus).map(store).collect();
         let base = first.parent().unwrap_or(&first);
         let labels = crate::prover_tree_syncer_prod::storage_labels_dir(&first);
         wc::Inputs {
             cpus,
             memory: wc::detect_memory(),
-            disk: wc::detect_disk(base, &labels, stores as u32),
+            disk: wc::detect_disk(base, &labels, &stores),
         }
     })
 }
@@ -1766,10 +1764,7 @@ mod tests {
             disk: Some(wc::Disk {
                 total: 1000 * GIB,
                 free: 500 * GIB,
-                labels: 0,
-                labels_files: 0,
-                labels_walk: std::time::Duration::ZERO,
-                stores: 0,
+                ..wc::Disk::default()
             }),
         });
         assert_eq!((derived.count, derived.binding), (53, wc::Binding::Disk));
