@@ -230,6 +230,69 @@ struct Jobs {
     stopping: AtomicBool,
     /// Whether a job not started for the stop has been logged.
     refused: AtomicBool,
+    waits: Mutex<Waits>,
+}
+
+/// How often a job that keeps waiting ([`QuilError::StorageWaiting`]) logs
+/// that it still waits, after the line of its first wait.
+const WAIT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// A job's waits in a row ([`Waits`]).
+struct JobWait {
+    since: Instant,
+    logged: Instant,
+    tries: u64,
+}
+
+/// Jobs that end waiting ([`QuilError::StorageWaiting`]), by lane and
+/// label: each logs its first wait, then at most once per [`WAIT_REPEAT`],
+/// and its end (2026-11-19: a seat whose sector GLOBAL had not certified
+/// logged a failure warn at each retry, once a minute). An entry lasts
+/// until its job next ends otherwise: one per lane and label.
+#[derive(Default)]
+struct Waits(HashMap<(Vec<u8>, &'static str), JobWait>);
+
+/// The line a job's wait or end logs ([`Waits`]).
+#[derive(Debug, PartialEq)]
+enum WaitLine {
+    Start,
+    Still { tries: u64, seconds: u64 },
+    End { tries: u64, seconds: u64 },
+}
+
+impl Waits {
+    /// One more wait of `key`, at `now`: the line it logs, if any.
+    fn waited(&mut self, key: (Vec<u8>, &'static str), now: Instant) -> Option<WaitLine> {
+        let Some(waiting) = self.0.get_mut(&key) else {
+            self.0.insert(
+                key,
+                JobWait {
+                    since: now,
+                    logged: now,
+                    tries: 1,
+                },
+            );
+            return Some(WaitLine::Start);
+        };
+        waiting.tries = waiting.tries.saturating_add(1);
+        if now.saturating_duration_since(waiting.logged) < WAIT_REPEAT {
+            return None;
+        }
+        waiting.logged = now;
+        Some(WaitLine::Still {
+            tries: waiting.tries,
+            seconds: now.saturating_duration_since(waiting.since).as_secs(),
+        })
+    }
+
+    /// `key` ended otherwise than waiting, at `now`: its end, if it waited.
+    fn ended(&mut self, key: &(Vec<u8>, &'static str), now: Instant) -> Option<WaitLine> {
+        let waiting = self.0.remove(key)?;
+        Some(WaitLine::End {
+            tries: waiting.tries,
+            seconds: now.saturating_duration_since(waiting.since).as_secs(),
+        })
+    }
 }
 
 fn jobs() -> &'static Jobs {
@@ -281,6 +344,85 @@ impl Jobs {
         self.stopping.load(Ordering::SeqCst)
     }
 
+    fn waits(&self) -> MutexGuard<'_, Waits> {
+        self.waits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Log how the job `label` of `key`, shown as `shown`, ended
+    /// ([`spawn`]): a failure warns; a stop or a wait
+    /// ([`QuilError::StorageWaiting`], bounded by [`Waits`]) is logged at
+    /// info.
+    fn job_ended(
+        &self,
+        key: (Vec<u8>, &'static str),
+        label: &'static str,
+        shown: &str,
+        started: Instant,
+        result: Result<()>,
+    ) {
+        let wait = match &result {
+            Err(QuilError::StorageWaiting(_)) => self.waits().waited(key, Instant::now()),
+            _ => self.waits().ended(&key, Instant::now()),
+        };
+        if let Some(WaitLine::End { tries, seconds }) = wait {
+            info!(
+                label,
+                lane = %shown,
+                tries,
+                waited_seconds = seconds,
+                "storage job waits no more (tries: its waits in a row); its outcome follows"
+            );
+        }
+        match result {
+            Ok(()) => info!(
+                label,
+                lane = %shown,
+                seconds = started.elapsed().as_secs_f64(),
+                "storage snapshot job done"
+            ),
+            Err(error) if self.stopping() => {
+                info!(label, lane = %shown, %error, "storage snapshot job stopped with the node")
+            }
+            // Work ahead that gave its memory back to more urgent work
+            // ([`Reservation::named_stop`]): an expected wait, not a
+            // failure (2026-11-08: logged as one at each renewal's
+            // snapshot during sector warmup).
+            Err(QuilError::StorageWorkStopped(stopped)) => info!(
+                label,
+                lane = %shown,
+                %stopped,
+                seconds = started.elapsed().as_secs_f64(),
+                scope = "local",
+                "storage job ahead stopped to give its memory back to more urgent work; it \
+                 goes on from what it kept when next asked: an expected wait"
+            ),
+            Err(QuilError::StorageWaiting(why)) => match wait {
+                Some(WaitLine::Start) => info!(
+                    label,
+                    lane = %shown,
+                    %why,
+                    scope = "local",
+                    "storage job waits for what this node cannot hurry (GLOBAL certifying a \
+                     sector, or a sector initialization slot freeing): an expected wait, not \
+                     a failure; it is tried again when next asked, and logged again every \
+                     30 minutes it still waits and when it ends"
+                ),
+                Some(WaitLine::Still { tries, seconds }) => info!(
+                    label,
+                    lane = %shown,
+                    %why,
+                    tries,
+                    waited_seconds = seconds,
+                    "storage job still waits (tries: its waits in a row): an expected wait"
+                ),
+                _ => {}
+            },
+            Err(error) => {
+                warn!(label, lane = %shown, %error, "storage snapshot job failed; it is tried again when next needed")
+            }
+        }
+    }
+
     fn spawn(
         &'static self,
         lane: &[u8],
@@ -288,6 +430,7 @@ impl Jobs {
         job: impl FnOnce() -> Result<()> + Send + 'static,
     ) {
         let shown = hex::encode(lane);
+        let key = (lane.to_vec(), label);
         let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
         let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
         let profile = quil_types::consensus::storage_seal_profile_thread_override();
@@ -320,33 +463,7 @@ impl Jobs {
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
-            match result {
-                Ok(()) => info!(
-                    label,
-                    lane = %shown,
-                    seconds = started.elapsed().as_secs_f64(),
-                    "storage snapshot job done"
-                ),
-                Err(error) if self.stopping() => {
-                    info!(label, lane = %shown, %error, "storage snapshot job stopped with the node")
-                }
-                // Work ahead that gave its memory back to more urgent work
-                // ([`Reservation::named_stop`]): an expected wait, not a
-                // failure (2026-11-08: logged as one at each renewal's
-                // snapshot during sector warmup).
-                Err(QuilError::StorageWorkStopped(stopped)) => info!(
-                    label,
-                    lane = %shown,
-                    %stopped,
-                    seconds = started.elapsed().as_secs_f64(),
-                    scope = "local",
-                    "storage job ahead stopped to give its memory back to more urgent work; it \
-                     goes on from what it kept when next asked: an expected wait"
-                ),
-                Err(error) => {
-                    warn!(label, lane = %shown, %error, "storage snapshot job failed; it is tried again when next needed")
-                }
-            }
+            self.job_ended(key, label, &shown, started, result);
         });
         {
             let mut lanes = self.lanes();
@@ -3048,6 +3165,79 @@ mod tests {
     const GIB: u64 = 1 << 30;
     const SOON: Duration = Duration::from_secs(10);
     const NOT_YET: Duration = Duration::from_millis(300);
+
+    /// A job that waits three times, then is done, logs at info its wait's
+    /// start and its end, once each, and warns of no failure (2026-11-19:
+    /// each retry of a seat waiting on GLOBAL warned of a failed job).
+    #[test]
+    fn a_waiting_job_is_logged_as_a_wait_not_a_failure() {
+        let jobs = Jobs::default();
+        let (label, shown) = ("storage snapshot", "73656174");
+        let key = || (b"seat".to_vec(), label);
+        let text = super::frame_verifier_tests::logged(|| {
+            for _ in 0..3 {
+                let wait = QuilError::StorageWaiting("sector certification".into());
+                jobs.job_ended(key(), label, shown, Instant::now(), Err(wait));
+            }
+            jobs.job_ended(key(), label, shown, Instant::now(), Ok(()));
+        });
+        assert!(
+            !text.contains("WARN"),
+            "WAIT-WARNED: a job's wait is logged as a failure:\n{text}"
+        );
+        assert_eq!(
+            text.matches("storage job waits for what").count(),
+            1,
+            "a wait's start is logged once:\n{text}"
+        );
+        assert_eq!(
+            text.matches("storage job waits no more").count(),
+            1,
+            "a wait's end is logged once:\n{text}"
+        );
+        assert!(
+            text.contains("tries=3"),
+            "its end counts its waits:\n{text}"
+        );
+    }
+
+    /// A job that keeps waiting logs its first wait, then once per
+    /// [`WAIT_REPEAT`] with its count, and once its end; another job's waits
+    /// are its own (2026-11-19: each retry of a waiting seat, once a
+    /// minute, logged a failure warn).
+    #[test]
+    fn a_wait_logs_its_start_a_bounded_repeat_and_its_end() {
+        let mut waits = Waits::default();
+        let seat = || (b"seat".to_vec(), "storage snapshot");
+        let start = Instant::now();
+        let at = |minutes: u64| start + Duration::from_secs(60 * minutes);
+        assert_eq!(waits.waited(seat(), at(0)), Some(WaitLine::Start));
+        let repeats: Vec<_> = (1..=59)
+            .filter_map(|m| waits.waited(seat(), at(m)))
+            .collect();
+        assert_eq!(
+            repeats,
+            [WaitLine::Still {
+                tries: 31,
+                seconds: 30 * 60
+            }],
+            "UNBOUNDED-REPEAT: a job waiting once a minute for 59 minutes logs one line \
+             past its first"
+        );
+        let other = (b"other seat".to_vec(), "storage snapshot");
+        assert_eq!(waits.waited(other.clone(), at(59)), Some(WaitLine::Start));
+        assert_eq!(
+            waits.ended(&seat(), at(60)),
+            Some(WaitLine::End {
+                tries: 60,
+                seconds: 60 * 60
+            }),
+            "NO-WAIT-END: the job's end follows its waits"
+        );
+        assert_eq!(waits.ended(&seat(), at(61)), None, "an end logs once");
+        assert_eq!(waits.waited(seat(), at(62)), Some(WaitLine::Start));
+        assert!(waits.ended(&other, at(62)).is_some());
+    }
 
     #[test]
     fn disk_scratch_follows_ram_per_worker_instead_of_total_mac_capacity() {

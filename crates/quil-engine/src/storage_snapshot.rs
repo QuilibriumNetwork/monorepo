@@ -1809,13 +1809,14 @@ pub fn request_member(
             Err(_) if grace_passed(&member, epoch) => "grace passed",
             Err(_) if snapshot_given_up(&member, &filter, epoch) => "given up",
             Err(_) if crate::storage_jobs::stopping() => "stopping",
+            Err(QuilError::StorageWaiting(_)) => "waiting",
             Err(_) => "failed",
         };
         info!(epoch, filter = %hex::encode(&filter), lane = %shown_lane,
             seconds = started.elapsed().as_secs_f64(), outcome,
             "storage snapshot encode ended: only `encoded` registers the seat's leaves; `given up` \
              and `grace passed` renew it without them (warned or logged as they happened), \
-             `failed` is tried again when next needed");
+             `waiting` and `failed` are tried again when next needed");
         match result {
             Err(_) if grace_passed(&member, epoch) => return past_grace(),
             // Logged as it was given up (`encode_member_until`).

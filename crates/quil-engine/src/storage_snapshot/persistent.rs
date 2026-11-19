@@ -14,6 +14,14 @@ use std::{
     sync::Mutex,
 };
 
+/// An expected wait of a leaf's encode: on GLOBAL certifying its sector
+/// ([`UNCERTIFIED`]), or on a sector initialization slot. Its storage job
+/// logs it as one, never as a failure at each retry (2026-11-19: on a
+/// 9-seat node the two were 55 failure warns in 12 hours).
+fn waiting(what: &str) -> QuilError {
+    QuilError::StorageWaiting(what.into())
+}
+
 fn io(error: std::io::Error) -> QuilError {
     unavailable(format!("persistent sector: {error}"))
 }
@@ -154,7 +162,7 @@ fn reserve(
     exact: u64,
 ) -> Result<(PathBuf, [u8; 32], u64)> {
     try_reserve(store, member, leaf, epoch, exact)?
-        .ok_or_else(|| unavailable("sector initialization slots are occupied".into()))
+        .ok_or_else(|| waiting("sector initialization slots are occupied"))
 }
 
 fn sector_lane(member: &[u8], id: &[u8; 32]) -> Vec<u8> {
@@ -732,7 +740,7 @@ pub(super) fn sectors_certified(
         let exact = captured.node_count(prefix)?;
         let (dir, _, _) = reserve(store, member, &leaf, captured.epoch, exact)?;
         if !Sector::load(dir)?.is_some_and(|sector| sector.certified) {
-            return Err(unavailable(UNCERTIFIED.into()));
+            return Err(waiting(UNCERTIFIED));
         }
     }
     Ok(())
@@ -756,7 +764,7 @@ pub(super) fn encode_leaf(
     let (dir, id, n) = reserve(store, member, &leaf, captured.epoch, exact)?;
     let sector = Sector::load(dir)?
         .filter(|sector| sector.certified)
-        .ok_or_else(|| unavailable(UNCERTIFIED.into()))?;
+        .ok_or_else(|| waiting(UNCERTIFIED))?;
     let fingerprint = captured.fingerprint(member, prefix);
     if let Some(from) = replicas.snapshot_match(&leaf, &fingerprint)? {
         if let Some(old) = replicas.get_hash_leaf(from, &leaf)? {
@@ -2181,9 +2189,9 @@ mod tests {
     /// memory share has room for, give its memory back. It fails on that
     /// leaf's certification. The labelling then completes, and once its
     /// sector is certified too, the same encode succeeds: the check refuses
-    /// only until each leaf's sector is certified. The first leaf is
-    /// certified, and one slot runs the leaves one after another, so it is
-    /// tried first.
+    /// only until each leaf's sector is certified. Every leaf is checked
+    /// before any asks for memory, so the leaf not certified is not the
+    /// first.
     #[test]
     fn an_encode_with_a_leaf_not_certified_takes_no_labelling_memory() {
         crate::storage_jobs::set_job_slots_for_test(1);
@@ -2245,7 +2253,7 @@ mod tests {
              sector's labelling for its memory ({error})"
         );
         assert!(
-            matches!(&error, QuilError::ExecutionUnavailable(what) if what == UNCERTIFIED),
+            matches!(&error, QuilError::StorageWaiting(what) if what == UNCERTIFIED),
             "the encode fails on the leaf not certified: {error}"
         );
         initialize(&store, &member, 1500, labelling.clone(), id, n, &|| {
@@ -2263,6 +2271,40 @@ mod tests {
                  failed ({error})"
             );
         }
+        gates(false);
+    }
+    /// The encode gate's refusals, a leaf whose sector GLOBAL has not
+    /// certified and a leaf finding every sector initialization slot
+    /// occupied, are expected waits ([`QuilError::StorageWaiting`]): its
+    /// storage job logs them as such, not as a failure warn at each retry
+    /// (2026-11-19: 55 such warns in 12 hours on a 9-seat node).
+    #[test]
+    fn the_encode_gate_refuses_with_an_expected_wait() {
+        crate::storage_jobs::set_job_slots_for_test(1);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([26; 32], [27; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let error =
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| false)
+                .expect_err("the leaf's sector is reserved, not labelled or certified");
+        assert!(
+            matches!(&error, QuilError::StorageWaiting(what) if what == UNCERTIFIED),
+            "GATE-NOT-A-WAIT: a leaf whose sector is not certified fails its encode \
+             otherwise than with an expected wait: {error:?}"
+        );
+        // The one slot holds that leaf's sector.
+        let error = reserve(&store, &member, b"another leaf", 1500, 100)
+            .expect_err("every sector initialization slot is occupied");
+        assert!(
+            matches!(&error, QuilError::StorageWaiting(_)),
+            "SLOTS-NOT-A-WAIT: a leaf finding every slot occupied fails otherwise than with \
+             an expected wait: {error:?}"
+        );
         gates(false);
     }
     /// A leaf reserving its certified sector again, as it does at every
