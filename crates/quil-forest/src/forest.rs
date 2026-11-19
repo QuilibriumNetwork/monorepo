@@ -132,6 +132,26 @@ impl StagedForestSync {
     }
 }
 
+/// A staged sync's reconstructed subtree root differs from the root its
+/// source authenticated. Both roots travel with the error, so the caller
+/// can log them with the context only it holds.
+#[derive(Debug, thiserror::Error)]
+#[error("reconstructed subtree differs from the authenticated source")]
+pub struct SubtreeRootMismatch {
+    pub expected: [u8; 32],
+    pub staged: [u8; 32],
+}
+
+impl SubtreeRootMismatch {
+    /// `Err(Self)` when the reconstructed root differs from the expected.
+    fn check(expected: [u8; 32], staged: [u8; 32]) -> Result<()> {
+        if staged == expected {
+            return Ok(());
+        }
+        Err(Self { expected, staged }.into())
+    }
+}
+
 impl crate::BatchTreeReader for UpdatedTree<'_> {}
 
 impl TreeReader for UpdatedTree<'_> {
@@ -927,11 +947,7 @@ impl Forest {
     ) -> Result<()> {
         let store = self.store(&TreeId::shard_phase(shard_id, phase));
         let root = crate::sync::preview_subtree_root(&store, version, leaves, bits)?;
-        anyhow::ensure!(
-            root == expected,
-            "reconstructed subtree differs from the authenticated source"
-        );
-        Ok(())
+        SubtreeRootMismatch::check(expected, root)
     }
 
     /// Prepare a whole-tree or subtree sync update without publishing it.
@@ -956,10 +972,7 @@ impl Forest {
         };
         let root = crate::sync::subtree_root(&preview, version, bits)?;
         if let Some(expected) = expected {
-            anyhow::ensure!(
-                root == expected,
-                "reconstructed subtree differs from the authenticated source"
-            );
+            SubtreeRootMismatch::check(expected, root)?;
         }
         let (puts, memory) = match store {
             TreeStore::Rocks(store) => (store.update_puts(&batch)?, None),
@@ -987,10 +1000,7 @@ impl Forest {
             batch: &batch.node_batch,
         };
         let root = crate::sync::subtree_root(&preview, version, bits)?;
-        anyhow::ensure!(
-            root == expected,
-            "reconstructed subtree differs from the authenticated source"
-        );
+        SubtreeRootMismatch::check(expected, root)?;
         match &store {
             TreeStore::Rocks(s) => Ok((root, s.update_puts(&batch)?)),
             TreeStore::Mem(_) => {
