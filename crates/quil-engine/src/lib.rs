@@ -71,6 +71,7 @@ pub mod resolver_traffic;
 pub mod restart_readiness;
 pub mod rewards;
 mod seal_follow;
+pub mod seal_report;
 pub mod shard_info;
 pub mod shard_rebalancer;
 pub mod spawn_gate;
