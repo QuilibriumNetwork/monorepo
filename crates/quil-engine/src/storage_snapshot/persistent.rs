@@ -2354,6 +2354,141 @@ mod tests {
         );
         assert!(!logs.contains("WARN"), "{logs}");
     }
+    /// Each leaf of `captured` gets a certified sector of `member`'s.
+    fn certify_all(store: &LabelStore, member: &[u8], captured: &Captured) {
+        for prefix in &captured.prefixes {
+            let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+            let exact = captured.node_count(prefix).unwrap();
+            let (dir, id, n) = reserve(store, member, &leaf, captured.epoch, exact).unwrap();
+            initialize(store, member, captured.epoch, dir.clone(), id, n, &|| false).unwrap();
+            let mut sector = Sector::load(dir).unwrap().unwrap();
+            sector.certified = true;
+            sector.save().unwrap();
+            store.release_certified_sector(captured.epoch, member, &id);
+        }
+    }
+    /// A seat's wait ends once its encode's gate opens: its end is logged
+    /// before the encode starts, and its renewal reads no wait while the
+    /// encode still runs (2026-11-19: it ended only with its job, so a
+    /// seat still encoding at the grace was told it waited on GLOBAL, and
+    /// the wait's seconds counted the encode).
+    #[test]
+    fn a_seat_wait_ends_when_its_gate_opens() {
+        use std::time::{Duration, Instant};
+        let logs = super::super::tests::capture_logs();
+        let text = || String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app, epoch) = ([0x3C; 32], [0x3D; 32], 1500);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, epoch);
+        let captured = capture_at(&crdt, &app, epoch, std::slice::from_ref(&source)).unwrap();
+        certify_all(store, &member, &captured);
+        // The seat's last try waited, in its lane.
+        crate::storage_jobs::spawn_in_epoch(&app, "member", Some(epoch), || {
+            Err(waiting(UNCERTIFIED))
+        });
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            Duration::from_secs(60)
+        ));
+        let lane = format!("lane={}", hex::encode(app));
+        let lines = |what: &str| {
+            text()
+                .lines()
+                .filter(|line| line.contains(what) && line.contains(&lane))
+                .count()
+        };
+        assert_eq!(lines("storage job waits for what"), 1, "{}", text());
+        // Its next encode, past the gate, waits for memory held here.
+        let held = crate::storage_jobs::reserve(u64::MAX / 4);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            epoch,
+            vec![source],
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while lines("storage snapshot taken") == 0 {
+            assert!(Instant::now() < deadline, "the encode starts:\n{}", text());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ended = lines("waits no more");
+        let renewal = crate::storage_jobs::take_wait(&app, epoch);
+        drop(held);
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            Duration::from_secs(300)
+        ));
+        let all = text();
+        assert!(
+            ended == 1 && renewal.is_none(),
+            "WAIT-END-AT-JOB-END: the seat's wait outlived its gate opening while its encode \
+             ran (ends logged: {ended}, the renewal read: {renewal:?}):\n{all}"
+        );
+        let at = |what: &str| all.find(what).unwrap_or(usize::MAX);
+        assert!(
+            at("waits no more") < at("storage snapshot taken"),
+            "the wait's end comes before the encode starts:\n{all}"
+        );
+        assert_eq!(lines("waits no more"), 1, "its end is logged once:\n{all}");
+        gates(false);
+    }
+    /// A seat still waiting when its renewal's grace frame passes keeps
+    /// its wait for that renewal to read, though a try of it queued before
+    /// the grace ends after it (2026-11-19: that try's end dropped the
+    /// wait, and the renewal named the node's load).
+    #[test]
+    fn a_wait_at_the_grace_is_left_for_its_renewal() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let (member, app, epoch) = ([0x3E; 32], [0x3F; 32], 1500);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, epoch);
+        crate::storage_jobs::spawn_in_epoch(&app, "member", Some(epoch), || {
+            Err(waiting(UNCERTIFIED))
+        });
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        super::super::note_grace_passed(&member, epoch);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            epoch,
+            vec![source],
+        );
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        let all = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            all.contains("the renewal's grace frame passed"),
+            "the try ends at the grace:\n{all}"
+        );
+        let renewal = crate::storage_jobs::take_wait(&app, epoch);
+        assert!(
+            renewal.as_deref() == Some(UNCERTIFIED) && !all.contains("waits no more"),
+            "WAIT-LOST-AT-GRACE: a try ending at the grace ended the seat's wait before its \
+             renewal read it (read: {renewal:?}):\n{all}"
+        );
+        gates(false);
+    }
     /// A leaf reserving its certified sector again, as it does at every
     /// GLOBAL frame, leaves its lease and mapping as they are: rewritten,
     /// each took a sync of its file and of its directory (2026-11-11). A

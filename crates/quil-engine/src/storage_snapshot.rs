@@ -1756,6 +1756,7 @@ pub fn request_member(
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
     let shown_lane = hex::encode(lane);
+    let lane_key = lane.to_vec();
     request(lane, key, "member", epoch, move || {
         use quil_crypto::storage_proof::data_node_count;
         let past_grace = || {
@@ -1763,6 +1764,8 @@ pub fn request_member(
                 "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
                  without a storage registration that epoch; \
                  its memory goes to other storage work");
+            // A wait the seat still had is its renewal's reason to read.
+            crate::storage_jobs::leave_wait(&lane_key, "member", epoch);
             Ok(())
         };
         if grace_passed(&member, epoch) {
@@ -1784,6 +1787,8 @@ pub fn request_member(
                 return Err(wait);
             }
         }
+        // What a wait was for is there: it ends now, not with the encode.
+        crate::storage_jobs::wait_over(&lane_key, "member", epoch);
         let started = std::time::Instant::now();
         // Its leaves' fewest nodes, from their values: labelled side by side,
         // the largest bounds the encode.

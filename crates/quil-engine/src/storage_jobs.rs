@@ -243,6 +243,8 @@ struct JobWait {
     epoch: Option<u64>,
     /// What its last wait was for.
     why: String,
+    /// Whether it is left for its epoch's renewal to read ([`leave_wait`]).
+    left: bool,
     since: Instant,
     logged: Instant,
     tries: u64,
@@ -255,9 +257,12 @@ type WaitKey = (Vec<u8>, &'static str);
 /// label: each logs its first wait, then at most once per [`WAIT_REPEAT`],
 /// and its end (2026-11-19: a seat whose sector GLOBAL had not certified
 /// logged a failure warn at each retry, once a minute). An entry lasts
-/// until its job next ends otherwise, its epoch's renewal reads it
-/// ([`take_wait`]) or a job of a later epoch ends: at most one per lane
-/// and label, of the epoch under way.
+/// until what it waits on is there ([`wait_over`]) or its job of that
+/// epoch next ends otherwise, until its epoch's renewal reads it
+/// ([`take_wait`]), or until GLOBAL is past its epoch: at most one per
+/// lane and label. Jobs of other epochs ending do not end it (2026-11-19:
+/// labels ahead, of later epochs, ended about 8,300 times an hour on a
+/// node and so ended each seat's wait within a second).
 #[derive(Default)]
 struct Waits(HashMap<WaitKey, JobWait>);
 
@@ -270,7 +275,8 @@ enum WaitLine {
 }
 
 impl Waits {
-    /// Drop the waits of epochs before `epoch`: they ended with them.
+    /// Drop the waits of epochs before `epoch`, that of the latest GLOBAL
+    /// frame ([`Jobs::waits`]): they ended with them.
     fn epoch_under_way(&mut self, epoch: Option<u64>) {
         if let Some(epoch) = epoch {
             self.0
@@ -287,7 +293,6 @@ impl Waits {
         why: &str,
         now: Instant,
     ) -> Option<WaitLine> {
-        self.epoch_under_way(epoch);
         let Some(waiting) = self
             .0
             .get_mut(&key)
@@ -298,6 +303,7 @@ impl Waits {
                 JobWait {
                     epoch,
                     why: why.to_owned(),
+                    left: false,
                     since: now,
                     logged: now,
                     tries: 1,
@@ -317,15 +323,24 @@ impl Waits {
         })
     }
 
-    /// `key`, for `epoch`, ended otherwise than waiting, at `now`: its end,
-    /// if it waited in that epoch.
+    /// `key`, for `epoch`, waits no more, at `now`: its end, if it waited
+    /// in that epoch and its wait is not left for its renewal.
     fn ended(&mut self, key: &WaitKey, epoch: Option<u64>, now: Instant) -> Option<WaitLine> {
-        self.epoch_under_way(epoch);
+        self.0
+            .get(key)
+            .filter(|waiting| waiting.epoch == epoch && !waiting.left)?;
         let waiting = self.0.remove(key)?;
         Some(WaitLine::End {
             tries: waiting.tries,
             seconds: now.saturating_duration_since(waiting.since).as_secs(),
         })
+    }
+
+    /// Leave `key`'s wait for `epoch` to its renewal ([`leave_wait`]).
+    fn leave(&mut self, key: &WaitKey, epoch: Option<u64>) {
+        if let Some(waiting) = self.0.get_mut(key).filter(|waiting| waiting.epoch == epoch) {
+            waiting.left = true;
+        }
     }
 
     /// What a job of `lane` waits on for `epoch`, its entry dropped.
@@ -344,6 +359,36 @@ impl Waits {
 /// registration names it as its reason. Its wait ends here.
 pub fn take_wait(lane: &[u8], epoch: u64) -> Option<String> {
     jobs().waits().take(lane, epoch)
+}
+
+/// The job `label` of `lane`, for `epoch`, running, has what its wait was
+/// for (a seat's sectors certified, its slots held): its wait's end is
+/// logged now, not when the job ends, and its renewal reads none
+/// ([`take_wait`]).
+pub fn wait_over(lane: &[u8], label: &'static str, epoch: u64) {
+    let key = (lane.to_vec(), label);
+    let wait = jobs().waits().ended(&key, Some(epoch), Instant::now());
+    if let Some(WaitLine::End { tries, seconds }) = wait {
+        log_wait_end(label, &hex::encode(lane), tries, seconds);
+    }
+}
+
+/// The job `label` of `lane`, for `epoch`, running, stops at its renewal's
+/// grace frame without what its wait was for: its wait is left for that
+/// renewal to read ([`take_wait`]), not ended with the job.
+pub fn leave_wait(lane: &[u8], label: &'static str, epoch: u64) {
+    jobs().waits().leave(&(lane.to_vec(), label), Some(epoch));
+}
+
+/// Log that the job `label` of the lane `shown` waits no more ([`Waits`]).
+fn log_wait_end(label: &'static str, shown: &str, tries: u64, seconds: u64) {
+    info!(
+        label,
+        lane = %shown,
+        tries,
+        waited_seconds = seconds,
+        "storage job waits no more (tries: its waits in a row); its outcome follows"
+    );
 }
 
 fn jobs() -> &'static Jobs {
@@ -405,8 +450,16 @@ impl Jobs {
         self.stopping.load(Ordering::SeqCst)
     }
 
+    /// The waits, those of epochs GLOBAL is past dropped: the epoch under
+    /// way is that of the latest GLOBAL frame
+    /// ([`crate::storage_snapshot::global_frame`]), never that of a job
+    /// ending, as jobs of several epochs run side by side.
     fn waits(&self) -> MutexGuard<'_, Waits> {
-        self.waits.lock().unwrap_or_else(PoisonError::into_inner)
+        let mut waits = self.waits.lock().unwrap_or_else(PoisonError::into_inner);
+        waits.epoch_under_way(
+            crate::storage_snapshot::global_frame().map(quil_types::consensus::epoch_for_frame),
+        );
+        waits
     }
 
     /// Log how the job `label` of `key`, for `epoch`, shown as `shown`,
@@ -429,13 +482,7 @@ impl Jobs {
             _ => self.waits().ended(&key, epoch, Instant::now()),
         };
         if let Some(WaitLine::End { tries, seconds }) = wait {
-            info!(
-                label,
-                lane = %shown,
-                tries,
-                waited_seconds = seconds,
-                "storage job waits no more (tries: its waits in a row); its outcome follows"
-            );
+            log_wait_end(label, shown, tries, seconds);
         }
         match result {
             Ok(()) => info!(
@@ -3313,10 +3360,11 @@ mod tests {
         assert!(waits.ended(&other, None, at(62)).is_some());
     }
 
-    /// A wait is of its job's epoch: a job of a later epoch, waiting or
-    /// not, drops the waits of earlier ones, which ended with them; that
-    /// epoch's renewal reads what its lane's job waits on last and drops
-    /// it; a job of another epoch in the same lane starts a wait of its own.
+    /// A wait is of its job's epoch: that epoch's renewal reads what its
+    /// lane's job waits on last and drops it; a job of another epoch in the
+    /// same lane starts a wait of its own; a job ending ends only its own
+    /// epoch's wait, and one left for its renewal not even that; waits of
+    /// epochs before the one under way are dropped, as they ended.
     #[test]
     fn a_wait_ends_with_its_epoch() {
         let mut waits = Waits::default();
@@ -3348,10 +3396,94 @@ mod tests {
             Some(WaitLine::Start)
         );
         assert_eq!(waits.ended(&seat(b"d"), Some(9), now), None);
-        assert!(
-            waits.0.is_empty(),
-            "STALE-WAIT-KEPT: waits of epochs before 9 outlived a job of epoch 9: {:?}",
-            waits.0.keys().collect::<Vec<_>>()
+        assert_eq!(
+            waits.ended(&seat(b"b"), Some(7), now),
+            None,
+            "not its epoch"
+        );
+        assert_eq!(
+            waits.0.len(),
+            2,
+            "PROXY-END: another job's end ended a wait"
+        );
+        assert_eq!(
+            waits.waited(seat(b"e"), Some(9), "certification", now),
+            Some(WaitLine::Start)
+        );
+        waits.leave(&seat(b"e"), Some(9));
+        assert_eq!(
+            waits.ended(&seat(b"e"), Some(9), now),
+            None,
+            "left to its renewal"
+        );
+        assert_eq!(waits.take(b"e", 9).as_deref(), Some("certification"));
+        waits.epoch_under_way(Some(8));
+        assert_eq!(
+            waits.0.keys().collect::<Vec<_>>(),
+            [&seat(b"b")],
+            "STALE-WAIT-KEPT: a wait of an epoch before the one under way was kept"
+        );
+        assert_eq!(
+            waits.ended(&seat(b"b"), Some(8), now),
+            Some(WaitLine::End {
+                tries: 1,
+                seconds: 0
+            })
+        );
+    }
+
+    /// A seat's wait lasts while GLOBAL is in an epoch before its own,
+    /// whatever jobs of later epochs end in other lanes, waiting or not:
+    /// its retries log no new start and its renewal reads it. Once GLOBAL
+    /// is past its epoch it is gone (2026-11-19: a seat's snapshot is for
+    /// the next epoch, labels ahead are for later ones; 32,797 of these
+    /// ended in four hours on a node, each dropping every seat's wait).
+    #[test]
+    fn a_wait_outlives_later_epochs_jobs_in_other_lanes() {
+        let jobs = Jobs::default();
+        let epoch = 7;
+        crate::storage_snapshot::note_global_frame(quil_types::consensus::epoch_start_frame(
+            epoch - 1,
+        ));
+        let why = "sector certification";
+        let wait = || Err(QuilError::StorageWaiting(why.into()));
+        let end = |lane: &[u8], label: &'static str, epoch: u64, result: Result<()>| {
+            let shown = hex::encode(lane);
+            let key = (lane.to_vec(), label);
+            jobs.job_ended(key, Some(epoch), label, &shown, Instant::now(), result);
+        };
+        let text = super::frame_verifier_tests::logged(|| {
+            end(b"seat", "member", epoch, wait());
+            end(b"warmup", "storage labels", epoch + 2, Ok(()));
+            end(b"warmup", "storage labels", epoch + 2, wait());
+            end(b"seat", "member", epoch, wait());
+        });
+        let seat_lines = |what: &str| {
+            text.lines()
+                .filter(|line| line.contains(what) && line.contains("lane=73656174"))
+                .count()
+        };
+        assert_eq!(
+            (
+                seat_lines("storage job waits for what"),
+                seat_lines("waits no more")
+            ),
+            (1, 0),
+            "PROXY-END: a later epoch's job in another lane ended the seat's wait:\n{text}"
+        );
+        assert_eq!(
+            jobs.waits().take(b"seat", epoch).as_deref(),
+            Some(why),
+            "PROXY-END: the seat's renewal finds no wait"
+        );
+        end(b"seat", "member", epoch, wait());
+        crate::storage_snapshot::note_global_frame(quil_types::consensus::epoch_start_frame(
+            epoch + 1,
+        ));
+        assert_eq!(
+            jobs.waits().take(b"seat", epoch),
+            None,
+            "STALE-WAIT-KEPT: a wait outlived GLOBAL passing its epoch"
         );
     }
 
