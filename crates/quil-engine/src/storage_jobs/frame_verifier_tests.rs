@@ -1323,7 +1323,7 @@ fn a_frames_starvation_outlives_the_gap() {
 }
 
 /// What a closure logged, through a subscriber on this thread.
-fn logged(run: impl FnOnce()) -> String {
+pub(super) fn logged(run: impl FnOnce()) -> String {
     #[derive(Clone, Default)]
     struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Lines {

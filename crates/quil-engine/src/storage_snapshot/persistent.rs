@@ -14,6 +14,14 @@ use std::{
     sync::Mutex,
 };
 
+/// An expected wait of a leaf's encode: on GLOBAL certifying its sector
+/// ([`UNCERTIFIED`]), or on a sector initialization slot. Its storage job
+/// logs it as one, never as a failure at each retry (2026-11-19: on a
+/// 9-seat node the two were 55 failure warns in 12 hours).
+fn waiting(what: &str) -> QuilError {
+    QuilError::StorageWaiting(what.into())
+}
+
 fn io(error: std::io::Error) -> QuilError {
     unavailable(format!("persistent sector: {error}"))
 }
@@ -154,7 +162,7 @@ fn reserve(
     exact: u64,
 ) -> Result<(PathBuf, [u8; 32], u64)> {
     try_reserve(store, member, leaf, epoch, exact)?
-        .ok_or_else(|| unavailable("sector initialization slots are occupied".into()))
+        .ok_or_else(|| waiting("sector initialization slots are occupied"))
 }
 
 fn sector_lane(member: &[u8], id: &[u8; 32]) -> Vec<u8> {
@@ -709,6 +717,35 @@ fn proof_verifies(
     protocol::verify_certificate(member, &cert.sector, epoch, cert.n, &root, beacon, bytes).is_ok()
 }
 
+/// The refusal of a leaf's encode while its sector is not certified.
+const UNCERTIFIED: &str = "sector certification must finish before data registration";
+
+/// Fail unless every leaf of `captured` has a certified sector to be
+/// encoded into ([`reserve`]), before any leaf asks for memory. The leaves
+/// of a seat encode side by side, and one without such a sector fails the
+/// seat's encode: a sibling waiting for memory meanwhile would make sector
+/// labelling ahead, that of the very sector it lacks perhaps, give its
+/// memory back for nothing (2026-11-18: on a 9-seat node, encodes held
+/// memory for up to 2928 s and then failed on a sibling's uncertified
+/// sector, while sector labelling stopped 25 times to give memory back).
+pub(super) fn sectors_certified(
+    captured: &Captured,
+    member: &[u8],
+    store: Option<&LabelStore>,
+) -> Result<()> {
+    let store = store
+        .ok_or_else(|| unavailable("persistent storage requires a sector directory".into()))?;
+    for prefix in &captured.prefixes {
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+        let exact = captured.node_count(prefix)?;
+        let (dir, _, _) = reserve(store, member, &leaf, captured.epoch, exact)?;
+        if !Sector::load(dir)?.is_some_and(|sector| sector.certified) {
+            return Err(waiting(UNCERTIFIED));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn encode_leaf(
     captured: &Captured,
     member: &[u8],
@@ -727,9 +764,7 @@ pub(super) fn encode_leaf(
     let (dir, id, n) = reserve(store, member, &leaf, captured.epoch, exact)?;
     let sector = Sector::load(dir)?
         .filter(|sector| sector.certified)
-        .ok_or_else(|| {
-            unavailable("sector certification must finish before data registration".into())
-        })?;
+        .ok_or_else(|| waiting(UNCERTIFIED))?;
     let fingerprint = captured.fingerprint(member, prefix);
     if let Some(from) = replicas.snapshot_match(&leaf, &fingerprint)? {
         if let Some(old) = replicas.get_hash_leaf(from, &leaf)? {
@@ -2146,6 +2181,312 @@ mod tests {
             "same-epoch leases cannot count one sector twice"
         );
         assert!(Sector::load(other).unwrap().is_none());
+        gates(false);
+    }
+    /// A seat's encode with one leaf in a sector still being labelled, the
+    /// others in certified sectors, asks for no memory: it would fail at that
+    /// leaf anyway, and its ask would make the labelling, holding what the
+    /// memory share has room for, give its memory back. It fails on that
+    /// leaf's certification. The labelling then completes, and once its
+    /// sector is certified too, the same encode succeeds: the check refuses
+    /// only until each leaf's sector is certified. Every leaf is checked
+    /// before any asks for memory, so the leaf not certified is not the
+    /// first.
+    #[test]
+    fn an_encode_with_a_leaf_not_certified_takes_no_labelling_memory() {
+        crate::storage_jobs::set_job_slots_for_test(1);
+        const GIB: u64 = 1 << 30;
+        crate::storage_jobs::set_available_for_test(Some(
+            GIB * 100 / crate::storage_jobs::MEMORY_SHARE_PERCENT,
+        ));
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([24; 32], [25; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let snap = super::super::tests::split(
+            capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap(),
+        );
+        assert!(snap.prefixes.len() >= 2, "a seat of several leaves");
+        let leaf =
+            |i: usize| quil_execution::global_intrinsic::leaf_id_bytes(&app, &snap.prefixes[i]);
+        let exact = |i: usize| snap.node_count(&snap.prefixes[i]).unwrap();
+        let certify = |dir: PathBuf, id: &[u8; 32]| {
+            let mut sector = Sector::load(dir).unwrap().unwrap();
+            sector.certified = true;
+            sector.save().unwrap();
+            store.release_certified_sector(1500, &member, id);
+        };
+        for i in (0..snap.prefixes.len()).filter(|&i| i != 1) {
+            let (dir, id, n) = reserve(&store, &member, &leaf(i), 1500, exact(i)).unwrap();
+            initialize(&store, &member, 1500, dir.clone(), id, n, &|| false).unwrap();
+            certify(dir, &id);
+        }
+        let (labelling, id, n) = reserve(&store, &member, &leaf(1), 1500, exact(1)).unwrap();
+        assert!(Sector::load(labelling.clone()).unwrap().is_none());
+        // The labelling holds all the share but a MiB; the encode needs more.
+        let held = GIB - (1 << 20);
+        assert!(proof::encoding_owned_with_labels_bytes(n) > GIB - held);
+        let memory = crate::storage_jobs::reserve_ahead(
+            held,
+            crate::storage_jobs::AheadOrder {
+                deferrable: false,
+                seat_leaves: 1,
+                seat: 0,
+                leaf: 0,
+            },
+            1500,
+            &|| false,
+        )
+        .expect("the labelling fits the share alone");
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        println!("REACH pending-slots");
+        let encoded =
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| {
+                memory.yield_requested()
+            });
+        let error = encoded.expect_err("a leaf without a certified sector fails the encode");
+        assert!(
+            !memory.yield_requested(),
+            "PENDING-ENCODE-ASK: an encode that fails for a leaf not certified asked the \
+             sector's labelling for its memory ({error})"
+        );
+        assert!(
+            matches!(&error, QuilError::StorageWaiting(what) if what == UNCERTIFIED),
+            "the encode fails on the leaf not certified: {error}"
+        );
+        initialize(&store, &member, 1500, labelling.clone(), id, n, &|| {
+            memory.yield_requested()
+        })
+        .expect("the labelling completes");
+        certify(labelling, &id);
+        drop(memory);
+        crate::storage_jobs::set_available_for_test(None);
+        if let Err(error) =
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| false)
+        {
+            panic!(
+                "SECOND-ENCODE-REFUSED: an encode with each leaf's sector certified \
+                 failed ({error})"
+            );
+        }
+        gates(false);
+    }
+    /// The encode gate's refusals, a leaf whose sector GLOBAL has not
+    /// certified and a leaf finding every sector initialization slot
+    /// occupied, are expected waits ([`QuilError::StorageWaiting`]): its
+    /// storage job logs them as such, not as a failure warn at each retry
+    /// (2026-11-19: 55 such warns in 12 hours on a 9-seat node).
+    #[test]
+    fn the_encode_gate_refuses_with_an_expected_wait() {
+        crate::storage_jobs::set_job_slots_for_test(1);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (member, app) = ([26; 32], [27; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let error =
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| false)
+                .expect_err("the leaf's sector is reserved, not labelled or certified");
+        assert!(
+            matches!(&error, QuilError::StorageWaiting(what) if what == UNCERTIFIED),
+            "GATE-NOT-A-WAIT: a leaf whose sector is not certified fails its encode \
+             otherwise than with an expected wait: {error:?}"
+        );
+        // The one slot holds that leaf's sector.
+        let error = reserve(&store, &member, b"another leaf", 1500, 100)
+            .expect_err("every sector initialization slot is occupied");
+        assert!(
+            matches!(&error, QuilError::StorageWaiting(_)),
+            "SLOTS-NOT-A-WAIT: a leaf finding every slot occupied fails otherwise than with \
+             an expected wait: {error:?}"
+        );
+        gates(false);
+    }
+    /// A seat's encode waiting on its sector's certification logs only
+    /// its wait, through its storage job, at info: neither an encode start
+    /// nor an encode end, at each retry (2026-11-19: up to 1,080 such lines
+    /// an hour on a 9-seat node).
+    #[test]
+    fn a_waiting_seat_encode_logs_only_its_wait() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let (member, app) = ([0x2E; 32], [0x2F; 32]);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, 1500);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            1500,
+            vec![source],
+        );
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        gates(false);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lane = format!("lane={}", hex::encode(app));
+        assert!(
+            !logs.contains("storage snapshot taken") && !logs.contains("encode ended"),
+            "ENCODE-START-LOGGED: a seat waiting on its sector logged an encode start or end:\n{logs}"
+        );
+        let waits: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("storage job waits for what") && line.contains(&lane))
+            .collect();
+        assert!(
+            waits.len() == 1 && waits[0].contains(UNCERTIFIED) && waits[0].contains(" INFO "),
+            "WAIT-NOT-LOGGED: the seat's wait was not logged once at info by its job:\n{logs}"
+        );
+        assert!(!logs.contains("WARN"), "{logs}");
+    }
+    /// Each leaf of `captured` gets a certified sector of `member`'s.
+    fn certify_all(store: &LabelStore, member: &[u8], captured: &Captured) {
+        for prefix in &captured.prefixes {
+            let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+            let exact = captured.node_count(prefix).unwrap();
+            let (dir, id, n) = reserve(store, member, &leaf, captured.epoch, exact).unwrap();
+            initialize(store, member, captured.epoch, dir.clone(), id, n, &|| false).unwrap();
+            let mut sector = Sector::load(dir).unwrap().unwrap();
+            sector.certified = true;
+            sector.save().unwrap();
+            store.release_certified_sector(captured.epoch, member, &id);
+        }
+    }
+    /// A seat's wait ends once its encode's gate opens: its end is logged
+    /// before the encode starts, and its renewal reads no wait while the
+    /// encode still runs (2026-11-19: it ended only with its job, so a
+    /// seat still encoding at the grace was told it waited on GLOBAL, and
+    /// the wait's seconds counted the encode).
+    #[test]
+    fn a_seat_wait_ends_when_its_gate_opens() {
+        use std::time::{Duration, Instant};
+        let logs = super::super::tests::capture_logs();
+        let text = || String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, app, epoch) = ([0x3C; 32], [0x3D; 32], 1500);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, epoch);
+        let captured = capture_at(&crdt, &app, epoch, std::slice::from_ref(&source)).unwrap();
+        certify_all(store, &member, &captured);
+        // The seat's last try waited, in its lane.
+        crate::storage_jobs::spawn_in_epoch(&app, "member", Some(epoch), || {
+            Err(waiting(UNCERTIFIED))
+        });
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            Duration::from_secs(60)
+        ));
+        let lane = format!("lane={}", hex::encode(app));
+        let lines = |what: &str| {
+            text()
+                .lines()
+                .filter(|line| line.contains(what) && line.contains(&lane))
+                .count()
+        };
+        assert_eq!(lines("storage job waits for what"), 1, "{}", text());
+        // Its next encode, past the gate, waits for memory held here.
+        let held = crate::storage_jobs::reserve(u64::MAX / 4);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            epoch,
+            vec![source],
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while lines("storage snapshot taken") == 0 {
+            assert!(Instant::now() < deadline, "the encode starts:\n{}", text());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ended = lines("waits no more");
+        let renewal = crate::storage_jobs::take_wait(&app, epoch);
+        drop(held);
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            Duration::from_secs(300)
+        ));
+        let all = text();
+        assert!(
+            ended == 1 && renewal.is_none(),
+            "WAIT-END-AT-JOB-END: the seat's wait outlived its gate opening while its encode \
+             ran (ends logged: {ended}, the renewal read: {renewal:?}):\n{all}"
+        );
+        let at = |what: &str| all.find(what).unwrap_or(usize::MAX);
+        assert!(
+            at("waits no more") < at("storage snapshot taken"),
+            "the wait's end comes before the encode starts:\n{all}"
+        );
+        assert_eq!(lines("waits no more"), 1, "its end is logged once:\n{all}");
+        gates(false);
+    }
+    /// A seat still waiting when its renewal's grace frame passes keeps
+    /// its wait for that renewal to read, though a try of it queued before
+    /// the grace ends after it (2026-11-19: that try's end dropped the
+    /// wait, and the renewal named the node's load).
+    #[test]
+    fn a_wait_at_the_grace_is_left_for_its_renewal() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let (member, app, epoch) = ([0x3E; 32], [0x3F; 32], 1500);
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let source = current_source(&crdt, &app, epoch);
+        crate::storage_jobs::spawn_in_epoch(&app, "member", Some(epoch), || {
+            Err(waiting(UNCERTIFIED))
+        });
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        super::super::note_grace_passed(&member, epoch);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        super::super::request_member(
+            crdt,
+            replicas,
+            member.to_vec(),
+            &app,
+            app.to_vec(),
+            epoch,
+            vec![source],
+        );
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &app,
+            std::time::Duration::from_secs(60)
+        ));
+        let all = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            all.contains("the renewal's grace frame passed"),
+            "the try ends at the grace:\n{all}"
+        );
+        let renewal = crate::storage_jobs::take_wait(&app, epoch);
+        assert!(
+            renewal.as_deref() == Some(UNCERTIFIED) && !all.contains("waits no more"),
+            "WAIT-LOST-AT-GRACE: a try ending at the grace ended the seat's wait before its \
+             renewal read it (read: {renewal:?}):\n{all}"
+        );
         gates(false);
     }
     /// A leaf reserving its certified sector again, as it does at every

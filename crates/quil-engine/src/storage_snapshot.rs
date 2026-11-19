@@ -1154,6 +1154,10 @@ fn encode_member_until(
     {
         store.sweep(captured.epoch);
     }
+    // No leaf asks for memory while another has no certified sector.
+    if quil_types::consensus::persistent_storage_at(captured.epoch) {
+        persistent::sectors_certified(captured, member, store)?;
+    }
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
         captured.plan.clone(),
@@ -1752,13 +1756,16 @@ pub fn request_member(
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
     let shown_lane = hex::encode(lane);
-    request(lane, key, "member", move || {
+    let lane_key = lane.to_vec();
+    request(lane, key, "member", epoch, move || {
         use quil_crypto::storage_proof::data_node_count;
         let past_grace = || {
             info!(epoch, filter = %hex::encode(&filter), scope = "local",
                 "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
                  without a storage registration that epoch; \
                  its memory goes to other storage work");
+            // A wait the seat still had is its renewal's reason to read.
+            crate::storage_jobs::leave_wait(&lane_key, "member", epoch);
             Ok(())
         };
         if grace_passed(&member, epoch) {
@@ -1768,6 +1775,20 @@ pub fn request_member(
             return Ok(());
         }
         let captured = capture_at(&crdt, &filter, epoch, &sources)?;
+        // A seat waiting on its sectors logs only its wait, through its
+        // job: each retry, once a minute, logged an encode start and end
+        // besides (2026-11-19: up to 1,080 lines an hour on 9 seats).
+        if quil_types::consensus::persistent_storage_at(epoch) {
+            if let Err(wait @ QuilError::StorageWaiting(_)) = persistent::sectors_certified(
+                &captured,
+                &member,
+                crate::storage_labels::installed(),
+            ) {
+                return Err(wait);
+            }
+        }
+        // What a wait was for is there: it ends now, not with the encode.
+        crate::storage_jobs::wait_over(&lane_key, "member", epoch);
         let started = std::time::Instant::now();
         // Its leaves' fewest nodes, from their values: labelled side by side,
         // the largest bounds the encode.
@@ -1805,13 +1826,14 @@ pub fn request_member(
             Err(_) if grace_passed(&member, epoch) => "grace passed",
             Err(_) if snapshot_given_up(&member, &filter, epoch) => "given up",
             Err(_) if crate::storage_jobs::stopping() => "stopping",
+            Err(QuilError::StorageWaiting(_)) => "waiting",
             Err(_) => "failed",
         };
         info!(epoch, filter = %hex::encode(&filter), lane = %shown_lane,
             seconds = started.elapsed().as_secs_f64(), outcome,
             "storage snapshot encode ended: only `encoded` registers the seat's leaves; `given up` \
              and `grace passed` renew it without them (warned or logged as they happened), \
-             `failed` is tried again when next needed");
+             `waiting` and `failed` are tried again when next needed");
         match result {
             Err(_) if grace_passed(&member, epoch) => return past_grace(),
             // Logged as it was given up (`encode_member_until`).
@@ -2362,15 +2384,17 @@ impl JobState {
     }
 }
 
-/// Run the snapshot job for `key` in `lane` (`crate::storage_jobs::spawn`)
-/// unless one is queued or running, or the last failed less than its wait
-/// ago ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
+/// Run the snapshot job for `key` in `lane`, for `epoch`
+/// (`crate::storage_jobs::spawn_in_epoch`), unless one is queued or
+/// running, or the last failed less than its wait ago
+/// ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
 /// it fails on a local disk error. A job that succeeds leaves its record
 /// behind, so its caller stops asking.
 pub fn request(
     lane: &[u8],
     key: Vec<u8>,
     label: &'static str,
+    epoch: u64,
     job: impl FnOnce() -> Result<()> + Send + 'static,
 ) {
     use std::collections::HashMap;
@@ -2398,7 +2422,7 @@ pub fn request(
             }
         }
     }
-    crate::storage_jobs::spawn(lane, label, move || {
+    crate::storage_jobs::spawn_in_epoch(lane, label, Some(epoch), move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
             .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
         if let Ok(mut jobs) = state.lock() {
@@ -6017,7 +6041,7 @@ pub(crate) mod tests {
     }
 
     /// A shard of `app` of 32 values of 300 bytes, committed.
-    fn shard_of_leaves(app: [u8; 32]) -> Arc<HypergraphCrdt> {
+    pub(super) fn shard_of_leaves(app: [u8; 32]) -> Arc<HypergraphCrdt> {
         let crdt = test_crdt();
         for lead in 0u8..32 {
             crdt.add_vertex(
@@ -6035,7 +6059,7 @@ pub(crate) mod tests {
 
     /// `captured` split into leaves of at most a fifth of its data: five or
     /// more.
-    fn split(mut captured: Captured) -> Captured {
+    pub(super) fn split(mut captured: Captured) -> Captured {
         let whole = captured.size(&[]).unwrap();
         captured.prefixes = captured
             .partition(whole / 5)

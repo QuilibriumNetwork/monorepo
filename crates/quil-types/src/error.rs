@@ -36,6 +36,13 @@ pub enum QuilError {
     #[error("stopped: {0}")]
     StorageWorkStopped(String),
 
+    /// Storage work waits for what this node cannot hurry: GLOBAL to
+    /// certify the sector a leaf is encoded into, or a sector initialization
+    /// slot to free. Not a failure: it is tried again when next asked, and
+    /// goes ahead once that happens.
+    #[error("waiting: {0}")]
+    StorageWaiting(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -140,6 +147,7 @@ impl QuilError {
                 | Self::ExecutionUnavailable(_)
                 | Self::StorageSnapshotPending(_)
                 | Self::StorageWorkStopped(_)
+                | Self::StorageWaiting(_)
         )
     }
 
