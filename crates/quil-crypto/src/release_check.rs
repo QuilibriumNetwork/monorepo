@@ -31,7 +31,7 @@ use ed448_rust::PublicKey;
 use quil_config::release_source::{
     load_release_source_at, owner_and_mode, Stat, RELEASE_SOURCE_FILE,
 };
-use quil_config::SIGNATORIES;
+use quil_config::{SIGNATORIES, VERSION_STRING};
 use sha3::{Digest, Sha3_256};
 use std::path::{Path, PathBuf};
 
@@ -106,6 +106,34 @@ pub fn verify_release(
             under: Box::new(under),
         }),
     }
+}
+
+/// [`verify_release`] for a binary built as `release`, the published file
+/// name of its release ([`release_file_name`]).
+pub fn verify_release_as(
+    exe_path: &Path,
+    official: &[&str],
+    stat: Stat,
+    release: &str,
+) -> Result<SelfCheck, ReleaseCheckError> {
+    let _ = release;
+    verify_release(exe_path, official, stat)
+}
+
+/// The published file name of this build's `kind` release (`node`,
+/// `qclient`): `<kind>-<VERSION_STRING>-<os>-<arch>`, the platform spelled
+/// as Go spells it.
+pub fn release_file_name(kind: &str) -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{kind}-{VERSION_STRING}-{os}-{arch}")
 }
 
 /// The release source file of the install root holding `exe`, a release
@@ -824,6 +852,50 @@ mod tests {
     /// Every path root-owned and writable only by root.
     fn root_only(_: &Path) -> std::io::Result<(u32, u32)> {
         Ok((0, 0o755))
+    }
+
+    /// A release file `file` in `dir`, its `.dgst` labelled `label` and
+    /// signed by `signers` as `.dgst.sig.1..`.
+    fn signed_as(
+        dir: &Path,
+        file: &str,
+        label: &str,
+        signers: &[ed448_rust::PrivateKey],
+    ) -> PathBuf {
+        let exe = dir.join(file);
+        std::fs::write(&exe, b"a node release").unwrap();
+        let digest: [u8; 32] = Sha3_256::digest(b"a node release").into();
+        let dgst = format!("SHA3-256({label})= {}\n", hex::encode(digest));
+        std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+        for (i, sk) in signers.iter().enumerate() {
+            let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+            std::fs::write(append_suffix(&exe, &format!(".dgst.sig.{}", i + 1)), sig).unwrap();
+        }
+        exe
+    }
+
+    /// A signed node release installed under another name, as an installer
+    /// that names it `quilibrium-node` does, passes the node's self-check:
+    /// its label names this build's release.
+    #[test]
+    fn a_signed_node_release_renamed_passes_the_node_self_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let release = release_file_name("node");
+        let (signers, keys) = official_signers();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let exe = signed_as(tmp.path(), "quilibrium-node", &release, &signers);
+        let by_name = verify_release(&exe, &keys, &root_only);
+        assert!(
+            matches!(by_name, Err(ReleaseCheckError::NameMismatch { .. })),
+            "premise: the file-name binding refuses the renamed release: {by_name:?}"
+        );
+        let checked = verify_release_as(&exe, &keys, &root_only, &release);
+        println!("REACH release label check: {release} as quilibrium-node: {checked:?}");
+        assert_eq!(
+            checked.as_ref().ok(),
+            Some(&SelfCheck::Verified(5)),
+            "renamed_refused: {checked:?}"
+        );
     }
 
     /// Official signatories for the fixtures below.
