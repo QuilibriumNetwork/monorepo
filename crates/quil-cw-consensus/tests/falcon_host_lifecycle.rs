@@ -204,11 +204,14 @@ async fn phase(
         .map(|key| key.as_ref().to_vec())
         .collect();
     let mut tips = vec![0; committee.peers.len()];
-    // Each finalization is progress: only a committee that stops finalizing
-    // reaches the bound.
+    // The loop ends once the slowest member reaches the target, so only its
+    // tip rising is progress: a member that stops finalizing fails the test
+    // while the others still report.
+    let mut slowest = (0, Instant::now());
     let result = async {
-        while tips.iter().any(|tip| *tip < target) {
-            let (member, digest, bytes) = tokio::time::timeout(TEST_HANG, rx.recv())
+        while slowest.0 < target {
+            let left = TEST_HANG.saturating_sub(slowest.1.elapsed());
+            let (member, digest, bytes) = tokio::time::timeout(left, rx.recv())
                 .await?
                 .expect("finalization report");
             let cert = verify_finalization_details(&bytes, &keys, NAMESPACE, digest.0)
@@ -223,6 +226,10 @@ async fn phase(
             }
             certificates.insert(view, cert);
             tips[member] = tips[member].max(view);
+            let lowest = *tips.iter().min().unwrap();
+            if lowest > slowest.0 {
+                slowest = (lowest, Instant::now());
+            }
         }
         Ok::<_, tokio::time::error::Elapsed>(())
     }
@@ -232,7 +239,11 @@ async fn phase(
     for router in routers {
         router.await.unwrap();
     }
-    result.expect("all committee members must finalize");
+    assert!(
+        result.is_ok(),
+        "all committee members must finalize: tips {tips:?} toward {target}, \
+         the lowest still for {TEST_HANG:?}"
+    );
 }
 
 #[test]

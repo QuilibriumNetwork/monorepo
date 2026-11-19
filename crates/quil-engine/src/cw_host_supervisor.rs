@@ -545,30 +545,32 @@ mod tests {
             Arc::new(Transport(tx)),
             policy(),
         );
-        // Wait while the hosts work, failing once they have done nothing for
-        // `STALL`: a bound on the whole run is a bound on the runner's load.
-        // A replacement that stops finalizing, or one failing again, still
-        // fails the test.
+        // Wait while the hosts finalize, failing once no view was finalized
+        // for `STALL`: a bound on the whole run is a bound on the runner's
+        // load. The wait ends on a finalized view, so only that is progress:
+        // a replacement that works without finalizing, or one failing again,
+        // still fails the test.
         const STALL: Duration = TEST_HANG;
-        let mut last = (progress.load(Ordering::SeqCst), Instant::now());
-        let mut finalized = 0;
+        let mut finalized = (0, Instant::now());
         let result = loop {
             if let Ok(view) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-                finalized = view.unwrap();
-                if finalized >= 5 {
+                let view = view.unwrap();
+                if view >= 5 {
                     break Ok(());
+                }
+                if view > finalized.0 {
+                    finalized = (view, Instant::now());
                 }
             }
             let started = starts.load(Ordering::SeqCst);
             let work = progress.load(Ordering::SeqCst);
             if started > 2 {
                 break Err(format!("the replacement failed too: {started} starts"));
-            } else if work != last.0 {
-                last = (work, Instant::now());
-            } else if last.1.elapsed() >= STALL {
+            } else if finalized.1.elapsed() >= STALL {
                 break Err(format!(
-                    "no progress for {STALL:?}, after {started} starts, {work} steps \
-                     and view {finalized} finalized"
+                    "no view finalized for {STALL:?}, after {started} starts, {work} steps \
+                     and view {} finalized",
+                    finalized.0
                 ));
             }
         };

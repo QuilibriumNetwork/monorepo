@@ -650,12 +650,18 @@ mod host_registry_tests {
 
     use super::TEST_HANG as HANG;
 
-    /// Returns once a thread sleeps in `hosts.wait`: a host that ends after
-    /// this can end that wait only by waking it.
-    fn until_waiting(hosts: &Hosts) {
+    /// Whether a thread slept in `hosts.wait` within `HANG`: a host that
+    /// ends after this can end that wait only by waking it. False when no
+    /// wait slept, as when the host ended before the wait began.
+    fn until_waiting(hosts: &Hosts) -> bool {
+        let deadline = Instant::now() + HANG;
         while hosts.state().waiting == 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
+        true
     }
 
     struct Directory(std::path::PathBuf);
@@ -876,10 +882,7 @@ mod host_registry_tests {
         // Running: it finalizes views.
         while finalized.recv_timeout(HANG).expect("the host finalized") < 2 {}
         // Stop it once the wait sleeps, so that only the host's end wakes it.
-        let stopper = std::thread::spawn(move || {
-            until_waiting(hosts);
-            hosts.stop()
-        });
+        let stopper = std::thread::spawn(move || until_waiting(hosts).then(|| hosts.stop()));
         let started = Instant::now();
         assert_eq!(hosts.wait(HANG), 0);
         // The node exits once the wait returns: by then the engine's actors,
@@ -890,7 +893,11 @@ mod host_registry_tests {
         );
         // The host's end woke the wait: one that missed it sleeps to HANG.
         assert!(started.elapsed() < HANG, "the wait missed the host's end");
-        assert_eq!(stopper.join().unwrap(), 1);
+        assert_eq!(
+            stopper.join().unwrap(),
+            Some(1),
+            "the host ended before the wait slept: the stop was never tested"
+        );
         handle.thread.join().unwrap();
     }
 
@@ -945,13 +952,17 @@ mod host_registry_tests {
         assert!(started.elapsed() >= Duration::from_millis(100));
         // Release it once the wait sleeps, so that only the release wakes it.
         let release = std::thread::spawn(move || {
-            until_waiting(hosts);
+            let slept = until_waiting(hosts);
             drop(registration);
+            slept
         });
         let started = Instant::now();
         assert_eq!(hosts.wait(HANG), 0);
         assert!(started.elapsed() < HANG, "the wait missed the release");
-        release.join().unwrap();
+        assert!(
+            release.join().unwrap(),
+            "the release came before the wait slept"
+        );
         let refused = Arc::new(AtomicBool::new(false));
         assert!(hosts.register(&refused).is_none());
         assert!(refused.load(Ordering::Acquire));
