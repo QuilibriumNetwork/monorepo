@@ -2,7 +2,8 @@
 //! IPv6 listener serves gossip, it still dials out over IPv4 (a DS-Lite host:
 //! IPv6 inbound, IPv4 only through its carrier's NAT), and an IPv4 config stays
 //! on IPv4. The IPv4 and IPv6 wildcards share a port, as the default config
-//! has them. A host without an IPv6 loopback skips with the reason.
+//! has them. A peer listed at both families gets one connection. A host
+//! without an IPv6 loopback skips with the reason.
 //!
 //! Every listener binds port 0 and the test reads the port the kernel gave
 //! it: a probed port is free only until the probe closes, and nextest runs
@@ -90,7 +91,20 @@ async fn gossip_to(
 ) {
     let mut config = base_config();
     config.bootstrap_peers = vec![dial.to_string()];
-    let node = P2PNode::new_with_options(&config, true, None).unwrap();
+    publish_over(sup, &config, listen, inbound, payload).await;
+}
+
+/// A node with `config` on `listen` that publishes one message, which
+/// `inbound` must deliver; the node, once it did.
+async fn publish_over(
+    sup: &mut Supervisor,
+    config: &quil_config::P2PConfig,
+    listen: &str,
+    inbound: &mut mpsc::Receiver<ReceivedMessage>,
+    payload: &[u8],
+) -> P2PHandle {
+    let dial = &config.bootstrap_peers;
+    let node = P2PNode::new_with_options(config, true, None).unwrap();
     let (sender, _rx) = node.start(sup, listen).await.unwrap();
     sender.subscribe_confirmed(topic()).await.unwrap();
     // The sender dials its bootstrap peer on its first discovery tick, and
@@ -101,7 +115,7 @@ async fn gossip_to(
         match sender.publish(topic(), data.clone()).await {
             Ok(()) => break,
             Err(e) if tokio::time::Instant::now() > deadline => {
-                panic!("not published over {dial}: {e}")
+                panic!("not published over {dial:?}: {e}")
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
         }
@@ -115,8 +129,9 @@ async fn gossip_to(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("not delivered over {dial}"));
+    .unwrap_or_else(|_| panic!("not delivered over {dial:?}"));
     assert_eq!(message.bitmask, topic());
+    sender
 }
 
 /// Whether the node lists `expected` within `wait`.
@@ -376,6 +391,80 @@ async fn an_ipv6_listener_that_cannot_bind_leaves_ipv4_serving() {
         &format!("{listen}/p2p/{id}"),
         &mut inbound,
         b"over ipv4 beside a failed ipv6 listener",
+    )
+    .await;
+}
+
+/// The outbound connections `node` established, from its metrics.
+fn outbound_connections(node: &P2PHandle) -> u64 {
+    let metrics = node.render_metrics();
+    let line = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("libp2p_connections_established")
+                && line.to_ascii_lowercase().contains("direction=\"outbound\"")
+        })
+        .unwrap_or_else(|| panic!("no outbound connection count in the metrics:\n{metrics}"));
+    let count = line.rsplit(' ').next().unwrap_or_default();
+    count
+        .parse::<f64>()
+        .unwrap_or_else(|e| panic!("{line}: {e}")) as u64
+}
+
+/// A node listed at the two addresses `at` (address prefixes to the port,
+/// read from its listen address `bound`) in a peer's bootstrap and direct
+/// lists, as the built-in list names each archive at its IPv4 and its IPv6
+/// address: the peer delivers gossip to it over one connection, not one
+/// per address or list entry.
+async fn one_connection_to_a_peer_at(
+    listen: &str,
+    additional: &[String],
+    bound: [&str; 2],
+    at: [&str; 2],
+    suffix: &str,
+) {
+    let mut sup = Supervisor::new();
+    let (node, mut inbound, id) = start_receiver(&mut sup, listen, additional).await;
+    let mut entries = Vec::new();
+    for (bound, at) in bound.iter().zip(at) {
+        let port = bound_port(&node, bound).await;
+        entries.push(format!("{at}{port}{suffix}/p2p/{id}"));
+    }
+    let mut config = base_config();
+    config.additional_listen_multiaddrs = additional.to_vec();
+    config.bootstrap_peers = entries.clone();
+    config.direct_peers = entries.iter().rev().cloned().collect();
+    let sender = publish_over(&mut sup, &config, listen, &mut inbound, b"one connection").await;
+    let connections = outbound_connections(&sender);
+    eprintln!("REACH v6-bootstrap checked: {connections} connection(s) over {entries:?}");
+    assert_eq!(
+        connections, 1,
+        "a peer listed at two addresses holds one connection per address: {entries:?}"
+    );
+}
+
+/// An archive listed at its IPv4 and its IPv6 address gets one connection
+/// from a dual-stack node; two IPv4 addresses of one peer stand in for the
+/// pair on a host without an IPv6 loopback, and run on every host.
+#[tokio::test]
+async fn a_peer_listed_at_two_addresses_gets_one_connection() {
+    one_connection_to_a_peer_at(
+        "/ip4/0.0.0.0/tcp/0",
+        &[],
+        ["/ip4/127.0.0.1/tcp/", "/ip4/127.0.0.1/tcp/"],
+        ["/ip4/127.0.0.1/tcp/", "/ip4/127.0.0.2/tcp/"],
+        "",
+    )
+    .await;
+    if !ipv6_loopback("a_peer_listed_at_two_addresses_gets_one_connection, its dual-stack half") {
+        return;
+    }
+    one_connection_to_a_peer_at(
+        "/ip4/0.0.0.0/udp/0/quic-v1",
+        &["/ip6/::/udp/0/quic-v1".to_string()],
+        ["/ip4/127.0.0.1/udp/", "/ip6/::1/udp/"],
+        ["/ip4/127.0.0.1/udp/", "/ip6/::1/udp/"],
+        "/quic-v1",
     )
     .await;
 }

@@ -99,22 +99,29 @@ impl ProbeServers {
         }
     }
 
-    /// The configured peer `peer` at `addr` is a server; the caller adds it
-    /// to AutoNAT with its address. It takes its IP from another server.
-    /// One on an address family this node does not listen on is removed.
-    /// A peer configured at several addresses (an archive's IPv4 and IPv6
-    /// entries) keeps the pin of its first listened one.
-    pub(crate) fn pin(&mut self, peer: PeerId, addr: &Multiaddr) -> Vec<ServerChange> {
-        if self.pinned.contains_key(&peer) {
-            return Vec::new();
-        }
+    /// The configured peer `peer` at `addrs`, every address it is listed
+    /// at, is a server; the caller adds it to AutoNAT with those addresses.
+    /// It takes its IP from another server when one listened IP group is
+    /// all it can be reached at; with several (an archive's IPv4 and IPv6
+    /// entries on a node listening on both) its IP is the one it connects
+    /// from. One at no address in a family this node listens on is removed.
+    pub(crate) fn pin(&mut self, peer: PeerId, addrs: &[Multiaddr]) -> Vec<ServerChange> {
         if let Some(ip) = self.servers.remove(&peer) {
             self.by_ip.remove(&ip);
         }
-        let ip = ip_of(addr).map(ip_group);
-        if ip.is_some_and(|ip| !self.listened(ip)) {
+        let reachable: Vec<Option<IpAddr>> = addrs
+            .iter()
+            .map(|addr| ip_of(addr).map(ip_group))
+            .filter(|ip| ip.is_none_or(|ip| self.listened(ip)))
+            .collect();
+        let Some(&first) = reachable.first() else {
             return vec![ServerChange::Remove(peer)];
-        }
+        };
+        let ip = if reachable.iter().all(|&ip| ip == first) {
+            first
+        } else {
+            None
+        };
         self.pinned.insert(peer, ip);
         ip.map(|ip| self.evict(ip)).unwrap_or_default()
     }
@@ -409,7 +416,7 @@ mod tests {
         let addr: Multiaddr = format!("/ip4/192.0.2.10/tcp/8336/p2p/{archive}")
             .parse()
             .unwrap();
-        assert!(net.servers.pin(archive, &addr).is_empty());
+        assert!(net.servers.pin(archive, &[addr]).is_empty());
         assert_eq!(net.servers.count(), 1);
         let peer = PeerId::random();
         assert!(net.identified(peer, "192.0.2.10", true).1.is_empty());
@@ -436,7 +443,7 @@ mod tests {
         assert_eq!(net.identified(peer, "192.0.2.10", true).1, vec![Add(peer)]);
         let archive = PeerId::random();
         let addr: Multiaddr = "/dns4/archive.example.com/tcp/8336".parse().unwrap();
-        assert!(net.servers.pin(archive, &addr).is_empty());
+        assert!(net.servers.pin(archive, &[addr]).is_empty());
         let remote: Multiaddr = "/ip4/192.0.2.10/tcp/8336".parse().unwrap();
         let conn = ConnectionId::new_unchecked(1_000);
         assert_eq!(
@@ -499,35 +506,54 @@ mod tests {
         assert_eq!(net.identified(v4, "198.51.100.7", true).1, vec![Add(v4)]);
         let archive = PeerId::random();
         let addr: Multiaddr = "/ip6/2001:db8:5::1/tcp/8336".parse().unwrap();
-        assert_eq!(net.servers.pin(archive, &addr), vec![Remove(archive)]);
+        assert_eq!(net.servers.pin(archive, &[addr]), vec![Remove(archive)]);
         assert_eq!(net.servers.count(), 1);
     }
 
-    /// An archive is configured at its IPv4 address, then at its IPv6 one.
-    /// On a node listening on IPv4 only it stays a server holding its IPv4
-    /// address; on one listening on both it keeps that pin too.
+    /// The node pins a configured peer at every address it is listed at.
+    fn pin_listed(
+        servers: &mut ProbeServers,
+        peer: PeerId,
+        addrs: &[Multiaddr],
+    ) -> Vec<ServerChange> {
+        servers.pin(peer, addrs)
+    }
+
+    /// An archive listed at its IPv4 and its IPv6 address, in either order,
+    /// stays a server on a node listening on IPv4 only, on IPv6 only, or on
+    /// both. On one family it holds that family's IP group; on both it
+    /// takes the IP of the connection it opens.
     #[test]
-    fn a_configured_peer_at_both_families_keeps_its_first_pin() {
-        for listen_v6 in [false, true] {
-            let mut net = Net {
-                servers: ProbeServers::new(routable, true, listen_v6),
-                next_conn: 0,
-            };
-            let archive = PeerId::random();
-            let v4: Multiaddr = "/ip4/192.0.2.10/udp/8336/quic-v1".parse().unwrap();
-            let v6: Multiaddr = "/ip6/2001:db8:5::1/udp/8336/quic-v1".parse().unwrap();
-            assert!(net.servers.pin(archive, &v4).is_empty());
-            let changes = net.servers.pin(archive, &v6);
-            eprintln!("REACH v6-bootstrap checked");
-            assert!(
-                changes.is_empty(),
-                "the IPv6 entry changed the archive's server (listen_v6 {listen_v6}): {changes:?}"
-            );
-            assert_eq!(net.servers.count(), 1);
-            assert_eq!(
-                net.servers.ip_of_server(&archive),
-                Some("192.0.2.10".parse().unwrap())
-            );
+    fn an_archive_at_both_families_stays_a_server_on_any_listener() {
+        let v4: Multiaddr = "/ip4/192.0.2.10/udp/8336/quic-v1".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2001:db8:5::1/udp/8336/quic-v1".parse().unwrap();
+        let v4_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6_group: IpAddr = "2001:db8:5::".parse().unwrap();
+        for (listen_v4, listen_v6, held) in [
+            (true, false, Some(v4_ip)),
+            (false, true, Some(v6_group)),
+            (true, true, None),
+        ] {
+            for addrs in [[v4.clone(), v6.clone()], [v6.clone(), v4.clone()]] {
+                let mut net = Net {
+                    servers: ProbeServers::new(routable, listen_v4, listen_v6),
+                    next_conn: 0,
+                };
+                let archive = PeerId::random();
+                let changes = pin_listed(&mut net.servers, archive, &addrs);
+                eprintln!("REACH v6-bootstrap checked");
+                let case = format!("listen v4 {listen_v4} v6 {listen_v6}, listed {addrs:?}");
+                assert!(
+                    !changes.contains(&Remove(archive)),
+                    "an archive listed at both families lost its server ({case}): {changes:?}"
+                );
+                assert_eq!(net.servers.count(), 1, "{case}");
+                assert_eq!(net.servers.ip_of_server(&archive), held, "{case}");
+                if held.is_none() {
+                    net.connect(archive, "2001:db8:5::1");
+                    assert_eq!(net.servers.ip_of_server(&archive), Some(v6_group), "{case}");
+                }
+            }
         }
     }
 
