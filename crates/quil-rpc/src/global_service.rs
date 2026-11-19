@@ -3162,17 +3162,25 @@ mod forest_read_tests {
     }
 
     /// A syncing peer that resets its stream while its forest read waits for
-    /// a slot gives its queue place back; a place once stayed counted, and 64
-    /// of them refused every later read at once.
+    /// a slot gives its queue place back. A place once stayed counted; once
+    /// 64 were, a read that found every slot busy was refused at once
+    /// instead of waiting.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_waiting_forest_read_gives_its_queue_place_back() {
         use std::sync::atomic::Ordering;
         static NO_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
         let wait = std::time::Duration::from_secs(60);
         let until_counted = |want: usize| async move {
-            while FOREST_READ_WAITERS.load(Ordering::Relaxed) != want {
+            for _ in 0..1_000_000 {
+                if FOREST_READ_WAITERS.load(Ordering::Relaxed) == want {
+                    return;
+                }
                 tokio::task::yield_now().await;
             }
+            panic!(
+                "the queue never counted {want} (counts {})",
+                FOREST_READ_WAITERS.load(Ordering::Relaxed)
+            );
         };
         let waiting: Vec<_> = (0..MAX_FOREST_READ_WAITERS)
             .map(|_| tokio::spawn(bounded_forest_read(&NO_SLOT, wait, None, || ())))

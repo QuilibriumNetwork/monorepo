@@ -3,13 +3,15 @@
 //! A request handler that waits for a worker slot is a future the server
 //! drops when its caller resets the stream or the connection ends. A count
 //! raised before such a wait and lowered after it would then never be
-//! lowered, and once the leaked count reached its bound every later request
-//! was refused at once. The place lowers the count on drop instead.
+//! lowered. Once the leaked count reached its bound, a read that found
+//! every slot busy was refused at once instead of waiting. The place
+//! lowers the count on drop instead.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) struct QueuePlace<'a> {
     waiting: &'a AtomicUsize,
+    queued: usize,
     /// Counts the place as abandoned on drop, unless it left the queue.
     abandoned: Option<&'a AtomicU64>,
 }
@@ -17,15 +19,21 @@ pub(crate) struct QueuePlace<'a> {
 impl<'a> QueuePlace<'a> {
     /// A place in the queue `waiting` counts, unless `max` are taken.
     pub(crate) fn take(waiting: &'a AtomicUsize, max: usize) -> Option<Self> {
-        waiting
+        let before = waiting
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()?;
         Some(Self {
             waiting,
+            queued: before + 1,
             abandoned: None,
         })
+    }
+
+    /// The queue's count as this place joined it, this place included.
+    pub(crate) fn queued(&self) -> usize {
+        self.queued
     }
 
     /// Count into `abandoned` a place dropped before it leaves the queue
@@ -62,6 +70,7 @@ mod tests {
         let second = QueuePlace::take(&waiting, 2)
             .unwrap()
             .abandoned_into(&abandoned);
+        assert_eq!((first.queued(), second.queued()), (1, 2));
         assert!(QueuePlace::take(&waiting, 2).is_none(), "the bound holds");
         assert_eq!(waiting.load(Ordering::Relaxed), 2);
         first.leave();

@@ -164,7 +164,7 @@ async fn coin_read_permit(
     let place = place.abandoned_into(&COIN_READS.abandoned);
     COIN_READS
         .peak_waiting
-        .fetch_max(COIN_READ_WAITERS.load(Ordering::Relaxed), Ordering::Relaxed);
+        .fetch_max(place.queued(), Ordering::Relaxed);
     let acquired = tokio::time::timeout(COIN_READ_WAIT, workers.acquire()).await;
     place.leave();
     match acquired {
@@ -185,7 +185,8 @@ async fn coin_read_permit(
 /// served to wallets since the last call, and its slots and queue now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CoinReadInterval {
-    /// Slots held now, of 8 scan, 2 witness and 1 mint status.
+    /// Slots held now, of `COIN_SCAN_SLOTS` scan, `COIN_WITNESS_SLOTS`
+    /// witness and 1 mint status.
     pub scan_held: usize,
     pub witness_held: usize,
     pub mint_status_held: usize,
@@ -277,22 +278,32 @@ impl CoinReadInterval {
 pub const COIN_READ_SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Log the coin reads since the last summary, once `COIN_READ_SUMMARY_EVERY`
-/// has passed; the first call only starts the interval. Call it from a
-/// periodic tick.
+/// has passed; the first call only starts the interval, so the first summary
+/// also counts reads served before it. Call it from a periodic tick.
 pub fn log_coin_reads() {
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = std::time::Instant::now();
+    if let Some(elapsed) = coin_read_summary_due(&mut last, std::time::Instant::now()) {
+        CoinReadInterval::take().log(elapsed.as_secs());
+    }
+}
+
+/// The time since the summary before when one is due at `now`, which then
+/// starts the next interval; the first call only starts one.
+fn coin_read_summary_due(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
     let Some(since) = *last else {
         *last = Some(now);
-        return;
+        return None;
     };
-    let elapsed = now.duration_since(since);
+    let elapsed = now.saturating_duration_since(since);
     if elapsed < COIN_READ_SUMMARY_EVERY {
-        return;
+        return None;
     }
     *last = Some(now);
-    CoinReadInterval::take().log(elapsed.as_secs());
+    Some(elapsed)
 }
 
 /// One page of a wallet scan as a provider answers it.
@@ -2274,14 +2285,56 @@ mod coin_read_queue_tests {
 
     /// Yields until `count` reads `want`; the paused clock never moves.
     async fn until_counted(count: &AtomicUsize, want: usize) {
-        while count.load(Ordering::Relaxed) != want {
+        for _ in 0..1_000_000 {
+            if count.load(Ordering::Relaxed) == want {
+                return;
+            }
             tokio::task::yield_now().await;
         }
+        panic!(
+            "the queue never counted {want} (counts {})",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
+    /// The first call starts the interval; a summary is due once 300 s have
+    /// passed since, and that summary starts the next interval.
+    #[test]
+    fn a_coin_read_summary_is_due_once_its_interval_has_passed() {
+        let secs = std::time::Duration::from_secs;
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert_eq!(
+            coin_read_summary_due(&mut last, start),
+            None,
+            "the first call only starts the interval"
+        );
+        println!("REACH coin-read-queue summary gate");
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(299)),
+            None,
+            "no summary before 300 s"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(300)),
+            Some(secs(300)),
+            "a summary is due at 300 s"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(599)),
+            None,
+            "the summary starts the next interval"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(600)),
+            Some(secs(300))
+        );
     }
 
     /// A wallet that resets its stream while its coin read waits for a slot
     /// gives its queue place back. A place once stayed counted for the life
-    /// of the process, and 128 of them refused every later read at once.
+    /// of the process; once 128 were, a read that found every slot busy was
+    /// refused at once instead of waiting.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_waiting_coin_read_gives_its_queue_place_back() {
         static NO_SLOT: Semaphore = Semaphore::const_new(0);
