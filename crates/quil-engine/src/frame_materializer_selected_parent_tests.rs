@@ -481,6 +481,73 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
     assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
 }
 
+/// A storage epoch proof a private proposal refuses leaves the public
+/// mempool with its sender's seat, so the sender's next proof of the seat
+/// is held. Refused from the proposal's copy alone, the refused proof held
+/// the seat to its window's end and every later proof of it was refused.
+#[test]
+fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
+    use crate::message_collector::{Provenance, Refusal, SubmitOutcome};
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let rig = Rig::new();
+    rig.collector.set_class_shares();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    // One seat's settlement, `tag` telling the proofs apart.
+    let proof = |tag: u8| {
+        let proof = StorageEpochProof {
+            member: [7; 32],
+            seats: vec![SeatProof {
+                shard_filter: vec![9; 32],
+                epoch: 1500,
+                seals: false,
+                settles: true,
+                ..Default::default()
+            }],
+            proof: vec![tag; 1_000],
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: proof.to_canonical_bytes(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    };
+    let send = |raw: Vec<u8>| {
+        rig.collector
+            .add_message_outcome_by(1, raw, Provenance::Prover, b"sender")
+    };
+    let refused = proof(1);
+    assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
+    assert_eq!(
+        send(proof(2)),
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "the sender's seat is held before the proposal"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    let state = lease.prove(&[]).unwrap();
+    assert!(state.state.messages.is_empty());
+    assert!(
+        rig.leader.refused_message(&refused).is_some(),
+        "the proposal validated and refused the proof"
+    );
+    assert_eq!(
+        send(proof(3)),
+        SubmitOutcome::Accepted,
+        "SEAT-FREED: a proof the proposal refused still holds its sender's seat"
+    );
+}
+
 #[test]
 fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
     let rig = Rig::new();
