@@ -1908,7 +1908,9 @@ fn archive_grid_list() -> Result<(String, HashMap<Vec<u8>, (u64, u64)>), String>
         Ok(endpoint) if !endpoint.is_empty() => vec![endpoint],
         _ => quil_engine::genesis::genesis_archive_static_ips()
             .into_iter()
-            .map(|(_, ip)| format!("{ip}:8340"))
+            .filter_map(|(_, ip)| {
+                Some(std::net::SocketAddr::new(ip.parse().ok()?, 8340).to_string())
+            })
             .collect(),
     };
     let quil = quil_execution::domains::QUIL_TOKEN;

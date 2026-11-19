@@ -102,7 +102,12 @@ impl ProbeServers {
     /// The configured peer `peer` at `addr` is a server; the caller adds it
     /// to AutoNAT with its address. It takes its IP from another server.
     /// One on an address family this node does not listen on is removed.
+    /// A peer configured at several addresses (an archive's IPv4 and IPv6
+    /// entries) keeps the pin of its first listened one.
     pub(crate) fn pin(&mut self, peer: PeerId, addr: &Multiaddr) -> Vec<ServerChange> {
+        if self.pinned.contains_key(&peer) {
+            return Vec::new();
+        }
         if let Some(ip) = self.servers.remove(&peer) {
             self.by_ip.remove(&ip);
         }
@@ -496,6 +501,34 @@ mod tests {
         let addr: Multiaddr = "/ip6/2001:db8:5::1/tcp/8336".parse().unwrap();
         assert_eq!(net.servers.pin(archive, &addr), vec![Remove(archive)]);
         assert_eq!(net.servers.count(), 1);
+    }
+
+    /// An archive is configured at its IPv4 address, then at its IPv6 one.
+    /// On a node listening on IPv4 only it stays a server holding its IPv4
+    /// address; on one listening on both it keeps that pin too.
+    #[test]
+    fn a_configured_peer_at_both_families_keeps_its_first_pin() {
+        for listen_v6 in [false, true] {
+            let mut net = Net {
+                servers: ProbeServers::new(routable, true, listen_v6),
+                next_conn: 0,
+            };
+            let archive = PeerId::random();
+            let v4: Multiaddr = "/ip4/192.0.2.10/udp/8336/quic-v1".parse().unwrap();
+            let v6: Multiaddr = "/ip6/2001:db8:5::1/udp/8336/quic-v1".parse().unwrap();
+            assert!(net.servers.pin(archive, &v4).is_empty());
+            let changes = net.servers.pin(archive, &v6);
+            eprintln!("REACH v6-bootstrap checked");
+            assert!(
+                changes.is_empty(),
+                "the IPv6 entry changed the archive's server (listen_v6 {listen_v6}): {changes:?}"
+            );
+            assert_eq!(net.servers.count(), 1);
+            assert_eq!(
+                net.servers.ip_of_server(&archive),
+                Some("192.0.2.10".parse().unwrap())
+            );
+        }
     }
 
     /// Probes go only to registered servers, at AutoNAT's own rate.

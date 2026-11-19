@@ -773,7 +773,7 @@ mod tests {
         let syncer = worker_tree_syncer(String::new(), hg_store, Vec::new(), crdt, 0);
         assert!(syncer.discover_archives_from_master && syncer.archive_pool.is_some());
         for (peer_id, ip) in statics {
-            let endpoint = format!("{ip}:8340");
+            let endpoint = crate::util::multiaddr::genesis_archive_endpoint(&ip).unwrap();
             assert_eq!(
                 quil_rpc::archive_client::pinned_archive_peer(&endpoint),
                 Some(peer_id.parse::<quil_p2p::PeerId>().unwrap()),
