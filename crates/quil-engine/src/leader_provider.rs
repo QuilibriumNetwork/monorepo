@@ -717,24 +717,26 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
 
 /// Remove `invalid`, the messages a leader's validation dropped, from its
 /// `collector`. A branch leader's collector is its proposal's copy of the
-/// public `mempool`: of what it drops, only proofs of seat parts a
-/// finalized frame applied leave the mempool ([`MessageCollector::learn_committed`]).
-/// `applied_of` reads those parts from the state validation ran on, so they
-/// re-teach a mempool that restarted and never saw those frames applied.
-/// Returns how many messages left the mempool: all of `invalid` for a
-/// leader over the mempool itself (`mempool` `None`).
+/// public `mempool`, with the frame its branch was executed over: of what
+/// it drops, only proofs of seat parts a frame at or below both that frame
+/// and the finalized one applied leave the mempool
+/// ([`MessageCollector::learn_committed`]). `applied_of` reads those parts
+/// from the state validation ran on, so they re-teach a mempool that
+/// restarted and never saw those frames applied. Returns how many messages
+/// left the mempool: all of `invalid` for a leader over the mempool itself
+/// (`mempool` `None`).
 pub(crate) fn release_applied(
     collector: &MessageCollector,
-    mempool: Option<&MessageCollector>,
+    mempool: Option<(&MessageCollector, u64)>,
     invalid: &[Vec<u8>],
     applied_of: impl Fn(&[u8]) -> Vec<quil_types::execution::SeatPartChange>,
 ) -> usize {
     let applied: Vec<quil_types::execution::SeatPartChange> =
         invalid.iter().flat_map(|raw| applied_of(raw)).collect();
     let left = match mempool {
-        Some(mempool) => mempool.learn_committed(&applied),
+        Some((mempool, base)) => mempool.learn_committed(&applied, base),
         None => {
-            collector.learn_committed(&applied);
+            collector.learn_committed(&applied, u64::MAX);
             invalid.len()
         }
     };
@@ -745,6 +747,9 @@ pub(crate) fn release_applied(
 /// What a proposal's executed ancestors did
 /// ([`GlobalLeaderProvider::for_execution_branch`]).
 pub(crate) struct ExecutedAncestors<'a> {
+    /// The frame they were executed over, the branch's executed base:
+    /// they may yet be abandoned, it may not.
+    pub base: u64,
     /// The bundles they consumed.
     pub consumed: &'a [Vec<u8>],
     /// The storage seat parts they applied.
@@ -815,11 +820,12 @@ pub struct GlobalLeaderProvider {
     /// the proposal line.
     pool: Option<crate::proposal_pool::ProposalPool>,
     /// The public mempool an execution-branch leader's `message_collector`
-    /// copied ([`Self::for_execution_branch`]): what its validation drops
-    /// leaves only the copy, except a proof a finalized frame applied
+    /// copied ([`Self::for_execution_branch`]), with its branch's executed
+    /// base: what its validation drops leaves only the copy, except a proof
+    /// a frame at or below that base and finalized applied
     /// ([`MessageCollector::learn_committed`]). `None` for a leader over the
     /// mempool itself.
-    mempool: Option<Arc<MessageCollector>>,
+    mempool: Option<(Arc<MessageCollector>, u64)>,
 }
 
 impl GlobalLeaderProvider {
@@ -853,6 +859,16 @@ impl GlobalLeaderProvider {
     #[cfg(test)]
     pub(crate) fn refusals_reused(&self) -> usize {
         self.rejected.lock().unwrap().reused
+    }
+
+    /// The messages this leader proposes from: an execution-branch
+    /// leader's copy of the mempool, with its branch's executed base.
+    #[cfg(test)]
+    pub(crate) fn proposal_messages(&self) -> (&MessageCollector, Option<u64>) {
+        (
+            &self.message_collector,
+            self.mempool.as_ref().map(|(_, base)| *base),
+        )
     }
 
     /// A leader over a private execution branch proposing `frame_number` at
@@ -894,7 +910,7 @@ impl GlobalLeaderProvider {
         leader.body_fetch = self.body_fetch.clone();
         leader.proof_settlement = self.proof_settlement.clone();
         leader.pool = self.message_collector.take_proposal_pool();
-        leader.mempool = Some(self.message_collector.clone());
+        leader.mempool = Some((self.message_collector.clone(), ancestors.base));
         Ok(leader)
     }
 
@@ -2016,7 +2032,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         .join(" | ");
                     let left_mempool = release_applied(
                         &self.message_collector,
-                        self.mempool.as_deref(),
+                        self.mempool
+                            .as_ref()
+                            .map(|(mempool, base)| (mempool.as_ref(), *base)),
                         &invalid,
                         |raw| validator.applied_seat_parts(raw),
                     );

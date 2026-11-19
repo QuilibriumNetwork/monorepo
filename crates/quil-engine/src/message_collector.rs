@@ -598,6 +598,9 @@ struct AppliedParts {
     overrun_warned: Option<u64>,
     /// Parts not remembered since that warning, for its summary.
     overrun_quiet: u64,
+    /// Passes over the parts for those whose window ended ([`Self::prune`]).
+    #[cfg(test)]
+    prunes: u64,
 }
 
 impl AppliedParts {
@@ -608,15 +611,21 @@ impl AppliedParts {
             unremembered: 0,
             overrun_warned: None,
             overrun_quiet: 0,
+            #[cfg(test)]
+            prunes: 0,
         }
     }
 
     /// Learn `changes`, in the order execution applied them; of two for a
     /// part, the later frame's stands. Returns the parts of `changes` that
     /// stand applied after them. `finalized` is the last frame seen
-    /// finalized: parts whose window ended by it make room.
+    /// finalized: parts whose window ended by it make room, looked for at
+    /// most once a call. Once a part past the bound pruned each (until
+    /// 2026-11-19), a frame's parts at the bound scanned every part each,
+    /// holding the submits' lock.
     fn learn(&mut self, changes: &[SeatPartChange], finalized: u64) -> HashSet<[u8; 32]> {
         let mut standing = HashSet::new();
+        let mut pruned = false;
         for change in changes {
             let applied = change.kind != SeatPartKind::Registered;
             for (key, end) in changed_parts(change) {
@@ -633,7 +642,10 @@ impl AppliedParts {
                     standing.remove(&key);
                 }
                 if !self.parts.contains_key(&key) && self.parts.len() >= self.max {
-                    self.prune(finalized);
+                    if !pruned {
+                        self.prune(finalized);
+                        pruned = true;
+                    }
                     if self.parts.len() >= self.max {
                         self.unremembered += 1;
                         if self.overrun_warned.is_some() {
@@ -703,6 +715,10 @@ impl AppliedParts {
     /// Forget the parts whose window ended by `frame`: a proof of one leaves
     /// anyway ([`MessageCollector::prune_after_finalization`]).
     fn prune(&mut self, frame: u64) {
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
         self.parts.retain(|_, known| known.end > frame);
     }
 }
@@ -5166,17 +5182,20 @@ impl MessageCollector {
     /// (`ExecutionEngineManager::applied_seat_parts` of proofs a leader's
     /// validation refused), as [`Self::mark_applied`] does: how a collector
     /// that restarted, and never saw those frames, learns them. Only parts
-    /// a frame at or below the finalized one applied: the state a branch
-    /// leader reads includes frames that may be abandoned. A part a later
+    /// a frame at or below both `base` and the finalized frame applied:
+    /// the state a branch leader reads holds the frames it executed above
+    /// `base`, its executed base, and one of those may be abandoned though
+    /// a frame of its number finalized while it validated (`u64::MAX` for
+    /// a leader over the mempool, whose state holds none). A part a later
     /// registration restarted stays forgotten. Returns how many messages
     /// left.
-    pub fn learn_committed(&self, parts: &[SeatPartChange]) -> usize {
+    pub fn learn_committed(&self, parts: &[SeatPartChange], base: u64) -> usize {
         let finalized = self
             .finalized_frame
             .load(std::sync::atomic::Ordering::Acquire);
         let parts: Vec<SeatPartChange> = parts
             .iter()
-            .filter(|part| finalized > 0 && part.frame <= finalized)
+            .filter(|part| finalized > 0 && part.frame <= finalized.min(base))
             .cloned()
             .collect();
         self.learn_applied(&parts)
@@ -5229,6 +5248,12 @@ impl MessageCollector {
     #[cfg(test)]
     fn set_applied_max(&self, max: usize) {
         self.applied.lock().unwrap().max = max;
+    }
+
+    /// Passes over the applied parts for those whose window ended.
+    #[cfg(test)]
+    fn applied_prunes(&self) -> u64 {
+        self.applied.lock().unwrap().prunes
     }
 
     /// Take back `data`, a message a finalized frame consumed that has to run
@@ -7421,7 +7446,7 @@ mod tests {
                 applied(7, 9, SeatPartKind::Sealed, 1502, 8_990),
                 applied(7, 11, SeatPartKind::Sealed, 1502, 9_001),
                 applied(7, 12, SeatPartKind::Sealed, 1502, 8_990),
-            ]),
+            ], u64::MAX),
             1,
             "APPLIED-UNFINAL: a part applied above the finalized frame, or one a registration restarted, took its proof"
         );
@@ -7707,7 +7732,7 @@ mod tests {
             .unwrap();
         assert_eq!(copy.pending_count(1), 2, "premise: the copy holds both");
         assert_eq!(
-            release_applied(&copy, Some(&public), &invalid, applied_of),
+            release_applied(&copy, Some((&public, 9_000)), &invalid, applied_of),
             1,
             "RELEASE-BRANCH: a branch leader's drop of an applied proof did not leave the mempool"
         );
@@ -7718,6 +7743,73 @@ mod tests {
         assert_eq!(release_applied(&public, None, &invalid, applied_of), 2);
         assert_eq!(public.pending_count(1), 0);
         assert!(refused(&public));
+    }
+
+    /// A branch executed over frame 9,000 whose ancestor 9,001 applied a
+    /// seal: while its leader validates, another frame 9,001 finalizes.
+    /// The seal its state shows is the abandoned ancestor's, so its proof
+    /// stays in the mempool and a copy of it is still taken; one its
+    /// executed base applied leaves.
+    #[test]
+    fn a_part_only_an_abandoned_ancestor_applied_is_not_learned() {
+        use crate::leader_provider::release_applied;
+        let public = global_collector();
+        public.note_finalized_frame(9_000);
+        let proof = seals_proof(7, &[9], 1);
+        assert_eq!(
+            public.add_message_outcome_by(1, proof.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let copy = public
+            .proposal_copy(1, 64 << 20, 10_000, 9_002, &[], &[])
+            .unwrap();
+        public.note_finalized_frame(9_001);
+        let ancestors = |_: &[u8]| vec![applied(7, 9, SeatPartKind::Sealed, 1502, 9_001)];
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), std::slice::from_ref(&proof), ancestors),
+            0,
+            "ABANDONED-PART: a part only an abandoned ancestor applied took the proof from the mempool"
+        );
+        assert_eq!(public.pending_count(1), 1);
+        assert_eq!(
+            public.add_message_outcome_by(1, seals_proof(7, &[9], 2), Provenance::Prover, b"b"),
+            SubmitOutcome::Accepted,
+            "ABANDONED-PART-INGEST: a copy of a part only an abandoned ancestor applied was refused"
+        );
+        let base = |_: &[u8]| vec![applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)];
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), &[proof], base),
+            2,
+            "a part the executed base applied takes both"
+        );
+    }
+
+    /// At the bound, the parts a frame applied look for room once: a part
+    /// that finds none is not remembered, and the next looks no more.
+    #[test]
+    fn parts_at_the_bound_look_for_room_once_a_frame() {
+        let mc = global_collector();
+        mc.set_applied_max(2);
+        mc.note_finalized_frame(9_000);
+        mc.mark_applied(&[
+            applied(7, 1, SeatPartKind::Sealed, 1502, 9_000),
+            applied(7, 2, SeatPartKind::Sealed, 1502, 9_000),
+        ]);
+        let before = mc.applied_prunes();
+        let parts: Vec<SeatPartChange> = (3..=8)
+            .map(|shard| applied(7, shard, SeatPartKind::Sealed, 1502, 9_000))
+            .collect();
+        mc.mark_applied(&parts);
+        assert_eq!(
+            mc.applied_counts(),
+            (2, 6),
+            "premise: each found the bound full"
+        );
+        assert_eq!(
+            mc.applied_prunes() - before,
+            1,
+            "PRUNE-ONCE: parts past the bound scanned the parts each"
+        );
     }
 
     /// Parts past the bound warn once; the rest are summarized in one line

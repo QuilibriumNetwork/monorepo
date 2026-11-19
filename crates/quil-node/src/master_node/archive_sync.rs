@@ -8228,3 +8228,48 @@ mod global_activation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod publish_tests {
+    /// The three arms that publish a finalized GLOBAL frame, each with what
+    /// a test says when it drops the parts: the atomic step, the canonical
+    /// attempt and the in-place materialization.
+    const ARMS: [(&str, &str); 3] = [
+        (
+            "FinalizationStep::Published { frame, result } => {",
+            "ARCHIVE-PUBLISH-1: the atomic step published without its seat parts",
+        ),
+        (
+            "Some(CanonicalAttempt::Published(result)) => {",
+            "ARCHIVE-PUBLISH-2: the canonical attempt published without its seat parts",
+        ),
+        (
+            "match m.materialize(&frame) {",
+            "ARCHIVE-PUBLISH-3: the in-place execution published without its seat parts",
+        ),
+    ];
+
+    /// Each arm that publishes a GLOBAL frame tells the mempool the seat
+    /// parts the frame applied, so their proofs leave it on every path;
+    /// the arms are driven only by the live sync loop, so this reads them.
+    #[test]
+    fn every_publishing_arm_releases_the_seat_parts_it_applied() {
+        let source = include_str!("archive_sync.rs");
+        let code = &source[..source.find("\nmod fh_r1_tests;").unwrap()];
+        assert_eq!(
+            code.matches("mc.learn_published(").count(),
+            ARMS.len(),
+            "ARCHIVE-PUBLISH: a publishing arm was added or removed"
+        );
+        for (arm, dropped) in ARMS {
+            let start = code.find(arm).unwrap();
+            let end = start + code[start..].find("cf.rank_epoch()").unwrap();
+            let region = &code[start..end];
+            assert!(
+                region.contains("mc.learn_published(")
+                    && region.contains("seat_parts: &result.seat_parts,"),
+                "{dropped}"
+            );
+        }
+    }
+}
