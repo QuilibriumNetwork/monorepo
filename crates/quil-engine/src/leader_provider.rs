@@ -88,10 +88,10 @@ type ValidationContext = (u64, Vec<u8>, u64);
 
 /// Messages validation refused under one [`ValidationContext`], shared by a
 /// node's leader and every execution-branch leader it makes. A proposal
-/// validates a private copy of the mempool and leaves the public pool as it
-/// is, so each proposal at one height validated the same refused messages
-/// again: after the split at 837360, 36 of them took most of every
-/// proposal's validation time.
+/// validates a private copy of the mempool and drops what it refuses from
+/// the public pool too, but a refused message sent again is copied again:
+/// after the split at 837360, 36 of them took most of every proposal's
+/// validation time at one height.
 #[derive(Default)]
 struct RejectedMessages {
     context: Option<ValidationContext>,

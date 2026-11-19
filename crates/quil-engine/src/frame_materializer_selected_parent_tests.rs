@@ -590,10 +590,138 @@ fn a_malformed_input_a_proposal_discards_leaves_the_public_pool() {
     );
 }
 
-/// A replayed copy of a refused seat proof (its sender's own signed gossip
-/// copy, sent again once the gossip seen cache forgets it) holds the seat
-/// again only until the next proposal, which drops it on the refusal it
-/// remembers without validating it again.
+/// A rig whose GLOBAL state settled a committee-handoff seal: its source
+/// was fenced after its closing timeout. Returns the rig and a bundle
+/// carrying a copy of that seal.
+fn settled_seal_rig() -> (Rig, Vec<u8>) {
+    use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
+    use quil_execution::global_intrinsic::handoff::{
+        self, CertificateSubmission, DesiredCommittee, SealSubmission, TYPE_COMMITTEE_HANDOFF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let mut members: Vec<_> = (0..2)
+        .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec())
+        .collect();
+    members.sort();
+    let filter = vec![0x61; 32];
+    let session = Session {
+        chain_id: [7; 32],
+        filter: filter.clone(),
+        generation: 1,
+        genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+        base_frame: 0,
+        authorization: [0; 32],
+        members: members.clone(),
+    };
+    let mut seal = None;
+    let signer = Arc::new(quil_crypto::FalconSigner::generate());
+    let fixture = Fixture::seeded(Some(signer.public_key()), |crdt| {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+        let commit = || {
+            state.commit().unwrap();
+            state.abort();
+            crdt.commit(0).unwrap();
+        };
+        handoff::initialize(&state, 1, &session).unwrap();
+        commit();
+        let request = handoff::schedule(
+            &state,
+            2,
+            vec![filter.clone()],
+            vec![DesiredCommittee {
+                filter: filter.clone(),
+                members,
+            }],
+        )
+        .unwrap();
+        commit();
+        let due = handoff::schedule::fence_due_frame(request.frame);
+        assert_eq!(
+            handoff::schedule::fence_stalled_sources(
+                &state,
+                due,
+                std::slice::from_ref(&filter),
+                None,
+            )
+            .unwrap(),
+            1,
+            "the closing source is fenced"
+        );
+        commit();
+        seal = Some(Seal {
+            request: request.id().unwrap(),
+            session: session.id().unwrap(),
+            view: 1,
+            checkpoint: Checkpoint {
+                frame: 0,
+                view: 0,
+                digest: [0; 32],
+                state_roots: [[0; 32]; 4],
+                history_root: [0; 32],
+            },
+        });
+    });
+    let submission = CertificateSubmission {
+        seal: seal.unwrap(),
+        certificate: vec![1; 40],
+    };
+    let raw = CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_COMMITTEE_HANDOFF,
+            inner_bytes: SealSubmission {
+                submission,
+                drain: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    (Rig::over(signer, fixture), raw)
+}
+
+/// A copy of a committee-handoff seal GLOBAL already settled, which a
+/// private proposal drops, leaves the public mempool too: dropped from the
+/// proposal's copy alone, every later proposal copied and dropped it again.
+#[test]
+fn a_settled_seal_copy_a_proposal_drops_leaves_the_public_pool() {
+    let (rig, raw) = settled_seal_rig();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let view =
+        quil_execution::global_intrinsic::handoff::CommittedView::capture(&rig.source.hypergraph)
+            .unwrap();
+    let copies = crate::leader_provider::order_handoff_copies(vec![raw.clone()], Some(&view));
+    assert_eq!(
+        copies.settled,
+        vec![raw.clone()],
+        "GLOBAL's committed view shows the seal settled: the test proves nothing"
+    );
+    assert!(
+        rig.collector.add_message(1, raw),
+        "the mempool holds the settled seal's copy"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "SETTLED-KEPT: a settled seal copy the proposal dropped stayed public"
+    );
+}
+
+/// A refused seat proof delivered again under its sender's identity (a
+/// resend by its sender, or its signed gossip copy relayed intact once the
+/// receiver's duplicate cache forgets it) holds the seat again only until
+/// the next proposal. On the same parent, as here, that proposal drops it
+/// on the refusal it remembers without validating it again; on another it
+/// validates it again and drops it as refused.
 #[test]
 fn a_replayed_refused_seat_proof_holds_its_seat_until_the_next_proposal() {
     use crate::message_collector::{Refusal, SubmitOutcome};

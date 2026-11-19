@@ -566,3 +566,34 @@ fn a_refusal_after_a_quiet_interval_begins_an_episode() {
         "quiet_episode_start: {refusing:?}"
     );
 }
+
+/// The refused keys a share-full line reads are bounded: past
+/// [`REFUSED_KEYS_KEPT`] the oldest is forgotten first, a key noted again
+/// takes no second place, and the set and its order name the same keys.
+#[test]
+fn refused_keys_forget_the_oldest_past_their_bound() {
+    let key = |i: usize| -> [u8; 32] {
+        let mut key = [0; 32];
+        key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        key
+    };
+    let mut refused = RefusedKeys::default();
+    for i in 0..REFUSED_KEYS_KEPT {
+        refused.note(key(i));
+    }
+    refused.note(key(0));
+    assert_eq!(refused.order.len(), REFUSED_KEYS_KEPT, "a key noted again");
+    refused.note(key(REFUSED_KEYS_KEPT));
+    assert_eq!(
+        (refused.keys.len(), refused.order.len()),
+        (REFUSED_KEYS_KEPT, REFUSED_KEYS_KEPT),
+        "REFUSED-BOUND: the refused keys outgrew their bound"
+    );
+    assert!(!refused.keys.contains(&key(0)), "the oldest is forgotten");
+    assert!(refused.keys.contains(&key(1)) && refused.keys.contains(&key(REFUSED_KEYS_KEPT)));
+    assert_eq!(refused.order.front(), Some(&key(1)));
+    assert!(
+        refused.order.iter().all(|key| refused.keys.contains(key)),
+        "the set and its order name the same keys"
+    );
+}
