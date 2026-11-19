@@ -120,6 +120,9 @@ pub(crate) type StateEntry = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 enum ExecutionChange {
     State(StateChange),
     Record(quil_types::store::RecordMutation),
+    /// A storage seat part the message applied: no write, a report that
+    /// a savepoint rollback drops with the writes it describes.
+    SeatPart(quil_types::execution::SeatPartChange),
 }
 
 /// Message changeset with savepoints for state and ancillary records. `commit`
@@ -462,6 +465,7 @@ impl HypergraphState {
                     mutations.push(quil_hypergraph::Mutation::Record(record));
                     continue;
                 }
+                ExecutionChange::SeatPart(_) => continue,
             };
             let loc = location_from_domain_address(&change.domain, &change.address)?;
 
@@ -535,6 +539,28 @@ impl HypergraphState {
             }
         }
         self.crdt.read_execution_record(key)
+    }
+
+    /// Report a storage seat part the current message applied. It leaves
+    /// with a rollback past it, so only parts of steps that stand remain.
+    pub(crate) fn note_seat_part(&self, part: quil_types::execution::SeatPartChange) {
+        self.changeset
+            .lock()
+            .unwrap()
+            .push(ExecutionChange::SeatPart(part));
+    }
+
+    /// The storage seat parts noted after `savepoint`, in order.
+    pub fn seat_parts_since(&self, savepoint: usize) -> Vec<quil_types::execution::SeatPartChange> {
+        let changeset = self.changeset.lock().unwrap();
+        changeset
+            .iter()
+            .skip(savepoint)
+            .filter_map(|change| match change {
+                ExecutionChange::SeatPart(part) => Some(part.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Abort — discard all pending changes.
@@ -941,6 +967,31 @@ mod tests {
         assert_eq!(
             vertex_adds_discriminator().unwrap(),
             vertex_adds_discriminator().unwrap()
+        );
+    }
+
+    /// A seat part noted after a savepoint leaves with a rollback to it,
+    /// as the writes it describes do; one noted before stays.
+    #[test]
+    fn a_rolled_back_seat_part_is_not_reported() {
+        use quil_types::execution::{SeatPartChange, SeatPartKind};
+        let s = stub_state();
+        let part = |shard: u8| SeatPartChange {
+            member: [7; 32],
+            shard: vec![shard; 32],
+            kind: SeatPartKind::Sealed,
+            epoch: 1502,
+            frame: 9_000,
+        };
+        s.note_seat_part(part(1));
+        let savepoint = s.changeset_len();
+        s.note_seat_part(part(2));
+        assert_eq!(s.seat_parts_since(0), vec![part(1), part(2)], "premise");
+        s.rollback_to(savepoint);
+        assert_eq!(
+            s.seat_parts_since(0),
+            vec![part(1)],
+            "SEAT-PART-ROLLBACK: a seat part noted past a savepoint survived a rollback to it"
         );
     }
 

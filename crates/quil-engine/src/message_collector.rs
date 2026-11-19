@@ -13,6 +13,7 @@ use sha3::{Digest, Sha3_256};
 
 use crate::proposal_pool::Intake;
 use quil_execution::manager::ShieldClaim;
+use quil_types::execution::{SeatPartChange, SeatPartKind};
 
 mod cert_union;
 #[cfg(test)]
@@ -111,6 +112,8 @@ struct CollectedMessage {
     sender: Option<[u8; 32]>,
     /// The seats the storage epoch proofs it carries prove ([`seat_identity`]).
     seat_keys: Vec<[u8; 32]>,
+    /// Each request's seals and settlements ([`StorageKinds::seat_parts`]).
+    seat_parts: Vec<Vec<([u8; 32], u64)>>,
     /// Its storage epoch proofs prove more seats than one proof covers
     /// ([`StorageKinds::too_many_seats`]).
     too_many_seats: bool,
@@ -190,6 +193,7 @@ impl CollectedMessage {
             passed: None,
             sender: None,
             seat_keys: kinds.seat_keys,
+            seat_parts: kinds.seat_parts,
             too_many_seats: kinds.too_many_seats,
         }
     }
@@ -212,6 +216,20 @@ impl CollectedMessage {
     /// [`OTHER_SEAL_BYTES_HELD`].
     fn held_seal(&self) -> bool {
         self.seal && !self.proof && self.capacity.is_none()
+    }
+
+    /// GLOBAL refuses every request it carries: each is a storage epoch
+    /// proof carrying a seat part a frame applied (`applied`), refused
+    /// whole. GLOBAL runs a bundle's requests one by one, so a bundle with
+    /// any other request, a capacity message included, or a proof of no
+    /// applied part, stays. Submits, the drop of applied parts and a
+    /// proposal's copy all judge by this ([`AppliedParts::refuses`]).
+    fn applied_by(&self, applied: impl Fn(&[u8; 32]) -> bool) -> bool {
+        !self.seat_parts.is_empty()
+            && self
+                .seat_parts
+                .iter()
+                .all(|parts| parts.iter().any(|(part, _)| applied(part)))
     }
 
     /// The member whose proofs due at one frame this one may ride ahead of
@@ -303,6 +321,11 @@ struct StorageKinds {
     /// messages prove ([`seat_identity`]), up to one proof's
     /// (`storage_epoch_proof::MAX_SEATS`).
     seat_keys: Vec<[u8; 32]>,
+    /// Each request's seals and settlements ([`seat_part`]), with the end
+    /// of each one's window; empty unless every request is a well-formed
+    /// storage epoch proof that is no capacity message, all within the
+    /// bound of `seat_keys` ([`CollectedMessage::applied_by`]).
+    seat_parts: Vec<Vec<([u8; 32], u64)>>,
     /// They prove more seats than that; the rest are not in `seat_keys`.
     too_many_seats: bool,
 }
@@ -349,6 +372,7 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
         member: None,
         seats: Default::default(),
         seat_keys: Vec::new(),
+        seat_parts: Vec::new(),
         too_many_seats: false,
     };
     let Ok(bundle) =
@@ -357,12 +381,19 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
         return kinds;
     };
     let only = bundle.requests.len() == 1;
-    for request in bundle.requests.iter().flatten() {
-        if request.inner_type_prefix != TYPE_STORAGE_EPOCH_PROOF {
+    // Every request so far is a proof whose seat parts were read.
+    let mut every_proof = !bundle.requests.is_empty();
+    for request in bundle.requests.iter() {
+        let Some(request) = request
+            .as_ref()
+            .filter(|request| request.inner_type_prefix == TYPE_STORAGE_EPOCH_PROOF)
+        else {
+            every_proof = false;
             continue;
-        }
+        };
         kinds.seal = true;
         let Ok(proof) = StorageEpochProof::from_canonical_bytes(&request.inner_bytes) else {
+            every_proof = false;
             continue;
         };
         if let Some(end) = storage_window_end(&proof) {
@@ -373,7 +404,9 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
             .iter()
             .map(|seat| usize::from(seat.seals) + usize::from(seat.settles))
             .sum::<usize>();
-        if !capacity_message(&proof) {
+        let capacity = capacity_message(&proof);
+        every_proof &= !capacity;
+        if !capacity {
             kinds.member = match kinds.member {
                 _ if !kinds.epoch_proof => Some(proof.member),
                 Some(member) if member == proof.member => Some(member),
@@ -389,6 +422,7 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
             // the buffers' lock ([`SenderSeals::of`]).
             kinds.too_many_seats |= kinds.seat_keys.len() + proof.seats.len() > MAX_SEATS as usize;
             if kinds.too_many_seats {
+                every_proof = false;
                 continue;
             }
             kinds.seat_keys.extend(
@@ -396,6 +430,13 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
                     .seats
                     .iter()
                     .map(|seat| seat_identity(&proof.member, seat)),
+            );
+            kinds.seat_parts.push(
+                proof
+                    .seats
+                    .iter()
+                    .flat_map(|seat| seat_parts(&proof.member, seat))
+                    .collect(),
             );
         } else if kinds.capacity.is_none() {
             kinds.capacity = Some(CapacityParts {
@@ -408,6 +449,9 @@ fn storage_kinds_with(data: &[u8], seats: bool) -> StorageKinds {
                 },
             });
         }
+    }
+    if !every_proof {
+        kinds.seat_parts.clear();
     }
     kinds
 }
@@ -449,6 +493,234 @@ fn seat_identity(
     h.update(seat.epoch.to_be_bytes());
     h.update([u8::from(seat.seals), u8::from(seat.settles)]);
     h.finalize().into()
+}
+
+/// One seal or one settlement of a seat: its member, shard, which and the
+/// epoch it seals or settles. GLOBAL applies each once, and refuses every
+/// later proof carrying it ([`MessageCollector::mark_applied`]).
+fn seat_part(member: &[u8; 32], shard: &[u8], seals: bool, epoch: u64) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/collector/seat-part/v1");
+    h.update(member);
+    h.update((shard.len() as u64).to_be_bytes());
+    h.update(shard);
+    h.update([u8::from(seals)]);
+    h.update(epoch.to_be_bytes());
+    h.finalize().into()
+}
+
+/// The seal of `member`'s seat on `shard` for `epoch` ([`seat_part`]), with
+/// the GLOBAL frame its window ends at: the epoch's first.
+fn sealed_part(member: &[u8; 32], shard: &[u8], epoch: u64) -> ([u8; 32], u64) {
+    (
+        seat_part(member, shard, true, epoch),
+        quil_types::consensus::epoch_start_frame(epoch),
+    )
+}
+
+/// The settlement of `member`'s seat on `shard` for `epoch` ([`seat_part`]),
+/// with the GLOBAL frame its window ends at ([`storage_window_end`]).
+fn settled_part(member: &[u8; 32], shard: &[u8], epoch: u64) -> ([u8; 32], u64) {
+    use quil_execution::global_intrinsic::storage_seat::settlement_window;
+    (
+        seat_part(member, shard, false, epoch),
+        settlement_window(epoch).1,
+    )
+}
+
+/// The seat parts `seat` proves ([`seat_part`]), each with the GLOBAL frame
+/// its window ends at.
+fn seat_parts(
+    member: &[u8; 32],
+    seat: &quil_execution::global_intrinsic::storage_epoch_proof::SeatProof,
+) -> Vec<([u8; 32], u64)> {
+    let seals = seat
+        .seals
+        .then(|| sealed_part(member, &seat.shard_filter, seat.seal_epoch()));
+    let settles = seat
+        .settles
+        .then(|| settled_part(member, &seat.shard_filter, seat.epoch));
+    seals.into_iter().chain(settles).collect()
+}
+
+/// The seat parts an applied `change` speaks for, each with the end of its
+/// window: the seal or settlement it applied, or both of the epoch a
+/// registration restarted.
+fn changed_parts(change: &SeatPartChange) -> Vec<([u8; 32], u64)> {
+    let (member, shard, epoch) = (&change.member, change.shard.as_slice(), change.epoch);
+    match change.kind {
+        SeatPartKind::Sealed => vec![sealed_part(member, shard, epoch)],
+        SeatPartKind::Settled => vec![settled_part(member, shard, epoch)],
+        SeatPartKind::Registered => vec![
+            sealed_part(member, shard, epoch),
+            settled_part(member, shard, epoch),
+        ],
+    }
+}
+
+/// Seat parts ([`seat_part`]) at most [`APPLIED_PARTS_MAX`] remembered:
+/// a part a frame applied is refused until its window ends.
+const APPLIED_PARTS_MAX: usize = 1 << 20;
+
+/// A GLOBAL frame this node published ([`MessageCollector::learn_published`]).
+pub struct Published<'a> {
+    /// The bundles it consumed.
+    pub consumed: &'a [Vec<u8>],
+    /// The bundles execution skipped.
+    pub skipped: &'a [Vec<u8>],
+    /// The seat parts execution applied, in order.
+    pub seat_parts: &'a [SeatPartChange],
+    /// Its frame number and rank, once it is the last frame materialized.
+    pub frame: Option<(u64, u64)>,
+}
+
+/// What finalized frames did to one seat part ([`AppliedParts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppliedPart {
+    /// The GLOBAL frame its window ends at: remembered until then.
+    end: u64,
+    /// The frame that applied it, or that registered its epoch again.
+    at: u64,
+    /// Applied, so GLOBAL refuses every proof carrying it; `false` once a
+    /// later registration restarted its epoch (a tombstone).
+    applied: bool,
+}
+
+/// The seat parts finalized frames applied or restarted, each until its
+/// window ends, at most `max`.
+struct AppliedParts {
+    parts: HashMap<[u8; 32], AppliedPart>,
+    max: usize,
+    /// Parts not remembered for the bound: their held proofs still left.
+    unremembered: u64,
+    /// The GLOBAL epoch whose first part not remembered was warned of
+    /// ([`Self::end_overrun`]).
+    overrun_warned: Option<u64>,
+    /// Parts not remembered since that warning, for its summary.
+    overrun_quiet: u64,
+    /// Passes over the parts for those whose window ended ([`Self::prune`]).
+    #[cfg(test)]
+    prunes: u64,
+}
+
+impl AppliedParts {
+    fn new(max: usize) -> Self {
+        Self {
+            parts: HashMap::new(),
+            max,
+            unremembered: 0,
+            overrun_warned: None,
+            overrun_quiet: 0,
+            #[cfg(test)]
+            prunes: 0,
+        }
+    }
+
+    /// Learn `changes`, in the order execution applied them; of two for a
+    /// part, the later frame's stands. Returns the parts of `changes` that
+    /// stand applied after them. `finalized` is the last frame seen
+    /// finalized: parts whose window ended by it make room, looked for at
+    /// most once a call. Once a part past the bound pruned each (until
+    /// 2026-11-19), a frame's parts at the bound scanned every part each,
+    /// holding the submits' lock.
+    fn learn(&mut self, changes: &[SeatPartChange], finalized: u64) -> HashSet<[u8; 32]> {
+        let mut standing = HashSet::new();
+        let mut pruned = false;
+        for change in changes {
+            let applied = change.kind != SeatPartKind::Registered;
+            for (key, end) in changed_parts(change) {
+                if self
+                    .parts
+                    .get(&key)
+                    .is_some_and(|known| known.at > change.frame)
+                {
+                    continue;
+                }
+                if applied {
+                    standing.insert(key);
+                } else {
+                    standing.remove(&key);
+                }
+                if !self.parts.contains_key(&key) && self.parts.len() >= self.max {
+                    if !pruned {
+                        self.prune(finalized);
+                        pruned = true;
+                    }
+                    if self.parts.len() >= self.max {
+                        self.unremembered += 1;
+                        if self.overrun_warned.is_some() {
+                            self.overrun_quiet += 1;
+                        } else {
+                            let epoch =
+                                finalized / quil_types::consensus::epoch_length_frames().max(1);
+                            self.overrun_warned = Some(epoch);
+                            tracing::warn!(
+                                remembered = self.parts.len(),
+                                max = self.max,
+                                finalized,
+                                frame = change.frame,
+                                scope = "this node",
+                                "applied seat part past the bound this collector remembers: later copies of such parts are held, not refused, until their window ends; more are summarized at the next epoch",
+                            );
+                        }
+                        continue;
+                    }
+                }
+                self.parts.insert(
+                    key,
+                    AppliedPart {
+                        end,
+                        at: change.frame,
+                        applied,
+                    },
+                );
+            }
+        }
+        standing
+    }
+
+    /// A frame applied `part`, and no later registration restarted it.
+    fn is_applied(&self, part: &[u8; 32]) -> bool {
+        self.parts.get(part).is_some_and(|known| known.applied)
+    }
+
+    /// GLOBAL refuses `message` whole for the parts remembered
+    /// ([`CollectedMessage::applied_by`]).
+    fn refuses(&self, message: &CollectedMessage) -> bool {
+        message.applied_by(|part| self.is_applied(part))
+    }
+
+    /// With `frame` finalized in a later epoch than the last warning of a
+    /// part not remembered, summarize the parts not remembered since it in
+    /// one line; the next one warns again.
+    fn end_overrun(&mut self, frame: u64) {
+        let epoch = frame / quil_types::consensus::epoch_length_frames().max(1);
+        let Some(warned) = self.overrun_warned.filter(|warned| *warned < epoch) else {
+            return;
+        };
+        if self.overrun_quiet > 0 {
+            tracing::warn!(
+                parts = self.overrun_quiet,
+                unremembered = self.unremembered,
+                max = self.max,
+                epoch = warned,
+                scope = "this node",
+                "more applied seat parts past the bound this collector remembers since its warning",
+            );
+        }
+        self.overrun_warned = None;
+        self.overrun_quiet = 0;
+    }
+
+    /// Forget the parts whose window ended by `frame`: a proof of one leaves
+    /// anyway ([`MessageCollector::prune_after_finalization`]).
+    fn prune(&mut self, frame: u64) {
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
+        self.parts.retain(|_, known| known.end > frame);
+    }
 }
 
 /// The share of held storage epoch proofs a proof from `sender` counts
@@ -1634,6 +1906,9 @@ pub enum Refusal {
     /// share or proving more seats than one proof covers
     /// ([`CollectedMessage::unsendable_seal`]).
     UnsendableSeal,
+    /// A storage epoch proof carrying a seal or settlement a finalized GLOBAL
+    /// frame applied: GLOBAL refuses it whole ([`MessageCollector::mark_applied`]).
+    AppliedSeatPart,
 }
 
 impl Refusal {
@@ -1648,6 +1923,7 @@ impl Refusal {
             Self::InvalidAltShardUpdate => "alt shard update failed verification",
             Self::ShieldClaimed => "another shield of this coin signed by the same key is pending here or awaits its GLOBAL decision",
             Self::UnsendableSeal => "storage epoch proof larger than a GLOBAL proposal's seal share, or proving more seats than one proof covers",
+            Self::AppliedSeatPart => "storage epoch proof seals or settles a seat part a finalized GLOBAL frame already applied, so GLOBAL refuses it whole",
         }
     }
 
@@ -2236,6 +2512,10 @@ pub struct MessageCollector {
     /// ([`Self::next_seal_frame`]). A proposal's frame does not count: one
     /// built on ancestors not yet finalized may be abandoned.
     finalized_frame: std::sync::atomic::AtomicU64,
+    /// Seat parts ([`seat_part`]) finalized frames applied, as execution
+    /// reported them ([`Self::mark_applied`]) or committed state shows them
+    /// ([`Self::learn_committed`]). Taken after the buffers' lock.
+    applied: std::sync::Mutex<AppliedParts>,
     /// Set while shard-frame submits are being rejected, so an admitted
     /// shard frame takes `rejects` only to end the stretch.
     rejects_active: std::sync::atomic::AtomicBool,
@@ -2946,6 +3226,7 @@ impl MessageCollector {
             windows_ended: Default::default(),
             seal_drops: Default::default(),
             finalized_frame: std::sync::atomic::AtomicU64::new(0),
+            applied: std::sync::Mutex::new(AppliedParts::new(APPLIED_PARTS_MAX)),
             rejects_active: std::sync::atomic::AtomicBool::new(false),
             rejects: std::sync::Mutex::new(RejectLog::new()),
             intake: Default::default(),
@@ -3609,6 +3890,13 @@ impl MessageCollector {
         if (message.verified && self.superseded(&keys, signers)) || self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
         }
+        // A proof of a seat part a finalized frame applied is refused for
+        // good: no branch accepts it. Checked under the buffers' lock, which
+        // learning a part takes first ([`Self::mark_applied`]), so a proof
+        // either is refused here or is held when its part is learned.
+        if !message.seat_parts.is_empty() && self.applied.lock().unwrap().refuses(&message) {
+            return SubmitOutcome::Filtered(Refusal::AppliedSeatPart);
+        }
         // Another copy of a storage epoch proof held since the check above,
         // at any rank: a prover's copy promotes another sender's, as there.
         if message.held_seal()
@@ -3899,6 +4187,38 @@ impl MessageCollector {
             .collect())
     }
 
+    /// A proposal's private copy of this mempool ([`Self::snapshot_for_proposal`]),
+    /// for a proposal built on executed ancestors that consumed `consumed`
+    /// and applied `seat_parts`: what they consumed is finalized in the
+    /// copy, and messages GLOBAL refuses for what they applied are left out
+    /// before the budget is spent ([`AppliedParts::refuses`]). Packed and
+    /// then dropped from the copy (until 2026-11-19), they took the budget
+    /// of proofs that could ride.
+    pub(crate) fn proposal_copy(
+        &self,
+        rank: u64,
+        max_bytes: usize,
+        max_items: usize,
+        frame: u64,
+        consumed: &[Vec<u8>],
+        seat_parts: &[SeatPartChange],
+    ) -> quil_types::error::Result<MessageCollector> {
+        let collector = MessageCollector::new();
+        let mut applied = AppliedParts::new(usize::MAX);
+        applied.learn(seat_parts, 0);
+        let messages =
+            self.snapshot_within(rank, max_bytes, max_items, Some(frame), consumed, &applied)?;
+        for (bytes, verified) in messages {
+            if verified {
+                collector.add_verified_message(rank, bytes);
+            } else {
+                collector.add_message(rank, bytes);
+            }
+        }
+        collector.mark_finalized(consumed);
+        Ok(collector)
+    }
+
     /// [`Self::snapshot_for_execution`] for a GLOBAL proposal of `frame`
     /// (`None` for any other proposal), with whether each message is held
     /// verified, so a private copy keeps that ([`Self::add_verified_message`]).
@@ -3933,6 +4253,22 @@ impl MessageCollector {
         frame: Option<u64>,
         consumed: &[Vec<u8>],
     ) -> quil_types::error::Result<Vec<(Vec<u8>, bool)>> {
+        let none = AppliedParts::new(0);
+        self.snapshot_within(rank, max_bytes, max_items, frame, consumed, &none)
+    }
+
+    /// [`Self::snapshot_for_proposal`], leaving out every message GLOBAL
+    /// refuses for the seat parts `applied` holds ([`AppliedParts::refuses`]),
+    /// counted on the proposal line (`pool_applied_skipped`).
+    fn snapshot_within(
+        &self,
+        rank: u64,
+        max_bytes: usize,
+        max_items: usize,
+        frame: Option<u64>,
+        consumed: &[Vec<u8>],
+        applied: &AppliedParts,
+    ) -> quil_types::error::Result<Vec<(Vec<u8>, bool)>> {
         use crate::leader_provider::MAX_TIP_VERIFICATIONS;
         use quil_types::error::QuilError;
         let unavailable =
@@ -3957,12 +4293,17 @@ impl MessageCollector {
         let (mut others, mut bundles, mut capacity, mut seals) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut shards: HashMap<&[u8], Vec<Candidate>> = HashMap::new();
+        let mut applied_skipped = 0usize;
         for rank in ranks {
             for (arrival, m) in buffers[&rank].iter() {
                 if finalized.contains(&m.hash)
                     || consumed_keys.contains(&m.hash)
                     || !seen.insert(m.hash)
                 {
+                    continue;
+                }
+                if applied.refuses(m) {
+                    applied_skipped += 1;
                     continue;
                 }
                 if m.class == Class::Capacity && !m.proof {
@@ -4063,7 +4404,15 @@ impl MessageCollector {
             cert_union::most_signers_first(candidates);
         }
         if let Some(frame) = frame {
-            self.note_proposal_pool(frame, &buffers, &finalized, &consumed_keys, &shards);
+            let skipped = applied_skipped;
+            self.note_proposal_pool(
+                frame,
+                &buffers,
+                &finalized,
+                &consumed_keys,
+                &shards,
+                skipped,
+            );
         }
         let mut groups: Vec<((u64, [u8; 32]), Vec<Candidate>)> = {
             let included = self.included.lock().map_err(|_| unavailable())?;
@@ -4270,11 +4619,13 @@ impl MessageCollector {
         finalized: &FinalizedSet,
         consumed: &HashSet<[u8; 32]>,
         shards: &HashMap<&[u8], Vec<Candidate>>,
+        applied_skipped: usize,
     ) {
         let parent = frame.saturating_sub(1);
         let mut pool = crate::proposal_pool::ProposalPool {
             shards: shards.len(),
             tips: shards.keys().map(|address| address.to_vec()).collect(),
+            applied_skipped,
             ..Default::default()
         };
         for (_, _, m) in shards.values().flatten() {
@@ -4331,6 +4682,11 @@ impl MessageCollector {
     pub fn note_finalized_frame(&self, frame: u64) {
         self.finalized_frame
             .fetch_max(frame, std::sync::atomic::Ordering::AcqRel);
+        // A proof past its window leaves anyway ([`Self::prune_after_finalization`]).
+        let mut applied = self.applied.lock().unwrap();
+        applied.prune(frame);
+        applied.end_overrun(frame);
+        drop(applied);
         // The window line's tally begins at the first frame seen finalized
         // ([`window_seats::WindowSeats::begin`]).
         let next = self.next_seal_frame();
@@ -4410,7 +4766,7 @@ impl MessageCollector {
             self.note_dropped_seats(&dropped, frame);
             if frame > 0 {
                 let ended = self.window_seats.lock().unwrap().ended(frame);
-                window_seats::log_ended(&ended);
+                window_seats::log_ended(&ended, self.applied_counts());
                 #[cfg(test)]
                 self.windows_ended.lock().unwrap().extend(ended);
             }
@@ -4785,6 +5141,119 @@ impl MessageCollector {
         // The coins they held stay held by the other messages carrying the
         // same shields ([`ShieldClaims`]).
         self.shield_claims.lock().unwrap().forget(&hashes);
+    }
+
+    /// Learn the storage seat parts a finalized frame's execution applied
+    /// (`MaterializeResult::seat_parts`), in order, and drop every held
+    /// storage epoch proof carrying one: GLOBAL refuses it whole on every
+    /// branch, and held it would take a proposal's seal share and its
+    /// sender's held share again (2026-11-19: about 7 such proofs a
+    /// proposal). Each part is remembered until its window ends, so
+    /// submits of one are refused ([`Refusal::AppliedSeatPart`]); a
+    /// registration that restarts a seat's epoch forgets its seal and
+    /// settlement. Returns how many messages left.
+    pub fn mark_applied(&self, parts: &[SeatPartChange]) -> usize {
+        self.learn_applied(parts)
+    }
+
+    /// Learn what a GLOBAL frame this node published did: its consumed
+    /// bundles leave ([`Self::mark_finalized`]), its skipped ones are
+    /// noted ([`Self::mark_skipped`]), its applied seat parts are learned
+    /// ([`Self::mark_applied`]) and, once it is the last frame
+    /// materialized, it is the finalized frame
+    /// ([`Self::note_finalized_frame`]) and, in the consensus epoch of
+    /// `rank_epoch`, ages the mempool ([`Self::prune_after_finalization`]).
+    /// The archive's three ways to publish a frame all call this.
+    pub fn learn_published(&self, published: Published<'_>, rank_epoch: u64) {
+        if !published.consumed.is_empty() {
+            self.mark_finalized(published.consumed);
+        }
+        self.mark_skipped(published.skipped);
+        self.mark_applied(published.seat_parts);
+        if let Some((number, rank)) = published.frame {
+            self.note_finalized_frame(number);
+            if quil_types::consensus::global_committee_epoch(number) == rank_epoch {
+                self.prune_after_finalization(rank);
+            }
+        }
+    }
+
+    /// Learn the seat parts committed state shows applied
+    /// (`ExecutionEngineManager::applied_seat_parts` of proofs a leader's
+    /// validation refused), as [`Self::mark_applied`] does: how a collector
+    /// that restarted, and never saw those frames, learns them. Only parts
+    /// a frame at or below both `base` and the finalized frame applied:
+    /// the state a branch leader reads holds the frames it executed above
+    /// `base`, its executed base, and one of those may be abandoned though
+    /// a frame of its number finalized while it validated (`u64::MAX` for
+    /// a leader over the mempool, whose state holds none). A part a later
+    /// registration restarted stays forgotten. Returns how many messages
+    /// left.
+    pub fn learn_committed(&self, parts: &[SeatPartChange], base: u64) -> usize {
+        let finalized = self
+            .finalized_frame
+            .load(std::sync::atomic::Ordering::Acquire);
+        let parts: Vec<SeatPartChange> = parts
+            .iter()
+            .filter(|part| finalized > 0 && part.frame <= finalized.min(base))
+            .cloned()
+            .collect();
+        self.learn_applied(&parts)
+    }
+
+    /// [`Self::mark_applied`]: the buffers' lock, then `applied`, as the
+    /// submit check takes them.
+    fn learn_applied(&self, parts: &[SeatPartChange]) -> usize {
+        if parts.is_empty() {
+            return 0;
+        }
+        let finalized = self
+            .finalized_frame
+            .load(std::sync::atomic::Ordering::Acquire);
+        let dropped: HashSet<[u8; 32]> = {
+            let mut buffers = self.buffers.write().unwrap();
+            let mut applied = self.applied.lock().unwrap();
+            let standing = applied.learn(parts, finalized);
+            if standing.is_empty() {
+                return 0;
+            }
+            // A part not remembered for the bound is still applied.
+            let dropped: HashSet<[u8; 32]> = buffers
+                .values()
+                .flat_map(|buffer| buffer.messages.values())
+                .filter(|m| {
+                    m.applied_by(|part| standing.contains(part) || applied.is_applied(part))
+                })
+                .map(|m| m.hash)
+                .collect();
+            drop(applied);
+            for buffer in buffers.values_mut() {
+                buffer.retain(|m| !dropped.contains(&m.hash));
+            }
+            buffers.retain(|_, b| !b.is_empty());
+            dropped
+        };
+        self.shield_claims.lock().unwrap().forget(&dropped);
+        dropped.len()
+    }
+
+    /// The seat parts remembered applied or restarted, and those not
+    /// remembered for the bound, for the window line.
+    fn applied_counts(&self) -> (usize, u64) {
+        let applied = self.applied.lock().unwrap();
+        (applied.parts.len(), applied.unremembered)
+    }
+
+    /// Remember at most `max` seat parts ([`APPLIED_PARTS_MAX`]).
+    #[cfg(test)]
+    fn set_applied_max(&self, max: usize) {
+        self.applied.lock().unwrap().max = max;
+    }
+
+    /// Passes over the applied parts for those whose window ended.
+    #[cfg(test)]
+    fn applied_prunes(&self) -> u64 {
+        self.applied.lock().unwrap().prunes
     }
 
     /// Take back `data`, a message a finalized frame consumed that has to run
@@ -6767,6 +7236,635 @@ mod tests {
         );
     }
 
+    /// A seat part execution applied at `frame`: `member`'s seat on
+    /// `shard`, of `epoch`.
+    fn applied(
+        member: u8,
+        shard: u8,
+        kind: SeatPartKind,
+        epoch: u64,
+        frame: u64,
+    ) -> SeatPartChange {
+        SeatPartChange {
+            member: [member; 32],
+            shard: vec![shard; 32],
+            kind,
+            epoch,
+            frame,
+        }
+    }
+
+    /// A storage epoch proof of `member` sealing its seats on `shards`
+    /// (epoch 1500's seats, so the seals of 1502).
+    fn seals_proof(member: u8, shards: &[u8], tag: u8) -> Vec<u8> {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        };
+        let proof = StorageEpochProof {
+            member: [member; 32],
+            seats: shards
+                .iter()
+                .map(|shard| SeatProof {
+                    shard_filter: vec![*shard; 32],
+                    epoch: 1500,
+                    seals: true,
+                    ..Default::default()
+                })
+                .collect(),
+            proof: vec![tag; 1_000],
+        };
+        one_request(TYPE_STORAGE_EPOCH_PROOF, proof.to_canonical_bytes())
+    }
+
+    /// A held proof of a seal a frame applied leaves the mempool and its
+    /// sender's share: the sender's next proof is held. Another copy of the
+    /// seal, in other bytes, is refused for good; the seat's settlement
+    /// stays.
+    #[test]
+    fn a_held_proof_of_an_applied_seal_leaves_the_mempool() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let dead = seat_proof(7, 9, 1500, true, 1, 3 << 20);
+        assert!(dead.len() > SEAL_BYTES_PER_SENDER);
+        assert_eq!(by(dead, b"a"), SubmitOutcome::Accepted);
+        let settles = seat_proof(7, 9, 1500, false, 2, 1_000);
+        assert_eq!(by(settles.clone(), b"b"), SubmitOutcome::Accepted);
+        let next = seat_proof(8, 8, 1500, true, 3, 1_000);
+        assert_eq!(
+            by(next.clone(), b"a"),
+            SubmitOutcome::Filtered(Refusal::RankFull),
+            "premise: the held proof takes its sender's share"
+        );
+        assert_eq!(
+            mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 8_999)]),
+            1,
+            "APPLIED-LEFT: a proof of an applied seal stayed in the mempool"
+        );
+        assert_eq!(mc.pending_count(1), 1);
+        assert_eq!(
+            by(next, b"a"),
+            SubmitOutcome::Accepted,
+            "APPLIED-SHARE: the dropped proof still held its sender's share"
+        );
+        assert_eq!(
+            by(seat_proof(7, 9, 1500, true, 4, 1_000), b"c"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart),
+            "APPLIED-INGEST: another copy of an applied seal was not refused"
+        );
+        assert_eq!(
+            by(settles, b"b"),
+            SubmitOutcome::Duplicate,
+            "the seat's settlement stays held"
+        );
+    }
+
+    /// A finalized frame carrying {A: seal X; B: seals X and Y} applies A
+    /// and refuses B whole: execution reports X alone, and Y stays open.
+    /// The collector learns what execution reported, never what a frame
+    /// carried.
+    #[test]
+    fn a_carried_proof_execution_refused_applies_none_of_its_parts() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let a = seals_proof(7, &[9], 1);
+        let b = seals_proof(7, &[9, 10], 2);
+        let y = seals_proof(7, &[10], 3);
+        assert_eq!(by(a.clone(), b"a"), SubmitOutcome::Accepted);
+        assert_eq!(by(b.clone(), b"b"), SubmitOutcome::Accepted);
+        assert_eq!(by(y.clone(), b"c"), SubmitOutcome::Accepted);
+        mc.mark_finalized(&[a, b]);
+        mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]);
+        assert_eq!(
+            by(y, b"c"),
+            SubmitOutcome::Duplicate,
+            "APPLIED-FROM-BUNDLES: a proof of a seal no frame applied left"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[10], 4), b"d"),
+            SubmitOutcome::Accepted,
+            "APPLIED-FROM-BUNDLES-INGEST: a proof of a seal no frame applied was refused"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[9], 5), b"d"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart),
+            "the applied seal is refused"
+        );
+    }
+
+    /// An applied part is remembered until its window ends: through the
+    /// frame before the seal's epoch begins, not at it.
+    #[test]
+    fn an_applied_part_is_forgotten_when_its_window_ends() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]);
+        let end = quil_types::consensus::epoch_start_frame(1502);
+        mc.note_finalized_frame(end - 1);
+        assert_eq!(mc.applied_counts(), (1, 0), "remembered inside its window");
+        mc.note_finalized_frame(end);
+        assert_eq!(
+            mc.applied_counts(),
+            (0, 0),
+            "APPLIED-PRUNE: a part was remembered past its window"
+        );
+    }
+
+    /// One applied part of a proof of many seats takes the whole proof:
+    /// GLOBAL refuses it whole. A copy of it is refused.
+    #[test]
+    fn one_applied_part_drops_a_proof_of_many_seats() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let both = seals_proof(7, &[9, 10], 1);
+        assert_eq!(by(both, b"a"), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.mark_applied(&[applied(7, 10, SeatPartKind::Sealed, 1502, 9_000)]),
+            1,
+            "APPLIED-ALL-PARTS: a proof whose second part was applied stayed"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[9, 10], 2), b"b"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart),
+            "APPLIED-ALL-PARTS-INGEST: a proof whose second part was applied was held"
+        );
+    }
+
+    /// A registration that restarts a seat's epoch forgets its applied
+    /// seal: a proof sealing the new registration is held. A later seal
+    /// is refused again.
+    #[test]
+    fn a_registration_readmits_proofs_of_the_parts_it_restarted() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]);
+        assert_eq!(
+            by(seals_proof(7, &[9], 1), b"a"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
+        );
+        mc.mark_applied(&[applied(7, 9, SeatPartKind::Registered, 1502, 9_010)]);
+        let fresh = seals_proof(7, &[9], 2);
+        assert_eq!(
+            by(fresh.clone(), b"a"),
+            SubmitOutcome::Accepted,
+            "APPLIED-REGISTER: a proof sealing a new registration was refused"
+        );
+        assert_eq!(
+            mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_020)]),
+            1,
+            "the next seal applied takes it"
+        );
+    }
+
+    /// Parts read from committed state ([`MessageCollector::learn_committed`])
+    /// count only at or below the finalized frame: a frame above it may be
+    /// abandoned. A part a later registration restarted stays forgotten.
+    #[test]
+    fn committed_parts_count_only_up_to_the_finalized_frame() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        assert_eq!(by(seals_proof(7, &[9], 1), b"a"), SubmitOutcome::Accepted);
+        assert_eq!(by(seals_proof(7, &[11], 2), b"b"), SubmitOutcome::Accepted);
+        assert_eq!(by(seals_proof(7, &[12], 3), b"c"), SubmitOutcome::Accepted);
+        mc.mark_applied(&[applied(7, 12, SeatPartKind::Registered, 1502, 8_995)]);
+        assert_eq!(
+            mc.learn_committed(&[
+                applied(7, 9, SeatPartKind::Sealed, 1502, 8_990),
+                applied(7, 11, SeatPartKind::Sealed, 1502, 9_001),
+                applied(7, 12, SeatPartKind::Sealed, 1502, 8_990),
+            ], u64::MAX),
+            1,
+            "APPLIED-UNFINAL: a part applied above the finalized frame, or one a registration restarted, took its proof"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[11], 4), b"d"),
+            SubmitOutcome::Accepted,
+            "APPLIED-UNFINAL-INGEST: a part applied above the finalized frame was refused"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[9], 5), b"d"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
+        );
+    }
+
+    /// A proposal's copy built on ancestors that applied a seal leaves out
+    /// the proofs of it; the mempool keeps them until a frame finalizes it.
+    #[test]
+    fn a_proposal_copy_leaves_out_proofs_its_ancestors_applied() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        assert_eq!(
+            mc.add_message_outcome_by(1, seals_proof(7, &[9], 1), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let copy = |parts: &[SeatPartChange]| {
+            mc.proposal_copy(1, 64 << 20, 10_000, 9_002, &[], parts)
+                .unwrap()
+                .pending_count(1)
+        };
+        assert_eq!(copy(&[]), 1, "premise: the copy holds the proof");
+        assert_eq!(
+            copy(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_001)]),
+            0,
+            "APPLIED-COPY: a proposal's copy held a proof its ancestors applied"
+        );
+        assert_eq!(mc.pending_count(1), 1, "the mempool keeps it");
+    }
+
+    /// At most the bound of parts is remembered: one more is counted, and
+    /// its held proofs still leave. A part whose window ended makes room.
+    #[test]
+    fn applied_parts_are_bounded() {
+        let mc = global_collector();
+        mc.set_applied_max(2);
+        mc.note_finalized_frame(9_000);
+        assert_eq!(
+            mc.add_message_outcome_by(1, seals_proof(7, &[3], 1), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let parts: Vec<SeatPartChange> = (1..=3)
+            .map(|shard| applied(7, shard, SeatPartKind::Sealed, 1502, 9_000))
+            .collect();
+        assert_eq!(
+            mc.mark_applied(&parts),
+            1,
+            "the unremembered part's proof left"
+        );
+        assert_eq!(
+            mc.applied_counts(),
+            (2, 1),
+            "APPLIED-BOUND: more parts remembered than the bound"
+        );
+        mc.note_finalized_frame(quil_types::consensus::epoch_start_frame(1502));
+        mc.mark_applied(&[applied(7, 4, SeatPartKind::Sealed, 1503, 9_000)]);
+        assert_eq!(mc.applied_counts(), (1, 1), "an ended window made room");
+    }
+
+    /// A seal learned applied while a proof of it is being filed: learned
+    /// before the proof is held, the proof is refused, never held.
+    #[test]
+    fn a_proof_of_a_seal_learned_applied_while_it_is_filed_is_refused() {
+        let mc = std::sync::Arc::new(global_collector());
+        mc.note_finalized_frame(9_000);
+        let racer = mc.clone();
+        set_file_gap_hook(Box::new(move || {
+            assert_eq!(
+                racer.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]),
+                0
+            );
+        }));
+        assert_eq!(
+            mc.add_message_outcome_by(1, seals_proof(7, &[9], 1), Provenance::Prover, b"a"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart),
+            "APPLIED-RACE: a proof of a seal learned applied while it was filed was held"
+        );
+        assert_eq!(mc.pending_count(1), 0);
+    }
+
+    /// One bundle of the requests of `bundles`, each a bundle of one.
+    fn joined(bundles: &[Vec<u8>]) -> Vec<u8> {
+        use quil_execution::message_envelope::CanonicalMessageBundle;
+        CanonicalMessageBundle {
+            requests: bundles
+                .iter()
+                .flat_map(|b| {
+                    CanonicalMessageBundle::from_canonical_bytes(b)
+                        .unwrap()
+                        .requests
+                })
+                .collect(),
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A proposal's copy leaves out a proof its ancestors applied before
+    /// spending its budget: with room for one proof, the live proof due
+    /// later rides, not the dead one due first. The proposal line counts
+    /// the one left out.
+    #[test]
+    fn a_proposal_copy_spends_its_budget_on_live_proofs() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let dead = seat_proof(7, 9, 1500, true, 1, 3 << 20);
+        let live = seat_proof(8, 8, 1501, true, 2, 3 << 20);
+        assert_eq!(by(dead.clone(), b"a"), SubmitOutcome::Accepted);
+        assert_eq!(by(live.clone(), b"b"), SubmitOutcome::Accepted);
+        let copy = |parts: &[SeatPartChange]| {
+            mc.proposal_copy(1, 4 << 20, 10_000, 9_002, &[], parts)
+                .unwrap()
+                .snapshot_for_execution(1, 64 << 20, 10_000)
+                .unwrap()
+        };
+        assert_eq!(
+            copy(&[]),
+            vec![dead],
+            "premise: the budget fits one proof, and the dead one is due first"
+        );
+        assert_eq!(
+            copy(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_001)]),
+            vec![live],
+            "APPLIED-COPY-BUDGET: a proof its ancestors applied took the budget of a live one"
+        );
+        assert_eq!(
+            mc.take_proposal_pool().map(|pool| pool.applied_skipped),
+            Some(1),
+            "the proposal line counts the proof left out"
+        );
+    }
+
+    /// GLOBAL runs a bundle's requests one by one: a bundle {X, Y} whose X
+    /// a frame applied stays for Y, and another copy of it is held. Once Y
+    /// is applied too, every copy leaves and a further one is refused.
+    #[test]
+    fn an_applied_proof_takes_no_other_request_of_its_bundle() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let both = |tag: u8| joined(&[seals_proof(7, &[9], tag), seals_proof(8, &[10], tag)]);
+        assert_eq!(by(both(1), b"a"), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]),
+            0,
+            "APPLIED-ANY-REQUEST: a bundle whose other request no frame applied left"
+        );
+        assert_eq!(
+            by(both(2), b"b"),
+            SubmitOutcome::Accepted,
+            "APPLIED-ANY-REQUEST-INGEST: a bundle whose other request no frame applied was refused"
+        );
+        assert_eq!(
+            mc.mark_applied(&[applied(8, 10, SeatPartKind::Sealed, 1502, 9_001)]),
+            2,
+            "each request applied: every copy leaves"
+        );
+        assert_eq!(
+            by(both(3), b"c"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
+        );
+    }
+
+    /// A bundle carrying a capacity certificate beside a proof of an
+    /// applied seal stays: the certificate is not lost with the proof.
+    #[test]
+    fn an_applied_proof_takes_no_capacity_certificate_with_it() {
+        let mc = global_collector();
+        mc.note_finalized_frame(9_000);
+        let mixed = joined(&[capacity_bundle(7, 1, 0, 1_000), seals_proof(7, &[9], 1)]);
+        assert_eq!(
+            mc.add_message_outcome_by(1, mixed.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "premise: the bundle is held"
+        );
+        assert_eq!(
+            mc.mark_applied(&[applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)]),
+            0,
+            "APPLIED-CERT: a capacity certificate left with a proof of an applied seal"
+        );
+        assert_eq!(mc.pending_count(1), 1);
+        assert_eq!(
+            mc.add_message_outcome_by(1, mixed, Provenance::Prover, b"b"),
+            SubmitOutcome::Duplicate,
+            "a copy is not refused for the applied seal"
+        );
+    }
+
+    /// The archive's three ways to publish a frame teach the mempool all
+    /// it did ([`MessageCollector::learn_published`]): its consumed bundles
+    /// and proofs of the seals it applied leave, a copy of one is refused,
+    /// and it is the finalized frame once it is the last materialized.
+    #[test]
+    fn a_published_frame_teaches_the_mempool_what_it_did() {
+        let mc = global_collector();
+        let by = |data: Vec<u8>, peer: &[u8]| {
+            mc.add_message_outcome_by(1, data, Provenance::Prover, peer)
+        };
+        let consumed = seals_proof(8, &[10], 1);
+        let dead = seals_proof(7, &[9], 2);
+        let live = seals_proof(7, &[11], 3);
+        for (data, peer) in [(&consumed, b"a"), (&dead, b"b"), (&live, b"c")] {
+            assert_eq!(by(data.clone(), peer), SubmitOutcome::Accepted);
+        }
+        let parts = [applied(7, 9, SeatPartKind::Sealed, 1502, 9_001)];
+        let published = |frame| Published {
+            consumed: std::slice::from_ref(&consumed),
+            skipped: &[],
+            seat_parts: &parts,
+            frame,
+        };
+        mc.learn_published(published(None), 0);
+        assert_eq!(
+            mc.pending_count(1),
+            1,
+            "APPLIED-PUBLISHED: a published frame's consumed bundle or applied seal stayed"
+        );
+        assert_eq!(
+            by(live, b"c"),
+            SubmitOutcome::Duplicate,
+            "the live proof stays"
+        );
+        assert_eq!(
+            by(seals_proof(7, &[9], 4), b"d"),
+            SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
+        );
+        assert_eq!(
+            mc.next_seal_frame(),
+            0,
+            "not yet the last frame materialized"
+        );
+        mc.learn_published(published(Some((9_001, 40))), 0);
+        assert_eq!(mc.next_seal_frame(), 9_002, "the finalized frame is noted");
+    }
+
+    /// A leader's validation drops: a branch leader's leave its copy, and
+    /// only proofs of seals a finalized frame applied leave the mempool; a
+    /// leader over the mempool drops them all from it. Either way a copy of
+    /// an applied seal is refused after.
+    #[test]
+    fn a_leaders_drops_release_only_applied_proofs_from_the_mempool() {
+        use crate::leader_provider::release_applied;
+        let dead = seals_proof(7, &[9], 1);
+        let other = seals_proof(8, &[10], 2);
+        let invalid = [dead.clone(), other.clone()];
+        let applied_of = |raw: &[u8]| {
+            if raw == dead.as_slice() {
+                vec![applied(7, 9, SeatPartKind::Sealed, 1502, 8_999)]
+            } else {
+                Vec::new()
+            }
+        };
+        let mempool = || {
+            let mc = global_collector();
+            mc.note_finalized_frame(9_000);
+            for (data, peer) in [(&dead, b"a"), (&other, b"b")] {
+                let outcome = mc.add_message_outcome_by(1, data.clone(), Provenance::Prover, peer);
+                assert_eq!(outcome, SubmitOutcome::Accepted);
+            }
+            mc
+        };
+        let refused = |mc: &MessageCollector| {
+            mc.add_message_outcome_by(1, seals_proof(7, &[9], 3), Provenance::Prover, b"c")
+                == SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
+        };
+        let public = mempool();
+        let copy = public
+            .proposal_copy(1, 64 << 20, 10_000, 9_002, &[], &[])
+            .unwrap();
+        assert_eq!(copy.pending_count(1), 2, "premise: the copy holds both");
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), &invalid, applied_of),
+            1,
+            "RELEASE-BRANCH: a branch leader's drop of an applied proof did not leave the mempool"
+        );
+        assert_eq!(copy.pending_count(1), 0, "both leave the copy");
+        assert_eq!(public.pending_count(1), 1, "the other stays in the mempool");
+        assert!(refused(&public));
+        let public = mempool();
+        assert_eq!(release_applied(&public, None, &invalid, applied_of), 2);
+        assert_eq!(public.pending_count(1), 0);
+        assert!(refused(&public));
+    }
+
+    /// A branch executed over frame 9,000 whose ancestor 9,001 applied a
+    /// seal: while its leader validates, another frame 9,001 finalizes.
+    /// The seal its state shows is the abandoned ancestor's, so its proof
+    /// stays in the mempool and a copy of it is still taken; one its
+    /// executed base applied leaves.
+    #[test]
+    fn a_part_only_an_abandoned_ancestor_applied_is_not_learned() {
+        use crate::leader_provider::release_applied;
+        let public = global_collector();
+        public.note_finalized_frame(9_000);
+        let proof = seals_proof(7, &[9], 1);
+        assert_eq!(
+            public.add_message_outcome_by(1, proof.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let copy = public
+            .proposal_copy(1, 64 << 20, 10_000, 9_002, &[], &[])
+            .unwrap();
+        public.note_finalized_frame(9_001);
+        let ancestors = |_: &[u8]| vec![applied(7, 9, SeatPartKind::Sealed, 1502, 9_001)];
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), std::slice::from_ref(&proof), ancestors),
+            0,
+            "ABANDONED-PART: a part only an abandoned ancestor applied took the proof from the mempool"
+        );
+        assert_eq!(public.pending_count(1), 1);
+        assert_eq!(
+            public.add_message_outcome_by(1, seals_proof(7, &[9], 2), Provenance::Prover, b"b"),
+            SubmitOutcome::Accepted,
+            "ABANDONED-PART-INGEST: a copy of a part only an abandoned ancestor applied was refused"
+        );
+        let base = |_: &[u8]| vec![applied(7, 9, SeatPartKind::Sealed, 1502, 9_000)];
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), &[proof], base),
+            2,
+            "a part the executed base applied takes both"
+        );
+    }
+
+    /// At the bound, the parts a frame applied look for room once: a part
+    /// that finds none is not remembered, and the next looks no more.
+    #[test]
+    fn parts_at_the_bound_look_for_room_once_a_frame() {
+        let mc = global_collector();
+        mc.set_applied_max(2);
+        mc.note_finalized_frame(9_000);
+        mc.mark_applied(&[
+            applied(7, 1, SeatPartKind::Sealed, 1502, 9_000),
+            applied(7, 2, SeatPartKind::Sealed, 1502, 9_000),
+        ]);
+        let before = mc.applied_prunes();
+        let parts: Vec<SeatPartChange> = (3..=8)
+            .map(|shard| applied(7, shard, SeatPartKind::Sealed, 1502, 9_000))
+            .collect();
+        mc.mark_applied(&parts);
+        assert_eq!(
+            mc.applied_counts(),
+            (2, 6),
+            "premise: each found the bound full"
+        );
+        assert_eq!(
+            mc.applied_prunes() - before,
+            1,
+            "PRUNE-ONCE: parts past the bound scanned the parts each"
+        );
+    }
+
+    /// Parts past the bound warn once; the rest are summarized in one line
+    /// once a later epoch's frame finalizes, and the next one warns again.
+    #[test]
+    fn parts_past_the_bound_warn_once_an_epoch() {
+        let mc = global_collector();
+        mc.set_applied_max(1);
+        mc.note_finalized_frame(9_000);
+        let part = |shard: u8| applied(7, shard, SeatPartKind::Sealed, 1502, 9_000);
+        let warned = |run: &dyn Fn()| -> Vec<String> {
+            #[derive(Clone, Default)]
+            struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Lines {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().write(bytes)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let lines = Lines::default();
+            let writer = lines.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run);
+            let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+            text.lines()
+                .filter(|line| line.contains("past the bound"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let first = warned(&|| {
+            mc.mark_applied(&[part(1), part(2), part(3)]);
+            mc.mark_applied(&[part(4)]);
+            mc.note_finalized_frame(9_001);
+        });
+        assert_eq!(
+            first.len(),
+            1,
+            "APPLIED-OVERRUN-WARN: parts past the bound warned more than once an epoch: {first:?}"
+        );
+        let next = quil_types::consensus::epoch_length_frames()
+            * (9_000 / quil_types::consensus::epoch_length_frames() + 1);
+        let summary = warned(&|| mc.note_finalized_frame(next));
+        assert_eq!(summary.len(), 1, "one summary: {summary:?}");
+        assert!(summary[0].contains("parts=2"), "{summary:?}");
+        let again = warned(&|| {
+            mc.mark_applied(&[part(5)]);
+        });
+        assert_eq!(again.len(), 1, "the next epoch warns again: {again:?}");
+    }
     /// A sender holding no storage epoch proof is held one above its share
     /// up to what a frame carries; one over a proposal's seal share is
     /// refused for good, and any further proof over the sender's share

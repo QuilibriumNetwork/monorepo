@@ -366,8 +366,11 @@ impl WindowSeats {
 }
 
 /// Log what became of each window's seats ([`WindowCounts`]), one line
-/// each: a warning if any seat was lost, else at info.
-pub(super) fn log_ended(ended: &[WindowCounts]) {
+/// each: a warning if any seat was lost, else at info. `applied` is how
+/// many seat parts the collector remembers applied, and how many it did
+/// not remember for its bound ([`super::MessageCollector::mark_applied`]).
+pub(super) fn log_ended(ended: &[WindowCounts], applied: (usize, u64)) {
+    let (applied_parts, applied_unremembered) = applied;
     for counts in ended {
         // A window ending at the start of epoch E + 2 settles epoch E.
         let epoch = (counts.window_end / quil_types::consensus::epoch_length_frames().max(1))
@@ -385,6 +388,8 @@ pub(super) fn log_ended(ended: &[WindowCounts]) {
                     closed = counts.closed,
                     unregistered_seats = counts.unregistered_seats,
                     overflowed = counts.overflowed,
+                    applied_parts,
+                    applied_unremembered,
                     $text
                 )
             };
@@ -718,7 +723,7 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .with_writer(move || writer.clone())
             .finish();
-        tracing::subscriber::with_default(subscriber, || log_ended(&[counts]));
+        tracing::subscriber::with_default(subscriber, || log_ended(&[counts], (0, 0)));
         let bytes = lines.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
     }

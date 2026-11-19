@@ -156,6 +156,9 @@ pub(crate) struct ProposalPool {
     pub late: HashSet<Vec<u8>>,
     /// This node's current shard set; empty until it is first read.
     pub known: HashSet<Vec<u8>>,
+    /// Held messages left out as GLOBAL refuses them for seat parts the
+    /// proposal's executed ancestors applied.
+    pub applied_skipped: usize,
 }
 
 /// `Some(ms)` as the number, `None` as -1, for a log field.

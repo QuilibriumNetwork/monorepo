@@ -4332,14 +4332,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     FinalizationStep::Published { frame, result } => {
                                                         // Consumed bundles leave the mempool
                                                         // only after publication.
-                                                        if !result.consumed_bundles.is_empty() {
-                                                            mc.mark_finalized(&result.consumed_bundles);
-                                                        }
-                                                        mc.mark_skipped(&result.skipped_bundles);
-                                                        if let Some(header) = frame.header.as_ref() {
-                                                            mc.note_finalized_frame(header.frame_number);
-                                                            if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
-                                                        }
+                                                        mc.learn_published(
+                                                            quil_engine::message_collector::Published {
+                                                                consumed: &result.consumed_bundles,
+                                                                skipped: &result.skipped_bundles,
+                                                                seat_parts: &result.seat_parts,
+                                                                frame: frame.header.as_ref().map(|h| (h.frame_number, h.rank)),
+                                                            },
+                                                            cf.rank_epoch(),
+                                                        );
                                                         pipeline.announce(&frame);
                                                         rebalance(&frame, next);
                                                         continue;
@@ -4405,14 +4406,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             probe::step(ProbeSection::MaterializerAtomic);
                                             match canonical_atomic_attempts(&m, &frame, attempts) {
                                                 Some(CanonicalAttempt::Published(result)) => {
-                                                    if !result.consumed_bundles.is_empty() {
-                                                        mc.mark_finalized(&result.consumed_bundles);
-                                                    }
-                                                    mc.mark_skipped(&result.skipped_bundles);
-                                                    if let Some(header) = frame.header.as_ref() {
-                                                        mc.note_finalized_frame(header.frame_number);
-                                                        if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
-                                                    }
+                                                    mc.learn_published(
+                                                        quil_engine::message_collector::Published {
+                                                            consumed: &result.consumed_bundles,
+                                                            skipped: &result.skipped_bundles,
+                                                            seat_parts: &result.seat_parts,
+                                                            frame: frame.header.as_ref().map(|h| (h.frame_number, h.rank)),
+                                                        },
+                                                        cf.rank_epoch(),
+                                                    );
                                                     if let Some(pipeline) = pipeline.as_ref() {
                                                         if pipeline.finish_legacy(&frame) {
                                                             pipeline.announce(&frame);
@@ -4445,16 +4447,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 // Consume the finalized frame's
                                                 // bundles from the mempool so they
                                                 // aren't re-proposed.
-                                                if !result.finalized_bundles.is_empty() {
-                                                    mc.mark_finalized(&result.finalized_bundles);
-                                                }
-                                                mc.mark_skipped(&result.skipped_bundles);
-                                                if m.last_materialized_frame() >= frame_number {
+                                                let in_place = m.last_materialized_frame() >= frame_number;
+                                                mc.learn_published(
+                                                    quil_engine::message_collector::Published {
+                                                        consumed: &result.finalized_bundles,
+                                                        skipped: &result.skipped_bundles,
+                                                        seat_parts: &result.seat_parts,
+                                                        frame: frame
+                                                            .header
+                                                            .as_ref()
+                                                            .filter(|_| in_place)
+                                                            .map(|h| (h.frame_number, h.rank)),
+                                                    },
+                                                    cf.rank_epoch(),
+                                                );
+                                                if in_place {
                                                     catch_up.record_in_place();
-                                                    if let Some(header) = frame.header.as_ref() {
-                                                        mc.note_finalized_frame(header.frame_number);
-                                                        if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
-                                                    }
                                                     // A consensus finalization that went
                                                     // through the legacy path is announced
                                                     // once it is materialized.
@@ -8218,5 +8226,50 @@ mod global_activation_tests {
         assert!(
             !await_global_allocation(&other, &prover, &cancel, Duration::from_millis(20)).await
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    /// The three arms that publish a finalized GLOBAL frame, each with what
+    /// a test says when it drops the parts: the atomic step, the canonical
+    /// attempt and the in-place materialization.
+    const ARMS: [(&str, &str); 3] = [
+        (
+            "FinalizationStep::Published { frame, result } => {",
+            "ARCHIVE-PUBLISH-1: the atomic step published without its seat parts",
+        ),
+        (
+            "Some(CanonicalAttempt::Published(result)) => {",
+            "ARCHIVE-PUBLISH-2: the canonical attempt published without its seat parts",
+        ),
+        (
+            "match m.materialize(&frame) {",
+            "ARCHIVE-PUBLISH-3: the in-place execution published without its seat parts",
+        ),
+    ];
+
+    /// Each arm that publishes a GLOBAL frame tells the mempool the seat
+    /// parts the frame applied, so their proofs leave it on every path;
+    /// the arms are driven only by the live sync loop, so this reads them.
+    #[test]
+    fn every_publishing_arm_releases_the_seat_parts_it_applied() {
+        let source = include_str!("archive_sync.rs");
+        let code = &source[..source.find("\nmod fh_r1_tests;").unwrap()];
+        assert_eq!(
+            code.matches("mc.learn_published(").count(),
+            ARMS.len(),
+            "ARCHIVE-PUBLISH: a publishing arm was added or removed"
+        );
+        for (arm, dropped) in ARMS {
+            let start = code.find(arm).unwrap();
+            let end = start + code[start..].find("cf.rank_epoch()").unwrap();
+            let region = &code[start..end];
+            assert!(
+                region.contains("mc.learn_published(")
+                    && region.contains("seat_parts: &result.seat_parts,"),
+                "{dropped}"
+            );
+        }
     }
 }

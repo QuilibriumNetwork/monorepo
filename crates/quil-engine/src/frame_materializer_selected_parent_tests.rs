@@ -2236,3 +2236,129 @@ fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
         agreed[0]
     );
 }
+
+/// A storage epoch proof of `member` sealing its seat on `shard`: epoch
+/// 1500's seat, so the seal of 1502.
+fn seal_proof(member: u8, shard: u8) -> Vec<u8> {
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let proof = StorageEpochProof {
+        member: [member; 32],
+        seats: vec![SeatProof {
+            shard_filter: vec![shard; 32],
+            epoch: 1500,
+            seals: true,
+            ..Default::default()
+        }],
+        proof: vec![1; 1_000],
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+            inner_bytes: proof.to_canonical_bytes(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A proposal on ancestors this node executed, or kept from an earlier
+/// execution, leaves out of its copy of the mempool the proofs of seat
+/// parts they applied, and its leader names the frame they were executed
+/// over; the public pool keeps the proofs.
+#[test]
+fn a_proposal_copy_leaves_out_what_its_executed_or_kept_ancestors_applied() {
+    use quil_types::execution::{SeatPartChange, SeatPartKind};
+    let rig = Rig::new();
+    let first = rig.deploy();
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&first).unwrap();
+    let second = state_frame(&expected.source, 2, 42, id(&first));
+    for frame in [&first, &second] {
+        rig.put(frame);
+    }
+    assert!(rig.collector.add_message(1, seal_proof(7, 9)));
+    let copied = |executor: &GlobalParentExecutor| {
+        let lease = executor
+            .prepare(rig.context(&second), 2, &rig.blocks, &rig.verifier, true)
+            .unwrap();
+        let (copy, base) = lease.proposal_leader().unwrap().proposal_messages();
+        (lease.kept_ancestors(), copy.total_pending(), base)
+    };
+    let unplanted = GlobalParentExecutor::new(
+        rig.source.clone(),
+        rig.leader.clone(),
+        0,
+        0,
+        rig.genesis,
+        GlobalParentLimits {
+            branch: limits(),
+            ..GlobalParentLimits::default()
+        },
+    );
+    let (kept, held, _) = copied(&unplanted);
+    assert_eq!((kept, held), (0, 1), "premise: the copy holds the proof");
+    rig.executor.plant_seat_parts(vec![SeatPartChange {
+        member: [7; 32],
+        shard: vec![9; 32],
+        kind: SeatPartKind::Sealed,
+        epoch: 1502,
+        frame: 2,
+    }]);
+    assert_eq!(
+        copied(&rig.executor),
+        (0, 0, Some(0)),
+        "ANCESTORS-EXECUTED: a copy held a proof its executed ancestors applied, or named another base"
+    );
+    assert_eq!(
+        copied(&rig.executor),
+        (2, 0, Some(0)),
+        "ANCESTORS-KEPT: a copy held a proof its kept ancestors applied, or named another base"
+    );
+    assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
+}
+
+/// A branch leader's validation refuses a proof of a seal its executed
+/// base applied: the proof leaves the public mempool, not just the copy.
+#[test]
+fn a_branch_leader_takes_a_proof_its_base_applied_from_the_mempool() {
+    use quil_execution::global_intrinsic::storage_seat;
+    let signer = Arc::new(quil_crypto::FalconSigner::generate());
+    let fixture = Fixture::seeded(Some(signer.public_key()), |crdt| {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+        let mut seat = storage_seat::Seat::new([7; 32], vec![9; 32]);
+        seat.register(1502, &[vec![0]], 0);
+        assert!(seat.seal(1502, 0));
+        storage_seat::write(&state, 0, &seat).unwrap();
+        state.commit().unwrap();
+        crdt.commit(0).unwrap();
+    });
+    let rig = Rig::over(signer, fixture);
+    let parent = rig.deploy();
+    rig.put(&parent);
+    rig.collector.note_finalized_frame(1);
+    let proof = seal_proof(7, 9);
+    assert!(rig.collector.add_message(1, proof.clone()));
+    let lease = rig
+        .executor
+        .prepare(rig.context(&parent), 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    assert_eq!(
+        lease.proposal_leader().unwrap().proposal_messages().1,
+        Some(0)
+    );
+    let state = lease.prove(&[]).unwrap();
+    assert!(state.state.messages.is_empty());
+    assert!(
+        rig.leader.refused_message(&proof).is_some(),
+        "premise: the branch refused the proof"
+    );
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "BRANCH-RELEASE: a proof of a seal the executed base applied stayed in the mempool"
+    );
+}

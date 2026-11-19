@@ -715,6 +715,47 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     selection
 }
 
+/// Remove `invalid`, the messages a leader's validation dropped, from its
+/// `collector`. A branch leader's collector is its proposal's copy of the
+/// public `mempool`, with the frame its branch was executed over: of what
+/// it drops, only proofs of seat parts a frame at or below both that frame
+/// and the finalized one applied leave the mempool
+/// ([`MessageCollector::learn_committed`]). `applied_of` reads those parts
+/// from the state validation ran on, so they re-teach a mempool that
+/// restarted and never saw those frames applied. Returns how many messages
+/// left the mempool: all of `invalid` for a leader over the mempool itself
+/// (`mempool` `None`).
+pub(crate) fn release_applied(
+    collector: &MessageCollector,
+    mempool: Option<(&MessageCollector, u64)>,
+    invalid: &[Vec<u8>],
+    applied_of: impl Fn(&[u8]) -> Vec<quil_types::execution::SeatPartChange>,
+) -> usize {
+    let applied: Vec<quil_types::execution::SeatPartChange> =
+        invalid.iter().flat_map(|raw| applied_of(raw)).collect();
+    let left = match mempool {
+        Some((mempool, base)) => mempool.learn_committed(&applied, base),
+        None => {
+            collector.learn_committed(&applied, u64::MAX);
+            invalid.len()
+        }
+    };
+    collector.remove(invalid);
+    left
+}
+
+/// What a proposal's executed ancestors did
+/// ([`GlobalLeaderProvider::for_execution_branch`]).
+pub(crate) struct ExecutedAncestors<'a> {
+    /// The frame they were executed over, the branch's executed base:
+    /// they may yet be abandoned, it may not.
+    pub base: u64,
+    /// The bundles they consumed.
+    pub consumed: &'a [Vec<u8>],
+    /// The storage seat parts they applied.
+    pub seat_parts: &'a [quil_types::execution::SeatPartChange],
+}
+
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
 /// `parent_selector`. Produces frames by collecting messages, computing
@@ -778,6 +819,13 @@ pub struct GlobalLeaderProvider {
     /// proposal copied it ([`MessageCollector::take_proposal_pool`]), for
     /// the proposal line.
     pool: Option<crate::proposal_pool::ProposalPool>,
+    /// The public mempool an execution-branch leader's `message_collector`
+    /// copied ([`Self::for_execution_branch`]), with its branch's executed
+    /// base: what its validation drops leaves only the copy, except a proof
+    /// a frame at or below that base and finalized applied
+    /// ([`MessageCollector::learn_committed`]). `None` for a leader over the
+    /// mempool itself.
+    mempool: Option<(Arc<MessageCollector>, u64)>,
 }
 
 impl GlobalLeaderProvider {
@@ -813,10 +861,20 @@ impl GlobalLeaderProvider {
         self.rejected.lock().unwrap().reused
     }
 
+    /// The messages this leader proposes from: an execution-branch
+    /// leader's copy of the mempool, with its branch's executed base.
+    #[cfg(test)]
+    pub(crate) fn proposal_messages(&self) -> (&MessageCollector, Option<u64>) {
+        (
+            &self.message_collector,
+            self.mempool.as_ref().map(|(_, base)| *base),
+        )
+    }
+
     /// A leader over a private execution branch proposing `frame_number` at
     /// `rank`, with a copy of the pending messages within the proposal budget
-    /// ([`MessageCollector::snapshot_for_proposal`]); what `consumed`, the
-    /// executed ancestors, carried is left out.
+    /// ([`MessageCollector::proposal_copy`]); what the executed `ancestors`
+    /// carried or applied is left out.
     pub(crate) fn for_execution_branch(
         &self,
         branch: &quil_execution::ExecutionBranch,
@@ -824,24 +882,16 @@ impl GlobalLeaderProvider {
         frame_number: u64,
         max_bytes: usize,
         max_items: usize,
-        consumed: &[Vec<u8>],
+        ancestors: ExecutedAncestors<'_>,
     ) -> Result<Self> {
-        let collector = Arc::new(MessageCollector::new());
-        let messages = self.message_collector.snapshot_for_proposal(
+        let collector = Arc::new(self.message_collector.proposal_copy(
             rank,
             max_bytes,
             max_items,
-            Some(frame_number),
-            consumed,
-        )?;
-        for (bytes, verified) in messages {
-            if verified {
-                collector.add_verified_message(rank, bytes);
-            } else {
-                collector.add_message(rank, bytes);
-            }
-        }
-        collector.mark_finalized(consumed);
+            frame_number,
+            ancestors.consumed,
+            ancestors.seat_parts,
+        )?);
         let mut leader = Self::new(
             Arc::new(branch.registry().clone()),
             self.frame_prover.clone(),
@@ -860,6 +910,7 @@ impl GlobalLeaderProvider {
         leader.body_fetch = self.body_fetch.clone();
         leader.proof_settlement = self.proof_settlement.clone();
         leader.pool = self.message_collector.take_proposal_pool();
+        leader.mempool = Some((self.message_collector.clone(), ancestors.base));
         Ok(leader)
     }
 
@@ -893,6 +944,7 @@ impl GlobalLeaderProvider {
             body_fetch: None,
             proof_settlement: None,
             pool: None,
+            mempool: None,
         }
     }
 
@@ -1681,7 +1733,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                 .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
-                                "dropping out-of-lockstep shard frame proof from global mempool",
+                                "dropping out-of-lockstep shard frame proof from this proposal's inputs",
                             );
                             invalid.push(raw);
                         }
@@ -1790,7 +1842,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
-                                "dropping protocol-invalid message from global mempool",
+                                "dropping protocol-invalid message from this proposal's inputs",
                             );
                             invalid.push(raw);
                         }
@@ -1978,13 +2030,22 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         .map(|(k, n)| format!("{n}× {k}"))
                         .collect::<Vec<_>>()
                         .join(" | ");
+                    let left_mempool = release_applied(
+                        &self.message_collector,
+                        self.mempool
+                            .as_ref()
+                            .map(|(mempool, base)| (mempool.as_ref(), *base)),
+                        &invalid,
+                        |raw| validator.applied_seat_parts(raw),
+                    );
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
+                        from = if self.mempool.is_some() { "proposal copy" } else { "global mempool" },
+                        left_mempool,
                         by_reason = %by_reason,
-                        "dropped protocol-invalid messages from global mempool",
+                        "dropped protocol-invalid messages",
                     );
-                    self.message_collector.remove(&invalid);
                 }
                 valid
             }
@@ -2003,6 +2064,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 pool_anchored_parent = pool.anchored_parent,
                 pool_anchored_earlier = pool.anchored_earlier,
                 pool_out_of_window = pool.out_of_window,
+                pool_applied_skipped = pool.applied_skipped,
                 pool_verified = pool.verified,
                 pool_unverified = pool.unverified,
                 verifying = pool.verifying,

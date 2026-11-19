@@ -699,6 +699,81 @@ pub fn check(
     ))
 }
 
+/// The seals and settlements among `message`'s storage epoch proofs that
+/// `state` holds applied, each with the frame that applied it: what every
+/// later proof carrying one is refused for ([`REFUSED_DUPLICATE`]). Read
+/// from the seats, so a mempool that restarted and never saw those frames
+/// learns them from the proofs it still holds. A message it cannot read
+/// names none.
+pub fn applied_seat_parts(
+    state: &crate::hypergraph_state::HypergraphState,
+    message: &[u8],
+) -> Vec<quil_types::execution::SeatPartChange> {
+    use crate::message_envelope::{
+        CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
+    };
+    use quil_types::execution::{SeatPartChange, SeatPartKind};
+    let requests = match message
+        .get(..4)
+        .map(|tp| u32::from_be_bytes(tp.try_into().unwrap()))
+    {
+        Some(TYPE_MESSAGE_BUNDLE) => CanonicalMessageBundle::from_canonical_bytes(message)
+            .map(|bundle| bundle.requests.into_iter().flatten().collect())
+            .unwrap_or_default(),
+        Some(TYPE_MESSAGE_REQUEST) => CanonicalMessageRequest::from_canonical_bytes(message)
+            .map(|request| vec![request])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut parts = Vec::new();
+    for request in requests {
+        if request.inner_type_prefix != TYPE_STORAGE_EPOCH_PROOF {
+            continue;
+        }
+        let Ok(proof) = StorageEpochProof::from_canonical_bytes(&request.inner_bytes) else {
+            continue;
+        };
+        if super::persistent_storage::capacity_message(&proof) {
+            continue;
+        }
+        for part in &proof.seats {
+            let Ok(Some(seat)) =
+                super::storage_seat::read(state, &proof.member, &part.shard_filter)
+            else {
+                continue;
+            };
+            let sealed = part
+                .seals
+                .then(|| seat.slot(part.seal_epoch()))
+                .flatten()
+                .and_then(|slot| slot.sealed_at)
+                .map(|at| (SeatPartKind::Sealed, part.seal_epoch(), at));
+            let settled = part
+                .settles
+                .then(|| seat.slot(part.epoch))
+                .flatten()
+                .and_then(|slot| match slot.outcome {
+                    super::storage_seat::Outcome::Settled(at) => Some(at),
+                    _ => None,
+                })
+                .map(|at| (SeatPartKind::Settled, part.epoch, at));
+            parts.extend(
+                sealed
+                    .into_iter()
+                    .chain(settled)
+                    .map(|(kind, epoch, frame)| SeatPartChange {
+                        member: proof.member,
+                        shard: part.shard_filter.clone(),
+                        kind,
+                        epoch,
+                        frame,
+                    }),
+            );
+        }
+    }
+    parts
+}
+
 /// What one seat's checks found besides its claim.
 struct SeatChecked {
     sealed: Vec<([u8; 32], quil_tries::VectorCommitmentTree)>,

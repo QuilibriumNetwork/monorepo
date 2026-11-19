@@ -280,6 +280,31 @@ impl Drop for SessionPassTiming {
     }
 }
 
+/// Report the seal and settlement `part` of `member`'s storage epoch proof
+/// applied at `frame`: a seal at the epoch it seals, a settlement at the
+/// epoch it settles.
+fn note_applied_seat_parts(
+    state: &HypergraphState,
+    frame: u64,
+    member: &[u8; 32],
+    part: &super::storage_epoch_proof::SeatProof,
+) {
+    use quil_types::execution::{SeatPartChange, SeatPartKind};
+    let seal = part
+        .seals
+        .then(|| (SeatPartKind::Sealed, part.seal_epoch()));
+    let settle = part.settles.then_some((SeatPartKind::Settled, part.epoch));
+    for (kind, epoch) in seal.into_iter().chain(settle) {
+        state.note_seat_part(SeatPartChange {
+            member: *member,
+            shard: part.shard_filter.clone(),
+            kind,
+            epoch,
+            frame,
+        });
+    }
+}
+
 /// The ring key of `address`'s allocation on `filter` in `scan`, or a key
 /// that ranks last when the allocation is not in it.
 fn ring_key_of(
@@ -1639,6 +1664,13 @@ impl GlobalIntrinsic {
                                     });
                             seat.register(epoch, &prefixes, frame_number);
                             super::storage_seat::write(state, frame_number, &seat)?;
+                            state.note_seat_part(quil_types::execution::SeatPartChange {
+                                member,
+                                shard: group.filter.clone(),
+                                kind: quil_types::execution::SeatPartKind::Registered,
+                                epoch,
+                                frame: frame_number,
+                            });
                         }
                     }
                 }
@@ -1781,6 +1813,7 @@ impl GlobalIntrinsic {
                         )?;
                     }
                     super::storage_seat::write(state, frame_number, &settlement.seat)?;
+                    note_applied_seat_parts(state, frame_number, &proof.member, part);
                     if let Some(released) = &settlement.released {
                         super::prover_shard_update::credit_storage_settlement(
                             state,
@@ -10122,14 +10155,50 @@ mod tests {
                 .is_err(),
                 "a KZG root does not register a hash-proof epoch"
             );
-            gi.invoke_step(
+            // Execution reports what the message applied to the seat: the
+            // registration, which unseals what the epoch held.
+            use quil_types::execution::{SeatPartChange, SeatPartKind};
+            let bundle_of = |requests: Vec<(u32, Vec<u8>)>| {
+                crate::message_envelope::CanonicalMessageBundle {
+                    requests: requests
+                        .into_iter()
+                        .map(|(inner_type_prefix, inner_bytes)| {
+                            Some(crate::message_envelope::CanonicalMessageRequest {
+                                inner_type_prefix,
+                                inner_bytes,
+                            })
+                        })
+                        .collect(),
+                    timestamp: 0,
+                }
+                .to_canonical_bytes()
+                .unwrap()
+            };
+            let execute = |frame: u64, message: &[u8]| {
+                crate::engines::invoke_global_message(Some(&gi), Some(&state), frame, message)
+                    .unwrap()
+            };
+            let part = |kind, epoch, frame| SeatPartChange {
+                member,
+                shard: filter.clone(),
+                kind,
+                epoch,
+                frame,
+            };
+            let confirmed = execute(
                 confirm_frame,
-                &confirm(encoded.registration_root(), encoded.n)
-                    .to_canonical_bytes()
-                    .unwrap(),
-                &state,
-            )
-            .unwrap();
+                &bundle_of(vec![(
+                    crate::global_intrinsic::prover_ops::TYPE_PROVER_CONFIRM,
+                    confirm(encoded.registration_root(), encoded.n)
+                        .to_canonical_bytes()
+                        .unwrap(),
+                )]),
+            );
+            assert_eq!(
+                confirmed,
+                vec![part(SeatPartKind::Registered, epoch, confirm_frame)],
+                "SEAT-REPORT-REGISTER: a confirm's registration was not reported"
+            );
             let va_disc = vertex_adds_discriminator().unwrap();
             let address = materialize::leaf_root_address(&member, &leaf_id).unwrap();
             let registration = || {
@@ -10302,7 +10371,44 @@ mod tests {
                 "a tampered proof"
             );
 
-            gi.invoke_step(confirm_frame + 2, &bytes, &state).unwrap();
+            // A bundle of the seal and a proof of it and a seat on another
+            // shard: GLOBAL applies the first and refuses the second whole,
+            // so execution reports the seal alone, never the other seat.
+            let mut wider = sealing.clone();
+            wider.seats.push(epoch_proof::SeatProof {
+                shard_filter: vec![0x82; 32],
+                epoch: epoch - 2,
+                seals: true,
+                ..Default::default()
+            });
+            let sealing_message =
+                bundle_of(vec![(epoch_proof::TYPE_STORAGE_EPOCH_PROOF, bytes.clone())]);
+            assert_eq!(
+                epoch_proof::applied_seat_parts(&state, &sealing_message),
+                Vec::new(),
+                "RETEACH-EARLY: an unsealed seat read as sealed"
+            );
+            let applied = execute(
+                confirm_frame + 2,
+                &bundle_of(vec![
+                    (epoch_proof::TYPE_STORAGE_EPOCH_PROOF, bytes.clone()),
+                    (
+                        epoch_proof::TYPE_STORAGE_EPOCH_PROOF,
+                        wider.to_canonical_bytes(),
+                    ),
+                ]),
+            );
+            assert_eq!(
+                applied,
+                vec![part(SeatPartKind::Sealed, epoch, confirm_frame + 2)],
+                "SEAT-REPORT: execution reported other than the one seal it applied"
+            );
+            // A mempool that never saw the frame reads it from the seat.
+            assert_eq!(
+                epoch_proof::applied_seat_parts(&state, &sealing_message),
+                vec![part(SeatPartKind::Sealed, epoch, confirm_frame + 2)],
+                "RETEACH: the applied seal was not read from the seat"
+            );
             assert_eq!(
                 materialize::leaf_root_registration_for_epoch(&registration(), epoch),
                 Some((encoded.registration_root(), encoded.n))
