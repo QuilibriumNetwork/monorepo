@@ -149,30 +149,145 @@ fn group_by_peer<'a>(
     peers
 }
 
-/// Dials configured peer `peer` once over all of `addrs`, unless it is
-/// connected or being dialed. libp2p tries the addresses together and
-/// keeps the first connection that opens, so a peer listed at both
-/// address families holds one connection, not one per address: two would
-/// fill the per-peer limit and leave no room for an AutoNAT dial-back.
+/// Whether `addr` is in the listened family (`listen_v6` names that of
+/// `listenMultiaddr`) or has no fixed family: an IP of that family, a
+/// `/dns4` or `/dns6` name of it, or a `/dns` name, whose family shows on
+/// connect.
+fn in_listened_family(addr: &Multiaddr, listen_v6: bool) -> bool {
+    match addr.iter().next() {
+        Some(Protocol::Ip4(_) | Protocol::Dns4(_)) => !listen_v6,
+        Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => listen_v6,
+        _ => true,
+    }
+}
+
+/// `addrs` split for the two-stage dial: those in the listened family
+/// (see [`in_listened_family`]) first, the others after, each in listed
+/// order.
+fn split_by_family(addrs: &[Multiaddr], listen_v6: bool) -> (Vec<Multiaddr>, Vec<Multiaddr>) {
+    addrs
+        .iter()
+        .cloned()
+        .partition(|addr| in_listened_family(addr, listen_v6))
+}
+
+/// Configured `(peer, address)` entries as one entry per peer (see
+/// [`group_by_peer`]), each with only its addresses in the listened family
+/// (see [`in_listened_family`]), or all of them when it has none there:
+/// the addresses Kademlia and AutoNAT get. A server dials back over the
+/// family a probe arrives on, so a probe sent over a family this node does
+/// not listen on fails and reads as private.
+pub(crate) fn configured_peers_in_family<'a>(
+    entries: impl IntoIterator<Item = &'a (PeerId, Multiaddr)>,
+    listen_v6: bool,
+) -> Vec<(PeerId, Vec<Multiaddr>)> {
+    let mut peers = group_by_peer(entries);
+    for (_, addrs) in &mut peers {
+        let (listened, _) = split_by_family(addrs, listen_v6);
+        if !listened.is_empty() {
+            *addrs = listened;
+        }
+    }
+    peers
+}
+
+/// The second stage of configured peers' dials: the addresses outside the
+/// listened family, by the first stage's connection. Each entry ends with
+/// its dial: the connection opens or the dial fails, and each address's
+/// transport timeout bounds it.
+type FallbackDials =
+    std::collections::HashMap<libp2p::swarm::ConnectionId, (PeerId, Vec<Multiaddr>)>;
+
+/// Dials configured peer `peer` at `addrs`, unless it is connected or being
+/// dialed: one dial over its addresses in the listened family (see
+/// [`in_listened_family`]), then, if that dial fails, one over the others
+/// ([`dial_fallback`]); a peer with addresses in one group only is dialed
+/// over that group at once. libp2p tries a dial's addresses together and
+/// keeps the first connection that opens, so a peer listed at several
+/// addresses holds one connection, not one per address: two would fill
+/// the per-peer limit and leave no room for an AutoNAT dial-back. A dial
+/// starts every address's transport timeout at once, so the second group
+/// gets a dial of its own rather than a place behind the first.
 fn dial_configured_peer(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    fallback: &mut FallbackDials,
     peer: PeerId,
     addrs: &[Multiaddr],
+    listen_v6: bool,
 ) -> Result<(), libp2p::swarm::DialError> {
     if swarm.is_connected(&peer) {
         return Ok(());
     }
-    for addr in addrs {
+    let (listened, other) = split_by_family(addrs, listen_v6);
+    let known = if listened.is_empty() {
+        &other
+    } else {
+        &listened
+    };
+    for addr in known {
         swarm
             .behaviour_mut()
             .kademlia
             .add_address(&peer, addr.clone());
     }
+    if listened.is_empty() || other.is_empty() {
+        return ignore_dialing(swarm.dial(configured_dial(peer, addrs.to_vec())));
+    }
+    let opts = configured_dial(peer, listened);
+    let connection = opts.connection_id();
+    match swarm.dial(opts) {
+        Ok(()) => {
+            fallback.insert(connection, (peer, other));
+            Ok(())
+        }
+        Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => Ok(()),
+        // Refused before any address was tried: try the others now.
+        Err(_) => ignore_dialing(swarm.dial(configured_dial(peer, other))),
+    }
+}
+
+/// The second stage of a configured peer's dial (see
+/// [`dial_configured_peer`]) once the first, `connection`, failed: one dial
+/// over the peer's addresses outside the listened family, unless the peer
+/// is connected meanwhile. It does not wait for another dial of the peer,
+/// such as Kademlia's over the same failing family.
+fn dial_fallback(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    fallback: &mut FallbackDials,
+    connection: libp2p::swarm::ConnectionId,
+) {
+    let Some((peer, other)) = fallback.remove(&connection) else {
+        return;
+    };
+    if swarm.is_connected(&peer) {
+        return;
+    }
+    debug!(%peer, addrs = ?other, "configured peer not reached over the listened family; dialing its other addresses");
     let opts = DialOpts::peer_id(peer)
-        .addresses(addrs.to_vec())
+        .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
+        .addresses(other)
         .allocate_new_port()
         .build();
-    match swarm.dial(opts) {
+    if let Err(e) = swarm.dial(opts) {
+        debug!(%e, %peer, "configured peer's other addresses not dialed");
+    }
+}
+
+/// One dial of configured peer `peer` over `addrs` (see
+/// [`dial_configured_peer`]).
+fn configured_dial(peer: PeerId, addrs: Vec<Multiaddr>) -> DialOpts {
+    DialOpts::peer_id(peer)
+        .addresses(addrs)
+        .allocate_new_port()
+        .build()
+}
+
+/// A dial refused because the peer is connected or being dialed is no
+/// failure.
+fn ignore_dialing(
+    result: Result<(), libp2p::swarm::DialError>,
+) -> Result<(), libp2p::swarm::DialError> {
+    match result {
         Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => Ok(()),
         other => other,
     }
@@ -753,10 +868,15 @@ impl P2PNode {
         let configured_listen = listen_multiaddr.clone();
         let peer_id = self.peer_id;
         // One entry per configured peer with every address it is listed at,
-        // so each peer is dialed and pinned once, not once per address.
+        // so each peer is dialed and pinned once, not once per address. The
+        // dials try the listened family first; AutoNAT pins only its
+        // addresses in that family when it has any.
         let bootstrap_peers = group_by_peer(&self.bootstrap_peers);
         let direct_peers = group_by_peer(&self.direct_peers);
-        let configured_peers = group_by_peer(self.bootstrap_peers.iter().chain(&self.direct_peers));
+        let configured_peers = configured_peers_in_family(
+            self.bootstrap_peers.iter().chain(&self.direct_peers),
+            listen_v6,
+        );
         let (msg_tx, msg_rx) = mpsc::channel::<ReceivedMessage>(4096);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(256);
         let peer_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -842,6 +962,9 @@ impl P2PNode {
             let mut last_need_peers_query: Option<std::time::Instant> = None;
             // Operator lines on QUIC connections that end on a transport error.
             let mut quic_closes = crate::quic_close::QuicCloses::default();
+            // Configured peers' dials over the listened family, with the
+            // addresses to dial if they fail.
+            let mut fallback_dials = FallbackDials::new();
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -912,7 +1035,7 @@ impl P2PNode {
                         // dropped direct peer must always be re-dialed.
                         if bootstrapped {
                             for (dp_peer, dp_addrs) in &direct_peers {
-                                let _ = dial_configured_peer(&mut swarm, *dp_peer, dp_addrs);
+                                let _ = dial_configured_peer(&mut swarm, &mut fallback_dials, *dp_peer, dp_addrs, listen_v6);
                             }
                         }
                         if bootstrapped && discovery_count < 30 {
@@ -930,7 +1053,7 @@ impl P2PNode {
                             if connected < 3 {
                                 debug!(connected, "low connectivity, re-dialing bootstrap peers");
                                 for (bp_peer, bp_addrs) in &bootstrap_peers {
-                                    let _ = dial_configured_peer(&mut swarm, *bp_peer, bp_addrs);
+                                    let _ = dial_configured_peer(&mut swarm, &mut fallback_dials, *bp_peer, bp_addrs, listen_v6);
                                 }
                             }
 
@@ -972,7 +1095,7 @@ impl P2PNode {
                                     bootstrapped = true;
                                     for (bp_peer, bp_addrs) in &bootstrap_peers {
                                         debug!(%bp_peer, addrs = ?bp_addrs, "dialing bootstrap peer");
-                                        if let Err(e) = dial_configured_peer(&mut swarm, *bp_peer, bp_addrs) {
+                                        if let Err(e) = dial_configured_peer(&mut swarm, &mut fallback_dials, *bp_peer, bp_addrs, listen_v6) {
                                             debug!(%e, %bp_peer, "dial failed");
                                         }
                                     }
@@ -987,7 +1110,7 @@ impl P2PNode {
                                     for (dp_peer, dp_addrs) in &direct_peers {
                                         debug!(%dp_peer, addrs = ?dp_addrs, "registering + dialing direct peer");
                                         swarm.behaviour_mut().blossomsub.add_direct_peer(*dp_peer);
-                                        if let Err(e) = dial_configured_peer(&mut swarm, *dp_peer, dp_addrs) {
+                                        if let Err(e) = dial_configured_peer(&mut swarm, &mut fallback_dials, *dp_peer, dp_addrs, listen_v6) {
                                             debug!(%e, %dp_peer, "direct peer dial failed");
                                         }
                                     }
@@ -1038,6 +1161,7 @@ impl P2PNode {
                                 listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, &addresses));
                             }
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                                fallback_dials.remove(&connection_id);
                                 quic_closes.on_established(connection_id, std::time::Instant::now());
                                 crate::autonat_servers::apply(
                                     &mut swarm.behaviour_mut().autonat,
@@ -1075,9 +1199,10 @@ impl P2PNode {
                                     line.log();
                                 }
                             }
-                            libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => {
                                 swarm_metrics.dial_failures.inc();
                                 debug!(peer = ?peer_id, error = %error, "outgoing connection failed");
+                                dial_fallback(&mut swarm, &mut fallback_dials, connection_id);
                             }
                             libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
                                 swarm_metrics.incoming_failures.inc();
@@ -2588,6 +2713,64 @@ mod tests {
             group_by_peer(bootstrap.iter().chain(&direct)),
             vec![(archive, vec![v4, v6]), (other, vec![o])]
         );
+    }
+
+    /// A configured peer's dial tries its addresses in the listened family
+    /// first, with DNS names of no fixed family, and the others after,
+    /// whatever order they are listed in; Kademlia and AutoNAT get only the
+    /// listened family's when the peer has any there, else all.
+    #[test]
+    fn configured_peers_are_tried_over_the_listened_family_first() {
+        let archive = PeerId::random();
+        let v4_only = PeerId::random();
+        let v6_only = PeerId::random();
+        let named = PeerId::random();
+        let at = |addr: &str, peer: PeerId| -> Multiaddr {
+            format!("{addr}/p2p/{peer}").parse().unwrap()
+        };
+        let v4 = at("/ip4/192.0.2.10/udp/8336/quic-v1", archive);
+        let v6 = at("/ip6/2001:db8:5::1/udp/8336/quic-v1", archive);
+        let o4 = at("/ip4/192.0.2.11/udp/8336/quic-v1", v4_only);
+        let o6 = at("/ip6/2001:db8:6::1/udp/8336/quic-v1", v6_only);
+        let dns = at("/dns/archive.example/udp/8336/quic-v1", named);
+        let d4 = at("/dns4/archive.example/udp/8336/quic-v1", named);
+        let n6 = at("/ip6/2001:db8:7::1/udp/8336/quic-v1", named);
+        for listen_v6 in [false, true] {
+            let (own, other) = if listen_v6 { (&v6, &v4) } else { (&v4, &v6) };
+            for order in [[v4.clone(), v6.clone()], [v6.clone(), v4.clone()]] {
+                let case = format!("listen v6 {listen_v6}, archive listed {order:?}");
+                eprintln!("REACH v6-bootstrap checked: {case}");
+                assert_eq!(
+                    split_by_family(&order, listen_v6),
+                    (vec![own.clone()], vec![other.clone()]),
+                    "{case}"
+                );
+                let entries = [
+                    (archive, order[0].clone()),
+                    (v4_only, o4.clone()),
+                    (archive, order[1].clone()),
+                    (v6_only, o6.clone()),
+                    (named, dns.clone()),
+                    (named, d4.clone()),
+                    (named, n6.clone()),
+                ];
+                let peers = configured_peers_in_family(&entries, listen_v6);
+                assert_eq!(
+                    peers[0],
+                    (archive, vec![own.clone()]),
+                    "an archive listed at both families is pinned at the family this node does \
+                     not listen on: {other} ({case})"
+                );
+                assert_eq!(peers[1], (v4_only, vec![o4.clone()]), "{case}");
+                assert_eq!(peers[2], (v6_only, vec![o6.clone()]), "{case}");
+                let named_addrs = if listen_v6 {
+                    vec![dns.clone(), n6.clone()]
+                } else {
+                    vec![dns.clone(), d4.clone()]
+                };
+                assert_eq!(peers[3], (named, named_addrs), "{case}");
+            }
+        }
     }
 
     fn routable(addr: &str) -> bool {
