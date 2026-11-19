@@ -1396,8 +1396,7 @@ fn hold_storage_shares(
         let updated_at = Instant::now();
         work.update += updated_at - read_at;
         if seat != before {
-            let written = storage_seat::write_record(state, current_frame_number, &seat)?;
-            seats.invalidate(&written);
+            seats.write(state, current_frame_number, &seat)?;
             counts.seats_written += 1;
             work.write += updated_at.elapsed();
         }
@@ -1431,7 +1430,10 @@ fn hold_storage_shares(
         )?;
         timing.mark("commitment");
         if first {
-            let seat = storage_seat::seat_address(&frame_header.prover, filter)?;
+            let seat = match frame_header.prover.as_slice().try_into() {
+                Ok(member) => seats.address(member, filter)?,
+                Err(_) => storage_seat::seat_address(&frame_header.prover, filter)?,
+            };
             storage_seat::enqueue_expiry(state, current_frame_number, epoch, &seat)?;
             timing.mark("expiry queue");
         }
@@ -2746,11 +2748,11 @@ mod tests {
             .is_none());
         batch.prefetch(&state, filter, members.iter()).unwrap();
         first.register(2, &[vec![1]], 3);
-        let written = storage_seat::write_record(&state, 3, &first).unwrap();
-        batch.invalidate(&written);
+        batch.write(&state, 3, &first).unwrap();
         assert_eq!(
             batch.read(&state, &members[0], filter).unwrap().unwrap().0,
-            first
+            first,
+            "a read after the batch's write took the buffered record"
         );
         // A second occurrence of the participant and a prefetched miss that
         // is filled by an intervening write must both see the new bytes.
@@ -2759,8 +2761,7 @@ mod tests {
             first
         );
         let third = Seat::new(members[2], filter.to_vec());
-        let written = storage_seat::write_record(&state, 3, &third).unwrap();
-        batch.invalidate(&written);
+        batch.write(&state, 3, &third).unwrap();
         assert_eq!(
             batch.read(&state, &members[2], filter).unwrap().unwrap().0,
             third

@@ -605,10 +605,32 @@ pub fn read_sized(
 
 /// Raw records for the next group of participants. A buffered miss is
 /// distinct from an address which has already been consumed or changed.
+/// Each member's seat address on the header's shard is derived once and
+/// kept for every later read and write of the header.
 #[derive(Default)]
-pub(super) struct ParticipantSeats(std::collections::BTreeMap<[u8; 32], Option<Vec<u8>>>);
+pub(super) struct ParticipantSeats {
+    records: std::collections::BTreeMap<[u8; 32], Option<Vec<u8>>>,
+    /// The shard of `addresses`, set by the first address derived.
+    filter: Option<Vec<u8>>,
+    addresses: std::collections::HashMap<[u8; 32], [u8; 32]>,
+}
 
 impl ParticipantSeats {
+    /// `seat_address(member, filter)`, derived once per member of the
+    /// first shard asked for.
+    pub(super) fn address(&mut self, member: &[u8; 32], filter: &[u8]) -> Result<[u8; 32]> {
+        let shard = self.filter.get_or_insert_with(|| filter.to_vec());
+        if shard.as_slice() != filter {
+            return seat_address(member, filter);
+        }
+        if let Some(address) = self.addresses.get(member) {
+            return Ok(*address);
+        }
+        let address = seat_address(member, filter)?;
+        self.addresses.insert(*member, address);
+        Ok(address)
+    }
+
     pub(super) fn prefetch<'a>(
         &mut self,
         state: &HypergraphState,
@@ -617,7 +639,7 @@ impl ParticipantSeats {
     ) -> Result<()> {
         let mut addresses = std::collections::BTreeSet::new();
         for member in members {
-            addresses.insert(seat_address(member, filter)?);
+            addresses.insert(self.address(member, filter)?);
         }
         let addresses: Vec<_> = addresses.into_iter().collect();
         let started = crate::step_timing::participant_lookup_start();
@@ -629,7 +651,7 @@ impl ParticipantSeats {
                 addresses.len() - rows.len(),
             );
         }
-        self.0 = addresses
+        self.records = addresses
             .into_iter()
             .map(|address| (address, rows.remove(&address)))
             .collect();
@@ -642,11 +664,11 @@ impl ParticipantSeats {
         member: &[u8; 32],
         filter: &[u8],
     ) -> Result<Option<(Seat, usize)>> {
-        if self.0.is_empty() {
-            return read_sized(state, member, filter);
+        let address = self.address(member, filter)?;
+        if self.records.is_empty() {
+            return read_address_sized(state, &address, true);
         }
-        let address = seat_address(member, filter)?;
-        match self.0.remove(&address) {
+        match self.records.remove(&address) {
             Some(Some(blob)) => {
                 decode_seat(&blob, crate::step_timing::participant_lookup_start()).map(Some)
             }
@@ -656,7 +678,16 @@ impl ParticipantSeats {
     }
 
     pub(super) fn invalidate(&mut self, address: &[u8; 32]) {
-        self.0.remove(address);
+        self.records.remove(address);
+    }
+
+    /// [`write`] `seat` at its derived address, which no later read of the
+    /// group may take from the buffer.
+    pub(super) fn write(&mut self, state: &HypergraphState, frame: u64, seat: &Seat) -> Result<()> {
+        let address = self.address(&seat.member, &seat.filter)?;
+        write_at(state, frame, &address, seat)?;
+        self.invalidate(&address);
+        Ok(())
     }
 }
 
@@ -754,16 +785,21 @@ pub fn write(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<()> {
 
 pub(super) fn write_record(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<[u8; 32]> {
     let address = seat_address(&seat.member, &seat.filter)?;
+    write_at(state, frame, &address, seat)?;
+    Ok(address)
+}
+
+/// Write `seat` at `address`, its `seat_address`.
+fn write_at(state: &HypergraphState, frame: u64, address: &[u8; 32], seat: &Seat) -> Result<()> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     let blob = crate::prover_registry::vertex_tree_to_blob(&seat.to_tree()?);
     state.set(
         &GLOBAL_INTRINSIC_ADDRESS[..],
-        &address,
+        address,
         &va_disc,
         frame,
         blob,
-    )?;
-    Ok(address)
+    )
 }
 
 /// Epochs whose queues are kept: a queue is swept two epochs after its own,
