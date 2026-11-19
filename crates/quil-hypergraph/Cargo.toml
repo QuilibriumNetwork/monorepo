@@ -37,6 +37,8 @@ tempfile = "3"
 jmt = "0.11"
 borsh = { version = "1", features = ["derive"] }
 anyhow = "1"
+# Capture warnings in tests of operator log lines.
+tracing-subscriber = "0.3"
 
 # Integration tests live in `tests/` and import the gated `testing`
 # module via `quil_hypergraph::testing`. Enable the feature on the

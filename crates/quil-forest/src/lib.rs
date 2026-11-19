@@ -48,7 +48,7 @@ mod sync;
 pub use forest::tree_generation;
 pub use forest::{
     node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase, ShardRoots,
-    SplitBifurcation, PHASES,
+    SplitBifurcation, SubtreeRootMismatch, PHASES,
 };
 pub use scope::ScopeDeletion;
 pub use storage_health::{DiskThresholds, StoreRole};

@@ -369,6 +369,10 @@ pub struct ForestSyncPlan {
     removals: bool,
     /// See [`Self::hold_view`].
     hold: bool,
+    /// Chunks installed and rebases taken since prepared; logged when the
+    /// last chunk's subtree differs from the source.
+    chunks: u32,
+    rebases: u32,
 }
 
 impl ForestSyncPlan {
@@ -392,6 +396,51 @@ impl ForestSyncPlan {
     pub fn hold_view(&mut self) {
         self.hold = true;
     }
+}
+
+/// A forest sync step whose reconstructed subtree was checked against its
+/// source, and what the sync knew there; logged by [`sync_step_error`].
+struct SyncStep<'a> {
+    /// The step's name, its error's prefix.
+    step: &'a str,
+    shard: &'a [u8],
+    phase: usize,
+    bit_path_bits: usize,
+    base_version: Option<u64>,
+    staged_version: u64,
+    /// Chunks installed before this one; 0 for a step that is not chunked.
+    chunk: u32,
+    chunk_leaves: usize,
+    planned_leaves: usize,
+    rebases: u32,
+}
+
+/// A forest sync step's error, prefixed with the step's name. A
+/// reconstructed subtree differing from its source also warns once with
+/// the step's context and both roots (first 8 bytes): the one place every
+/// sync step logs it.
+fn sync_step_error(e: anyhow::Error, at: SyncStep<'_>) -> QuilError {
+    if let Some(mismatch) = e.downcast_ref::<quil_forest::SubtreeRootMismatch>() {
+        // Which of a confinement mid-sync, an unaligned child path or a
+        // chunked reconstruction differing from the preview it was:
+        // answered from operators' warnings.
+        tracing::warn!(
+            shard = %hex::encode(at.shard),
+            phase = at.phase,
+            bit_path_bits = at.bit_path_bits,
+            base_version = ?at.base_version,
+            staged_version = at.staged_version,
+            chunk = at.chunk,
+            chunk_leaves = at.chunk_leaves,
+            planned_leaves = at.planned_leaves,
+            rebases = at.rebases,
+            expected_root = %hex::encode(&mismatch.expected[..8]),
+            staged_root = %hex::encode(&mismatch.staged[..8]),
+            "{}: {mismatch}",
+            at.step
+        );
+    }
+    QuilError::Internal(format!("{}: {e}", at.step))
 }
 
 /// What [`HypergraphCrdt::checkpoint_synced_view`] found.
@@ -4122,7 +4171,21 @@ impl HypergraphCrdt {
                     target_root,
                 )
                 .map_err(|e| {
-                    QuilError::Internal(format!("sync phase {phase_idx} reconstruction: {e}"))
+                    sync_step_error(
+                        e,
+                        SyncStep {
+                            step: &format!("sync phase {phase_idx} reconstruction"),
+                            shard: shard_id,
+                            phase: phase_idx,
+                            bit_path_bits: bit_path.len(),
+                            base_version,
+                            staged_version: version,
+                            chunk: 0,
+                            chunk_leaves: leaves.len(),
+                            planned_leaves: leaves.len(),
+                            rebases: 0,
+                        },
+                    )
                 })?;
         }
         Ok(ForestSyncPlan {
@@ -4140,6 +4203,8 @@ impl HypergraphCrdt {
                 && bit_path.is_empty()
                 && anchor.is_some(),
             hold: false,
+            chunks: 0,
+            rebases: 0,
         })
     }
 
@@ -4212,6 +4277,7 @@ impl HypergraphCrdt {
         plan.leaves = remaining;
         plan.next = 0;
         plan.base_version = Some(now);
+        plan.rebases = plan.rebases.saturating_add(1);
         Ok(plan.leaves.len())
     }
 
@@ -4305,7 +4371,24 @@ impl HypergraphCrdt {
                 &plan.bit_path,
                 final_chunk.then_some(plan.target_root),
             )
-            .map_err(|e| QuilError::Internal(format!("stage sync chunk: {e}")))?;
+            .map_err(|e| {
+                sync_step_error(
+                    e,
+                    SyncStep {
+                        step: "stage sync chunk",
+                        shard: &plan.shard_id,
+                        phase: plan.phase_idx,
+                        bit_path_bits: plan.bit_path.len(),
+                        // The current version: a differing one returned above.
+                        base_version: plan.base_version,
+                        staged_version: version,
+                        chunk: plan.chunks,
+                        chunk_leaves: blobs.len(),
+                        planned_leaves: plan.leaves.len(),
+                        rebases: plan.rebases,
+                    },
+                )
+            })?;
         let txn = self.store.new_transaction(false)?;
         for (key, value) in staged.puts() {
             txn.set(key, value)?;
@@ -4371,6 +4454,7 @@ impl HypergraphCrdt {
         }
         plan.base_version = Some(version);
         plan.next += blobs.len();
+        plan.chunks = plan.chunks.saturating_add(1);
         if change == ScopeChange::Completed {
             self.sync_completed(&plan.shard_id);
         }
@@ -5193,7 +5277,23 @@ impl HypergraphCrdt {
                 bit_path,
                 src_subtree_root,
             )
-            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
+            .map_err(|e| {
+                sync_step_error(
+                    e,
+                    SyncStep {
+                        step: "apply synced subtree",
+                        shard: app,
+                        phase: phase_idx,
+                        bit_path_bits: bit_path.len(),
+                        base_version: cur_opt,
+                        staged_version: ver,
+                        chunk: 0,
+                        chunk_leaves: changed.len(),
+                        planned_leaves: changed.len(),
+                        rebases: 0,
+                    },
+                )
+            })?;
         let txn = self.store.new_transaction(false)?;
         for (k, v) in puts {
             txn.set(&k, &v)?;
@@ -8352,6 +8452,325 @@ mod commit_lock_wait_tests {
             waited >= Duration::from_millis(200),
             "the wait is counted: {waited:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_mismatch_log_tests {
+    use super::*;
+    use crate::testing::{CrdtTreeReader, MemStore, StubProver};
+    use std::sync::Mutex;
+
+    /// The lines logged at warn or above from now on. Installs this
+    /// process's subscriber (nextest runs each test in its own process).
+    fn capture_warnings() -> Arc<Mutex<Vec<u8>>> {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(lines.clone());
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .expect("no other subscriber in this test's process");
+        lines
+    }
+
+    fn location(app: [u8; 32], byte: u8) -> Location {
+        Location {
+            app_address: app,
+            data_address: [byte; 32],
+        }
+    }
+
+    const APP: [u8; 32] = [0x74; 32];
+
+    /// A store holding `APP`'s vertices `bytes` (each `[byte; 48]`),
+    /// committed, and its phase 0 head.
+    fn holding(bytes: &[u8]) -> (Arc<HypergraphCrdt>, u64, [u8; 32]) {
+        let crdt = Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        for &byte in bytes {
+            crdt.add_vertex(&location(APP, byte), &[byte; 48]).unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let (version, root) = crdt.serve_forest_head(&APP, 0).unwrap();
+        (crdt, version, root)
+    }
+
+    fn reader(source: &Arc<HypergraphCrdt>) -> CrdtTreeReader {
+        CrdtTreeReader {
+            source: source.clone(),
+            shard_id: APP.to_vec(),
+            phase: 0,
+        }
+    }
+
+    /// The source's blobs of the plan's next `count` leaves.
+    fn blobs(source: &HypergraphCrdt, plan: &ForestSyncPlan, count: usize) -> Vec<Vec<u8>> {
+        plan.remaining()[..count]
+            .iter()
+            .map(|(key, _)| {
+                source
+                    .get_vertex_data_checked(&location(APP, key[0]))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// The one captured line holding `text`, asserted to hold each field.
+    fn assert_one_line(logs: &Mutex<Vec<u8>>, text: &str, fields: &[String]) {
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs.lines().filter(|line| line.contains(text)).collect();
+        assert_eq!(lines.len(), 1, "one line: {logs}");
+        for field in fields {
+            assert!(lines[0].contains(field.as_str()), "{field}: {}", lines[0]);
+        }
+    }
+
+    /// The fields every step's line gives, each with its value (a
+    /// trailing space ends a value; `staged_root` ends the line). `phase`
+    /// and `bit_path_bits` hold their fields, `counts` the chunk, leaf and
+    /// rebase fields, `expected_root` its field.
+    fn mismatch_fields(
+        phase: &str,
+        bit_path_bits: &str,
+        base_version: u64,
+        counts: &str,
+        expected_root: String,
+        staged: &[u8; 32],
+    ) -> Vec<String> {
+        vec![
+            format!("shard={} ", hex::encode(APP)),
+            phase.into(),
+            bit_path_bits.into(),
+            format!("base_version=Some({base_version}) "),
+            format!("staged_version={} ", base_version + 1),
+            counts.into(),
+            expected_root,
+            format!("staged_root={}", hex::encode(&staged[..8])),
+        ]
+    }
+
+    const STAGE_MISMATCH: &str =
+        "stage sync chunk: reconstructed subtree differs from the authenticated source";
+
+    /// A sync's last chunk whose reconstructed subtree differs from the
+    /// source is refused, and one warning gives what separates the causes
+    /// operators' nodes report: the phase, the subtree's path length, the
+    /// versions, the chunk, the rebases taken and both roots.
+    #[test]
+    fn a_last_chunk_differing_from_its_source_is_logged_with_its_sync_context() {
+        let logs = capture_warnings();
+        let (source, version, root) = holding(&[0x10, 0x90]);
+        let target = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        let mut plan = target
+            .prepare_phase_sync(
+                &reader(&source),
+                version,
+                &APP,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        assert_eq!(plan.remaining().len(), 2, "two leaves to install");
+        let first = blobs(&source, &plan, 1);
+        target.apply_sync_chunk(&mut plan, &first).unwrap();
+        let base = plan.base_version.expect("the first chunk's version");
+        // A source root the reconstruction cannot reach.
+        plan.target_root = [0xee; 32];
+        let last = blobs(&source, &plan, 1);
+        let error = target.apply_sync_chunk(&mut plan, &last).unwrap_err();
+        assert!(error.to_string().contains(STAGE_MISMATCH), "{error}");
+        let fields = mismatch_fields(
+            "phase=0 ",
+            "bit_path_bits=0 ",
+            base,
+            "chunk=1 chunk_leaves=1 planned_leaves=2 rebases=0 ",
+            "expected_root=eeeeeeeeeeeeeeee ".into(),
+            &root,
+        );
+        assert_one_line(&logs, STAGE_MISMATCH, &fields);
+    }
+
+    /// After a local commit moved the tree under a sync and the sync was
+    /// rebased onto it, a last chunk differing from its source is logged
+    /// with the rebase counted and the rebased plan's leaves.
+    #[test]
+    fn a_last_chunk_differing_after_a_rebase_is_logged_with_the_rebase() {
+        let logs = capture_warnings();
+        let (source, version, root) = holding(&[0x10, 0x90]);
+        let target = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        let mut plan = target
+            .prepare_phase_sync(
+                &reader(&source),
+                version,
+                &APP,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let first = blobs(&source, &plan, 1);
+        target.apply_sync_chunk(&mut plan, &first).unwrap();
+        let before = plan.base_version;
+        // The node overwrites the installed leaf in a frame of its own.
+        target
+            .add_vertex(&location(APP, 0x10), b"local frame write")
+            .unwrap();
+        target.commit(2).unwrap();
+        assert_eq!(
+            target.rebase_phase_sync(&mut plan).unwrap(),
+            2,
+            "0x10 again, 0x90"
+        );
+        let base = plan.base_version.expect("the local commit's version");
+        assert_ne!(Some(base), before, "the rebase moved the plan's base");
+        plan.target_root = [0xee; 32];
+        let last = blobs(&source, &plan, 2);
+        let error = target.apply_sync_chunk(&mut plan, &last).unwrap_err();
+        assert!(error.to_string().contains(STAGE_MISMATCH), "{error}");
+        let fields = mismatch_fields(
+            "phase=0 ",
+            "bit_path_bits=0 ",
+            base,
+            "chunk=1 chunk_leaves=2 planned_leaves=2 rebases=1 ",
+            "expected_root=eeeeeeeeeeeeeeee ".into(),
+            &root,
+        );
+        assert_one_line(&logs, STAGE_MISMATCH, &fields);
+    }
+
+    /// A removes-phase sync under an unaligned child path (three bits)
+    /// whose last chunk differs from its source is logged with that phase
+    /// and the path's length: what separates a child path's mismatch from
+    /// an app root's.
+    #[test]
+    fn a_last_chunk_differing_under_a_child_path_is_logged_with_its_phase_and_path() {
+        let logs = capture_warnings();
+        let unified = || {
+            let crdt = Arc::new(HypergraphCrdt::new(
+                Arc::new(MemStore::new()),
+                Arc::new(StubProver),
+            ));
+            crdt.set_unified_tree(true);
+            crdt
+        };
+        let bits = [true, false, true];
+        // Two vertices under the path (0b101...) and one outside it, removed.
+        let source = unified();
+        for byte in [0xa1, 0xb2, 0x10] {
+            source
+                .add_vertex(&location(APP, byte), &[byte; 48])
+                .unwrap();
+        }
+        source.commit(1).unwrap();
+        for byte in [0xa1, 0xb2, 0x10] {
+            source.remove_vertex(&location(APP, byte)).unwrap();
+        }
+        source.commit(2).unwrap();
+        let (version, _) = source.serve_forest_head(&APP, 1).unwrap();
+        let reader = CrdtTreeReader {
+            source: source.clone(),
+            shard_id: APP.to_vec(),
+            phase: 1,
+        };
+        let target = unified();
+        let mut plan = target
+            .prepare_phase_sync(&reader, version, &APP, 1, &bits, None)
+            .unwrap();
+        let keys: Vec<u8> = plan.remaining().iter().map(|(key, _)| key[0]).collect();
+        assert_eq!(keys, [0xa1, 0xb2], "the two removals under the path");
+        // A removal's blob is empty.
+        let removal = vec![Vec::new()];
+        target.apply_sync_chunk(&mut plan, &removal).unwrap();
+        let base = plan.base_version.expect("the first chunk's version");
+        let source_root = plan.target_root;
+        plan.target_root = [0xee; 32];
+        let error = target.apply_sync_chunk(&mut plan, &removal).unwrap_err();
+        assert!(error.to_string().contains(STAGE_MISMATCH), "{error}");
+        let fields = mismatch_fields(
+            "phase=1 ",
+            "bit_path_bits=3 ",
+            base,
+            "chunk=1 chunk_leaves=1 planned_leaves=2 rebases=0 ",
+            "expected_root=eeeeeeeeeeeeeeee ".into(),
+            &source_root,
+        );
+        assert_one_line(&logs, STAGE_MISMATCH, &fields);
+    }
+
+    /// A target holding a leaf its source lacks: what a sync of the
+    /// source's two leaves reconstructs there, and the target's version.
+    fn target_with_an_extra_leaf() -> (Arc<HypergraphCrdt>, u64, [u8; 32]) {
+        let (target, base, _) = holding(&[0x50]);
+        let (_, _, reconstructed) = holding(&[0x10, 0x50, 0x90]);
+        (target, base, reconstructed)
+    }
+
+    /// A sync whose preview of the complete result differs from its source
+    /// is refused before any chunk, logged with its versions and both roots.
+    #[test]
+    fn a_preview_differing_from_its_source_is_logged_with_its_sync_context() {
+        let logs = capture_warnings();
+        let (source, version, root) = holding(&[0x10, 0x90]);
+        let (target, base, reconstructed) = target_with_an_extra_leaf();
+        let error = target
+            .prepare_phase_sync(&reader(&source), version, &APP, 0, &[], None)
+            .err()
+            .expect("the preview differs");
+        let text = "sync phase 0 reconstruction: reconstructed subtree differs from the \
+                    authenticated source";
+        assert!(error.to_string().contains(text), "{error}");
+        let fields = mismatch_fields(
+            "phase=0 ",
+            "bit_path_bits=0 ",
+            base,
+            "chunk=0 chunk_leaves=2 planned_leaves=2 rebases=0 ",
+            format!("expected_root={} ", hex::encode(&root[..8])),
+            &reconstructed,
+        );
+        assert_one_line(&logs, text, &fields);
+    }
+
+    /// A one-shot subtree sync whose result differs from its source is
+    /// refused, logged with its versions and both roots.
+    #[test]
+    fn an_applied_subtree_differing_from_its_source_is_logged_with_its_sync_context() {
+        let logs = capture_warnings();
+        let (source, version, root) = holding(&[0x10, 0x90]);
+        let (target, base, reconstructed) = target_with_an_extra_leaf();
+        let error = target
+            .sync_shard_subtree_phase_from(&reader(&source), version, &APP, 0, &[], None)
+            .unwrap_err();
+        let text = "apply synced subtree: reconstructed subtree differs from the authenticated \
+                    source";
+        assert!(error.to_string().contains(text), "{error}");
+        let fields = mismatch_fields(
+            "phase=0 ",
+            "bit_path_bits=0 ",
+            base,
+            "chunk=0 chunk_leaves=2 planned_leaves=2 rebases=0 ",
+            format!("expected_root={} ", hex::encode(&root[..8])),
+            &reconstructed,
+        );
+        assert_one_line(&logs, text, &fields);
     }
 }
 
