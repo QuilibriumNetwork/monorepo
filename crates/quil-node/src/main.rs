@@ -706,9 +706,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
     // using hardcoded Ed448 public keys, else the keys of the release
-    // source qclient stored in its install root. Fails closed; skipped on
-    // Windows and when --signature-check=false.
-    match release_check::self_check(args.signature_check) {
+    // source qclient stored in its install root. The signed label names
+    // this build's release or the executable's file name. Fails closed;
+    // skipped on Windows and when --signature-check=false.
+    let release = release_check::release_file_name("node");
+    match release_check::self_check_as(args.signature_check, &release) {
         Ok(SelfCheck::Verified(count)) => info!(
             valid_signatures = count,
             total_signatories = quil_config::SIGNATORIES.len(),
@@ -724,10 +726,13 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         }
         Ok(SelfCheck::Disabled) => info!("signature check disabled, skipping"),
         Err(e) => {
+            // A label refusal is a signed release of another file, never a
+            // build from source: its hint says so.
             error!(
                 error = %e,
+                release = %release,
                 "signature check failed — {}",
-                release_check::SELF_CHECK_HINT
+                e.hint()
             );
             return Err(anyhow::anyhow!("signature check failed: {}", e));
         }

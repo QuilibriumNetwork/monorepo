@@ -14,8 +14,11 @@
 //! 4. Refuses to start if fewer than `quorum_required(N_TOTAL)`
 //! signatures verified.
 //! 5. Refuses to start unless the signed `SHA3-256(<filename>)=` label
-//! names the executable's own file name, so a release signed for
-//! another version, type or platform does not pass under this name.
+//!    names the executable's own file name, so a release signed for
+//!    another version, type or platform does not pass under this name. The
+//!    node also accepts the label of its own release, named from its
+//!    compiled version and platform ([`release_file_name`]), so a release
+//!    installed under another name (`quilibrium-node`) starts.
 //!
 //! Quorum follows the Go formula `((N-4)/2) + ((N-4) % 2)`. With
 //! N=17, that's `(13/2)+(13%2) = 6 + 1 = 7`.
@@ -39,6 +42,12 @@ use std::path::{Path, PathBuf};
 pub const SELF_CHECK_HINT: &str = "are you running this from source? (use \
      --signature-check=false or QUILIBRIUM_SIGNATURE_CHECK=false)";
 
+/// What to do about a signed release whose label names another release
+/// ([`ReleaseCheckError::is_name_mismatch`]), for its error message.
+pub const NAME_MISMATCH_HINT: &str = "its signer published this binary under the name \
+     its label gives: install it under that file name, its .dgst and .dgst.sig.N files \
+     renamed alike, or install the release published for this version and platform";
+
 /// What [`self_check`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SelfCheck {
@@ -57,6 +66,17 @@ pub enum SelfCheck {
 /// ([`verify_release`]) unless `enabled` is false or the platform has no
 /// check. An error means the binary must not run.
 pub fn self_check(enabled: bool) -> Result<SelfCheck, ReleaseCheckError> {
+    self_check_named(enabled, None)
+}
+
+/// [`self_check`] for a binary built as `release`, the published file name
+/// of its release ([`release_file_name`]): a label naming it passes under
+/// any file name ([`verify_release_as`]).
+pub fn self_check_as(enabled: bool, release: &str) -> Result<SelfCheck, ReleaseCheckError> {
+    self_check_named(enabled, Some(release))
+}
+
+fn self_check_named(enabled: bool, release: Option<&str>) -> Result<SelfCheck, ReleaseCheckError> {
     if !enabled {
         return Ok(SelfCheck::Disabled);
     }
@@ -64,7 +84,7 @@ pub fn self_check(enabled: bool) -> Result<SelfCheck, ReleaseCheckError> {
         return Ok(SelfCheck::Unavailable);
     }
     let exe = std::env::current_exe().map_err(|source| ReleaseCheckError::ExePath { source })?;
-    verify_release(&exe, &SIGNATORIES, &owner_and_mode)
+    verify_release_named(&exe, &SIGNATORIES, &owner_and_mode, release)
 }
 
 /// Verify the release at `exe_path` under the `official` signatories, else,
@@ -77,10 +97,32 @@ pub fn verify_release(
     official: &[&str],
     stat: Stat,
 ) -> Result<SelfCheck, ReleaseCheckError> {
-    let official_err = match verify_release_signatures_with(exe_path, official) {
-        Ok(valid) => return Ok(SelfCheck::Verified(valid)),
-        Err(e) => e,
-    };
+    verify_release_named(exe_path, official, stat, None)
+}
+
+/// [`verify_release`] for a binary built as `release`, the published file
+/// name of its release ([`release_file_name`]): its signed label may name
+/// `release` instead of the executable's file name.
+pub fn verify_release_as(
+    exe_path: &Path,
+    official: &[&str],
+    stat: Stat,
+    release: &str,
+) -> Result<SelfCheck, ReleaseCheckError> {
+    verify_release_named(exe_path, official, stat, Some(release))
+}
+
+fn verify_release_named(
+    exe_path: &Path,
+    official: &[&str],
+    stat: Stat,
+    release: Option<&str>,
+) -> Result<SelfCheck, ReleaseCheckError> {
+    let official_err =
+        match verify_named(exe_path, official, quorum_required(official.len()), release) {
+            Ok(valid) => return Ok(SelfCheck::Verified(valid)),
+            Err(e) => e,
+        };
     let Some(file) = std::fs::canonicalize(exe_path)
         .ok()
         .and_then(|exe| install_source_file(&exe))
@@ -98,7 +140,7 @@ pub fn verify_release(
         }
     };
     let keys: Vec<&str> = source.keys.iter().map(String::as_str).collect();
-    match verify_release_signatures_quorum(exe_path, &keys, source.quorum) {
+    match verify_named(exe_path, &keys, source.quorum, release) {
         Ok(valid) => Ok(SelfCheck::VerifiedBySource { valid, file }),
         Err(under) => Err(ReleaseCheckError::NotUnderSource {
             official: Box::new(official_err),
@@ -108,32 +150,33 @@ pub fn verify_release(
     }
 }
 
-/// [`verify_release`] for a binary built as `release`, the published file
-/// name of its release ([`release_file_name`]).
-pub fn verify_release_as(
-    exe_path: &Path,
-    official: &[&str],
-    stat: Stat,
-    release: &str,
-) -> Result<SelfCheck, ReleaseCheckError> {
-    let _ = release;
-    verify_release(exe_path, official, stat)
-}
-
 /// The published file name of this build's `kind` release (`node`,
 /// `qclient`): `<kind>-<VERSION_STRING>-<os>-<arch>`, the platform spelled
 /// as Go spells it.
 pub fn release_file_name(kind: &str) -> String {
-    let os = match std::env::consts::OS {
+    let os = go_os(std::env::consts::OS);
+    let arch = go_arch(std::env::consts::ARCH);
+    format!("{kind}-{VERSION_STRING}-{os}-{arch}")
+}
+
+/// Rust's name of an OS (`std::env::consts::OS`) as Go's `runtime.GOOS`
+/// spells it in release names: `macos` is `darwin`.
+pub fn go_os(os: &str) -> &str {
+    match os {
         "macos" => "darwin",
         other => other,
-    };
-    let arch = match std::env::consts::ARCH {
+    }
+}
+
+/// Rust's name of an architecture (`std::env::consts::ARCH`) as Go's
+/// `runtime.GOARCH` spells it in release names: `x86_64` is `amd64`,
+/// `aarch64` is `arm64`.
+pub fn go_arch(arch: &str) -> &str {
+    match arch {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         other => other,
-    };
-    format!("{kind}-{VERSION_STRING}-{os}-{arch}")
+    }
 }
 
 /// The release source file of the install root holding `exe`, a release
@@ -190,13 +233,16 @@ pub enum ReleaseCheckError {
         total: usize,
     },
     #[error(
-        "digest file {path} is signed for another file ({label:?}), not {file}; run a release \
-         under its published file name"
+        "digest file {path} is signed for another release: label {label:?}, expected {}",
+        expected_labels(.expected, .file)
     )]
     NameMismatch {
         path: PathBuf,
         label: String,
+        /// The executable's file name.
         file: String,
+        /// The label this binary passes under.
+        expected: String,
     },
     #[error("{official}; nor under the stored release source: {detail}")]
     SourceRefused {
@@ -209,6 +255,43 @@ pub enum ReleaseCheckError {
         file: PathBuf,
         under: Box<ReleaseCheckError>,
     },
+}
+
+impl ReleaseCheckError {
+    /// Whether the official signatories or the stored release source
+    /// verified the binary and only its signed label refused it: a signed
+    /// release of another file, never a build from source.
+    pub fn is_name_mismatch(&self) -> bool {
+        match self {
+            Self::NameMismatch { .. } => true,
+            Self::SourceRefused { official, .. } => official.is_name_mismatch(),
+            Self::NotUnderSource {
+                official, under, ..
+            } => official.is_name_mismatch() || under.is_name_mismatch(),
+            _ => false,
+        }
+    }
+
+    /// What the operator does about this failed self-check:
+    /// [`NAME_MISMATCH_HINT`] for a label refusal, else [`SELF_CHECK_HINT`].
+    pub fn hint(&self) -> &'static str {
+        if self.is_name_mismatch() {
+            NAME_MISMATCH_HINT
+        } else {
+            SELF_CHECK_HINT
+        }
+    }
+}
+
+/// The labels a [`ReleaseCheckError::NameMismatch`] binary passes under:
+/// `expected`, and the label naming its own `file` when that differs.
+fn expected_labels(expected: &str, file: &str) -> String {
+    let own = format!("SHA3-256({file})=");
+    if expected == own {
+        format!("{expected:?}")
+    } else {
+        format!("{expected:?} or {own:?}")
+    }
 }
 
 /// Verify `<exe_path>`, `<exe_path>.dgst`, and `<exe_path>.dgst.sig.*`.
@@ -236,6 +319,17 @@ pub fn verify_release_signatures_quorum(
     exe_path: &Path,
     signatories_hex: &[&str],
     required: usize,
+) -> Result<usize, ReleaseCheckError> {
+    verify_named(exe_path, signatories_hex, required, None)
+}
+
+/// [`verify_release_signatures_quorum`] whose signed label may also name
+/// `release` instead of the executable's file name.
+fn verify_named(
+    exe_path: &Path,
+    signatories_hex: &[&str],
+    required: usize,
+    release: Option<&str>,
 ) -> Result<usize, ReleaseCheckError> {
     // A release runs through its symlink (/usr/local/bin/qclient); on macOS
     // `current_exe` returns the link. The release files sit beside, and the
@@ -325,10 +419,11 @@ pub fn verify_release_signatures_quorum(
     }
 
     let file = exe_path.file_name().unwrap_or_default().to_string_lossy();
-    if !label_names(label, &file) {
+    if !label_names(label, &file) && !release.is_some_and(|r| label_names(label, r)) {
         return Err(ReleaseCheckError::NameMismatch {
             path: dgst_path,
             label: label.chars().take(120).collect(),
+            expected: format!("SHA3-256({})=", release.unwrap_or(&*file)),
             file: file.into_owned(),
         });
     }
@@ -895,6 +990,241 @@ mod tests {
             checked.as_ref().ok(),
             Some(&SelfCheck::Verified(5)),
             "renamed_refused: {checked:?}"
+        );
+    }
+
+    /// A signed release labelled `signed_for`, installed as
+    /// `quilibrium-node`, is refused by the node's self-check on its label,
+    /// and the error names the label this build expects.
+    fn node_self_check_refuses(signed_for: &str, tag: &str) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let release = release_file_name("node");
+        assert_ne!(signed_for, release, "premise: another release");
+        let (signers, keys) = official_signers();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let exe = signed_as(tmp.path(), "quilibrium-node", signed_for, &signers);
+        let checked = verify_release_as(&exe, &keys, &root_only, &release);
+        println!("REACH release label check: {signed_for} as quilibrium-node: {checked:?}");
+        let Err(err) = checked else {
+            panic!("{tag}: {signed_for} passed as {release}");
+        };
+        assert!(err.is_name_mismatch(), "{err:?}");
+        match &err {
+            ReleaseCheckError::NameMismatch {
+                label, expected, ..
+            } => {
+                assert_eq!(label, &format!("SHA3-256({signed_for})="));
+                assert_eq!(expected, &format!("SHA3-256({release})="));
+            }
+            other => panic!("expected NameMismatch, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains(&format!("SHA3-256({release})=")),
+            "{err}"
+        );
+    }
+
+    /// This build's release name split as `(kind, version, os, arch)`.
+    fn node_release_parts() -> (String, String, String, String) {
+        let release = release_file_name("node");
+        let parts: Vec<&str> = release.split('-').collect();
+        assert_eq!(parts.len(), 4, "{release}");
+        assert_eq!(parts[1], VERSION_STRING);
+        (
+            parts[0].into(),
+            parts[1].into(),
+            parts[2].into(),
+            parts[3].into(),
+        )
+    }
+
+    /// A release signed for another version stays refused.
+    #[test]
+    fn the_node_self_check_refuses_another_versions_label() {
+        let (kind, _, os, arch) = node_release_parts();
+        node_self_check_refuses(
+            &format!("{kind}-1.0.0.0-{os}-{arch}"),
+            "other_version_passed",
+        );
+    }
+
+    /// A release signed for another platform stays refused.
+    #[test]
+    fn the_node_self_check_refuses_another_platforms_label() {
+        let (kind, version, os, arch) = node_release_parts();
+        let other = if arch == "amd64" { "arm64" } else { "amd64" };
+        node_self_check_refuses(
+            &format!("{kind}-{version}-{os}-{other}"),
+            "other_arch_passed",
+        );
+        let other = if os == "linux" { "darwin" } else { "linux" };
+        node_self_check_refuses(
+            &format!("{kind}-{version}-{other}-{arch}"),
+            "other_os_passed",
+        );
+    }
+
+    /// A qclient release stays refused by the node.
+    #[test]
+    fn the_node_self_check_refuses_a_qclient_label() {
+        let (_, version, os, arch) = node_release_parts();
+        node_self_check_refuses(&format!("qclient-{version}-{os}-{arch}"), "qclient_passed");
+    }
+
+    /// A release the stored release source signed, installed under another
+    /// name, passes the node's self-check on its release label too.
+    #[test]
+    fn a_source_signed_node_release_renamed_passes_the_node_self_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let release = release_file_name("node");
+        let dir = root.join("bin").join("node").join(VERSION_STRING);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sk, pk) = test_signer(0xC7);
+        let exe = signed_as(&dir, "quilibrium-node", &release, &[sk]);
+        store_source(&root, &pk);
+        let (_, official) = official_signers();
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let checked = verify_release_as(&exe, &official, &root_only, &release);
+        println!("REACH release label check: {release} under the source: {checked:?}");
+        assert_eq!(
+            checked.as_ref().ok(),
+            Some(&SelfCheck::VerifiedBySource {
+                valid: 1,
+                file: root.join(RELEASE_SOURCE_FILE),
+            }),
+            "source_renamed_refused: {checked:?}"
+        );
+    }
+
+    /// A label refusal under the stored source still reads as a signed
+    /// release of another file, not a build from source.
+    #[test]
+    fn a_label_refusal_is_a_name_mismatch_through_the_source() {
+        let mismatch = || ReleaseCheckError::NameMismatch {
+            path: PathBuf::from("x.dgst"),
+            label: "SHA3-256(y)=".into(),
+            file: "x".into(),
+            expected: "SHA3-256(x)=".into(),
+        };
+        let quorum = ReleaseCheckError::QuorumNotMet {
+            valid: 0,
+            required: 1,
+            total: 1,
+        };
+        assert!(mismatch().is_name_mismatch());
+        assert!(!quorum.is_name_mismatch());
+        let refused = ReleaseCheckError::SourceRefused {
+            official: Box::new(mismatch()),
+            detail: String::new(),
+        };
+        let not_under = ReleaseCheckError::NotUnderSource {
+            official: Box::new(mismatch()),
+            file: PathBuf::new(),
+            under: Box::new(quorum),
+        };
+        println!("REACH release label check: {refused}; {not_under}");
+        assert!(
+            refused.is_name_mismatch(),
+            "source_mismatch_lost: {refused}"
+        );
+        assert!(
+            not_under.is_name_mismatch(),
+            "source_mismatch_lost: {not_under}"
+        );
+    }
+
+    /// A label refusal names every label that passes, the compiled
+    /// release's and the file's own, and the operator's action; any other
+    /// refusal asks whether the binary is a build from source.
+    #[test]
+    fn a_label_refusal_names_the_labels_that_pass_and_the_action() {
+        let mismatch = |expected: &str| ReleaseCheckError::NameMismatch {
+            path: PathBuf::from("quilibrium-node.dgst"),
+            label: "SHA3-256(node-0.0.1-linux-amd64)=".into(),
+            file: "quilibrium-node".into(),
+            expected: expected.into(),
+        };
+        let renamed = mismatch("SHA3-256(node-2.1.0.25-linux-amd64)=").to_string();
+        assert!(
+            renamed.ends_with(
+                "expected \"SHA3-256(node-2.1.0.25-linux-amd64)=\" or \
+                 \"SHA3-256(quilibrium-node)=\""
+            ),
+            "{renamed}"
+        );
+        let own = mismatch("SHA3-256(quilibrium-node)=").to_string();
+        assert!(
+            own.ends_with("expected \"SHA3-256(quilibrium-node)=\""),
+            "{own}"
+        );
+        assert_eq!(mismatch("x").hint(), NAME_MISMATCH_HINT);
+        let quorum = ReleaseCheckError::QuorumNotMet {
+            valid: 0,
+            required: 1,
+            total: 1,
+        };
+        assert_eq!(quorum.hint(), SELF_CHECK_HINT);
+    }
+
+    /// A renamed release the stored release source signed for another
+    /// release is a signed release of another file, never a build from
+    /// source: the official signatories refuse it, and the source's
+    /// signature verifies but its label names another release.
+    #[test]
+    fn a_source_signed_release_of_another_file_is_a_name_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let release = release_file_name("node");
+        let (kind, _, os, arch) = node_release_parts();
+        let other = format!("{kind}-1.0.0.0-{os}-{arch}");
+        let dir = root.join("bin").join("node").join(VERSION_STRING);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sk, pk) = test_signer(0xC9);
+        let exe = signed_as(&dir, "quilibrium-node", &other, &[sk]);
+        store_source(&root, &pk);
+        let (_, official) = official_signers();
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let checked = verify_release_as(&exe, &official, &root_only, &release);
+        println!("REACH release label check: {other} under the source: {checked:?}");
+        let Err(err) = checked else {
+            panic!("premise: {other} passed as {release}");
+        };
+        assert!(
+            matches!(
+                &err,
+                ReleaseCheckError::NotUnderSource { official, under, .. }
+                    if !official.is_name_mismatch()
+                        && matches!(**under, ReleaseCheckError::NameMismatch { .. })
+            ),
+            "premise: refused on the source's label: {err:?}"
+        );
+        assert!(err.is_name_mismatch(), "source_label_lost: {err}");
+    }
+
+    /// Go's spelling of each release platform, on every host: the CI host
+    /// checks only its own.
+    #[test]
+    fn release_platforms_are_spelled_as_go_spells_them() {
+        let spelled = [
+            go_os("linux"),
+            go_os("macos"),
+            go_arch("x86_64"),
+            go_arch("aarch64"),
+        ];
+        println!("REACH release label check: platforms {spelled:?}");
+        assert_eq!(
+            spelled,
+            ["linux", "darwin", "amd64", "arm64"],
+            "go_spelling_wrong"
+        );
+        assert_eq!(
+            release_file_name("node"),
+            format!(
+                "node-{VERSION_STRING}-{}-{}",
+                go_os(std::env::consts::OS),
+                go_arch(std::env::consts::ARCH)
+            )
         );
     }
 
