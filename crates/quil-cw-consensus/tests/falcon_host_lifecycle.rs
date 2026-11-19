@@ -13,7 +13,9 @@ use commonware_p2p::Recipients;
 use commonware_utils::ordered::Set;
 use quil_cw_consensus::adapters::{BlockStore, FrameFinalizer, FrameSink, GlobalProposer};
 use quil_cw_consensus::app_cert::{verify_finalization_details, AppFinalization};
-use quil_cw_consensus::engine_host::{spawn_global_host, GlobalEngineParams, GlobalHostHandle};
+use quil_cw_consensus::engine_host::{
+    spawn_global_host, GlobalEngineParams, GlobalHostHandle, TEST_HANG,
+};
 use quil_cw_consensus::falcon_base::{FalconPrivateKey, FalconPublicKey};
 use quil_cw_consensus::falcon_simplex::SimplexFalconScheme;
 use quil_cw_consensus::p2p_bridge::inbound_message;
@@ -110,7 +112,7 @@ impl Committee {
 
 // A failed lifecycle must fail the test instead of hanging on JoinHandle::join.
 async fn join_hosts(threads: Vec<std::thread::JoinHandle<()>>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + TEST_HANG;
     while threads.iter().any(|thread| !thread.is_finished()) {
         assert!(
             Instant::now() < deadline,
@@ -148,8 +150,8 @@ async fn phase(
         }
         // Votes in flight when every member stops are lost, so a reopened
         // committee may have to time out the view it resumes in. At the
-        // standard 30 s leader timeout two such views exceed the phase budget;
-        // what is tested here is the reopened journal, not that timeout.
+        // standard 30 s leader timeout two such views take a minute; what is
+        // tested here is the reopened journal, not that timeout.
         let mut params =
             GlobalEngineParams::new("journal", 17, Digest([0; 32])).with_leader_timeout_secs(2);
         if let Some(floor) = &floor {
@@ -202,9 +204,13 @@ async fn phase(
         .map(|key| key.as_ref().to_vec())
         .collect();
     let mut tips = vec![0; committee.peers.len()];
-    let result = tokio::time::timeout(Duration::from_secs(60), async {
+    // Each finalization is progress: only a committee that stops finalizing
+    // reaches the bound.
+    let result = async {
         while tips.iter().any(|tip| *tip < target) {
-            let (member, digest, bytes) = rx.recv().await.expect("finalization report");
+            let (member, digest, bytes) = tokio::time::timeout(TEST_HANG, rx.recv())
+                .await?
+                .expect("finalization report");
             let cert = verify_finalization_details(&bytes, &keys, NAMESPACE, digest.0)
                 .unwrap()
                 .finalization;
@@ -218,7 +224,8 @@ async fn phase(
             certificates.insert(view, cert);
             tips[member] = tips[member].max(view);
         }
-    })
+        Ok::<_, tokio::time::error::Elapsed>(())
+    }
     .await;
     shutdown.store(true, Ordering::Release);
     join_hosts(threads).await;
@@ -319,7 +326,7 @@ fn production_host_drains_after_voter_panics_on_corrupt_journal() {
 /// before the timeout and after it: the timeout must bring a vote of its
 /// own, besides any notarize vote a running leader's proposal drew.
 #[test]
-fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
+fn present_members_of_a_stalled_committee_send_votes_when_the_view_times_out() {
     let directory = Directory::new();
     let committee = Committee::new(4);
     let store = BlockStore::new();
@@ -390,9 +397,19 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
                 .map(|count| count.load(Ordering::Relaxed))
                 .collect::<Vec<u64>>()
         };
+        // No view starts before its host, so none times out in the first
+        // 30 s; a count taken later only waits for the timeout's retry.
         tokio::time::sleep(Duration::from_secs(25)).await;
         let before_timeout = counts();
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        let silent = |sent: &[u64]| {
+            sent.iter()
+                .zip(&before_timeout)
+                .any(|(now, then)| now <= then)
+        };
+        let waiting = Instant::now();
+        while silent(&counts()) && waiting.elapsed() < TEST_HANG {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let sent = counts();
         shutdown.store(true, Ordering::Release);
         join_hosts(threads).await;
@@ -400,11 +417,10 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
             router.await.unwrap();
         }
         assert!(
-            sent.iter()
-                .zip(&before_timeout)
-                .all(|(after, before)| after > before),
-            "each running member sends a vote when the view times out, within 45 s: \
-             {before_timeout:?} after 25 s, {sent:?} after 45 s"
+            !silent(&sent),
+            "each running member sends a vote when the view times out: \
+             {before_timeout:?} after 25 s, {sent:?} {:?} later",
+            waiting.elapsed()
         );
     });
 }

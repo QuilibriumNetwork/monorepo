@@ -179,7 +179,7 @@ mod tests {
         digest_from_identity, BlockStore, Digest, FrameFinalizer, FrameSink, GlobalProposer,
         Recipients,
     };
-    use quil_cw_consensus::engine_host::{spawn_global_host, GlobalEngineParams};
+    use quil_cw_consensus::engine_host::{spawn_global_host, GlobalEngineParams, TEST_HANG};
     use quil_cw_consensus::p2p_bridge::inbound_message;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
@@ -267,7 +267,7 @@ mod tests {
     }
 
     async fn until(mut predicate: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(TEST_HANG, async {
             while !predicate() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -300,7 +300,7 @@ mod tests {
         }
         let mut channels = Vec::new();
         for _ in 0..3 {
-            let (channel, bytes) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            let (channel, bytes) = tokio::time::timeout(TEST_HANG, received.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -310,7 +310,7 @@ mod tests {
         channels.sort();
         assert_eq!(channels, vec![0, 1, 2]);
         drop(inputs);
-        tokio::time::timeout(Duration::from_secs(2), task)
+        tokio::time::timeout(TEST_HANG, task)
             .await
             .unwrap()
             .unwrap();
@@ -354,8 +354,8 @@ mod tests {
         until(|| starts.lock().unwrap().len() == 1).await;
         flags.lock().unwrap()[0].store(true, Ordering::Release);
         until(|| active.load(Ordering::SeqCst) == 0).await;
-        // Several restart backoffs (30 ms) long.
-        let ended = tokio::time::timeout(Duration::from_millis(500), task).await;
+        // A supervisor that replaced its host keeps running it.
+        let ended = tokio::time::timeout(TEST_HANG, task).await;
         assert_eq!(
             starts.lock().unwrap().len(),
             1,
@@ -386,14 +386,14 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            tokio::time::timeout(TEST_HANG, rx.recv())
                 .await
                 .unwrap()
                 .unwrap(),
             (1, vec![1])
         );
         drop(inputs);
-        tokio::time::timeout(Duration::from_secs(2), task)
+        tokio::time::timeout(TEST_HANG, task)
             .await
             .unwrap()
             .unwrap();
@@ -418,7 +418,7 @@ mod tests {
         );
         until(|| starts.lock().unwrap().len() == 1 && active.load(Ordering::SeqCst) == 0).await;
         drop(inputs);
-        tokio::time::timeout(Duration::from_secs(2), task)
+        tokio::time::timeout(TEST_HANG, task)
             .await
             .unwrap()
             .unwrap();
@@ -547,10 +547,9 @@ mod tests {
         );
         // Wait while the hosts work, failing once they have done nothing for
         // `STALL`: a bound on the whole run is a bound on the runner's load.
-        // It takes about 0.4 s beside other tests, and over 20 s on a host
-        // loaded past its CPUs (2026-11-03). A replacement that stops
-        // finalizing, or one failing again, still fails the test.
-        const STALL: Duration = Duration::from_secs(20);
+        // A replacement that stops finalizing, or one failing again, still
+        // fails the test.
+        const STALL: Duration = TEST_HANG;
         let mut last = (progress.load(Ordering::SeqCst), Instant::now());
         let mut finalized = 0;
         let result = loop {
@@ -576,7 +575,7 @@ mod tests {
         drop(inputs);
         // The host reads its flag every 250 ms, then drains its runtime; the
         // bound only catches a host or supervisor that never stops.
-        let stopped = tokio::time::timeout(Duration::from_secs(60), task).await;
+        let stopped = tokio::time::timeout(TEST_HANG, task).await;
         if let Err(stalled) = result {
             panic!("replacement must continue finalizing after the injected failure: {stalled}");
         }

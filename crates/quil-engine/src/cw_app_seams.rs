@@ -3135,7 +3135,7 @@ mod tests {
             outbound_task: tokio::spawn(std::future::pending()),
         };
         let joining = tokio::spawn(handle.shutdown_and_join());
-        tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
+        tokio::time::timeout(quil_cw_consensus::engine_host::TEST_HANG, observed_rx)
             .await
             .unwrap()
             .unwrap();
@@ -3144,7 +3144,7 @@ mod tests {
             "replacement must wait for runtime exit"
         );
         release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), joining)
+        tokio::time::timeout(quil_cw_consensus::engine_host::TEST_HANG, joining)
             .await
             .unwrap()
             .unwrap()
