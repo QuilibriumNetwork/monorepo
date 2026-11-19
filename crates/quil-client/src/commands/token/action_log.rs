@@ -538,10 +538,13 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
             serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
         ),
         TokenCommand::Merge {
-            coins, fee: given, ..
+            coins,
+            batch,
+            fee: given,
+            ..
         } => (
             "merge",
-            serde_json::json!({ "coins": coins, "fee": fee(given) }),
+            serde_json::json!({ "coins": coins, "batch": batch, "fee": fee(given) }),
         ),
         TokenCommand::Mint {
             claim: Some(path), ..
@@ -934,6 +937,35 @@ mod tests {
             (s(&["reject", &"ab".repeat(32), "--fee", "98765"]), "refund"),
             (s(&["merge", &"ab".repeat(32), &"cd".repeat(32)]), "merge"),
         ]
+    }
+
+    /// `merge --batch` and `merge all` record one kind; the start record's
+    /// `batch` field tells them apart for `token history`.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_batch_merge_records_its_batch_flag() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            token: super::super::TokenArgs,
+        }
+        for (arguments, batch) in [(["merge", "--batch"], true), (["merge", "all"], false)] {
+            let config = tempfile::tempdir().unwrap();
+            let log = ActionLog::new(config.path());
+            let command = Cli::try_parse_from([&["token"][..], &arguments[..]].concat())
+                .unwrap()
+                .token
+                .command;
+            let action = CliAction::with_log(Some(log.clone()), &command).unwrap();
+            assert!(action.finish(Ok(())).is_ok());
+            let start = &records(&log)[0];
+            assert_eq!(start["kind"], "merge");
+            assert_eq!(
+                start["batch"], batch,
+                "MERGE-BATCH-UNRECORDED: {arguments:?}"
+            );
+        }
     }
 
     /// Each CLI wallet command records its inputs and outcome in the

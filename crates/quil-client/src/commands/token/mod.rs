@@ -680,11 +680,20 @@ pub enum TokenCommand {
     /// the value a paid-mint token's `payment_address` must hold.
     #[cfg(feature = "native-proof")]
     PaymentAddress,
-    /// Merge several coins into one: `merge [all | <Coin>...]` (at most four per transaction).
+    /// Merge several coins into one: `merge [all | <Coin>...]` (at most four per transaction),
+    /// or `merge --batch` for every coin, four at a time.
     Merge {
         /// `all` (default), or coin identifiers (address or one-time key).
         coins: Vec<String>,
-        /// Fee in base units (default: conservative node estimate).
+        /// Merge every unspent coin four at a time, largest first, each group
+        /// into one coin, every group's paths from one coin scan. When GLOBAL
+        /// publishes roots faster than the merges prove, the run rescans and
+        /// plans the coins left, the merged outputs among them. Coins a merge
+        /// submitted in the last two hours are left out, so a rerun resumes;
+        /// one run at a time.
+        #[arg(long, conflicts_with = "coins")]
+        batch: bool,
+        /// Fee in base units per merge (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
         /// Seconds to wait for the global commit to decide it, then for the coins
@@ -1248,7 +1257,30 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 .await;
                 return action_log::CliAction::close(action, result);
             }
-            TokenCommand::Merge { coins, fee, wait } => {
+            TokenCommand::Merge {
+                batch: true,
+                fee,
+                wait,
+                ..
+            } => {
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_merge_batch(
+                        tc,
+                        &application,
+                        merge_fee(tc, &application, *fee).await?,
+                        args.page_cap(),
+                        args.max_coins,
+                        secs(*wait),
+                    )
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
+            }
+            TokenCommand::Merge {
+                coins, fee, wait, ..
+            } => {
                 let action = action_log::CliAction::start(&tc.config_dir, &args.command);
                 let result = async {
                     wallet::run_merge(

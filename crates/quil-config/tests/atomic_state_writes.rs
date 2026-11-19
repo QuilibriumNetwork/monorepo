@@ -42,8 +42,8 @@ const WRITERS: &[(&str, &str, &str)] = &[
     ),
     (
         "quil-client/src/commands/token/legacy.rs",
-        "record_shielded",
-        "shield-all journal",
+        "record_journaled",
+        "shield-all and token merge journals",
     ),
     (
         "quil-client/src/commands/node/nodeconfig.rs",
@@ -197,6 +197,12 @@ const OTHER_WRITES: &[(&str, &str, &str, &str)] = &[
         "switch_symlink",
         "rename(",
         "the installed binary's link, repointed as root",
+    ),
+    (
+        "quil-client/src/commands/token/wallet.rs",
+        "lock_merge_batch",
+        "OpenOptions::new(",
+        "opens the batch lock file only to hold its flock; writes no content",
     ),
 ];
 

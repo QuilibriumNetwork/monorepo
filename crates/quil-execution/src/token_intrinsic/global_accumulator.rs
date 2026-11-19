@@ -299,6 +299,22 @@ pub fn decode_root_history_record(blob: &[u8], context: &[u8; 32]) -> Result<Opt
         .transpose()
 }
 
+/// How many distinct roots the canonical root history in a root-history
+/// record blob (as a client reads it) published after `root` at `depth`: 0
+/// while current, `None` once evicted or when the record is cleared. A spend
+/// citing `root` is admitted while the history retains it.
+pub fn decode_root_history_age(
+    blob: &[u8],
+    context: &[u8; 32],
+    depth: u8,
+    root: &Node,
+) -> Result<Option<usize>> {
+    match decode_record(blob, &kind(ROOT_HISTORY_KIND)?, &[&[0]])? {
+        Some(fields) => roots::history_age(&fields[0], context, depth, root),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn read_index(
     state: &HypergraphState,
     application: &[u8; 32],
