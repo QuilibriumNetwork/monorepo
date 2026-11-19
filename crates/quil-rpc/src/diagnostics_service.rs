@@ -349,6 +349,10 @@ pub struct HealthInputs {
     pub store_space: Option<StoreSpace>,
     /// The machine this node runs on ([`crate::machine::current`]).
     pub machine: Option<Machine>,
+    /// The source commit this node was built from: its ID's bytes (empty
+    /// when the build could not read one) and whether tracked files
+    /// differed from it; `None` reports none.
+    pub build_commit: Option<(Vec<u8>, bool)>,
 }
 
 /// The disk space of this node's stores and storage labels: `master`, the
@@ -411,6 +415,11 @@ pub fn build_report(
         store_io: inputs.store_io.clone(),
         store_space: inputs.store_space,
         machine: inputs.machine,
+        build_commit: inputs.build_commit.as_ref().map(|(id, _)| id.clone()),
+        build_dirty: inputs
+            .build_commit
+            .as_ref()
+            .is_some_and(|(_, dirty)| *dirty),
         // Before the workers, within half the size bound; a peer gets no
         // kind local to this node.
         health: inputs
@@ -979,6 +988,24 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn the_report_carries_the_build_commit() {
+        let none = build_report(&HealthInputs::default(), &[], 1, Requester::Own);
+        assert_eq!((none.build_commit, none.build_dirty), (None, false));
+        let inputs = HealthInputs {
+            build_commit: Some((vec![0x12; 20], true)),
+            ..Default::default()
+        };
+        for requester in [Requester::Own, Requester::Peer(peer())] {
+            let report = build_report(&inputs, &[], 1, requester);
+            assert_eq!(
+                (report.build_commit, report.build_dirty),
+                (Some(vec![0x12; 20]), true),
+                "REPORT-COMMIT {requester:?}"
+            );
+        }
     }
 
     #[tokio::test]

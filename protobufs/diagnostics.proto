@@ -210,6 +210,12 @@ message HealthReport {
   StoreSpace store_space = 14;
   // The machine this node runs on; absent from nodes that predate it.
   Machine machine = 15;
+  // The source commit this node was built from: its object ID's bytes,
+  // empty when the build could not read one. Absent from nodes that
+  // predate it.
+  optional bytes build_commit = 16;
+  // Tracked files differed from that commit when the node was built.
+  bool build_dirty = 17;
 }
 
 // The machine a node runs on, read once per process: its model and CPU
