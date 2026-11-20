@@ -217,7 +217,7 @@ pub(super) fn claimed_payment(
 pub(super) async fn submit_paid(
     tc: &TokenCtx,
     wallet: &RecipientWallet,
-    bytes: Vec<u8>,
+    operation: RootChecked,
     payment: Option<(RecipientAddress, u128)>,
     wait: std::time::Duration,
     save: bool,
@@ -229,7 +229,7 @@ pub(super) async fn submit_paid(
     Box::pin(submit_paid_with(
         tc,
         wallet,
-        bytes,
+        operation,
         payment,
         wait,
         save,
@@ -257,7 +257,7 @@ pub(super) async fn submit_paid(
 pub(super) async fn submit_paid_with<Pay>(
     tc: &TokenCtx,
     wallet: &RecipientWallet,
-    bytes: Vec<u8>,
+    operation: RootChecked,
     payment: Option<(RecipientAddress, u128)>,
     wait: std::time::Duration,
     save: bool,
@@ -271,6 +271,7 @@ where
         Option<&BeforeSubmit<'_>>,
     ) -> anyhow::Result<[u8; 32]>,
 {
+    let bytes = operation.into_bytes();
     let submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
     let (domain, request) = wallet.prepare_submission(bytes.clone())?;
     let unpaid = PaidBundle {
