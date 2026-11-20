@@ -6092,6 +6092,35 @@ async fn one_batch_merge_runs_at_a_time_per_wallet() {
     drop(lock_merge_batch(directory.path()).expect("the lock ends with its run"));
 }
 
+/// The batch lock follows no link in its place: a user who may write the
+/// config directory plants one there naming nothing yet, and a root
+/// `token merge --batch` creates nothing where it points and is refused.
+#[cfg(all(unix, feature = "native-proof"))]
+#[test]
+fn a_link_at_the_batch_lock_creates_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("nologin");
+    let link = directory.path().join(MERGE_BATCH_LOCK);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+            && std::fs::symlink_metadata(&target).is_err(),
+        "the test plants a link naming nothing"
+    );
+    let locked = lock_merge_batch(directory.path());
+    eprintln!("REACH batch-lock-link locked={}", locked.is_ok());
+    assert!(
+        std::fs::symlink_metadata(&target).is_err(),
+        "LINK-CREATE-FOLLOWED: the batch lock created the file a planted link names"
+    );
+    let error = locked.expect_err("LINK-CREATE-FOLLOWED: the batch lock opened through a link");
+    assert!(error.to_string().contains("link"), "{error}");
+}
+
 /// A batch merge proved against a root GLOBAL no longer retains is dropped
 /// unjournaled, and as a merge from this scan was already submitted, the
 /// run rescans: the coins left (the journaled ones out) are replanned and

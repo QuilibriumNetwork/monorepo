@@ -845,6 +845,67 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "");
     }
 
+    /// The append follows no link swapped in after its check: a user who
+    /// may write the wallet directory puts a link naming nothing there
+    /// just after the check found no file, and the append creates nothing
+    /// where it points. The swaps race the appends, so they repeat up to
+    /// `ATTEMPTS` times, stopping at the first file created, and the name
+    /// must have taken both states while they ran.
+    #[test]
+    fn a_link_swapped_in_after_the_check_creates_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        const ATTEMPTS: u32 = 50_000;
+        let config = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let dir = config.path().join(DIR);
+        private::ensure_dir(&dir).unwrap();
+        let path = dir.join(FILE);
+        let target = elsewhere.path().join("nologin");
+        let stop = Arc::new(AtomicBool::new(false));
+        let swaps = Arc::new(AtomicU64::new(0));
+        let swapper = {
+            let (stop, swaps) = (stop.clone(), swaps.clone());
+            let (path, target, staged) = (path.clone(), target.clone(), dir.join("staged"));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // The name becomes a link naming nothing, then nothing.
+                    if symlink(&target, &staged).is_ok() && std::fs::rename(&staged, &path).is_ok()
+                    {
+                        swaps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            })
+        };
+        let (mut attempts, mut opened, mut refused) = (0u32, 0u32, 0u32);
+        while attempts < ATTEMPTS && std::fs::symlink_metadata(&target).is_err() {
+            attempts += 1;
+            match private::open_append(&path) {
+                Ok(_) => opened += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        let swaps = swaps.load(Ordering::Relaxed);
+        let created = std::fs::symlink_metadata(&target).is_ok();
+        eprintln!(
+            "REACH swapped-link attempts={attempts} opened={opened} refused={refused} \
+             swaps={swaps} created={created}"
+        );
+        assert!(
+            !created,
+            "LINK-CREATE-FOLLOWED: an append created the file a link swapped in after its \
+             check names ({attempts} attempts)"
+        );
+        assert!(
+            swaps > 0 && opened > 0 && refused > 0,
+            "the name never took both states while the appends ran: {swaps} swaps, \
+             {opened} opened, {refused} refused"
+        );
+    }
+
     /// A recorder stamps each record with its kind and source and ends with
     /// the outcome; after a refused write it writes nothing more and says
     /// why once.
