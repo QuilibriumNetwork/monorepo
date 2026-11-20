@@ -504,7 +504,7 @@ fn measure_with_store(
                 let start = Instant::now();
                 // A fresh output DB forces the production full-read/encode path on
                 // EVERY round even though the authenticated input roots are fixed.
-                let (count, _, _) = encode_leaf(
+                let (count, _) = encode_leaf(
                     &captured,
                     &options.member,
                     prefix,
