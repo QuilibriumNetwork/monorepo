@@ -15,7 +15,8 @@
 //! for a worker the closing session does not seat and the successor does, and
 //! while a hash storage proof record this node waits for is not in its view:
 //! its shard's snapshot, which a renewal encodes, its own registration, which
-//! it seals, or a seal or settlement it sent (its proposals commit roots only
+//! it seals, the frames a settlement proves (all recorded by its window's
+//! start), or a seal or settlement it sent (its proposals commit roots only
 //! once it sees its seal), and after this node's operator sends a prover
 //! operation, whose outcome the node and its operator read from this view. Early
 //! pulls are capped per epoch, with sub-caps for seals and successors; they
@@ -151,6 +152,14 @@ struct State {
     /// Spent budgets reported this epoch: all early pulls, the successors',
     /// the seals', the storage records', the operator's.
     reported: [bool; 5],
+    /// The GLOBAL frame whose state this process's prover registry reflects
+    /// ([`ViewRefresh::note_registry_view`]).
+    registry_view: Option<u64>,
+    /// Whether this process's prover registry is pulled from archives
+    /// ([`ViewRefresh::note_registry_pulled`]).
+    registry_pulled: bool,
+    /// The highest committed view seen ([`ViewRefresh::committed_view`]).
+    committed: Option<u64>,
 }
 
 /// The sync task's early-pull state, shared with the sessions that ask.
@@ -237,6 +246,42 @@ impl ViewRefresh {
                     && (gap_over || state.seal_skipped.map_or(true, |skipped| wanted > skipped))))
     }
 
+    /// This process's prover registry now reflects the state after GLOBAL
+    /// `frame`: the cursor a verified pull recorded, noted once the registry
+    /// was refreshed from that pull. Never moves back.
+    pub fn note_registry_view(&self, frame: u64) {
+        let mut state = self.lock();
+        state.registry_view = Some(state.registry_view.map_or(frame, |view| view.max(frame)));
+    }
+
+    /// The GLOBAL frame whose state this process's prover registry reflects
+    /// ([`Self::note_registry_view`]): `None` before the first verified pull
+    /// refreshed it, and where none is pulled.
+    pub fn registry_view(&self) -> Option<u64> {
+        self.lock().registry_view
+    }
+
+    /// This process's prover registry is pulled from archives (a regular
+    /// node, whose in-process workers read it): noted before its workers
+    /// start, so a view not yet pulled ([`Self::registry_view`] `None`) is
+    /// known as such from the start, not only once the first pull ends.
+    pub fn note_registry_pulled(&self) {
+        self.lock().registry_pulled = true;
+    }
+
+    /// Whether this process's prover registry is pulled from archives
+    /// ([`Self::note_registry_pulled`]).
+    pub fn registry_pulled(&self) -> bool {
+        self.lock().registry_pulled
+    }
+
+    /// The highest committed view [`Self::settle`] or [`Self::decide`] saw:
+    /// the frame the last pull's cursor reached, which the registry reflects
+    /// only once refreshed from it ([`Self::registry_view`]).
+    pub fn committed_view(&self) -> Option<u64> {
+        self.lock().committed
+    }
+
     /// The pending request of `reason`, if any.
     pub fn requested(&self, reason: Reason) -> Option<u64> {
         let state = self.lock();
@@ -253,6 +298,7 @@ impl ViewRefresh {
     pub fn settle(&self, view: u64) {
         let mut guard = self.lock();
         let state = &mut *guard;
+        state.committed = Some(state.committed.map_or(view, |seen| seen.max(view)));
         for slot in [
             &mut state.seal,
             &mut state.successor,
@@ -297,6 +343,7 @@ impl ViewRefresh {
         let (Some(view), Some(head)) = (view, head) else {
             return Decision::Idle;
         };
+        state.committed = Some(state.committed.map_or(view, |seen| seen.max(view)));
         let reach = head.saturating_sub(1);
         if state.running.is_some() || reach <= view {
             return Decision::Idle;
