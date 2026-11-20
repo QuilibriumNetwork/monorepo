@@ -527,6 +527,11 @@ fn claim(dir: &Path, n: u64) -> std::io::Result<Option<File>> {
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
         if is_at(&file, &path) {
+            // Stamped as claimed: one left by a process that exited
+            // without ending its claim dates that dead labelling instead
+            // ([`held_secs`]). Evidence only: a stamp that fails fails
+            // no labelling.
+            let _ = file.set_modified(std::time::SystemTime::now());
             return Ok(Some(file));
         }
     }
@@ -862,8 +867,8 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// How long ago the writer file at `path` was made: how long its claim
-/// has been held ([`claim`]).
+/// How long ago the writer file at `path` was claimed: how long its claim
+/// has been held ([`claim`] stamps it).
 fn held_secs(path: &Path) -> Option<u64> {
     let made = fs::metadata(path).and_then(|m| m.modified()).ok()?;
     Some(made.elapsed().map_or(0, |held| held.as_secs()))
@@ -2123,6 +2128,10 @@ impl LabelStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(e, _, _)| *e >= epoch);
+        self.busy_logged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(e, _)| *e >= epoch);
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -4630,6 +4639,73 @@ mod tests {
         assert!(store.find(9, &member, b"other", |_| true).is_some());
         store.evict_before(10);
         assert!(store.find(9, &member, leaf, |_| true).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A busy refusal dates the claim holding the count, not the writer
+    /// file a labelling that exited without ending its claim left
+    /// (2026-11-20: the claim reopened that file unstamped, so a refusal
+    /// named the dead labelling's age).
+    #[test]
+    fn a_busy_refusal_dates_the_claim_not_a_writer_file_left_before_it() {
+        let dir = temp_dir("held-age");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let other = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        fs::create_dir_all(&leaf_dir).unwrap();
+        let left = File::create(writer_path(&leaf_dir, n)).unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        left.set_modified(std::time::SystemTime::now() - day)
+            .unwrap();
+        drop(left);
+        let held = store
+            .admit(9, &member, leaf, n, Stage::Snapshot)
+            .expect("room");
+        let refusal = other
+            .admit_or_refusal(9, &member, leaf, n, Stage::Snapshot)
+            .err();
+        drop(held);
+        println!("REACH sector-floor");
+        let Some(Refusal::Busy {
+            elsewhere: true,
+            held_secs: Some(secs),
+            ..
+        }) = refusal
+        else {
+            panic!("HELD-AGE: no busy refusal naming its age: {refusal:?}");
+        };
+        assert!(
+            secs < 600,
+            "HELD-AGE: the claim is dated {secs} s ago, the left writer file's age"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Another process's hold, logged once a leaf and epoch, is forgotten
+    /// with its epoch's labels, as refusals are: the set stays bounded.
+    #[test]
+    fn a_hold_logged_once_is_forgotten_with_its_epoch() {
+        let dir = temp_dir("busy-logged");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let other = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        let held = store
+            .admit(9, &member, leaf, n, Stage::Snapshot)
+            .expect("room");
+        assert!(other.admit(9, &member, leaf, n, Stage::Snapshot).is_none());
+        drop(held);
+        assert_eq!(
+            other.busy_logged.lock().unwrap().len(),
+            1,
+            "the hold is logged"
+        );
+        other.evict_before(10);
+        println!("REACH sector-floor");
+        assert!(
+            other.busy_logged.lock().unwrap().is_empty(),
+            "BUSY-PRUNED: a hold logged once outlived its epoch"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
