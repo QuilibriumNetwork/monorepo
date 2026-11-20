@@ -235,16 +235,30 @@ fn dial_configured_peer(
     if listened.is_empty() || other.is_empty() {
         return ignore_dialing(swarm.dial(configured_dial(peer, addrs.to_vec())));
     }
+    two_stage_dial(|opts| swarm.dial(opts), fallback, peer, listened, other)
+}
+
+/// The first stage of configured peer `peer`'s dial over `listened`, with
+/// `other` kept for the second ([`dial_fallback`]); `dial` starts a dial.
+/// A dial refused because the peer is being dialed keeps nothing: that
+/// dial's connection would never end the entry.
+fn two_stage_dial(
+    mut dial: impl FnMut(DialOpts) -> Result<(), libp2p::swarm::DialError>,
+    fallback: &mut FallbackDials,
+    peer: PeerId,
+    listened: Vec<Multiaddr>,
+    other: Vec<Multiaddr>,
+) -> Result<(), libp2p::swarm::DialError> {
     let opts = configured_dial(peer, listened);
     let connection = opts.connection_id();
-    match swarm.dial(opts) {
+    match dial(opts) {
         Ok(()) => {
             fallback.insert(connection, (peer, other));
             Ok(())
         }
         Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => Ok(()),
         // Refused before any address was tried: try the others now.
-        Err(_) => ignore_dialing(swarm.dial(configured_dial(peer, other))),
+        Err(_) => ignore_dialing(dial(configured_dial(peer, other))),
     }
 }
 
@@ -258,12 +272,11 @@ fn dial_fallback(
     fallback: &mut FallbackDials,
     connection: libp2p::swarm::ConnectionId,
 ) {
-    let Some((peer, other)) = fallback.remove(&connection) else {
+    let Some((peer, other)) =
+        fallback_to_dial(fallback, connection, |peer| swarm.is_connected(peer))
+    else {
         return;
     };
-    if swarm.is_connected(&peer) {
-        return;
-    }
     debug!(%peer, addrs = ?other, "configured peer not reached over the listened family; dialing its other addresses");
     let opts = DialOpts::peer_id(peer)
         .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
@@ -273,6 +286,18 @@ fn dial_fallback(
     if let Err(e) = swarm.dial(opts) {
         debug!(%e, %peer, "configured peer's other addresses not dialed");
     }
+}
+
+/// The entry of failed first-stage dial `connection` (see
+/// [`dial_fallback`]), removed; `None` without one or once the peer is
+/// `connected` meanwhile.
+fn fallback_to_dial(
+    fallback: &mut FallbackDials,
+    connection: libp2p::swarm::ConnectionId,
+    connected: impl Fn(&PeerId) -> bool,
+) -> Option<(PeerId, Vec<Multiaddr>)> {
+    let (peer, other) = fallback.remove(&connection)?;
+    (!connected(&peer)).then_some((peer, other))
 }
 
 /// One dial of configured peer `peer` over `addrs` (see
@@ -2720,6 +2745,131 @@ mod tests {
             1,
             "extra bootstrap entries counted as peers"
         );
+    }
+
+    /// One [`two_stage_dial`] run by [`first_stage`].
+    struct FirstStage {
+        peer: PeerId,
+        result: Result<(), libp2p::swarm::DialError>,
+        /// Each dial's connection and `Debug` text, the only view of its
+        /// addresses.
+        dials: Vec<(libp2p::swarm::ConnectionId, String)>,
+        fallback: FallbackDials,
+    }
+
+    /// Runs [`two_stage_dial`] of a peer at one listened and one other
+    /// address, its first dial returning `first`.
+    fn first_stage(first: fn() -> Result<(), libp2p::swarm::DialError>) -> FirstStage {
+        let peer = PeerId::random();
+        let listened = vec!["/ip4/192.0.2.1/udp/8336/quic-v1".parse().unwrap()];
+        let other = vec!["/ip6/2001:db8::1/udp/8336/quic-v1".parse().unwrap()];
+        let mut fallback = FallbackDials::new();
+        let mut dials = Vec::new();
+        let result = two_stage_dial(
+            |opts| {
+                dials.push((opts.connection_id(), format!("{opts:?}")));
+                if dials.len() == 1 {
+                    first()
+                } else {
+                    Ok(())
+                }
+            },
+            &mut fallback,
+            peer,
+            listened,
+            other,
+        );
+        FirstStage {
+            peer,
+            result,
+            dials,
+            fallback,
+        }
+    }
+
+    /// A first stage that started keeps the other addresses by its
+    /// connection; one refused because the peer is being dialed keeps
+    /// nothing, as no event of that connection would end the entry, and
+    /// dials nothing more.
+    #[test]
+    fn a_first_stage_refused_as_dialing_keeps_no_fallback() {
+        let FirstStage {
+            peer,
+            result,
+            dials,
+            fallback,
+        } = first_stage(|| Ok(()));
+        assert!(result.is_ok());
+        assert_eq!(dials.len(), 1, "premise: one dial");
+        let (connection, _) = fallback
+            .iter()
+            .next()
+            .expect("a started dial kept no fallback");
+        assert_eq!((*connection, fallback[connection].0), (dials[0].0, peer));
+
+        let FirstStage {
+            result,
+            dials,
+            fallback,
+            ..
+        } = first_stage(|| {
+            Err(libp2p::swarm::DialError::DialPeerConditionFalse(
+                libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing,
+            ))
+        });
+        assert!(result.is_ok(), "a dial refused as dialing is a failure");
+        assert_eq!(dials.len(), 1, "a dial refused as dialing dialed again");
+        assert!(
+            fallback.is_empty(),
+            "a dial refused as dialing kept a fallback no event ends"
+        );
+    }
+
+    /// A first stage refused before any address was tried dials the other
+    /// addresses at once and keeps nothing.
+    #[test]
+    fn a_first_stage_refused_outright_dials_the_others_at_once() {
+        let FirstStage {
+            result,
+            dials,
+            fallback,
+            ..
+        } = first_stage(|| {
+            Err(libp2p::swarm::DialError::Denied {
+                cause: libp2p::swarm::ConnectionDenied::new("pending dial limit"),
+            })
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            dials.len(),
+            2,
+            "a refused first stage did not dial the other addresses at once"
+        );
+        assert!(dials[0].1.contains("/ip4/192.0.2.1/") && !dials[0].1.contains("2001:db8"));
+        assert!(dials[1].1.contains("/ip6/2001:db8::1/") && !dials[1].1.contains("192.0.2.1"));
+        assert!(fallback.is_empty(), "a refused first stage kept a fallback");
+    }
+
+    /// A failed first stage's entry is taken once; a peer connected
+    /// meanwhile is not dialed again.
+    #[test]
+    fn a_peer_connected_meanwhile_gets_no_second_stage() {
+        let peer = PeerId::random();
+        let other: Vec<Multiaddr> = vec!["/ip6/2001:db8::1/udp/8336/quic-v1".parse().unwrap()];
+        let connection = libp2p::swarm::ConnectionId::new_unchecked(7);
+        let mut fallback = FallbackDials::from([(connection, (peer, other.clone()))]);
+        assert_eq!(
+            fallback_to_dial(&mut fallback, connection, |_| true),
+            None,
+            "a peer connected meanwhile dialed again"
+        );
+        assert!(fallback.is_empty(), "a taken entry kept");
+        fallback.insert(connection, (peer, other.clone()));
+        assert_eq!(
+            fallback_to_dial(&mut fallback, connection, |_| false),
+            Some((peer, other))
+        );
+        assert_eq!(fallback_to_dial(&mut fallback, connection, |_| false), None);
     }
 
     /// An archive listed at its IPv4 and its IPv6 address, in the bootstrap
