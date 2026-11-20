@@ -86,7 +86,9 @@ pub struct P2PNode {
 /// What a node made of its configured peer lists, for the operator.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PeerListNotes {
-    /// Bootstrap peers `p2p.extraBootstrapPeers` added to the network's list.
+    /// Bootstrap peers `p2p.extraBootstrapPeers` added to the network's
+    /// list: peers it did not name, each once however many addresses it is
+    /// listed at ([`quil_config::distinct_peer_count`]).
     pub added_bootstrap_peers: usize,
     /// Each configured entry the node does not dial, with its config key.
     pub rejected: Vec<(&'static str, String)>,
@@ -416,13 +418,16 @@ impl P2PNode {
         // the dial list is built, so a saved config keeps both as written.
         let (extra_bootstrap_peers, rejected_extra) =
             parse_peer_multiaddrs(&config.extra_bootstrap_peers);
-        let mut added_bootstrap_peers = 0;
+        let peers = |entries: &[(PeerId, Multiaddr)]| {
+            quil_config::distinct_peer_count(entries.iter().map(|(_, addr)| addr.to_string()))
+        };
+        let network_peers = peers(&bootstrap_peers);
         for peer in extra_bootstrap_peers {
             if !bootstrap_peers.contains(&peer) {
                 bootstrap_peers.push(peer);
-                added_bootstrap_peers += 1;
             }
         }
+        let added_bootstrap_peers = peers(&bootstrap_peers) - network_peers;
         // Operator-configured direct peers (e.g. the genesis global
         // archives). Parsed identically to bootstrap peers; entries must
         // carry a `/p2p/<peer-id>` segment so we can pin them by PeerId.
@@ -2687,6 +2692,33 @@ mod tests {
                 ],
             },
             "an entry no node dials counted or not named"
+        );
+    }
+
+    /// `p2p.extraBootstrapPeers` counts peers, not entries: one extra peer
+    /// at both families adds one peer, another address of a listed peer
+    /// none, though both entries are dialed.
+    #[test]
+    fn extra_bootstrap_peers_are_counted_in_peers() {
+        let own = PeerId::random();
+        let extra = PeerId::random();
+        let entry = |addr: &str, peer: PeerId| format!("{addr}/udp/8336/quic-v1/p2p/{peer}");
+        let config = P2PConfig {
+            network: 99,
+            bootstrap_peers: vec![entry("/ip4/192.0.2.1", own)],
+            extra_bootstrap_peers: vec![
+                entry("/ip4/192.0.2.2", extra),
+                entry("/ip6/2001:db8::2", extra),
+                entry("/ip6/2001:db8::1", own),
+            ],
+            ..P2PConfig::default()
+        };
+        let node = P2PNode::new_with_options(&config, true, None).unwrap();
+        assert_eq!(node.bootstrap_peers.len(), 4, "premise: every entry kept");
+        assert_eq!(
+            node.peer_list_notes().added_bootstrap_peers,
+            1,
+            "extra bootstrap entries counted as peers"
         );
     }
 

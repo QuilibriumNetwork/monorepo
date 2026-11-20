@@ -216,15 +216,27 @@ pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
     "/ip6/2606:c700:8410:62:a236:9fff:fee8:88cc/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
 ];
 
-/// How many archives [`MAINNET_BOOTSTRAP_PEERS`] names: its distinct peer
-/// IDs, as it lists each archive once per address family.
-pub(crate) fn mainnet_bootstrap_archive_count() -> usize {
-    MAINNET_BOOTSTRAP_PEERS
-        .iter()
-        .filter_map(|entry| entry.rsplit_once("/p2p/"))
-        .map(|(_, peer)| peer)
+/// How many peers the multiaddr `entries` name: their distinct
+/// `/p2p/<peer-id>` segments (the last of each entry). A peer listed at
+/// several addresses, such as an archive at both address families, is one
+/// peer; an entry without the segment names none.
+pub fn distinct_peer_count<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> usize {
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (_, peer) = entry.as_ref().trim().rsplit_once("/p2p/")?;
+            let peer = peer.split('/').next().unwrap_or_default();
+            (!peer.is_empty()).then(|| peer.to_owned())
+        })
         .collect::<std::collections::BTreeSet<_>>()
         .len()
+}
+
+/// How many archives [`MAINNET_BOOTSTRAP_PEERS`] names: its distinct peers
+/// ([`distinct_peer_count`]), as it lists each archive once per address
+/// family.
+pub(crate) fn mainnet_bootstrap_archive_count() -> usize {
+    distinct_peer_count(MAINNET_BOOTSTRAP_PEERS)
 }
 
 /// The mainnet bootstrap list releases before the IPv6 entries built in.
@@ -248,9 +260,10 @@ pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] =
 
 /// How many configured bootstrap peers [`P2PConfig::apply_defaults`]
 /// replaces with [`MAINNET_BOOTSTRAP_PEERS`]: the number of distinct
-/// configured entries on mainnet when they differ from the built-in list
-/// and from [`EARLIER_MAINNET_BOOTSTRAP_PEERS`], otherwise `None` (another
-/// network, an empty list or the same peers).
+/// configured peers ([`distinct_peer_count`]) on mainnet when the entries
+/// differ from the built-in list and from
+/// [`EARLIER_MAINNET_BOOTSTRAP_PEERS`], otherwise `None` (another network,
+/// an empty list or the same entries).
 pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> Option<usize> {
     if network != 0 || configured.is_empty() {
         return None;
@@ -259,7 +272,7 @@ pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> O
     let configured: BTreeSet<&str> = configured.iter().map(|peer| peer.trim()).collect();
     let same = |list: &[&str]| configured == list.iter().copied().collect::<BTreeSet<_>>();
     let differs = !same(MAINNET_BOOTSTRAP_PEERS) && !same(EARLIER_MAINNET_BOOTSTRAP_PEERS);
-    differs.then_some(configured.len())
+    differs.then(|| distinct_peer_count(&configured))
 }
 
 impl P2PConfig {
@@ -456,6 +469,33 @@ mod tests {
         assert_eq!(ipv4.len(), 4, "IPv4 archive entries");
         assert_eq!(ipv6, ipv4, "an archive without its IPv6 entry");
         assert_eq!(MAINNET_BOOTSTRAP_PEERS.len(), ipv4.len() + ipv6.len());
+    }
+
+    /// A replaced list is counted in peers, not entries: an archive listed
+    /// at both address families is one peer, an entry without a peer id
+    /// none.
+    #[test]
+    fn a_replaced_bootstrap_list_counts_peers_not_entries() {
+        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        let archives = ipv4_entries().len();
+        let mut entries = built_in[..built_in.len() - 1].to_vec();
+        entries.push("/ip4/192.0.2.1/udp/8336/quic-v1".into());
+        assert!(
+            entries.len() > archives + 1,
+            "premise: archives listed twice"
+        );
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &entries),
+            Some(archives),
+            "a replaced list counted in entries, not peers"
+        );
+        assert_eq!(
+            distinct_peer_count(["/p2p/QmA/p2p-circuit/p2p/QmB", " /p2p/QmB "]),
+            1
+        );
     }
 
     /// A config saved by a release whose built-in list held the IPv4

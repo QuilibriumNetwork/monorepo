@@ -902,9 +902,11 @@ p2p:
             built_in[0].clone(),
         ];
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &stale), Some(2));
+        // Dropping one entry still names every archive: one per family.
+        let archives = built_in.iter().filter(|e| e.starts_with("/ip4/")).count();
         assert_eq!(
             replaced_mainnet_bootstrap_peers(0, &built_in[1..]),
-            Some(built_in.len() - 1)
+            Some(archives)
         );
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &[]), None);
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &built_in), None);
