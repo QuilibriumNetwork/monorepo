@@ -1001,6 +1001,7 @@ fn page_fixed_vertices_at_snapshot(
     after: Option<&[u8; 32]>,
     limits: quil_types::store::VertexPageLimits,
     skip: &dyn Fn(&[u8; 32]) -> bool,
+    fill_cache: bool,
 ) -> Result<quil_types::store::VertexDataPage> {
     use quil_types::store::VertexDataPage;
     if limits.max_entries == 0 || limits.max_bytes < 64 {
@@ -1036,8 +1037,8 @@ fn page_fixed_vertices_at_snapshot(
         }
         key
     };
-    let mut legacy = snapshot.raw_cursor();
-    let mut versioned = snapshot.raw_cursor();
+    let mut legacy = snapshot.raw_cursor(fill_cache);
+    let mut versioned = snapshot.raw_cursor(fill_cache);
     legacy.seek(start(&legacy_prefix));
     versioned.seek(start(&versioned_prefix));
     // None for the blob records an oversized row without copying it. That
@@ -1288,6 +1289,29 @@ macro_rules! impl_hypergraph_snapshot {
                     after,
                     limits,
                     &|_| false,
+                    true,
+                )
+            }
+
+            fn page_vertex_underlying_fixed_for_scan(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                after: Option<&[u8; 32]>,
+                limits: quil_types::store::VertexPageLimits,
+            ) -> Result<quil_types::store::VertexDataPage> {
+                page_fixed_vertices_at_snapshot(
+                    &self.snapshot,
+                    set_type,
+                    phase_type,
+                    shard,
+                    domain,
+                    after,
+                    limits,
+                    &|_| false,
+                    false,
                 )
             }
 
@@ -1310,6 +1334,7 @@ macro_rules! impl_hypergraph_snapshot {
                     after,
                     limits,
                     skip,
+                    true,
                 )
             }
 

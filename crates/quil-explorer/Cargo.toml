@@ -9,6 +9,7 @@ description = "In-process read-only explorer REST API over the node's live store
 quil-types = { path = "../quil-types" }
 quil-forest = { path = "../quil-forest" }
 quil-hypergraph = { path = "../quil-hypergraph" }
+quil-store = { path = "../quil-store" }
 quil-execution = { path = "../quil-execution" }
 # Reads the signer bitmap of an applied app frame's CW certificate.
 quil-cw-consensus = { path = "../quil-cw-consensus" }
@@ -34,7 +35,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 # The ignored production-index measurement opens a node store read-only
 # and wires the explorer over it as an archive does.
-quil-store = { path = "../quil-store" }
 quil-engine = { path = "../quil-engine" }
 quil-forest-migrate = { path = "../quil-forest-migrate" }
 # It reads the QUIL grid from an archive once, under a throwaway key.

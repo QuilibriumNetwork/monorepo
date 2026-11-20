@@ -34,7 +34,10 @@ use quil_forest::{
 };
 use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{HypergraphStore, RecordMutation, ShardKey};
+use quil_types::store::{
+    HypergraphStore, RecordMutation, ShardKey,
+    LOCAL_VERTEX_COMMIT_KEYS_LIMIT as MAX_EXECUTION_OBSERVER_KEYS,
+};
 
 use crate::addressing::{shard_key_for_location, Location};
 
@@ -823,6 +826,221 @@ pub type LineageRecord = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
 /// before (`None`: absent).
 type SizePreImages = HashMap<Vec<u8>, Option<(u64, i128)>>;
 
+#[cfg(test)]
+mod supply_observer_tests {
+    use super::*;
+    use quil_types::store::LocalVertexCommitObserver;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Observer {
+        removed: std::sync::Mutex<Vec<Vec<u8>>>,
+        invalidations: AtomicUsize,
+        panic_after_first: bool,
+    }
+
+    impl Observer {
+        fn new(panic_after_first: bool) -> Self {
+            Self {
+                removed: std::sync::Mutex::new(Vec::new()),
+                invalidations: AtomicUsize::new(0),
+                panic_after_first,
+            }
+        }
+    }
+
+    impl LocalVertexCommitObserver for Observer {
+        fn committed<'a>(&self, _: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {}
+
+        fn removed<'a>(&self, keys: &mut dyn Iterator<Item = &'a [u8]>) {
+            for key in keys {
+                self.removed.lock().unwrap().push(key.to_vec());
+                assert!(!self.panic_after_first, "simulated cache failure");
+            }
+        }
+
+        fn watches_sync(&self, app: &[u8]) -> bool {
+            app == [7; 32]
+        }
+        fn invalidated(&self) {
+            self.invalidations.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn removal_chain_replays_consumed_prefix_after_observer_panic() {
+        let first = Arc::new(Observer::new(true));
+        let second = Arc::new(Observer::new(false));
+        let chain = ChainedLocalVertexObserver {
+            first,
+            second: second.clone(),
+        };
+        let keys = [[1; 64], [2; 64]];
+        chain.removed(&mut keys.iter().map(|key| key.as_slice()));
+        assert_eq!(
+            *second.removed.lock().unwrap(),
+            keys.iter().map(|key| key.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn execution_keys_are_bounded_deduplicated_and_filtered_before_overflow() {
+        struct KeyObserver;
+        impl LocalVertexCommitObserver for KeyObserver {
+            fn committed<'a>(&self, _: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {}
+            fn execution_key_domains(&self) -> &'static [[u8; 32]] {
+                &[[7; 32]]
+            }
+        }
+        let mut changes = ExecutionVertexChanges::new(Arc::new(KeyObserver)).unwrap();
+        let mut key = [8; 64];
+        for n in 0..=MAX_EXECUTION_OBSERVER_KEYS {
+            key[32..40].copy_from_slice(&(n as u64).to_be_bytes());
+            changes.record(&key);
+        }
+        assert!(changes.keys.is_empty());
+        assert!(!changes.overflowed);
+        key[..32].fill(7);
+        // The consumer accepts at most 16,384 distinct addresses per adoption.
+        for n in 0..16_384 {
+            key[32..40].copy_from_slice(&(n as u64).to_be_bytes());
+            changes.record(&key);
+            changes.record(&key);
+        }
+        assert_eq!(changes.keys.len(), 16_384);
+        assert!(!changes.overflowed);
+        key[32..40].copy_from_slice(&16_384u64.to_be_bytes());
+        changes.record(&key);
+        assert!(changes.keys.is_empty());
+        assert!(changes.overflowed);
+        changes.record(&[7; 64]);
+        assert!(changes.keys.is_empty());
+    }
+
+    #[test]
+    fn vertex_removes_sync_invalidates_only_interested_observers() {
+        let crdt = HypergraphCrdt::new(
+            Arc::new(crate::testing::MemStore::new()),
+            Arc::new(crate::testing::StubProver),
+        );
+        let observer = Arc::new(Observer::new(false));
+        crdt.set_local_vertex_observer(observer.clone());
+        crdt.invalidate_local_observer_after_sync(&[7; 32], 1);
+        assert_eq!(observer.invalidations.load(Ordering::Acquire), 1);
+        crdt.invalidate_local_observer_after_sync(&[8; 32], 1);
+        crdt.invalidate_local_observer_after_sync(&[7; 32], 2);
+        assert_eq!(observer.invalidations.load(Ordering::Acquire), 1);
+    }
+}
+
+struct ChainedLocalVertexObserver {
+    first: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    second: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+}
+
+impl quil_types::store::LocalVertexCommitObserver for ChainedLocalVertexObserver {
+    fn committed<'a>(&self, vertices: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {
+        let mut consumed = Vec::new();
+        let mut first = (&mut *vertices).inspect(|vertex| consumed.push(*vertex));
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.first.committed(&mut first)
+        }))
+        .is_err()
+        {
+            tracing::warn!("first local vertex observer panicked after durable commit");
+        }
+        drop(first);
+        self.second
+            .committed(&mut consumed.into_iter().chain(vertices));
+    }
+
+    fn removed<'a>(&self, keys: &mut dyn Iterator<Item = &'a [u8]>) {
+        let mut consumed = Vec::new();
+        let mut first = (&mut *keys).inspect(|key| consumed.push(*key));
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.first.removed(&mut first)
+        }))
+        .is_err()
+        {
+            tracing::warn!("first local vertex removal observer panicked after durable commit");
+        }
+        drop(first);
+        self.second.removed(&mut consumed.into_iter().chain(keys));
+    }
+
+    fn watches_sync(&self, app: &[u8]) -> bool {
+        self.first.watches_sync(app) || self.second.watches_sync(app)
+    }
+
+    fn invalidated(&self) {
+        self.first.invalidated();
+        self.second.invalidated();
+    }
+}
+
+// Optional, per-observer execution journals. They contain addresses only, and
+// grow only for apps the observer opted into. Overflow degrades that observer
+// to one invalidation at publication, never a failed canonical execution.
+#[derive(Clone)]
+struct ExecutionVertexChanges {
+    observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    domains: &'static [[u8; 32]],
+    keys: std::collections::BTreeSet<[u8; 64]>,
+    overflowed: bool,
+    max_keys: usize,
+}
+
+impl ExecutionVertexChanges {
+    fn new(observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>) -> Option<Self> {
+        let domains = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.execution_key_domains()
+        }))
+        .ok()?;
+        if domains.is_empty() {
+            return None;
+        }
+        Some(Self {
+            observer,
+            domains,
+            keys: Default::default(),
+            overflowed: false,
+            max_keys: MAX_EXECUTION_OBSERVER_KEYS,
+        })
+    }
+
+    fn clone_bounded(&self, max_keys: usize) -> Self {
+        let overflowed = self.overflowed || self.keys.len() > max_keys;
+        Self {
+            observer: self.observer.clone(),
+            domains: self.domains,
+            keys: if overflowed {
+                Default::default()
+            } else {
+                self.keys.clone()
+            },
+            overflowed,
+            max_keys,
+        }
+    }
+
+    fn record(&mut self, key: &[u8]) {
+        if self.overflowed || key.len() != 64 || !self.watches_app(key) {
+            return;
+        }
+        let key: [u8; 64] = key.try_into().expect("checked address width");
+        if self.keys.len() == self.max_keys && !self.keys.contains(&key) {
+            self.keys.clear();
+            self.overflowed = true;
+        } else {
+            self.keys.insert(key);
+        }
+    }
+
+    fn watches_app(&self, app: &[u8]) -> bool {
+        app.get(..32)
+            .is_some_and(|app| self.domains.iter().any(|domain| domain.as_slice() == app))
+    }
+}
+
 /// The forest-native hypergraph CRDT.
 pub struct HypergraphCrdt {
     /// Key-value store: per-vertex blobs, the shard-commit cache, the cursor.
@@ -940,6 +1158,10 @@ pub struct HypergraphCrdt {
     /// Snapshot-generation registry for sync `expected_root` gating.
     snapshot_mgr: SnapshotManager,
     local_vertex_observer: RwLock<Option<Arc<dyn quil_types::store::LocalVertexCommitObserver>>>,
+    // Keep the registered leaves so adoption never forwards a keys-only
+    // notification to an uninterested legacy/witness observer in a chain.
+    local_vertex_key_observers: RwLock<Vec<Arc<dyn quil_types::store::LocalVertexCommitObserver>>>,
+    execution_vertex_changes: Option<std::sync::Mutex<Vec<ExecutionVertexChanges>>>,
     /// Covered nibble prefix (address gating). Empty = accept all.
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes mutation batches, commits and coordinated forest updates.
@@ -1098,6 +1320,8 @@ impl HypergraphCrdt {
             size_warm_lock: std::sync::Mutex::new(()),
             snapshot_mgr: SnapshotManager::new(),
             local_vertex_observer: RwLock::new(None),
+            local_vertex_key_observers: RwLock::new(Vec::new()),
+            execution_vertex_changes: None,
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: CommitLock::default(),
             unified_tree: AtomicBool::new(false),
@@ -1110,7 +1334,72 @@ impl HypergraphCrdt {
         &self,
         observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
     ) {
-        *self.local_vertex_observer.write().unwrap() = Some(observer);
+        let mut slot = self.local_vertex_observer.write().unwrap();
+        *self.local_vertex_key_observers.write().unwrap() = vec![observer.clone()];
+        *slot = Some(observer);
+    }
+
+    /// Add a local cache observer without replacing the existing witness
+    /// observer. The first observer may consume only a prefix of the stream;
+    /// the second still receives every committed vertex.
+    pub fn add_local_vertex_observer(
+        &self,
+        observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    ) {
+        let mut slot = self.local_vertex_observer.write().unwrap();
+        self.local_vertex_key_observers
+            .write()
+            .unwrap()
+            .push(observer.clone());
+        let previous = slot.take();
+        *slot = Some(match previous {
+            Some(first) => Arc::new(ChainedLocalVertexObserver {
+                first,
+                second: observer,
+            }),
+            None => observer,
+        });
+    }
+
+    /// Invalidate interested caches after an out-of-band shard wipe. Call
+    /// under the same forest-write barrier as the reset, before readers can
+    /// capture the changed database. Private execution has no live observers.
+    pub fn invalidate_local_vertex_observer_for_app(&self, app: &[u8]) {
+        if let Some(changes) = &self.execution_vertex_changes {
+            if let Ok(mut changes) = changes.lock() {
+                for change in changes.iter_mut() {
+                    // A branch-local wipe cannot enumerate all removed keys.
+                    // Defer invalidation to adoption, just like key deltas.
+                    if change.watches_app(app) {
+                        change.keys.clear();
+                        change.overflowed = true;
+                    }
+                }
+            }
+        }
+        let observers = self
+            .local_vertex_key_observers
+            .read()
+            .ok()
+            .map(|observers| observers.clone())
+            .unwrap_or_default();
+        for observer in observers {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if observer.watches_sync(app) {
+                    observer.invalidated();
+                }
+            }))
+            .is_err()
+            {
+                tracing::warn!("local vertex reset observer panicked after durable reset");
+            }
+        }
+    }
+
+    fn invalidate_local_observer_after_sync(&self, app: &[u8], phase: usize) {
+        if phase <= 1 {
+            self.invalidate_local_vertex_observer_for_app(app);
+        }
     }
 
     /// Enable/disable [`unified_tree`](Self::unified_tree) mode. Flag-day gated in
@@ -2068,6 +2357,11 @@ impl HypergraphCrdt {
             .for_each_vertex_underlying(set_type, phase_type, shard, cb)
     }
 
+    /// Read candidate application domains from persisted vertex-adds roots.
+    pub fn vertex_adds_domains(&self) -> Result<Vec<[u8; 32]>> {
+        self.store.range_vertex_adds_domains()
+    }
+
     // ---- commit ---------------------------------------------------------
 
     pub fn commit(&self, frame_number: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
@@ -2521,6 +2815,27 @@ impl HypergraphCrdt {
             .unwrap()
             .extend(global_versions);
         self.shard_metadata.write().unwrap().extend(shard_metadata);
+        if let Some(changes) = &self.execution_vertex_changes {
+            // Only this private CRDT owns these journals. No callback escapes
+            // until its overlay is successfully committed and adopted.
+            if let Ok(mut changes) = changes.lock() {
+                for change in changes.iter_mut() {
+                    if change.overflowed {
+                        continue;
+                    }
+                    'groups: for ((_, phase), blobs) in pending_blobs.iter() {
+                        if *phase <= 1 {
+                            for key in blobs.keys() {
+                                change.record(key);
+                                if change.overflowed {
+                                    break 'groups;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let observer = self
             .local_vertex_observer
             .read()
@@ -2546,6 +2861,17 @@ impl HypergraphCrdt {
             .is_err()
             {
                 tracing::warn!("local vertex commit observer panicked after durable commit");
+            }
+            let mut removed = pending_blobs
+                .iter()
+                .filter(|((_, phase), _)| *phase == 1)
+                .flat_map(|(_, blobs)| blobs.keys().map(Vec::as_slice));
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.removed(&mut removed)
+            }))
+            .is_err()
+            {
+                tracing::warn!("local vertex removal observer panicked after durable commit");
             }
         }
 
@@ -4230,6 +4556,7 @@ impl HypergraphCrdt {
         }
         mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, plan.phase_idx);
         staged
             .publish_memory()
             .map_err(|e| QuilError::Internal(format!("publish synced memory tree: {e}")))?;
@@ -4525,6 +4852,7 @@ impl HypergraphCrdt {
             return Ok(());
         }
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, 0);
         for (phase_idx, version, phase) in staged {
             phase
                 .publish_memory()
@@ -4605,6 +4933,7 @@ impl HypergraphCrdt {
         let txn = self.store.new_transaction(false)?;
         let leaves = self.stage_phase_wipe(&forest, txn.as_ref(), &shard, phase_idx, head)?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&app, phase_idx);
         self.finish_phase_wipe(&forest, &app, phase_idx)?;
         Ok(leaves)
     }
@@ -6189,6 +6518,7 @@ impl HypergraphCrdt {
             version,
         )?;
         txn.commit()?;
+        self.invalidate_local_observer_after_sync(&shard.l2, phase_idx);
         Ok(())
     }
 
@@ -6941,6 +7271,38 @@ impl HypergraphCrdt {
         });
         views.keep(Some(view.clone()));
         Ok(view)
+    }
+
+    /// Capture a fresh view after the active commit releases its lock. Local
+    /// indexes use this to align their snapshot with commit notifications.
+    pub fn capture_fresh_committed_snapshot(
+        &self,
+    ) -> Result<Arc<dyn quil_types::store::SnapshotReadable>> {
+        self.capture_fresh_committed_snapshot_with(|| ())
+            .map(|(snapshot, ())| snapshot)
+    }
+
+    /// Pair a committed snapshot with a local observer's position while the
+    /// same forest/commit barriers exclude its notifications. `at_capture`
+    /// must only read local state; it must not block or reenter this CRDT.
+    pub fn capture_fresh_committed_snapshot_with<T>(
+        &self,
+        at_capture: impl FnOnce() -> T,
+    ) -> Result<(Arc<dyn quil_types::store::SnapshotReadable>, T)> {
+        // Out-of-band resets hold the forest barrier across the entire wipe
+        // and reseed. Wait until that maintenance completes, so a local index
+        // cannot publish a snapshot of the intermediate cleared keyspace.
+        let _forest = self.forest_write_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("snapshot forest barrier poisoned".into())
+        })?;
+        let _guard = self
+            .commit_lock
+            .lock_to_read()
+            .map_err(|_| QuilError::ExecutionUnavailable("snapshot commit lock poisoned".into()))?;
+        let snapshot = self.store.capture_tree_snapshot()?.ok_or_else(|| {
+            QuilError::ExecutionUnavailable("committed snapshots unsupported by this store".into())
+        })?;
+        Ok((snapshot, at_capture()))
     }
 
     /// Capture a full-filter checkpoint without interpreting read failures as

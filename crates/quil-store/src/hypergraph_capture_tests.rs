@@ -460,3 +460,286 @@ fn execution_capture_layout_failure_preserves_sizes_and_allows_a_fresh_attempt()
     branch.overlay.close();
     retry.overlay.close();
 }
+
+#[derive(Default)]
+struct AdoptionObserver {
+    keys: std::sync::Mutex<Vec<[u8; 64]>>,
+    invalidations: AtomicUsize,
+    legacy: AtomicUsize,
+}
+impl quil_types::store::LocalVertexCommitObserver for AdoptionObserver {
+    fn execution_key_domains(&self) -> &'static [[u8; 32]] {
+        &[APP]
+    }
+    fn committed<'a>(&self, _: &mut dyn Iterator<Item = (&'a [u8], &'a [u8])>) {
+        self.legacy.fetch_add(1, Ordering::SeqCst);
+    }
+    fn committed_keys(&self, keys: Vec<[u8; 64]>) {
+        self.keys.lock().unwrap().extend(keys);
+    }
+    fn watches_sync(&self, app: &[u8]) -> bool {
+        app == APP
+    }
+    fn invalidated(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn canonical_adoption_notifies_live_cache_only_after_publication() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let witness = Arc::new(Observer(AtomicUsize::new(0)));
+    fixture.crdt.set_local_vertex_observer(witness.clone());
+    let cache = Arc::new(AdoptionObserver::default());
+    fixture.crdt.add_local_vertex_observer(cache.clone());
+    let old = fixture.crdt.capture_fresh_committed_snapshot().unwrap();
+    let branch = capture(&fixture.crdt);
+    branch
+        .crdt
+        .add_vertex(&location(1), b"replacement")
+        .unwrap();
+    branch.crdt.remove_vertex(&location(128)).unwrap();
+    branch
+        .crdt
+        .commit_with_global_cursor(2, &crate::encoding::global_materialized_cursor_key())
+        .unwrap();
+    let child = capture(&branch.crdt);
+    child.crdt.add_vertex(&location(2), b"child").unwrap();
+    child
+        .crdt
+        .commit_with_global_cursor(3, &crate::encoding::global_materialized_cursor_key())
+        .unwrap();
+    assert!(cache.keys.lock().unwrap().is_empty());
+    {
+        let capture = fixture.crdt.lock_execution_capture().unwrap();
+        let mut adoption = capture
+            .prepare_adoption(&child.crdt, &child.overlay, limits(), record_store)
+            .unwrap();
+        assert!(cache.keys.lock().unwrap().is_empty());
+        let plan = child.overlay.prepare_commit().unwrap();
+        let mut write = fixture.db.lock_writes().unwrap();
+        plan.commit_locked(&mut write).unwrap();
+        adoption.adopt();
+        adoption.adopt();
+    }
+    let mut expected = vec![
+        location(1).to_id(),
+        location(2).to_id(),
+        location(128).to_id(),
+    ];
+    expected.sort();
+    assert_eq!(*cache.keys.lock().unwrap(), expected);
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    assert_eq!(cache.legacy.load(Ordering::SeqCst), 0);
+    assert_eq!(witness.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.crdt.get_vertex_data_checked(&location(1)).unwrap(),
+        Some(b"replacement".to_vec())
+    );
+    let shard = quil_hypergraph::shard_key_for_location(&location(1));
+    assert_eq!(
+        old.load_vertex_underlying_raw("vertex", "adds", &shard, &location(1).to_id())
+            .unwrap(),
+        Some(b"one".to_vec())
+    );
+    branch.overlay.close();
+    child.overlay.close();
+}
+
+#[test]
+fn discarded_and_failed_adoptions_do_not_notify_local_cache() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let cache = Arc::new(AdoptionObserver::default());
+    fixture.crdt.set_local_vertex_observer(cache.clone());
+    let branch = capture(&fixture.crdt);
+    branch.crdt.add_vertex(&location(2), b"discarded").unwrap();
+    branch.crdt.commit(2).unwrap();
+    let capture = fixture.crdt.lock_execution_capture().unwrap();
+    let adoption = capture
+        .prepare_adoption(&branch.crdt, &branch.overlay, limits(), record_store)
+        .unwrap();
+    let plan = branch.overlay.prepare_commit().unwrap();
+    fixture.db.put(b"canonical conflict", b"changed").unwrap();
+    assert!(plan.commit(&fixture.db).is_err());
+    drop(adoption);
+    drop(capture);
+    branch.overlay.close();
+    assert!(cache.keys.lock().unwrap().is_empty());
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn private_reset_invalidation_waits_for_canonical_adoption() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let cache = Arc::new(AdoptionObserver::default());
+    fixture.crdt.set_local_vertex_observer(cache.clone());
+    let branch = capture(&fixture.crdt);
+    branch
+        .crdt
+        .invalidate_local_vertex_observer_for_app(&[8; 32]);
+    branch.crdt.invalidate_local_vertex_observer_for_app(&APP);
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    {
+        let capture = fixture.crdt.lock_execution_capture().unwrap();
+        let mut adoption = capture
+            .prepare_adoption(&branch.crdt, &branch.overlay, limits(), record_store)
+            .unwrap();
+        let plan = branch.overlay.prepare_commit().unwrap();
+        let mut write = fixture.db.lock_writes().unwrap();
+        plan.commit_locked(&mut write).unwrap();
+        adoption.adopt();
+        adoption.adopt();
+    }
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    assert!(cache.keys.lock().unwrap().is_empty());
+    branch.overlay.close();
+}
+
+#[test]
+fn fresh_index_snapshot_waits_for_reset_forest_barrier() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let cache = Arc::new(AdoptionObserver::default());
+    fixture.crdt.set_local_vertex_observer(cache.clone());
+    let guard = fixture.crdt.lock_forest_writes();
+    let source = fixture.crdt.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        snapshot_tx
+            .send(source.capture_fresh_committed_snapshot().unwrap())
+            .unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert!(snapshot_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    let shard = quil_hypergraph::shard_key_for_location(&location(1));
+    fixture.store.clear_shard_underlying(&shard).unwrap();
+    fixture.crdt.invalidate_local_vertex_observer_for_app(&APP);
+    assert!(snapshot_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    drop(guard);
+    let snapshot = snapshot_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .load_vertex_underlying_raw("vertex", "adds", &shard, &location(1).to_id())
+            .unwrap(),
+        None
+    );
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    reader.join().unwrap();
+}
+
+#[test]
+fn observer_registered_after_capture_invalidates_once_then_receives_keys() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let branch = capture(&fixture.crdt);
+    branch
+        .crdt
+        .add_vertex(&location(2), b"captured before registration")
+        .unwrap();
+    branch.crdt.commit(2).unwrap();
+    let cache = Arc::new(AdoptionObserver::default());
+    fixture.crdt.add_local_vertex_observer(cache.clone());
+    {
+        let capture = fixture.crdt.lock_execution_capture().unwrap();
+        let mut adoption = capture
+            .prepare_adoption(&branch.crdt, &branch.overlay, limits(), record_store)
+            .unwrap();
+        let plan = branch.overlay.prepare_commit().unwrap();
+        let mut write = fixture.db.lock_writes().unwrap();
+        plan.commit_locked(&mut write).unwrap();
+        adoption.adopt();
+    }
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    assert!(cache.keys.lock().unwrap().is_empty());
+    branch.overlay.close();
+    let branch = capture(&fixture.crdt);
+    branch
+        .crdt
+        .add_vertex(&location(2), b"captured after registration")
+        .unwrap();
+    branch.crdt.commit(3).unwrap();
+    {
+        let capture = fixture.crdt.lock_execution_capture().unwrap();
+        let mut adoption = capture
+            .prepare_adoption(&branch.crdt, &branch.overlay, limits(), record_store)
+            .unwrap();
+        let plan = branch.overlay.prepare_commit().unwrap();
+        let mut write = fixture.db.lock_writes().unwrap();
+        plan.commit_locked(&mut write).unwrap();
+        adoption.adopt();
+    }
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    assert_eq!(*cache.keys.lock().unwrap(), vec![location(2).to_id()]);
+    branch.overlay.close();
+}
+
+#[test]
+fn prepared_adoption_serializes_observer_registration() {
+    let fixture = Fixture::new(true, true);
+    fixture.seed();
+    let branch = capture(&fixture.crdt);
+    branch
+        .crdt
+        .add_vertex(&location(2), b"before registration")
+        .unwrap();
+    branch.crdt.commit(2).unwrap();
+    let capture = fixture.crdt.lock_execution_capture().unwrap();
+    let mut adoption = capture
+        .prepare_adoption(&branch.crdt, &branch.overlay, limits(), record_store)
+        .unwrap();
+    let cache = Arc::new(AdoptionObserver::default());
+    let registered_cache = cache.clone();
+    let source = fixture.crdt.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let registration = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        source.add_local_vertex_observer(registered_cache);
+        done_tx.send(()).unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert!(done_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    let plan = branch.overlay.prepare_commit().unwrap();
+    {
+        let mut write = fixture.db.lock_writes().unwrap();
+        plan.commit_locked(&mut write).unwrap();
+        adoption.adopt();
+    }
+    assert!(done_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    drop(adoption);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    drop(capture);
+    registration.join().unwrap();
+    let snapshot = fixture.crdt.capture_fresh_committed_snapshot().unwrap();
+    let shard = quil_hypergraph::shard_key_for_location(&location(2));
+    assert_eq!(
+        snapshot
+            .load_vertex_underlying_raw("vertex", "adds", &shard, &location(2).to_id())
+            .unwrap(),
+        Some(b"before registration".to_vec())
+    );
+    assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    assert!(cache.keys.lock().unwrap().is_empty());
+    branch.overlay.close();
+}
