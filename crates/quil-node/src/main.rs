@@ -1198,6 +1198,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 /// within a second or two.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
+// A consensus host reads its stop flag within its poll, a bound its tests
+// hold on paused time, then drops its engine: the grace must cover the poll.
+const _: () =
+    assert!(quil_cw_consensus::engine_host::STOP_POLL.as_millis() < STOP_GRACE.as_millis());
+
 /// Stop the work that runs on threads of its own and holds store handles:
 /// the storage jobs (`quil_engine::storage_jobs`), the consensus hosts
 /// (`quil_cw_consensus::engine_host`, GLOBAL on a committee member and app

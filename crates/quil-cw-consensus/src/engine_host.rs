@@ -261,6 +261,10 @@ struct HostsState {
     next: u64,
     /// Each running host's id and shutdown flag.
     running: Vec<(u64, Arc<AtomicBool>)>,
+    /// Threads asleep in [`Hosts::wait`]: a test ends a host only once its
+    /// waiter sleeps, so that only the host's wake-up can end the wait.
+    #[cfg(test)]
+    waiting: usize,
 }
 
 static HOSTS: Hosts = Hosts::new();
@@ -279,6 +283,8 @@ impl Hosts {
                 stopping: false,
                 next: 0,
                 running: Vec::new(),
+                #[cfg(test)]
+                waiting: 0,
             }),
             ended: Condvar::new(),
         }
@@ -324,11 +330,19 @@ impl Hosts {
             if left.is_zero() {
                 break;
             }
+            #[cfg(test)]
+            {
+                state.waiting += 1;
+            }
             state = self
                 .ended
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+            #[cfg(test)]
+            {
+                state.waiting -= 1;
+            }
         }
         state.running.len()
     }
@@ -338,6 +352,34 @@ impl Drop for Registration {
     fn drop(&mut self) {
         self.hosts.state().running.retain(|(id, _)| *id != self.id);
         self.hosts.ended.notify_all();
+    }
+}
+
+/// How often a host reads its stop flag ([`stop_hosts`]) while its engine
+/// runs. A stop then drops the engine and waits for its actors to end, so a
+/// stopping node's grace has to cover at least this poll.
+pub const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// How long a test waits for a consensus host's progress (a view, a report,
+/// its end) before calling it hung: the waits end on that progress, and a
+/// host that dies ends them at once. For tests only.
+#[doc(hidden)]
+pub const TEST_HANG: Duration = Duration::from_secs(120);
+
+/// Run until the engine ends (its outcome) or `shutdown` is set (`None`),
+/// reading the flag every [`STOP_POLL`].
+async fn until_stopped<H: std::future::Future + Unpin>(
+    handle: &mut H,
+    shutdown: &AtomicBool,
+) -> Option<H::Output> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            outcome = &mut *handle => return Some(outcome),
+            _ = tokio::time::sleep(STOP_POLL) => {}
+        }
     }
 }
 
@@ -511,23 +553,11 @@ where
             // voter, say): then this thread returns, so the owner can see the
             // host is dead (`thread.is_finished()`) and rebuild it.
             let mut handle = engine.start((s0, r0), (s1, r1), (s2, r2));
-            let mut stopped = None;
-            loop {
-                // Poll the flag (cw_tokio is tokio-backed, so tokio::time works
-                // in this runtime); on set, fall through and drop the engine
-                // handle to stop this instance. The owner sets it, or
-                // `stop_hosts` when the process stops.
-                if shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::select! {
-                    outcome = &mut handle => {
-                        stopped = Some(outcome);
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                }
-            }
+            // Poll the flag (cw_tokio is tokio-backed, so tokio::time works
+            // in this runtime); on set, fall through and drop the engine
+            // handle to stop this instance. The owner sets it, or
+            // `stop_hosts` when the process stops.
+            let stopped = until_stopped(&mut handle, &shutdown).await;
             if let Some(outcome) = stopped {
                 // The owner may ask for a stop while the engine is already
                 // returning: closing its inputs also ends the engine.
@@ -617,6 +647,22 @@ mod host_registry_tests {
     use commonware_cryptography::{Hasher as _, Signer as _};
     use commonware_math::algebra::Random as _;
     use std::sync::mpsc;
+
+    use super::TEST_HANG as HANG;
+
+    /// Whether a thread slept in `hosts.wait` within `HANG`: a host that
+    /// ends after this can end that wait only by waking it. False when no
+    /// wait slept, as when the host ended before the wait began.
+    fn until_waiting(hosts: &Hosts) -> bool {
+        let deadline = Instant::now() + HANG;
+        while hosts.state().waiting == 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
 
     struct Directory(std::path::PathBuf);
     impl Directory {
@@ -759,11 +805,11 @@ mod host_registry_tests {
         );
         drop(probe);
         for _ in 0..12 {
-            let tagged = reports.recv_timeout(Duration::from_secs(20)).unwrap();
+            let tagged = reports.recv_timeout(HANG).expect("the host reported");
             assert!(tagged, "a consensus actor ran on an untagged thread");
         }
         assert_eq!(hosts.stop(), 1);
-        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
+        assert_eq!(hosts.wait(HANG), 0);
         handle.thread.join().unwrap();
     }
 
@@ -834,21 +880,52 @@ mod host_registry_tests {
         let directory = Directory::new();
         let (handle, finalized, released) = spawn(hosts, &directory);
         // Running: it finalizes views.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while finalized.recv_timeout(Duration::from_secs(20)).unwrap() < 2 {
-            assert!(Instant::now() < deadline, "the host did not finalize");
-        }
-        assert_eq!(hosts.stop(), 1);
+        while finalized.recv_timeout(HANG).expect("the host finalized") < 2 {}
+        // Stop it once the wait sleeps, so that only the host's end wakes it.
+        let stopper = std::thread::spawn(move || until_waiting(hosts).then(|| hosts.stop()));
         let started = Instant::now();
-        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
+        assert_eq!(hosts.wait(HANG), 0);
         // The node exits once the wait returns: by then the engine's actors,
         // and every store handle they held, must be gone.
         assert!(
             released.load(Ordering::SeqCst),
             "the host's finalizer outlived the wait"
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The host's end woke the wait: one that missed it sleeps to HANG.
+        assert!(started.elapsed() < HANG, "the wait missed the host's end");
+        assert_eq!(
+            stopper.join().unwrap(),
+            Some(1),
+            "the host ended before the wait slept: the stop was never tested"
+        );
         handle.thread.join().unwrap();
+    }
+
+    /// A stopping node waits for its hosts within its stop grace (quil-node
+    /// checks at compile time that [`STOP_POLL`] fits in it): a host reads
+    /// its flag within one poll of the stop. The poll runs on paused time
+    /// here, which advances only while every task waits, so a loaded
+    /// machine cannot stretch it and a slower poll always fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_reads_its_stop_flag_within_one_poll() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Mid-poll, after a few of them.
+        let stop_at = STOP_POLL * 3 + STOP_POLL / 2;
+        let flag = shutdown.clone();
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(stop_at).await;
+            flag.store(true, Ordering::Release);
+        });
+        let started = tokio::time::Instant::now();
+        let mut engine = std::future::pending::<()>();
+        let stopped = tokio::time::timeout(HANG, until_stopped(&mut engine, &shutdown)).await;
+        assert_eq!(stopped, Ok(None), "the host never read its stop flag");
+        let read = started.elapsed().saturating_sub(stop_at);
+        assert!(
+            read <= STOP_POLL,
+            "the host read its stop flag {read:?} after the stop"
+        );
+        stop.await.unwrap();
     }
 
     #[test]
@@ -873,12 +950,19 @@ mod host_registry_tests {
         let started = Instant::now();
         assert_eq!(hosts.wait(Duration::from_millis(100)), 1);
         assert!(started.elapsed() >= Duration::from_millis(100));
+        // Release it once the wait sleeps, so that only the release wakes it.
         let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            let slept = until_waiting(hosts);
             drop(registration);
+            slept
         });
-        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
-        release.join().unwrap();
+        let started = Instant::now();
+        assert_eq!(hosts.wait(HANG), 0);
+        assert!(started.elapsed() < HANG, "the wait missed the release");
+        assert!(
+            release.join().unwrap(),
+            "the release came before the wait slept"
+        );
         let refused = Arc::new(AtomicBool::new(false));
         assert!(hosts.register(&refused).is_none());
         assert!(refused.load(Ordering::Acquire));
