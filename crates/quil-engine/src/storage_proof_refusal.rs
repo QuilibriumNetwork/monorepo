@@ -4,7 +4,7 @@
 //! seals; the mempool drop summary groups reasons with their digits masked
 //! and cut short, and so cannot say whose proof it was, which epoch, or
 //! whether it came late or was a copy of one already applied
-//! (`storage_epoch_proof::REFUSED_LATE`, `REFUSED_DUPLICATE`). One info line
+//! (`storage_epoch_proof::refusal_kind`). One info line
 //! per proof, at most [`LINES_PER_FRAME`] a frame. A proof that does not
 //! parse (a malformed binding, say) is named by the member bytes it starts
 //! with, its seats unlisted. A sector's capacity precommit or certificate
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use quil_execution::global_intrinsic::persistent_storage::{capacity_message, CapacityMessage};
 use quil_execution::global_intrinsic::storage_epoch_proof::{
-    StorageEpochProof, REFUSED_DUPLICATE, REFUSED_LATE, TYPE_STORAGE_EPOCH_PROOF,
+    refusal_kind, RefusalKind, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
 };
 
 /// Refused proofs named in one GLOBAL frame; the rest are named in a later
@@ -167,12 +167,12 @@ fn describe(proof: &StorageEpochProof, reason: &str) -> Refused {
         })
         .collect::<Vec<_>>()
         .join("; ");
-    let kind = if reason.contains(REFUSED_DUPLICATE) {
-        "duplicate"
-    } else if reason.contains(REFUSED_LATE) {
-        "deadline_miss"
-    } else {
-        "other"
+    let kind = match refusal_kind(reason) {
+        RefusalKind::Duplicate => "duplicate",
+        RefusalKind::Late => "deadline_miss",
+        RefusalKind::Early => "early",
+        RefusalKind::Invalid => "invalid",
+        RefusalKind::Other => "other",
     };
     Refused {
         prover: hex::encode(&proof.member[..8]),
@@ -223,8 +223,9 @@ pub(crate) fn note(frame: u64, raw: &[u8], reason: &str) {
             "storage epoch proof refused: GLOBAL drops the whole proof, so this prover loses each \
              settlement and seal in it that GLOBAL has not applied, unless it sends another in time; \
              duplicate: a part GLOBAL already applied; deadline_miss: a part sent after the frame it \
-             had to land by, the prover's node is late (its operator's logs say why); malformed: \
-             the proof does not parse, so its seats are not listed, the prover's build encodes it \
+             had to land by, the prover's node is late (its operator's logs say why); early: a \
+             part sent before its window or beacon frame; invalid: the proof does not verify; \
+             malformed: the proof does not parse, so its seats are not listed, the prover's build encodes it \
              otherwise; other: see reason (reported once a proof)"
         );
     }
@@ -242,7 +243,9 @@ pub(crate) fn note(frame: u64, raw: &[u8], reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_execution::global_intrinsic::storage_epoch_proof::SeatProof;
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        SeatProof, REFUSED_DUPLICATE, REFUSED_LATE,
+    };
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
     fn proof(member: u8, epoch: u64) -> Vec<u8> {

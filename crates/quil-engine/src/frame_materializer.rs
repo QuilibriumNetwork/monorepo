@@ -1005,6 +1005,9 @@ impl FrameMaterializer {
             .then(|| quil_execution::archive_frame::ArchiveFrame::begin(frame_number));
         let sections = quil_execution::step_timing::collect_for_archive(self.archive_mode);
         let mut prover_ops = crate::prover_op_tally::ProverOpTally::default();
+        // Only the publication logs it (below), so only it decodes the proofs.
+        let mut proof_outcomes = (!self.tentative_execution)
+            .then(crate::proof_outcome_tally::ProofOutcomeTally::default);
         let mut execution_tally = crate::execution_summary::ExecutionTally::default();
         let mut record_execution = |raw: &[u8], validate_us: u64, process_us: u64| {
             execution_tally.record(
@@ -1084,9 +1087,16 @@ impl FrameMaterializer {
                     Err(e) => {
                         skipped += 1;
                         prover_ops.record(&bundle_bytes, false);
+                        let error = format!("invalid fee cost: {e}");
+                        if let Some(tally) = proof_outcomes.as_mut() {
+                            tally.record(
+                                bundle,
+                                crate::proof_outcome_tally::Outcome::Refused(&error),
+                            );
+                        }
                         outcomes.push(RequestOutcome {
                             status: RequestStatus::Skipped,
-                            error: format!("invalid fee cost: {e}"),
+                            error,
                         });
                         skipped_bundles.push(bundle_bytes);
                         continue;
@@ -1154,6 +1164,12 @@ impl FrameMaterializer {
             if let Some(reason) = reject_reason {
                 record_execution(&bundle_bytes, validate_us, 0);
                 prover_ops.record(&bundle_bytes, false);
+                if let Some(tally) = proof_outcomes.as_mut() {
+                    tally.record(
+                        bundle,
+                        crate::proof_outcome_tally::Outcome::Refused(&reason),
+                    );
+                }
                 skipped += 1;
                 outcomes.push(RequestOutcome {
                     status: RequestStatus::Rejected,
@@ -1184,6 +1200,14 @@ impl FrameMaterializer {
             match result {
                 Ok(result) => {
                     processed += 1;
+                    if let Some(tally) = proof_outcomes.as_mut() {
+                        tally.record(
+                            bundle,
+                            crate::proof_outcome_tally::Outcome::Executed {
+                                seat_parts: result.seat_parts.len(),
+                            },
+                        );
+                    }
                     seat_parts.extend(result.seat_parts);
                     let fees = self
                         .execution_manager
@@ -1211,9 +1235,13 @@ impl FrameMaterializer {
                         "skipping message that failed processing"
                     );
                     skipped += 1;
+                    let error = format!("{e}");
+                    if let Some(tally) = proof_outcomes.as_mut() {
+                        tally.record(bundle, crate::proof_outcome_tally::Outcome::Refused(&error));
+                    }
                     outcomes.push(RequestOutcome {
                         status: RequestStatus::Failed,
-                        error: format!("{e}"),
+                        error,
                     });
                     skipped_bundles.push(bundle_bytes);
                 }
@@ -1777,6 +1805,9 @@ impl FrameMaterializer {
         // its publication logs the tally that counts.
         if !self.tentative_execution {
             prover_ops.log(frame_number);
+            if let Some(tally) = &proof_outcomes {
+                tally.log(frame_number);
+            }
         }
         let execution = match self.execution_role {
             crate::execution_summary::ExecutionRole::Publication => Some(execution),
