@@ -274,17 +274,20 @@ pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] =
 /// replaces with [`MAINNET_BOOTSTRAP_PEERS`]: the number of distinct
 /// configured peers ([`distinct_peer_count`]) on mainnet when the entries
 /// differ from the built-in list and from
-/// [`EARLIER_MAINNET_BOOTSTRAP_PEERS`], otherwise `None` (another network,
-/// an empty list or the same entries).
+/// [`EARLIER_MAINNET_BOOTSTRAP_PEERS`] and name a peer, otherwise `None`
+/// (another network, a list naming no peer, such as an empty or blank one,
+/// or the same entries).
 pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> Option<usize> {
-    if network != 0 || configured.is_empty() {
+    if network != 0 {
         return None;
     }
     use std::collections::BTreeSet;
     let configured: BTreeSet<&str> = configured.iter().map(|peer| peer.trim()).collect();
     let same = |list: &[&str]| configured == list.iter().copied().collect::<BTreeSet<_>>();
     let differs = !same(MAINNET_BOOTSTRAP_PEERS) && !same(EARLIER_MAINNET_BOOTSTRAP_PEERS);
-    differs.then(|| distinct_peer_count(&configured))
+    differs
+        .then(|| distinct_peer_count(&configured))
+        .filter(|&peers| peers > 0)
 }
 
 impl P2PConfig {
@@ -486,7 +489,8 @@ mod tests {
     /// A replaced list is counted in peers, not entries: an archive listed
     /// at both address families is one peer, and each distinct entry
     /// without a peer ID one more, so a list naming no peer ID is not
-    /// reported as 0 peers.
+    /// reported as 0 peers. A list naming no peer at all, such as a blank
+    /// entry, is not reported.
     #[test]
     fn a_replaced_bootstrap_list_counts_peers_not_entries() {
         let peerless: Vec<String> = [
@@ -522,6 +526,14 @@ mod tests {
             distinct_peer_count(["/p2p/QmA/p2p-circuit/p2p/QmB", " /p2p/QmB "]),
             1
         );
+        for blank in [&[][..], &[""][..], &[" ", "\t"][..]] {
+            let blank: Vec<String> = blank.iter().map(|entry| entry.to_string()).collect();
+            assert_eq!(
+                replaced_mainnet_bootstrap_peers(0, &blank),
+                None,
+                "a list naming no peer reported as 0 configured peers"
+            );
+        }
     }
 
     /// A config saved by a release whose built-in list held the IPv4
