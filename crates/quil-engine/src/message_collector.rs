@@ -43,7 +43,7 @@ use window_seats::SeatEvent;
 /// ([`MessageCollector::prune_after_finalization`]), and keeps a held
 /// storage epoch proof whose window ends within [`carry_lead_frames`] past
 /// it, until it rides, is evicted or its window ends.
-const RETENTION_WINDOW: u64 = 10;
+pub(crate) const RETENTION_WINDOW: u64 = 10;
 
 /// The one shard frame a message carries.
 #[derive(Clone)]
@@ -5610,6 +5610,10 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// `frame_number` cannot carry ([`bundle_shard_frames_in_lockstep`]) is
 /// anchored ahead of its window, at least one: a later frame may carry
 /// them. One behind the window, or naming no anchor, rides no later frame.
+/// Nor does one anchored past the window's newest anchor plus
+/// `RETENTION_WINDOW`: its rank ages out (`age_ranks`) before any frame's
+/// window reaches it. Held (until 2026-11-20), any anchor up to `u64::MAX`
+/// stayed in the mempool, never carried and never refused.
 pub fn bundle_shard_frames_ahead(data: &[u8], frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::{
         anchor_window, FrameHeader, TYPE_FRAME_HEADER,
@@ -5620,6 +5624,7 @@ pub fn bundle_shard_frames_ahead(data: &[u8], frame_number: u64) -> bool {
         return false;
     };
     let (_, newest) = anchor_window(frame_number);
+    let last = newest.saturating_add(RETENTION_WINDOW);
     let mut ahead = false;
     for req in bundle.requests.into_iter().flatten() {
         if req.inner_type_prefix != TYPE_FRAME_HEADER {
@@ -5631,7 +5636,7 @@ pub fn bundle_shard_frames_ahead(data: &[u8], frame_number: u64) -> bool {
         if anchor_in_lockstep(fh.global_frame_number, frame_number) {
             continue;
         }
-        if fh.global_frame_number <= newest {
+        if fh.global_frame_number <= newest || fh.global_frame_number > last {
             return false;
         }
         ahead = true;

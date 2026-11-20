@@ -773,12 +773,15 @@ fn a_message_a_leader_cannot_judge_rides_once_it_validates() {
     );
 }
 
-/// A shard proof anchored ahead of the proposed frame stays in the
-/// mempool for a later frame; one no later frame can carry (here, naming
-/// no anchor once anchors are required) leaves it.
+/// A shard proof anchored ahead of the proposed frame, up to the window's
+/// newest anchor plus `RETENTION_WINDOW`, stays in the mempool and rides
+/// the frame whose window reaches it. One no frame can carry before its
+/// rank ages out leaves it: naming no anchor once anchors are required,
+/// or anchored past that bound (`u64::MAX` included).
 #[test]
 fn a_shard_proof_anchored_ahead_of_the_frame_stays_and_one_behind_leaves() {
     use crate::message_collector::bundle_shard_frames_in_lockstep as in_lockstep;
+    use crate::message_collector::RETENTION_WINDOW;
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
     let shard_proof = |address: u8, anchor: u64| {
@@ -805,19 +808,49 @@ fn a_shard_proof_anchored_ahead_of_the_frame_stays_and_one_behind_leaves() {
         raw
     };
     let rig = Rig::new();
-    // Frame 1 carries anchors in 0..=0.
-    let (ahead, behind) = (shard_proof(0x11, 5), shard_proof(0x22, 0));
-    assert!(rig.collector.add_message(1, ahead.clone()));
-    assert!(rig.collector.add_message(1, behind.clone()));
+    // Frame 1 carries anchors in 0..=0; frame 2 in 0..=1.
+    let ahead = shard_proof(0x11, 1);
+    let behind = shard_proof(0x22, 0);
+    let edge = shard_proof(0x33, RETENTION_WINDOW);
+    let past = shard_proof(0x44, RETENTION_WINDOW + 1);
+    let farthest = shard_proof(0x55, u64::MAX);
+    // Verified on admission, as an archive does: it rides unchecked.
+    assert!(rig.collector.add_verified_message(1, ahead.clone()));
+    for raw in [&behind, &edge, &past, &farthest] {
+        assert!(rig.collector.add_message(1, raw.clone()));
+    }
     quil_types::consensus::set_required_anchor_epoch_for_thread(Some(0));
-    assert!(!in_lockstep(&ahead, 1) && !in_lockstep(&behind, 1));
+    for raw in [&ahead, &behind, &edge, &past, &farthest] {
+        assert!(!in_lockstep(raw, 1));
+    }
     let messages = propose_on_genesis(&rig);
     quil_types::consensus::set_required_anchor_epoch_for_thread(None);
     assert!(messages.is_empty());
-    assert_eq!(
-        rig.collector.collect_for_rank(1),
-        vec![ahead],
+    let pending = rig.collector.collect_for_rank(1);
+    assert!(
+        pending.contains(&ahead) && !pending.contains(&behind),
         "AHEAD-LEFT: a shard proof anchored ahead of the frame left the mempool, or one behind stayed"
+    );
+    assert!(
+        pending.contains(&edge),
+        "AHEAD-EDGE: a shard proof anchored at the newest anchor plus the retention window left the mempool"
+    );
+    assert!(
+        !pending.contains(&past) && !pending.contains(&farthest),
+        "AHEAD-UNBOUNDED: a shard proof anchored past the newest anchor plus the retention window stayed"
+    );
+    assert_eq!(
+        pending.len(),
+        2,
+        "only the proofs a later frame can carry stay"
+    );
+    let parent = rig.deploy();
+    rig.put(&parent);
+    assert!(in_lockstep(&ahead, 2));
+    assert_eq!(
+        propose_privately(&rig, &parent),
+        vec![ahead],
+        "AHEAD-NEVER-RODE: a shard proof held ahead of its window never rode the frame whose window reached it"
     );
 }
 
