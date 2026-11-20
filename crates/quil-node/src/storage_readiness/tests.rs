@@ -236,6 +236,28 @@ async fn live_mainnet_checkpoint_and_snapshot_record_are_authenticated() {
     panic!("live inputs unavailable: {}", failures.join("; "));
 }
 
+/// Without `--benchmark-storage-archive` the probe dials each genesis
+/// archive at its address on port 8340, an IPv6 one bracketed.
+#[test]
+fn default_archives_are_the_genesis_ones_at_8340() {
+    use clap::Parser;
+    let args = crate::Args::try_parse_from(["quil-node"]).unwrap();
+    let archives = quil_engine::genesis::genesis_archive_static_ips();
+    assert!(
+        archives.iter().any(|(_, ip)| ip.contains(':')),
+        "premise: an IPv6 genesis archive"
+    );
+    let endpoints = endpoints(&args.storage_readiness).unwrap();
+    assert_eq!(endpoints.len(), archives.len());
+    for ((endpoint, peer), (id, ip)) in endpoints.iter().zip(&archives) {
+        let addr: std::net::SocketAddr = endpoint
+            .parse()
+            .unwrap_or_else(|e| panic!("{endpoint}: {e}"));
+        assert_eq!((addr.ip().to_string(), addr.port()), (ip.clone(), 8340));
+        assert_eq!(peer.to_string(), *id);
+    }
+}
+
 #[test]
 fn suite_selection_uses_scheduled_mainnet_default_and_rejects_unsupported_parameters() {
     use clap::Parser;
