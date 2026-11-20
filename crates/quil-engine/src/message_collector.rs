@@ -5316,15 +5316,21 @@ impl MessageCollector {
     /// registration restarted stays forgotten. Returns how many messages
     /// left.
     pub fn learn_committed(&self, parts: &[SeatPartChange], base: u64) -> usize {
-        let finalized = self
-            .finalized_frame
-            .load(std::sync::atomic::Ordering::Acquire);
         let parts: Vec<SeatPartChange> = parts
             .iter()
-            .filter(|part| finalized > 0 && part.frame <= finalized.min(base))
+            .filter(|part| self.is_committed(part, base))
             .cloned()
             .collect();
         self.learn_applied(&parts)
+    }
+
+    /// Whether [`Self::learn_committed`] over `base` learns `part`: a frame
+    /// at or below both `base` and the finalized frame applied it.
+    pub fn is_committed(&self, part: &SeatPartChange, base: u64) -> bool {
+        let finalized = self
+            .finalized_frame
+            .load(std::sync::atomic::Ordering::Acquire);
+        finalized > 0 && part.frame <= finalized.min(base)
     }
 
     /// [`Self::mark_applied`]: the buffers' lock, then `applied`, as the
@@ -7848,19 +7854,24 @@ mod tests {
         assert_eq!(mc.next_seal_frame(), 9_002, "the finalized frame is noted");
     }
 
-    /// A leader's validation drops: a branch leader's leave its copy, and
-    /// only proofs of seals a finalized frame applied leave the mempool; a
-    /// leader over the mempool drops them all from it. Either way a copy of
-    /// an applied seal is refused after.
+    /// A leader's validation refusals leave its collector and the mempool,
+    /// and the count returned is what left the mempool. A branch leader
+    /// keeps public a proof refused only for a seal applied above its
+    /// executed base, and learns one applied at or below it and the
+    /// finalized frame; a leader over the mempool drops them all from it.
+    /// Either way a copy of the learned seal is refused after.
     #[test]
-    fn a_leaders_drops_release_only_applied_proofs_from_the_mempool() {
+    fn a_leaders_drops_leave_the_mempool_save_abandonable_refusals() {
         use crate::leader_provider::release_applied;
         let dead = seals_proof(7, &[9], 1);
         let other = seals_proof(8, &[10], 2);
-        let invalid = [dead.clone(), other.clone()];
+        let ahead = seals_proof(6, &[11], 3);
+        let invalid = [dead.clone(), other.clone(), ahead.clone()];
         let applied_of = |raw: &[u8]| {
             if raw == dead.as_slice() {
                 vec![applied(7, 9, SeatPartKind::Sealed, 1502, 8_999)]
+            } else if raw == ahead.as_slice() {
+                vec![applied(6, 11, SeatPartKind::Sealed, 1502, 9_001)]
             } else {
                 Vec::new()
             }
@@ -7868,40 +7879,83 @@ mod tests {
         let mempool = || {
             let mc = global_collector();
             mc.note_finalized_frame(9_000);
-            for (data, peer) in [(&dead, b"a"), (&other, b"b")] {
+            for (data, peer) in [(&dead, b"a"), (&other, b"b"), (&ahead, b"c")] {
                 let outcome = mc.add_message_outcome_by(1, data.clone(), Provenance::Prover, peer);
                 assert_eq!(outcome, SubmitOutcome::Accepted);
             }
             mc
         };
         let refused = |mc: &MessageCollector| {
-            mc.add_message_outcome_by(1, seals_proof(7, &[9], 3), Provenance::Prover, b"c")
+            mc.add_message_outcome_by(1, seals_proof(7, &[9], 4), Provenance::Prover, b"d")
                 == SubmitOutcome::Filtered(Refusal::AppliedSeatPart)
         };
         let public = mempool();
         let copy = public
             .proposal_copy(1, 64 << 20, 10_000, 9_002, &[], &[])
             .unwrap();
-        assert_eq!(copy.pending_count(1), 2, "premise: the copy holds both");
+        assert_eq!(
+            copy.pending_count(1),
+            3,
+            "premise: the copy holds all three"
+        );
         assert_eq!(
             release_applied(&copy, Some((&public, 9_000)), &invalid, applied_of),
-            1,
-            "RELEASE-BRANCH: a branch leader's drop of an applied proof did not leave the mempool"
+            2,
+            "LEFT-MEMPOOL: the count returned is not what left the mempool"
         );
-        assert_eq!(copy.pending_count(1), 0, "both leave the copy");
-        assert_eq!(public.pending_count(1), 1, "the other stays in the mempool");
+        assert_eq!(copy.pending_count(1), 0, "all leave the copy");
+        assert_eq!(
+            public.pending_count(1),
+            1,
+            "RELEASE-BRANCH: a branch leader's refusals did not leave the mempool"
+        );
+        assert_eq!(
+            public.add_message_outcome_by(1, ahead.clone(), Provenance::Prover, b"c"),
+            SubmitOutcome::Duplicate,
+            "the proof refused only above the executed base stays"
+        );
         assert!(refused(&public));
         let public = mempool();
-        assert_eq!(release_applied(&public, None, &invalid, applied_of), 2);
+        assert_eq!(release_applied(&public, None, &invalid, applied_of), 3);
         assert_eq!(public.pending_count(1), 0);
         assert!(refused(&public));
     }
 
+    /// A proof a branch leader's validation refused for a reason other
+    /// than an applied seat part leaves the mempool, and nothing is
+    /// learned: its sender's next proof of the seat is taken.
+    #[test]
+    fn a_proof_refused_for_another_reason_leaves_the_mempool_unlearned() {
+        use crate::leader_provider::release_applied;
+        let public = global_collector();
+        public.note_finalized_frame(9_000);
+        let proof = seals_proof(7, &[9], 1);
+        assert_eq!(
+            public.add_message_outcome_by(1, proof.clone(), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted
+        );
+        let copy = public
+            .proposal_copy(1, 64 << 20, 10_000, 9_002, &[], &[])
+            .unwrap();
+        assert_eq!(
+            release_applied(&copy, Some((&public, 9_000)), &[proof], |_| Vec::new()),
+            1,
+            "REFUSED-LEFT: a proof refused for another reason stayed in the mempool"
+        );
+        assert_eq!(public.pending_count(1), 0);
+        assert_eq!(
+            public.add_message_outcome_by(1, seals_proof(7, &[9], 2), Provenance::Prover, b"a"),
+            SubmitOutcome::Accepted,
+            "a seal nothing applied was learned"
+        );
+    }
+
     /// A branch executed over frame 9,000 whose ancestor 9,001 applied a
     /// seal: while its leader validates, another frame 9,001 finalizes.
-    /// The seal its state shows is the abandoned ancestor's, so its proof
-    /// stays in the mempool and a copy of it is still taken; one its
-    /// executed base applied leaves.
+    /// The seal its state shows is the abandoned ancestor's, so the proof
+    /// its validation refused for it stays in the mempool, nothing leaves
+    /// and a copy of it is still taken; one its executed base applied
+    /// leaves with that copy.
     #[test]
     fn a_part_only_an_abandoned_ancestor_applied_is_not_learned() {
         use crate::leader_provider::release_applied;

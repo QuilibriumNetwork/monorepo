@@ -715,33 +715,44 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     selection
 }
 
-/// Remove `invalid`, the messages a leader's validation dropped, from its
-/// `collector`. A branch leader's collector is its proposal's copy of the
-/// public `mempool`, with the frame its branch was executed over: of what
-/// it drops, only proofs of seat parts a frame at or below both that frame
-/// and the finalized one applied leave the mempool
-/// ([`MessageCollector::learn_committed`]). `applied_of` reads those parts
-/// from the state validation ran on, so they re-teach a mempool that
-/// restarted and never saw those frames applied. Returns how many messages
-/// left the mempool: all of `invalid` for a leader over the mempool itself
-/// (`mempool` `None`).
+/// Remove `invalid`, the messages a leader's validation refused, from its
+/// `collector` and the mempool; returns how many left the mempool. A
+/// branch leader's collector is its proposal's copy of the public
+/// `mempool`, with the frame its branch was executed over: the state
+/// validation ran on holds the frames executed above it, any of which may
+/// yet be abandoned. So a message whose seat parts `applied_of` reads all
+/// sit above both that frame and the finalized one stays in the mempool,
+/// until that frame finalizes ([`MessageCollector::learn_published`]) or
+/// is abandoned and the message validates. Every other message leaves it
+/// ([`MessageCollector::remove_refused`]), and the parts at or below both
+/// are learned ([`MessageCollector::learn_committed`]): they re-teach a
+/// mempool that restarted and never saw those frames applied. A leader
+/// over the mempool itself (`mempool` `None`) drops all of `invalid`.
 pub(crate) fn release_applied(
     collector: &MessageCollector,
     mempool: Option<(&MessageCollector, u64)>,
     invalid: &[Vec<u8>],
     applied_of: impl Fn(&[u8]) -> Vec<quil_types::execution::SeatPartChange>,
 ) -> usize {
-    let applied: Vec<quil_types::execution::SeatPartChange> =
-        invalid.iter().flat_map(|raw| applied_of(raw)).collect();
-    let left = match mempool {
-        Some((mempool, base)) => mempool.learn_committed(&applied, base),
-        None => {
-            collector.learn_committed(&applied, u64::MAX);
-            invalid.len()
+    let applied: Vec<Vec<quil_types::execution::SeatPartChange>> =
+        invalid.iter().map(|raw| applied_of(raw)).collect();
+    let parts: Vec<quil_types::execution::SeatPartChange> =
+        applied.iter().flatten().cloned().collect();
+    match mempool {
+        Some((mempool, base)) => {
+            collector.remove(invalid);
+            let leaving: Vec<Vec<u8>> = invalid
+                .iter()
+                .zip(&applied)
+                .filter(|(_, parts)| {
+                    parts.is_empty() || parts.iter().any(|part| mempool.is_committed(part, base))
+                })
+                .map(|(raw, _)| raw.clone())
+                .collect();
+            mempool.learn_committed(&parts, base) + mempool.remove_refused(&leaving)
         }
-    };
-    collector.remove(invalid);
-    left
+        None => collector.learn_committed(&parts, u64::MAX) + collector.remove_refused(invalid),
+    }
 }
 
 /// What a proposal's executed ancestors did
@@ -821,10 +832,11 @@ pub struct GlobalLeaderProvider {
     pool: Option<crate::proposal_pool::ProposalPool>,
     /// The public mempool an execution-branch leader's `message_collector`
     /// copied ([`Self::for_execution_branch`]), with its branch's executed
-    /// base. What its proposal refuses leaves both ([`Self::drop_messages`]);
-    /// what it learns applied it learns only at or below that base and the
-    /// finalized frame ([`MessageCollector::learn_committed`]). `None` for a
-    /// leader over the mempool itself.
+    /// base. What its proposal refuses leaves both ([`Self::drop_messages`]),
+    /// save proofs refused only for seat parts applied above that base and
+    /// the finalized frame, which stay public; it learns parts applied at
+    /// or below both ([`release_applied`]). `None` for a leader over the
+    /// mempool itself.
     mempool: Option<(Arc<MessageCollector>, u64)>,
 }
 
@@ -919,12 +931,10 @@ impl GlobalLeaderProvider {
     /// message stayed held for every later proposal to copy and drop again,
     /// a storage epoch proof with its sender's seat to its window's end.
     /// Each collector remembers them as refused for its share-full line.
-    /// Returns how many left the public mempool.
-    fn drop_messages(&self, raw: &[Vec<u8>]) -> usize {
-        let local = self.message_collector.remove_refused(raw);
-        match &self.mempool {
-            Some((mempool, _)) => mempool.remove_refused(raw),
-            None => local,
+    fn drop_messages(&self, raw: &[Vec<u8>]) {
+        self.message_collector.remove_refused(raw);
+        if let Some((mempool, _)) = &self.mempool {
+            mempool.remove_refused(raw);
         }
     }
 
@@ -2051,7 +2061,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             .map(|(mempool, base)| (mempool.as_ref(), *base)),
                         &invalid,
                         |raw| validator.applied_seat_parts(raw),
-                    ) + self.drop_messages(&invalid);
+                    );
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
