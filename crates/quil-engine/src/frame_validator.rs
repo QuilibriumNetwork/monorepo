@@ -367,6 +367,19 @@ impl GlobalFrameVerifier {
         self.global_finalization_parent(header).is_some()
     }
 
+    /// Whether `clock`'s canonical record at `frame`'s height already holds
+    /// its block ([`quil_store::RocksClockStore::holds_global_block`]), the
+    /// stored certificate judged as an execution base is: a record held
+    /// against every later copy is one execution can start from, so a
+    /// record execution refuses is still replaced.
+    pub fn holds_global_block(
+        &self,
+        clock: &quil_store::RocksClockStore,
+        frame: &GlobalFrame,
+    ) -> bool {
+        clock.holds_global_block(frame, |stored| self.verify_global_execution_base(stored))
+    }
+
     /// Authenticated parent view from a finalization by the committee of the
     /// header's frame, in its epoch and at the header's view. Callers also
     /// bind its digest, height and state roots.
