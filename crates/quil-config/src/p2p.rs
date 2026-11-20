@@ -216,6 +216,17 @@ pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
     "/ip6/2606:c700:8410:62:a236:9fff:fee8:88cc/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
 ];
 
+/// How many archives [`MAINNET_BOOTSTRAP_PEERS`] names: its distinct peer
+/// IDs, as it lists each archive once per address family.
+pub(crate) fn mainnet_bootstrap_archive_count() -> usize {
+    MAINNET_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|entry| entry.rsplit_once("/p2p/"))
+        .map(|(_, peer)| peer)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 /// The mainnet bootstrap list releases before the IPv6 entries built in.
 /// A config saved by one of them holds it; it names no peer the node does
 /// not dial, so it is not reported as replaced.

@@ -174,7 +174,7 @@ impl ConfigNotices {
         self.replaced_bootstrap_peers.map(|configured| {
             format!(
                 "mainnet uses its {} built-in bootstrap peers instead of the {configured} configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this, list peers to add in p2p.extraBootstrapPeers",
-                MAINNET_BOOTSTRAP_PEERS.len()
+                p2p::mainnet_bootstrap_archive_count()
             )
         })
     }
@@ -922,7 +922,7 @@ p2p:
             notices.bootstrap_peers_line().unwrap(),
             format!(
                 "mainnet uses its {} built-in bootstrap peers instead of the 1 configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this, list peers to add in p2p.extraBootstrapPeers",
-                built_in.len()
+                p2p::mainnet_bootstrap_archive_count()
             )
         );
         assert_eq!(
@@ -933,6 +933,30 @@ p2p:
         let (_, notices) = load_config_with_notices(&dir).unwrap();
         assert_eq!(notices, ConfigNotices::default());
         cleanup(&dir);
+    }
+
+    /// The replaced-list notice counts the built-in archives, not their
+    /// entries: the list names each archive once per address family.
+    #[test]
+    fn the_bootstrap_notice_counts_archives_not_entries() {
+        let archives: std::collections::BTreeSet<&str> = MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|entry| entry.rsplit('/').next().unwrap())
+            .collect();
+        assert!(
+            archives.len() < MAINNET_BOOTSTRAP_PEERS.len(),
+            "premise: an archive listed at more than one address"
+        );
+        let notices = ConfigNotices {
+            replaced_bootstrap_peers: Some(1),
+            ..ConfigNotices::default()
+        };
+        let line = notices.bootstrap_peers_line().unwrap();
+        let expected = format!(
+            "mainnet uses its {} built-in bootstrap peers instead of the 1 configured",
+            archives.len()
+        );
+        assert!(line.starts_with(&expected), "{line}");
     }
 
     /// The loader reports the unused keys of the file it read; a config it
