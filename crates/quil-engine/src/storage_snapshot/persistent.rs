@@ -95,10 +95,67 @@ enum Relabel {
     /// Labelled again to this same certificate: one more failed proof
     /// gives it up.
     Done = 1,
-    /// No proof is made for it without labels kept; it is proven once its
-    /// labels are kept.
+    /// No proof is made for it without labels kept: it is set up again at
+    /// each poll, so its labels are kept once there is room for them, and
+    /// it is proven from them.
     GivenUp = 2,
 }
+
+/// What moves a sector's [`Relabel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelabelEvent {
+    /// Its certificate proof made without labels kept failed.
+    UnkeptProofFailed,
+    /// It was labelled again, to the same certificate or to another.
+    Relabelled { same: bool },
+    /// A certificate proof for it was made, with labels kept or not.
+    Proven,
+}
+
+/// What a poll does for a sector with no labels kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnkeptStep {
+    /// Prove it, labelled where the proof needs it.
+    Prove,
+    /// Label it again first ([`initialize`]).
+    Relabel,
+    /// Set it up again, so its labels are kept once there is room for
+    /// them; no proof is made before they are.
+    KeepLabels,
+}
+
+impl Relabel {
+    /// Where a sector stands after `event`, from `state`: the one owner of
+    /// every move, each state with its exit. A proof made ends every state.
+    fn after(state: Option<Relabel>, event: RelabelEvent) -> Option<Relabel> {
+        match (state, event) {
+            (_, RelabelEvent::Proven) => None,
+            (None, RelabelEvent::UnkeptProofFailed) => Some(Relabel::Asked),
+            (Some(Relabel::Done), RelabelEvent::UnkeptProofFailed) => Some(Relabel::GivenUp),
+            (Some(Relabel::Asked), RelabelEvent::Relabelled { same: true }) => Some(Relabel::Done),
+            (Some(Relabel::Asked), RelabelEvent::Relabelled { same: false }) => None,
+            // No proof without labels kept is made while asked or given up,
+            // and only an asked sector is labelled again for its state.
+            (state, _) => state,
+        }
+    }
+    /// What a poll does for a sector in `state` with no labels kept.
+    fn unkept_step(state: Option<Relabel>) -> UnkeptStep {
+        match state {
+            None | Some(Relabel::Done) => UnkeptStep::Prove,
+            Some(Relabel::Asked) => UnkeptStep::Relabel,
+            Some(Relabel::GivenUp) => UnkeptStep::KeepLabels,
+        }
+    }
+}
+
+/// Sectors whose [`Relabel`] could not be written, as a full disk refuses
+/// it, by directory: the certificate and the state they were to take. No
+/// proof is made for them without labels kept, nor are they labelled
+/// again, until that state is written (2026-11-20: unwritten, each poll
+/// labelled the sector in memory to fail the same proof).
+static UNMARKED: Mutex<std::collections::BTreeMap<PathBuf, (Vec<u8>, Relabel)>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 #[derive(Clone)]
 struct Sector {
@@ -186,6 +243,47 @@ impl Sector {
         let mut bytes = self.cert.to_bytes();
         bytes.push(relabel as u8);
         atomic(&self.dir.join(RELABEL), &bytes)
+    }
+    /// Record `relabel`, or with `None` remove its record.
+    fn set_relabel(&self, relabel: Option<Relabel>) -> Result<()> {
+        match relabel {
+            Some(relabel) => self.mark_relabel(relabel),
+            None => match fs::remove_file(self.dir.join(RELABEL)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(e)),
+                _ => Ok(()),
+            },
+        }
+    }
+    /// Move its [`Relabel`] on `event`, written, and an unwritten one
+    /// forgotten once a proof is made.
+    fn relabel_event(&self, event: RelabelEvent) -> Result<Option<Relabel>> {
+        let relabel = Relabel::after(self.relabel(), event);
+        self.set_relabel(relabel)?;
+        if event == RelabelEvent::Proven {
+            self.unmarked_written();
+        }
+        Ok(relabel)
+    }
+    /// The [`Relabel`] it was to take when that could not be written
+    /// ([`UNMARKED`]), for its certificate on disk.
+    fn unmarked(&self) -> Option<Relabel> {
+        let unmarked = UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (cert, relabel) = unmarked.get(&self.dir)?;
+        (*cert == self.cert.to_bytes()).then_some(*relabel)
+    }
+    fn hold_unmarked(&self, relabel: Relabel) {
+        UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.dir.clone(), (self.cert.to_bytes(), relabel));
+    }
+    fn unmarked_written(&self) {
+        UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.dir);
     }
     /// Whether a repair found the sector's labels, made again, to differ
     /// from its certificate: it is not labelled again, and no leaf is
@@ -549,11 +647,11 @@ fn initialize_with_progress(
     // Labelled again for a proof that failed: it is proven from the
     // certificate its labels give, and given up should that same one fail.
     if let Some(old) = previous.filter(|old| old.relabel() == Some(Relabel::Asked)) {
-        if old.cert == sector.cert {
-            sector.mark_relabel(Relabel::Done)?;
-        } else {
-            let _ = fs::remove_file(sector.dir.join(RELABEL));
-        }
+        let same = old.cert == sector.cert;
+        sector.set_relabel(Relabel::after(
+            Some(Relabel::Asked),
+            RelabelEvent::Relabelled { same },
+        ))?;
     }
     Ok(sector)
 }
@@ -588,25 +686,34 @@ fn label_unkept(
 /// A sector's certificate proof made without labels kept failed with
 /// `error`: the sector is labelled again once before another proof, and
 /// given up when its labels, made again, gave that same certificate
-/// ([`Relabel`]). The error, as the proof's caller reports it.
+/// ([`Relabel`]). Should that not be written, neither is done until it is
+/// ([`UNMARKED`]). The error, as the proof's caller reports it.
 fn unkept_proof_failed(sector: &Sector, target: u64, error: String) -> String {
     let id = hex::encode(sector.cert.sector);
-    let given_up = sector.relabel() == Some(Relabel::Done);
-    let relabel = if given_up {
-        Relabel::GivenUp
-    } else {
-        Relabel::Asked
+    let relabel = match sector.relabel_event(RelabelEvent::UnkeptProofFailed) {
+        Ok(relabel) => relabel,
+        Err(marked) => {
+            let relabel = Relabel::after(sector.relabel(), RelabelEvent::UnkeptProofFailed);
+            if let Some(relabel) = relabel {
+                sector.hold_unmarked(relabel);
+            }
+            warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, %marked,
+                scope = "local",
+                action = "free disk space in this node's storage directory and check its disk; \
+                          the sector goes on once this is written or its labels are kept",
+                "an uncertified sector's certificate proof made without labels kept failed, \
+                 and that could not be written; until it is, the sector is neither proven nor \
+                 labelled again without labels kept");
+            return format!("{error}; not marked to be labelled again: {marked}");
+        }
     };
-    if let Err(marked) = sector.mark_relabel(relabel) {
-        return format!("{error}; not marked to be labelled again: {marked}");
-    }
-    if given_up {
+    if relabel == Some(Relabel::GivenUp) {
         warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, scope = "local",
             action = "free disk space above the labels' floor so its labels are kept, and \
                       check this node's disk and memory if this recurs",
             "an uncertified sector labelled again failed its certificate proof made without \
              labels kept once more, with the same certificate; no proof is made for it until \
-             its labels are kept");
+             its labels are kept, which is tried at each poll");
     } else {
         warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, scope = "local",
             action = "check this node's disk and its kernel log for I/O errors if this recurs",
@@ -1839,19 +1946,30 @@ pub(crate) fn poll_sector_certificates(
         // process that keeps no labels, from its last layer on disk. One
         // whose proof so failed is labelled again first, once ([`Relabel`]).
         if kept.is_none() {
-            match sector.relabel() {
-                Some(Relabel::Asked) => {
+            let step = match sector.unmarked() {
+                // Its state could not be written: neither proven nor
+                // labelled again until it is, or its labels are kept.
+                Some(relabel) => match sector.mark_relabel(relabel) {
+                    Err(_) => UnkeptStep::KeepLabels,
+                    Ok(()) => {
+                        sector.unmarked_written();
+                        info!(frame, sector = %hex::encode(sector.cert.sector), ?relabel,
+                            "a sector's state after its failed certificate proof made without \
+                             labels kept is now written; it goes on from it");
+                        Relabel::unkept_step(Some(relabel))
+                    }
+                },
+                None => Relabel::unkept_step(sector.relabel()),
+            };
+            match step {
+                UnkeptStep::Prove => {}
+                // Labelled again past the disk floor while asked; else set
+                // up cheaply while refused room, and its labels kept once
+                // admitted, after which they prove it.
+                UnkeptStep::Relabel | UnkeptStep::KeepLabels => {
                     resume_reserved_sector(store, member, sector.dir.clone())?;
                     return Ok(());
                 }
-                Some(Relabel::GivenUp) => {
-                    return Err(unavailable(
-                        "sector proof without labels kept given up: labelled again, it failed \
-                         the same proof; it is proven once its labels are kept"
-                            .into(),
-                    ))
-                }
-                Some(Relabel::Done) | None => {}
             }
         }
         if !certificate_due(&sector.dir, target, beacon_frame, frame) {
@@ -1980,6 +2098,9 @@ pub(crate) fn poll_sector_certificates(
                         )
                         .map_err(QuilError::InvalidArgument)?;
                         atomic(&cache, &bytes)?;
+                        // A proof made ends where a failed one left it, so
+                        // a later failure is labelled again before given up.
+                        let _ = sector.relabel_event(RelabelEvent::Proven);
                         bytes
                     }
                     Err(e) => return Err(io(e)),
@@ -2647,12 +2768,15 @@ mod tests {
         global: Arc<HypergraphCrdt>,
         clock: Arc<quil_store::testing::InMemoryClockStore>,
         at: u64,
+        /// The frame its precommit was committed one after.
+        frame: u64,
+        publish: Publish,
+        sent: std::sync::mpsc::Receiver<Vec<u8>>,
     }
     impl UnkeptPending {
         /// Poll from the next frame, `polls` times, each poll's jobs run
         /// to their end.
         fn poll(&mut self, polls: u64) {
-            let (publish, _sent) = published();
             let lane = sector_lane(&self.member, &self.sector.cert.sector);
             for _ in 0..polls {
                 poll_sector_certificates(
@@ -2661,7 +2785,7 @@ mod tests {
                     &self.global,
                     self.clock.clone(),
                     &TestIdentity,
-                    publish.clone(),
+                    self.publish.clone(),
                 )
                 .unwrap();
                 assert!(
@@ -2674,6 +2798,33 @@ mod tests {
         /// The sector as its directory holds it now.
         fn now(&self) -> Sector {
             Sector::load(self.sector.dir.clone()).unwrap().unwrap()
+        }
+        /// Poll until something is sent, at most `polls` times: whether
+        /// GLOBAL takes it as the sector's certificate proof.
+        fn proven_within(&mut self, polls: u64) -> bool {
+            use quil_execution::global_intrinsic::persistent_storage as protocol;
+            use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+            use quil_execution::hypergraph_state::HypergraphState;
+            for _ in 0..polls {
+                self.poll(1);
+                if let Ok(bytes) = self.sent.try_recv() {
+                    let sent = StorageEpochProof::from_canonical_bytes(&bytes).unwrap();
+                    let state = HypergraphState::new(self.global.clone());
+                    let beacon = self.frame + 2;
+                    return protocol::check_capacity(
+                        self.frame + 4,
+                        &sent,
+                        &state,
+                        &TestIdentity,
+                        &|at| {
+                            assert_eq!(at, beacon);
+                            Ok(vec![9; 516])
+                        },
+                    )
+                    .is_ok();
+                }
+            }
+            false
         }
     }
     /// A sector of the installed store set up below the disk floor, turned
@@ -2701,12 +2852,16 @@ mod tests {
             )
             .unwrap();
         txn.commit().unwrap();
+        let (publish, sent) = published();
         UnkeptPending {
             sector,
             member,
             global,
             clock,
             at: frame + 3,
+            frame,
+            publish,
+            sent,
         }
     }
 
@@ -2763,6 +2918,168 @@ mod tests {
             now.relabel()
         );
         gates(false);
+    }
+
+    /// A filesystem of 1 PiB with `free` bytes of it free.
+    fn free_space(free: &Arc<std::sync::atomic::AtomicU64>) -> crate::storage_labels::SpaceSource {
+        let free = free.clone();
+        Box::new(move |_| {
+            Some(quil_forest::storage_health::FsUsage {
+                total_bytes: 1 << 50,
+                free_bytes: free.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            })
+        })
+    }
+
+    /// A sector given up on its proof made without labels kept is set up
+    /// again at each poll: once there is room, its labels are kept, it is
+    /// proven from them, and GLOBAL takes the proof (2026-11-20: nothing
+    /// kept its labels once given up, so it waited on its certificate for
+    /// good).
+    #[test]
+    fn a_sector_given_up_without_labels_kept_is_proven_once_they_are() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let free = Arc::new(AtomicU64::new(0));
+        crate::storage_labels::install_with_space(dir.path().to_owned(), free_space(&free));
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up then kept", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id) = (pending.member, pending.sector.cert.sector);
+        pending.poll(2);
+        assert!(
+            pending.sent.try_recv().is_err()
+                && unkept_proofs(&pending.sector.dir) == 0
+                && !store.holds(1500, &member, &id),
+            "below the floor a given-up sector is neither proven nor kept"
+        );
+        free.store(1 << 50, Ordering::SeqCst);
+        let proven = pending.proven_within(8);
+        println!("REACH sector-floor");
+        assert!(
+            proven && store.holds(1500, &member, &id) && unkept_proofs(&pending.sector.dir) == 0,
+            "GIVEN-UP-KEPT: a given-up sector was not proven from labels kept once there was room \
+             (proven: {proven})"
+        );
+        assert_eq!(
+            pending.now().relabel(),
+            None,
+            "its proof ends its given-up state"
+        );
+        gates(false);
+    }
+
+    /// A sector proven without labels kept after it was labelled again
+    /// leaves that state: a later failed proof labels it again before it
+    /// is given up (2026-11-20: the state outlived the proof, and a later
+    /// failure gave it up at once).
+    #[test]
+    fn a_sector_proven_after_labelled_again_leaves_that_state() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"labelled again then proven", |s| {
+            s.mark_relabel(Relabel::Done).unwrap();
+        });
+        let proven = pending.proven_within(8);
+        println!("REACH sector-floor");
+        let now = pending.now();
+        assert!(
+            proven && now.relabel().is_none() && !now.dir.join(RELABEL).exists(),
+            "DONE-CLEARED: a sector proven after labelled again kept that state (proven: \
+             {proven}, {:?})",
+            now.relabel()
+        );
+        gates(false);
+    }
+
+    /// A sector whose failed proof made without labels kept cannot be
+    /// recorded, as a full disk refuses it, is neither proven nor labelled
+    /// again, with a line naming what to do, until it is recorded; then it
+    /// goes on: labelled again, it takes the certificate its labels give.
+    #[test]
+    fn a_sector_whose_failed_proof_is_not_recorded_is_not_proven_again() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unrecorded columns", |s| {
+            s.cert.columns[0] ^= 1;
+            // A directory where its record goes: it cannot be written.
+            fs::create_dir_all(s.dir.join(RELABEL).join("held")).unwrap();
+        });
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let proofs = unkept_proofs(&pending.sector.dir);
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let warned = text
+            .lines()
+            .any(|line| line.contains("that could not be written") && line.contains("action="));
+        assert!(
+            proofs == 1 && pending.now().cert != pending.sector.cert && warned,
+            "UNMARKED-ONCE: a sector whose failed proof was not recorded was proven or labelled \
+             again, or without a line ({proofs} proofs, warned: {warned})"
+        );
+        fs::remove_dir_all(pending.sector.dir.join(RELABEL)).unwrap();
+        pending.poll(4);
+        let now = pending.now();
+        assert!(
+            now.cert == pending.sector.cert && unkept_proofs(&now.dir) == 1,
+            "UNMARKED-WRITTEN: recorded at last, it was not labelled again to the certificate \
+             its labels give"
+        );
+        gates(false);
+    }
+
+    /// Each [`Relabel`] state moves on each event as this table says, and
+    /// a poll without labels kept takes its step, so every state has an
+    /// exit: a proof made, or labels kept for one.
+    #[test]
+    fn a_relabel_state_moves_as_its_table_says() {
+        use Relabel::{Asked, Done, GivenUp};
+        use RelabelEvent::{Proven, Relabelled, UnkeptProofFailed};
+        let (same, other) = (Relabelled { same: true }, Relabelled { same: false });
+        let moves = [
+            (None, UnkeptProofFailed, Some(Asked)),
+            (None, same, None),
+            (None, other, None),
+            (None, Proven, None),
+            (Some(Asked), UnkeptProofFailed, Some(Asked)),
+            (Some(Asked), same, Some(Done)),
+            (Some(Asked), other, None),
+            (Some(Asked), Proven, None),
+            (Some(Done), UnkeptProofFailed, Some(GivenUp)),
+            (Some(Done), same, Some(Done)),
+            (Some(Done), other, Some(Done)),
+            (Some(Done), Proven, None),
+            (Some(GivenUp), UnkeptProofFailed, Some(GivenUp)),
+            (Some(GivenUp), same, Some(GivenUp)),
+            (Some(GivenUp), other, Some(GivenUp)),
+            (Some(GivenUp), Proven, None),
+        ];
+        for (state, event, after) in moves {
+            assert_eq!(
+                Relabel::after(state, event),
+                after,
+                "RELABEL-TABLE: {state:?} on {event:?}"
+            );
+        }
+        let steps = [
+            (None, UnkeptStep::Prove),
+            (Some(Asked), UnkeptStep::Relabel),
+            (Some(Done), UnkeptStep::Prove),
+            (Some(GivenUp), UnkeptStep::KeepLabels),
+        ];
+        for (state, step) in steps {
+            assert_eq!(
+                Relabel::unkept_step(state),
+                step,
+                "RELABEL-TABLE: {state:?}"
+            );
+        }
     }
 
     /// An uncertified sector set up below the disk floor whose last layer
