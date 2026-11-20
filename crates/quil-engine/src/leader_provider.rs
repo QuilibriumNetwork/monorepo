@@ -821,10 +821,10 @@ pub struct GlobalLeaderProvider {
     pool: Option<crate::proposal_pool::ProposalPool>,
     /// The public mempool an execution-branch leader's `message_collector`
     /// copied ([`Self::for_execution_branch`]), with its branch's executed
-    /// base: what its validation drops leaves only the copy, except a proof
-    /// a frame at or below that base and finalized applied
-    /// ([`MessageCollector::learn_committed`]). `None` for a leader over the
-    /// mempool itself.
+    /// base. What its proposal refuses leaves both ([`Self::drop_messages`]);
+    /// what it learns applied it learns only at or below that base and the
+    /// finalized frame ([`MessageCollector::learn_committed`]). `None` for a
+    /// leader over the mempool itself.
     mempool: Option<(Arc<MessageCollector>, u64)>,
 }
 
@@ -912,6 +912,20 @@ impl GlobalLeaderProvider {
         leader.pool = self.message_collector.take_proposal_pool();
         leader.mempool = Some((self.message_collector.clone(), ancestors.base));
         Ok(leader)
+    }
+
+    /// Drop `raw` from the mempool: from an execution-branch leader's copy
+    /// and the public collector it copied. Dropped from the copy alone, a
+    /// message stayed held for every later proposal to copy and drop again,
+    /// a storage epoch proof with its sender's seat to its window's end.
+    /// Each collector remembers them as refused for its share-full line.
+    /// Returns how many left the public mempool.
+    fn drop_messages(&self, raw: &[Vec<u8>]) -> usize {
+        let local = self.message_collector.remove_refused(raw);
+        match &self.mempool {
+            Some((mempool, _)) => mempool.remove_refused(raw),
+            None => local,
+        }
     }
 
     pub fn new(
@@ -1636,7 +1650,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 rejected = malformed.len(),
                 "discarding non-canonical GLOBAL proposal inputs"
             );
-            self.message_collector.remove(&malformed);
+            self.drop_messages(&malformed);
         }
         // Committee-handoff seals: every member of a closing committee submits
         // the same seal and resubmits until its own view shows it recorded,
@@ -1659,7 +1673,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     settled = copies.settled.len(),
                     "dropping committee-handoff seals GLOBAL already recorded"
                 );
-                self.message_collector.remove(&copies.settled);
+                self.drop_messages(&copies.settled);
             }
             copies
         };
@@ -2037,11 +2051,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             .map(|(mempool, base)| (mempool.as_ref(), *base)),
                         &invalid,
                         |raw| validator.applied_seat_parts(raw),
-                    );
+                    ) + self.drop_messages(&invalid);
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
-                        from = if self.mempool.is_some() { "proposal copy" } else { "global mempool" },
+                        from = if self.mempool.is_some() {
+                            "proposal copy and global mempool"
+                        } else {
+                            "global mempool"
+                        },
                         left_mempool,
                         by_reason = %by_reason,
                         "dropped protocol-invalid messages",

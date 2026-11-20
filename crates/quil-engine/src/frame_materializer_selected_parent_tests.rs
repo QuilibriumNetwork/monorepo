@@ -338,7 +338,7 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
     );
     let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&parent.requests[0])
         .unwrap();
-    assert!(rig.collector.add_message(1, raw));
+    assert!(rig.collector.add_message(1, raw.clone()));
     assert!(rig.collector.add_message(1, vec![1, 2, 3]));
     let sequence = rig.db.inner().latest_sequence_number();
     {
@@ -408,9 +408,9 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
         0
     );
     assert_eq!(
-        rig.collector.total_pending(),
-        2,
-        "private proposal must not remove or age out public messages"
+        rig.collector.collect_for_rank(1),
+        vec![raw],
+        "a private proposal keeps its ancestor's input public and drops the bytes it refused"
     );
     assert_eq!(
         rig.source.hypergraph.global_commitments_checked().unwrap(),
@@ -419,8 +419,9 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
 }
 
 // After the split at 837360 each proposal for 837364 validated the same 36
-// refused messages again: proposals validate a private copy of the mempool,
-// and the public pool keeps what they refuse.
+// refused messages again: proposals validate a private copy of the mempool.
+// What one refuses leaves the public pool; a copy sent again is not
+// validated again on the same parent.
 #[test]
 fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
     let rig = Rig::new();
@@ -459,8 +460,11 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
     let decoded = crate::consensus_wire::decode_message_bundle(&once).unwrap();
     let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&decoded).unwrap();
     assert_eq!(raw, once, "a canonical bundle reaches validation");
-    assert!(rig.collector.add_message(1, raw.clone()));
     for proposal in 0..2 {
+        assert!(
+            rig.collector.add_message(1, raw.clone()),
+            "the public pool takes it again once refused"
+        );
         let lease = rig
             .executor
             .prepare(context, 1, &rig.blocks, &rig.verifier, true)
@@ -478,7 +482,46 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
             "validated only by the first proposal"
         );
     }
-    assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "refused, it leaves the public pool"
+    );
+}
+
+/// A storage epoch proof settling one seat, `tag` telling the proofs apart.
+fn seat_settlement(tag: u8) -> Vec<u8> {
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let proof = StorageEpochProof {
+        member: [7; 32],
+        seats: vec![SeatProof {
+            shard_filter: vec![9; 32],
+            epoch: 1500,
+            seals: false,
+            settles: true,
+            ..Default::default()
+        }],
+        proof: vec![tag; 1_000],
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+            inner_bytes: proof.to_canonical_bytes(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// Delivers `raw` to the rig's public mempool from one sender.
+fn send_seat_proof(rig: &Rig, raw: Vec<u8>) -> crate::message_collector::SubmitOutcome {
+    use crate::message_collector::Provenance;
+    rig.collector
+        .add_message_outcome_by(1, raw, Provenance::Prover, b"sender")
 }
 
 /// A storage epoch proof a private proposal refuses leaves the public
@@ -487,47 +530,17 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
 /// the seat to its window's end and every later proof of it was refused.
 #[test]
 fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
-    use crate::message_collector::{Provenance, Refusal, SubmitOutcome};
-    use quil_execution::global_intrinsic::storage_epoch_proof::{
-        SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
-    };
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    use crate::message_collector::{Refusal, SubmitOutcome};
     let rig = Rig::new();
     rig.collector.set_class_shares();
     let parent = rig.deploy();
     rig.put(&parent);
     let context = rig.context(&parent);
-    // One seat's settlement, `tag` telling the proofs apart.
-    let proof = |tag: u8| {
-        let proof = StorageEpochProof {
-            member: [7; 32],
-            seats: vec![SeatProof {
-                shard_filter: vec![9; 32],
-                epoch: 1500,
-                seals: false,
-                settles: true,
-                ..Default::default()
-            }],
-            proof: vec![tag; 1_000],
-        };
-        CanonicalMessageBundle {
-            requests: vec![Some(CanonicalMessageRequest {
-                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
-                inner_bytes: proof.to_canonical_bytes(),
-            })],
-            timestamp: 0,
-        }
-        .to_canonical_bytes()
-        .unwrap()
-    };
-    let send = |raw: Vec<u8>| {
-        rig.collector
-            .add_message_outcome_by(1, raw, Provenance::Prover, b"sender")
-    };
-    let refused = proof(1);
+    let send = |raw: Vec<u8>| send_seat_proof(&rig, raw);
+    let refused = seat_settlement(1);
     assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
     assert_eq!(
-        send(proof(2)),
+        send(seat_settlement(2)),
         SubmitOutcome::Filtered(Refusal::RankFull),
         "the sender's seat is held before the proposal"
     );
@@ -542,9 +555,85 @@ fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
         "the proposal validated and refused the proof"
     );
     assert_eq!(
-        send(proof(3)),
+        send(seat_settlement(3)),
         SubmitOutcome::Accepted,
         "SEAT-FREED: a proof the proposal refused still holds its sender's seat"
+    );
+}
+
+/// A message that is not a canonical bundle, which a private proposal
+/// discards, leaves the public mempool too: discarded from the proposal's
+/// copy alone, every later proposal copied and discarded it again.
+#[test]
+fn a_malformed_input_a_proposal_discards_leaves_the_public_pool() {
+    use crate::message_collector::SubmitOutcome;
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let mut malformed = seat_settlement(1);
+    malformed.push(0);
+    assert_eq!(
+        send_seat_proof(&rig, malformed),
+        SubmitOutcome::Accepted,
+        "the mempool holds a message it cannot decode"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "MALFORMED-KEPT: a malformed input the proposal discarded stayed public"
+    );
+}
+
+/// A replayed copy of a refused seat proof (its sender's own signed gossip
+/// copy, sent again once the gossip seen cache forgets it) holds the seat
+/// again only until the next proposal, which drops it on the refusal it
+/// remembers without validating it again.
+#[test]
+fn a_replayed_refused_seat_proof_holds_its_seat_until_the_next_proposal() {
+    use crate::message_collector::{Refusal, SubmitOutcome};
+    let rig = Rig::new();
+    rig.collector.set_class_shares();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let send = |raw: Vec<u8>| send_seat_proof(&rig, raw);
+    let refused = seat_settlement(1);
+    let propose = || {
+        let lease = rig
+            .executor
+            .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+            .unwrap();
+        assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    };
+    assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
+    propose();
+    assert!(rig.leader.refused_message(&refused).is_some());
+    assert_eq!(
+        send(refused.clone()),
+        SubmitOutcome::Accepted,
+        "a replayed copy of the refused proof is held again"
+    );
+    assert_eq!(
+        send(seat_settlement(2)),
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "the replayed copy holds the seat until a proposal"
+    );
+    propose();
+    assert_eq!(
+        rig.leader.refusals_reused(),
+        1,
+        "the next proposal drops the replayed copy on its remembered refusal"
+    );
+    assert_eq!(
+        send(seat_settlement(3)),
+        SubmitOutcome::Accepted,
+        "REPLAY-HELD: a replayed refused proof held its sender's seat past the next proposal"
     );
 }
 

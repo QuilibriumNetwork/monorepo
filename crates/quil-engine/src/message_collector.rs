@@ -2495,6 +2495,9 @@ pub struct MessageCollector {
     share_full_active: std::sync::atomic::AtomicBool,
     /// The log of submits refused over a class share of a rank.
     share_full: std::sync::Mutex<ShareFullLog>,
+    /// Messages a GLOBAL proposal refused ([`Self::remove_refused`]), for
+    /// the held bytes the share-full line names as refused.
+    refused: std::sync::Mutex<RefusedKeys>,
     /// The log of held and deferred storage epoch proofs over a frame's
     /// seal budget ([`MessageCollector::note_oversize_seal`]).
     oversize_seals: std::sync::Mutex<OversizeSealLog>,
@@ -2734,6 +2737,98 @@ impl RankFullLog {
             outage: crate::outage::Outage::begin_after_repeating(1, RANK_FULL_LOG_EVERY),
             unreported: 0,
         }
+    }
+}
+
+/// Most keys of refused messages [`RefusedKeys`] remembers, the oldest
+/// forgotten first: a few ranks of held storage epoch proofs, with room.
+const REFUSED_KEYS_KEPT: usize = 4096;
+
+/// The keys of messages a GLOBAL proposal refused, newest last, at most
+/// [`REFUSED_KEYS_KEPT`].
+#[derive(Default)]
+struct RefusedKeys {
+    keys: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl RefusedKeys {
+    fn note(&mut self, key: [u8; 32]) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.order.len() > REFUSED_KEYS_KEPT {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+            }
+        }
+    }
+}
+
+/// What a share-full line names of the refusal that logs it, read only
+/// when the line is due.
+struct ShareFullDetail {
+    /// The refused storage epoch proof's first seat ([`seat_label`]).
+    seat: String,
+    /// The held storage epoch proofs a GLOBAL proposal already refused, as
+    /// (messages, bytes).
+    refused_held: (usize, usize),
+}
+
+/// A storage epoch proof's first seat, for a log line:
+/// `member/shard/epoch/part`, each key's first four bytes in hex, with
+/// `+N` for the other seats it proves. Empty for anything else.
+fn seat_label(data: &[u8]) -> String {
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    let Ok(bundle) =
+        quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data)
+    else {
+        return String::new();
+    };
+    let mut proofs = bundle
+        .requests
+        .iter()
+        .flatten()
+        .filter(|request| request.inner_type_prefix == TYPE_STORAGE_EPOCH_PROOF)
+        .filter_map(|request| StorageEpochProof::from_canonical_bytes(&request.inner_bytes).ok());
+    let Some(proof) = proofs.next() else {
+        return String::new();
+    };
+    let Some(seat) = proof.seats.first() else {
+        return String::new();
+    };
+    let part = match (seat.seals, seat.settles) {
+        (true, true) => "seal+settle",
+        (true, false) => "seal",
+        (false, true) => "settle",
+        (false, false) => "none",
+    };
+    let short = |key: &[u8]| hex::encode(&key[..key.len().min(4)]);
+    let others = proof.seats.len() - 1 + proofs.map(|p| p.seats.len()).sum::<usize>();
+    let mut label = format!(
+        "{}/{}/{}/{part}",
+        short(&proof.member),
+        short(&seat.shard_filter),
+        seat.epoch
+    );
+    if others > 0 {
+        label.push_str(&format!("+{others}"));
+    }
+    label
+}
+
+/// A share's name in a share-full line.
+fn share_label(share: Share) -> &'static str {
+    match share {
+        Share::Unreserved => "unreserved",
+        Share::Capacity => "capacity",
+        Share::Member => "member",
+        Share::Seals => "seals",
+        Share::OtherSeals => "other_seals",
+        Share::Sender => "sender",
     }
 }
 
@@ -3044,7 +3139,12 @@ impl MessageCollector {
     /// an episode and then at most one line per [`RANK_FULL_LOG_EVERY`] with
     /// the counts since the previous line ([`ShareFullLog`]). A refusal a
     /// whole interval after the last ends that episode and begins another.
-    fn note_share_full(&self, now: Instant, state: ShareFullState) {
+    fn note_share_full(
+        &self,
+        now: Instant,
+        state: ShareFullState,
+        detail: impl FnOnce() -> ShareFullDetail,
+    ) {
         let mut log = self.share_full.lock().unwrap();
         if log.quiet(now) {
             // A whole interval passed without a refusal, though no submit
@@ -3083,6 +3183,11 @@ impl MessageCollector {
         let total = log.total;
         let not_only_seals = std::mem::take(&mut log.not_only_seals);
         let (latest_sender, (sender_pending, sender_bytes)) = state.sender.unwrap_or_default();
+        let ShareFullDetail {
+            seat: latest_seat,
+            refused_held: (refused_held_pending, refused_held_bytes),
+        } = detail();
+        let latest_share = share_label(state.share);
         macro_rules! share_full_line {
             ($level:ident) => {
                 tracing::$level!(
@@ -3105,6 +3210,10 @@ impl MessageCollector {
                     sender_seal_pending = sender_pending,
                     sender_seal_bytes = sender_bytes,
                     sender_seal_max_bytes = SEAL_BYTES_PER_SENDER,
+                    latest_share,
+                    latest_seat = %latest_seat,
+                    refused_held_pending,
+                    refused_held_bytes,
                     reopened,
                     refused_total = total,
                     for_secs = secs,
@@ -3116,7 +3225,7 @@ impl MessageCollector {
                     unreserved_bytes = state.unreserved.1,
                     reserved_bytes = RESERVED_BYTES_PER_RANK,
                     latest_member = %state.member.map(hex::encode).unwrap_or_default(),
-                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes), sender_seal_refused those over one sender's share across both (latest_sender names the last, holding sender_seal_pending proofs of sender_seal_bytes, at most sender_seal_max_bytes, or one proof up to a frame's seal budget, and one per seat; one proof over a frame's seal budget is held at a time from active provers and one from others); reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
+                    "message collector: refusing submits over their class share of the rank, so shard frame headers and storage epoch proofs keep their reserved room; counts are since the previous line: capacity_refused and member_refused are persistent-sector capacity messages over the rank's share or one member's from one sender (latest_member names the last), unreserved_refused any other message over the room outside the reserve, seal_refused storage epoch proofs from active provers over what this archive holds for its frames (seal_bytes held across all ranks, at most seal_max_bytes), other_seal_refused those from other senders over their own share (other_seal_bytes, at most other_seal_max_bytes), sender_seal_refused those over one sender's share across both (latest_sender names the last, holding sender_seal_pending proofs of sender_seal_bytes, at most sender_seal_max_bytes, or one proof up to a frame's seal budget, and one per seat; one proof over a frame's seal budget is held at a time from active provers and one from others); latest_share names the share the last refusal was over and latest_seat its proof's first seat (member/shard/epoch/part); refused_held_pending proofs of refused_held_bytes are held storage epoch proofs a GLOBAL proposal already refused, sent again since; reopened counts the times the shares accepted again in between, as each frame frees room the next submits fill, and refused_total the refusals since for_secs ago. seal_refused during an epoch's proof wave is expected and senders resend: an interval refusing only storage epoch proofs logs at info. Senders retry until their window ends. A long stretch of capacity refusals means members send capacity messages faster than GLOBAL carries them: check latest_member's release. Ends once a whole interval passes without a refusal"
                 )
             };
         }
@@ -3220,6 +3329,7 @@ impl MessageCollector {
             class_shares: std::sync::atomic::AtomicBool::new(false),
             share_full_active: std::sync::atomic::AtomicBool::new(false),
             share_full: Default::default(),
+            refused: Default::default(),
             oversize_seals: Default::default(),
             window_seats: Default::default(),
             #[cfg(test)]
@@ -3985,18 +4095,19 @@ impl MessageCollector {
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         if let Some(share) = over {
             // Retryable as a full rank: senders of every release resend it.
-            self.note_share_full(
-                Instant::now(),
-                ShareFullState {
-                    rank,
-                    share,
-                    unreserved: buffer.shares.unreserved,
-                    capacity: buffer.shares.capacity,
-                    seals,
-                    member: message.capacity.as_ref().map(|c| c.member),
-                    sender: held_seal.then(|| (sender_label(sender), from_sender.held)),
-                },
-            );
+            let state = ShareFullState {
+                rank,
+                share,
+                unreserved: buffer.shares.unreserved,
+                capacity: buffer.shares.capacity,
+                seals,
+                member: message.capacity.as_ref().map(|c| c.member),
+                sender: held_seal.then(|| (sender_label(sender), from_sender.held)),
+            };
+            self.note_share_full(Instant::now(), state, || ShareFullDetail {
+                seat: seat_label(&message.data),
+                refused_held: self.refused_held(&buffers),
+            });
             if let Some(bytes) = oversize {
                 let reason = from_sender.oversize_refusal(&message, share);
                 self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
@@ -4938,18 +5049,22 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         };
         if let Some(share) = over_sender.or_else(|| seals.over(message)) {
-            self.note_share_full(
-                Instant::now(),
-                ShareFullState {
-                    rank,
-                    share,
-                    unreserved: buffer.shares.unreserved,
-                    capacity: buffer.shares.capacity,
-                    seals,
-                    member: None,
-                    sender: Some((sender_label(sender), from_sender.held)),
-                },
-            );
+            let state = ShareFullState {
+                rank,
+                share,
+                unreserved: buffer.shares.unreserved,
+                capacity: buffer.shares.capacity,
+                seals,
+                member: None,
+                sender: Some((sender_label(sender), from_sender.held)),
+            };
+            self.note_share_full(Instant::now(), state, || ShareFullDetail {
+                seat: seat_label(&message.data),
+                refused_held: self.refused_held(buffers),
+            });
+            let Some(buffer) = buffers.get_mut(&rank) else {
+                return SubmitOutcome::Duplicate;
+            };
             if message.sender.is_some() && message.oversize_seal() {
                 let reason = from_sender.oversize_refusal(message, share);
                 let bytes = message.data.len();
@@ -5129,18 +5244,29 @@ impl MessageCollector {
     /// and re-proposed every rank until they age out of the retention
     /// window — they leave the mempool the moment we know they're invalid.
     pub fn remove(&self, raw_msgs: &[Vec<u8>]) {
+        self.remove_counted(raw_msgs);
+    }
+
+    /// [`Self::remove`], returning how many messages left.
+    fn remove_counted(&self, raw_msgs: &[Vec<u8>]) -> usize {
         if raw_msgs.is_empty() {
-            return;
+            return 0;
         }
         let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
         let mut buffers = self.buffers.write().unwrap();
+        let count = |buffers: &HashMap<u64, RankBuffer>| {
+            buffers.values().map(RankBuffer::len).sum::<usize>()
+        };
+        let before = count(&buffers);
         for buf in buffers.values_mut() {
             buf.retain(|m| !hashes.contains(&m.hash));
         }
         buffers.retain(|_, b| !b.is_empty());
+        let left = before - count(&buffers);
         // The coins they held stay held by the other messages carrying the
         // same shields ([`ShieldClaims`]).
         self.shield_claims.lock().unwrap().forget(&hashes);
+        left
     }
 
     /// Learn the storage seat parts a finalized frame's execution applied
@@ -5254,6 +5380,32 @@ impl MessageCollector {
     #[cfg(test)]
     fn applied_prunes(&self) -> u64 {
         self.applied.lock().unwrap().prunes
+    }
+
+    /// [`Self::remove`] for messages a GLOBAL proposal refused, remembering
+    /// their keys: a copy held again (a resend or a replay) counts in the
+    /// share-full line's refused held bytes. Returns how many messages left.
+    pub fn remove_refused(&self, raw_msgs: &[Vec<u8>]) -> usize {
+        let left = self.remove_counted(raw_msgs);
+        let mut refused = self.refused.lock().unwrap();
+        for raw in raw_msgs {
+            refused.note(message_key(raw));
+        }
+        left
+    }
+
+    /// The held storage epoch proofs in `buffers` a GLOBAL proposal refused
+    /// ([`Self::remove_refused`]), as (messages, bytes).
+    fn refused_held(&self, buffers: &HashMap<u64, RankBuffer>) -> (usize, usize) {
+        let refused = self.refused.lock().unwrap();
+        if refused.keys.is_empty() {
+            return (0, 0);
+        }
+        buffers
+            .values()
+            .flat_map(|buffer| buffer.messages.values())
+            .filter(|m| m.held_seal() && refused.keys.contains(&m.hash))
+            .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.data.len()))
     }
 
     /// Take back `data`, a message a finalized frame consumed that has to run
