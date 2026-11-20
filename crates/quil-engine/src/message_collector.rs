@@ -5606,6 +5606,39 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
     true
 }
 
+/// Whether every shard frame header in `data` that GLOBAL frame
+/// `frame_number` cannot carry ([`bundle_shard_frames_in_lockstep`]) is
+/// anchored ahead of its window, at least one: a later frame may carry
+/// them. One behind the window, or naming no anchor, rides no later frame.
+pub fn bundle_shard_frames_ahead(data: &[u8], frame_number: u64) -> bool {
+    use quil_execution::global_intrinsic::frame_header::{
+        anchor_window, FrameHeader, TYPE_FRAME_HEADER,
+    };
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+
+    let Ok(bundle) = CanonicalMessageBundle::from_canonical_bytes(data) else {
+        return false;
+    };
+    let (_, newest) = anchor_window(frame_number);
+    let mut ahead = false;
+    for req in bundle.requests.into_iter().flatten() {
+        if req.inner_type_prefix != TYPE_FRAME_HEADER {
+            continue;
+        }
+        let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) else {
+            continue;
+        };
+        if anchor_in_lockstep(fh.global_frame_number, frame_number) {
+            continue;
+        }
+        if fh.global_frame_number <= newest {
+            return false;
+        }
+        ahead = true;
+    }
+    ahead
+}
+
 /// A shard frame anchored to GLOBAL frame `anchor` may ride GLOBAL frame
 /// `frame_number`. WINDOWED LOCKSTEP (the predicate GLOBAL validation and
 /// execution use, `anchor_in_window`, so a packed header is never refused): a
