@@ -11,7 +11,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 /// An expected wait of a leaf's encode: on GLOBAL certifying its sector
@@ -746,6 +749,83 @@ pub(super) fn sectors_certified(
     Ok(())
 }
 
+/// How [`encode_leaf`] stored a leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LeafStored {
+    /// Stored whole from the same source this epoch already: nothing
+    /// written.
+    Kept,
+    /// Aliased to an earlier epoch's replica of the same data and sector.
+    Aliased,
+    /// Encoded and written.
+    Written,
+}
+
+/// One persistent encode's leaves by how they were stored, and their
+/// replica bytes, for its summary line ([`Tally::log`]).
+#[derive(Default)]
+pub(super) struct Tally {
+    kept: AtomicU64,
+    kept_bytes: AtomicU64,
+    aliased: AtomicU64,
+    written: AtomicU64,
+    written_bytes: AtomicU64,
+}
+impl Tally {
+    pub(super) fn count(&self, n: u64, stored: LeafStored) {
+        let bytes = n.saturating_mul(proof::NODE_BYTES as u64);
+        let (leaves, total) = match stored {
+            LeafStored::Kept => (&self.kept, Some(&self.kept_bytes)),
+            LeafStored::Aliased => (&self.aliased, None),
+            LeafStored::Written => (&self.written, Some(&self.written_bytes)),
+        };
+        leaves.fetch_add(1, Ordering::Relaxed);
+        if let Some(total) = total {
+            total.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+    /// One line per encode, completed or not: a retry after a failure
+    /// shows the leaves it kept rather than wrote again.
+    pub(super) fn log(&self, captured: &Captured, completed: bool, seconds: u64) {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let (kept, aliased, written) = (get(&self.kept), get(&self.aliased), get(&self.written));
+        info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+            leaves = captured.prefixes.len(), completed,
+            leaves_not_reached = (captured.prefixes.len() as u64)
+                .saturating_sub(kept + aliased + written),
+            leaves_kept = kept, kept_bytes = get(&self.kept_bytes), leaves_aliased = aliased,
+            leaves_written = written, written_bytes = get(&self.written_bytes), seconds,
+            scope = "local",
+            "persistent storage encode: leaves this epoch already stored whole from the same \
+             data and sector are kept and not written again; `written_bytes` counts each \
+             written leaf's whole replica");
+    }
+}
+
+/// What `member`'s replica of a leaf encoded into the sector `cert`
+/// certifies is encoded from, recorded beside it
+/// ([`ReplicaStore::put_hash_source`]): the leaf's snapshot data and the
+/// sector, whose certificate commits to the labels it is encoded with.
+fn sector_leaf_source(
+    captured: &Captured,
+    member: &[u8],
+    prefix: &[u32],
+    cert: &sector::Certificate,
+) -> [u8; 32] {
+    use sha2::Digest as _;
+    let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
+        captured.filter.clone(),
+        captured.plan.clone(),
+    )]);
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"quil/storage-snapshot/persistent-leaf-source/v1");
+    hash.update(captured.epoch.to_be_bytes());
+    hash.update(captured.fingerprint(member, prefix));
+    hash.update(cert.to_bytes());
+    hash.update(plan);
+    hash.finalize().into()
+}
+
 pub(super) fn encode_leaf(
     captured: &Captured,
     member: &[u8],
@@ -753,7 +833,7 @@ pub(super) fn encode_leaf(
     replicas: &ReplicaStore,
     store: Option<&LabelStore>,
     stop: &(dyn Fn() -> bool + Sync),
-) -> Result<(u64, bool, usize)> {
+) -> Result<(u64, LeafStored)> {
     let store = store
         .ok_or_else(|| unavailable("persistent storage requires a sector directory".into()))?;
     if stop() {
@@ -766,14 +846,32 @@ pub(super) fn encode_leaf(
         .filter(|sector| sector.certified)
         .ok_or_else(|| waiting(UNCERTIFIED))?;
     let fingerprint = captured.fingerprint(member, prefix);
+    // A leaf stored whole into this sector this epoch, before a failure
+    // later in the encode or a restart, would encode to the same replica:
+    // it is kept, unless a node of it no longer hashes up to its
+    // registration (2026-11-20: each retry of a seat's encode wrote every
+    // leaf stored before the failure again whole, 512 MB each, as an
+    // alias of the epoch's own leaf is refused).
+    let source = sector_leaf_source(captured, member, prefix, &sector.cert);
+    match replicas.stored_from(captured.epoch, &leaf, &source, stop) {
+        Ok(StoredFrom::Whole(_)) => {
+            replicas.note_snapshot(captured.epoch, &leaf, &fingerprint)?;
+            return Ok((n, LeafStored::Kept));
+        }
+        Ok(StoredFrom::Stopped) => return Err(unavailable("persistent snapshot stopped".into())),
+        Ok(StoredFrom::Damaged(why)) => damaged_leaf(captured, &leaf, &why),
+        Err(error) => damaged_leaf(captured, &leaf, &error.to_string()),
+        Ok(StoredFrom::Unrecorded | StoredFrom::Other) => {}
+    }
     if let Some(from) = replicas.snapshot_match(&leaf, &fingerprint)? {
         if let Some(old) = replicas.get_hash_leaf(from, &leaf)? {
             if sector::Registration::parse(&old.registration_root)
                 .is_some_and(|r| r.certificate(old.n) == sector.cert)
                 && replicas.alias_hash(captured.epoch, &leaf, from)?
             {
+                replicas.put_hash_source(captured.epoch, &leaf, &source)?;
                 replicas.note_snapshot(captured.epoch, &leaf, &fingerprint)?;
-                return Ok((n, true, 0));
+                return Ok((n, LeafStored::Aliased));
             }
         }
     }
@@ -832,8 +930,16 @@ pub(super) fn encode_leaf(
         &root.to_bytes(),
     )?;
     replicas.put_data_cap(captured.epoch, &leaf, &encoded.data_cap)?;
+    replicas.put_hash_source(captured.epoch, &leaf, &source)?;
     replicas.note_snapshot(captured.epoch, &leaf, &fingerprint)?;
-    Ok((n, true, 0))
+    Ok((n, LeafStored::Written))
+}
+
+fn damaged_leaf(captured: &Captured, leaf: &[u8], why: &str) {
+    warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+        leaf = %hex::encode(leaf), reason = %why, scope = "local",
+        action = "check this node's disk and store for errors; the leaf is encoded again",
+        "persistent storage encode found a leaf it stored this epoch damaged");
 }
 
 struct Source {
@@ -2366,6 +2472,249 @@ mod tests {
             sector.save().unwrap();
             store.release_certified_sector(captured.epoch, member, &id);
         }
+    }
+    /// A seat of several leaves, each with its certified sector, in a
+    /// store of its own: the snapshot, its sectors and each leaf's id.
+    fn certified_seat(
+        member: &[u8; 32],
+        app: [u8; 32],
+    ) -> (tempfile::TempDir, LabelStore, Captured, Vec<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let crdt = super::super::tests::shard_of_leaves(app);
+        let snap = super::super::tests::split(
+            capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap(),
+        );
+        assert!(snap.prefixes.len() >= 2, "a seat of several leaves");
+        certify_all(&store, member, &snap);
+        let leaves = snap
+            .prefixes
+            .iter()
+            .map(|prefix| quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix))
+            .collect();
+        (dir, store, snap, leaves)
+    }
+    /// A retry of a seat's encode after a later leaf failed it keeps each
+    /// leaf the failed try stored whole: it writes only the leaf that
+    /// failed (2026-11-20: each retry wrote every leaf stored before the
+    /// failure again whole, 512 MB each, up to 34 times a leaf).
+    #[test]
+    fn a_retry_after_a_later_leaf_fails_writes_no_leaf_stored_before() {
+        use quil_store::replica_store::replica_bytes_written;
+        use std::os::unix::fs::FileExt;
+        crate::storage_jobs::set_job_slots_for_test(1);
+        let logs = super::super::tests::capture_logs();
+        let text = || String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        gates(true);
+        let member = [0x5A; 32];
+        let (_dir, store, snap, leaves) = certified_seat(&member, [0x5B; 32]);
+        let torn = leaves.len() - 1;
+        let exact = snap.node_count(&snap.prefixes[torn]).unwrap();
+        let (path, _, n) = reserve(&store, &member, &leaves[torn], 1500, exact).unwrap();
+        // The last leaf's sector's last layer torn, its repair this epoch
+        // begun already: that leaf fails the encode, after the others.
+        atomic(&path.join("repair-1500"), &[]).unwrap();
+        let last = path.join("last");
+        let whole = fs::read(&last).unwrap();
+        let file = OpenOptions::new().write(true).open(&last).unwrap();
+        file.write_all_at(&vec![0u8; (n - n / 2) as usize * 32], n / 2 * 32)
+            .unwrap();
+        drop(file);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let encode = || {
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| false)
+        };
+        assert!(encode().is_err(), "the torn leaf fails the encode");
+        let stored: Vec<_> = leaves
+            .iter()
+            .map(|leaf| replicas.get_hash(1500, leaf).unwrap())
+            .collect();
+        assert!(
+            stored[..torn].iter().all(Option::is_some) && stored[torn].is_none(),
+            "the premise: the failed try stored each leaf but the torn one"
+        );
+        fs::write(&last, &whole).unwrap();
+        let before = replica_bytes_written();
+        encode().expect("the retry completes");
+        println!("REACH persistent-keep");
+        let written = replica_bytes_written() - before;
+        let failed = replicas.get_hash(1500, &leaves[torn]).unwrap().unwrap();
+        let rest: u64 = stored[..torn]
+            .iter()
+            .flatten()
+            .map(|leaf| leaf.replica.len() as u64)
+            .sum();
+        assert_eq!(
+            written,
+            failed.replica.len() as u64,
+            "RETRY-REWRITES-STORED: the retry wrote {written} replica bytes for the one leaf \
+             of {} the failed try did not store; the {rest} bytes of the {torn} it stored are \
+             to be kept",
+            failed.replica.len()
+        );
+        for (leaf, kept) in leaves.iter().zip(&stored).take(torn) {
+            assert_eq!(
+                &replicas.get_hash(1500, leaf).unwrap(),
+                kept,
+                "each kept as stored"
+            );
+        }
+        let all = text();
+        let summary = |completed: bool| {
+            all.lines()
+                .find(|line| {
+                    line.contains("persistent storage encode:")
+                        && line.contains(&format!("completed={completed}"))
+                })
+                .unwrap_or_else(|| panic!("an encode summary, completed={completed}:\n{all}"))
+                .to_owned()
+        };
+        let (first, retry) = (summary(false), summary(true));
+        assert!(
+            first.contains(&format!("leaves_written={torn} "))
+                && first.contains("leaves_not_reached=1 ")
+                && retry.contains(&format!("leaves_kept={torn} "))
+                && retry.contains(&format!("kept_bytes={rest} "))
+                && retry.contains("leaves_written=1 ")
+                && retry.contains(&format!("written_bytes={written} ")),
+            "SUMMARY-COUNTS: each encode's line counts its leaves kept and written:\n{first}\n{retry}"
+        );
+        gates(false);
+    }
+    /// A leaf stored this epoch whose nodes no longer hash up to its
+    /// registration is encoded again at the next try, not kept, and only
+    /// it: the others stored whole are kept.
+    #[test]
+    fn a_damaged_leaf_stored_this_epoch_is_encoded_again() {
+        use quil_store::replica_store::replica_bytes_written;
+        crate::storage_jobs::set_job_slots_for_test(1);
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let member = [0x5C; 32];
+        let (_dir, store, snap, leaves) = certified_seat(&member, [0x5D; 32]);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let encode = || {
+            super::super::encode_member_until(&snap, &member, &replicas, Some(&store), &|| false)
+        };
+        encode().expect("the first encode completes");
+        let stored = replicas.get_hash(1500, &leaves[0]).unwrap().unwrap();
+        let node = proof::NODE_BYTES;
+        let mut changed = stored.replica.to_vec();
+        changed[..2 * node].rotate_left(node);
+        assert_ne!(&changed[..], &stored.replica[..]);
+        replicas
+            .put_hash(
+                1500,
+                &leaves[0],
+                &changed,
+                &stored.cap,
+                &stored.registration_root,
+            )
+            .unwrap();
+        let exact = snap.node_count(&snap.prefixes[0]).unwrap();
+        let (dir, _, _) = reserve(&store, &member, &leaves[0], 1500, exact).unwrap();
+        let cert = Sector::load(dir).unwrap().unwrap().cert;
+        let source = sector_leaf_source(&snap, &member, &snap.prefixes[0], &cert);
+        replicas.put_hash_source(1500, &leaves[0], &source).unwrap();
+        assert!(
+            matches!(
+                replicas.stored_from(1500, &leaves[0], &source, &|| false),
+                Ok(StoredFrom::Damaged(_))
+            ),
+            "the premise: a damaged leaf recorded as stored from its source"
+        );
+        let before = replica_bytes_written();
+        encode().expect("the next encode completes");
+        println!("REACH persistent-keep");
+        let written = replica_bytes_written() - before;
+        assert_eq!(
+            written,
+            stored.replica.len() as u64,
+            "DAMAGED-KEPT: a damaged leaf of {} replica bytes is to be written again, and \
+             only it; {written} were",
+            stored.replica.len()
+        );
+        assert_eq!(
+            replicas.get_hash(1500, &leaves[0]).unwrap().unwrap(),
+            stored,
+            "encoded again to its replica"
+        );
+        let all = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            all.contains("found a leaf it stored this epoch damaged"),
+            "the damage is warned:\n{all}"
+        );
+        gates(false);
+    }
+    /// A leaf stored this epoch is kept only for the sector it was encoded
+    /// into: encoded again into another sector of the same member, as one
+    /// reserved and certified afresh, every leaf is written again, each
+    /// registering its new sector, none kept naming the old one.
+    #[test]
+    fn an_encode_into_another_sector_writes_every_leaf_again() {
+        use quil_store::replica_store::replica_bytes_written;
+        crate::storage_jobs::set_job_slots_for_test(1);
+        gates(true);
+        let member = [0x5E; 32];
+        let (_dir, first, snap, leaves) = certified_seat(&member, [0x5F; 32]);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let encode = |store: &LabelStore| {
+            super::super::encode_member_until(&snap, &member, &replicas, Some(store), &|| false)
+        };
+        encode(&first).expect("the first encode completes");
+        // The same member's sectors reserved afresh, at an earlier epoch:
+        // each leaf's sector and its certificate differ.
+        let other = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(
+            other.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let mut sectors = Vec::new();
+        for (prefix, leaf) in snap.prefixes.iter().zip(&leaves) {
+            let exact = snap.node_count(prefix).unwrap();
+            let (dir, id, n) = reserve(&store, &member, leaf, 1499, exact).unwrap();
+            initialize(&store, &member, 1499, dir.clone(), id, n, &|| false).unwrap();
+            let mut sector = Sector::load(dir).unwrap().unwrap();
+            sector.certified = true;
+            sector.save().unwrap();
+            store.release_certified_sector(1499, &member, &id);
+            sectors.push(id);
+        }
+        let stored: Vec<_> = leaves
+            .iter()
+            .map(|leaf| replicas.get_hash(1500, leaf).unwrap().unwrap())
+            .collect();
+        let registered = |leaf: &quil_store::replica_store::HashReplica| {
+            sector::Registration::parse(&leaf.registration_root)
+                .unwrap()
+                .sector
+        };
+        assert!(
+            stored
+                .iter()
+                .zip(&sectors)
+                .all(|(leaf, id)| registered(leaf) != *id),
+            "the premise: each leaf stored into a sector other than its new one"
+        );
+        let before = replica_bytes_written();
+        encode(&store).expect("the encode into the other sectors completes");
+        println!("REACH persistent-keep");
+        let written = replica_bytes_written() - before;
+        let again: Vec<_> = leaves
+            .iter()
+            .map(|leaf| replicas.get_hash(1500, leaf).unwrap().unwrap())
+            .collect();
+        let all: u64 = again.iter().map(|leaf| leaf.replica.len() as u64).sum();
+        let named: Vec<_> = again.iter().map(registered).collect();
+        assert!(
+            written == all && named == sectors,
+            "SOURCE-CHANGE-KEPT: each of {} leaves is to be written again into its new \
+             sector, {all} replica bytes; {written} were, and {} of them register it",
+            leaves.len(),
+            named.iter().zip(&sectors).filter(|(a, b)| a == b).count()
+        );
+        gates(false);
     }
     /// A seat's wait ends once its encode's gate opens: its end is logged
     /// before the encode starts, and its renewal reads no wait while the
