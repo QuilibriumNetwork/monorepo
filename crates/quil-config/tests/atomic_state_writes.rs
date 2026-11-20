@@ -169,18 +169,6 @@ const OTHER_WRITES: &[(&str, &str, &str, &str)] = &[
         "an imported config into a new directory",
     ),
     (
-        "quil-client/src/commands/token/action_log.rs",
-        "open_append",
-        "OpenOptions::new(",
-        "appends to the private action log in place, keeping its owner",
-    ),
-    (
-        "quil-client/src/commands/token/action_log.rs",
-        "open_append",
-        ".append(true)",
-        "appends to the private action log in place, keeping its owner",
-    ),
-    (
         "quil-client/src/release.rs",
         "write_atomic",
         "OpenOptions::new(",
@@ -199,10 +187,67 @@ const OTHER_WRITES: &[(&str, &str, &str, &str)] = &[
         "the installed binary's link, repointed as root",
     ),
     (
-        "quil-client/src/commands/token/wallet.rs",
-        "lock_merge_batch",
+        "quil-config/src/private_files.rs",
+        "open_private_create",
         "OpenOptions::new(",
-        "opens the batch lock file only to hold its flock; writes no content",
+        "appends to the action log or holds a lock file in place, keeping its owner",
+    ),
+    (
+        "quil-config/src/private_files.rs",
+        "open_private_create",
+        ".append(true)",
+        "appends to the action log in place, keeping its owner",
+    ),
+];
+
+/// Calls that create a missing file and follow a link in its place: run
+/// as root in a directory another user may write, they create a file
+/// wherever a link that user planted points.
+const CREATES: &[&str] = &[".create(true)", "File::create(", "fs::write(", "fs::copy("];
+
+/// `(source file, function)` of the one create that follows no link in
+/// its place, which every create in a directory another user may write
+/// goes through.
+const PRIVATE_CREATE: (&str, &str) = ("quil-config/src/private_files.rs", "open_private_create");
+
+/// `(source file, function, call, why no other user plants a link there)`
+/// for each other create in [`SCANNED`] outside the tests.
+const LINKED_CREATES: &[(&str, &str, &str, &str)] = &[
+    (
+        "quil-client/src/commands/node/lifecycle.rs",
+        "lock_node_updates",
+        ".create(true)",
+        "the update lock in the install directory, which only root may write",
+    ),
+    (
+        "quil-client/src/commands/deploy/get.rs",
+        "run",
+        "fs::write(",
+        "the output path the operator names",
+    ),
+    (
+        "quil-client/src/commands/node/diagnostics_logs.rs",
+        "write_bundle",
+        "fs::write(",
+        "a new staging directory beside the output path the operator names",
+    ),
+    (
+        "quil-client/src/commands/node/log/export.rs",
+        "run",
+        "File::create(",
+        "a new staging directory beside the output path the operator names",
+    ),
+    (
+        "quil-client/src/commands/node/log/export.rs",
+        "run",
+        "fs::write(",
+        "a new staging directory beside the output path the operator names",
+    ),
+    (
+        "quil-client/src/commands/node/nodeconfig.rs",
+        "copy_dir",
+        "fs::copy(",
+        "an import into the directory the operator names",
     ),
 ];
 
@@ -412,9 +457,14 @@ fn enclosing_fn(code: &str) -> String {
 
 /// `(function, call)` for each write in `text` outside its tests.
 fn writes(text: &str) -> Vec<(String, &'static str)> {
+    calls(text, WRITES)
+}
+
+/// `(function, call)` for each of `wanted` in `text` outside its tests.
+fn calls(text: &str, wanted: &[&'static str]) -> Vec<(String, &'static str)> {
     let code = without_tests(&code_only(text));
     let mut found = Vec::new();
-    for call in WRITES {
+    for call in wanted {
         for (at, _) in code.match_indices(call) {
             found.push((enclosing_fn(&code[..at]), *call));
         }
@@ -496,22 +546,10 @@ fn the_check_finds_writes_in_place() {
 /// [`OTHER_WRITES`], and each `OTHER_WRITES` entry is still found.
 #[test]
 fn every_write_is_listed() {
-    let crates = crates_dir();
-    let mut files = Vec::new();
-    for dir in SCANNED {
-        sources(&crates.join(dir), &mut files);
-    }
     let mut found = BTreeSet::new();
     let mut unlisted = Vec::new();
-    for file in files {
-        let rel = file
-            .strip_prefix(&crates)
-            .unwrap()
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        for (function, call) in writes(&std::fs::read_to_string(&file).unwrap()) {
+    for (rel, text) in scanned() {
+        for (function, call) in writes(&text) {
             let writer = WRITERS.iter().any(|(r, f, _)| *r == rel && *f == function);
             let other = OTHER_WRITES
                 .iter()
@@ -535,6 +573,93 @@ fn every_write_is_listed() {
     assert!(
         stale.is_empty(),
         "OTHER_WRITES entries no longer found: {stale:?}"
+    );
+}
+
+/// `(path under crates/, text)` of each source in [`SCANNED`].
+fn scanned() -> Vec<(String, String)> {
+    let crates = crates_dir();
+    let mut files = Vec::new();
+    for dir in SCANNED {
+        sources(&crates.join(dir), &mut files);
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            let rel = file
+                .strip_prefix(&crates)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            (rel, std::fs::read_to_string(&file).unwrap())
+        })
+        .collect()
+}
+
+/// Each create in the code qclient runs goes through
+/// [`PRIVATE_CREATE`], which follows no link in the file's place, or is
+/// in [`LINKED_CREATES`] with why no other user can plant one there; each
+/// `LINKED_CREATES` entry is still found, and so is the private create.
+#[test]
+fn every_create_follows_no_planted_link() {
+    let mut found = BTreeSet::new();
+    let mut unlisted = Vec::new();
+    for (rel, text) in scanned() {
+        for (function, call) in calls(&text, CREATES) {
+            let private = (rel.as_str(), function.as_str()) == PRIVATE_CREATE;
+            let listed = LINKED_CREATES
+                .iter()
+                .any(|(r, f, c, _)| *r == rel && *f == function && *c == call);
+            if !private && !listed {
+                unlisted.push(format!("{rel} `{function}` {call}"));
+            }
+            found.insert((rel.clone(), function, call));
+        }
+    }
+    assert!(
+        unlisted.is_empty(),
+        "creates that follow a link in the file's place: open the file through \
+         quil_config::open_private_create, else add the create to LINKED_CREATES with \
+         why no other user can plant a link there:\n{}",
+        unlisted.join("\n")
+    );
+    let (rel, function) = PRIVATE_CREATE;
+    assert!(
+        found.contains(&(rel.to_string(), function.to_string(), ".create(true)")),
+        "{rel} `{function}` no longer creates its file"
+    );
+    let stale: Vec<_> = LINKED_CREATES
+        .iter()
+        .filter(|(r, f, c, _)| !found.contains(&(r.to_string(), f.to_string(), *c)))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "LINKED_CREATES entries no longer found: {stale:?}"
+    );
+}
+
+/// The create census finds each create that follows a link, by its
+/// function, and no exclusive create.
+#[test]
+fn the_create_census_finds_creates_that_follow_links() {
+    let planted = r##"
+fn lock(path: &Path) { OpenOptions::new().write(true).create(true).open(path); }
+fn fresh(path: &Path) { OpenOptions::new().write(true).create_new(true).open(path); }
+fn export(path: &Path) { std::fs::File::create(path); tokio::fs::write(path, b""); }
+fn import(a: &Path, b: &Path) { std::fs::copy(a, b); }
+"##;
+    let mut found = calls(planted, CREATES);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("export".to_string(), "File::create("),
+            ("export".to_string(), "fs::write("),
+            ("import".to_string(), "fs::copy("),
+            ("lock".to_string(), ".create(true)"),
+        ]
     );
 }
 

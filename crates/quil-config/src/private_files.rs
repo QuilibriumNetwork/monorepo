@@ -243,6 +243,61 @@ pub fn restrict_private_file(path: &Path) -> io::Result<Option<u32>> {
     }
 }
 
+/// What [`open_private_create`] opens its file for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateCreate {
+    /// Appending records.
+    Append,
+    /// Holding a lock on it; nothing is written.
+    Lock,
+}
+
+/// Open the regular file at `path` for `how`, created owner-only (mode
+/// 0600 less the umask) when missing. The open follows no link in its
+/// place: a user who may write the directory and plants one there, also
+/// one naming nothing yet, gets a refusal, and nothing is created or
+/// opened where it points. A FIFO or other special file there is refused
+/// without waiting on it, and so is a file swapped in while it was
+/// opened. Links to the directory on the way are followed. The file
+/// closes on exec. Errors name no path; the caller names the file.
+pub fn open_private_create(path: &Path, how: PrivateCreate) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    match how {
+        PrivateCreate::Append => options.append(true),
+        PrivateCreate::Lock => options.write(true),
+    };
+    options.create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let file = options
+            .open(path)
+            .map_err(|e| match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a link stands in its place, which is not followed; nothing was created",
+                ),
+                _ => e,
+            })?;
+        let opened = file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !opened.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file, or replaced while it was opened",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -623,6 +678,76 @@ mod tests {
         set_mode(&dir, 0o755);
         assert_eq!(restrict_private_file(&dir).unwrap(), None, "a directory");
         assert_eq!(mode(&dir), 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A private create makes a missing file 0600 and opens an existing
+    /// one in place, appending or for a lock, without truncating it.
+    #[test]
+    fn a_private_create_makes_the_file_owner_only_and_keeps_its_contents() {
+        use std::io::Write as _;
+        let dir = tempdir("create");
+        let path = dir.join("actions.jsonl");
+        open_private_create(&path, PrivateCreate::Append)
+            .unwrap()
+            .write_all(b"one\n")
+            .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        open_private_create(&path, PrivateCreate::Append)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
+        drop(open_private_create(&path, PrivateCreate::Lock).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        let lock = dir.join("batch.lock");
+        drop(open_private_create(&lock, PrivateCreate::Lock).unwrap());
+        assert_eq!(mode(&lock), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A private create follows no link in its place, one naming nothing
+    /// or a file, and waits on no FIFO: each is refused and nothing is
+    /// created or changed where it points.
+    #[test]
+    fn a_private_create_follows_no_link_and_waits_on_no_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let dir = tempdir("create-link");
+        for how in [PrivateCreate::Append, PrivateCreate::Lock] {
+            let target = dir.join("nologin");
+            let link = dir.join("dangling");
+            symlink(&target, &link).unwrap();
+            let error = open_private_create(&link, how).expect_err("a dangling link was followed");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert!(
+                std::fs::symlink_metadata(&target).is_err(),
+                "{how:?} created the file a dangling link names"
+            );
+            std::fs::remove_file(&link).unwrap();
+
+            let file = dir.join("roots");
+            std::fs::write(&file, b"root's").unwrap();
+            symlink(&file, &link).unwrap();
+            let error = open_private_create(&link, how).expect_err("a link to a file was followed");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert_eq!(std::fs::read(&file).unwrap(), b"root's");
+            std::fs::remove_file(&link).unwrap();
+        }
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // An open of a FIFO with no reader returns at once or never: the
+        // wait is a cap, not a pace.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_private_create(&path, PrivateCreate::Append).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the open waited on a FIFO");
+        assert!(refused, "a FIFO was opened");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -236,14 +236,12 @@ mod private {
         owner_only(path, &opened, 0o600)
     }
 
-    /// Open for appending, created 0600 if missing.
+    /// Open for appending, created 0600 if missing, through no link: one
+    /// swapped in after the check fails the open and creates nothing.
     pub(super) fn open_append(path: &Path) -> anyhow::Result<File> {
         check(path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
+        let file = quil_config::open_private_create(path, quil_config::PrivateCreate::Append)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", name(path)))?;
         same(path, &file)?;
         Ok(file)
     }

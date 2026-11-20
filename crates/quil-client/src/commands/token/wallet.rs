@@ -6548,15 +6548,12 @@ pub(crate) async fn run_merge(
 pub(super) const MERGE_BATCH_LOCK: &str = "token-merge-batch.lock";
 
 /// Hold [`MERGE_BATCH_LOCK`] for a batch run; refused while another run holds
-/// it. The lock ends with the returned file.
+/// it. The lock ends with the returned file. A link in its place is refused,
+/// so a root run creates no file where another user points it.
 #[cfg(feature = "native-proof")]
 pub(super) fn lock_merge_batch(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let path = dir.join(MERGE_BATCH_LOCK);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
+    let file = quil_config::open_private_create(&path, quil_config::PrivateCreate::Lock)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(file),
