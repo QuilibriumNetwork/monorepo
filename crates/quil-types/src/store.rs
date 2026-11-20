@@ -32,6 +32,10 @@ pub struct RecordMutation {
     pub value: Option<Vec<u8>>,
 }
 
+/// Maximum distinct addresses in a local-cache adoption notification. Journals
+/// may retain fewer keys when execution metadata headroom is smaller.
+pub const LOCAL_VERTEX_COMMIT_KEYS_LIMIT: usize = 16_384;
+
 /// Optional local-cache notification after a successful durable CRDT commit:
 /// the committed vertex-adds blobs, then the execution records it wrote.
 /// The callback must not block, perform I/O, or reenter the CRDT. Dropped

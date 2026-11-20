@@ -34,7 +34,10 @@ use quil_forest::{
 };
 use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{HypergraphStore, RecordMutation, ShardKey};
+use quil_types::store::{
+    HypergraphStore, RecordMutation, ShardKey,
+    LOCAL_VERTEX_COMMIT_KEYS_LIMIT as MAX_EXECUTION_OBSERVER_KEYS,
+};
 
 use crate::addressing::{shard_key_for_location, Location};
 
@@ -897,14 +900,15 @@ mod supply_observer_tests {
         assert!(changes.keys.is_empty());
         assert!(!changes.overflowed);
         key[..32].fill(7);
-        for n in 0..MAX_EXECUTION_OBSERVER_KEYS {
+        // The consumer accepts at most 16,384 distinct addresses per adoption.
+        for n in 0..16_384 {
             key[32..40].copy_from_slice(&(n as u64).to_be_bytes());
             changes.record(&key);
             changes.record(&key);
         }
-        assert_eq!(changes.keys.len(), MAX_EXECUTION_OBSERVER_KEYS);
+        assert_eq!(changes.keys.len(), 16_384);
         assert!(!changes.overflowed);
-        key[32..40].copy_from_slice(&(MAX_EXECUTION_OBSERVER_KEYS as u64).to_be_bytes());
+        key[32..40].copy_from_slice(&16_384u64.to_be_bytes());
         changes.record(&key);
         assert!(changes.keys.is_empty());
         assert!(changes.overflowed);
@@ -976,8 +980,6 @@ impl quil_types::store::LocalVertexCommitObserver for ChainedLocalVertexObserver
 // Optional, per-observer execution journals. They contain addresses only, and
 // grow only for apps the observer opted into. Overflow degrades that observer
 // to one invalidation at publication, never a failed canonical execution.
-const MAX_EXECUTION_OBSERVER_KEYS: usize = 32_768;
-
 #[derive(Clone)]
 struct ExecutionVertexChanges {
     observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,

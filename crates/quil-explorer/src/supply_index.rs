@@ -13,7 +13,7 @@ use quil_hypergraph::{shard_key_for_location, HypergraphCrdt, Location};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{
     HypergraphStore, KvDb, LocalVertexCommitObserver, RecordMutation, ShardKey, SnapshotReadable,
-    VertexPageLimits,
+    VertexPageLimits, LOCAL_VERTEX_COMMIT_KEYS_LIMIT as EVENT_KEYS_LIMIT,
 };
 
 const QUIL: [u8; 32] = quil_execution::domains::QUIL_TOKEN;
@@ -25,14 +25,13 @@ const LEGACY_INDEX_PREFIX: &[u8] = b"\0explorer-supply-v1/";
 const LEGACY_INDEX_END: &[u8] = b"\0explorer-supply-v10";
 // All mutations, including legacy cleanup, use the existing conflict ledger.
 const INDEX_WRITE_PREFIXES: &[[u8; 2]] = &[[quil_store::encoding::EXPLORER_SUPPLY, 1], [0, b'e']];
-const EVENT_KEYS_LIMIT: usize = 16_384;
 const EVENT_QUEUE_LIMIT: usize = 256;
-// At most 16 MiB of raw addresses, plus the set's allocation overhead.
+// Each current/next-pass set holds at most 16 MiB of raw addresses, plus overhead.
 const REBUILD_KEYS_LIMIT: usize = 262_144;
 const LOST_EVENT_KEYS: u64 = 1;
 const LOST_QUEUE_FULL: u64 = 2;
 const LOST_DISCONNECTED: u64 = 4;
-const LOST_SYNC: u64 = 8;
+const LOST_OBSERVER: u64 = 8;
 const LOST_UPDATE: u64 = 16;
 const LOST_REBUILD_KEYS: u64 = 32;
 const LOST_WORKER: u64 = 64;
@@ -200,13 +199,17 @@ impl SupplyIndex {
                 db,
                 index,
                 receiver,
-                deferred: RefCell::new(None),
+                deferred: RefCell::new(BTreeSet::new()),
                 #[cfg(test)]
                 page_hook: None,
                 #[cfg(test)]
                 after_update_hook: None,
                 #[cfg(test)]
                 replay_capture_hook: None,
+                #[cfg(test)]
+                replay_chunk_hook: None,
+                #[cfg(test)]
+                scan_wait_hook: None,
             },
         )
     }
@@ -232,7 +235,7 @@ impl SupplyIndex {
             (LOST_EVENT_KEYS, "commit_key_limit"),
             (LOST_QUEUE_FULL, "commit_queue_full"),
             (LOST_DISCONNECTED, "commit_queue_disconnected"),
-            (LOST_SYNC, "canonical_sync"),
+            (LOST_OBSERVER, "observer_invalidated"),
             (LOST_UPDATE, "index_update_error"),
             (LOST_REBUILD_KEYS, "rebuild_key_limit"),
             (LOST_WORKER, "worker_stopped"),
@@ -284,7 +287,7 @@ impl LocalVertexCommitObserver for SupplyIndex {
 
     fn invalidated(&self) {
         self.sequence.fetch_add(1, Ordering::AcqRel);
-        self.mark_lost(LOST_SYNC);
+        self.mark_lost(LOST_OBSERVER);
     }
 }
 
@@ -333,15 +336,19 @@ pub struct SupplyIndexRunner {
     db: Arc<dyn KvDb>,
     index: Arc<SupplyIndex>,
     receiver: Receiver<Event>,
-    // One event newer than a retained read point. Only the blocking worker
-    // consumes events; Receiver already makes this runner non-Sync.
-    deferred: RefCell<Option<Event>>,
+    // Keys newer than the replay snapshot, applied only at the next read point.
+    // Only the blocking worker consumes events; Receiver makes this runner non-Sync.
+    deferred: RefCell<BTreeSet<[u8; 64]>>,
     #[cfg(test)]
     page_hook: Option<Box<dyn Fn() + Send>>,
     #[cfg(test)]
     after_update_hook: Option<Box<dyn Fn() + Send>>,
     #[cfg(test)]
     replay_capture_hook: Option<Box<dyn Fn() + Send>>,
+    #[cfg(test)]
+    replay_chunk_hook: Option<Box<dyn Fn() + Send>>,
+    #[cfg(test)]
+    scan_wait_hook: Option<Box<dyn Fn() + Send>>,
 }
 
 /// Bounded key-only merge cursor. Canonical pages visit ids in the same order
@@ -405,19 +412,6 @@ impl SupplyIndexRunner {
                     );
                 }
                 counts = None;
-                self.deferred.borrow_mut().take();
-                // These notifications precede the fresh snapshot. Retire them
-                // before reenabling collection so a stale full queue cannot
-                // immediately invalidate the next rebuild.
-                for _ in 0..EVENT_QUEUE_LIMIT {
-                    if self.receiver.try_recv().is_err() {
-                        break;
-                    }
-                }
-                *self.index.counts.write() = None;
-                // mark_lost is lock-free and leaves the old counts in place.
-                // Clear them before reopening reads/notification collection.
-                self.index.lost.store(false, Ordering::Release);
                 let rebuilt = self.rebuild(stop);
                 backoff.finished(Instant::now());
                 match rebuilt {
@@ -464,11 +458,66 @@ impl SupplyIndexRunner {
     }
 
     fn rebuild(&self, stop: &AtomicBool) -> Result<Option<SupplyCounts>> {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeThread(std::thread::Thread);
+        impl Wake for WakeThread {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
         // Share the existing full-scan permit with HTTP. Bootstrap and fallback
-        // must not each walk the archive concurrently.
-        let Ok(_scan) = self.index.scan_gate.try_acquire() else {
-            return Ok(None);
+        // must not each walk the archive concurrently. Keep one acquire future
+        // queued so repeated requests cannot take this worker's place.
+        let mut acquire = std::pin::pin!(self.index.scan_gate.acquire());
+        let waker = Waker::from(Arc::new(WakeThread(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let waiting = Instant::now();
+        let mut logged_wait = false;
+        let _scan = loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match acquire.as_mut().poll(&mut context) {
+                Poll::Ready(permit) => {
+                    break permit.map_err(|_| {
+                        QuilError::ExecutionUnavailable("supply scan permit closed".into())
+                    })?;
+                }
+                Poll::Pending => {
+                    if !logged_wait {
+                        tracing::info!("explorer supply index waiting for scan permit");
+                        logged_wait = true;
+                        #[cfg(test)]
+                        if let Some(hook) = &self.scan_wait_hook {
+                            hook();
+                        }
+                    }
+                    std::thread::park_timeout(Duration::from_millis(100));
+                }
+            }
         };
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if logged_wait {
+            tracing::info!(
+                wait_ms = waiting.elapsed().as_millis() as u64,
+                "explorer supply index acquired scan permit"
+            );
+        }
+        // Waiting for HTTP may fill or invalidate the queue. These events
+        // precede the fresh snapshot; retire them only after acquiring the permit.
+        self.deferred.borrow_mut().clear();
+        for _ in 0..EVENT_QUEUE_LIMIT {
+            if self.receiver.try_recv().is_err() {
+                break;
+            }
+        }
+        *self.index.counts.write() = None;
+        self.index.lost.store(false, Ordering::Release);
         let started = Instant::now();
         let mut progress = RebuildProgress::default();
         let result = self.rebuild_inner(stop, &mut progress);
@@ -641,11 +690,14 @@ impl SupplyIndexRunner {
         Ok(self.collect_changes(progress, stop))
     }
 
-    fn next_event(&self) -> std::result::Result<Event, mpsc::RecvTimeoutError> {
-        if let Some(event) = self.deferred.borrow_mut().take() {
-            return Ok(event);
+    fn next_event(&self) -> std::result::Result<Vec<[u8; 64]>, mpsc::RecvTimeoutError> {
+        let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+        if !deferred.is_empty() {
+            return Ok(deferred.into_iter().collect());
         }
-        self.receiver.recv_timeout(Duration::from_secs(1))
+        self.receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map(|event| event.keys)
     }
 
     fn index_snapshot(&self) -> Result<(Arc<dyn SnapshotReadable>, u64)> {
@@ -653,8 +705,12 @@ impl SupplyIndexRunner {
             .capture_fresh_committed_snapshot_with(|| self.index.sequence.load(Ordering::Acquire))
     }
 
-    fn retain_keys(&self, event: Event, pending: &mut BTreeSet<[u8; 64]>) -> bool {
-        for key in event.keys {
+    fn retain_keys(
+        &self,
+        keys: impl IntoIterator<Item = [u8; 64]>,
+        pending: &mut BTreeSet<[u8; 64]>,
+    ) -> bool {
+        for key in keys {
             if !pending.contains(&key) && pending.len() == REBUILD_KEYS_LIMIT {
                 self.index.mark_lost(LOST_REBUILD_KEYS);
                 return false;
@@ -664,12 +720,37 @@ impl SupplyIndexRunner {
         true
     }
 
+    fn collect_replay_changes(
+        &self,
+        through: u64,
+        pending: &mut BTreeSet<[u8; 64]>,
+        stop: &AtomicBool,
+    ) -> bool {
+        if stop.load(Ordering::Acquire) || self.index.lost.load(Ordering::Acquire) {
+            return false;
+        }
+        for _ in 0..EVENT_QUEUE_LIMIT {
+            let Ok(event) = self.receiver.try_recv() else {
+                break;
+            };
+            let retained = if event.sequence <= through {
+                self.retain_keys(event.keys, pending)
+            } else {
+                self.retain_keys(event.keys, &mut self.deferred.borrow_mut())
+            };
+            if !retained {
+                return false;
+            }
+        }
+        !stop.load(Ordering::Acquire) && !self.index.lost.load(Ordering::Acquire)
+    }
+
     /// Publish an aggregate at one captured canonical point. Reading each
     /// queued event against a different latest snapshot can combine balances
     /// that never existed together, even when every notification arrives.
     fn replay_at_snapshot(
         &self,
-        first: Option<Event>,
+        first: Option<Vec<[u8; 64]>>,
         pending: &mut BTreeSet<[u8; 64]>,
         counts: &mut SupplyCounts,
         stop: &AtomicBool,
@@ -680,30 +761,21 @@ impl SupplyIndexRunner {
         if let Some(hook) = &self.replay_capture_hook {
             hook();
         }
-        if let Some(event) = first {
-            if !self.retain_keys(event, pending) {
+        if let Some(keys) = first {
+            if !self.retain_keys(keys, pending) {
                 return Ok(false);
             }
         }
+        // These keys were committed before this capture. Keep later keys in a
+        // separate set until the next snapshot, even if they repeat current keys.
+        let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+        if !self.retain_keys(deferred, pending) {
+            return Ok(false);
+        }
         // Every notification through this point was enqueued before capture
-        // released its barriers. The bounded queue holds at most this many;
-        // later commits stay queued (or one event is deferred) for the next pass.
-        for _ in 0..=EVENT_QUEUE_LIMIT {
-            let event = self
-                .deferred
-                .borrow_mut()
-                .take()
-                .or_else(|| self.receiver.try_recv().ok());
-            let Some(event) = event else {
-                break;
-            };
-            if event.sequence > through {
-                *self.deferred.borrow_mut() = Some(event);
-                break;
-            }
-            if !self.retain_keys(event, pending) {
-                return Ok(false);
-            }
+        // released its barriers. Drain a full queue, retaining newer keys too.
+        if !self.collect_replay_changes(through, pending, stop) {
+            return Ok(false);
         }
         while !pending.is_empty() {
             if stop.load(Ordering::Acquire) || self.index.lost.load(Ordering::Acquire) {
@@ -713,6 +785,13 @@ impl SupplyIndexRunner {
                 .filter_map(|_| pending.pop_first())
                 .collect();
             self.apply_snapshot_keys(snapshot.as_ref(), &keys, counts)?;
+            #[cfg(test)]
+            if let Some(hook) = &self.replay_chunk_hook {
+                hook();
+            }
+            if !self.collect_replay_changes(through, pending, stop) {
+                return Ok(false);
+            }
         }
         Ok(!stop.load(Ordering::Acquire) && !self.index.lost.load(Ordering::Acquire))
     }
@@ -997,7 +1076,7 @@ mod tests {
         let mut counts = runner.rebuild(&stop).unwrap().unwrap();
         add_reward(&crdt, 1, 200);
         crdt.commit(2).unwrap();
-        let first = runner.receiver.try_recv().unwrap();
+        let first = runner.receiver.try_recv().unwrap().keys;
         runner.replay_capture_hook = Some(Box::new({
             let crdt = crdt.clone();
             let once = AtomicBool::new(false);
@@ -1016,8 +1095,8 @@ mod tests {
             counts.reward_subunits, 300,
             "later keys leaked into an older read point"
         );
-        assert!(runner.deferred.borrow().is_some());
-        // A saved future event plus a completely full queue must still be
+        assert!(!runner.deferred.borrow().is_empty());
+        // Saved future keys plus a completely full queue must still be
         // processed through the captured point, including the changed B key.
         for number in 0..EVENT_QUEUE_LIMIT {
             add_reward(&crdt, 1, 1000 + number as u64);
@@ -1029,7 +1108,52 @@ mod tests {
             .unwrap());
         assert_eq!(counts.reward_subunits, 1455);
         assert_eq!(counts, scan_supply(&crdt).unwrap());
-        assert!(runner.deferred.borrow().is_none());
+        assert!(runner.deferred.borrow().is_empty());
+        assert!(runner.receiver.try_recv().is_err());
+
+        // Keep replay busy for three chunks while newer commits arrive.
+        // These keys must be drained without entering the older snapshot's total.
+        let mut pending: BTreeSet<_> = (0..2 * EVENT_KEYS_LIMIT + 1)
+            .map(|number| {
+                let mut key = [0; 64];
+                key[..32].copy_from_slice(&QUIL);
+                key[32..40].copy_from_slice(&(number as u64).to_be_bytes());
+                key
+            })
+            .collect();
+        runner.replay_chunk_hook = Some(Box::new({
+            let crdt = crdt.clone();
+            let index = index.clone();
+            let chunks = AtomicU64::new(0);
+            move || {
+                let chunk = chunks.fetch_add(1, Ordering::AcqRel);
+                if chunk >= 3 {
+                    return;
+                }
+                add_reward(&crdt, 1, 2000 + chunk);
+                add_reward(&crdt, 2, 3000 + chunk);
+                crdt.commit(1000 + chunk).unwrap();
+                let mut key = [2; 64];
+                key[..32].copy_from_slice(&GLOBAL);
+                // More than 256 notifications across chunks, mostly duplicates.
+                for _ in 0..128 {
+                    index.committed_keys(vec![key]);
+                }
+            }
+        }));
+        assert!(
+            runner
+                .replay_at_snapshot(None, &mut pending, &mut counts, &stop)
+                .unwrap(),
+            "replay let newer notifications overflow the queue"
+        );
+        assert_eq!(counts.reward_subunits, 1455, "mixed snapshot totals");
+        assert!(!index.lost.load(Ordering::Acquire));
+        assert!(runner
+            .replay_at_snapshot(None, &mut pending, &mut counts, &stop)
+            .unwrap());
+        assert_eq!(counts.reward_subunits, 5004);
+        assert_eq!(counts, scan_supply(&crdt).unwrap());
         assert!(runner.receiver.try_recv().is_err());
     }
 
@@ -1160,17 +1284,65 @@ mod tests {
         ));
         add_reward(&crdt, 1, 42);
         crdt.commit(1).unwrap();
-        let (index, runner) = SupplyIndex::start(crdt.clone(), store.clone(), db);
-        let permit = index.scan_gate.try_acquire().unwrap();
-        assert!(runner.rebuild(&AtomicBool::new(false)).unwrap().is_none());
+        let (index, mut runner) = SupplyIndex::start(crdt.clone(), store.clone(), db);
+        let permit = index.scan_gate.clone().try_acquire_owned().unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        runner.scan_wait_hook = Some(Box::new(move || {
+            waiting_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let result = runner.rebuild(&worker_stop);
+            (runner, result)
+        });
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(30));
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(&GLOBAL);
+        for _ in 0..=EVENT_QUEUE_LIMIT {
+            index.committed_keys(vec![key]);
+        }
+        assert!(index.lost.load(Ordering::Acquire));
         drop(permit);
+        // Keep the registered waiter paused: the released permit belongs to it.
+        let newcomer_blocked = index.scan_gate.try_acquire().is_err();
+        resume_tx.send(()).unwrap();
+        let (runner, result) = worker.join().unwrap();
+        waiting.unwrap();
+        assert!(
+            newcomer_blocked,
+            "later request bypassed the queued rebuild"
+        );
         assert_eq!(
-            runner
-                .rebuild(&AtomicBool::new(false))
+            result
                 .unwrap()
-                .unwrap()
+                .expect("rebuild skipped a busy scan permit")
                 .reward_subunits,
             42
+        );
+        let permit = index.scan_gate.clone().try_acquire_owned().unwrap();
+        let worker_stop = stop.clone();
+        let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = runner.rebuild(&worker_stop);
+            cancelled_tx.send(()).unwrap();
+            (runner, result)
+        });
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(30));
+        stop.store(true, Ordering::Release);
+        resume_tx.send(()).unwrap();
+        let cancelled = cancelled_rx.recv_timeout(Duration::from_secs(30));
+        // Release even on failure so a broken cancellation path cannot hang CI.
+        drop(permit);
+        let (runner, result) = worker.join().unwrap();
+        waiting.unwrap();
+        cancelled.unwrap();
+        assert!(result.unwrap().is_none());
+        assert!(
+            index.scan_gate.try_acquire().is_ok(),
+            "cancelled waiter leaked a permit"
         );
         {
             let guard = crdt.lock_forest_writes();
@@ -1184,12 +1356,6 @@ mod tests {
             crdt.invalidate_local_vertex_observer_for_app(&GLOBAL);
         }
         assert!(index.read().is_none());
-        let counts = runner.rebuild(&AtomicBool::new(false)).unwrap();
-        assert!(
-            counts.is_none(),
-            "invalidated rebuild must not publish until worker starts a fresh pass"
-        );
-        index.lost.store(false, Ordering::Release);
         let counts = runner.rebuild(&AtomicBool::new(false)).unwrap().unwrap();
         assert_eq!(counts.reward_provers, 0);
         assert_eq!(counts.reward_subunits, 0);
@@ -1356,6 +1522,28 @@ mod tests {
         index.committed_keys(vec![extra]);
         assert!(!runner.collect_changes(&mut progress, &AtomicBool::new(false)));
         assert_eq!(progress.pending.len(), REBUILD_KEYS_LIMIT);
+        assert!(index.read().is_none());
+        assert_eq!(
+            index.lost_reasons.load(Ordering::Acquire),
+            LOST_REBUILD_KEYS
+        );
+
+        // The next-pass set obeys the same distinct-key bound as scan replay.
+        index.lost.store(false, Ordering::Release);
+        index.lost_reasons.store(0, Ordering::Release);
+        *index.counts.write() = Some(SupplyCounts::default());
+        assert!(index.read().is_some());
+        *runner.deferred.borrow_mut() = progress.pending;
+        index.committed_keys(vec![existing]);
+        assert!(runner.collect_replay_changes(0, &mut BTreeSet::new(), &AtomicBool::new(false)));
+        assert_eq!(runner.deferred.borrow().len(), REBUILD_KEYS_LIMIT);
+        assert!(
+            index.read().is_some(),
+            "duplicate key invalidated readable counts"
+        );
+        index.committed_keys(vec![extra]);
+        assert!(!runner.collect_replay_changes(0, &mut BTreeSet::new(), &AtomicBool::new(false)));
+        assert_eq!(runner.deferred.borrow().len(), REBUILD_KEYS_LIMIT);
         assert!(index.read().is_none());
         assert_eq!(
             index.lost_reasons.load(Ordering::Acquire),
