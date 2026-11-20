@@ -217,16 +217,28 @@ pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
 ];
 
 /// How many peers the multiaddr `entries` name: their distinct
-/// `/p2p/<peer-id>` segments (the last of each entry). A peer listed at
+/// `/p2p/<peer-id>` segments (the last of each entry), plus their distinct
+/// entries without one, each naming a peer of unknown ID. A peer listed at
 /// several addresses, such as an archive at both address families, is one
-/// peer; an entry without the segment names none.
+/// peer.
 pub fn distinct_peer_count<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> usize {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Named {
+        Peer(String),
+        Entry(String),
+    }
     entries
         .into_iter()
         .filter_map(|entry| {
-            let (_, peer) = entry.as_ref().trim().rsplit_once("/p2p/")?;
-            let peer = peer.split('/').next().unwrap_or_default();
-            (!peer.is_empty()).then(|| peer.to_owned())
+            let entry = entry.as_ref().trim();
+            let peer = entry
+                .rsplit_once("/p2p/")
+                .and_then(|(_, peer)| peer.split('/').next())
+                .filter(|peer| !peer.is_empty());
+            match peer {
+                Some(peer) => Some(Named::Peer(peer.to_owned())),
+                None => (!entry.is_empty()).then(|| Named::Entry(entry.to_owned())),
+            }
         })
         .collect::<std::collections::BTreeSet<_>>()
         .len()
@@ -472,10 +484,24 @@ mod tests {
     }
 
     /// A replaced list is counted in peers, not entries: an archive listed
-    /// at both address families is one peer, an entry without a peer id
-    /// none.
+    /// at both address families is one peer, and each distinct entry
+    /// without a peer ID one more, so a list naming no peer ID is not
+    /// reported as 0 peers.
     #[test]
     fn a_replaced_bootstrap_list_counts_peers_not_entries() {
+        let peerless: Vec<String> = [
+            "/ip4/192.0.2.1/udp/8336/quic-v1",
+            "/ip4/192.0.2.2/udp/8336/quic-v1",
+            " /ip4/192.0.2.1/udp/8336/quic-v1 ",
+        ]
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect();
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &peerless),
+            Some(2),
+            "a list naming no peer ID counted as fewer peers than its entries"
+        );
         let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS
             .iter()
             .map(|entry| entry.to_string())
@@ -484,12 +510,12 @@ mod tests {
         let mut entries = built_in[..built_in.len() - 1].to_vec();
         entries.push("/ip4/192.0.2.1/udp/8336/quic-v1".into());
         assert!(
-            entries.len() > archives + 1,
+            entries.len() > archives + 2,
             "premise: archives listed twice"
         );
         assert_eq!(
             replaced_mainnet_bootstrap_peers(0, &entries),
-            Some(archives),
+            Some(archives + 1),
             "a replaced list counted in entries, not peers"
         );
         assert_eq!(
