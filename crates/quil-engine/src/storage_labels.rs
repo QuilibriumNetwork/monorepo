@@ -1200,6 +1200,16 @@ impl LabelStore {
         self.room_from(pending, bytes, false)
     }
 
+    /// Whether a sector's labels at `n` nodes would be admitted on free
+    /// space alone ([`Self::admit_or_refusal`] at [`Stage::Snapshot`]): a
+    /// free-space read that changes nothing, where an admission frees room
+    /// and checks the layers kept first.
+    pub(crate) fn sector_labels_fit(&self, n: u64) -> bool {
+        let pending = self.pending();
+        self.room(*pending, self.label_bytes(n).saturating_mul(DISK_MARGIN))
+            .is_ok()
+    }
+
     /// [`Self::room`] for a leaf labelled at `stage`: labelling ahead also
     /// waits, while labels are released for free space, until it is back at
     /// [`resume_free`] ([`Self::keep_floor`]).

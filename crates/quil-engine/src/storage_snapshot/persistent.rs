@@ -43,9 +43,17 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&tmp)
         .map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    file.sync_all().map_err(io)?;
-    fs::rename(&tmp, path).map_err(io)?;
+    // Failed, it removes its own file: a write retried at every poll left
+    // one more at each (2026-11-20).
+    if let Err(error) = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path))
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(io(error));
+    }
     File::open(path.parent().unwrap())
         .and_then(|f| f.sync_all())
         .map_err(io)
@@ -156,6 +164,65 @@ impl Relabel {
 /// labelled the sector in memory to fail the same proof).
 static UNMARKED: Mutex<std::collections::BTreeMap<PathBuf, (Vec<u8>, Relabel)>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+/// A sector's last setup to keep its labels ([`UnkeptStep::KeepLabels`]).
+struct KeepTried {
+    /// The certificate it was set up for.
+    cert: Vec<u8>,
+    /// The epoch it began in.
+    epoch: u64,
+    /// Whether its labels were labelled to their end without being kept.
+    unkept: bool,
+}
+
+/// Each sector's [`KeepTried`], by directory.
+static KEEP_TRIED: Mutex<std::collections::BTreeMap<PathBuf, KeepTried>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether a sector waiting for room to keep its labels is set up again
+/// now ([`UnkeptStep::KeepLabels`]), in `epoch`: the one gate of every way
+/// into that wait. Each setup reserves its memory and, refused room,
+/// reads and hashes the sector's whole last layer (up to 2 GiB); one
+/// admitted that runs out of room midway labels the sector in full
+/// (2026-11-20: either ran at every poll while the disk stayed short). So
+/// it runs when the free space read fits its labels, and otherwise once
+/// an epoch, as room an admission makes ([`LabelStore::admit_or_refusal`])
+/// is not read here; after a setup labelled without being kept, not again
+/// that epoch.
+fn keep_labels_due(store: &LabelStore, sector: &Sector, epoch: u64) -> bool {
+    let fits = store
+        .for_profile(sector.cert.profile)
+        .sector_labels_fit(sector.cert.n);
+    let cert = sector.cert.to_bytes();
+    let mut tried = KEEP_TRIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let due = match tried.get(&sector.dir) {
+        Some(last) if last.cert == cert && last.epoch == epoch => fits && !last.unkept,
+        _ => true,
+    };
+    if due {
+        let tried_now = KeepTried {
+            cert,
+            epoch,
+            unkept: false,
+        };
+        tried.insert(sector.dir.clone(), tried_now);
+    }
+    due
+}
+
+/// A setup of the sector in `dir` labelled it to its end without keeping
+/// its labels: [`keep_labels_due`] sets it up no more that epoch.
+fn keep_labels_unkept(dir: &Path) {
+    if let Some(tried) = KEEP_TRIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(dir)
+    {
+        tried.unkept = true;
+    }
+}
 
 #[derive(Clone)]
 struct Sector {
@@ -553,7 +620,12 @@ fn initialize_with_progress(
                     // Kept, or labelled to its end past room that ran out
                     // on the way and so not kept: the sector is set up
                     // from them either way.
-                    Labelling::Labelled(labelled) => Some((labelled.last, labelled.comm_c)),
+                    Labelling::Labelled(labelled) => {
+                        if !labelled.kept {
+                            keep_labels_unkept(&dir);
+                        }
+                        Some((labelled.last, labelled.comm_c))
+                    }
                     // Told to stop: it gave its memory back to more urgent
                     // work, or its caller stops. Not a failure: the next
                     // attempt goes on from the whole layers kept.
@@ -1611,6 +1683,8 @@ fn resume_reserved_sector(
     if lock.try_lock().is_err() {
         return Ok(());
     }
+    #[cfg(test)]
+    tests::count_resume(&dir);
     let member = *member;
     crate::storage_jobs::spawn(
         &sector_lane(&member, &id),
@@ -1963,11 +2037,17 @@ pub(crate) fn poll_sector_certificates(
             };
             match step {
                 UnkeptStep::Prove => {}
-                // Labelled again past the disk floor while asked; else set
-                // up cheaply while refused room, and its labels kept once
-                // admitted, after which they prove it.
-                UnkeptStep::Relabel | UnkeptStep::KeepLabels => {
+                // Labelled again past the disk floor while asked.
+                UnkeptStep::Relabel => {
                     resume_reserved_sector(store, member, sector.dir.clone())?;
+                    return Ok(());
+                }
+                // Set up again, paced, while refused room, and its labels
+                // kept once admitted, after which they prove it.
+                UnkeptStep::KeepLabels => {
+                    if keep_labels_due(store, &sector, current) {
+                        resume_reserved_sector(store, member, sector.dir.clone())?;
+                    }
                     return Ok(());
                 }
             }
@@ -3032,6 +3112,207 @@ mod tests {
              its labels give"
         );
         gates(false);
+    }
+
+    /// A given-up sector below the floor is set up again once an epoch
+    /// however often it is polled: each setup reserves its memory and,
+    /// refused room, reads its whole last layer (2026-11-20: both at every
+    /// poll, up to 2 GiB each).
+    #[test]
+    fn a_given_up_sector_below_the_floor_is_set_up_again_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"given up below the floor", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let at = pending.sector.dir.clone();
+        let (resumed, read) = (resumes(&at), last_reads(&at).len());
+        pending.poll(6);
+        println!("REACH sector-floor");
+        let (resumed, read) = (resumes(&at) - resumed, last_reads(&at).len() - read);
+        assert!(
+            resumed == 1 && read <= 1,
+            "GATE-ONCE: a given-up sector below the floor was set up {resumed} times and its last \
+             layer read {read} times in six polls of one epoch"
+        );
+        assert!(pending.sent.try_recv().is_err() && unkept_proofs(&at) == 0);
+        gates(false);
+    }
+
+    /// A sector whose failed proof made without labels kept cannot be
+    /// recorded is set up again once an epoch while that record fails,
+    /// however often it is polled.
+    #[test]
+    fn an_unrecorded_sector_below_the_floor_is_set_up_again_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unrecorded below the floor", |s| {
+            s.cert.columns[0] ^= 1;
+            // A directory where its record goes: it cannot be written.
+            fs::create_dir_all(s.dir.join(RELABEL).join("held")).unwrap();
+        });
+        let at = pending.sector.dir.clone();
+        pending.poll(1);
+        assert!(
+            unkept_proofs(&at) == 1 && pending.now().unmarked() == Some(Relabel::Asked),
+            "premise: its proof failed and its state is held unwritten"
+        );
+        let (resumed, read) = (resumes(&at), last_reads(&at).len());
+        pending.poll(6);
+        println!("REACH sector-floor");
+        let (resumed, read) = (resumes(&at) - resumed, last_reads(&at).len() - read);
+        assert!(
+            resumed == 1 && read <= 1 && unkept_proofs(&at) == 1,
+            "GATE-UNMARKED: an unrecorded sector below the floor was set up {resumed} times and \
+             its last layer read {read} times in six polls of one epoch"
+        );
+        gates(false);
+    }
+
+    /// Whether a layer of any leaf's labels under `root` is on disk.
+    fn layer_written(root: &Path) -> bool {
+        let mut dirs = vec![root.to_owned()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "layers")
+                    && entry.metadata().is_ok_and(|meta| meta.len() > 0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A given-up sector whose labels, admitted, run out of room midway is
+    /// set up from them and not labelled again that epoch, however much
+    /// room the free space read shows after (2026-11-20: each poll
+    /// labelled it in full again, about an hour a GiB).
+    #[test]
+    fn a_given_up_sector_whose_labels_run_out_of_room_is_not_labelled_again_that_epoch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        // No room until `midway`; then room until a layer is on disk.
+        let midway = Arc::new(AtomicBool::new(false));
+        let space: crate::storage_labels::SpaceSource = {
+            let (root, midway) = (root.clone(), midway.clone());
+            Box::new(move |_| {
+                let room = midway.load(Ordering::SeqCst) && !layer_written(&root);
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 1 << 40,
+                    free_bytes: if room { 1 << 40 } else { 0 },
+                    ..Default::default()
+                })
+            })
+        };
+        crate::storage_labels::install_with_space(root.clone(), space);
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up, room ran out", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id, at) = (
+            pending.member,
+            pending.sector.cert.sector,
+            pending.sector.dir.clone(),
+        );
+        let resumed = resumes(&at);
+        midway.store(true, Ordering::SeqCst);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - resumed == 1
+                && !store.holds(1500, &member, &id)
+                && !layer_written(&root)
+                && pending.now().relabel() == Some(Relabel::GivenUp),
+            "premise: admitted, its labels ran out of room midway and it was set up from them"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - resumed;
+        assert_eq!(
+            resumed, 1,
+            "GATE-UNKEPT: a given-up sector labelled without its labels kept was set up again \
+             in the same epoch"
+        );
+        gates(false);
+    }
+
+    /// [`keep_labels_due`] at its edges: a given-up sector is set up again
+    /// with free space exactly what its labels need, not one byte below,
+    /// and below that once in a new epoch.
+    #[test]
+    fn a_given_up_sector_is_set_up_again_at_room_for_its_labels_or_a_new_epoch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let free = Arc::new(AtomicU64::new(0));
+        crate::storage_labels::install_with_space(dir.path().to_owned(), free_space(&free));
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up at the edges", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id, at) = (
+            pending.member,
+            pending.sector.cert.sector,
+            pending.sector.dir.clone(),
+        );
+        let needed = crate::storage_labels::disk_floor(1 << 50)
+            + crate::storage_labels::DISK_MARGIN
+                * crate::storage_labels::label_bytes(pending.sector.cert.n);
+        let base = resumes(&at);
+        // The epoch's one setup, refused room.
+        pending.poll(1);
+        free.store(needed - 1, Ordering::SeqCst);
+        pending.poll(2);
+        assert_eq!(
+            resumes(&at) - base,
+            1,
+            "GATE-EDGE-BELOW: one byte short of the room its labels need, it was set up again \
+             within the epoch"
+        );
+        pending.at = 1500 * quil_types::consensus::epoch_length_frames() + 1;
+        pending.poll(3);
+        assert_eq!(
+            resumes(&at) - base,
+            2,
+            "GATE-EPOCH: short of room, it was not set up exactly once in a new epoch"
+        );
+        free.store(needed, Ordering::SeqCst);
+        pending.poll(1);
+        println!("REACH sector-floor");
+        assert!(
+            resumes(&at) - base == 3 && store.holds(1500, &member, &id),
+            "GATE-EDGE-AT: with exactly the room its labels need it was not set up again with \
+             them kept"
+        );
+        gates(false);
+    }
+
+    /// A write that fails, here renamed onto a directory, leaves no file
+    /// of its own (2026-11-20: a record retried at every poll left one
+    /// more at each).
+    #[test]
+    fn a_failed_write_leaves_no_file_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        fs::create_dir_all(path.join("held")).unwrap();
+        assert!(
+            atomic(&path, b"bytes").is_err(),
+            "premise: a write onto a directory fails"
+        );
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "record")
+            .collect();
+        assert!(left.is_empty(), "ATOMIC-TMP: a failed write left {left:?}");
     }
 
     /// Each [`Relabel`] state moves on each event as this table says, and
@@ -4591,6 +4872,16 @@ mod tests {
     }
     fn unkept_proofs(dir: &Path) -> usize {
         UNKEPT_PROOFS.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+    /// Each reserved sector's setups begun ([`resume_reserved_sector`]), by
+    /// directory.
+    static RESUMES: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_resume(dir: &Path) {
+        *RESUMES.lock().unwrap().entry(dir.to_owned()).or_default() += 1;
+    }
+    fn resumes(dir: &Path) -> usize {
+        RESUMES.lock().unwrap().get(dir).copied().unwrap_or(0)
     }
     /// Each read of a sector's last layer (`Sector::last`), by directory:
     /// the bytes this process held reserved as it began.
