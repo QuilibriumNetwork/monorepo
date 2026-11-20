@@ -523,7 +523,9 @@ fn read_row(
 
 /// Consume one phase in address order. Archive row indexes share the
 /// snapshot's version iterator across each page of changed addresses.
-fn phase_reader<'a>(
+/// Batched rows are paired with their addresses; a request out of that
+/// order is an error, never another address's row.
+pub(super) fn phase_reader<'a>(
     snapshot: &'a dyn SnapshotReadable,
     shard: &'a ShardKey,
     phase: &'static str,
@@ -540,14 +542,20 @@ fn phase_reader<'a>(
         if !batch {
             return read_row(snapshot, phase, shard, address, limits);
         }
-        if let Some(row) = buffered.next() {
+        let out_of_order = || QuilError::Store("registry row read out of address order".into());
+        if let Some((buffered_address, row)) = buffered.next() {
+            if buffered_address != *address {
+                return Err(out_of_order());
+            }
             return Ok(row);
         }
         let addresses: Vec<_> = remaining
             .by_ref()
             .take(quil_types::store::VERTEX_READ_BATCH)
             .collect();
-        debug_assert_eq!(addresses.first(), Some(address));
+        if addresses.first() != Some(address) {
+            return Err(out_of_order());
+        }
         let rows = snapshot.vertex_batch(
             phase,
             shard,
@@ -560,9 +568,11 @@ fn phase_reader<'a>(
         if rows.len() != addresses.len() {
             return Err(QuilError::Store("incomplete registry row batch".into()));
         }
-        buffered = rows.into_iter();
+        let pairs: Vec<_> = addresses.into_iter().zip(rows).collect();
+        buffered = pairs.into_iter();
         buffered
             .next()
+            .map(|(_, row)| row)
             .ok_or_else(|| QuilError::Store("empty registry row batch".into()))
     }
 }

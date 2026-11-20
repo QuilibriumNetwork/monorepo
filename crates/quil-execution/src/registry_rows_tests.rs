@@ -272,3 +272,30 @@ fn a_row_update_declines_after_a_direct_edit_or_with_no_rows_left() {
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
     assert!(!emptied.update_rows(snapshot.as_ref(), &written, limits, None).unwrap(), "a refresh would read the legacy tree");
 }
+
+// Committee-indexed reads fetch rows in batches, in address order. A read
+// out of that order was caught only by a debug assertion; a release build
+// returned another address's row. It fails now, at any row of a batch.
+#[test]
+fn a_batched_row_read_out_of_address_order_fails() {
+    let (_tmp, store) = temp_store();
+    let addresses = [row_address(1), row_address(2), row_address(3)];
+    for (n, address) in addresses.iter().enumerate() {
+        put_row(&store, "adds", address, Some(&[n as u8 + 1; 4]));
+    }
+    let written: std::collections::BTreeMap<[u8; 32], registry_rows::Written> =
+        addresses.iter().map(|a| (*a, registry_rows::Written { adds: true, removes: false })).collect();
+    let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+    let shard = quil_store::encoding::prover_registry_shard();
+    let page = RegistryLimits::UNBOUNDED.page();
+    let reader = || registry_rows::phase_reader(snapshot.as_ref(), &shard, "adds", &written, page, true);
+
+    let mut read = reader();
+    for (n, address) in addresses.iter().enumerate() {
+        assert_eq!(read(address).unwrap(), Some(vec![n as u8 + 1; 4]), "in order, each address reads its own row");
+    }
+    let mut read = reader();
+    assert_eq!(read(&addresses[0]).unwrap(), Some(vec![1; 4]));
+    assert!(read(&addresses[2]).is_err(), "the next buffered row is the second address's");
+    assert!(reader()(&addresses[1]).is_err(), "a batch starts at the first address");
+}
