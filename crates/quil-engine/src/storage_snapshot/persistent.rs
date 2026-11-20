@@ -15,7 +15,9 @@ use std::{
 };
 
 /// An expected wait of a leaf's encode: on GLOBAL certifying its sector
-/// ([`UNCERTIFIED`]), or on a sector initialization slot. Its storage job
+/// ([`UNCERTIFIED`]), or on a sector initialization slot; or of a sector's
+/// set-up or repair on the labelling holding its count
+/// ([`Refusal::Busy`]). Its storage job
 /// logs it as one, never as a failure at each retry (2026-11-19: on a
 /// 9-seat node the two were 55 failure warns in 12 hours).
 fn waiting(what: &str) -> QuilError {
@@ -467,9 +469,10 @@ fn initialize_with_progress(
                     }
                     Labelling::Refused => None,
                 },
-                // The labelling that holds the count sets the sector up.
+                // The labelling that holds the count sets the sector up:
+                // an expected wait, logged as one by its job, not a failure.
                 Err(busy @ Refusal::Busy { .. }) => {
-                    return Err(unavailable(format!(
+                    return Err(waiting(&format!(
                         "a new sector's labels not admitted to certify it: {busy}; it is set \
                          up once that labelling ends"
                     )))
@@ -695,8 +698,10 @@ fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
                         Labelling::Labelled(labelled) => (labelled.last, labelled.comm_c),
                         _ => return Err(unavailable("sector repair stopped".into())),
                     },
+                    // An expected wait, as at its set-up: repaired once
+                    // the labelling holding the count ends.
                     Err(busy @ Refusal::Busy { .. }) => {
-                        return Err(unavailable(format!(
+                        return Err(waiting(&format!(
                             "a sector's labels not admitted to repair it: {busy}"
                         )))
                     }
@@ -2259,6 +2264,94 @@ mod tests {
                     .all(|field| busy[0].contains(field)),
             "BUSY-LINE: the other process's hold is not named once: {busy:?}"
         );
+    }
+
+    /// A new sector whose count another labelling holds, in this process
+    /// or another worker process, waits for it: an expected wait its job
+    /// logs as one, bounded, and the seal report files as occupied slots,
+    /// never a failure (2026-11-20: a failure warn at each retry).
+    #[test]
+    fn a_sector_set_up_behind_a_busy_count_waits_for_it() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let ample = crate::storage_labels::ample_space;
+        let store = LabelStore::with_space(dir.path().to_owned(), ample());
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let member = [0xCE; 32];
+        let (path, id, n) = reserve(&store, &member, b"busy wait leaf", 1500, 100).unwrap();
+        for holder in [&store, &other] {
+            let held = holder
+                .admit(1500, &member, &id, n, Stage::Snapshot)
+                .expect("room for the sector's labels");
+            let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                .err()
+                .expect("the sector's count is labelled already");
+            drop(held);
+            println!("REACH sector-floor");
+            assert!(
+                matches!(&error, QuilError::StorageWaiting(what)
+                    if what.contains(crate::storage_labels::BUSY)),
+                "BUSY-WAIT: a busy refusal of a sector's set-up is no wait: {error:?}"
+            );
+            assert_eq!(
+                crate::seal_report::Reason::classify(&error.to_string()),
+                crate::seal_report::Reason::SlotsOccupied,
+                "BUSY-SLOTS: the seal report does not file a busy refusal as occupied \
+                 slots: {error}"
+            );
+        }
+        gates(false);
+    }
+
+    /// A certified sector's repair whose count another worker process's
+    /// labelling holds waits for it, logged as a wait and not a failure,
+    /// and is repaired once that labelling ends.
+    #[test]
+    fn a_sector_repair_behind_a_busy_count_waits_for_it() {
+        gates(true);
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let ample = crate::storage_labels::ample_space;
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let (member, app) = ([66; 32], [67; 32]);
+        let (_crdt, _prefix, path, id, n) = certified_leaf(&store, &member, app);
+        let whole = tear_last(&path, n);
+        let lane = sector_lane(&member, &id);
+        let idle = std::time::Duration::from_secs(120);
+        let repair = || {
+            let sector = Sector::load(path.clone()).unwrap().unwrap();
+            repair_last(&store, &member, 1500, &sector);
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, idle),
+                "the repair ends"
+            );
+        };
+        let held = other
+            .admit(1500, &member, &id, n, Stage::Snapshot)
+            .expect("room for the sector's labels");
+        repair();
+        println!("REACH sector-floor");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lines = |what: &str| {
+            text.lines()
+                .filter(|line| line.contains(what) && line.contains("not admitted to repair it"))
+                .count()
+        };
+        assert!(
+            lines("storage job waits") == 1
+                && lines("storage snapshot job failed") == 0
+                && fs::read(path.join("last")).unwrap() != whole,
+            "BUSY-REPAIR-WAIT: a busy refusal of a sector's repair is not logged as one wait: \
+             {text}"
+        );
+        drop(held);
+        repair();
+        assert!(
+            fs::read(path.join("last")).unwrap() == whole,
+            "BUSY-REPAIR-END: not repaired once the labelling holding its count ended"
+        );
+        gates(false);
     }
 
     /// A sector set up without labels kept is proven where its proof is

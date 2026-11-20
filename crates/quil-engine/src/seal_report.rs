@@ -43,7 +43,10 @@ impl Reason {
             Reason::DiskShort
         } else if error.contains("certification must finish") {
             Reason::CertificationPending
-        } else if error.contains("slots are occupied") || error.contains("already runs") {
+        } else if error.contains("slots are occupied")
+            || error.contains("already runs")
+            || error.contains(crate::storage_labels::BUSY)
+        {
             Reason::SlotsOccupied
         } else if error.contains("not be retained")
             || error.contains("not retained")

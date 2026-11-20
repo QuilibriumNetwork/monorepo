@@ -810,6 +810,10 @@ struct Shortfall {
     floor: Option<u64>,
 }
 
+/// The start of a [`Refusal::Busy`]'s text, which the seal report files
+/// as occupied slots ([`crate::seal_report::Reason::classify`]).
+pub(crate) const BUSY: &str = "busy: the count is being labelled already";
+
 /// Why [`LabelStore::admit_or_refusal`] admitted no labelling of a leaf's
 /// count: the disk floor, or a labelling of that count already running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,7 +858,7 @@ impl std::fmt::Display for Refusal {
                 held_secs,
             } => write!(
                 f,
-                "busy: the count is being labelled already by {}, holding {} for {} s",
+                "{BUSY} by {}, holding {} for {} s",
                 if *elsewhere {
                     "another worker process of this node"
                 } else {
