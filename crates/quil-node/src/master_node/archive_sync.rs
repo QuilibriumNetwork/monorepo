@@ -100,6 +100,88 @@ struct SyncRegistry {
     noted: Arc<dyn Fn(u64, Option<u64>) + Send + Sync>,
 }
 
+/// Notes a refreshed prover registry everywhere this node reads it: the
+/// lifecycle, whose joins, leaves and expiries wait for the syncs it reflects,
+/// and the early-pull state (`refresh`), whose registry view this node's
+/// storage settlements wait for. One place for both, so neither misses a
+/// refresh the other sees.
+#[derive(Clone)]
+pub(crate) struct RegistryViewNotes {
+    refresh: Arc<quil_engine::global_view_refresh::ViewRefresh>,
+}
+
+impl RegistryViewNotes {
+    /// A node's notes on `refresh`. A regular node (not `archive_mode`) pulls
+    /// its registry from archives: that is noted now, before its workers
+    /// start, so their settlements wait for a pulled view from the start, not
+    /// only once the first pull ends.
+    pub(crate) fn new(
+        refresh: Arc<quil_engine::global_view_refresh::ViewRefresh>,
+        archive_mode: bool,
+    ) -> Self {
+        if !archive_mode {
+            refresh.note_registry_pulled();
+        }
+        Self { refresh }
+    }
+
+    /// The registry now reflects the sync `lifecycle` numbered `sync`, which
+    /// verified the GLOBAL view through the frame `view` names.
+    fn refreshed(
+        &self,
+        lifecycle: &quil_engine::provers::lifecycle::ProverLifecycle,
+        sync: u64,
+        view: Option<u64>,
+    ) {
+        lifecycle.note_registry_synced(sync);
+        if let Some(view) = view {
+            lifecycle.note_registry_view(view);
+            self.refresh.note_registry_view(view);
+        }
+    }
+
+    /// [`Self::refreshed`] on `lifecycle`, as [`SyncRegistry::noted`].
+    fn noted(
+        &self,
+        lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
+    ) -> Arc<dyn Fn(u64, Option<u64>) + Send + Sync> {
+        let notes = self.clone();
+        Arc::new(move |sync, view| notes.refreshed(&lifecycle, sync, view))
+    }
+}
+
+/// Refreshes the prover registry (`refresh`) after the initial prover-tree
+/// sync `lifecycle` numbered `sync`, and notes it
+/// ([`RegistryViewNotes::refreshed`]) where that sync's data verified
+/// (`data_ok`), with the committed view (`committed_view`, read after the
+/// refresh): the registry's state is at least at that cursor. Whether the
+/// registry now holds verified data.
+async fn refresh_after_initial_sync(
+    refresh: impl FnOnce() -> quil_types::error::Result<()> + Send + 'static,
+    data_ok: bool,
+    committed_view: impl FnOnce() -> Option<u64>,
+    notes: &RegistryViewNotes,
+    lifecycle: &quil_engine::provers::lifecycle::ProverLifecycle,
+    sync: u64,
+) -> bool {
+    match tokio::task::spawn_blocking(refresh).await {
+        Ok(Ok(())) => {
+            if data_ok {
+                notes.refreshed(lifecycle, sync, committed_view());
+            }
+            data_ok
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "prover registry refresh failed; lifecycle gate stays held");
+            false
+        }
+        Err(error) => {
+            warn!(%error, "prover registry refresh task failed; lifecycle gate stays held");
+            false
+        }
+    }
+}
+
 /// Runs the passes verified registry syncs owe, off the sync task: a pass can
 /// take minutes on a node with many seats, and awaited there it held the next
 /// pull, and with it the view every session and storage duty reads. A pass
@@ -1848,6 +1930,8 @@ pub(crate) struct ArchiveSyncArgs {
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
     pub prover_lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
+    /// Where a refreshed prover registry is noted.
+    pub registry_notes: RegistryViewNotes,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
     pub coverage_monitor: Arc<quil_engine::coverage::CoverageMonitor>,
@@ -2620,6 +2704,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         exec_manager,
         worker_allocator,
         prover_lifecycle,
+        registry_notes,
         prover_registry,
         worker_manager,
         coverage_monitor,
@@ -3308,6 +3393,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_pr = prover_registry.clone();
             let sync_wa = worker_allocator.clone();
             let sync_pl = prover_lifecycle.clone();
+            let sync_notes = registry_notes.clone();
             let sync_km = file_key_manager.clone();
             let sync_cs = clock_store.clone();
             let sync_fp = frame_prover.clone();
@@ -3432,29 +3518,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         false
                     }).await;
                     let Some(synced) = synced else { return Ok(()); };
-                    initial_sync_data_ok = synced;
-                    // Refresh prover registry from synced data
-                    let pr = sync_pr.clone();
-                    let hs2 = sync_hg.clone();
-                    match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs2.as_ref())).await {
-                        Ok(Ok(())) => {
-                            if initial_sync_data_ok {
-                                // Its state is at least at the cursor committed with it.
-                                if let Some(view) = sync_cs.get_global_materialized_cursor() {
-                                    sync_pl.note_registry_view(view);
-                                }
-                                sync_pl.note_registry_synced(registry_sync);
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            initial_sync_data_ok = false;
-                            warn!(%error, "prover registry refresh failed; lifecycle gate stays held");
-                        }
-                        Err(error) => {
-                            initial_sync_data_ok = false;
-                            warn!(%error, "prover registry refresh task failed; lifecycle gate stays held");
-                        }
-                    }
+                    // Refresh the prover registry from the synced data.
+                    initial_sync_data_ok = refresh_after_initial_sync(
+                        {
+                            let (pr, hs) = (sync_pr.clone(), sync_hg.clone());
+                            move || pr.refresh_from_store(hs.as_ref())
+                        },
+                        synced,
+                        || sync_cs.get_global_materialized_cursor(),
+                        &sync_notes,
+                        &sync_pl,
+                        registry_sync,
+                    )
+                    .await;
                     // Reconstruct coverage streaks from synced prover
                     // data once at startup, before any frame-driven check.
                     // Without this, the first eviction pass after a
@@ -5149,18 +5225,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         Arc::new(move || lifecycle.set_sync_complete())
                     },
                     {
-                        let (registry, store, lifecycle) =
-                            (sync_pr.clone(), sync_hg.clone(), sync_pl.clone());
+                        let (registry, store) = (sync_pr.clone(), sync_hg.clone());
                         SyncRegistry {
                             refresh: Arc::new(move |capture: &dyn quil_types::store::SnapshotReadable| {
                                 registry.refresh_from_capture(store.as_ref(), capture)
                             }),
-                            noted: Arc::new(move |sync, view| {
-                                lifecycle.note_registry_synced(sync);
-                                if let Some(view) = view {
-                                    lifecycle.note_registry_view(view);
-                                }
-                            }),
+                            noted: sync_notes.noted(sync_pl.clone()),
                         }
                     },
                     sync_token.clone(),
@@ -6971,6 +7041,128 @@ mod validation_tests {
         }
         assert_eq!(state(), (vec![(2, Some(2102))], vec![Some(2102)], 1));
         assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    /// A prover lifecycle on test workers and registry.
+    fn test_lifecycle() -> Arc<quil_engine::provers::lifecycle::ProverLifecycle> {
+        let allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
+            Arc::new(quil_engine::test_support::TestWorkerManager::new()),
+            Arc::new(quil_engine::test_support::TestProverRegistry::new()),
+            vec![0xAA; 32],
+        ));
+        Arc::new(quil_engine::provers::lifecycle::ProverLifecycle::new(
+            vec![0xAA; 32],
+            allocator,
+            Arc::new(quil_engine::halt_state::HaltState::new()),
+            quil_engine::current_frame::CurrentFrame::new(),
+            quil_engine::provers::proposer::Strategy::RewardGreedy,
+        ))
+    }
+
+    /// A regular node's notes mark its registry pulled when made, before its
+    /// workers start; an archive's do not.
+    #[test]
+    fn a_regular_nodes_registry_notes_mark_it_pulled_when_made() {
+        for archive_mode in [false, true] {
+            let refresh = Arc::new(quil_engine::global_view_refresh::ViewRefresh::default());
+            let _notes = RegistryViewNotes::new(refresh.clone(), archive_mode);
+            assert_eq!(
+                refresh.registry_pulled(),
+                !archive_mode,
+                "NOTES-PULLED: archive mode {archive_mode}"
+            );
+        }
+    }
+
+    /// A verified sync's refreshed registry is noted where this node's
+    /// storage settlements read its view, through the node's notes: the
+    /// view is the pass's cursor once the registry is refreshed, on the sync
+    /// task or deferred to the pass, and unchanged after a failed refresh.
+    #[tokio::test]
+    async fn a_refreshed_registry_notes_its_view_where_settlements_read_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let refresh = Arc::new(quil_engine::global_view_refresh::ViewRefresh::default());
+        let notes = RegistryViewNotes::new(refresh.clone(), false);
+        let fail = Arc::new(AtomicBool::new(false));
+        let reconciles = SyncReconciles::with_registry(
+            false,
+            Arc::new(|anchor: &RegistrySyncAnchor| Ok(anchor.cursor)),
+            Arc::new(|| {}),
+            SyncRegistry {
+                refresh: {
+                    let fail = fail.clone();
+                    Arc::new(move |_: &dyn quil_types::store::SnapshotReadable| {
+                        if fail.load(Ordering::SeqCst) {
+                            Err(quil_types::error::QuilError::Store("unreadable".into()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+                noted: notes.noted(test_lifecycle()),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert_eq!(refresh.registry_view(), None, "premise: no view noted yet");
+        // Sync, whether its refresh fails, whether it is deferred to the
+        // pass, and the view noted after it.
+        for (sync, fails, defer, want) in [
+            (1u64, false, false, Some(2101)),
+            (2, true, false, Some(2101)),
+            (3, false, true, Some(2103)),
+            (4, true, true, Some(2103)),
+        ] {
+            fail.store(fails, Ordering::SeqCst);
+            let mut pass = sync_pass(2100 + sync);
+            pass.registry_sync = sync;
+            let capture: quil_types::error::Result<Arc<dyn quil_types::store::SnapshotReadable>> =
+                Ok(Arc::new(EmptyCapture));
+            let settled = settle_verified_sync(&reconciles, capture, pass, defer).await;
+            reconciles.wait_idle().await;
+            assert_eq!(
+                (settled.is_some(), refresh.registry_view()),
+                (defer || !fails, want),
+                "VIEW-UNNOTED: sync {sync} at view {}, refresh fails {fails}, deferred {defer}",
+                2100 + sync
+            );
+        }
+    }
+
+    /// The initial sync's refresh notes the committed view where this node's
+    /// storage settlements read it, once its data verified and the refresh
+    /// succeeded; else it notes nothing and the registry holds no verified
+    /// data.
+    #[tokio::test]
+    async fn the_initial_sync_notes_its_view_where_settlements_read_it() {
+        for (data_ok, fails, want) in [
+            (true, false, Some(2100)),
+            (true, true, None),
+            (false, false, None),
+        ] {
+            let refresh = Arc::new(quil_engine::global_view_refresh::ViewRefresh::default());
+            let notes = RegistryViewNotes::new(refresh.clone(), false);
+            let lifecycle = test_lifecycle();
+            let verified = refresh_after_initial_sync(
+                move || {
+                    if fails {
+                        Err(quil_types::error::QuilError::Store("unreadable".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                data_ok,
+                || Some(2100),
+                &notes,
+                &lifecycle,
+                lifecycle.begin_registry_sync(),
+            )
+            .await;
+            assert_eq!(
+                (verified, refresh.registry_view()),
+                (data_ok && !fails, want),
+                "INITIAL-UNNOTED: data verified {data_ok}, refresh fails {fails}"
+            );
+        }
     }
 
     /// Shutdown waits for the running pass and starts no waiting one.
