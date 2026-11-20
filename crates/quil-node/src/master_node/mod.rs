@@ -790,6 +790,14 @@ pub(crate) async fn start(
     };
     let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
 
+    // Before the workers start: a regular node pulls its prover registry
+    // from archives, and its workers' settlements wait for a view at their
+    // window's start, none pulled yet when they start.
+    let registry_notes = archive_sync::RegistryViewNotes::new(
+        quil_engine::global_view_refresh::shared(),
+        archive_mode,
+    );
+
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
         worker_manager::WorkerManagerArgs {
@@ -1568,6 +1576,7 @@ pub(crate) async fn start(
             exec_manager: exec_manager.clone(),
             worker_allocator: worker_allocator.clone(),
             prover_lifecycle: prover_lifecycle.clone(),
+            registry_notes,
             prover_registry: prover_registry.clone(),
             worker_manager: worker_manager.clone(),
             coverage_monitor: coverage_monitor.clone(),

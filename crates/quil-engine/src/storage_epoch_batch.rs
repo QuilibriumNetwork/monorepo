@@ -814,6 +814,141 @@ pub fn settlement_due(epoch: u64, frame: u64, view: SettlementView) -> Option<Se
     })
 }
 
+/// Whether a seat's settlement waits for this node's registry view
+/// ([`settlement_view_wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewWait {
+    /// It goes: the view reaches its window's start, the frame is past its
+    /// window, or this process's registry is not pulled.
+    Synced,
+    /// The frame is before its window, where nothing is sent: a wait
+    /// begun is left as it is. The frame a seat's check runs at can fall
+    /// back (an app frame's GLOBAL anchor, the stored GLOBAL head, behind
+    /// a GLOBAL frame received), so only the view or an unpulled registry
+    /// ends a wait.
+    Before,
+    /// It waits for a pull whose view reaches its window's start.
+    Held,
+    /// Its window's closing frames came with the view still short: it goes
+    /// with the frames the view lists.
+    Overrun,
+}
+
+/// A settlement of `epoch` proves the frames its seat committed in it, as
+/// this node's registry lists them. GLOBAL has recorded the last of them by
+/// the settlement window's start (no frame anchored in the epoch executes
+/// later), but a registry pulled from an archive every few minutes can show
+/// the state of a frame before it and list too few: GLOBAL refuses such a
+/// proof. At GLOBAL frame `frame`, the settlement waits for a view (`view`,
+/// the GLOBAL frame whose state the registry reflects; `None` before its
+/// first pull) at the window's start where this process's registry is
+/// `pulled` ([`crate::global_view_refresh::ViewRefresh::registry_pulled`]),
+/// until the window's closing frames ([`settle_closing_frames`]): then it
+/// goes with what the view lists, so the wait never outlasts the window. A
+/// frame before the window leaves a wait as it is ([`ViewWait::Before`]). A
+/// cluster worker's own process is not `pulled`: its registry, synced from
+/// its master, records no GLOBAL frame for its view.
+pub fn settlement_view_wait(epoch: u64, frame: u64, pulled: bool, view: Option<u64>) -> ViewWait {
+    let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+    if !pulled || view.is_some_and(|view| view >= from) || frame >= until {
+        return ViewWait::Synced;
+    }
+    if frame < from {
+        return ViewWait::Before;
+    }
+    if frame >= until.saturating_sub(settle_closing_frames()) {
+        ViewWait::Overrun
+    } else {
+        ViewWait::Held
+    }
+}
+
+/// The settlements waiting for this node's registry view: the GLOBAL frame
+/// each began waiting at, and whether its overrun was reported.
+fn view_waits() -> &'static Mutex<HashMap<SettlementKey, (u64, bool)>> {
+    static WAITS: OnceLock<Mutex<HashMap<SettlementKey, (u64, bool)>>> = OnceLock::new();
+    WAITS.get_or_init(Default::default)
+}
+
+/// Whether `member`'s settlement of `epoch` on `filter` goes at GLOBAL frame
+/// `frame` as far as this process's registry view `view` goes
+/// ([`settlement_view_wait`]; `refresh`: this process's early pulls). `view`
+/// is read before the slot: it is noted after the registry's refresh. While
+/// it waits with the committed view short of the window's start, it asks for
+/// an early pull whose view reaches it: the sync task starts one once GLOBAL
+/// is past that frame, at least [`crate::global_view_refresh::MIN_GAP`] after
+/// the last pull, while the epoch's storage budget lasts
+/// ([`crate::global_view_refresh::STORAGE_PER_EPOCH`]); the periodic pull
+/// reaches it otherwise. Once the committed view reaches it, a pull already
+/// did, and the registry's refresh from that pull is what it waits for (run
+/// after the pull, or by the next one where it failed). A frame before its
+/// window, to which the check's frame can fall back, neither ends nor
+/// restarts a wait ([`ViewWait::Before`]). A wait's start, with
+/// what it waits for, and its end are logged once each, and a window nearing
+/// its end with the view still short once as a warning.
+pub fn settlement_view_ready(
+    member: &[u8; 32],
+    filter: &[u8],
+    epoch: u64,
+    frame: u64,
+    view: Option<u64>,
+    refresh: &crate::global_view_refresh::ViewRefresh,
+) -> bool {
+    let wait = settlement_view_wait(epoch, frame, refresh.registry_pulled(), view);
+    let Ok(mut waits) = view_waits().lock() else {
+        return wait != ViewWait::Held;
+    };
+    waits.retain(|(_, _, e), _| {
+        quil_execution::global_intrinsic::storage_seat::settlement_window(*e).1 > frame
+    });
+    let key = (*member, filter.to_vec(), epoch);
+    let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+    if wait == ViewWait::Synced {
+        if let Some((since, _)) = waits.remove(&key) {
+            info!(epoch, filter = %hex::encode(filter), registry_view = ?view, window_start = from,
+                global_frame = frame, waited_frames = frame.saturating_sub(since),
+                "storage settlement goes: this node's registry view reached its window's start");
+        }
+        return true;
+    }
+    if wait == ViewWait::Before {
+        return true;
+    }
+    let committed = refresh.committed_view();
+    let pulled = committed.is_some_and(|committed| committed >= from);
+    if !pulled {
+        refresh.request(
+            crate::global_view_refresh::Reason::StorageRecordAwaited,
+            from,
+            Instant::now(),
+        );
+    }
+    let (since, warned) = waits.entry(key).or_insert_with(|| {
+        let awaits = if pulled {
+            "the last registry pull reached it and the registry's refresh from that pull is awaited"
+        } else if refresh.enabled() {
+            "an early registry pull is asked"
+        } else {
+            "the next periodic registry pull reaches it"
+        };
+        info!(epoch, filter = %hex::encode(filter), registry_view = ?view, committed_view = ?committed,
+            window_start = from, global_frame = frame,
+            "storage settlement waits for this node's registry view to reach its window's start, so it \
+             lists every frame its seat committed; {awaits}");
+        (frame, false)
+    });
+    if wait == ViewWait::Overrun && !*warned {
+        *warned = true;
+        warn!(epoch, filter = %hex::encode(filter), registry_view = ?view, window_start = from,
+            global_frame = frame, window_end = until, waited_frames = frame.saturating_sub(*since),
+            "storage settlement near its window's end while this node's registry view is still short of the \
+             window's start: sending it with the frames the view lists, which GLOBAL refuses if the view misses \
+             any. This node's registry pulls have not caught up; check its `prover tree sync` lines and its \
+             connections to the archives");
+    }
+    wait == ViewWait::Overrun
+}
+
 /// What a worker sent of a seat's settlement: the GLOBAL frames of its first
 /// and last sends, how many, and the last sent alone.
 #[derive(Debug, Clone, Copy)]
@@ -2787,6 +2922,188 @@ mod tests {
         part.part.epoch = epoch;
         part.claim.settle_epoch = epoch;
         part
+    }
+
+    /// The registry-view wait's edges: the last view and the last frame it
+    /// holds at, the first it ends at, a view not yet pulled, a registry not
+    /// pulled, and frames outside the window.
+    #[test]
+    fn a_settlement_view_wait_ends_at_its_window_start_and_closing_frames() {
+        use ViewWait::{Before, Held, Overrun, Synced};
+        let epoch = 5;
+        let (from, until) =
+            quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let closing = until - settle_closing_frames();
+        let at = from + 1;
+        // The last view short of the start, the first at it; no view yet;
+        // no pull; the last frame before closing, the first closing frame;
+        // the frames on either side of the window.
+        for (frame, pulled, view, want) in [
+            (at, true, Some(from - 1), Held),
+            (at, true, Some(from), Synced),
+            (at, true, None, Held),
+            (at, false, None, Synced),
+            (closing - 1, true, Some(from - 1), Held),
+            (closing, true, Some(from - 1), Overrun),
+            (closing, true, None, Overrun),
+            (from - 1, true, None, Before),
+            (from - 1, true, Some(from), Synced),
+            (until, true, None, Synced),
+        ] {
+            assert_eq!(
+                settlement_view_wait(epoch, frame, pulled, view),
+                want,
+                "VIEW-WAIT at frame {frame} (window {from}..{until}, closing from {closing}), \
+                 pulled {pulled}, view {view:?}"
+            );
+        }
+    }
+
+    /// A waiting settlement asks for an early pull only while the committed
+    /// view is short of its window's start. Once the committed view reaches
+    /// it, a pull already did and the registry's refresh from that pull is
+    /// awaited: no pull is asked, and the wait's line says so. Where this
+    /// process takes no early pulls, the line names the periodic pull.
+    #[test]
+    fn a_settlement_wait_asks_a_pull_only_while_the_committed_view_is_short() {
+        use crate::global_view_refresh::{Reason, ViewRefresh};
+        let epoch = 5;
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        for (key, committed, enabled, asked, awaits) in [
+            (1u8, from - 1, true, true, "an early registry pull is asked"),
+            (2, from, true, false, "refresh from that pull is awaited"),
+            (3, from - 1, false, false, "next periodic registry pull"),
+        ] {
+            let refresh = ViewRefresh::default();
+            if enabled {
+                refresh.enable(quil_types::consensus::epoch_length_frames());
+            }
+            refresh.note_registry_pulled();
+            refresh.note_registry_view(from - 1);
+            refresh.settle(committed);
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = {
+                let lines = lines.clone();
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .with_writer(move || LineSink(lines.clone()))
+                    .finish()
+            };
+            let ready = tracing::subscriber::with_default(subscriber, || {
+                settlement_view_ready(
+                    &[key; 32],
+                    &[0x5A; 35],
+                    epoch,
+                    from + 1,
+                    refresh.registry_view(),
+                    &refresh,
+                )
+            });
+            let logged = String::from_utf8_lossy(&lines.lock().unwrap()).into_owned();
+            assert!(
+                !ready,
+                "premise: the settlement waits (view {}, window start {from})",
+                from - 1
+            );
+            assert_eq!(
+                refresh.requested(Reason::StorageRecordAwaited).is_some(),
+                asked,
+                "WAIT-ASK: committed view {committed}, window start {from}, early pulls {enabled}"
+            );
+            assert!(
+                logged.contains("storage settlement waits for this node's registry view")
+                    && logged.contains(awaits),
+                "WAIT-LINE: committed view {committed}, early pulls {enabled}, want {awaits:?}: {logged}"
+            );
+        }
+    }
+
+    /// The frame a seat's check runs at can fall back below the window's
+    /// start after a wait began (a devnet saw it in every seat-epoch):
+    /// that frame leaves the wait alone. With the view short throughout,
+    /// one wait line and no end; the view reaching the start ends it,
+    /// counting from the frame it began at.
+    #[test]
+    fn a_frame_falling_back_before_its_window_leaves_a_settlement_wait_alone() {
+        use crate::global_view_refresh::ViewRefresh;
+        let epoch = 5;
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let (member, filter) = ([0xB4; 32], [0x5B; 35]);
+        let refresh = ViewRefresh::default();
+        refresh.note_registry_pulled();
+        refresh.note_registry_view(from - 1);
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = {
+            let lines = lines.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(move || LineSink(lines.clone()))
+                .finish()
+        };
+        let logged = || String::from_utf8_lossy(&lines.lock().unwrap()).into_owned();
+        let waits = "storage settlement waits for this node's registry view";
+        let goes = "storage settlement goes";
+        tracing::subscriber::with_default(subscriber, || {
+            let ready = |frame: u64| {
+                settlement_view_ready(
+                    &member,
+                    &filter,
+                    epoch,
+                    frame,
+                    refresh.registry_view(),
+                    &refresh,
+                )
+            };
+            assert!(
+                !ready(from + 3),
+                "premise: the settlement waits at {}",
+                from + 3
+            );
+            ready(from - 1);
+            assert!(
+                !ready(from + 4),
+                "FELL-BACK-SENT: the view {} is short of the window start {from}",
+                from - 1
+            );
+            let seen = logged();
+            assert!(
+                seen.matches(waits).count() == 1 && !seen.contains(goes),
+                "FELL-BACK-ENDED: frames {}, {}, {} with the view {} short of {from}: \
+                 want one wait line and no end: {seen}",
+                from + 3,
+                from - 1,
+                from + 4,
+                from - 1
+            );
+            refresh.note_registry_view(from);
+            assert!(
+                ready(from + 6),
+                "premise: the view reached the window start"
+            );
+        });
+        let seen = logged();
+        assert!(
+            seen.matches(goes).count() == 1 && seen.contains("waited_frames=3"),
+            "FELL-BACK-RESTARTED: the wait began at {}, ended at {}: {seen}",
+            from + 3,
+            from + 6
+        );
+    }
+
+    /// Collects a test's log lines.
+    struct LineSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LineSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// Once persistent storage holds, a member's settlements of one epoch go
