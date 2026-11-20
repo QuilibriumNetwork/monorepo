@@ -272,8 +272,8 @@ pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] =
 
 /// How many configured bootstrap peers [`P2PConfig::apply_defaults`]
 /// replaces with [`MAINNET_BOOTSTRAP_PEERS`]: the number of distinct
-/// configured peers ([`distinct_peer_count`]) on mainnet when the entries
-/// differ from the built-in list and from
+/// configured peers ([`distinct_peer_count`]) on mainnet when the entries,
+/// blank ones ignored, differ from the built-in list and from
 /// [`EARLIER_MAINNET_BOOTSTRAP_PEERS`] and name a peer, otherwise `None`
 /// (another network, a list naming no peer, such as an empty or blank one,
 /// or the same entries).
@@ -282,7 +282,11 @@ pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> O
         return None;
     }
     use std::collections::BTreeSet;
-    let configured: BTreeSet<&str> = configured.iter().map(|peer| peer.trim()).collect();
+    let configured: BTreeSet<&str> = configured
+        .iter()
+        .map(|peer| peer.trim())
+        .filter(|peer| !peer.is_empty())
+        .collect();
     let same = |list: &[&str]| configured == list.iter().copied().collect::<BTreeSet<_>>();
     let differs = !same(MAINNET_BOOTSTRAP_PEERS) && !same(EARLIER_MAINNET_BOOTSTRAP_PEERS);
     differs
@@ -490,7 +494,7 @@ mod tests {
     /// at both address families is one peer, and each distinct entry
     /// without a peer ID one more, so a list naming no peer ID is not
     /// reported as 0 peers. A list naming no peer at all, such as a blank
-    /// entry, is not reported.
+    /// entry, is not reported, nor is the built-in list with a blank entry.
     #[test]
     fn a_replaced_bootstrap_list_counts_peers_not_entries() {
         let peerless: Vec<String> = [
@@ -534,11 +538,19 @@ mod tests {
                 "a list naming no peer reported as 0 configured peers"
             );
         }
+        let mut padded = built_in;
+        padded.push(String::new());
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &padded),
+            None,
+            "the built-in list with a blank entry reported as replaced"
+        );
     }
 
     /// A config saved by a release whose built-in list held the IPv4
     /// entries only names no peer the node does not dial: it is not
-    /// reported as replaced. One differing entry still is.
+    /// reported as replaced, with a blank entry or without. One differing
+    /// entry still is.
     #[test]
     fn a_config_saved_with_the_ipv4_bootstrap_list_is_not_reported() {
         let saved = ipv4_entries();
@@ -550,6 +562,13 @@ mod tests {
                 "the IPv4-only list reported as replaced"
             );
         }
+        let mut padded = saved.clone();
+        padded.push(" ".into());
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &padded),
+            None,
+            "the IPv4-only list with a blank entry reported as replaced"
+        );
         assert_eq!(
             replaced_mainnet_bootstrap_peers(0, &saved[1..]),
             Some(saved.len() - 1)
