@@ -60,7 +60,7 @@ pub async fn run_test_prover_sync(
     } else if network == 0 {
         quil_engine::genesis::genesis_archive_static_ips()
             .into_iter()
-            .filter_map(|(_pid, ip)| crate::util::multiaddr::genesis_archive_endpoint(&ip))
+            .map(|(_pid, ip)| format!("{ip}:8340"))
             .collect()
     } else {
         Vec::new()

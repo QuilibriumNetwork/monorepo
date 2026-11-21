@@ -146,8 +146,11 @@ fn endpoints(args: &Arguments) -> anyhow::Result<Vec<(String, quil_p2p::PeerId)>
         quil_engine::genesis::genesis_archive_static_ips()
             .into_iter()
             .map(|(peer, ip)| {
-                let addr = crate::util::multiaddr::genesis_archive_endpoint(&ip)
-                    .with_context(|| format!("genesis archive address {ip} does not parse"))?;
+                let addr = if ip.contains(':') {
+                    format!("[{ip}]:8340")
+                } else {
+                    format!("{ip}:8340")
+                };
                 Ok((addr, peer.parse()?))
             })
             .collect()

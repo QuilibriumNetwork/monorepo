@@ -317,7 +317,7 @@ mod r112_d2_tests {
         let endpoints = query_endpoints("", &[], 0);
         assert!(!endpoints.is_empty());
         for (peer_id, ip) in quil_engine::genesis::genesis_archive_static_ips() {
-            let endpoint = crate::util::multiaddr::genesis_archive_endpoint(&ip).unwrap();
+            let endpoint = format!("{ip}:8340");
             assert!(endpoints.contains(&endpoint));
             assert_eq!(
                 quil_rpc::archive_client::pinned_archive_peer(&endpoint),
