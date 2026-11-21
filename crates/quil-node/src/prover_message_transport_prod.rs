@@ -155,8 +155,8 @@ pub(crate) struct SubmitRetryQueue {
 /// about 18.5 s, and one sender's share holds about one proof: rounds 5 s
 /// apart sent every queued proof to every archive, and four archives
 /// refused about 130,000 sends an epoch each, against about 1,100 seats
-/// (2026-11-21). An archive taking a proof is sent at most one more before
-/// it refuses and rests.
+/// (2026-11-21). The rests are read as each send starts: an archive is
+/// sent past its refusal only the proofs already on their way to it.
 #[derive(Default)]
 struct ArchiveRests {
     rests: std::sync::Mutex<std::collections::HashMap<String, Rest>>,
@@ -204,7 +204,8 @@ struct Resting<'a> {
     rests: &'a ArchiveRests,
     /// The proof's window end ([`StorageProofSubmission::window_end`]).
     window_end: u64,
-    /// How long an archive refusing it for room rests, before jitter.
+    /// How long an archive refusing it for room rests at least, before
+    /// jitter ([`jittered_up`]).
     rest: Duration,
 }
 
@@ -447,7 +448,8 @@ struct RetryTiming {
     /// How often a storage epoch proof's failed resends are logged.
     proof_log_every: Duration,
     /// How long an archive refusing a storage epoch proof for room rests
-    /// ([`ArchiveRests`]), before jitter ([`jittered`]).
+    /// at least ([`ArchiveRests`]), before jitter adds up to half
+    /// ([`jittered_up`]).
     room_rest: Duration,
 }
 
@@ -457,8 +459,9 @@ const RETRY_TIMING: RetryTiming = RetryTiming {
     give_up: Duration::from_secs(600),
     proof_give_up: Duration::from_secs(4 * 3600),
     proof_log_every: Duration::from_secs(300),
-    // Two GLOBAL frames at mainnet's pace (about 18.5 s each, 2026-11-21):
-    // a frame carrying held proofs frees the room.
+    // Over two GLOBAL frames at mainnet's pace (about 18.5 s each,
+    // 2026-11-21), so a frame carrying held proofs frees the room; jitter
+    // makes it 40-60 s.
     room_rest: Duration::from_secs(40),
 };
 const RETRY_MAX_MESSAGES: usize = 256;
@@ -682,11 +685,21 @@ impl SubmitRetryQueue {
 /// `delay` less a random part of up to half of it, so nodes refused
 /// together do not all send again together.
 fn jittered(delay: Duration) -> Duration {
+    delay - random_part(delay / 2)
+}
+
+/// `delay` plus a random part of up to half of it: [`jittered`] for a wait
+/// that must last at least `delay`.
+fn jittered_up(delay: Duration) -> Duration {
+    delay + random_part(delay / 2)
+}
+
+/// A random duration of up to `most`.
+fn random_part(most: Duration) -> Duration {
     use std::hash::BuildHasher;
-    let half = delay / 2;
-    let spread = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
+    let spread = u64::try_from(most.as_nanos()).unwrap_or(u64::MAX);
     let draw = std::collections::hash_map::RandomState::new().hash_one(Instant::now());
-    delay - Duration::from_nanos(draw % spread.saturating_add(1))
+    Duration::from_nanos(draw % spread.saturating_add(1))
 }
 
 /// The archives' answers to one submission.
@@ -1241,7 +1254,9 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             }
             // GLOBAL refuses it whole: its window ended before it came.
             let frame = latest_frame(self.clock_store.as_ref());
-            if let Some(frame) = frame.filter(|&frame| frame >= proof.window_end) {
+            if let Some(frame) =
+                frame.filter(|_| window_over(proof, Instant::now(), RETRY_TIMING, frame))
+            {
                 self.retry_queue
                     .tally(proof.window_end, |t| t.undelivered += 1);
                 let (member, shards, epochs) = proof.fields();
@@ -1556,7 +1571,7 @@ where
                     if reason.contains("rank buffer full") {
                         delivery.room += 1;
                         if let Some(resting) = resting {
-                            let rest = jittered(resting.rest);
+                            let rest = jittered_up(resting.rest);
                             let now = Instant::now();
                             resting
                                 .rests
@@ -1856,7 +1871,7 @@ mod tests {
         asks_for_retry, combine_publish_outcome, describe_bundle, fan_out_resting,
         fan_out_to_archives, refusal_reason, refusals, retryable, run_retries, submit_to_archives,
         submit_to_archives_with, ArchiveRefusals, ArchiveRests, Delivery, Resting, RetryTiming,
-        StorageProofSubmission, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY,
+        StorageProofSubmission, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY, RETRY_TIMING,
     };
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3061,6 +3076,129 @@ mod tests {
             "room_rest: queued proofs went to the resting archive at each round"
         );
         assert_eq!(queue.len(), 3, "all still queued");
+    }
+
+    /// An archive refusing a proof for room rests at least two GLOBAL
+    /// frames at mainnet's pace (`RETRY_TIMING.room_rest`, 40 s), and
+    /// jitter adds up to half: never less.
+    #[tokio::test]
+    async fn a_room_rest_lasts_at_least_two_frames() {
+        let rests = ArchiveRests::default();
+        let submit = |addr: String, _bytes: Vec<u8>| async move {
+            Err((
+                addr,
+                "message collector rejected: rank buffer full".to_string(),
+                true,
+            ))
+        };
+        let archives: Vec<String> = (0..8).map(|n| format!("full-{n}")).collect();
+        let resting = Resting {
+            rests: &rests,
+            window_end: 100,
+            rest: RETRY_TIMING.room_rest,
+        };
+        let before = Instant::now();
+        let delivery =
+            fan_out_resting(archives.clone(), vec![1], submit, true, Some(resting)).await;
+        let sent = before.elapsed();
+        assert_eq!(delivery.room, 8, "each archive refused for room");
+        let lefts: Vec<Duration> = archives
+            .iter()
+            .map(|addr| rests.rests(addr, 100, before).expect("each archive rests"))
+            .collect();
+        eprintln!("REACH room rest lengths={lefts:?}");
+        let (least, most) = (Duration::from_secs(40), Duration::from_secs(60) + sent);
+        assert!(
+            lefts.iter().all(|left| *left >= least),
+            "room_jitter: a rest shorter than two GLOBAL frames: {lefts:?}"
+        );
+        assert!(
+            lefts.iter().all(|left| *left <= most),
+            "a rest longer than 60 s: {lefts:?}"
+        );
+    }
+
+    /// A queued proof refused for room by the only archive goes to it
+    /// again once the archive's rest ends, and is delivered then, not
+    /// before.
+    #[tokio::test]
+    async fn a_queued_proof_goes_again_once_its_rest_ends() {
+        let timing = RetryTiming {
+            room_rest: Duration::from_millis(50),
+            ..FAST
+        };
+        let queue = Arc::new(SubmitRetryQueue::default());
+        queue.push(storage_proof_bundle(1, &[(1, 1335, false, true)], 64));
+        let sends = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+        let (sends_in, rounds_in, queue_in) = (sends.clone(), rounds.clone(), queue.clone());
+        let task = tokio::spawn(run_retries(
+            queue.clone(),
+            timing,
+            move |bytes| {
+                let (sends_in, queue_in) = (sends_in.clone(), queue_in.clone());
+                rounds_in.lock().unwrap().push(Instant::now());
+                let window_end = StorageProofSubmission::of(&bytes).unwrap().window_end;
+                async move {
+                    let submit = move |addr: String, _bytes: Vec<u8>| {
+                        let first = {
+                            let mut sends = sends_in.lock().unwrap();
+                            sends.push(Instant::now());
+                            sends.len() == 1
+                        };
+                        async move {
+                            if first {
+                                Err((
+                                    addr,
+                                    "message collector rejected: rank buffer full".to_string(),
+                                    true,
+                                ))
+                            } else {
+                                Ok(addr)
+                            }
+                        }
+                    };
+                    let resting = Resting {
+                        rests: &queue_in.rests,
+                        window_end,
+                        rest: timing.room_rest,
+                    };
+                    fan_out_resting(vec!["full".into()], bytes, submit, true, Some(resting)).await
+                }
+            },
+            || None,
+        ));
+        // Progress: the proof delivered, or 20 rounds after the longest
+        // rest (with jitter) ended.
+        let longest = timing.room_rest + timing.room_rest / 2;
+        let rounds_past_rest = || {
+            let first = sends.lock().unwrap().first().copied();
+            first.map_or(0, |first| {
+                let rounds = rounds.lock().unwrap();
+                rounds.iter().filter(|at| **at > first + longest).count()
+            })
+        };
+        let guard = Instant::now();
+        while queue.len() > 0
+            && rounds_past_rest() < 20
+            && guard.elapsed() < Duration::from_secs(30)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        task.abort();
+        let sends = sends.lock().unwrap().clone();
+        let rounds = rounds.lock().unwrap().len();
+        eprintln!("REACH rest end sends={} rounds={rounds}", sends.len());
+        assert_eq!(
+            sends.len(),
+            2,
+            "rest_ends: the queued proof did not go again once its rest ended ({rounds} rounds)"
+        );
+        assert!(
+            sends[1] - sends[0] >= timing.room_rest,
+            "sent again before its rest ended"
+        );
+        assert_eq!(queue.len(), 0, "delivered once sent again");
     }
 
     /// A proof handed over once its window ended is not sent: GLOBAL

@@ -1146,10 +1146,7 @@ fn reuse_settlement_proof(seats: &[PreparedSeat]) -> Option<(Arc<Vec<u8>>, u32)>
 /// proof made of them before ([`reuse_settlement_proof`]). False when there
 /// is none, or a window has closed (the proving path drops it and logs why).
 fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
-    if seats
-        .iter()
-        .any(|seat| crate::storage_snapshot::settlement_closed(seat.part.epoch, 0))
-    {
+    if seats.iter().any(window_closed) {
         return false;
     }
     let Some((bytes, resends)) = reuse_settlement_proof(seats) else {
@@ -1227,12 +1224,19 @@ fn note_published_alone(key: SettlementKey) {
     }
 }
 
-/// Whether `seat`'s window has closed in this node's view of GLOBAL: its
-/// settlement's (`storage_seat::settlement_window`) and its seal's, which
-/// ends as the epoch it seals begins, at the same frame
-/// (`storage_epoch_proof::check`). GLOBAL refuses either half from then.
+/// Whether the window of a seat's part for `epoch` has closed at `frame`
+/// or this node's later view of GLOBAL: its settlement's
+/// (`storage_seat::settlement_window`) and its seal's, which ends as the
+/// epoch it seals begins, at the same frame (`storage_epoch_proof::check`).
+/// GLOBAL refuses either half from then. The one rule for every part:
+/// queued, batched or sent again.
+pub(crate) fn epoch_window_closed(epoch: u64, frame: u64) -> bool {
+    crate::storage_snapshot::settlement_closed(epoch, frame)
+}
+
+/// Whether `seat`'s window has closed ([`epoch_window_closed`]).
 fn window_closed(seat: &PreparedSeat) -> bool {
-    crate::storage_snapshot::settlement_closed(seat.part.epoch, 0)
+    epoch_window_closed(seat.part.epoch, 0)
 }
 
 /// Why a seat left a proof before it went out ([`batch_to_send`]).
