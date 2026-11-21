@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use commonware_consensus::simplex::{elector::RoundRobin, Config, Engine, Floor, ForwardingPolicy};
+use commonware_consensus::simplex::{
+    elector::RoundRobin, CertificateFanout, Config, Engine, Floor, ForwardingPolicy,
+};
 use commonware_consensus::types::{Epoch, View, ViewDelta};
 use commonware_cryptography::Sha256;
 use commonware_p2p::Blocker;
@@ -62,6 +64,10 @@ pub struct GlobalEngineParams {
     /// Keeps finalize votes that come after a view's certificate, for the
     /// copy an application shard publishes to GLOBAL.
     pub late_finalizes: Option<Arc<crate::late_finalize::LateFinalizes>>,
+    /// The transport relays every copy a member sends to every member (an
+    /// application shard's gossip), set by [`Self::with_relaying_transport`];
+    /// see [`Self::certificate_fanout`].
+    relaying_transport: bool,
 }
 
 /// Which certified parents a leader can build on, in view numbers: the
@@ -119,7 +125,27 @@ impl GlobalEngineParams {
             parent_fallback: None,
             thread_tag: None,
             late_finalizes: None,
+            relaying_transport: false,
         }
+    }
+
+    /// The engine's transport relays every copy to every member (an
+    /// application shard's gossip), so certificates may go out from `f+1`
+    /// members ([`Self::certificate_fanout`]).
+    pub fn with_relaying_transport(mut self) -> Self {
+        self.relaying_transport = true;
+        self
+    }
+
+    /// The engine's `certificate_fanout`: a view's certificate goes out from
+    /// `max(f+1, 2)` members at once, with deferred copies after half of
+    /// `fetch_timeout`, only over a relaying transport. A deferred member
+    /// stops once `f+1` copies reached it, which proves nothing about the
+    /// members it would have reached over direct delivery (GLOBAL's `:8340`),
+    /// so there every member sends, as upstream.
+    pub fn certificate_fanout(&self) -> Option<CertificateFanout> {
+        self.relaying_transport
+            .then(|| CertificateFanout::from_fetch_timeout(self.fetch_timeout))
     }
 
     /// Override the leader timeout (seconds). Certification timeout is kept at
@@ -200,6 +226,7 @@ where
         .with_liveness(params.liveness.clone())
         .with_late_finalizes(params.late_finalizes.clone());
     let parent_fallback = params.parent_fallback.clone();
+    let certificate_fanout = params.certificate_fanout();
 
     let cfg = Config {
         scheme,
@@ -220,6 +247,7 @@ where
         certification_timeout: params.certification_timeout,
         timeout_retry: params.timeout_retry,
         fetch_timeout: params.fetch_timeout,
+        certificate_fanout,
         activity_timeout: ViewDelta::new(params.activity_timeout),
         skip_timeout: ViewDelta::new(params.skip_timeout),
         fetch_concurrent: NZUsize!(4),
@@ -616,6 +644,28 @@ fn remove_torn_blobs(dir: &std::path::Path) -> usize {
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod certificate_fanout_tests {
+    use super::*;
+
+    #[test]
+    fn certificates_fan_out_from_f_plus_one_only_over_a_relaying_transport() {
+        let digest = crate::adapters::digest_from_identity([0; 32]);
+        let direct = GlobalEngineParams::new("fanout", 1, digest);
+        let none = direct.certificate_fanout();
+        assert_eq!(none, None, "direct delivery: every member sends");
+        let fetch = Duration::from_secs(4);
+        let mut relayed = direct.with_relaying_transport();
+        relayed.fetch_timeout = fetch;
+        let waits = Some(CertificateFanout::from_fetch_timeout(fetch));
+        assert_eq!(
+            relayed.certificate_fanout(),
+            waits,
+            "a relaying transport fans out from f+1, waiting from fetch_timeout"
+        );
+    }
 }
 
 #[cfg(test)]

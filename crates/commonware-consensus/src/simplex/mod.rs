@@ -351,6 +351,8 @@ cfg_if::cfg_if! {
         use commonware_p2p::Recipients;
 
         mod actors;
+        // QUILIBRIUM: f+1 certificate broadcasters (`Config::certificate_fanout`).
+        pub use actors::fanout::Timing as CertificateFanout;
         pub mod config;
         pub use config::{Config, Floor, ForwardingPolicy, ParentFallback};
         mod engine;
@@ -912,6 +914,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -1161,6 +1164,7 @@ mod tests {
                         PAGE_CACHE_SIZE,
                     ),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(validator_context.child("engine"), cfg);
                 let (pending, recovered, resolver) =
@@ -1264,6 +1268,7 @@ mod tests {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&joiner_context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(joiner_context.child("engine"), cfg);
             let (pending, recovered, resolver) = register_validator(&mut oracle, joiner).await;
@@ -1399,6 +1404,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
                 let (pending, recovered, resolver) = registrations
@@ -1561,6 +1567,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -1715,6 +1722,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
 
@@ -1891,6 +1899,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2013,6 +2022,7 @@ mod tests {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2142,6 +2152,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2369,6 +2380,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2529,6 +2541,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2722,6 +2735,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -2910,6 +2924,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -3106,6 +3121,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engine.start(pending, recovered, resolver);
@@ -3275,6 +3291,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
                 let (pending, recovered, resolver) = registrations
@@ -3329,6 +3346,588 @@ mod tests {
     }
 
     test_for_all_fixtures!(invalid, seeds = 5);
+
+    /// QUILIBRIUM: certificate sends of every validator, summed per kind
+    /// `[notarization, nullification, finalization]` from the voters'
+    /// outbound counters (entry and floor re-sends included).
+    fn certificate_sends(encoded: &str) -> [u64; 3] {
+        let mut sends = [0; 3];
+        for line in encoded
+            .lines()
+            .filter(|line| line.contains("outbound_messages"))
+        {
+            let lower = line.to_lowercase();
+            let kind = if lower.contains("message=\"notarization\"") {
+                0
+            } else if lower.contains("message=\"nullification\"") {
+                1
+            } else if lower.contains("message=\"finalization\"") {
+                2
+            } else {
+                continue;
+            };
+            if let Some(value) = line
+                .split_whitespace()
+                .last()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                sends[kind] += value;
+            }
+        }
+        sends
+    }
+
+    /// QUILIBRIUM: deferred certificate sends of every validator, from the
+    /// voters' `deferred_certificate_sends` counters.
+    fn deferred_sends(encoded: &str) -> u64 {
+        encoded
+            .lines()
+            .filter(|line| line.contains("deferred_certificate_sends") && !line.starts_with('#'))
+            .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
+            .sum()
+    }
+
+    /// QUILIBRIUM: the largest `certificate_fanout_tracked` gauge of any
+    /// validator (actors/fanout.rs `Fanout::tracked`), with its line.
+    fn fanout_tracked(encoded: &str) -> Option<(u64, String)> {
+        encoded
+            .lines()
+            .filter(|line| line.contains("certificate_fanout_tracked") && !line.starts_with('#'))
+            .filter_map(|line| {
+                let value = line.split_whitespace().last()?.parse::<u64>().ok()?;
+                Some((value, line.to_string()))
+            })
+            .max_by_key(|(value, _)| *value)
+    }
+
+    /// QUILIBRIUM: views past `activity_timeout` a validator of a
+    /// [`certificate_fanout`] run may hold fan-out entries for: its view
+    /// runs ahead of its last finalized one (nullified views, a future
+    /// certificate). The voter prunes the rest (voter/actor.rs
+    /// `prune_views`); without that, entries grow by about two per view.
+    const FANOUT_TRACKED_MARGIN: u64 = 5;
+
+    /// QUILIBRIUM: how often a [`certificate_fanout`] run samples the
+    /// validators' `certificate_fanout_tracked` gauges.
+    const FANOUT_TRACKED_EVERY: Duration = Duration::from_millis(100);
+
+    /// QUILIBRIUM: the epoch of [`certificate_fanout`]'s runs; with
+    /// `RoundRobin`, view `v`'s leader is participant `(333 + v) mod n`.
+    const FANOUT_EPOCH: u64 = 333;
+
+    /// QUILIBRIUM: the `fetch_timeout` of [`certificate_fanout`]'s runs,
+    /// which derives every deferred wait (actors/fanout.rs
+    /// `Timing::from_fetch_timeout`; the longest is `Timing::latest`, one
+    /// step under it). The run waits this long after every validator
+    /// finalized before reading the counters, so every deferral staged by
+    /// then is due.
+    const FANOUT_FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// QUILIBRIUM: the view every validator of a [`certificate_fanout`] run
+    /// finalizes before its `aborted` members stop.
+    const FANOUT_ABORT_AFTER: u64 = 4;
+
+    /// QUILIBRIUM: the views after [`FANOUT_ABORT_AFTER`] whose sends a
+    /// [`certificate_fanout`] run with `aborted` members checks. Each aborted
+    /// member voted for one of the views from `FANOUT_ABORT_AFTER - 1` on, so
+    /// it stays heard (`Timing::heard_views`, 20) through all of them.
+    const FANOUT_ABORT_WINDOW: u64 = 18;
+
+    /// QUILIBRIUM: what a [`certificate_fanout`] run counted.
+    struct FanoutRun {
+        /// Deferred certificates sent (the voters' counters).
+        deferred: u64,
+        /// The highest view any running validator certified.
+        views: u64,
+        /// Certificates of the views in [`FANOUT_ABORT_WINDOW`] sent by a
+        /// member outside the view's selected set.
+        fallback: u64,
+    }
+
+    /// QUILIBRIUM: `n` validators under `seed`, with
+    /// `Config::certificate_fanout` set; `down` of them, from participant
+    /// `down_from` on (wrapping), never started. Every started validator
+    /// finalizes view `views` and holds a certificate of every view up to the
+    /// lowest finalized height among them; each view's certificates go out
+    /// about `max(f+1, 2)` times in total (actors/fanout.rs), not once per
+    /// member. Down members are never heard voting, so they rank after every
+    /// heard member and are not selected.
+    ///
+    /// With `aborted` set (and `down` 0), that many members stop once every
+    /// validator finalized [`FANOUT_ABORT_AFTER`]: those after the leader in
+    /// the next view's selected set, so its slots go to fallbacks while they
+    /// stay heard. Through [`FANOUT_ABORT_WINDOW`], each view's certificates
+    /// of each kind come from at most as many members outside its selected
+    /// set as aborted members inside it.
+    ///
+    /// Through the run, no validator holds fan-out entries for more than
+    /// `activity_timeout` plus [`FANOUT_TRACKED_MARGIN`] views, three kinds
+    /// each.
+    ///
+    /// Counts once every deferral staged before the last validator finalized
+    /// is due.
+    fn certificate_fanout<S, F, L>(
+        mut fixture: F,
+        seed: u64,
+        n: u32,
+        down_from: u32,
+        down: u32,
+        aborted: u32,
+        views: u64,
+    ) -> FanoutRun
+    where
+        S: Scheme<Sha256Digest, PublicKey = PublicKey>,
+        F: FnMut(&mut deterministic::Context, &[u8], u32) -> Fixture<S>,
+        L: Elector<S>,
+    {
+        let f = n - quorum(n);
+        let broadcasters = u64::from((f + 1).max(2).min(n));
+        let is_down = |idx: usize| (idx as u32 + n - down_from % n) % n < down;
+        // The members `fallback_rank` selects for `view` while every member
+        // is heard: `broadcasters` in participant order from its leader.
+        let selected = |view: u64| -> HashSet<u32> {
+            (0..broadcasters)
+                .map(|i| ((FANOUT_EPOCH + view + i) % u64::from(n)) as u32)
+                .collect()
+        };
+        let stopping: Vec<u32> = (1..=u64::from(aborted))
+            .map(|i| ((FANOUT_EPOCH + FANOUT_ABORT_AFTER + 1 + i) % u64::from(n)) as u32)
+            .collect();
+        assert!(
+            aborted == 0
+                || (down == 0
+                    && u64::from(aborted) < broadcasters
+                    && views > FANOUT_ABORT_AFTER + FANOUT_ABORT_WINDOW),
+            "aborted members need every member started, a live selected member per view \
+             and every view of the window run"
+        );
+        let required_containers = View::new(views);
+        let activity_timeout = ViewDelta::new(10);
+        let skip_timeout = ViewDelta::new(5);
+        let namespace = b"consensus".to_vec();
+        let executor = deterministic::Runner::new(
+            deterministic::Config::new()
+                .with_seed(seed)
+                .with_timeout(Some(Duration::from_secs(600))),
+        );
+        executor.start(|mut context| async move {
+            let Fixture {
+                participants,
+                schemes,
+                ..
+            } = fixture(&mut context, &namespace, n);
+            let mut oracle =
+                start_test_network_with_peers(context.child("network"), participants.clone(), true)
+                    .await;
+            let mut registrations = register_validators(&mut oracle, &participants).await;
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            link_validators(&mut oracle, &participants, Action::Link(link), None).await;
+
+            let elector = L::default();
+            let relay = Arc::new(mocks::relay::Relay::new());
+            // Senders of each (view, kind `[notarization, nullification,
+            // finalization]`) certificate, and the highest view each member
+            // sent a vote for, as the members put them on the network.
+            let sent = Arc::new(Mutex::new(HashMap::<(u64, usize), HashSet<u32>>::new()));
+            let voted = Arc::new(Mutex::new(HashMap::<u32, u64>::new()));
+            let mut reporters = Vec::new();
+            let mut started = Vec::new();
+            let mut engines = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                if is_down(idx) {
+                    continue;
+                }
+                started.push(idx as u32);
+                let context = context
+                    .child("validator")
+                    .with_attribute("public_key", validator);
+                let reporter_config = mocks::reporter::Config {
+                    participants: participants.clone().try_into().unwrap(),
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                };
+                let reporter =
+                    mocks::reporter::Reporter::new(context.child("reporter"), reporter_config);
+                reporters.push(reporter.clone());
+                let application_cfg = mocks::application::Config {
+                    hasher: Sha256::default(),
+                    relay: relay.clone(),
+                    me: validator.clone(),
+                    propose_latency: (10.0, 5.0),
+                    verify_latency: (10.0, 5.0),
+                    certify_latency: (10.0, 5.0),
+                    should_certify: mocks::application::Certifier::Always,
+                };
+                let (actor, application) = mocks::application::Application::new(
+                    context.child("application"),
+                    application_cfg,
+                );
+                actor.start();
+                let cfg = config::Config {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker: oracle.control(validator.clone()),
+                    automaton: application.clone(),
+                    relay: application.clone(),
+                    reporter: reporter.clone(),
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(FANOUT_EPOCH),
+                    floor: config::Floor::Genesis(mocks::application::genesis::<Sha256>(
+                        Epoch::new(FANOUT_EPOCH),
+                    )),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: FANOUT_FETCH_TIMEOUT,
+                    activity_timeout,
+                    skip_timeout,
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    write_buffer: NZUsize!(1024 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                    forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: Some(CertificateFanout::from_fetch_timeout(
+                        FANOUT_FETCH_TIMEOUT,
+                    )),
+                };
+                let engine = Engine::new(context.child("engine"), cfg);
+                let (
+                    (vote_sender, vote_receiver),
+                    (certificate_sender, certificate_receiver),
+                    resolver,
+                ) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                let member = idx as u32;
+                let votes = voted.clone();
+                let (vote_sender, _) = vote_sender.split_with(
+                    move |_: SplitOrigin, recipients: &Recipients<_>, message: &IoBuf| {
+                        let vote: Vote<S, Sha256Digest> = Vote::decode(message.clone()).unwrap();
+                        let view = vote.view().get();
+                        let mut votes = votes.lock();
+                        let last = votes.entry(member).or_insert(view);
+                        *last = (*last).max(view);
+                        Some(recipients.clone())
+                    },
+                );
+                let codec = schemes[idx].certificate_codec_config();
+                let certificates = sent.clone();
+                let (certificate_sender, _) = certificate_sender.split_with(
+                    move |_: SplitOrigin, recipients: &Recipients<_>, message: &IoBuf| {
+                        let certificate: Certificate<S, Sha256Digest> =
+                            Certificate::decode_cfg(&mut message.as_ref(), &codec).unwrap();
+                        let kind = match &certificate {
+                            Certificate::Notarization(_) => 0,
+                            Certificate::Nullification(_) => 1,
+                            Certificate::Finalization(_) => 2,
+                        };
+                        certificates
+                            .lock()
+                            .entry((certificate.view().get(), kind))
+                            .or_default()
+                            .insert(member);
+                        Some(recipients.clone())
+                    },
+                );
+                engines.push(engine.start(
+                    (vote_sender, vote_receiver),
+                    (certificate_sender, certificate_receiver),
+                    resolver,
+                ));
+            }
+
+            // The largest fan-out entry gauge of any validator through the
+            // run (sampled; each voter sets its gauge as it stages, sends a
+            // deferral or prunes).
+            let tracked = Arc::new(Mutex::new(None::<(u64, String)>));
+            let sampler = context.child("tracked").spawn({
+                let tracked = tracked.clone();
+                move |context| async move {
+                    loop {
+                        context.sleep(FANOUT_TRACKED_EVERY).await;
+                        let sample = fanout_tracked(&context.encode());
+                        let mut tracked = tracked.lock();
+                        if sample.as_ref().map(|(value, _)| *value)
+                            > tracked.as_ref().map(|(value, _)| *value)
+                        {
+                            *tracked = sample;
+                        }
+                    }
+                }
+            });
+
+            // Every started validator finalizes. With `aborted`, every one
+            // first finalizes `FANOUT_ABORT_AFTER`; then the aborted members,
+            // each heard voting (sent a vote) from the view before it on,
+            // stop.
+            let abort_at = (aborted > 0).then_some(View::new(FANOUT_ABORT_AFTER));
+            for target in abort_at.into_iter().chain([required_containers]) {
+                let mut finalizers = Vec::new();
+                for reporter in reporters.iter_mut() {
+                    let (mut latest, mut monitor) = reporter.subscribe().await;
+                    finalizers.push(context.child("finalizer").spawn(move |_| async move {
+                        while latest < target {
+                            latest = monitor.recv().await.expect("event missing");
+                        }
+                    }));
+                }
+                join_all(finalizers).await;
+                if Some(target) != abort_at {
+                    continue;
+                }
+                for member in &stopping {
+                    let last = voted.lock().get(member).copied();
+                    assert!(
+                        last.is_some_and(|last| last + 1 >= FANOUT_ABORT_AFTER),
+                        "seed={seed} n={n}: member {member} to abort last voted for view \
+                         {last:?}, before view {}",
+                        FANOUT_ABORT_AFTER - 1
+                    );
+                    let at = started
+                        .iter()
+                        .position(|idx| idx == member)
+                        .expect("a started member");
+                    started.remove(at);
+                    reporters.remove(at);
+                    let engine = engines.remove(at);
+                    engine.abort();
+                    let _ = engine.await;
+                }
+            }
+            for reporter in reporters.iter() {
+                reporter.assert_no_faults();
+                reporter.assert_no_invalid();
+            }
+
+            // A deferral goes out at most `FANOUT_FETCH_TIMEOUT` after it was
+            // staged: wait that long so every one staged by now is counted.
+            context.sleep(FANOUT_FETCH_TIMEOUT).await;
+
+            // Fan-out entries stayed within the active views: the voter
+            // pruned them as views finalized.
+            sampler.abort();
+            let tracked_limit = 3 * (activity_timeout.get() + FANOUT_TRACKED_MARGIN);
+            let (most_tracked, line) = tracked.lock().clone().unwrap_or_else(|| {
+                panic!("seed={seed} n={n}: no certificate_fanout_tracked gauge sampled")
+            });
+            assert!(
+                most_tracked > 0,
+                "seed={seed} n={n}: no fan-out entry tracked: {line}"
+            );
+            assert!(
+                most_tracked <= tracked_limit,
+                "seed={seed} n={n}: tracked fan-out entries {most_tracked} over {tracked_limit}: \
+                 {line}"
+            );
+
+            // Through the window, each view's certificates of each kind came
+            // from at most as many members outside its selected set as there
+            // are aborted members inside it: one fallback per silent slot.
+            let mut fallback = 0;
+            if aborted > 0 {
+                let sent = sent.lock();
+                let window = FANOUT_ABORT_AFTER + 1..=FANOUT_ABORT_AFTER + FANOUT_ABORT_WINDOW;
+                for view in window {
+                    let selected = selected(view);
+                    let silent = stopping
+                        .iter()
+                        .filter(|member| selected.contains(member))
+                        .count();
+                    for kind in 0..3 {
+                        let mut outside: Vec<u32> = sent
+                            .get(&(view, kind))
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|sender| !selected.contains(sender))
+                            .collect();
+                        outside.sort_unstable();
+                        assert!(
+                            outside.len() <= silent,
+                            "seed={seed} n={n} aborted={aborted}: fallback senders {outside:?} \
+                             of view {view} kind {kind} (notarization, nullification, \
+                             finalization) over the {silent} aborted of its selected set"
+                        );
+                        fallback += outside.len() as u64;
+                    }
+                }
+            }
+
+            // Every certificate a validator sent is counted when sent; views
+            // up to the highest one any validator saw bound them.
+            let sends = certificate_sends(&context.encode());
+            let views = reporters
+                .iter()
+                .filter_map(|reporter| {
+                    let notarizations = reporter.notarizations.lock();
+                    let nullifications = reporter.nullifications.lock();
+                    let top = notarizations.keys().max().copied();
+                    let top_nullified = nullifications.keys().max().copied();
+                    top.max(top_nullified)
+                })
+                .max()
+                .expect("a certified view")
+                .get();
+            let per_view = broadcasters;
+            let limit = per_view * (views + 1);
+            assert!(
+                sends[0] + sends[1] <= limit && sends[2] <= limit,
+                "seed={seed} n={n} down={down}: sends {sends:?} over {views} views, \
+                 limit {per_view} per view per kind (upstream: {n})"
+            );
+
+            // Every started validator holds a certificate of every view up to
+            // the lowest finalized height among them.
+            let height = reporters
+                .iter()
+                .map(|reporter| {
+                    let finalizations = reporter.finalizations.lock();
+                    finalizations.keys().max().copied().unwrap_or(View::zero())
+                })
+                .min()
+                .expect("a started validator")
+                .get();
+            for (idx, reporter) in started.iter().zip(reporters.iter()) {
+                let notarizations = reporter.notarizations.lock();
+                let nullifications = reporter.nullifications.lock();
+                let finalizations = reporter.finalizations.lock();
+                for view in (1..=height).map(View::new) {
+                    assert!(
+                        notarizations.contains_key(&view)
+                            || nullifications.contains_key(&view)
+                            || finalizations.contains_key(&view),
+                        "seed={seed} n={n} down={down}: started validator {idx} holds no \
+                         certificate of view {view} (height {height})"
+                    );
+                }
+            }
+            FanoutRun {
+                deferred: deferred_sends(&context.encode()),
+                views,
+                fallback,
+            }
+        })
+    }
+
+    // QUILIBRIUM: one test per seed, `<name>_seed_0` to `_seed_4`, so
+    // nextest runs the seeds of a `certificate_fanout` test in parallel.
+    macro_rules! fanout_seeds {
+        ($name:ident, |$seed:ident| $body:block) => {
+            fanout_seeds!(@seed $name, $seed, $body, 0);
+            fanout_seeds!(@seed $name, $seed, $body, 1);
+            fanout_seeds!(@seed $name, $seed, $body, 2);
+            fanout_seeds!(@seed $name, $seed, $body, 3);
+            fanout_seeds!(@seed $name, $seed, $body, 4);
+        };
+        (@seed $name:ident, $seed:ident, $body:block, $n:literal) => {
+            paste::paste! {
+                #[test_group("slow")]
+                #[test_traced]
+                fn [<$name _seed_ $n>]() {
+                    let $seed: u64 = $n;
+                    $body
+                }
+            }
+        };
+    }
+
+    // QUILIBRIUM: fails on upstream fan-out, where every one of the `n`
+    // members sends each certificate it holds.
+    fanout_seeds!(
+        test_certificate_sends_per_view_at_most_f_plus_one_all_honest,
+        |seed| {
+            for n in [7, 15] {
+                certificate_fanout::<_, _, RoundRobin>(ed25519::fixture, seed, n, 0, 0, 0, 40);
+            }
+        }
+    );
+
+    // QUILIBRIUM: up to `f` members down, never started. They are never
+    // heard voting, so the rotation passes over them: each view still has
+    // `f+1` live selected members, no fallback replaces a down one, and
+    // every started validator finalizes and holds every view's certificate.
+    // Sends stay within `max(f+1, 2)` per view and kind, under the `n - f`
+    // started members of upstream fan-out.
+    fanout_seeds!(
+        test_certificate_fanout_survives_f_selected_crashed,
+        |seed| {
+            for n in [7, 15] {
+                let f = n - quorum(n);
+                certificate_fanout::<_, _, RoundRobin>(ed25519::fixture, seed, n, 0, f, 0, 40);
+            }
+        }
+    );
+
+    // QUILIBRIUM: on mainnet, 5-6 members of a 34-35 member committee sent
+    // no vote and no certificate for hours. They are ranked after every
+    // member heard voting, so their slots cost no fallback: under 5% of
+    // views see a deferred send, and every started validator still holds
+    // every view's certificate. The silent members are the last six of the
+    // `f+1` that view 1's rotation selects; without the heard filter they
+    // stay selected in each of the 6 views run, so every view would see
+    // deferred sends. 6 views keep a run of 35 members near 100 s; over so
+    // few views one deferred send fails it.
+    fanout_seeds!(test_certificate_fanout_skips_silent_members, |seed| {
+        let (n, silent) = (35, 6);
+        let selected = (n - quorum(n) + 1).max(2);
+        let leader = ((FANOUT_EPOCH + 1) % u64::from(n)) as u32;
+        let down_from = (leader + selected - silent) % n;
+        let FanoutRun {
+            deferred, views, ..
+        } = certificate_fanout::<_, _, RoundRobin>(
+            ed25519::fixture,
+            seed,
+            n,
+            down_from,
+            silent,
+            0,
+            6,
+        );
+        assert!(
+            deferred * 20 < views,
+            "seed={seed} n={n} silent={silent}: {deferred} deferred sends over {views} views \
+             (limit 5%)"
+        );
+    });
+
+    // QUILIBRIUM: the `f` members after the leader in the selected set of
+    // view `FANOUT_ABORT_AFTER + 1` stop after voting, while still heard: the
+    // rotation keeps them selected for the 20 views they stay heard, so their
+    // slots fall to deferred members. Deferred certificates go out, from at
+    // most one fallback per aborted selected member in each view and kind
+    // (each view has `f` aborted selected members at most), and every running
+    // validator finalizes. Certificates can also be built from votes, so
+    // holding them shows liveness, not delivery.
+    fanout_seeds!(
+        test_certificate_fanout_falls_back_for_f_heard_crashed,
+        |seed| {
+            for n in [7, 15] {
+                let f = n - quorum(n);
+                let run = certificate_fanout::<_, _, RoundRobin>(
+                    ed25519::fixture,
+                    seed,
+                    n,
+                    0,
+                    0,
+                    f,
+                    FANOUT_ABORT_AFTER + FANOUT_ABORT_WINDOW + 6,
+                );
+                assert!(
+                    run.deferred > 0 && run.fallback > 0,
+                    "seed={seed} n={n} aborted={f}: no deferred send: counter {}, \
+                     fallback senders in the window {}",
+                    run.deferred,
+                    run.fallback
+                );
+            }
+        }
+    );
 
     // Test that when a node receives finalizations, it reports them.
     fn received_certificates_are_reported<S, F, L>(mut fixture: F)
@@ -3440,6 +4039,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
                 let (pending, recovered, resolver) = registrations
@@ -3627,6 +4227,7 @@ mod tests {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(context.child("engine"), cfg);
             engine.start(pending, recovered, resolver);
@@ -3749,6 +4350,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engine.start(pending, recovered, resolver);
@@ -3903,6 +4505,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engines.push(engine.start(pending, recovered, resolver));
@@ -3997,6 +4600,7 @@ mod tests {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(context.child("engine"), cfg);
             engine.start(pending, recovered, resolver);
@@ -4150,6 +4754,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engine.start(pending, recovered, resolver);
@@ -4296,6 +4901,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engine.start(pending, recovered, resolver);
@@ -4459,6 +5065,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
                     engine.start(pending, recovered, resolver);
@@ -4588,6 +5195,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -4711,6 +5319,7 @@ mod tests {
                 write_buffer: NZUsize!(1024 * 16),
                 page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(context.child("engine"), cfg);
 
@@ -4887,6 +5496,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -5224,6 +5834,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(
                         context
@@ -5430,6 +6041,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -5576,6 +6188,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
 
@@ -5678,6 +6291,7 @@ mod tests {
                     write_buffer: NZUsize!(1024 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let engine = Engine::new(context.child("engine"), cfg);
                 engine_handlers.insert(idx, engine.start(pending, recovered, resolver));
@@ -6062,6 +6676,7 @@ mod tests {
                             write_buffer: NZUsize!(1024 * 1024),
                             page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                             forwarding: ForwardingPolicy::Disabled,
+                            certificate_fanout: None,
                         };
                         let engine = Engine::new(context.child("engine"), cfg);
                         engine_handlers.push(engine.start(
@@ -6132,6 +6747,7 @@ mod tests {
                         write_buffer: NZUsize!(1024 * 1024),
                         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                         forwarding: ForwardingPolicy::Disabled,
+                        certificate_fanout: None,
                     };
                     let engine = Engine::new(context.child("engine"), cfg);
 
@@ -6627,6 +7243,7 @@ mod tests {
                     write_buffer: NZUsize!(2 * 1024),
                     page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
                     forwarding: ForwardingPolicy::Disabled,
+                    certificate_fanout: None,
                 };
                 let mut engine = Engine::new(context.child("engine"), cfg);
                 if let Some(headroom) = hooks[idx] {

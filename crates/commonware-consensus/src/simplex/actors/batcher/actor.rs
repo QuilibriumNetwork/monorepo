@@ -71,6 +71,9 @@ where
     repeats: super::repeats::Repeats<S::PublicKey>,
     // QUILIBRIUM: where this member's finalize votes stood (race.rs).
     races: super::race::Races,
+    // QUILIBRIUM: senders of each held certificate, read by the voter
+    // (fanout.rs); `None` outside an engine.
+    copies: Option<Arc<crate::simplex::actors::fanout::Copies>>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
 
@@ -151,6 +154,7 @@ where
                 batch_size,
                 verify_latency: histogram::Timed::new(verify_latency),
                 recover_latency: histogram::Timed::new(recover_latency),
+                copies: None,
             },
             Mailbox::new(sender),
         )
@@ -163,6 +167,40 @@ where
         self.discards.partition = partition.to_string();
         self.repeats.partition = partition.to_string();
         self.races.partition = partition.to_string();
+    }
+
+    /// QUILIBRIUM: record the sender of every certificate copy this member
+    /// verified or already holds into `copies` (fanout.rs).
+    pub fn set_copies(&mut self, copies: Arc<crate::simplex::actors::fanout::Copies>) {
+        self.copies = Some(copies);
+    }
+
+    /// QUILIBRIUM: counts a copy of a certificate this member holds (fanout.rs).
+    /// A copy from this member itself never counts.
+    fn record_copy(
+        &self,
+        view: View,
+        kind: crate::simplex::actors::fanout::Kind,
+        sender: &S::PublicKey,
+    ) {
+        let Some(copies) = self.copies.as_ref() else {
+            return;
+        };
+        let participant = self.scheme.participants().index(sender);
+        if participant.is_some() && participant == self.scheme.me() {
+            return;
+        }
+        copies.record(view, kind, participant);
+    }
+
+    /// QUILIBRIUM: counts the sender of a vote as heard voting (fanout.rs).
+    fn record_vote(&self, view: View, sender: &S::PublicKey) {
+        let Some(copies) = self.copies.as_ref() else {
+            return;
+        };
+        if let Some(participant) = self.scheme.participants().index(sender) {
+            copies.record_vote(view, participant);
+        }
     }
 
     fn new_round(&self, view: View) -> Round<S, B, D, Re> {
@@ -463,6 +501,7 @@ where
 
                 // Skip certificates we already have for the view
                 let kind = message.kind();
+                let copy_kind = crate::simplex::actors::fanout::Kind::of(&message);
                 let round = work.get(&view);
                 let duplicate = round.is_some_and(|round| match &message {
                     Certificate::Notarization(_) => round.has_notarization(),
@@ -471,6 +510,9 @@ where
                 });
                 if duplicate {
                     trace!(%view, kind, "skipping duplicate certificate");
+                    // QUILIBRIUM: a copy of a held certificate still counts
+                    // its sender (fanout.rs); a faulty sender counts once.
+                    self.record_copy(view, copy_kind, &sender);
                     continue;
                 }
 
@@ -545,6 +587,9 @@ where
                     }
                 }
 
+                // QUILIBRIUM: a verified copy counts its sender (fanout.rs).
+                self.record_copy(view, copy_kind, &sender);
+
                 // Certificates are already forwarded to voter, no need for construction
                 continue;
             },
@@ -618,6 +663,9 @@ where
                         .latest_vote
                         .get_or_create_by(&sender)
                         .try_set_max(view.get());
+                    // QUILIBRIUM: certificate broadcasters are picked among
+                    // members heard voting (fanout.rs).
+                    self.record_vote(view, &sender);
 
                     // If the current leader explicitly nullifies the current view, signal
                     // the voter so it can fast-path timeout without waiting for its local

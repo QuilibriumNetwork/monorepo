@@ -5,7 +5,11 @@ use super::{
 };
 use crate::{
     simplex::{
-        actors::{batcher, resolver},
+        actors::{
+            batcher,
+            fanout::{Copies, Fanout, Kind, Summary, Timing},
+            resolver,
+        },
         elector::Config as Elector,
         metrics::{self, Outbound, TimeoutReason},
         scheme::Scheme,
@@ -27,7 +31,7 @@ use commonware_runtime::{
     buffer::paged::CacheRef,
     spawn_cell,
     telemetry::{
-        metrics::{CounterFamily, Histogram, MetricsExt as _},
+        metrics::{Counter, CounterFamily, Gauge, GaugeExt as _, Histogram, MetricsExt as _},
         traces::TracedExt as _,
     },
     BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, Storage,
@@ -35,7 +39,7 @@ use commonware_runtime::{
 use commonware_storage::journal::segmented::variable::{Config as JConfig, Journal};
 use commonware_utils::{channel::oneshot, futures::AbortablePool};
 use core::{future::Future, panic};
-use futures::{pin_mut, StreamExt};
+use futures::{future::Either, pin_mut, StreamExt};
 use rand_core::CryptoRng;
 use std::{
     num::NonZeroUsize,
@@ -162,6 +166,16 @@ pub struct Actor<
     outbound_messages: CounterFamily<Outbound>,
     notarization_latency: Histogram,
     finalization_latency: Histogram,
+    // QUILIBRIUM: deferred certificates sent at their fallback deadline
+    // (fanout.rs).
+    deferred_sends: Counter,
+    // QUILIBRIUM: `(view, kind)` entries the fan-out holds (fanout.rs
+    // `Fanout::tracked`), bounded by the active views while pruned.
+    fanout_tracked: Gauge,
+
+    // QUILIBRIUM: f+1 certificate broadcasters (fanout.rs); `None` sends
+    // every certificate at once, as upstream.
+    fanout: Option<Fanout<Certificate<S, D>>>,
 }
 
 impl<
@@ -187,6 +201,14 @@ impl<
             context.histogram("notarization_latency", "notarization latency", LATENCY);
         let finalization_latency =
             context.histogram("finalization_latency", "finalization latency", LATENCY);
+        let deferred_sends = context.counter(
+            "deferred_certificate_sends",
+            "number of deferred certificates sent at their fallback deadline",
+        );
+        let fanout_tracked = context.gauge(
+            "certificate_fanout_tracked",
+            "certificate (view, kind) entries held for fan-out (copy counts or deferrals)",
+        );
 
         // Initialize store
         let (mailbox_sender, mailbox_receiver) =
@@ -228,6 +250,10 @@ impl<
                 outbound_messages,
                 notarization_latency,
                 finalization_latency,
+                deferred_sends,
+                fanout_tracked,
+
+                fanout: None,
             },
             mailbox,
         )
@@ -248,6 +274,11 @@ impl<
         let removed = self.state.prune();
         if removed.is_empty() {
             return;
+        }
+        // QUILIBRIUM: deferred certificates and copy counts go with their views.
+        if let Some(fanout) = self.fanout.as_mut() {
+            fanout.prune(self.state.min_active());
+            let _ = self.fanout_tracked.try_set(fanout.tracked());
         }
         for view in &removed {
             debug!(
@@ -360,6 +391,86 @@ impl<
 
         // Broadcast certificate
         sender.send(Recipients::All, certificate, true);
+    }
+
+    /// QUILIBRIUM: send this view's certificates at once only as one of its
+    /// `f+1` selected members; otherwise defer them (fanout.rs). `copies` is
+    /// shared with the batcher, which counts the senders of held certificates.
+    pub fn set_fanout(
+        &mut self,
+        timing: Timing,
+        copies: Arc<Copies>,
+        participants: u32,
+        me: Option<u32>,
+    ) {
+        self.fanout = Some(Fanout::new(timing, copies, participants, me));
+    }
+
+    /// QUILIBRIUM: sends a certificate of its own view now, or defers it
+    /// (fanout.rs).
+    fn send_certificate<T: Sender>(
+        &mut self,
+        sender: &mut WrappedSender<T, Certificate<S, D>>,
+        certificate: Certificate<S, D>,
+    ) {
+        let certificate = match self.fanout.as_mut() {
+            Some(fanout) => {
+                let view = certificate.view();
+                let kind = Kind::of(&certificate);
+                let finalized = self.state.finalization(view).is_some();
+                let now = self.context.current();
+                let staged =
+                    fanout.stage(self.state.epoch(), view, kind, certificate, now, finalized);
+                let _ = self.fanout_tracked.try_set(fanout.tracked());
+                let Some(certificate) = staged else {
+                    trace!(%view, ?kind, "deferring certificate broadcast");
+                    return;
+                };
+                certificate
+            }
+            None => certificate,
+        };
+        self.broadcast_certificate(sender, certificate);
+    }
+
+    /// QUILIBRIUM: sends the deferred certificates that are due and that
+    /// `f+1` members (or a finalization) have not made redundant (fanout.rs).
+    fn send_deferred<T: Sender>(&mut self, sender: &mut WrappedSender<T, Certificate<S, D>>) {
+        let now = self.context.current();
+        let Some(fanout) = self.fanout.as_mut() else {
+            return;
+        };
+        let state = &self.state;
+        let due = fanout.due(now, |view| state.finalization(view).is_some());
+        let _ = self.fanout_tracked.try_set(fanout.tracked());
+        for certificate in due {
+            debug!(view = %certificate.view(), "broadcasting deferred certificate");
+            self.deferred_sends.inc();
+            self.broadcast_certificate(sender, certificate);
+        }
+    }
+
+    /// QUILIBRIUM: one line of fan-out counters per
+    /// [`SUMMARY_EVERY`](crate::simplex::actors::fanout::SUMMARY_EVERY).
+    fn log_fanout(&mut self) {
+        let now = self.context.current();
+        let Some(summary) = self.fanout.as_mut().and_then(|fanout| fanout.summary(now)) else {
+            return;
+        };
+        info!(
+            partition = %self.partition,
+            secs = summary.secs,
+            selected_sent = %Summary::per_kind(&summary.selected_sent),
+            deferred = %Summary::per_kind(&summary.deferred),
+            fallback_fired = %Summary::per_kind(&summary.fallback_fired),
+            fallback_cancelled = %Summary::per_kind(&summary.fallback_cancelled),
+            unknown_sender_copies = %Summary::per_kind(&summary.unknown_sender_copies),
+            silent_skipped = %Summary::per_kind(&summary.silent_skipped),
+            action = "none: fallback_fired near deferred means selected members were offline \
+                      or slow; unknown_sender_copies above zero means copies from outside the \
+                      committee; silent_skipped counts members not heard voting, ranked last",
+            "certificate fan-out (notarization/nullification/finalization)"
+        );
     }
 
     /// QUILIBRIUM: see [`State::set_parent_fallback`].
@@ -910,7 +1021,7 @@ impl<
         }
         if let Some(notarization) = staged.notarization {
             debug!(proposal=?notarization.proposal, "broadcasting notarization");
-            self.broadcast_certificate(
+            self.send_certificate(
                 certificate_sender,
                 Certificate::Notarization(notarization.clone()),
             );
@@ -938,7 +1049,7 @@ impl<
                 self.broadcast_certificate(certificate_sender, floor);
             }
             debug!(round=?nullification.round(), "broadcasting nullification");
-            self.broadcast_certificate(
+            self.send_certificate(
                 certificate_sender,
                 Certificate::Nullification(nullification.clone()),
             );
@@ -950,7 +1061,7 @@ impl<
         }
         if let Some(finalization) = staged.finalization {
             debug!(proposal=?finalization.proposal, "broadcasting finalization");
-            self.broadcast_certificate(
+            self.send_certificate(
                 certificate_sender,
                 Certificate::Finalization(finalization.clone()),
             );
@@ -1180,6 +1291,11 @@ impl<
 
                 // Wait for a timeout to fire or for a message to arrive
                 let timeout = self.state.next_timeout_deadline();
+                // QUILIBRIUM: the next deferred certificate (fanout.rs).
+                let deferred = match self.fanout.as_ref().and_then(|fanout| fanout.next_deadline()) {
+                    Some(deadline) => Either::Left(self.context.sleep_until(deadline)),
+                    None => Either::Right(futures::future::pending()),
+                };
                 let start = self.state.current_view();
                 let mut resolved = Resolved::None;
                 let mut nullify = None;
@@ -1200,6 +1316,13 @@ impl<
                 );
                 nullify = self.timeout(&mut batcher).instrument(span).await;
                 view = self.state.current_view();
+            },
+            // QUILIBRIUM: deferred certificates fall due (fanout.rs). After
+            // the view timeout, so a tie never starves it.
+            _ = deferred => {
+                self.send_deferred(&mut certificate_sender);
+                self.log_fanout();
+                continue;
             },
             (context, span, proposed) = propose_wait => {
                 // Clear propose waiter
@@ -1289,6 +1412,7 @@ impl<
                         nullify,
                         certification,
                     );
+                    self.log_fanout();
                 }
                 .instrument(span)
                 .await;

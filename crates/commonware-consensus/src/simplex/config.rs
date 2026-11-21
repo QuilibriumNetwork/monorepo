@@ -1,6 +1,7 @@
 use super::{
     elector::Config as Elector,
     types::{Activity, Context, Finalization},
+    CertificateFanout,
 };
 use crate::{
     types::{Epoch, View, ViewDelta},
@@ -195,6 +196,21 @@ where
     /// Policy for proactively forwarding certified blocks when entering the
     /// next view.
     pub forwarding: ForwardingPolicy,
+
+    /// QUILIBRIUM: f+1 certificate broadcasters. `None` keeps upstream
+    /// fan-out: every member sends each certificate it holds to every
+    /// member. `Some` lets `max(f+1, 2)` members send a view's certificate at
+    /// once and defers it on the others with these waits
+    /// ([`CertificateFanout::from_fetch_timeout`]).
+    ///
+    /// Premise: the transport relays every copy a member sends to every
+    /// member (a gossip mesh). A deferred member drops its copy once copies
+    /// from `f+1` others reached it, which says nothing about the members it
+    /// would have reached directly. Over direct delivery a member linked only
+    /// to deferred members may never get the certificate (upstream
+    /// `received_certificates_are_reported` shows it), so leave it `None`
+    /// there.
+    pub certificate_fanout: Option<CertificateFanout>,
 }
 
 impl<

@@ -1,5 +1,5 @@
 use super::{
-    actors::{batcher, resolver, voter},
+    actors::{batcher, fanout, resolver, voter},
     config::Config,
     elector::Config as Elector,
     types::{Activity, Context},
@@ -79,8 +79,21 @@ impl<
         // QUILIBRIUM: discard summaries name the session (batcher/discards.rs).
         batcher.name_discards(&cfg.partition);
 
+        // QUILIBRIUM: f+1 certificate broadcasters (actors/fanout.rs), only
+        // when the config asks for them (a relaying transport, see
+        // `Config::certificate_fanout`); else voter and batcher are upstream's.
+        // The batcher counts who sent each held certificate; the voter defers
+        // its own copy unless selected.
+        let fanout = cfg.certificate_fanout.map(|timing| {
+            let copies = Arc::new(fanout::Copies::default());
+            batcher.set_copies(copies.clone());
+            (timing, copies)
+        });
+        let fanout_participants = cfg.scheme.participants().len() as u32;
+        let fanout_me = cfg.scheme.me().map(|me| me.get());
+
         // Create voter
-        let (voter, voter_mailbox) = voter::Actor::new(
+        let (mut voter, voter_mailbox) = voter::Actor::new(
             context.child("voter"),
             voter::Config {
                 scheme: cfg.scheme.clone(),
@@ -102,6 +115,9 @@ impl<
                 page_cache: cfg.page_cache,
             },
         );
+        if let Some((timing, copies)) = fanout {
+            voter.set_fanout(timing, copies, fanout_participants, fanout_me);
+        }
 
         // Create resolver
         let (resolver, resolver_mailbox) = resolver::Actor::new(
