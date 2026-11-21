@@ -199,7 +199,7 @@ pub fn genesis_archive_successor_peers() -> Result<Vec<(String, Vec<u8>)>> {
 pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
     // Single source of truth: the P2P mainnet bootstrap list (the archives ARE
     // the DHT bootstraps). Kept here as the `:8340` archive-pool seed derives
-    // `host:8340` from these same `host:8336` multiaddrs
+    // `host:8340` from the IPv4 ones of these same `host:8336` multiaddrs
     // (`genesis_archive_static_ips`). Deduped against `quil-config` so the
     // gossip-bootstrap and archive-pool lists can never drift apart (a drift
     // that once left the pre-Falcon peer IDs in the bootstrap list while the
@@ -210,6 +210,10 @@ pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
 /// Helper: extract `(peer_id_str, ip_str)` from each genesis-archive
 /// QUIC multiaddr. Used by `main.rs` to derive the corresponding
 /// `host:8340` mTLS endpoints to seed the archive pool.
+///
+/// Only the IPv4 entries count: the archives serve `tcp/8340` over IPv4
+/// alone, so an IPv6 entry, listed for bootstrapping over IPv6, would add
+/// a pool endpoint that never answers.
 pub fn genesis_archive_static_ips() -> Vec<(String, String)> {
     let mut out = Vec::new();
     for ma in genesis_archive_static_multiaddrs() {
@@ -219,7 +223,7 @@ pub fn genesis_archive_static_ips() -> Vec<(String, String)> {
         let mut i = 0;
         while i < parts.len() {
             match parts[i] {
-                "ip4" | "ip6" if i + 1 < parts.len() => {
+                "ip4" if i + 1 < parts.len() => {
                     ip = Some(parts[i + 1].to_string());
                     i += 2;
                 }

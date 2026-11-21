@@ -201,7 +201,8 @@ impl Default for P2PConfig {
 /// IPv6-only node bootstraps too. A node dials a peer's entries over the
 /// listened family first; the other family only after that dial fails
 /// (a 5 s handshake wait), and a configured peer listed twice stays one
-/// AutoNAT server and one archive.
+/// AutoNAT server and one archive. The archive pool takes the IPv4
+/// entries alone: the archives serve `tcp/8340` over IPv4 only.
 ///
 /// A decommissioned archive leaves this list but stays in the genesis
 /// `archive_peers` (see [`DECOMMISSIONED_GENESIS_ARCHIVES`]).
