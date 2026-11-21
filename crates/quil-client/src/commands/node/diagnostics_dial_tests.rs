@@ -570,11 +570,11 @@ async fn refuses_a_listener_with_another_peer_id() {
 
 #[tokio::test]
 async fn a_closed_port_is_refused() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A bound socket that never listens: a dial is refused, and no other
+    // socket can take the port while the test dials it.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = closed.local_addr().unwrap().port();
     let failure = dial_text(&format!("/ip4/127.0.0.1/tcp/{port}"), None, 5)
         .await
         .unwrap_err();

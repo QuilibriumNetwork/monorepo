@@ -1905,12 +1905,11 @@ mod tests {
     /// what to do, not only as a transport error.
     #[tokio::test]
     async fn an_unreachable_node_is_named_with_its_source_and_the_fix() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!(
-            "/ip4/127.0.0.1/tcp/{}",
-            listener.local_addr().unwrap().port()
-        );
-        drop(listener);
+        // A bound socket that never listens: a dial is refused, and no other
+        // socket can take the port while the test dials it.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = format!("/ip4/127.0.0.1/tcp/{}", closed.local_addr().unwrap().port());
         let config_dir = PathBuf::from("old-node").join(".config");
         let node = ReadNode {
             opts: ConnectOpts {

@@ -3420,8 +3420,18 @@ mod data_ipc_bind_tests {
     async fn a_held_data_ipc_port_is_bound_once_released() {
         let logs = CapturedLogs::default();
         let _guard = logs.install();
-        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let listen_addr = holder.local_addr().unwrap();
+        // A bound socket that never listens keeps the port for the whole
+        // test, so no other socket takes it once the holder lets go. The
+        // holder and then the worker's listener bind beside it, as all
+        // three reuse the address and only one listens at a time.
+        let reserve = tokio::net::TcpSocket::new_v4().unwrap();
+        reserve.set_reuseaddr(true).unwrap();
+        reserve.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listen_addr = reserve.local_addr().unwrap();
+        let holder = tokio::net::TcpSocket::new_v4().unwrap();
+        holder.set_reuseaddr(true).unwrap();
+        holder.bind(listen_addr).unwrap();
+        let holder = holder.listen(16).unwrap();
         let cancel = CancellationToken::new();
         let binding = tokio::spawn({
             let cancel = cancel.clone();

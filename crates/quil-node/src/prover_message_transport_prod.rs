@@ -2671,9 +2671,11 @@ mod tests {
     /// storage epoch proof queued to retry, and any other message not.
     #[tokio::test]
     async fn an_unreachable_archive_queues_a_storage_proof_to_retry() {
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A bound socket that never listens: a dial is refused, and no other
+        // socket can take the port while the test dials it.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = closed.local_addr().unwrap().to_string();
-        drop(closed);
         let pool = quil_rpc::ArchiveEndpointPool::new(Duration::ZERO);
         pool.add(address).await;
         let key = quil_p2p::generate_falcon_signing_key();
