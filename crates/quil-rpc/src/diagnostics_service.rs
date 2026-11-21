@@ -46,6 +46,11 @@ pub const MAX_REPORT_BYTES: usize = 32 * 1024;
 pub const MAX_HEALTH_BYTES: usize = MAX_REPORT_BYTES / 2;
 /// A filter longer than any shard filter is not reported.
 pub const MAX_FILTER_BYTES: usize = 128;
+/// A worker's build names its release in this many version bytes and a
+/// commit ID of at most [`MAX_COMMIT_BYTES`] (SHA-256); any other build is
+/// reported as unknown.
+pub const WORKER_BUILD_VERSION_BYTES: usize = 3;
+pub const MAX_COMMIT_BYTES: usize = 32;
 /// Requests are empty: anything larger is refused before it is decoded.
 pub const MAX_REQUEST_BYTES: usize = 1024;
 /// The one answer to a caller who is not served.
@@ -296,6 +301,20 @@ fn observe(worker: &mut WorkerHealth, execution: &WorkerExecution) {
     worker.awaited_frame = execution.awaited_frame;
     worker.materialized_frame = execution.materialized_frame;
     worker.last_advance_unix_ms = execution.last_advance_unix_ms;
+    // A worker sends its build over IPC: one of any other length reads as
+    // unknown, so it cannot crowd later workers out of the report.
+    match &execution.build {
+        Some(build) if *build == quil_engine::worker_execution::own_build() => {
+            worker.build_is_node = true;
+        }
+        Some(build)
+            if build.version.len() == WORKER_BUILD_VERSION_BYTES
+                && build.commit.len() <= MAX_COMMIT_BYTES =>
+        {
+            worker.build = Some(build.clone());
+        }
+        _ => {}
+    }
     if let Some(recovery) = &execution.recovery {
         worker.set_recovery_phase(recovery_phase(&recovery.phase));
         worker.recovery_phase_since_unix_ms = recovery.phase_since_unix_ms;
@@ -349,10 +368,6 @@ pub struct HealthInputs {
     pub store_space: Option<StoreSpace>,
     /// The machine this node runs on ([`crate::machine::current`]).
     pub machine: Option<Machine>,
-    /// The source commit this node was built from: its ID's bytes (empty
-    /// when the build could not read one) and whether tracked files
-    /// differed from it; `None` reports none.
-    pub build_commit: Option<(Vec<u8>, bool)>,
 }
 
 /// The disk space of this node's stores and storage labels: `master`, the
@@ -395,18 +410,21 @@ pub fn store_space(
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
-/// within [`MAX_WORKERS`] and [`MAX_REPORT_BYTES`].
+/// within [`MAX_WORKERS`] and [`MAX_REPORT_BYTES`]. The node's release and
+/// commit are the build its workers are compared against
+/// ([`quil_engine::worker_execution::own_build`]).
 pub fn build_report(
     inputs: &HealthInputs,
     build_fingerprint: &[u8],
     now_ms: u64,
     requester: Requester,
 ) -> HealthReport {
+    let own = quil_engine::worker_execution::own_build();
     let mut report = HealthReport {
         schema: SCHEMA,
-        version: quil_config::VERSION.to_vec(),
-        patch: quil_config::PATCH_NUMBER.into(),
-        subpatch: quil_config::SUBPATCH.parse().unwrap_or(0),
+        version: own.version,
+        patch: own.patch,
+        subpatch: own.subpatch,
         build_fingerprint: build_fingerprint.to_vec(),
         global_head_frame: inputs.global_head_frame,
         generated_unix_ms: now_ms,
@@ -415,11 +433,8 @@ pub fn build_report(
         store_io: inputs.store_io.clone(),
         store_space: inputs.store_space,
         machine: inputs.machine,
-        build_commit: inputs.build_commit.as_ref().map(|(id, _)| id.clone()),
-        build_dirty: inputs
-            .build_commit
-            .as_ref()
-            .is_some_and(|(_, dirty)| *dirty),
+        build_commit: quil_engine::worker_execution::build_commit_recorded().then_some(own.commit),
+        build_dirty: own.dirty,
         // Before the workers, within half the size bound; a peer gets no
         // kind local to this node.
         health: inputs
@@ -432,8 +447,13 @@ pub fn build_report(
             .map(bound_health),
         ..Default::default()
     };
-    // Before the size bound: a withheld field takes no room.
-    if let Requester::Peer(_, consent) = requester {
+    // Before the size bound: a withheld field takes no room. A peer's
+    // workers are withheld one by one below, as each is added.
+    let consent = match requester {
+        Requester::Own => None,
+        Requester::Peer(_, consent) => Some(consent),
+    };
+    if let Some(consent) = consent {
         withhold_unconsented(&mut report, consent);
     }
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -452,7 +472,10 @@ pub fn build_report(
         let join_wait = (!entry.filter.is_empty())
             .then(|| inputs.join_waits.get(&entry.filter).copied())
             .flatten();
-        let worker = worker_health(entry, head, join_wait);
+        let mut worker = worker_health(entry, head, join_wait);
+        if let Some(consent) = consent {
+            withhold_worker_unconsented(&mut worker, consent);
+        }
         let len = worker.encoded_len();
         let framed = 1 + prost::length_delimiter_len(len) + len;
         if bytes + framed > MAX_REPORT_BYTES {
@@ -473,11 +496,6 @@ pub fn build_report(
 /// node diagnostics allow` showed at an earlier level never takes a later
 /// one, and a new field takes a new level.
 pub fn withhold_unconsented(report: &mut HealthReport, level: u32) {
-    fn from<T: Default>(first: u32, level: u32, field: &mut T) {
-        if level < first {
-            *field = T::default();
-        }
-    }
     let HealthReport {
         schema,
         version,
@@ -498,24 +516,99 @@ pub fn withhold_unconsented(report: &mut HealthReport, level: u32) {
         build_dirty,
     } = report;
     // 0: what the first `allow` listed, and grants that record no level.
-    from(0, level, schema);
-    from(0, level, version);
-    from(0, level, patch);
-    from(0, level, subpatch);
-    from(0, level, build_fingerprint);
-    from(0, level, global_head_frame);
-    from(0, level, generated_unix_ms);
-    from(0, level, workers);
-    from(0, level, omitted_workers);
-    from(0, level, master_store_write_failed);
-    from(0, level, worker_capacity);
-    from(0, level, store_io);
+    withhold_below(0, level, schema);
+    withhold_below(0, level, version);
+    withhold_below(0, level, patch);
+    withhold_below(0, level, subpatch);
+    withhold_below(0, level, build_fingerprint);
+    withhold_below(0, level, global_head_frame);
+    withhold_below(0, level, generated_unix_ms);
+    withhold_below(0, level, workers);
+    withhold_below(0, level, omitted_workers);
+    withhold_below(0, level, master_store_write_failed);
+    withhold_below(0, level, worker_capacity);
+    withhold_below(0, level, store_io);
     // 1: health conditions, disk space, machine and source commit.
-    from(1, level, health);
-    from(1, level, store_space);
-    from(1, level, machine);
-    from(1, level, build_commit);
-    from(1, level, build_dirty);
+    withhold_below(1, level, health);
+    withhold_below(1, level, store_space);
+    withhold_below(1, level, machine);
+    withhold_below(1, level, build_commit);
+    withhold_below(1, level, build_dirty);
+    for worker in workers.iter_mut() {
+        withhold_worker_unconsented(worker, level);
+    }
+}
+
+/// Clear each field of `worker` that a grant of consent `level` did not
+/// list, as [`withhold_unconsented`] does for the report. It names every
+/// field, so a new one does not compile until it is given a level.
+pub fn withhold_worker_unconsented(worker: &mut WorkerHealth, level: u32) {
+    let WorkerHealth {
+        core_id,
+        filter,
+        allocated,
+        phase,
+        blocker,
+        observed_unix_ms,
+        materialized_frame,
+        last_advance_unix_ms,
+        committee_head_frame,
+        committed_generation,
+        recovery_phase,
+        recovery_phase_since_unix_ms,
+        recovery_attempts,
+        recovery_consecutive_failures,
+        recovery_failures,
+        last_failure,
+        last_failure_unix_ms,
+        last_success_unix_ms,
+        longest_permit_wait_ms,
+        seal_generation,
+        seal_recorded_unix_ms,
+        join_confirm_epoch,
+        activation_frame,
+        awaited_frame,
+        draining,
+        build,
+        build_is_node,
+    } = worker;
+    // 0: what the first `allow` listed per worker.
+    withhold_below(0, level, core_id);
+    withhold_below(0, level, filter);
+    withhold_below(0, level, allocated);
+    withhold_below(0, level, phase);
+    withhold_below(0, level, blocker);
+    withhold_below(0, level, observed_unix_ms);
+    withhold_below(0, level, materialized_frame);
+    withhold_below(0, level, last_advance_unix_ms);
+    withhold_below(0, level, committee_head_frame);
+    withhold_below(0, level, committed_generation);
+    withhold_below(0, level, recovery_phase);
+    withhold_below(0, level, recovery_phase_since_unix_ms);
+    withhold_below(0, level, recovery_attempts);
+    withhold_below(0, level, recovery_consecutive_failures);
+    withhold_below(0, level, recovery_failures);
+    withhold_below(0, level, last_failure);
+    withhold_below(0, level, last_failure_unix_ms);
+    withhold_below(0, level, last_success_unix_ms);
+    withhold_below(0, level, longest_permit_wait_ms);
+    withhold_below(0, level, seal_generation);
+    withhold_below(0, level, seal_recorded_unix_ms);
+    withhold_below(0, level, join_confirm_epoch);
+    withhold_below(0, level, activation_frame);
+    withhold_below(0, level, awaited_frame);
+    withhold_below(0, level, draining);
+    // 2: the worker's build.
+    withhold_below(2, level, build);
+    withhold_below(2, level, build_is_node);
+}
+
+/// Clear `field` when a grant of consent `level` predates `first`, the
+/// level that first shares it.
+fn withhold_below<T: Default>(first: u32, level: u32, field: &mut T) {
+    if level < first {
+        *field = T::default();
+    }
 }
 
 /// `health` within [`MAX_HEALTH_BYTES`]: the last listed shards of the
@@ -978,6 +1071,7 @@ mod tests {
         BLOCKERS as ENGINE_BLOCKERS, FAILURE_CLASSES, RECOVERY_PHASES as ENGINE_RECOVERY_PHASES,
         STATES,
     };
+    use quil_types::proto::diagnostics::WorkerBuild;
     use quil_types::proto::node::{SessionSeal, ShardRecovery};
 
     fn peer() -> PeerId {
@@ -1080,22 +1174,29 @@ mod tests {
         );
     }
 
+    /// The report names the build its workers are compared against: the
+    /// release, and the commit once this process recorded it. The first
+    /// assertion needs a process of its own (nextest runs one per test).
     #[test]
     fn the_report_carries_the_build_commit() {
         let none = build_report(&HealthInputs::default(), &[], 1, Requester::Own);
         assert_eq!((none.build_commit, none.build_dirty), (None, false));
-        let inputs = HealthInputs {
-            build_commit: Some((vec![0x12; 20], true)),
-            ..Default::default()
-        };
+        quil_engine::worker_execution::set_build_commit(vec![0x34; 20], true);
+        let own = quil_engine::worker_execution::own_build();
         for requester in [
             Requester::Own,
             Requester::Peer(peer(), HEALTH_REPORT_CONSENT),
         ] {
-            let report = build_report(&inputs, &[], 1, requester);
+            let report = build_report(&HealthInputs::default(), &[], 1, requester);
             assert_eq!(
-                (report.build_commit, report.build_dirty),
-                (Some(vec![0x12; 20]), true),
+                (
+                    (report.version, report.patch, report.subpatch),
+                    (report.build_commit, report.build_dirty)
+                ),
+                (
+                    (own.version.clone(), own.patch, own.subpatch),
+                    (Some(vec![0x34; 20]), true)
+                ),
                 "REPORT-COMMIT {requester:?}"
             );
         }
@@ -1184,15 +1285,17 @@ mod tests {
     }
 
     /// A peer gets the health conditions, disk space, machine and source
-    /// commit only under a grant whose recorded level listed them: a grant
-    /// that records none listed none of them. This node always gets them.
+    /// commit, and each worker's build, only under a grant whose recorded
+    /// level listed them: a grant that records none listed none of them,
+    /// one at level 1 no worker's build. This node always gets them.
     #[test]
     fn a_peer_gets_health_disk_machine_and_commit_only_under_a_grant_that_listed_them() {
         use quil_types::proto::diagnostics::{ConditionKind, HealthCondition};
-        let (own, earlier, now) = (peer(), peer(), peer());
-        let mut granted = config(true, &[earlier, now]);
+        let (own, earlier, first, now) = (peer(), peer(), peer(), peer());
+        let mut granted = config(true, &[earlier, first, now]);
         granted.allowed_consent = BTreeMap::from([
             (now.to_base58(), HEALTH_REPORT_CONSENT),
+            (first.to_base58(), 1),
             ("not a peer ID".to_string(), HEALTH_REPORT_CONSENT),
         ]);
         let admission = Admission::new(&granted, own);
@@ -1224,13 +1327,38 @@ mod tests {
                 cpus: 8,
                 ..Default::default()
             }),
-            build_commit: Some((vec![0x12; 20], true)),
             global_head_frame: 9,
             ..Default::default()
+        };
+        quil_engine::worker_execution::set_build_commit(vec![0x12; 20], true);
+        // One worker runs another build, one the node's own.
+        let other = WorkerBuild {
+            version: vec![2, 1, 0],
+            patch: 26,
+            subpatch: 3,
+            commit: vec![0x34; 20],
+            dirty: false,
+        };
+        assert_ne!(other, quil_engine::worker_execution::own_build());
+        let running = |core, build| {
+            let execution = WorkerExecution {
+                state: "running".into(),
+                build: Some(build),
+                ..Default::default()
+            };
+            entry(core, &[core as u8; 32], Some(execution))
+        };
+        let inputs = HealthInputs {
+            workers: vec![
+                running(1, other.clone()),
+                running(2, quil_engine::worker_execution::own_build()),
+            ],
+            ..inputs
         };
         let shared = |requester| {
             let report = build_report(&inputs, &[], 1, requester);
             assert_eq!(report.global_head_frame, 9, "the rest is served");
+            assert_eq!(report.workers.len(), 2, "each worker is served");
             (
                 report.health.is_some(),
                 report.store_space.is_some(),
@@ -1239,13 +1367,37 @@ mod tests {
                 report.build_dirty,
             )
         };
+        let builds = |requester| -> Vec<_> {
+            let report = build_report(&inputs, &[], 1, requester);
+            report
+                .workers
+                .into_iter()
+                .map(|worker| (worker.build, worker.build_is_node))
+                .collect()
+        };
+        let served = vec![(Some(other), false), (None, true)];
+        let withheld = vec![(None, false), (None, false)];
         assert_eq!(
             shared(Requester::Peer(earlier, HEALTH_REPORT_CONSENT_UNRECORDED)),
             (false, false, false, false, false),
             "EARLIER-GRANT-SHARED: a grant without a level gets none of them"
         );
+        assert_eq!(
+            builds(Requester::Peer(earlier, HEALTH_REPORT_CONSENT_UNRECORDED)),
+            withheld,
+            "worker_build_withheld: a grant without a level gets no worker's build"
+        );
+        let first = admission.admit(Some(&first), start).unwrap();
+        assert_eq!(shared(first), (true, true, true, true, true));
+        assert_eq!(
+            builds(first),
+            withheld,
+            "worker_build_withheld: a level 1 grant gets no worker's build"
+        );
         assert_eq!(shared(listed), (true, true, true, true, true));
+        assert_eq!(builds(listed), served, "worker_build_dropped");
         assert_eq!(shared(Requester::Own), (true, true, true, true, true));
+        assert_eq!(builds(Requester::Own), served, "worker_build_dropped");
     }
 
     /// A report that fails to build does not use up the requester's
@@ -1697,6 +1849,83 @@ mod tests {
         }
     }
 
+    /// A worker's report carries a build that differs from the node's, and
+    /// only a flag for the node's own; one from a worker that predates the
+    /// field, none, or one of unexpected length carries neither.
+    #[test]
+    fn a_worker_reports_its_build() {
+        let running = |build: Option<WorkerBuild>| {
+            let execution = WorkerExecution {
+                state: "running".into(),
+                build,
+                ..Default::default()
+            };
+            worker_health(&entry(3, &[5; 32], Some(execution)), None, None)
+        };
+        let other = WorkerBuild {
+            version: vec![2, 1, 0],
+            patch: 26,
+            subpatch: 3,
+            commit: vec![0x12; 20],
+            dirty: true,
+        };
+        assert_ne!(other, quil_engine::worker_execution::own_build());
+        let longest = WorkerBuild {
+            commit: vec![0x12; MAX_COMMIT_BYTES],
+            ..other.clone()
+        };
+        assert_eq!(
+            running(Some(longest.clone())).build,
+            Some(longest),
+            "health_build_dropped"
+        );
+        for oversized in [
+            WorkerBuild {
+                version: vec![2; 30_000],
+                ..other.clone()
+            },
+            WorkerBuild {
+                version: vec![2, 1],
+                ..other.clone()
+            },
+            WorkerBuild {
+                commit: vec![0x12; MAX_COMMIT_BYTES + 1],
+                ..other.clone()
+            },
+        ] {
+            let worker = running(Some(oversized));
+            assert_eq!(
+                (worker.build, worker.build_is_node),
+                (None, false),
+                "health_build_unbounded"
+            );
+        }
+        let worker = running(Some(other.clone()));
+        assert_eq!(
+            (worker.build, worker.build_is_node),
+            (Some(other), false),
+            "health_build_dropped"
+        );
+        let worker = running(Some(quil_engine::worker_execution::own_build()));
+        assert_eq!(
+            (worker.build, worker.build_is_node),
+            (None, true),
+            "health_build_not_node"
+        );
+        let worker = running(None);
+        assert_eq!(
+            (worker.build, worker.build_is_node),
+            (None, false),
+            "health_build_invented"
+        );
+        let idle = worker_health(&entry(4, &[], None), None, None);
+        assert_eq!(
+            (idle.build, idle.build_is_node),
+            (None, false),
+            "health_build_invented"
+        );
+    }
+
     #[test]
     fn a_worker_reports_its_observations_without_their_texts() {
         let head = GlobalAppFrameHead {
@@ -1994,6 +2223,34 @@ mod tests {
         assert_eq!(
             build_report(&long, &[], 0, Requester::Own).omitted_workers,
             1
+        );
+        // The first worker's oversized build reads as unknown instead of
+        // crowding the later workers out.
+        let mut workers: Vec<_> = (0..20)
+            .map(|core| entry(core, &[core as u8; 32], None))
+            .collect();
+        workers[0].execution = Some(WorkerExecution {
+            state: "running".into(),
+            build: Some(WorkerBuild {
+                version: vec![2, 1, 0],
+                commit: vec![0x12; MAX_REPORT_BYTES - 512],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let crowded = HealthInputs {
+            workers,
+            ..Default::default()
+        };
+        let report = build_report(&crowded, &[], 0, Requester::Own);
+        assert_eq!(
+            (
+                report.workers.len(),
+                report.omitted_workers,
+                report.workers[0].build.is_some()
+            ),
+            (20, 0, false),
+            "health_build_unbounded"
         );
     }
 

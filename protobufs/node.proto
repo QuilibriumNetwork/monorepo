@@ -259,6 +259,8 @@ message WorkerExecution {
   // What restarting the node now costs this worker's seat. Set by the
   // master for a worker holding a seat; absent on older nodes.
   RestartReadiness restart = 20;
+  // The build this worker's process runs; absent on older builds.
+  quilibrium.node.diagnostics.pb.WorkerBuild build = 21;
 }
 
 // What a restart now would cost one seat, from the node's own data.

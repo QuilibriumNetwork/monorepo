@@ -17,7 +17,7 @@ fn default_min_interval_secs() -> u64 {
 /// the fields its grant's level covers; a new field takes a new level. The
 /// fields of each level are the node's table (`withhold_unconsented`) and
 /// the client's frozen texts, not listed here.
-pub const HEALTH_REPORT_CONSENT: u32 = 1;
+pub const HEALTH_REPORT_CONSENT: u32 = 2;
 /// The level of a grant that records none (written before levels were):
 /// the fields the first `allow` listed.
 pub const HEALTH_REPORT_CONSENT_UNRECORDED: u32 = 0;

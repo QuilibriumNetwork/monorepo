@@ -64,6 +64,8 @@ futures = "0.3"
 libc = "0.2"
 
 [dev-dependencies]
+# Records the build commit a served health report names.
+quil-engine = { path = "../quil-engine" }
 quil-forest = { path = "../quil-forest" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }

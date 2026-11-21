@@ -1,4 +1,5 @@
 //! Local engine observations, with no allocation or reward inference.
+use quil_types::proto::diagnostics::WorkerBuild;
 use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,6 +175,36 @@ pub fn with_held_stores(
         }
     }
     executions
+}
+
+/// This process's source commit and whether tracked files differed from
+/// it, set once at start by the binary that read them ([`set_build_commit`]).
+static BUILD_COMMIT: std::sync::OnceLock<(Vec<u8>, bool)> = std::sync::OnceLock::new();
+
+/// Records this process's source commit for [`own_build`]: its object ID's
+/// bytes (empty when the build could not read one) and whether tracked
+/// files differed from it. The first call wins.
+pub fn set_build_commit(id: Vec<u8>, dirty: bool) {
+    let _ = BUILD_COMMIT.set((id, dirty));
+}
+
+/// [`set_build_commit`] recorded this process's commit.
+pub fn build_commit_recorded() -> bool {
+    BUILD_COMMIT.get().is_some()
+}
+
+/// The build this process runs, as its workers report it and the node's
+/// health report names it: the release, and the commit once
+/// [`set_build_commit`] recorded it.
+pub fn own_build() -> WorkerBuild {
+    let (commit, dirty) = BUILD_COMMIT.get().cloned().unwrap_or_default();
+    WorkerBuild {
+        version: quil_config::VERSION.to_vec(),
+        patch: quil_config::PATCH_NUMBER.into(),
+        subpatch: quil_config::SUBPATCH.parse().unwrap_or(0),
+        commit,
+        dirty,
+    }
 }
 
 pub fn now_ms() -> u64 {
@@ -414,8 +445,11 @@ impl SharedWorkerExecution {
         )
     }
 
+    /// The record, with the build this worker's process runs.
     pub fn snapshot(&self) -> WorkerExecution {
-        self.record.lock().unwrap().clone()
+        let mut execution = self.record.lock().unwrap().clone();
+        execution.build = Some(own_build());
+        execution
     }
 
     pub fn state(&self, state: &str, blocker: &str) {
@@ -1675,6 +1709,30 @@ mod restart_readiness_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each report names the build the worker's process runs: the release
+    /// the node's health report gives, and its source commit once recorded.
+    #[test]
+    fn a_worker_reports_the_build_its_process_runs() {
+        let shared = SharedWorkerExecution::default();
+        let before = shared.snapshot().build.expect("worker_build_absent");
+        assert_eq!(
+            (before.version.as_slice(), before.patch, before.commit.len()),
+            (
+                &quil_config::VERSION[..],
+                u32::from(quil_config::PATCH_NUMBER),
+                0
+            ),
+            "worker_build_release"
+        );
+        set_build_commit(vec![0x12; 20], true);
+        let after = shared.snapshot().build.expect("worker_build_absent");
+        assert_eq!(
+            (after.commit, after.dirty),
+            (vec![0x12; 20], true),
+            "worker_build_commit"
+        );
+    }
 
     /// A worker whose store latched reads as blocked by it, with or without
     /// an engine; others keep their engine's report.
