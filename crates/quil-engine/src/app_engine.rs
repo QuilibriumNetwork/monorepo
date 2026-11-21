@@ -3348,6 +3348,8 @@ pub struct AppConsensusEngine {
     discarded_records_dropped: bool,
     /// When the passive retry next tries a start an expected wait refused.
     start_pace: StartPace,
+    /// Ends a pace through a GLOBAL state sync install when it completes.
+    global_sync_installs: GlobalSyncInstalls,
     /// A read of this shard's dropped-lineage record under the forest write
     /// barrier found none ([`Self::dropped_lineage_record`]).
     lineage_record_absent: bool,
@@ -3591,6 +3593,7 @@ impl AppConsensusEngine {
             .unwrap_or_else(|| deps.clock_store.clone());
 
         let cw_storage_base = cw_app_storage_base(&deps.db_config, core_id);
+        let global_sync_installs = GlobalSyncInstalls::new(deps.global_hypergraph.as_ref());
         let engine = Self {
             core_id,
             cw_storage_base,
@@ -3679,6 +3682,7 @@ impl AppConsensusEngine {
             history_discarded: std::sync::OnceLock::new(),
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
+            global_sync_installs,
             lineage_record_absent: false,
             sector_signer: Arc::from(deps.bls_signer),
             storage_epoch_checks: Default::default(),
@@ -8663,6 +8667,9 @@ impl AppConsensusEngine {
                     if cw_transport_ready && self.cw_handle.is_none() && !paced {
                         // Passive-mode retry: keep trying until the committee is
                         // buildable (active provers present in this registry).
+                        // Completions so far are seen before the attempt, so
+                        // one landing during it wakes the retry it refuses.
+                        self.global_sync_installs.seen();
                         match self.start_consensus_cw((bls_signer_factory)()).await {
                             Ok(handle) => {
                                 self.start_pace = StartPace::default();
@@ -8792,6 +8799,17 @@ impl AppConsensusEngine {
                     if self.continue_history_walk().await {
                         cw_retry_timer.reset_immediately();
                     }
+                }
+
+                // The GLOBAL state sync a start was refused for completed its
+                // install: the next attempt runs now, not at the pace's end
+                // (a successor waited out up to a minute of it at each
+                // session handoff, its committee short of quorum meanwhile).
+                () = self.global_sync_installs.next(),
+                    if self.cw_handle.is_none() && self.start_pace.waits_for_global_sync() =>
+                {
+                    self.start_pace.global_sync_installed();
+                    cw_retry_timer.reset_immediately();
                 }
             }
 
@@ -17108,14 +17126,18 @@ struct PacedWait {
     until_frame: Option<u64>,
 }
 
+/// The paced wait of a start refused while a GLOBAL state sync installs.
+const GLOBAL_SYNC_WAIT: &str = "GLOBAL state sync installing";
+
 /// Whether a refused start is an expected wait whose end no start attempt
 /// hastens, so the passive retry tries again only every
-/// [`START_WAIT_RETRY`], once the cursor moves, or once GLOBAL reaches the
-/// frame the wait ends at, instead of every 10 s: an attempt repeats every
-/// start check and its store reads, which held a mainnet worker's thread 6
-/// to 40 s a retry (2026-10-31). Waits that end with GLOBAL starting or
-/// seating a session are not paced: a member that started late would cost
-/// its committee quorum.
+/// [`START_WAIT_RETRY`], once the cursor moves, once GLOBAL reaches the
+/// frame the wait ends at, or once the GLOBAL state sync it waits for
+/// completes its install ([`GlobalSyncInstalls`]), instead of every 10 s:
+/// an attempt repeats every start check and its store reads, which held a
+/// mainnet worker's thread 6 to 40 s a retry (2026-10-31). Waits that end
+/// with GLOBAL starting or seating a session are not paced: a member that
+/// started late would cost its committee quorum.
 fn paced_start_wait(
     error: &QuilError,
     context: &StartContext,
@@ -17130,7 +17152,7 @@ fn paced_start_wait(
             .map(quil_types::consensus::JoinWait::activation_frame);
         wait("allocation joining", activation)
     } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
-        wait("GLOBAL state sync installing", None)
+        wait(GLOBAL_SYNC_WAIT, None)
     } else if error.to_string().contains(REANCHOR_IN_PROGRESS) {
         wait("shard re-anchor in progress", None)
     } else if proof_wait && crate::app_handoff::predecessor_unrecovered(error) {
@@ -17181,6 +17203,19 @@ impl StartPace {
                 .is_some_and(|frame| global_frame() >= frame)
     }
 
+    /// Whether the last refusal waits for a GLOBAL state sync's install.
+    fn waits_for_global_sync(&self) -> bool {
+        self.wait.is_some_and(|wait| wait.label == GLOBAL_SYNC_WAIT)
+    }
+
+    /// The GLOBAL state sync the last refusal waited for completed its
+    /// install ([`GlobalSyncInstalls::next`]): the next attempt is due.
+    fn global_sync_installed(&mut self) {
+        if self.waits_for_global_sync() {
+            self.wait = None;
+        }
+    }
+
     /// A start was refused at `now` with the cursor at `cursor`; `wait`: the
     /// expected wait it paces, if any.
     fn refused(&mut self, now: std::time::Instant, cursor: u64, wait: Option<PacedWait>) {
@@ -17194,6 +17229,37 @@ impl StartPace {
         }
         self.wait = wait;
         self.refused = Some((now, cursor));
+    }
+}
+
+/// The completions of GLOBAL state sync installs into this engine's GLOBAL
+/// state ([`quil_hypergraph::HypergraphCrdt::sync_completions`]), which end
+/// a start's pace through one ([`StartPace::global_sync_installed`]).
+struct GlobalSyncInstalls(Option<tokio::sync::watch::Receiver<u64>>);
+
+impl GlobalSyncInstalls {
+    fn new(global: Option<&Arc<quil_hypergraph::HypergraphCrdt>>) -> Self {
+        Self(global.map(|global| {
+            global.sync_completions(&quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS)
+        }))
+    }
+
+    /// Completions so far are seen: [`Self::next`] waits for a later one.
+    fn seen(&mut self) {
+        if let Some(installs) = &mut self.0 {
+            installs.borrow_and_update();
+        }
+    }
+
+    /// Resolves at the next completion not yet seen; never without GLOBAL
+    /// state of its own.
+    async fn next(&mut self) {
+        let Some(installs) = &mut self.0 else {
+            return std::future::pending().await;
+        };
+        if installs.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -17247,7 +17313,7 @@ mod start_pace_tests {
         let mut pace = StartPace::default();
         assert!(pace.due(now, 7, head));
         let sync = PacedWait {
-            label: "GLOBAL state sync installing",
+            label: GLOBAL_SYNC_WAIT,
             until_frame: None,
         };
         pace.refused(now, 7, Some(sync));
@@ -17274,6 +17340,76 @@ mod start_pace_tests {
         assert!(pace.due(now, 7, head), "a refusal that is not paced");
     }
 
+    /// Whether `installs` has a completion not yet seen, without waiting.
+    async fn completed(installs: &mut GlobalSyncInstalls) -> bool {
+        tokio::time::timeout(Duration::ZERO, installs.next())
+            .await
+            .is_ok()
+    }
+
+    /// A start a GLOBAL state sync install refused is due once that
+    /// install completes, not at the end of its pace: at a session handoff
+    /// a successor otherwise waited up to [`START_WAIT_RETRY`] after the
+    /// sync had installed the view seating it. A pace through another wait
+    /// stays.
+    #[tokio::test]
+    async fn a_start_an_installing_global_sync_refused_is_due_once_the_install_completes() {
+        use crate::app_handoff::successor_tests::{
+            closing_session, commit, global_state, sync_global_from,
+        };
+        use quil_execution::global_intrinsic::handoff::{global_sync_in_progress, CommittedView};
+        use quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        let head = || 100;
+        let (archive, archive_state) = global_state();
+        let _ = closing_session(&archive, &archive_state, &[0x0f; 32]);
+        let (global, state) = global_state();
+        commit(&global, &state, 1);
+        let mut installs = GlobalSyncInstalls::new(Some(&global));
+
+        sync_global_from(&archive, &global);
+        installs.seen();
+        let error = CommittedView::capture(&global)
+            .err()
+            .expect("the held sync withholds the view");
+        assert!(global_sync_in_progress(&error), "{error}");
+        let wait = paced_start_wait(&error, &StartContext::default(), false);
+        let now = std::time::Instant::now();
+        let mut pace = StartPace::default();
+        pace.refused(now, 7, wait);
+        assert!(pace.waits_for_global_sync());
+        assert!(!completed(&mut installs).await, "the install is not done");
+        assert!(!pace.due(now + Duration::from_secs(10), 7, head));
+
+        global
+            .checkpoint_synced_view(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                3,
+                &quil_store::encoding::global_materialized_cursor_key(),
+            )
+            .unwrap();
+        assert!(completed(&mut installs).await, "the install completed");
+        pace.global_sync_installed();
+        assert!(
+            pace.due(now + Duration::from_secs(10), 7, head),
+            "due at the next tick, not {} s after the refusal",
+            START_WAIT_RETRY.as_secs()
+        );
+        assert_eq!(CommittedView::capture(&global).unwrap().frame(), 3);
+        assert!(!completed(&mut installs).await, "one wake per completion");
+
+        let reanchor = PacedWait {
+            label: "shard re-anchor in progress",
+            until_frame: None,
+        };
+        pace.refused(now, 7, Some(reanchor));
+        pace.global_sync_installed();
+        assert!(!pace.due(now + Duration::from_secs(10), 7, head));
+        assert!(
+            !completed(&mut GlobalSyncInstalls::new(None)).await,
+            "no GLOBAL state, no wake"
+        );
+    }
+
     /// Which refusals are paced: the waits that end with no start attempt's
     /// help; never one ending as GLOBAL starts or seats a session, nor a
     /// predecessor wait the retry's shard sync request drives.
@@ -17292,10 +17428,7 @@ mod start_pace_tests {
         let label = |error, proof_wait| {
             paced_start_wait(error, &context, proof_wait).map(|wait| (wait.label, wait.until_frame))
         };
-        assert_eq!(
-            label(&sync, false),
-            Some(("GLOBAL state sync installing", None))
-        );
+        assert_eq!(label(&sync, false), Some((GLOBAL_SYNC_WAIT, None)));
         assert_eq!(
             label(&reanchor, false),
             Some(("shard re-anchor in progress", None))

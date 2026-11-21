@@ -615,6 +615,18 @@ fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
 /// has this index, and its empty bit path overlaps every scope.
 const SYNC_HOLD_SCOPE: usize = 0xff;
 
+/// What [`mark_sync_scopes`] staged for a shard's incomplete scopes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopeChange {
+    /// Nothing listed or unlisted.
+    Unchanged,
+    /// A scope listed or unlisted, with some still listed after.
+    Changed,
+    /// The last listed scope unlisted: once committed, a committed snapshot
+    /// shows the shard's synced state ([`snapshot_sync_incomplete`]).
+    Completed,
+}
+
 /// List or unlist `(phase, bit_path)` among `shard_id`'s incomplete scopes
 /// in `txn`. Callers hold the commit lock, so the read is current.
 fn mark_sync_incomplete(
@@ -623,18 +635,18 @@ fn mark_sync_incomplete(
     phase_idx: usize,
     bit_path: &[bool],
     incomplete: bool,
-) -> Result<bool> {
+) -> Result<ScopeChange> {
     mark_sync_scopes(txn, shard_id, &[(phase_idx, bit_path, incomplete)])
 }
 
 /// Stage [`HypergraphCrdt::checkpoint_synced_view`] in `txn`, under the
-/// commit lock.
+/// commit lock, and what it staged for the shard's incomplete scopes.
 fn stage_synced_view(
     txn: &dyn quil_types::store::Transaction,
     shard_id: &[u8],
     frame: u64,
     cursor_key: &[u8],
-) -> Result<SyncedViewCheckpoint> {
+) -> Result<(SyncedViewCheckpoint, ScopeChange)> {
     let previous = txn
         .get(cursor_key)?
         .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
@@ -643,8 +655,9 @@ fn stage_synced_view(
         txn.set(cursor_key, &frame.to_be_bytes())?;
     }
     let hold: [(usize, &[bool], bool); 1] = [(SYNC_HOLD_SCOPE, &[], false)];
-    let held = mark_sync_scopes(txn, shard_id, &hold)?;
-    Ok(SyncedViewCheckpoint { previous, held })
+    let change = mark_sync_scopes(txn, shard_id, &hold)?;
+    let held = change != ScopeChange::Unchanged;
+    Ok((SyncedViewCheckpoint { previous, held }, change))
 }
 
 /// [`mark_sync_incomplete`] for several scopes in one write: a store
@@ -653,7 +666,7 @@ fn mark_sync_scopes(
     txn: &dyn quil_types::store::Transaction,
     shard_id: &[u8],
     changes: &[(usize, &[bool], bool)],
-) -> Result<bool> {
+) -> Result<ScopeChange> {
     let key = sync_incomplete_key(shard_id);
     let mut scopes = txn
         .get(&key)?
@@ -671,14 +684,15 @@ fn mark_sync_scopes(
         changed = true;
     }
     if !changed {
-        return Ok(false);
+        return Ok(ScopeChange::Unchanged);
     }
     if scopes.is_empty() {
         txn.delete(&key)?;
+        Ok(ScopeChange::Completed)
     } else {
         txn.set(&key, &encode_sync_scopes(&scopes))?;
+        Ok(ScopeChange::Changed)
     }
-    Ok(true)
 }
 
 /// Whether committed snapshot `records` lists any scope of `shard_id` as
@@ -1036,6 +1050,9 @@ pub struct HypergraphCrdt {
     /// flipped at the flag-day frame AFTER the one-time consolidation, since
     /// a split app's existing data lives in the per-prefix trees until then.
     unified_tree: AtomicBool,
+    /// Per shard, a counter of its syncs' completions, for
+    /// [`Self::sync_completions`]; a shard is listed once subscribed.
+    sync_completions: std::sync::Mutex<HashMap<Vec<u8>, tokio::sync::watch::Sender<u64>>>,
 }
 
 /// READ-ONLY snapshot of where an app's forest leaves actually live — the
@@ -1183,6 +1200,33 @@ impl HypergraphCrdt {
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: CommitLock::default(),
             unified_tree: AtomicBool::new(false),
+            sync_completions: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A receiver whose value changes at each commit that completes a sync
+    /// of `shard_id`: the one unlisting its last partly installed scope or
+    /// ending a held sync's hold, after which a committed snapshot shows the
+    /// synced state ([`snapshot_sync_incomplete`]). A wait on that state
+    /// ends at the change, not at its next poll.
+    pub fn sync_completions(&self, shard_id: &[u8]) -> tokio::sync::watch::Receiver<u64> {
+        self.sync_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(shard_id.to_vec())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    /// A commit completed a sync of `shard_id` ([`Self::sync_completions`]).
+    fn sync_completed(&self, shard_id: &[u8]) {
+        if let Some(completions) = self
+            .sync_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(shard_id)
+        {
+            completions.send_modify(|count| *count = count.wrapping_add(1));
         }
     }
 
@@ -2209,8 +2253,11 @@ impl HypergraphCrdt {
         })?;
         let txn = self.store.new_transaction(false)?;
         match stage_synced_view(txn.as_ref(), shard_id, frame, cursor_key) {
-            Ok(checkpoint) => {
+            Ok((checkpoint, change)) => {
                 txn.commit()?;
+                if change == ScopeChange::Completed {
+                    self.sync_completed(shard_id);
+                }
                 Ok(checkpoint)
             }
             Err(error) => {
@@ -4310,7 +4357,7 @@ impl HypergraphCrdt {
         if plan.hold {
             scopes.push((SYNC_HOLD_SCOPE, &[][..], true));
         }
-        mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
+        let change = mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
         txn.commit()?;
         staged
             .publish_memory()
@@ -4324,6 +4371,9 @@ impl HypergraphCrdt {
         }
         plan.base_version = Some(version);
         plan.next += blobs.len();
+        if change == ScopeChange::Completed {
+            self.sync_completed(&plan.shard_id);
+        }
         Ok(())
     }
 
@@ -4401,16 +4451,20 @@ impl HypergraphCrdt {
         // A retry can find nothing left to install (its source already equal
         // to the partial tree); the scope is complete all the same.
         let txn = self.store.new_transaction(false)?;
-        if mark_sync_incomplete(
+        let change = mark_sync_incomplete(
             txn.as_ref(),
             &plan.shard_id,
             plan.phase_idx,
             &plan.bit_path,
             false,
-        )? {
-            txn.commit()?;
-        } else {
+        )?;
+        if change == ScopeChange::Unchanged {
             txn.abort()?;
+        } else {
+            txn.commit()?;
+            if change == ScopeChange::Completed {
+                self.sync_completed(&plan.shard_id);
+            }
         }
         Ok(plan.target_root)
     }
