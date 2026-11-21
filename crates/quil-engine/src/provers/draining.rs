@@ -153,6 +153,9 @@ pub(crate) struct DrainSummary {
     pub eligible: usize,
     /// Bound seats the halt-risk shield holds, on any worker.
     pub shielded: usize,
+    /// Kept workers idle at the configured count: a draining seat yields to
+    /// each unless the shield holds it or its storage renewal is under way.
+    pub idle_kept: usize,
     /// Each draining worker, by core, with its filter and seat.
     pub seats: Vec<(u32, Vec<u8>, DrainSeat)>,
 }
@@ -198,16 +201,18 @@ impl DrainSummary {
             draining_leaving = leaving,
             draining_proposed = proposed,
             draining_shielded = held,
+            idle_kept_workers = self.idle_kept,
             last_departure_epoch = ?last_departure_epoch,
             epochs_to_last_departure = ?last_departure_epoch.map(|last| last.saturating_sub(epoch_for_frame(frame))),
             seats = ?seats,
             scope = "this node",
             "workers above the configured count are draining: they take no new seat, their seats leave through \
-             the surplus leave (eligible seats, lowest reward first), and each stops once it holds no seat or \
-             join. Expected waits: a leave departs at its epoch once confirmed; a shielded seat is held until its \
-             shard has more than 4 active provers; a kept seat is not surplus (lower-reward draining seats make \
-             up the surplus, or none is) and stays until it departs; a joining seat drains once its join is \
-             confirmed or expires"
+             the surplus leave (eligible seats, lowest reward first; one also yields to each kept worker idle at \
+             the count), and each stops once it holds no seat or join. Expected waits: a leave departs at its \
+             epoch once confirmed; a shielded seat is held until its shard has more than 4 active provers, even \
+             while kept workers idle; a seat whose storage renewal is under way is spared until it lands or its \
+             grace frame passes; a kept seat is not surplus (lower-reward draining seats make up the surplus, or \
+             none is) and stays until it departs; a joining seat drains once its join is confirmed or expires"
         );
         let stalled: Vec<String> = self
             .seats

@@ -615,9 +615,9 @@ impl LifecycleReadiness {
     }
 }
 
-/// The surplus leave's choice: how many Active seats exceed the configured
-/// count, how many seats it may leave, the bound seats the halt-risk shield
-/// holds, and the seats it leaves, lowest reward first.
+/// The surplus leave's choice: how many Active seats it sheds
+/// (`shed_count`), how many seats it may leave, the bound seats the
+/// halt-risk shield holds, and the seats it leaves, lowest reward first.
 #[derive(Debug, Default)]
 struct SurplusSelection {
     surplus: usize,
@@ -627,6 +627,27 @@ struct SurplusSelection {
     /// Seats the ranking would have picked that are spared while their
     /// storage renewal is under way (`ProverLifecycle::storage_renewals_under_way`).
     spared: Vec<Vec<u8>>,
+    /// Kept workers idle with no slot left (`DrainingSeats::idle_kept`).
+    idle_kept: usize,
+}
+
+/// The seats of draining workers (above the configured count) and the kept
+/// workers idle for want of a slot, as the capacity sheds read them.
+struct DrainingSeats<'a> {
+    filters: &'a std::collections::HashSet<Vec<u8>>,
+    /// Auto-managed workers within the count that are free, owed no held
+    /// seat, and get no slot because the node holds its count.
+    idle_kept: usize,
+}
+
+/// How many seats a capacity shed leaves: the `held` seats above
+/// `capacity`, or one of the `draining` seats it may take (neither shielded
+/// nor spared) per kept worker idle for want of a slot, whichever is more.
+/// A draining seat counts towards the capacity, so without the second term
+/// a kept worker that lost its seat while a draining one kept its own stays
+/// idle, no seat is surplus, and the draining worker never stops.
+fn shed_count(held: usize, capacity: usize, draining: usize, idle_kept: usize) -> usize {
+    held.saturating_sub(capacity).max(draining.min(idle_kept))
 }
 
 pub use super::renewal_storage::RenewalStorage;
@@ -1765,6 +1786,7 @@ impl ProverLifecycle {
             worker_capacity,
             surplus.surplus,
             surplus.eligible,
+            surplus.idle_kept,
             auto_held,
             auto_capacity,
             pins.len(),
@@ -1785,6 +1807,7 @@ impl ProverLifecycle {
             surplus = surplus.surplus,
             eligible = surplus.eligible,
             shielded = surplus.shielded.len(),
+            idle_kept_workers = surplus.idle_kept,
             auto_held,
             auto_worker_capacity = auto_capacity,
             overcapacity,
@@ -1793,7 +1816,8 @@ impl ProverLifecycle {
             pending_leaves = leaving.len(),
             scope = "local",
             "lifecycle capacity: seats held against the workers that can serve them; a surplus \
-             is proposed to leave, worst-scoring first, unless the halt-risk shield keeps it \
+             is proposed to leave, worst-scoring first, unless the halt-risk shield keeps it, and \
+             a draining worker's seat yields to each kept worker idle at the count \
              (logged on change, else every 10 min)"
         );
     }
@@ -2259,7 +2283,8 @@ impl ProverLifecycle {
     /// more than it may. Picks (`SurplusSelection::picks`) the seats of
     /// draining workers first, then the lowest-scoring active filters, when
     /// total active allocs exceed `total_capacity` (the configured worker
-    /// count). Manually-managed pins are
+    /// count), and a draining seat for each kept worker idle at that count
+    /// (`shed_count`). Manually-managed pins are
     /// protected — they're never picked as leave candidates — but
     /// they DO count toward capacity (an idle manual worker is still
     /// a worker, capable of hosting whichever filter the operator
@@ -2272,9 +2297,10 @@ impl ProverLifecycle {
         allocated_descriptors: &[ShardDescriptor],
         difficulty: u64,
         world_bytes: &BigInt,
-        draining_filters: &std::collections::HashSet<Vec<u8>>,
+        draining: &DrainingSeats<'_>,
         storage_protected: &HashMap<Vec<u8>, RenewalStorage>,
     ) -> SurplusSelection {
+        let draining_filters = draining.filters;
         let mm_filters = manually_managed_filters(workers);
         let bound_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
@@ -2291,7 +2317,6 @@ impl ProverLifecycle {
         // capacity while still counting all actives, falsely
         // concluding "too many allocs, propose leave."
         let total_active_count = active_filters.len();
-        let surplus = total_active_count.saturating_sub(total_capacity);
 
         // Shed the worst-scoring allocations, bound or not.
         //
@@ -2356,8 +2381,9 @@ impl ProverLifecycle {
         // goes before any other, lowest score first, so the draining worker
         // can stop. Shedding a kept worker's seat instead idles that worker
         // while the draining one keeps its seat; the node is then at its
-        // count, so the idle worker cannot join and no seat is surplus, and
-        // the draining worker never stops.
+        // count and the idle worker cannot join, so a draining seat the shed
+        // may take also counts as surplus while a kept worker idles
+        // (`shed_count`).
         ranked.sort_by(|a, b| {
             draining_filters
                 .contains(&b.0)
@@ -2370,6 +2396,22 @@ impl ProverLifecycle {
                 })
         });
         let eligible = ranked.len();
+        // Draining seats the shed may take: neither manual nor shielded, and
+        // in their own count, not spared below.
+        let draining_ranked = ranked
+            .iter()
+            .filter(|(f, _)| draining_filters.contains(f))
+            .count();
+        let yielding = ranked
+            .iter()
+            .filter(|(f, _)| draining_filters.contains(f) && !storage_protected.contains_key(f))
+            .count();
+        let surplus = shed_count(
+            total_active_count,
+            total_capacity,
+            yielding,
+            draining.idle_kept,
+        );
         // A filter that's `Active` but absent from `allocated_descriptors`
         // is, in practice, a size-0 shard (build_decide_descriptors
         // skipped it). Mirroring Go's `worker_allocator.go:821-824` —
@@ -2381,10 +2423,18 @@ impl ProverLifecycle {
         // A seat whose storage for the next epoch is being encoded or is
         // encoded is spared while its renewal's grace frame is ahead
         // (`storage_renewals_under_way`): the next-worst seat goes instead,
-        // or the shed waits for the renewal to land or the grace to pass.
+        // or the shed waits for the renewal to land or the grace to pass. A
+        // draining seat that would yield to an idle kept worker is spared and
+        // reported the same way; no other seat yields in its place.
+        let wanted = shed_count(
+            total_active_count,
+            total_capacity,
+            draining_ranked,
+            draining.idle_kept,
+        );
         let spared: Vec<Vec<u8>> = ranked
             .iter()
-            .take(surplus.min(MAX_PROPOSALS_PER_CYCLE))
+            .take(wanted.min(MAX_PROPOSALS_PER_CYCLE))
             .filter(|(f, _)| storage_protected.contains_key(f))
             .map(|(f, _)| f.clone())
             .collect();
@@ -2401,6 +2451,7 @@ impl ProverLifecycle {
             shielded,
             picks,
             spared,
+            idle_kept: draining.idle_kept,
         }
     }
 
@@ -2468,13 +2519,14 @@ impl ProverLifecycle {
                         .iter()
                         .find(|a| !w.filter.is_empty() && a.confirmation_filter == w.filter)
                 });
-                let shield_active =
-                    (selection.surplus > 0 && selection.shielded.contains(&w.filter)).then(|| {
-                        descriptors
-                            .iter()
-                            .find(|d| d.filter == w.filter)
-                            .map_or(0, |d| d.active_count)
-                    });
+                let shield_active = ((selection.surplus > 0 || selection.idle_kept > 0)
+                    && selection.shielded.contains(&w.filter))
+                .then(|| {
+                    descriptors
+                        .iter()
+                        .find(|d| d.filter == w.filter)
+                        .map_or(0, |d| d.active_count)
+                });
                 let seat = DrainSeat::of(
                     &w.filter,
                     w.pending_filter_frame > 0,
@@ -2494,6 +2546,7 @@ impl ProverLifecycle {
             surplus: selection.surplus,
             eligible: selection.eligible,
             shielded: selection.shielded.len(),
+            idle_kept: selection.idle_kept,
             seats,
         }
         .log(frame_number);
@@ -3339,6 +3392,12 @@ impl ProverLifecycle {
                     .min(worker_capacity.saturating_sub(occupied)),
             )
             .collect();
+        // Kept workers the capacity leaves idle: free, owed no held seat, and
+        // past the slots left. A draining seat yields to each (`shed_count`).
+        let idle_kept = free_worker_ids
+            .len()
+            .saturating_sub(unbound_held_count)
+            .saturating_sub(assignable_worker_ids.len());
         let allow_proposals = !assignable_worker_ids.is_empty();
         let note = self
             .capacity_wait
@@ -3719,7 +3778,10 @@ impl ProverLifecycle {
             &allocated_descriptors,
             difficulty,
             &world_bytes,
-            &draining_filters,
+            &DrainingSeats {
+                filters: &draining_filters,
+                idle_kept,
+            },
             &storage_protected,
         );
         if shard_info_ready && !active_filters.is_empty() {
@@ -3757,6 +3819,11 @@ impl ProverLifecycle {
                         .iter()
                         .filter(|f| draining_filters.contains(*f))
                         .count();
+                    let reason = if active_filters.len() > worker_capacity {
+                        "capacity reduction (active count exceeds worker count)"
+                    } else {
+                        "draining workers' seats yield to kept workers idle at the worker count"
+                    };
                     info!(
                         frame = frame_number,
                         active_count = active_filters.len(),
@@ -3766,8 +3833,9 @@ impl ProverLifecycle {
                         eligible = surplus_selection.eligible,
                         shielded = surplus_selection.shielded.len(),
                         draining_leaves,
+                        idle_kept_workers = surplus_selection.idle_kept,
                         ?leave_summary,
-                        reason = "capacity reduction (active count exceeds worker count)",
+                        reason,
                         "proposing leaves for surplus actives"
                     );
                     proposal_reasons.extend(surplus.iter().cloned().map(|f| (f, false, "C")));
@@ -4909,7 +4977,10 @@ impl ProverLifecycle {
                 .map(|d| d.filter.clone())
                 .collect();
             // As the surplus leave picks: a draining worker's seat first, then
-            // lowest score first.
+            // lowest score first. As it counts, too (`shed_count`): a draining
+            // seat's leave confirms while a kept worker idles at the count,
+            // or the score rule rejects the leave the surplus proposed for it
+            // and the kept worker stays idle.
             let mut capacity_ranked = proposer::rank_allocated_by_score_ascending(
                 &held_descriptors,
                 difficulty,
@@ -4924,7 +4995,11 @@ impl ProverLifecycle {
                     .cmp(&draining_filters.contains(&a.0))
                     .then_with(|| a.1.cmp(&b.1))
             });
-            let capacity_needed = serving.saturating_sub(worker_capacity);
+            let yielding = capacity_ranked
+                .iter()
+                .filter(|(f, _)| draining_filters.contains(f) && auto_ready.contains(f))
+                .count();
+            let capacity_needed = shed_count(serving, worker_capacity, yielding, idle_kept);
             let capacity_ready: Vec<Vec<u8>> = capacity_ranked
                 .into_iter()
                 .map(|(f, _)| f)
@@ -11949,6 +12024,59 @@ mod proposal_loop_tests {
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
+    /// While a kept worker idles at the count, the draining seat that would
+    /// yield to it is spared while its storage renewal is under way, as any
+    /// seat the capacity shed would take: no kept seat leaves in its place,
+    /// the spare is reported once, and the draining seat leaves once the
+    /// renewal's grace frame passes.
+    #[test]
+    fn a_draining_seat_renewing_its_storage_yields_to_an_idle_kept_worker_after_the_grace() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let grace_frame = quil_types::consensus::storage_snapshot_frame(2)
+            + crate::app_shard_metadata::storage_snapshot_grace();
+        let address = vec![0xCDu8; 32];
+        let (kept, draining) = (filter_bytes(0xA1), filter_bytes(0xA2));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, kept.clone()));
+        wm.add(idle_worker(2));
+        wm.add(allocated_worker(3, draining.clone()));
+        wm.set_configured_count(2);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(kept.clone(), ProverStatus::Active, 10),
+                renewing(draining.clone()),
+            ],
+        ));
+        reg.set_summaries(sized_summaries(&[kept.clone(), draining.clone()]));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        note_storage(&lc, 790, &draining, RenewalStorage::Encoding);
+        let evaluate = |frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
+        };
+        let (actions, logged) = evaluate(800);
+        println!("REACH drain-yield");
+        assert!(
+            proposed_leaves(&actions).is_empty(),
+            "SPARE-KEPT: no seat leaves while the draining one's storage renews: {actions:?}"
+        );
+        let spares = "capacity shed spares seats whose storage";
+        assert!(
+            logged.matches(spares).count() == 1 && logged.contains(&hex::encode(&draining)),
+            "SPARE-LOGGED: the spared draining seat is reported: {logged}"
+        );
+        let (actions, _) = evaluate(grace_frame);
+        assert_eq!(
+            proposed_leaves(&actions),
+            vec![draining],
+            "SPARED-YIELD: past the grace frame the draining seat leaves: {actions:?}"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
     /// A renewal a leave skips while the seat's storage for the next epoch is
     /// encoding is warned of, once per seat per epoch, while the renewal's
     /// grace frame is ahead; past it, or for a seat whose storage is not
@@ -14375,12 +14503,15 @@ mod proposal_loop_tests {
 
     /// A node holding 9 seats restarts on a host whose memory holds 6
     /// (`crate::worker_count`): it joins nothing, the surplus leave proposes
-    /// the 3 surplus seats once and none again through its cooldown, the
+    /// the 3 surplus seats once and none again through its cooldown, and the
     /// draining seat whose shard sits at halt risk stays (the halt-risk
-    /// shield), and once the leaves depart the node holds its count: no
-    /// join, no leave, only the drained workers retired.
+    /// shield), so a kept seat leaves in its place. Once the leaves depart
+    /// the node holds its count with that kept worker idle: the shield still
+    /// holds the draining seat, so nothing joins or leaves. Once the shard
+    /// grows past the shield, the draining seat yields to the idle kept
+    /// worker: it leaves, its worker retires, and the kept worker joins.
     #[test]
-    fn a_restart_at_a_memory_bound_count_sheds_its_surplus_once_and_keeps_the_shield() {
+    fn a_memory_bound_restart_drains_a_shielded_seat_into_an_idle_kept_worker() {
         use crate::worker_count as wc;
         const GIB: u64 = 1 << 30;
         let mac = wc::Memory {
@@ -14454,8 +14585,15 @@ mod proposal_loop_tests {
         }
         // The proposed leaves depart and their workers go idle.
         let left_cores: Vec<u32> = (1..=9u32).filter(|c| left.contains(&seat(*c))).collect();
+        let kept: Vec<u32> = left_cores.iter().copied().filter(|c| *c <= 6).collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "one kept seat left in the shielded one's place"
+        );
+        let kept = kept[0];
         allocs.retain(|a| !left.contains(&a.confirmation_filter));
-        reg.set_prover(prover(address, allocs));
+        reg.set_prover(prover(address.clone(), allocs.clone()));
         for core in &left_cores {
             wm.deallocate_worker(*core).unwrap();
         }
@@ -14470,7 +14608,8 @@ mod proposal_loop_tests {
                 count_proposed_leaves(&actions)
             ),
             (0, 0),
-            "at its count the node neither joins nor leaves: {actions:?}"
+            "SHIELD-KEPT: at its count with core {kept} idle, the shield keeps the draining seat \
+             and no kept seat leaves for it: {actions:?}"
         );
         let mut retired = wm.retired();
         retired.sort_unstable();
@@ -14478,6 +14617,58 @@ mod proposal_loop_tests {
             retired,
             vec![7, 8],
             "the drained workers retire; core 9 keeps its shielded seat: {actions:?}"
+        );
+
+        // Shard 9 grows to 10 active provers: the shield no longer holds the
+        // draining seat, and it yields to the idle kept worker.
+        reg.set_summaries(
+            (1..=10u32)
+                .map(|core| shard_summary(seat(core), 10))
+                .collect(),
+        );
+        let grown = after + 1;
+        lifecycle.set_prover_root_verified_frame(grown);
+        let actions = lifecycle
+            .evaluate(grown, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        println!("REACH drain-yield");
+        assert_eq!(
+            (
+                count_proposed_joins(&actions),
+                proposed_leave_filters(&actions)
+            ),
+            (0, vec![seat(9)]),
+            "DRAIN-YIELD: the draining seat leaves for idle core {kept}: {actions:?}"
+        );
+        // The leave departs: the draining worker retires and the kept one
+        // joins.
+        allocs.retain(|a| a.confirmation_filter != seat(9));
+        reg.set_prover(prover(address, allocs));
+        wm.deallocate_worker(9).unwrap();
+        let departed = grown + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(departed);
+        let actions = lifecycle
+            .evaluate(departed, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let mut retired = wm.retired();
+        retired.sort_unstable();
+        assert_eq!(
+            retired,
+            vec![7, 8, 9],
+            "DRAIN-YIELD: core 9 retires: {actions:?}"
+        );
+        let joined: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { worker_ids, .. } => Some(worker_ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            (joined, count_proposed_leaves(&actions)),
+            (vec![kept], 0),
+            "DRAIN-YIELD: the idle kept worker joins: {actions:?}"
         );
     }
 
@@ -14550,6 +14741,69 @@ mod proposal_loop_tests {
             (decided(true), decided(false)),
             (vec![draining], vec![kept_low]),
             "capacity_order: {actions:?}"
+        );
+    }
+
+    /// At the confirm boundary, a draining worker's pending leave confirms
+    /// while a kept worker idles at the count, although the node serves no
+    /// more seats than its count and no better shard is open: the score rule
+    /// would reject it, the draining worker keep its seat, and the kept one
+    /// stay idle.
+    #[test]
+    fn a_draining_seats_leave_confirms_while_a_kept_worker_idles_at_the_count() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (kept, draining) = (filter_bytes(0xD4), filter_bytes(0xD5));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, kept.clone()));
+        wm.add(idle_worker(2));
+        wm.add(allocated_worker(3, draining.clone()));
+        wm.set_configured_count(2);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_summaries(vec![
+            shard_summary(kept.clone(), 10),
+            shard_summary(draining.clone(), 10),
+        ]);
+        let mut allocs = vec![
+            alloc(kept.clone(), ProverStatus::Active, 10),
+            alloc(draining.clone(), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        // Whatever was proposed, decide the draining seat's pending leave in
+        // its confirm epoch.
+        allocs[1].status = ProverStatus::Leaving;
+        allocs[1].leave_frame_number = 100;
+        reg.set_prover(prover(address, allocs));
+        lifecycle.set_prover_root_verified_frame(800);
+        let actions = lifecycle
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        println!("REACH drain-yield");
+        let decided = |confirm: bool| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ConfirmLeaves { filters, .. } if confirm => Some(filters),
+                    LifecycleAction::RejectLeaves { filters, .. } if !confirm => Some(filters),
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            (decided(true), decided(false)),
+            (vec![draining], Vec::<Vec<u8>>::new()),
+            "YIELD-CONFIRM: {actions:?}"
         );
     }
 
