@@ -3410,7 +3410,15 @@ impl MessageCollector {
         if self.shard_frame_verifier.read().unwrap().is_none() {
             return false;
         }
-        let checks = extract_shard_frame_checks(data);
+        let (evidence, checks): (Vec<_>, Vec<_>) = carried_headers(data)
+            .into_iter()
+            .partition(|(_, fence)| *fence);
+        // Fee vote fence evidence is verified like a shard frame
+        // ([`Self::admit`]), and nothing supersedes it.
+        if !evidence.is_empty() {
+            return true;
+        }
+        let checks: Vec<ShardFrameCheck> = checks.into_iter().map(|(check, _)| check).collect();
         let signers = match checks.as_slice() {
             [check] => Some(check.signers),
             _ => None,
@@ -3776,11 +3784,23 @@ impl MessageCollector {
             self.intake.note(Intake::RefusedInvalid, Instant::now());
             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
         }
-        let checks: Vec<ShardFrameCheck> = carried
-            .into_iter()
-            .filter(|(_, evidence)| !evidence)
-            .map(|(check, _)| check)
-            .collect();
+        // Every carried header passes one admission, fee vote fence evidence
+        // too: the address check here and the verifier below, which bounds
+        // its anchor as a leader does (`execution_deferral::held_unverified`).
+        // Whether a header is evidence rests on its own vote, which anyone
+        // sets, so only past admission is it kept out of the shard frames
+        // below. Filed unverified (until 2026-11-21), a header voting out of
+        // bounds skipped every check, at any anchor up to `u64::MAX`.
+        let carries_header = !carried.is_empty();
+        let mut checks: Vec<ShardFrameCheck> = Vec::with_capacity(carried.len());
+        let mut evidence: Vec<ShardFrameCheck> = Vec::new();
+        for (check, fence) in carried {
+            if fence {
+                evidence.push(check);
+            } else {
+                checks.push(check);
+            }
+        }
 
         // Reject addresses outside the known current shard set before spending
         // certificate-verification work. Missing attestations affect rewards,
@@ -3788,9 +3808,9 @@ impl MessageCollector {
         // The address check only engages once the valid-shard set has been
         // populated from the shards store (fail-open before the first refresh
         // so a just-started node doesn't drop everything).
-        if !checks.is_empty() {
+        if carries_header {
             let valid = self.valid_shard_addresses.read().unwrap();
-            for c in &checks {
+            for c in checks.iter().chain(&evidence) {
                 // A storage frame with NO attestation is NOT invalid: the app-shard
                 // validator binds an empty `storage_attestation_root` into its
                 // deterministic output like any other value (frame_validator.rs),
@@ -3889,7 +3909,7 @@ impl MessageCollector {
         let mut _claim = None;
         // Why a filed shard frame stays unverified, for the proposal line.
         let mut held = None;
-        if !keys.is_empty() && !verified {
+        if carries_header && !verified {
             let verifier = self.shard_frame_verifier.read().unwrap().clone();
             if let Some(verify) = verifier {
                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3923,13 +3943,13 @@ impl MessageCollector {
                     match verdict {
                         ShardFrameVerdict::Valid => message.verified = true,
                         ShardFrameVerdict::Invalid(reason) => {
-                            if let Some((address, frame_number)) = keys.first() {
+                            if let Some(c) = checks.iter().chain(&evidence).next() {
                                 self.note_reject(
                                     Instant::now(),
                                     Reject {
                                         kind: RejectKind::Verification,
-                                        address: address.clone(),
-                                        frame_number: *frame_number,
+                                        address: c.address.clone(),
+                                        frame_number: c.frame_number,
                                         valid_shard_count: self
                                             .valid_shard_addresses
                                             .read()
@@ -5726,7 +5746,8 @@ fn certificate_signers(signature: &[u8]) -> usize {
 /// (`quil_execution::global_intrinsic::handoff::fee_fence`). Held as a shard
 /// frame, the session's next frame, which extends it, would supersede it, and
 /// the session would stall unfenced; it is validated like any other GLOBAL
-/// message instead.
+/// message instead, once it passed a shard frame's admission
+/// ([`MessageCollector::admit`]).
 fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
     carried_headers(data)
         .into_iter()

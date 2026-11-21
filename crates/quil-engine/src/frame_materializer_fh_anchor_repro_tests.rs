@@ -434,6 +434,80 @@ fn fh_fix_a_collector_refuses_an_anchor_past_the_leaders_bound() {
     eprintln!("FH FIX: a collector holds an ahead anchor only within the leader's bound");
 }
 
+/// Fee vote fence evidence passes the admission a shard frame does: a
+/// header voting 0, out of bounds at every anchor here, is held unverified
+/// at the leader's bound and refused one past it and at `u64::MAX`, and one
+/// naming no known shard is refused before any verification. Whether a
+/// header is evidence rests on its own vote, which anyone sets. Filed
+/// unverified (until 2026-11-21), such a header skipped the address check,
+/// the verifier and every anchor check.
+#[test]
+fn fh_fix_a_collector_admits_fence_evidence_as_a_shard_frame() {
+    use crate::execution_deferral::{collector_verifier, CollectorDeferrals};
+    use crate::message_collector::{
+        fee_fence_keys, MessageCollector, Refusal, SubmitOutcome, RETENTION_WINDOW,
+    };
+    use quil_execution::global_intrinsic::frame_header::anchor_window;
+    struct Unbound;
+    impl Drop for Unbound {
+        fn drop(&mut self) {
+            crate::fees::set_fee_vote_bound_frame_for_thread(None);
+        }
+    }
+    crate::fees::set_fee_vote_bound_frame_for_thread(Some(0));
+    let _unbound = Unbound;
+    let (fixture, _) = materializer_with_header_deps();
+    fixture.current.observe(100);
+    let (_, newest) = anchor_window(101);
+    assert_eq!(
+        newest, 100,
+        "the next GLOBAL frame's window ends at the head"
+    );
+    let edge = newest + RETENTION_WINDOW;
+    let verifier = collector_verifier(
+        fixture.source.execution_manager.clone(),
+        fixture.current.clone(),
+        fixture.source.hypergraph.clone(),
+        Arc::new(CollectorDeferrals::default()),
+    );
+    let evidence = |anchor: u64| {
+        let bytes = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(
+            &junk_header_bundle(anchor),
+        )
+        .unwrap();
+        assert_eq!(
+            fee_fence_keys(&bytes),
+            vec![(vec![0x77; 32], 9)],
+            "anchor {anchor}: the header voting 0 is fence evidence"
+        );
+        bytes
+    };
+    let collector = MessageCollector::new();
+    collector.set_shard_frame_verifier_with_provenance(verifier.clone());
+    for (anchor, held) in [(edge, true), (edge + 1, false), (u64::MAX, false)] {
+        let outcome = collector.add_message_outcome(1, evidence(anchor));
+        let expected = if held {
+            SubmitOutcome::Accepted
+        } else {
+            SubmitOutcome::Filtered(Refusal::InvalidShardFrame)
+        };
+        assert_eq!(
+            outcome, expected,
+            "ADMIT-EVIDENCE: fence evidence anchored at {anchor} (leader's bound {edge}) is \
+             admitted as a shard frame anchored there would be"
+        );
+    }
+    let known = MessageCollector::new();
+    known.set_shard_frame_verifier_with_provenance(verifier);
+    known.set_valid_shard_addresses(std::collections::HashSet::from([vec![0x55; 32]]));
+    assert_eq!(
+        known.add_message_outcome(1, evidence(edge)),
+        SubmitOutcome::Filtered(Refusal::UnknownShard),
+        "ADMIT-EVIDENCE: fence evidence naming no known shard is refused"
+    );
+    eprintln!("FH FIX: a collector admits fence evidence as a shard frame");
+}
+
 // FH-R13, the member route. A GLOBAL member leading a view packs shard frame
 // headers no key signed, claiming a shard's next frame numbers. Voters certify
 // the frame (they do not execute carried headers) and every node executing it
