@@ -8,8 +8,9 @@
 //! counts by its /48), and only peers reached over an address family this
 //! node listens on, since a server dials back over the family it sees. The
 //! configured archive and bootstrap peers are registered from the start, so
-//! the first probe, 15 s after start, does not wait for identify. AutoNAT
-//! keeps its own probe rate.
+//! the first probe, 15 s after start, does not wait for identify; one
+//! connected over a family this node does not listen on is no server until
+//! that connection closes. AutoNAT keeps its own probe rate.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
@@ -48,20 +49,46 @@ pub(crate) fn ip_group(ip: IpAddr) -> IpAddr {
 }
 
 /// A change to AutoNAT's server list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ServerChange {
     Add(PeerId),
+    /// A configured peer serves again, at the addresses it is pinned at.
+    AddAt(PeerId, Vec<Multiaddr>),
     Remove(PeerId),
 }
 
 /// Apply `changes` to AutoNAT. Configured peers are added by the caller,
-/// with their address.
+/// with their addresses, and again with them after an off-family
+/// connection (see [`ProbeServers::on_connection`]).
 pub(crate) fn apply(autonat: &mut libp2p::autonat::Behaviour, changes: Vec<ServerChange>) {
     for change in changes {
         match change {
             ServerChange::Add(peer) => autonat.add_server(peer, None),
+            ServerChange::AddAt(peer, addrs) if addrs.is_empty() => autonat.add_server(peer, None),
+            ServerChange::AddAt(peer, addrs) => {
+                for addr in addrs {
+                    autonat.add_server(peer, Some(addr));
+                }
+            }
             ServerChange::Remove(peer) => autonat.remove_server(&peer),
         }
+    }
+}
+
+/// A configured peer AutoNAT probes.
+struct Pin {
+    /// Its remote IP group once known.
+    ip: Option<IpAddr>,
+    /// The addresses it is pinned at, in families this node listens on or
+    /// DNS names.
+    addrs: Vec<Multiaddr>,
+}
+
+impl Pin {
+    /// Whether it is pinned at an IP: one pinned at DNS names only keeps the
+    /// rule of an unknown family (see [`ProbeServers::on_connection`]).
+    fn at_an_ip(&self) -> bool {
+        self.addrs.iter().any(|addr| ip_of(addr).is_some())
     }
 }
 
@@ -76,8 +103,9 @@ pub(crate) struct ProbeServers {
     /// Connected peers whose identify lists the AutoNAT protocol.
     capable: HashSet<PeerId>,
     /// Configured peers, servers until identify shows they do not serve
-    /// AutoNAT; their IP once known.
-    pinned: HashMap<PeerId, Option<IpAddr>>,
+    /// AutoNAT, except while connected over an unlistened family (see
+    /// [`ProbeServers::on_connection`]).
+    pinned: HashMap<PeerId, Pin>,
     /// The other servers, with the IP each one holds.
     servers: HashMap<PeerId, IpAddr>,
     by_ip: HashMap<IpAddr, PeerId>,
@@ -99,22 +127,48 @@ impl ProbeServers {
         }
     }
 
-    /// The configured peer `peer` at `addr` is a server; the caller adds it
-    /// to AutoNAT with its address. It takes its IP from another server.
-    /// One on an address family this node does not listen on is removed.
-    pub(crate) fn pin(&mut self, peer: PeerId, addr: &Multiaddr) -> Vec<ServerChange> {
+    /// The configured peer `peer` at `addrs`, every address it is listed
+    /// at, is a server; the caller adds it to AutoNAT with those addresses.
+    /// It takes its IP from another server when one listened IP group is
+    /// all it can be reached at; with several (an archive's IPv4 and IPv6
+    /// entries on a node listening on both) its IP is the one it connects
+    /// from. One at no address in a family this node listens on is removed.
+    pub(crate) fn pin(&mut self, peer: PeerId, addrs: &[Multiaddr]) -> Vec<ServerChange> {
         if let Some(ip) = self.servers.remove(&peer) {
             self.by_ip.remove(&ip);
         }
-        let ip = ip_of(addr).map(ip_group);
-        if ip.is_some_and(|ip| !self.listened(ip)) {
+        let reachable: Vec<&Multiaddr> = addrs
+            .iter()
+            .filter(|addr| ip_of(addr).is_none_or(|ip| self.listened(ip)))
+            .collect();
+        let ips: Vec<Option<IpAddr>> = reachable
+            .iter()
+            .map(|addr| ip_of(addr).map(ip_group))
+            .collect();
+        let Some(&first) = ips.first() else {
             return vec![ServerChange::Remove(peer)];
+        };
+        let ip = if ips.iter().all(|&ip| ip == first) {
+            first
+        } else {
+            None
+        };
+        let addrs = reachable.into_iter().cloned().collect();
+        self.pinned.insert(peer, Pin { ip, addrs });
+        let mut changes = ip.map(|ip| self.evict(ip)).unwrap_or_default();
+        if self.suspended(&peer) {
+            changes.push(ServerChange::Remove(peer));
         }
-        self.pinned.insert(peer, ip);
-        ip.map(|ip| self.evict(ip)).unwrap_or_default()
+        changes
     }
 
-    /// A connection to `peer` from `remote` opened.
+    /// A connection to `peer` from `remote` opened. A configured peer
+    /// pinned at an IP is no server while it holds a connection over a
+    /// family this node does not listen on: AutoNAT would probe over it and
+    /// the server would dial back over that family. It serves again when
+    /// the last such connection closes ([`Self::on_connection_closed`]).
+    /// One pinned at DNS names only is removed for good by its first
+    /// connection over such a family, before its IP is known.
     pub(crate) fn on_connection(
         &mut self,
         conn: ConnectionId,
@@ -124,13 +178,35 @@ impl ProbeServers {
         let Some(ip) = ip_of(remote).map(ip_group) else {
             return Vec::new();
         };
+        let was_suspended = self.suspended(&peer);
         self.conns.insert(conn, (peer, ip));
-        if self.pinned.get(&peer) == Some(&None) {
-            if !self.listened(ip) {
+        let listened = self.listened(ip);
+        let Some(pin) = self.pinned.get_mut(&peer) else {
+            return Vec::new();
+        };
+        if !listened && !pin.at_an_ip() {
+            if pin.ip.is_none() {
                 self.pinned.remove(&peer);
                 return vec![ServerChange::Remove(peer)];
             }
-            self.pinned.insert(peer, Some(ip));
+            return Vec::new();
+        }
+        if !listened {
+            if was_suspended {
+                return Vec::new();
+            }
+            tracing::info!(
+                %peer,
+                remote = %remote,
+                "a configured AutoNAT server is connected over an address family this node does \
+                 not listen on (its listened-family addresses did not answer the dial, or it \
+                 dialed this node there); it is not probed until that connection closes, so \
+                 this node has one AutoNAT server less meanwhile"
+            );
+            return vec![ServerChange::Remove(peer)];
+        }
+        if pin.ip.is_none() {
+            pin.ip = Some(ip);
             return self.evict(ip);
         }
         Vec::new()
@@ -147,7 +223,7 @@ impl ProbeServers {
             if serves_autonat {
                 return Vec::new();
             }
-            let ip = self.pinned.remove(&peer).flatten();
+            let ip = self.pinned.remove(&peer).and_then(|pin| pin.ip);
             let mut changes = vec![ServerChange::Remove(peer)];
             changes.extend(ip.map(|ip| self.promote(ip)).unwrap_or_default());
             return changes;
@@ -173,13 +249,26 @@ impl ProbeServers {
         peer: PeerId,
         remaining: u32,
     ) -> Vec<ServerChange> {
+        let was_suspended = self.suspended(&peer);
         self.conns.remove(&conn);
+        let mut changes = Vec::new();
+        if was_suspended && !self.suspended(&peer) {
+            let addrs = self.pinned.get(&peer).map(|pin| pin.addrs.clone());
+            tracing::info!(
+                %peer,
+                "a configured AutoNAT server's connection over an address family this node does \
+                 not listen on closed; it is probed again, and its next dial tries the listened \
+                 family first"
+            );
+            changes.push(ServerChange::AddAt(peer, addrs.unwrap_or_default()));
+        }
         if remaining > 0 {
-            return Vec::new();
+            return changes;
         }
         // A configured peer stays a server: AutoNAT dials it when needed.
         self.capable.remove(&peer);
-        self.release(peer)
+        changes.extend(self.release(peer));
+        changes
     }
 
     /// The remote IP group (see [`ip_group`]) of `peer`'s open connection
@@ -196,7 +285,7 @@ impl ProbeServers {
         self.servers
             .get(peer)
             .copied()
-            .or_else(|| self.pinned.get(peer).copied().flatten())
+            .or_else(|| self.pinned.get(peer).and_then(|pin| pin.ip))
             .or_else(|| {
                 self.conns
                     .values()
@@ -206,7 +295,23 @@ impl ProbeServers {
 
     /// How many servers AutoNAT holds.
     pub(crate) fn count(&self) -> usize {
-        self.pinned.len() + self.servers.len()
+        let pinned = self
+            .pinned
+            .keys()
+            .filter(|peer| !self.suspended(peer))
+            .count();
+        pinned + self.servers.len()
+    }
+
+    /// Whether configured peer `peer`, pinned at an IP, holds a connection
+    /// over a family this node does not listen on, and so is no server
+    /// (see [`Self::on_connection`]).
+    fn suspended(&self, peer: &PeerId) -> bool {
+        self.pinned.get(peer).is_some_and(Pin::at_an_ip)
+            && self
+                .conns
+                .values()
+                .any(|&(p, ip)| p == *peer && !self.listened(ip))
     }
 
     fn listened(&self, ip: IpAddr) -> bool {
@@ -217,7 +322,7 @@ impl ProbeServers {
     }
 
     fn ip_taken(&self, ip: IpAddr) -> bool {
-        self.by_ip.contains_key(&ip) || self.pinned.values().any(|p| *p == Some(ip))
+        self.by_ip.contains_key(&ip) || self.pinned.values().any(|pin| pin.ip == Some(ip))
     }
 
     /// Make `peer` the server of `ip` if `ip` is listened, routable and free.
@@ -272,7 +377,7 @@ impl ProbeServers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ServerChange::{Add, Remove};
+    use ServerChange::{Add, AddAt, Remove};
 
     /// The node's routability rule, widened to the documentation ranges the
     /// tests use in place of real public addresses.
@@ -404,7 +509,7 @@ mod tests {
         let addr: Multiaddr = format!("/ip4/192.0.2.10/tcp/8336/p2p/{archive}")
             .parse()
             .unwrap();
-        assert!(net.servers.pin(archive, &addr).is_empty());
+        assert!(net.servers.pin(archive, &[addr]).is_empty());
         assert_eq!(net.servers.count(), 1);
         let peer = PeerId::random();
         assert!(net.identified(peer, "192.0.2.10", true).1.is_empty());
@@ -431,7 +536,7 @@ mod tests {
         assert_eq!(net.identified(peer, "192.0.2.10", true).1, vec![Add(peer)]);
         let archive = PeerId::random();
         let addr: Multiaddr = "/dns4/archive.example.com/tcp/8336".parse().unwrap();
-        assert!(net.servers.pin(archive, &addr).is_empty());
+        assert!(net.servers.pin(archive, &[addr]).is_empty());
         let remote: Multiaddr = "/ip4/192.0.2.10/tcp/8336".parse().unwrap();
         let conn = ConnectionId::new_unchecked(1_000);
         assert_eq!(
@@ -494,8 +599,202 @@ mod tests {
         assert_eq!(net.identified(v4, "198.51.100.7", true).1, vec![Add(v4)]);
         let archive = PeerId::random();
         let addr: Multiaddr = "/ip6/2001:db8:5::1/tcp/8336".parse().unwrap();
-        assert_eq!(net.servers.pin(archive, &addr), vec![Remove(archive)]);
+        assert_eq!(net.servers.pin(archive, &[addr]), vec![Remove(archive)]);
         assert_eq!(net.servers.count(), 1);
+    }
+
+    /// The node pins a configured peer at every address it is listed at.
+    fn pin_listed(
+        servers: &mut ProbeServers,
+        peer: PeerId,
+        addrs: &[Multiaddr],
+    ) -> Vec<ServerChange> {
+        servers.pin(peer, addrs)
+    }
+
+    /// An archive listed at its IPv4 and its IPv6 address, in either order,
+    /// stays a server on a node listening on IPv4 only, on IPv6 only, or on
+    /// both. On one family it holds that family's IP group; on both it
+    /// takes the IP of the connection it opens.
+    #[test]
+    fn an_archive_at_both_families_stays_a_server_on_any_listener() {
+        let v4: Multiaddr = "/ip4/192.0.2.10/udp/8336/quic-v1".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2001:db8:5::1/udp/8336/quic-v1".parse().unwrap();
+        let v4_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6_group: IpAddr = "2001:db8:5::".parse().unwrap();
+        for (listen_v4, listen_v6, held) in [
+            (true, false, Some(v4_ip)),
+            (false, true, Some(v6_group)),
+            (true, true, None),
+        ] {
+            for addrs in [[v4.clone(), v6.clone()], [v6.clone(), v4.clone()]] {
+                let mut net = Net {
+                    servers: ProbeServers::new(routable, listen_v4, listen_v6),
+                    next_conn: 0,
+                };
+                let archive = PeerId::random();
+                let changes = pin_listed(&mut net.servers, archive, &addrs);
+                eprintln!("REACH v6-bootstrap checked");
+                let case = format!("listen v4 {listen_v4} v6 {listen_v6}, listed {addrs:?}");
+                assert!(
+                    !changes.contains(&Remove(archive)),
+                    "an archive listed at both families lost its server ({case}): {changes:?}"
+                );
+                assert_eq!(net.servers.count(), 1, "{case}");
+                assert_eq!(net.servers.ip_of_server(&archive), held, "{case}");
+                if held.is_none() {
+                    net.connect(archive, "2001:db8:5::1");
+                    assert_eq!(net.servers.ip_of_server(&archive), Some(v6_group), "{case}");
+                }
+            }
+        }
+    }
+
+    /// Opens a connection to `peer` from `ip`; the changes it makes.
+    fn open(net: &mut Net, peer: PeerId, ip: &str) -> (ConnectionId, Vec<ServerChange>) {
+        net.next_conn += 1;
+        let conn = ConnectionId::new_unchecked(net.next_conn);
+        let remote = Multiaddr::from(ip.parse::<IpAddr>().unwrap()).with(Protocol::Udp(8336));
+        (conn, net.servers.on_connection(conn, peer, &remote))
+    }
+
+    /// A node listening on one family, with an archive pinned at its address
+    /// there: the archive's address, its IP in the other family, and the
+    /// archive.
+    fn pinned_archive(listen_v6: bool) -> (Net, Multiaddr, &'static str, PeerId) {
+        let (own, other) = if listen_v6 {
+            ("/ip6/2001:db8:5::1/udp/8336/quic-v1", "192.0.2.10")
+        } else {
+            ("/ip4/192.0.2.10/udp/8336/quic-v1", "2001:db8:5::1")
+        };
+        let own: Multiaddr = own.parse().unwrap();
+        let mut net = Net {
+            servers: ProbeServers::new(routable, !listen_v6, listen_v6),
+            next_conn: 0,
+        };
+        let archive = PeerId::random();
+        assert!(net
+            .servers
+            .pin(archive, std::slice::from_ref(&own))
+            .is_empty());
+        assert_eq!(
+            net.servers.count(),
+            1,
+            "the pinned archive serves (listen v6 {listen_v6})"
+        );
+        (net, own, other, archive)
+    }
+
+    /// An archive pinned at its address in the listened family that
+    /// connects over the other family (its listened address did not answer)
+    /// is no server while that connection is open: AutoNAT would probe over
+    /// it and the archive would dial back over a family this node does not
+    /// listen on. When the connection closes it serves again, at its pinned
+    /// address, and counts again.
+    #[test]
+    fn an_archive_over_the_unlistened_family_serves_again_once_that_connection_closes() {
+        for listen_v6 in [false, true] {
+            let (mut net, own, other, archive) = pinned_archive(listen_v6);
+            let (conn, changes) = open(&mut net, archive, other);
+            eprintln!("REACH v6-bootstrap checked: listen v6 {listen_v6}, opened {changes:?}");
+            assert_eq!(
+                changes,
+                vec![Remove(archive)],
+                "an archive connected over the unlistened family stayed a server (listen v6 \
+                 {listen_v6})"
+            );
+            assert_eq!(
+                net.servers.count(),
+                0,
+                "a suspended archive is counted as a server (listen v6 {listen_v6})"
+            );
+            let changes = net.servers.on_connection_closed(conn, archive, 0);
+            assert_eq!(
+                changes,
+                vec![AddAt(archive, vec![own.clone()])],
+                "an archive whose unlistened-family connection closed was not added back at its \
+                 pinned address (listen v6 {listen_v6})"
+            );
+            assert_eq!(net.servers.count(), 1, "listen v6 {listen_v6}");
+            assert_eq!(
+                net.servers.ip_of_server(&archive),
+                ip_of(&own).map(ip_group),
+                "listen v6 {listen_v6}"
+            );
+        }
+    }
+
+    /// An archive with a connection in each family is no server until the
+    /// unlistened family's connection closes, in either opening order;
+    /// closing its listened-family connection first changes nothing.
+    #[test]
+    fn an_archive_with_both_families_open_serves_once_the_unlistened_one_closes() {
+        for listen_v6 in [false, true] {
+            let (mut net, own, other, archive) = pinned_archive(listen_v6);
+            let own_ip = ip_of(&own).unwrap().to_string();
+            let (listened, changes) = open(&mut net, archive, &own_ip);
+            assert!(changes.is_empty(), "listen v6 {listen_v6}: {changes:?}");
+            let (unlistened, changes) = open(&mut net, archive, other);
+            assert_eq!(changes, vec![Remove(archive)], "listen v6 {listen_v6}");
+            let changes = net.servers.on_connection_closed(listened, archive, 1);
+            eprintln!(
+                "REACH v6-bootstrap checked: listen v6 {listen_v6}, closed listened {changes:?}"
+            );
+            assert!(
+                changes.is_empty(),
+                "an archive served again while its unlistened-family connection was open \
+                 (listen v6 {listen_v6}): {changes:?}"
+            );
+            assert_eq!(net.servers.count(), 0, "listen v6 {listen_v6}");
+            assert_eq!(
+                net.servers.on_connection_closed(unlistened, archive, 0),
+                vec![AddAt(archive, vec![own.clone()])],
+                "listen v6 {listen_v6}"
+            );
+            // The other order: the unlistened family first.
+            let (unlistened, changes) = open(&mut net, archive, other);
+            assert_eq!(changes, vec![Remove(archive)], "listen v6 {listen_v6}");
+            let (listened, changes) = open(&mut net, archive, &own_ip);
+            assert!(
+                changes.is_empty(),
+                "an archive served again while its unlistened-family connection was open \
+                 (listen v6 {listen_v6}): {changes:?}"
+            );
+            assert_eq!(
+                net.servers.on_connection_closed(unlistened, archive, 1),
+                vec![AddAt(archive, vec![own.clone()])],
+                "listen v6 {listen_v6}"
+            );
+            assert!(net
+                .servers
+                .on_connection_closed(listened, archive, 0)
+                .is_empty());
+            assert_eq!(net.servers.count(), 1, "listen v6 {listen_v6}");
+        }
+    }
+
+    /// A configured peer listed at a DNS name only is removed for good by a
+    /// first connection over a family this node does not listen on, as
+    /// before IPv6 entries: its family is unknown until it connects.
+    #[test]
+    fn a_peer_pinned_at_a_dns_name_over_the_unlistened_family_stays_removed() {
+        let mut net = Net {
+            servers: ProbeServers::new(routable, true, false),
+            next_conn: 0,
+        };
+        let archive = PeerId::random();
+        let addr: Multiaddr = "/dns/archive.example.com/udp/8336/quic-v1".parse().unwrap();
+        assert!(net.servers.pin(archive, &[addr]).is_empty());
+        let (conn, changes) = open(&mut net, archive, "2001:db8:5::1");
+        assert_eq!(changes, vec![Remove(archive)]);
+        let changes = net.servers.on_connection_closed(conn, archive, 0);
+        eprintln!("REACH v6-bootstrap checked: dns pin closed {changes:?}");
+        assert!(
+            changes.is_empty(),
+            "a peer pinned at a DNS name came back after an unlistened-family connection: \
+             {changes:?}"
+        );
+        assert_eq!(net.servers.count(), 0);
     }
 
     /// Probes go only to registered servers, at AutoNAT's own rate.

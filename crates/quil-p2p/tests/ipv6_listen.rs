@@ -2,7 +2,9 @@
 //! IPv6 listener serves gossip, it still dials out over IPv4 (a DS-Lite host:
 //! IPv6 inbound, IPv4 only through its carrier's NAT), and an IPv4 config stays
 //! on IPv4. The IPv4 and IPv6 wildcards share a port, as the default config
-//! has them. A host without an IPv6 loopback skips with the reason.
+//! has them. A peer listed at both families gets one connection, over the
+//! listened family while it answers and over the other family when it does
+//! not. A host without an IPv6 loopback skips with the reason.
 //!
 //! Every listener binds port 0 and the test reads the port the kernel gave
 //! it: a probed port is free only until the probe closes, and nextest runs
@@ -90,7 +92,20 @@ async fn gossip_to(
 ) {
     let mut config = base_config();
     config.bootstrap_peers = vec![dial.to_string()];
-    let node = P2PNode::new_with_options(&config, true, None).unwrap();
+    publish_over(sup, &config, listen, inbound, payload).await;
+}
+
+/// A node with `config` on `listen` that publishes one message, which
+/// `inbound` must deliver; the node, once it did.
+async fn publish_over(
+    sup: &mut Supervisor,
+    config: &quil_config::P2PConfig,
+    listen: &str,
+    inbound: &mut mpsc::Receiver<ReceivedMessage>,
+    payload: &[u8],
+) -> P2PHandle {
+    let dial = &config.bootstrap_peers;
+    let node = P2PNode::new_with_options(config, true, None).unwrap();
     let (sender, _rx) = node.start(sup, listen).await.unwrap();
     sender.subscribe_confirmed(topic()).await.unwrap();
     // The sender dials its bootstrap peer on its first discovery tick, and
@@ -101,7 +116,7 @@ async fn gossip_to(
         match sender.publish(topic(), data.clone()).await {
             Ok(()) => break,
             Err(e) if tokio::time::Instant::now() > deadline => {
-                panic!("not published over {dial}: {e}")
+                panic!("not published over {dial:?}: {e}")
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
         }
@@ -115,8 +130,9 @@ async fn gossip_to(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("not delivered over {dial}"));
+    .unwrap_or_else(|_| panic!("not delivered over {dial:?}"));
     assert_eq!(message.bitmask, topic());
+    sender
 }
 
 /// Whether the node lists `expected` within `wait`.
@@ -378,4 +394,229 @@ async fn an_ipv6_listener_that_cannot_bind_leaves_ipv4_serving() {
         b"over ipv4 beside a failed ipv6 listener",
     )
     .await;
+}
+
+/// The outbound connections `node` established, from its metrics.
+fn outbound_connections(node: &P2PHandle) -> u64 {
+    let metrics = node.render_metrics();
+    let line = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("libp2p_connections_established")
+                && line.to_ascii_lowercase().contains("direction=\"outbound\"")
+        })
+        .unwrap_or_else(|| panic!("no outbound connection count in the metrics:\n{metrics}"));
+    let count = line.rsplit(' ').next().unwrap_or_default();
+    count
+        .parse::<f64>()
+        .unwrap_or_else(|e| panic!("{line}: {e}")) as u64
+}
+
+/// A node listed at the two addresses `at` (address prefixes to the port,
+/// read from its listen address `bound`) in a peer's bootstrap and direct
+/// lists, as the built-in list names each archive at its IPv4 and its IPv6
+/// address: the peer delivers gossip to it over one connection, not one
+/// per address or list entry.
+async fn one_connection_to_a_peer_at(
+    listen: &str,
+    additional: &[String],
+    bound: [&str; 2],
+    at: [&str; 2],
+    suffix: &str,
+) {
+    let mut sup = Supervisor::new();
+    let (node, mut inbound, id) = start_receiver(&mut sup, listen, additional).await;
+    let mut entries = Vec::new();
+    for (bound, at) in bound.iter().zip(at) {
+        let port = bound_port(&node, bound).await;
+        entries.push(format!("{at}{port}{suffix}/p2p/{id}"));
+    }
+    let mut config = base_config();
+    config.additional_listen_multiaddrs = additional.to_vec();
+    config.bootstrap_peers = entries.clone();
+    config.direct_peers = entries.iter().rev().cloned().collect();
+    let sender = publish_over(&mut sup, &config, listen, &mut inbound, b"one connection").await;
+    let connections = outbound_connections(&sender);
+    eprintln!("REACH v6-bootstrap checked: {connections} connection(s) over {entries:?}");
+    assert_eq!(
+        connections, 1,
+        "a peer listed at two addresses holds one connection per address: {entries:?}"
+    );
+}
+
+/// An archive listed at its IPv4 and its IPv6 address gets one connection
+/// from a dual-stack node; two IPv4 addresses of one peer stand in for the
+/// pair on a host without an IPv6 loopback, and run on every host.
+#[tokio::test]
+async fn a_peer_listed_at_two_addresses_gets_one_connection() {
+    one_connection_to_a_peer_at(
+        "/ip4/0.0.0.0/tcp/0",
+        &[],
+        ["/ip4/127.0.0.1/tcp/", "/ip4/127.0.0.1/tcp/"],
+        ["/ip4/127.0.0.1/tcp/", "/ip4/127.0.0.2/tcp/"],
+        "",
+    )
+    .await;
+    if !ipv6_loopback("a_peer_listed_at_two_addresses_gets_one_connection, its dual-stack half") {
+        return;
+    }
+    one_connection_to_a_peer_at(
+        "/ip4/0.0.0.0/udp/0/quic-v1",
+        &["/ip6/::/udp/0/quic-v1".to_string()],
+        ["/ip4/127.0.0.1/udp/", "/ip6/::1/udp/"],
+        ["/ip4/127.0.0.1/udp/", "/ip6/::1/udp/"],
+        "/quic-v1",
+    )
+    .await;
+}
+
+/// The QUIC multiaddr of a UDP socket address.
+fn quic_at(addr: std::net::SocketAddr) -> String {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => format!("/ip4/{ip}/udp/{}/quic-v1", addr.port()),
+        std::net::IpAddr::V6(ip) => format!("/ip6/{ip}/udp/{}/quic-v1", addr.port()),
+    }
+}
+
+/// A UDP socket on `loopback` (`127.0.0.1` or `[::1]`) that answers
+/// nothing: a configured address that does not answer.
+fn silent_udp(loopback: &str) -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind(format!("{loopback}:0")).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    socket
+}
+
+/// The datagrams `socket` received so far.
+fn datagrams(socket: &std::net::UdpSocket) -> usize {
+    let mut buf = [0u8; 2048];
+    let mut count = 0;
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok(_) => count += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return count,
+            Err(e) => panic!("{socket:?}: {e}"),
+        }
+    }
+}
+
+/// A listened family for the dial-order tests: the node's QUIC listen
+/// address and loopback, and the other family's loopback.
+type DialFamily = (&'static str, &'static str, &'static str);
+const DIAL_FAMILIES: [DialFamily; 2] = [
+    ("/ip4/0.0.0.0/udp/0/quic-v1", "127.0.0.1", "[::1]"),
+    ("/ip6/::/udp/0/quic-v1", "[::1]", "127.0.0.1"),
+];
+
+/// The receiving node's QUIC listen address on `loopback`.
+fn quic_listen(loopback: &str) -> &'static str {
+    if loopback == "127.0.0.1" {
+        "/ip4/0.0.0.0/udp/0/quic-v1"
+    } else {
+        "/ip6/::/udp/0/quic-v1"
+    }
+}
+
+/// Its QUIC listen address prefix, to the port.
+fn quic_prefix(loopback: &str) -> &'static str {
+    if loopback == "127.0.0.1" {
+        "/ip4/127.0.0.1/udp/"
+    } else {
+        "/ip6/::1/udp/"
+    }
+}
+
+/// An archive listed at both families, with both answering, is reached
+/// over the family of the node's listen address only: a server dials back
+/// over the family a probe arrives on. The other family's address is a
+/// UDP socket that must receive no datagram: one dial of both families
+/// sends its first packet there at once, before the listened family's
+/// handshake ends, and so before the gossip that follows it arrives.
+#[tokio::test]
+async fn an_archive_listed_at_both_families_is_reached_over_the_listened_one() {
+    if !ipv6_loopback("an_archive_listed_at_both_families_is_reached_over_the_listened_one") {
+        return;
+    }
+    for (listen, own, other) in DIAL_FAMILIES {
+        let mut sup = Supervisor::new();
+        let (node, mut inbound, id) = start_receiver(&mut sup, quic_listen(own), &[]).await;
+        let port = bound_port(&node, quic_prefix(own)).await;
+        let own = format!("{}{port}/quic-v1/p2p/{id}", quic_prefix(own));
+        let decoy = silent_udp(other);
+        let other = format!("{}/p2p/{id}", quic_at(decoy.local_addr().unwrap()));
+        let mut config = base_config();
+        config.bootstrap_peers = vec![other.clone(), own.clone()];
+        config.direct_peers = vec![other.clone(), own.clone()];
+        publish_over(&mut sup, &config, listen, &mut inbound, b"listened family").await;
+        let received = datagrams(&decoy);
+        eprintln!("REACH v6-bootstrap checked: listen {listen}, {received} datagram(s) at {other}");
+        assert_eq!(
+            received, 0,
+            "an archive listed at both families was dialed over the family this node does not \
+             listen on: {other} (listen {listen})"
+        );
+    }
+}
+
+/// The node dials an archive's first address at once, and a tick redial
+/// comes 30 s later: an archive reached sooner was reached by the first
+/// dial.
+const BEFORE_A_TICK: Duration = Duration::from_secs(25);
+
+/// An archive whose listened-family addresses `dead` do not answer is
+/// reached over its address in the other family by the same dial, before
+/// a tick redial.
+async fn reached_over_the_other_family(listen: &str, other: &str, dead: &[String], case: &str) {
+    let mut sup = Supervisor::new();
+    let (node, mut inbound, id) = start_receiver(&mut sup, quic_listen(other), &[]).await;
+    let port = bound_port(&node, quic_prefix(other)).await;
+    let reachable = format!("{}{port}/quic-v1/p2p/{id}", quic_prefix(other));
+    let mut config = base_config();
+    config.bootstrap_peers = dead
+        .iter()
+        .map(|addr| format!("{addr}/p2p/{id}"))
+        .chain([reachable.clone()])
+        .collect();
+    let started = tokio::time::Instant::now();
+    publish_over(&mut sup, &config, listen, &mut inbound, case.as_bytes()).await;
+    let took = started.elapsed();
+    eprintln!("REACH v6-bootstrap checked: {case}, listen {listen}, reached in {took:?}");
+    assert!(
+        took < BEFORE_A_TICK,
+        "an archive whose listened-family addresses do not answer was reached over {reachable} \
+         only after {took:?}, by a later redial ({case}, listen {listen})"
+    );
+}
+
+/// An archive whose listened-family address is closed is reached over its
+/// address in the other family by the same dial.
+#[tokio::test]
+async fn an_archive_whose_listened_address_is_closed_is_reached_over_the_other_family() {
+    if !ipv6_loopback(
+        "an_archive_whose_listened_address_is_closed_is_reached_over_the_other_family",
+    ) {
+        return;
+    }
+    for (listen, own, other) in DIAL_FAMILIES {
+        let closed = quic_at(silent_udp(own).local_addr().unwrap());
+        reached_over_the_other_family(listen, other, &[closed], "closed listened address").await;
+    }
+}
+
+/// An archive behind two silent listened-family addresses is reached over
+/// its third address, in the other family: every address of one libp2p
+/// dial starts its transport timeout when the dial starts, so the other
+/// family takes a dial of its own.
+#[tokio::test]
+async fn an_archive_behind_two_silent_listened_addresses_is_reached_over_the_third() {
+    if !ipv6_loopback("an_archive_behind_two_silent_listened_addresses_is_reached_over_the_third") {
+        return;
+    }
+    for (listen, own, other) in DIAL_FAMILIES {
+        let silent = [silent_udp(own), silent_udp(own)];
+        let dead: Vec<String> = silent
+            .iter()
+            .map(|socket| quic_at(socket.local_addr().unwrap()))
+            .collect();
+        reached_over_the_other_family(listen, other, &dead, "two silent listened addresses").await;
+    }
 }
