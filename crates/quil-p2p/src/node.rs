@@ -970,7 +970,7 @@ impl P2PNode {
             // queue's share kept for gossip ([`crate::direct::DirectAdmission`]).
             let mut direct_admission = crate::direct::DirectAdmission::default();
             let mut bootstrapped = false;
-            let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
+            let mut discovery_timer = tokio::time::interval(DISCOVERY_INTERVAL);
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
             let mut ticks_without_listener = 0u32;
@@ -1773,6 +1773,15 @@ impl P2PNode {
         Ok((handle, inbound, port))
     }
 }
+
+/// How long a test waits for a node's bootstrap peer to connect: past the
+/// discovery tick, which re-dials a bootstrap peer whose first dial failed.
+#[doc(hidden)]
+pub const CONNECT_WAIT: Duration = Duration::from_secs(DISCOVERY_INTERVAL.as_secs() + 10);
+
+/// How often the node runs peer discovery and re-dials a bootstrap peer it
+/// is not connected to; the first round runs at the start.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A listener's transport, for [`P2PNode::start_on_loopback`] and
 /// [`P2PHandle::bound_port`].

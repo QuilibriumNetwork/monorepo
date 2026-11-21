@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use quil_p2p::node::{ListenFamily, ListenTransport};
+use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
 use quil_p2p::{ClassTraffic, Flow, GossipClass, P2PNode};
 
 #[tokio::test]
@@ -41,7 +41,7 @@ async fn gossip_messages_are_counted_by_class_on_both_nodes() {
     // The sender dials its bootstrap peer on its first discovery tick, and
     // publishing fails until it knows the receiver's subscription.
     let vote = [&[0x80u8][..], &[1u8; 8][..], &b"a vote"[..]].concat();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     loop {
         match sender.publish(cw.clone(), vote.clone()).await {
             Ok(()) => break,

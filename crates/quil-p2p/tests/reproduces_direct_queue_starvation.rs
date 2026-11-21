@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use quil_p2p::node::{ListenFamily, ListenTransport};
+use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
 use quil_p2p::{DirectOutcome, P2PNode};
 
 /// Slots of the node's receive queue (`P2PNode::start`).
@@ -41,7 +41,7 @@ async fn reproduces_direct_messages_filling_the_receive_queue() {
 
     let allowed = vec![1, 7, 7];
     receiver.allow_direct(allowed.clone()).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     let mut delivered = loop {
         let outcome = sender
             .send_direct(receiver_id, allowed.clone(), vec![0])

@@ -4,8 +4,32 @@
 
 use std::time::Duration;
 
-use quil_p2p::node::{ListenFamily, ListenTransport};
-use quil_p2p::{DirectOutcome, P2PNode};
+use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
+use quil_p2p::{DirectOutcome, P2PHandle, P2PNode};
+
+/// The connection counters [`connection_state`] reports.
+const COUNTERS: [&str; 3] = [
+    "libp2p_connections_",
+    "libp2p_dial_failures",
+    "libp2p_incoming_failures",
+];
+
+/// A node's listen addresses, peer count and connection counters, for a
+/// failure message: whether it listened, dialed, connected or lost the
+/// connection.
+fn connection_state(name: &str, node: &P2PHandle) -> String {
+    let metrics = node.render_metrics();
+    let counters: Vec<&str> = metrics
+        .lines()
+        .filter(|line| COUNTERS.iter().any(|c| line.starts_with(c)))
+        .collect();
+    format!(
+        "{name}: listening on {:?}, {} peers, {}",
+        node.listen_addresses(),
+        node.peer_count(),
+        counters.join(", ")
+    )
+}
 
 #[tokio::test]
 async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
@@ -36,7 +60,7 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
     let allowed = vec![1, 7, 7];
     receiver.allow_direct(allowed.clone()).await;
     // The sender dials its bootstrap peer on its first discovery tick.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     let outcome = loop {
         let outcome = sender
             .send_direct(receiver_id, allowed.clone(), b"resolver response".to_vec())
@@ -46,7 +70,13 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    assert_eq!(outcome, DirectOutcome::Delivered);
+    assert_eq!(
+        outcome,
+        DirectOutcome::Delivered,
+        "{}; {}",
+        connection_state("sender", &sender),
+        connection_state("receiver", &receiver)
+    );
     let message = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
         .await
         .unwrap()

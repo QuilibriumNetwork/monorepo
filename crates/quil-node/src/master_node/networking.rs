@@ -717,7 +717,7 @@ mod tests {
                 p2p.subscribe(topic.to_vec()).await;
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
         for topic in topics {
             loop {
                 let peers = relay
@@ -767,7 +767,7 @@ mod tests {
         /// of the other topics.
         async fn wait_for_meshes(&mut self) {
             let alert = quil_engine::bitmasks::GLOBAL_ALERT.to_vec();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
             let mut n = 0;
             'publish: loop {
                 let _ = self.source.publish(alert.clone(), control_alert(n)).await;
@@ -1017,7 +1017,7 @@ mod tests {
             start_node(&mut chain._sup, Some((chain.relay_port, chain.relay_id))).await;
         chain._inbound.push(member_rx);
         member.subscribe(alert.to_vec()).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
         while chain
             .relay
             .subscribed_peer_count(alert.to_vec())

@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use quil_p2p::node::{ListenFamily, ListenTransport};
+use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
 use quil_p2p::{P2PHandle, P2PNode, ReceivedMessage};
 use tokio::sync::mpsc;
 
@@ -98,7 +98,7 @@ async fn publish_over(
     // The sender dials its bootstrap peer on its first discovery tick, and
     // publishing fails until it knows the receiver's subscription.
     let data = [&[0x80u8][..], &[1u8; 8][..], payload].concat();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     loop {
         match sender.publish(topic(), data.clone()).await {
             Ok(()) => break,
