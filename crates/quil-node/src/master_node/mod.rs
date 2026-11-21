@@ -2023,7 +2023,7 @@ pub(crate) async fn start(
             recent_messages: recent_messages.clone(),
             config_brief: crate::effective_config::EffectiveConfig::resolve(
                 config,
-                &crate::effective_config::Runtime::detect(0, network, archive_mode, false),
+                &crate::effective_config::Runtime::detect(config, 0, network, archive_mode, false),
             )
             .status_brief({
                 // The slots the built verifier admits, whatever chose them.

@@ -356,6 +356,10 @@ pub struct MaterializeResult {
     /// header no key signed claiming any number, and recorded as carried it
     /// would make every collector drop the genuine frame of that number.
     pub skipped_bundles: Vec<Vec<u8>>,
+    /// The storage seat parts execution applied, as it reports them: never
+    /// read from the bundles, whose refused steps applied nothing. The
+    /// caller feeds them to `MessageCollector::mark_applied`.
+    pub seat_parts: Vec<quil_types::execution::SeatPartChange>,
     /// The prover lifecycle filters the frame's bundles carried.
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
     /// A publication's execution, recorded once its batch commits; every
@@ -550,6 +554,7 @@ impl FrameMaterializer {
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
+                seat_parts: Vec::new(),
                 prover_ops: Default::default(),
                 execution: None,
             });
@@ -575,6 +580,7 @@ impl FrameMaterializer {
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
+                seat_parts: Vec::new(),
                 prover_ops: Default::default(),
                 execution: None,
             });
@@ -733,6 +739,7 @@ impl FrameMaterializer {
                 },
                 finalized_bundles: Vec::new(),
                 skipped_bundles: Vec::new(),
+                seat_parts: Vec::new(),
                 prover_ops: Default::default(),
                 execution: None,
             });
@@ -851,6 +858,7 @@ impl FrameMaterializer {
         // mempool: those execution processed, whose shard frames count as
         // carried, and those it skipped, whose claims count for nothing.
         let mut finalized_bundles: Vec<Vec<u8>> = Vec::with_capacity(frame.requests.len());
+        let mut seat_parts: Vec<quil_types::execution::SeatPartChange> = Vec::new();
         let mut skipped_bundles: Vec<Vec<u8>> = Vec::new();
         // Per-bundle materialization outcome, ONE per `frame.requests` entry in
         // order (so the explorer can align it to each request). Every path
@@ -1174,8 +1182,9 @@ impl FrameMaterializer {
             );
             prover_ops.record(&bundle_bytes, result.is_ok());
             match result {
-                Ok(_) => {
+                Ok(result) => {
                     processed += 1;
+                    seat_parts.extend(result.seat_parts);
                     let fees = self
                         .execution_manager
                         .message_token_fees(&route_addr, &bundle_bytes);
@@ -1784,6 +1793,7 @@ impl FrameMaterializer {
             local_prover_root: post_root,
             finalized_bundles,
             skipped_bundles,
+            seat_parts,
             prover_ops,
             execution,
         })
@@ -3410,6 +3420,7 @@ mod tests {
             local_prover_root: vec![0xAA; 64],
             finalized_bundles: Vec::new(),
             skipped_bundles: Vec::new(),
+            seat_parts: Vec::new(),
             prover_ops: Default::default(),
             execution: None,
         };

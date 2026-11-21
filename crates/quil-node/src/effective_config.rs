@@ -13,6 +13,7 @@
 //! few most-asked values ([`EffectiveConfig::status_brief`]) in `node status`,
 //! so any recent log window answers them after the startup line rotated away.
 
+use crate::master_node::worker_manager::auto_worker_count;
 use quil_config::Config;
 use tracing::info;
 
@@ -37,6 +38,9 @@ pub(crate) struct Runtime {
     pub dht_only: bool,
     /// CPUs this process may use (cgroup-aware).
     pub cpus: u32,
+    /// Workers the master runs when `dataWorkerCount` is unset
+    /// ([`auto_worker_count`]).
+    pub auto_workers: u32,
     /// This process's store cache, bytes, when the store has one of its own:
     /// an archive's, or any store's under `QUIL_ROCKSDB_BLOCK_CACHE_MB`.
     pub store_cache_bytes: u64,
@@ -54,7 +58,13 @@ pub(crate) struct Runtime {
 
 impl Runtime {
     /// The values of the running process.
-    pub(crate) fn detect(core: u32, network: u8, archive: bool, dht_only: bool) -> Self {
+    pub(crate) fn detect(
+        config: &Config,
+        core: u32,
+        network: u8,
+        archive: bool,
+        dht_only: bool,
+    ) -> Self {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(4);
@@ -62,12 +72,14 @@ impl Runtime {
             .filter(|(name, _)| name.starts_with("QUIL_"))
             .collect();
         env.sort();
+        let auto_workers = auto_worker_count(config, core, archive, dht_only);
         Self {
             core,
             network,
             archive,
             dht_only,
             cpus,
+            auto_workers,
             store_cache_bytes: quil_store::effective_block_cache_bytes(archive && core == 0) as u64,
             worker_cache_bytes: quil_store::effective_block_cache_bytes(false) as u64,
             shared_cache_bytes: quil_store::shared_block_cache_bytes,
@@ -223,7 +235,7 @@ impl EffectiveConfig {
         } else if cluster {
             0
         } else {
-            runtime.cpus.saturating_sub(1).max(1)
+            runtime.auto_workers
         };
         let own = mb(runtime.store_cache_bytes);
         let per_worker = mb(runtime.worker_cache_bytes);
@@ -319,6 +331,7 @@ impl EffectiveConfig {
     pub(crate) fn log(&self) {
         info!(
             build_fingerprint = self.build_fingerprint,
+            build_commit = crate::build_commit::label(),
             core = self.core,
             network = self.network,
             mode = self.mode,
@@ -416,6 +429,7 @@ mod tests {
             archive: false,
             dht_only: false,
             cpus: 8,
+            auto_workers: 7,
             store_cache_bytes: 256 << 20,
             worker_cache_bytes: 256 << 20,
             shared_cache_bytes: default_shared_cache,
@@ -470,7 +484,7 @@ mod tests {
         let config = config_from(
             "proofWorker:\n  maxConcurrent: 6\n  nativeThreads: 2\nengine:\n  dataWorkerCount: 3\nlogger:\n  stderrLevel: info\n",
         );
-        let runtime = Runtime::detect(0, 0, false, false);
+        let runtime = Runtime::detect(&config, 0, 0, false, false);
         let effective = EffectiveConfig::resolve(&config, &runtime);
         std::env::remove_var("QUIL_ROCKSDB_BLOCK_CACHE_MB");
         assert_eq!(effective.mode, "regular");
@@ -520,7 +534,10 @@ mod tests {
         assert_eq!(effective.block_cache_total_mb, 4096);
         assert_eq!(effective.env_overrides, "none");
         let regular = EffectiveConfig::resolve(&config, &runtime(&[]));
-        assert_eq!(regular.workers, 7, "cpus - 1 when dataWorkerCount is unset");
+        assert_eq!(
+            regular.workers, 7,
+            "the derived count when dataWorkerCount is unset"
+        );
         assert_eq!(
             regular.block_cache_total_mb, 1024,
             "master and 7 workers share the 1 GB budget"
@@ -545,7 +562,7 @@ mod tests {
         if std::env::var_os("QUIL_ROCKSDB_BLOCK_CACHE_MB").is_none()
             && std::env::var_os("QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB").is_none()
         {
-            let detected = Runtime::detect(0, 0, false, false);
+            let detected = Runtime::detect(&thread(15), 0, 0, false, false);
             let effective = EffectiveConfig::resolve(&thread(15), &detected);
             let text = captured(|| effective.log());
             for shown in [
@@ -555,7 +572,7 @@ mod tests {
             ] {
                 assert!(text.contains(shown), "{shown} missing: {text}");
             }
-            let worker = Runtime::detect(3, 0, false, false);
+            let worker = Runtime::detect(&thread(15), 3, 0, false, false);
             let effective = EffectiveConfig::resolve(&thread(15), &worker);
             assert_eq!(effective.block_cache_total_mb, 256, "a worker process");
         }

@@ -181,6 +181,10 @@ pub struct GlobalParentExecutor {
     /// Finalization materializes the application frames each GLOBAL frame
     /// sequences before executing it ([`Self::sequence_with_ingest`]).
     sequenced: AtomicBool,
+    /// Seat parts a test has the execution of the ancestor of each one's
+    /// frame report besides its own ([`Self::plant_seat_parts`]).
+    #[cfg(test)]
+    planted: std::sync::Mutex<Vec<quil_types::execution::SeatPartChange>>,
 }
 
 /// Ancestors an earlier preparation executed above the published base,
@@ -200,6 +204,8 @@ struct ExecutedAncestry {
     frames: Vec<GlobalFrame>,
     /// Bundles those frames consumed.
     consumed: Vec<Vec<u8>>,
+    /// The storage seat parts those frames applied.
+    seat_parts: Vec<quil_types::execution::SeatPartChange>,
     /// When its database view was captured; every child reads through it.
     captured: Instant,
 }
@@ -217,6 +223,7 @@ struct KeptExecution {
     branch: MaterializerBranch,
     executed: usize,
     consumed: Vec<Vec<u8>>,
+    seat_parts: Vec<quil_types::execution::SeatPartChange>,
     captured: Instant,
 }
 
@@ -343,6 +350,11 @@ impl PreparedGlobalParent {
     #[cfg(test)]
     pub(crate) fn kept_ancestors(&self) -> usize {
         self.kept
+    }
+    /// A proposal's leader over its branch.
+    #[cfg(test)]
+    pub(crate) fn proposal_leader(&self) -> Option<&GlobalLeaderProvider> {
+        self.leader.as_ref()
     }
     pub(crate) fn check(&self) -> Result<()> {
         if self.started.elapsed() > self.max_elapsed {
@@ -774,7 +786,27 @@ impl GlobalParentExecutor {
             executed: Default::default(),
             finalized: std::sync::atomic::AtomicU64::new(0),
             sequenced: AtomicBool::new(false),
+            #[cfg(test)]
+            planted: Default::default(),
         }
+    }
+
+    /// Have executing an ancestor report `parts` of its frame as applied,
+    /// besides what its execution applied.
+    #[cfg(test)]
+    pub(crate) fn plant_seat_parts(&self, parts: Vec<quil_types::execution::SeatPartChange>) {
+        *self.planted.lock().unwrap() = parts;
+    }
+
+    /// `result`, the execution of ancestor `frame`, with the parts planted
+    /// for it ([`Self::plant_seat_parts`]).
+    #[cfg(test)]
+    fn with_planted(&self, mut result: TentativeFrameResult, frame: u64) -> TentativeFrameResult {
+        let planted = self.planted.lock().unwrap();
+        result
+            .seat_parts
+            .extend(planted.iter().filter(|part| part.frame == frame).cloned());
+        result
     }
 
     /// Finalization brings this archive's application state to each GLOBAL
@@ -999,6 +1031,7 @@ impl GlobalParentExecutor {
         }
         let parent = ancestry.first().cloned().unwrap_or_else(|| base.clone());
         let mut consumed = Vec::new();
+        let mut seat_parts = Vec::new();
         let mut kept = 0;
         let mut keep = None;
         if ancestry.is_empty() {
@@ -1014,6 +1047,7 @@ impl GlobalParentExecutor {
                 branch = child.branch;
                 kept = child.executed;
                 consumed = child.consumed;
+                seat_parts = child.seat_parts;
                 captured = child.captured;
                 timing.mark("kept ancestors");
             }
@@ -1033,7 +1067,11 @@ impl GlobalParentExecutor {
             let txn = clock.new_transaction(false)?;
             clock.put_global_clock_frame(frame, txn.as_ref())?;
             txn.commit()?;
-            consumed.extend(branch.materialize(frame)?.consumed_bundles);
+            let result = branch.materialize(frame)?;
+            #[cfg(test)]
+            let result = self.with_planted(result, header.frame_number);
+            consumed.extend(result.consumed_bundles);
+            seat_parts.extend(result.seat_parts);
         }
         timing.mark("execute ancestors");
         if let Ok(mut authenticated) = self.authenticated.lock() {
@@ -1056,6 +1094,7 @@ impl GlobalParentExecutor {
                             base,
                             frames: ancestry.iter().rev().cloned().collect(),
                             consumed: consumed.clone(),
+                            seat_parts: seat_parts.clone(),
                             captured,
                         });
                     }
@@ -1075,7 +1114,11 @@ impl GlobalParentExecutor {
                 number + 1,
                 self.limits.max_proposal_message_bytes,
                 self.limits.max_proposal_message_items,
-                &consumed,
+                crate::leader_provider::ExecutedAncestors {
+                    base: cursor,
+                    consumed: &consumed,
+                    seat_parts: &seat_parts,
+                },
             )?)
         } else {
             None
@@ -1136,6 +1179,7 @@ impl GlobalParentExecutor {
                 branch,
                 executed: kept.frames.len(),
                 consumed: kept.consumed.clone(),
+                seat_parts: kept.seat_parts.clone(),
                 captured: kept.captured,
             }),
             Err(error) => {

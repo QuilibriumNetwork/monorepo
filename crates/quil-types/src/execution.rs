@@ -9,6 +9,32 @@ pub struct ProcessMessageResult {
     pub messages: Vec<Vec<u8>>,
     /// Serialized state changes.
     pub state: Vec<u8>,
+    /// The storage seat parts this message applied, in order.
+    pub seat_parts: Vec<SeatPartChange>,
+}
+
+/// What a message did to one storage seat part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeatPartKind {
+    /// A storage epoch proof sealed the seat's epoch.
+    Sealed,
+    /// A storage epoch proof settled the seat's epoch.
+    Settled,
+    /// A registration (re)started the seat: what it applied before no
+    /// longer stands.
+    Registered,
+}
+
+/// A storage seat part a message applied: the member's seat on a shard,
+/// at the epoch a seal or settlement covers (for a registration, the
+/// epoch it starts at), and the frame applying it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SeatPartChange {
+    pub member: [u8; 32],
+    pub shard: Vec<u8>,
+    pub kind: SeatPartKind,
+    pub epoch: u64,
+    pub frame: u64,
 }
 
 /// State change event types.

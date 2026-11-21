@@ -743,10 +743,11 @@ async fn wallet_pending_flow(fund_escrow: bool, disk: bool) {
                 refund_recovery: funding.statement.refund_recovery.clone(),
             };
             address = escrow.encode(&wallets[0].context).unwrap().0;
-            wallets[0]
-                .submit(&mut client, &km, bytes.clone())
-                .await
-                .unwrap();
+            let checked =
+                RootChecked::check(&wallets[0], &client, bytes.clone(), RootLimit::Retained)
+                    .await
+                    .unwrap();
+            wallets[0].submit(&mut client, &km, checked).await.unwrap();
             assert_eq!(
                 roots::read_current(&state, &network, &application)
                     .unwrap()
@@ -799,8 +800,16 @@ async fn wallet_pending_flow(fund_escrow: bool, disk: bool) {
             claim.proof.len(),
             started.elapsed().as_secs_f64()
         );
+        let checked = RootChecked::check(
+            &wallets[selected],
+            &client,
+            bytes.clone(),
+            RootLimit::Retained,
+        )
+        .await
+        .unwrap();
         wallets[selected]
-            .submit(&mut client, &km, bytes.clone())
+            .submit(&mut client, &km, checked)
             .await
             .unwrap();
         expected_deliveries.push(bytes.clone());
@@ -811,9 +820,15 @@ async fn wallet_pending_flow(fund_escrow: bool, disk: bool) {
         assert_eq!(root.coins, if fund_escrow { 5 } else { 2 });
         // Resubmitting the executed claim is a replay: the engine rejects it
         // on the committed consumption marker and the root is unchanged.
-        let replay = wallets[selected]
-            .submit(&mut client, &km, bytes.clone())
-            .await;
+        let checked = RootChecked::check(
+            &wallets[selected],
+            &client,
+            bytes.clone(),
+            RootLimit::Retained,
+        )
+        .await
+        .unwrap();
+        let replay = wallets[selected].submit(&mut client, &km, checked).await;
         let rejection = replay.unwrap_err().to_string();
         assert!(
             rejection.contains("already decided") || rejection.contains("escrow already consumed"),
@@ -1637,6 +1652,229 @@ async fn wallet_rpc_proves_settlement() {
         "wallet_settlement bytes={} proof_bytes={} native_verified=true seconds={:.3}",
         bytes.len(),
         tx.proof.len(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// `token merge --batch` over six coins of 5 at fee 1, through the parsed
+/// command: from one scan, whose root is GLOBAL's current one, a merge of
+/// the four largest, then one of the last two. Each submission is signed
+/// by the node key and is a merge the network's verifier accepts: one
+/// output of the inputs less the fee, to the wallet, against the scanned
+/// root, its spend images shared with no other merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native batch merge command: two proofs, scan, witness RPC and authenticated submission"]
+async fn wallet_merge_batch_command_proves_and_submits() {
+    use quil_execution::token_intrinsic::coin_blocks;
+    let started = std::time::Instant::now();
+    let directory = tempfile::tempdir().unwrap();
+    let km = Arc::new(
+        quil_keys::FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            &hex::encode([65; 32]),
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap(),
+    );
+    km.create_agreement_key("q-onion-key", 9).unwrap();
+    let peer_seed = [66; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&peer_seed).unwrap();
+    let mut peer_key = peer_seed.to_vec();
+    peer_key.extend_from_slice(&public);
+    km.set_peer_priv_key_hex(&hex::encode(peer_key));
+    let mut tc = TokenCtx {
+        node_config: quil_config::Config::default(),
+        config_dir: directory.path().to_path_buf(),
+        key_manager: km.clone(),
+        connect_opts: crate::rpc::ConnectOpts::default(),
+        submit_opts: crate::rpc::ConnectOpts::default(),
+        submit_key_manager: km,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
+        peer_id_bytes: Vec::new(),
+        max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
+    };
+    let wallet = Arc::new(
+        RecipientWallet::load(
+            &tc,
+            &quil_lattice_ct::confidential::transfer::network_identifier(
+                tc.node_config.p2p.network,
+            ),
+            &quil_execution::domains::QUIL_TOKEN,
+        )
+        .unwrap(),
+    );
+    let width = coin_blocks::INITIAL_BLOCK_BITS;
+    let mut next_local: std::collections::BTreeMap<u64, u64> = Default::default();
+    let (mut coins, mut records) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
+        let output = create_output(&wallet.context, wallet.address(), 5)
+            .unwrap()
+            .output;
+        let identity =
+            quil_execution::token_intrinsic::state::coin_identity(&wallet.context, 1, &output)
+                .unwrap()
+                .0;
+        let block = coin_blocks::block_for_address(width, &identity).unwrap();
+        let local = next_local.entry(block).or_default();
+        let position = coin_blocks::position(width, block, *local).unwrap();
+        *local += 1;
+        let (address, _) = quil_execution::token_intrinsic::state::create_coin(
+            &wallet.context,
+            1,
+            &output,
+            position,
+        )
+        .unwrap();
+        records.push(CoinRecord {
+            address,
+            owner: output.owner,
+            commitment: output.commitment.clone(),
+            position,
+        });
+        coins.push((address, output, position));
+    }
+    let tree = quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree::build(
+        &wallet.context,
+        quil_lattice_ct::confidential::sharded_tree::Shape {
+            shard_bits: coin_blocks::BLOCK_INDEX_BITS,
+            subtree_bits: coin_blocks::SUBTREE_BITS,
+        },
+        &records,
+    )
+    .unwrap();
+    let root = tree.root_at_depth(tree.current_depth()).unwrap();
+    // GLOBAL's root history holds the scanned root, so its age is known.
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        store.clone(),
+        Arc::new(quil_types::crypto::NoopInclusionProver),
+    ));
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+    quil_execution::token_intrinsic::global_accumulator::publish_root_for_tests(
+        &state,
+        1,
+        &wallet.application,
+        root.clone(),
+    )
+    .unwrap();
+    state.commit().unwrap();
+    state.abort();
+    crdt.commit(1).unwrap();
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = received.clone();
+    let application = wallet.application;
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(store)
+        .with_coin_witness_provider(Arc::new(SnapshotWitnessProvider {
+            snapshot: tree,
+            network: wallet.network,
+            application,
+            coins: coins.clone(),
+        }))
+        .with_send_handler_fn(Arc::new(move |domain, payload, signature| {
+            let public = public.clone();
+            let capture = capture.clone();
+            Box::pin(async move {
+                let mut signed = crate::send::node_auth_domain(&domain);
+                signed.extend_from_slice(&payload);
+                if domain != application || !quil_crypto::ed448_verify(&public, &signed, &signature)
+                {
+                    return Err("invalid authenticated merge submission".into());
+                }
+                let bundle =
+                    quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(
+                        &payload,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if bundle.requests.len() != 1 {
+                    return Err("expected one merge".into());
+                }
+                capture.lock().unwrap().push(
+                    bundle.requests[0]
+                        .as_ref()
+                        .ok_or("missing merge")?
+                        .inner_bytes
+                        .clone(),
+                );
+                Ok(())
+            })
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tc.connect_opts.listen_grpc_multiaddr = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        listener.local_addr().unwrap().port()
+    );
+    tc.submit_opts = tc.connect_opts.clone();
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(stream, _)| stream);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(
+                quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+            )
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    run_parsed_token_command(
+        &tc,
+        &[
+            "token",
+            "merge",
+            "--batch",
+            "--fee",
+            "1",
+            "--application",
+            &hex::encode(application),
+            "--max-pages",
+            "128",
+            "--max-coins",
+            "1024",
+        ],
+    )
+    .await;
+    let captured = received.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2, "one merge of four, then one of two");
+    let limits = compile_limits();
+    let budget = native_budget();
+    let mut images = std::collections::BTreeSet::new();
+    for (bytes, merged) in captured.iter().zip([19u128, 9]) {
+        let merge = Transfer::decode(bytes, &wallet.network, &wallet.application).unwrap();
+        assert!(
+            quil_lattice_ct::confidential::relation::backend::native::verify_owned(
+                merge.statement.public_relation(limits).unwrap(),
+                &merge.proof,
+                budget
+            )
+            .unwrap()
+        );
+        assert_eq!(merge.statement.root, root.root);
+        assert_eq!(merge.statement.fee, 1);
+        assert_eq!(merge.statement.outputs.len(), 1);
+        assert_eq!(
+            wallet.open(&merge.statement.outputs[0]).unwrap().amount,
+            merged
+        );
+        assert!(bytes.len() <= TARGET_TRANSACTION_BYTES);
+        let mine: std::collections::BTreeSet<_> = merge.statement.images.iter().copied().collect();
+        assert!(images.is_disjoint(&mine), "two merges spend one coin");
+        images.extend(mine);
+    }
+    let journal = super::super::legacy::recently_journaled(directory.path(), MERGE_JOURNAL);
+    assert_eq!(journal.len(), 6, "every merged coin is journaled");
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    eprintln!(
+        "wallet_merge_batch merges={} native_verified=true seconds={:.3}",
+        captured.len(),
         started.elapsed().as_secs_f64()
     );
 }

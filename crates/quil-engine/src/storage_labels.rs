@@ -1434,6 +1434,7 @@ impl LabelStore {
         stage: Stage,
         shortfall: Shortfall,
     ) {
+        crate::seal_report::note_disk_short(epoch, shortfall.needed, shortfall.free);
         if stage == Stage::Snapshot {
             let at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

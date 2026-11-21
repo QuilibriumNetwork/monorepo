@@ -613,6 +613,95 @@ pub(crate) struct WorkerManagerArgs {
         Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
 }
 
+/// The worker count of a node's master (core 0, not DHT-only): the count
+/// it derived when its workers run in its process ([`derived_worker_count`]);
+/// an archive's or a cluster's master derives none and keeps
+/// `dataWorkerCount`, else its CPUs less one.
+fn master_worker_count(config: &quil_config::Config, archive: bool) -> u32 {
+    derived_worker_count(config, 0, archive, false).map_or_else(
+        || quil_engine::worker_count::cpu_count(config.engine.data_worker_count),
+        |derived| derived.count,
+    )
+}
+
+/// Data workers a master pre-allocates idle: its thread manager's count,
+/// and so its allocation capacity ([`master_worker_count`]).
+pub(crate) fn idle_worker_count(config: &quil_config::Config, archive: bool) -> u32 {
+    master_worker_count(config, archive)
+}
+
+/// The thread manager of a master in local mode, sized by
+/// [`master_worker_count`]: an archive keeps its configured or CPU count.
+pub(crate) fn thread_manager(
+    config: &quil_config::Config,
+    archive: bool,
+) -> quil_engine::thread_worker::ThreadWorkerManager {
+    let count = master_worker_count(config, archive);
+    quil_engine::thread_worker::ThreadWorkerManager::new_with_count(
+        i32::try_from(count).unwrap_or(i32::MAX),
+    )
+}
+
+/// The count of a node's master running its workers in its process
+/// ([`init_worker_count`]); `None` for a process that derives none: an
+/// archive, a cluster's master, a standalone worker, a DHT-only node.
+pub(crate) fn derived_worker_count(
+    config: &quil_config::Config,
+    core: u32,
+    archive: bool,
+    dht_only: bool,
+) -> Option<quil_engine::worker_count::WorkerCount> {
+    let threads = core == 0
+        && !dht_only
+        && !archive
+        && config.engine.data_worker_stream_multiaddrs.is_empty();
+    threads.then(|| init_worker_count(config))
+}
+
+/// Workers a master runs when `dataWorkerCount` is unset: the count it
+/// derived ([`derived_worker_count`]), else its CPUs less one.
+pub(crate) fn auto_worker_count(
+    config: &quil_config::Config,
+    core: u32,
+    archive: bool,
+    dht_only: bool,
+) -> u32 {
+    match derived_worker_count(config, core, archive, dht_only) {
+        Some(derived) => derived.auto,
+        None => quil_engine::worker_count::cpu_count(0),
+    }
+}
+
+/// The worker count of a master whose workers run in its process, derived
+/// at the first call by any site that sizes them: its CPUs, the memory the
+/// host reports, and the disk of its workers' stores, those present among
+/// the cores its CPUs could run.
+pub(crate) fn init_worker_count(
+    config: &quil_config::Config,
+) -> quil_engine::worker_count::WorkerCount {
+    use quil_engine::worker_count as wc;
+    wc::init(config.engine.data_worker_count, || {
+        let cpus = wc::process_cpus();
+        let store = |core| {
+            crate::prover_tree_syncer_prod::worker_store_path(
+                &config.db.worker_paths,
+                &config.db.worker_path_prefix,
+                &config.db.path,
+                core,
+            )
+        };
+        let first = store(1);
+        let stores: Vec<_> = (1..=cpus).map(store).collect();
+        let base = first.parent().unwrap_or(&first);
+        let labels = crate::prover_tree_syncer_prod::storage_labels_dir(&first);
+        wc::Inputs {
+            cpus,
+            memory: wc::detect_memory(),
+            disk: wc::detect_disk(base, &labels, &stores),
+        }
+    })
+}
+
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
     args: WorkerManagerArgs,
@@ -771,13 +860,10 @@ pub(crate) fn init(
     } else {
         // LOCAL MODE: core-pinned threads
         // Honor an explicit `dataWorkerCount` in local thread mode (0/unset
-        // → auto-size to cpu-1). Without this the config field was ignored
-        // and every node ran cpu-1 workers regardless of what was requested.
-        let thread_mgr = Arc::new(
-            quil_engine::thread_worker::ThreadWorkerManager::new_with_count(
-                config.engine.data_worker_count,
-            ),
-        );
+        // → what the CPUs, memory and disk hold). Without this the config
+        // field was ignored and every node ran cpu-1 workers regardless of
+        // what was requested.
+        let thread_mgr = Arc::new(thread_manager(&config, archive_mode));
         // Persistent worker registry — survives restarts so the
         // operator's `manually_managed` flag and the
         // worker→filter binding don't reset every reboot.
@@ -1595,21 +1681,11 @@ pub(crate) fn init(
             Ok(ids) => ids.len() as u32,
             Err(_) => 0,
         };
-        // If no workers exist yet, create them for cores 1..N. Honor an explicit
-        // `dataWorkerCount` (>0); otherwise auto-size to `available_parallelism-1`
-        // (reserve core 0 for the master). Without honoring the config here, this
-        // loop would spawn cpu-1 worker threads even when the operator asked for
-        // a specific count (e.g. a single-worker localnet).
+        // If no workers exist yet, create them for cores 1..N: the count the
+        // thread manager and allocation capacity use (an explicit
+        // `dataWorkerCount`, else what CPUs, memory and disk hold).
         if num_cores == 0 {
-            let worker_count = if config.engine.data_worker_count > 0 {
-                config.engine.data_worker_count as u32
-            } else {
-                std::thread::available_parallelism()
-                    .map(|n| n.get() as u32)
-                    .unwrap_or(4)
-                    .saturating_sub(1)
-                    .max(1) // reserve core 0 for master
-            };
+            let worker_count = idle_worker_count(&config, archive_mode);
             for core_id in 1..=worker_count {
                 if let Err(e) = worker_manager.allocate_worker(core_id, &[]) {
                     warn!(core_id, error = %e, "failed to pre-allocate idle worker");
@@ -1670,6 +1746,104 @@ pub(crate) fn init(
 
 #[cfg(test)]
 mod tests {
+    /// One count sizes the workers everywhere: the thread manager's
+    /// allocation capacity, the idle pre-allocation, the effective config
+    /// and storage memory policy, each through the call production makes.
+    /// It seeds the process's count with a host none of the test hosts is,
+    /// so a site sized by the CPUs alone fails; it runs in a process of its
+    /// own (nextest).
+    #[test]
+    fn every_site_reads_the_derived_worker_count() {
+        use clap::Parser as _;
+        use quil_engine::worker::WorkerManager as _;
+        use quil_engine::worker_count as wc;
+        const GIB: u64 = 1 << 30;
+        let derived = wc::init(0, || wc::Inputs {
+            cpus: 64,
+            memory: wc::Memory::linux(64 * GIB, None),
+            disk: Some(wc::Disk {
+                total: 1000 * GIB,
+                free: 500 * GIB,
+                ..wc::Disk::default()
+            }),
+        });
+        assert_eq!((derived.count, derived.binding), (53, wc::Binding::Disk));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.yml"),
+            "engine:\n  dataWorkerCount: 0\n",
+        )
+        .unwrap();
+        let config = quil_config::load_config(directory.path()).expect("test config");
+        assert_eq!(super::init_worker_count(&config), derived);
+        assert_eq!(
+            super::idle_worker_count(&config, false),
+            53,
+            "the idle pre-allocation reads the derived count"
+        );
+        let threads = super::thread_manager(&config, false);
+        assert_eq!(
+            threads.allocation_capacity().unwrap(),
+            53,
+            "the thread manager reads the derived count"
+        );
+        let runtime = crate::effective_config::Runtime::detect(&config, 0, 0, false, false);
+        let effective = crate::effective_config::EffectiveConfig::resolve(&config, &runtime);
+        assert_eq!(
+            effective.workers, 53,
+            "the effective config reads the derived count"
+        );
+        let args = crate::Args::parse_from(["quil-node"]);
+        quil_engine::storage_jobs::set_memory_worker_count(crate::memory_worker_count(
+            &config, &args,
+        ));
+        assert_eq!(
+            quil_engine::storage_jobs::memory_worker_count(),
+            53,
+            "storage memory policy reads the derived count"
+        );
+    }
+
+    /// An archive's master runs no app workers in its process: its thread
+    /// manager and idle pre-allocation keep `dataWorkerCount`, else its
+    /// CPUs less one, and derive no count, so it never reads memory or its
+    /// disk (a full archive disk logged a false "free disk space" warn). It
+    /// runs in a process of its own (nextest): the count is derived once.
+    #[test]
+    fn an_archive_master_derives_no_worker_count() {
+        use quil_engine::worker::WorkerManager as _;
+        use quil_engine::worker_count as wc;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.yml"),
+            "engine:\n  dataWorkerCount: 0\n  archiveMode: true\n",
+        )
+        .unwrap();
+        let config = quil_config::load_config(directory.path()).expect("test config");
+        let threads = super::thread_manager(&config, true);
+        let idle = super::idle_worker_count(&config, true);
+        let mut derived_later = false;
+        wc::init(0, || {
+            derived_later = true;
+            wc::Inputs {
+                cpus: 2,
+                memory: None,
+                disk: None,
+            }
+        });
+        assert!(derived_later, "an archive's master derives no worker count");
+        assert_eq!(
+            threads.allocation_capacity().unwrap(),
+            usize::try_from(wc::cpu_count(0)).unwrap(),
+            "an archive's thread manager keeps its CPU count"
+        );
+        assert_eq!(
+            idle,
+            wc::cpu_count(0),
+            "an archive's idle pre-allocation keeps its CPU count"
+        );
+    }
+
     use super::*;
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;

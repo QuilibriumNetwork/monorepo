@@ -239,6 +239,9 @@ pub struct CommittedShardSnapshot {
     pub records: Arc<dyn quil_types::store::SnapshotReadable>,
 }
 
+/// `(version, vertex key, blob)` of a GLOBAL vertex at a retained root.
+type GlobalVertexAt = (u64, Vec<u8>, Vec<u8>);
+
 /// GLOBAL vertex reads at retained roots over one committed view
 /// ([`HypergraphCrdt::committed_global_view`]). Every read of one view sees
 /// the same commits; none waits for the commit lock.
@@ -254,6 +257,19 @@ impl CommittedGlobalView {
         root: &[u8; 32],
         data_address: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .vertex_at_root(root, data_address)?
+            .map(|(_, _, blob)| blob))
+    }
+
+    /// `(version, vertex key, blob)` of the GLOBAL vertex at `data_address`
+    /// at `root`: what [`HypergraphCrdt::global_vertex_blob_at_root`] reads
+    /// under the commit lock.
+    fn vertex_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<GlobalVertexAt>> {
         let app = [0xff; 32];
         let (version, _) = self
             .0
@@ -267,8 +283,74 @@ impl CommittedGlobalView {
         };
         let mut vertex = app.to_vec();
         vertex.extend_from_slice(data_address);
-        self.0
-            .vertex_underlying_at("vertex", "adds", &shard, &vertex, version)
+        let blob = self
+            .0
+            .vertex_underlying_at("vertex", "adds", &shard, &vertex, version)?;
+        Ok(blob.map(|blob| (version, vertex, blob)))
+    }
+}
+
+/// The serving read of GLOBAL vertex proofs at retained roots, for client
+/// and peer RPCs: the mint claim witness, the reward witness and a peer's
+/// `global_vertex_proof`. Roots, versions and blobs come from one committed
+/// view and proofs from the forest, none waiting for the commit lock, so a
+/// GLOBAL finalization holding it while it executes a frame (minutes for a
+/// large proof) holds up no answer. A proof is the one
+/// [`HypergraphCrdt::global_vertex_membership_at_root`] builds for the root.
+///
+/// Execution (the mint and mint claim in `mint.rs`, delivery, frame
+/// validation) keeps that locked live read on purpose: what it accepts must
+/// not depend on when a view was last published.
+pub struct ServedGlobalReads<'a> {
+    crdt: &'a HypergraphCrdt,
+    view: CommittedGlobalView,
+}
+
+impl ServedGlobalReads<'_> {
+    /// Whether this view indexes the GLOBAL prover-shard root `root` and the
+    /// forest still holds it at that version:
+    /// [`HypergraphCrdt::global_root_available`] read through the view, so a
+    /// root chosen here is one [`Self::membership`] can read.
+    pub fn root_available(&self, root: &[u8; 32]) -> Result<bool> {
+        let app = [0xff; 32];
+        let Some((version, _)) = self.view.0.root_version("vertex", "adds", &app, root)? else {
+            return Ok(false);
+        };
+        let forest = self.crdt.forest.read().map_err(|_| {
+            QuilError::ExecutionUnavailable("historical global reward forest poisoned".into())
+        })?;
+        Ok(matches!(
+            forest.shard_phase_root(&app, PHASES[0], version),
+            Ok(Some(found)) if found == *root
+        ))
+    }
+
+    /// The blob of the GLOBAL vertex at `data_address` at `root`, read from
+    /// this view without a proof
+    /// ([`CommittedGlobalView::vertex_blob_at_root`]).
+    pub fn vertex_blob_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        self.view.vertex_blob_at_root(root, data_address)
+    }
+
+    /// The membership proof of the GLOBAL vertex at `data_address` at `root`,
+    /// checked against `root`. A retention prune racing the proof read leaves
+    /// a proof that fails to build or to verify: `ExecutionUnavailable`, as
+    /// for a root no longer retained.
+    pub fn membership(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<quil_forest::VertexMembershipProof>> {
+        let Some((version, vertex, blob)) = self.view.vertex_at_root(root, data_address)? else {
+            return Ok(None);
+        };
+        self.crdt
+            .prove_global_vertex(root, version, &vertex, &blob)
+            .map(Some)
     }
 }
 
@@ -5795,9 +5877,34 @@ impl HypergraphCrdt {
         else {
             return Ok(None);
         };
+        self.prove_global_vertex(root, version, &vertex, &blob)
+            .map(Some)
+    }
+
+    /// The serving read of GLOBAL vertex proofs: one committed view
+    /// ([`Self::committed_global_view`]) and proofs built without the commit
+    /// lock ([`ServedGlobalReads`]).
+    pub fn served_global_reads(&self) -> Result<ServedGlobalReads<'_>> {
+        Ok(ServedGlobalReads {
+            crdt: self,
+            view: self.committed_global_view()?,
+        })
+    }
+
+    /// The membership proof of a GLOBAL vertex read at `version`, checked
+    /// against `root`. JMT nodes of a version never change; only retention
+    /// pruning removes them, which the check turns into
+    /// `ExecutionUnavailable`.
+    fn prove_global_vertex(
+        &self,
+        root: &[u8; 32],
+        version: u64,
+        vertex: &[u8],
+        blob: &[u8],
+    ) -> Result<quil_forest::VertexMembershipProof> {
         let forest = self.forest.read().unwrap();
         let proof = forest
-            .build_vertex_membership_proof(&[0xff; 32], PHASES[0], version, &vertex, &blob)
+            .build_vertex_membership_proof(&[0xff; 32], PHASES[0], version, vertex, blob)
             .map_err(|e| {
                 QuilError::ExecutionUnavailable(format!("historical global reward proof: {e}"))
             })?;
@@ -5805,7 +5912,7 @@ impl HypergraphCrdt {
         quil_forest::verify_vertex_membership(root, &proof, &[]).map_err(|_| {
             QuilError::ExecutionUnavailable("historical global reward blob/root mismatch".into())
         })?;
-        Ok(Some(proof))
+        Ok(proof)
     }
 
     /// Whether a GLOBAL vertex exists at a retained root: the read of
@@ -5841,7 +5948,7 @@ impl HypergraphCrdt {
         &self,
         root: &[u8; 32],
         data_address: &[u8; 32],
-    ) -> Result<Option<(u64, Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Option<GlobalVertexAt>> {
         let app = [0xff; 32];
         let (version, _) = self
             .store

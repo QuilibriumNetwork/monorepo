@@ -1396,8 +1396,7 @@ fn hold_storage_shares(
         let updated_at = Instant::now();
         work.update += updated_at - read_at;
         if seat != before {
-            let written = storage_seat::write_record(state, current_frame_number, &seat)?;
-            seats.invalidate(&written);
+            seats.write(state, current_frame_number, &seat)?;
             counts.seats_written += 1;
             work.write += updated_at.elapsed();
         }
@@ -1431,7 +1430,10 @@ fn hold_storage_shares(
         )?;
         timing.mark("commitment");
         if first {
-            let seat = storage_seat::seat_address(&frame_header.prover, filter)?;
+            let seat = match frame_header.prover.as_slice().try_into() {
+                Ok(member) => seats.address(member, filter)?,
+                Err(_) => storage_seat::seat_address(&frame_header.prover, filter)?,
+            };
             storage_seat::enqueue_expiry(state, current_frame_number, epoch, &seat)?;
             timing.mark("expiry queue");
         }
@@ -2746,11 +2748,11 @@ mod tests {
             .is_none());
         batch.prefetch(&state, filter, members.iter()).unwrap();
         first.register(2, &[vec![1]], 3);
-        let written = storage_seat::write_record(&state, 3, &first).unwrap();
-        batch.invalidate(&written);
+        batch.write(&state, 3, &first).unwrap();
         assert_eq!(
             batch.read(&state, &members[0], filter).unwrap().unwrap().0,
-            first
+            first,
+            "a read after the batch's write took the buffered record"
         );
         // A second occurrence of the participant and a prefetched miss that
         // is filled by an intervening write must both see the new bytes.
@@ -2759,8 +2761,7 @@ mod tests {
             first
         );
         let third = Seat::new(members[2], filter.to_vec());
-        let written = storage_seat::write_record(&state, 3, &third).unwrap();
-        batch.invalidate(&written);
+        batch.write(&state, 3, &third).unwrap();
         assert_eq!(
             batch.read(&state, &members[2], filter).unwrap().unwrap().0,
             third
@@ -2770,6 +2771,151 @@ mod tests {
         assert!(storage_seat::read(&state, &members[2], filter)
             .unwrap()
             .is_none());
+    }
+
+    /// A participant batch prefetched for one shard reads another shard's
+    /// seats at that shard's addresses.
+    #[test]
+    fn a_participant_batch_reads_other_shards_seats_at_their_addresses() {
+        use super::super::storage_seat::{self, ParticipantSeats, Seat};
+        let state = make_state();
+        let (filter, other) = (&[0x71; 32], &[0x72; 32]);
+        let members = [[1; 32], [2; 32]];
+        for member in &members {
+            let mut seat = Seat::new(*member, other.to_vec());
+            seat.register(4, &[vec![1]], 2);
+            storage_seat::write(&state, 1, &Seat::new(*member, filter.to_vec())).unwrap();
+            storage_seat::write(&state, 1, &seat).unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        let mut batch = ParticipantSeats::default();
+        batch.prefetch(&state, filter, members.iter()).unwrap();
+        for member in &members {
+            for shard in [other, filter] {
+                let read = batch.read(&state, member, shard).unwrap().unwrap().0;
+                assert_eq!(
+                    (read.member, read.filter.as_slice()),
+                    (*member, shard.as_slice()),
+                    "a batch read returned another shard's seat"
+                );
+            }
+        }
+    }
+
+    /// One hash-epoch header as a regular node (`archive` false) or an
+    /// archive executes it: three of four participants hold sealed seats,
+    /// the proposer among them makes its epoch's first commitment. Returns
+    /// the changeset's `(domain, address, discriminator, value)` entries,
+    /// and the seat addresses hashed and type hashes computed executing it.
+    fn seat_path_header(archive: bool) -> (Vec<crate::hypergraph_state::StateEntry>, usize, usize) {
+        use super::super::storage_seat::{self, Seat};
+        let state = make_state();
+        let filter = vec![0xC3u8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=4)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let epoch = 7;
+        for p in &provers[..3] {
+            let member = <[u8; 32]>::try_from(p.address.as_slice()).unwrap();
+            let mut seat = Seat::new(member, filter.clone());
+            seat.register(epoch, &[vec![]], 10);
+            assert!(seat.seal(epoch, 11));
+            storage_seat::write(&state, 11, &seat).unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        let mut header = fake_header(filter.clone(), 11);
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(300);
+        header.prover = provers[1].address.clone();
+        header.storage_attestation_root = storage_seat::encode_commitment(&[0x11; 32], 98);
+        let mut storage = StorageFrame {
+            epoch,
+            commitment: Some(StorageCommitment {
+                root: [0x11; 32],
+                beacon: 98,
+                rho_n: vec![5u8; 32],
+            }),
+            kicks: Vec::new(),
+        };
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let frame = 101;
+        let _frame = archive.then(|| crate::archive_frame::ArchiveFrame::begin(frame));
+        let (addresses, types) = (
+            storage_seat::seat_addresses_hashed(),
+            crate::global_schema::type_hashes_computed(),
+        );
+        materialize_prover_shard_update_with_fees(
+            &header,
+            frame,
+            &state,
+            &noop_registry(),
+            &noop_frame_prover(),
+            &reward_issuance,
+            4096,
+            provers.clone(),
+            &[0, 1, 2, 3],
+            ShardMetadata {
+                state_size: 1024,
+                shard_count: 1,
+            },
+            0,
+            None,
+            Some(&mut storage),
+            HeaderIssuance::claimed(&header),
+        )
+        .unwrap();
+        (
+            state.state_changes(),
+            storage_seat::seat_addresses_hashed() - addresses,
+            crate::global_schema::type_hashes_computed() - types,
+        )
+    }
+
+    /// A header derives each seat address once and hashes no class name:
+    /// an archive's reads hashed every participant's address twice, each
+    /// write hashed it again and its class name too (2026-11-19).
+    #[test]
+    fn a_header_hashes_each_seat_address_once_and_no_class_name() {
+        for archive in [false, true] {
+            let (changes, addresses, types) = seat_path_header(archive);
+            assert!(!changes.is_empty());
+            assert_eq!(
+                addresses, 4,
+                "seat addresses hashed for 4 participants (archive {archive})"
+            );
+            assert_eq!(
+                types, 0,
+                "type hashes computed in one header (archive {archive})"
+            );
+        }
+    }
+
+    /// The bytes a hash-epoch header writes, recorded on the release tip
+    /// before seat addresses and type hashes were shared: the same
+    /// on a regular node and an archive, and unchanged.
+    #[test]
+    fn a_header_writes_the_bytes_it_wrote_before_seat_hashes_were_shared() {
+        use sha2::{Digest, Sha256};
+        let (regular, _, _) = seat_path_header(false);
+        let (archive, _, _) = seat_path_header(true);
+        assert_eq!(archive, regular);
+        let mut digest = Sha256::new();
+        for (domain, address, discriminator, value) in &regular {
+            for part in [domain, address, discriminator, value] {
+                digest.update((part.len() as u64).to_be_bytes());
+                digest.update(part);
+            }
+        }
+        assert_eq!(
+            hex::encode(digest.finalize()),
+            "41b4878bfc8970b44661f4cec869348af350466bfbf47f23ac53bb5a77f18132",
+            "the header's {} state changes differ from the release tip's",
+            regular.len()
+        );
     }
 
     #[test]

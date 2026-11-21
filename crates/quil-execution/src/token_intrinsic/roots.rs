@@ -163,6 +163,25 @@ pub(crate) fn history_retains(
     Ok(history.digests.contains(&root_digest(context, depth, root)))
 }
 
+/// How many distinct roots an encoded root history published after `root`
+/// at `depth`: 0 while it is current, `None` once evicted (or never held).
+/// A spend citing `root` is admitted until it is evicted, so a wallet that
+/// spends several times from one scan reads this before each spend.
+pub(crate) fn history_age(
+    bytes: &[u8],
+    context: &[u8; 32],
+    depth: u8,
+    root: &Node,
+) -> Result<Option<usize>> {
+    let history = History::decode(bytes, context)?;
+    let digest = root_digest(context, depth, root);
+    Ok(history
+        .digests
+        .iter()
+        .rposition(|held| held == &digest)
+        .map(|at| history.digests.len() - 1 - at))
+}
+
 pub(crate) fn decode_current(bytes: &[u8], context: &[u8; 32]) -> Result<RootRecord> {
     History::decode(bytes, context).map(|history| history.current)
 }
@@ -1462,6 +1481,46 @@ mod tests {
         );
         history.digests[0] = history.digests[1];
         assert!(history.encode().is_err());
+    }
+
+    /// A root's age counts the distinct roots published after it: 0 while
+    /// current, one more per later publication, a republished root current
+    /// again, and none once `HISTORY_LIMIT` newer roots evicted it.
+    #[test]
+    fn history_age_counts_later_publications_until_eviction() {
+        let context = [1; 32];
+        let root = |i: usize| RootRecord {
+            context,
+            depth: 1,
+            coins: 0,
+            root: Node::from_identity_bytes(&[i as u8; IDENTITY_BYTES]).unwrap(),
+        };
+        let age = |bytes: &[u8], i: usize| history_age(bytes, &context, 1, &root(i).root).unwrap();
+        let mut bytes = publish_history(None, root(0)).unwrap();
+        assert_eq!(age(&bytes, 0), Some(0));
+        assert_eq!(age(&bytes, 1), None, "a root never published has no age");
+        for i in 1..=3 {
+            bytes = publish_history(Some(&bytes), root(i)).unwrap();
+        }
+        assert_eq!(age(&bytes, 0), Some(3));
+        assert_eq!(age(&bytes, 3), Some(0));
+        bytes = publish_history(Some(&bytes), root(0)).unwrap();
+        assert_eq!(age(&bytes, 0), Some(0), "republished: current again");
+        assert_eq!(age(&bytes, 1), Some(3));
+        for i in 4..4 + HISTORY_LIMIT - 1 {
+            bytes = publish_history(Some(&bytes), root(i)).unwrap();
+        }
+        assert_eq!(
+            age(&bytes, 0),
+            Some(HISTORY_LIMIT - 1),
+            "the oldest retained"
+        );
+        assert!(history_retains(&bytes, &context, 1, &root(0).root).unwrap());
+        assert_eq!(age(&bytes, 1), None, "evicted");
+        bytes = publish_history(Some(&bytes), root(4 + HISTORY_LIMIT)).unwrap();
+        assert_eq!(age(&bytes, 0), None, "evicted by the next publication");
+        assert!(!history_retains(&bytes, &context, 1, &root(0).root).unwrap());
+        assert!(history_age(&bytes, &[2; 32], 1, &root(0).root).is_err());
     }
 
     /// A history stored with root ids (the earlier encoding) reads as the same

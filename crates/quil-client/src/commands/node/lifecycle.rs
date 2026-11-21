@@ -792,10 +792,11 @@ mod tests {
         release.install_with(&dest, &[key.as_str()], 1).unwrap().0
     }
 
-    /// `node link` links a release iff the node's startup check starts it:
-    /// a custom release whose `.dgst` separates label and checksum with a
-    /// tab, which qclient's own parse reads but the startup check does
-    /// not, is refused and nothing is linked; with a space it links.
+    /// `node link` links a release only if the startup check under its file
+    /// name starts it: a custom release whose `.dgst` separates label and
+    /// checksum with a tab, which qclient's own parse reads but the startup
+    /// check does not, is refused and nothing is linked; with a space it
+    /// links.
     #[cfg(unix)]
     #[test]
     fn link_takes_only_a_release_the_startup_check_starts() {

@@ -158,6 +158,8 @@ WORKDIR /opt/ceremonyclient/node
 # suffix on the output directory is driven by the AVX512 env var; with it set
 # the binary lands at node/build/amd64_avx512_linux/node.
 ENV AVX512=1
+ARG QUIL_BUILD_COMMIT
+ENV QUIL_BUILD_COMMIT=$QUIL_BUILD_COMMIT
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-avx512,target=/opt/ceremonyclient/target,sharing=locked \
@@ -177,6 +179,8 @@ WORKDIR /opt/ceremonyclient
 # bring in just that data dir here.
 COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
 COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+ARG QUIL_BUILD_COMMIT
+ENV QUIL_BUILD_COMMIT=$QUIL_BUILD_COMMIT
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-avx512,target=/opt/ceremonyclient/target,sharing=locked \

@@ -1772,6 +1772,14 @@ impl ExecutionEngineManager {
         self.crdt.clone()
     }
 
+    /// The seals and settlements among a GLOBAL message's storage epoch
+    /// proofs that this state holds applied
+    /// ([`crate::global_intrinsic::storage_epoch_proof::applied_seat_parts`]).
+    pub fn applied_seat_parts(&self, message: &[u8]) -> Vec<quil_types::execution::SeatPartChange> {
+        let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
+        crate::global_intrinsic::storage_epoch_proof::applied_seat_parts(&state, message)
+    }
+
     /// Reads the engines until the returned guard drops, as a gossip
     /// validation or an RPC cost query does.
     #[cfg(any(test, feature = "testing-stubs"))]

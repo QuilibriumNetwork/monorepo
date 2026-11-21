@@ -735,10 +735,18 @@ pub(crate) const SUBMITTED_EXCLUSION_SECS: u64 = 7_200;
 /// within the last two hours ([`SUBMITTED_EXCLUSION_SECS`]): shield-all
 /// leaves them for their batch to commit.
 pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
+    recently_journaled(dir, SHIELD_JOURNAL)
+}
+
+/// Coins the journal `name` in the config directory `dir` lists as
+/// submitted within the last two hours ([`SUBMITTED_EXCLUSION_SECS`]): a
+/// batch command leaves them for their operation to commit. A missing
+/// journal or a malformed line lists none.
+pub(crate) fn recently_journaled(dir: &Path, name: &str) -> BTreeSet<[u8; 32]> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    std::fs::read_to_string(dir.join(SHIELD_JOURNAL))
+    std::fs::read_to_string(dir.join(name))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| {
@@ -760,8 +768,21 @@ pub(crate) fn record_shielded(
     now: u64,
     addresses: impl IntoIterator<Item = [u8; 32]>,
 ) -> anyhow::Result<()> {
+    record_journaled(dir, SHIELD_JOURNAL, now, addresses)
+}
+
+/// Add the coins `addresses` of an operation submitted at `now` (Unix
+/// seconds) to the journal `name` in the config directory `dir`, as
+/// [`record_shielded`] does for shield-all's.
+#[cfg(feature = "native-proof")]
+pub(crate) fn record_journaled(
+    dir: &Path,
+    name: &str,
+    now: u64,
+    addresses: impl IntoIterator<Item = [u8; 32]>,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    let path = dir.join(SHIELD_JOURNAL);
+    let path = dir.join(name);
     let mut journal = match std::fs::read_to_string(&path) {
         Ok(journal) => journal,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

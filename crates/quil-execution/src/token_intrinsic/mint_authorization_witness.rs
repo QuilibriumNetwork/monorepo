@@ -89,9 +89,21 @@ fn cap_source(from_shard_anchor: bool) -> &'static str {
 }
 
 /// The witness at the newest retained root at or below `cap`, with that root's
-/// frame.
+/// frame, served without the commit lock
+/// ([`quil_hypergraph::crdt::ServedGlobalReads`]), so a GLOBAL finalization
+/// holding it while it executes a frame does not hold up a claim.
 fn witness_at_cap(
     state: &HypergraphState,
+    clock: &dyn ClockStore,
+    receipt: &[u8; 32],
+    cap: u64,
+) -> Result<(u64, MintAuthorizationWitnessData)> {
+    witness_from(&state.crdt().served_global_reads()?, clock, receipt, cap)
+}
+
+/// [`witness_at_cap`] over the view of `reads`.
+fn witness_from(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     clock: &dyn ClockStore,
     receipt: &[u8; 32],
     cap: u64,
@@ -100,14 +112,16 @@ fn witness_at_cap(
         QuilError::ExecutionUnavailable(format!("mint authorization witness: {message}"))
     };
     // Same citation rule as the reward witness: the newest global frame whose
-    // root this node retains (a syncing node rarely holds the latest root).
-    let (root, header) =
-        super::reward_witness::newest_retained_global_root(state, clock, Some(cap))
-            .map_err(|e| unavailable(&e.to_string()))?;
-    let Some(proof) = state
-        .crdt()
-        .global_vertex_membership_at_root(&root, receipt)?
-    else {
+    // root this node retains (a syncing node rarely holds the latest root),
+    // read through the view the proof is read from.
+    let (root, header, proof) = super::reward_witness::served_vertex_at_newest_root(
+        reads,
+        clock,
+        Some(cap),
+        receipt,
+        |e| unavailable(&e.to_string()),
+    )?;
+    let Some(proof) = proof else {
         return Ok((header.frame_number, MintAuthorizationWitnessData::default()));
     };
     let limit = super::reward_witness::MAX_REWARD_PROOF_BYTES;
@@ -190,10 +204,11 @@ const SLOW_STATUS: std::time::Duration = std::time::Duration::from_secs(10);
 /// Why a claim through this node can or cannot be made now, for the
 /// `GetMintAuthorizationStatus` RPC only. Bounded: one read per frame of the
 /// lookback (headers only) plus a binary search over the retained roots in it.
-/// The receipt reads go to one committed view
-/// ([`quil_hypergraph::HypergraphCrdt::committed_global_view`]), so a GLOBAL
-/// finalization holding the commit lock while it executes a frame does not
-/// hold this up. Writes nothing.
+/// Roots and receipt reads go to one committed view
+/// ([`quil_hypergraph::crdt::ServedGlobalReads`], as [`witness`] reads them),
+/// so a GLOBAL finalization holding the commit lock while it executes a frame
+/// does not hold this up and the status names the root a claim would cite.
+/// Writes nothing.
 pub fn status(
     state: &HypergraphState,
     clock: &dyn ClockStore,
@@ -227,7 +242,21 @@ fn status_now(
     receipt: &[u8; 32],
     shard_anchor: Option<u64>,
 ) -> Result<MintAuthorizationStatusData> {
-    let view = state.crdt().committed_global_view()?;
+    status_from(
+        &state.crdt().served_global_reads()?,
+        clock,
+        receipt,
+        shard_anchor,
+    )
+}
+
+/// [`status_now`] over the view of `reads`.
+fn status_from(
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
+    clock: &dyn ClockStore,
+    receipt: &[u8; 32],
+    shard_anchor: Option<u64>,
+) -> Result<MintAuthorizationStatusData> {
     let head = clock
         .get_latest_global_clock_frame()?
         .header
@@ -240,7 +269,7 @@ fn status_now(
         head_frame: head,
         ..Default::default()
     };
-    let at_cap = retained(present_at_cap(state, clock, &view, receipt, cap))?;
+    let at_cap = retained(present_at_cap(reads, clock, receipt, cap))?;
     if let Some((frame, _)) = &at_cap {
         out.cited_frame = *frame;
     }
@@ -251,8 +280,8 @@ fn status_now(
             Some(frame)
         }
         at_cap => {
-            match retained(super::reward_witness::newest_retained_global_root(
-                state, clock, None,
+            match retained(super::reward_witness::newest_served_global_root(
+                reads, clock, None,
             ))? {
                 None => {
                     out.state = MintAuthorizationState::NoRetainedRoot;
@@ -260,7 +289,7 @@ fn status_now(
                 }
                 Some((root, header)) => {
                     out.searched_frame = header.frame_number;
-                    if retained(view.vertex_blob_at_root(&root, receipt))?
+                    if retained(reads.vertex_blob_at_root(&root, receipt))?
                         .flatten()
                         .is_some()
                     {
@@ -283,7 +312,7 @@ fn status_now(
         if out.searched_frame == 0 {
             out.searched_frame = holding;
         }
-        let (first, earliest) = first_root_holding(state, clock, &view, receipt, holding);
+        let (first, earliest) = first_root_holding(reads, clock, receipt, holding);
         out.first_root_frame = first;
         // A header carries its parent's root: first in the root of frame F
         // means executed at frame F-1 or earlier.
@@ -296,21 +325,19 @@ fn status_now(
 
 /// The frame of the newest retained root at or below `cap`, and whether it
 /// holds the receipt within the witness's record limit: whether
-/// [`witness_at_cap`] would find it, read from `view`.
+/// [`witness_from`] would find it over the same `reads`.
 fn present_at_cap(
-    state: &HypergraphState,
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     clock: &dyn ClockStore,
-    view: &quil_hypergraph::crdt::CommittedGlobalView,
     receipt: &[u8; 32],
     cap: u64,
 ) -> Result<(u64, bool)> {
     let unavailable = |message: &str| {
         QuilError::ExecutionUnavailable(format!("mint authorization witness: {message}"))
     };
-    let (root, header) =
-        super::reward_witness::newest_retained_global_root(state, clock, Some(cap))
-            .map_err(|e| unavailable(&e.to_string()))?;
-    match view.vertex_blob_at_root(&root, receipt)? {
+    let (root, header) = super::reward_witness::newest_served_global_root(reads, clock, Some(cap))
+        .map_err(|e| unavailable(&e.to_string()))?;
+    match reads.vertex_blob_at_root(&root, receipt)? {
         Some(blob) if blob.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES => {
             Err(unavailable("receipt record exceeds witness limit"))
         }
@@ -331,9 +358,8 @@ fn retained<T>(result: Result<T>) -> Result<Option<T>> {
 /// receipt, and the earliest frame its inclusion may be (the newest retained
 /// root lacking it; 0 when none does).
 fn first_root_holding(
-    state: &HypergraphState,
+    reads: &quil_hypergraph::crdt::ServedGlobalReads<'_>,
     clock: &dyn ClockStore,
-    view: &quil_hypergraph::crdt::CommittedGlobalView,
     receipt: &[u8; 32],
     holding: u64,
 ) -> (u64, u64) {
@@ -341,7 +367,7 @@ fn first_root_holding(
     let mut roots: Vec<(u64, [u8; 32])> = (start..holding)
         .filter_map(|frame| {
             let header = clock.get_global_clock_frame_header(frame).ok()?;
-            let root = super::reward_witness::retained_header_root(state, &header).ok()??;
+            let root = super::reward_witness::served_header_root(reads, &header).ok()??;
             Some((frame, root))
         })
         .collect();
@@ -350,7 +376,8 @@ fn first_root_holding(
     let frames: Vec<u64> = roots.iter().map(|(frame, _)| *frame).collect();
     first_holding(&frames, |frame| {
         let index = frames.binary_search(&frame).ok()?;
-        view.vertex_blob_at_root(&roots[index].1, receipt)
+        reads
+            .vertex_blob_at_root(&roots[index].1, receipt)
             .ok()
             .map(|blob| blob.is_some())
     })
@@ -458,46 +485,69 @@ mod tests {
             Arc::new(NoopInclusionProver),
         ));
         crdt.set_forest(quil_forest::Forest::new(db.inner()));
-        let state = HypergraphState::new(crdt.clone());
-        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let disc = vertex_adds_discriminator().unwrap();
-        for frame in 10..=14u64 {
-            let address = if frame == INCLUDED_AT {
-                RECEIPT
-            } else {
-                [frame as u8; 32]
-            };
-            let mut tree = quil_tries::VectorCommitmentTree::new();
-            tree.insert(&[0], &[frame as u8], &[], &num_bigint::BigInt::from(1))
-                .unwrap();
-            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
-            state
-                .set(&domains::GLOBAL, &address, &disc, frame, blob)
-                .unwrap();
-            state.commit().unwrap();
-            crdt.commit(frame).unwrap();
-            let root = crdt.compute_shard_root(
-                "vertex",
-                "adds",
-                &ShardKey {
-                    l1: [0; 3],
-                    l2: domains::GLOBAL,
-                },
-            );
-            clock.seed_frame(GlobalFrame {
-                header: Some(GlobalFrameHeader {
-                    frame_number: frame + 1,
-                    prover_tree_commitment: root,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-        Chain {
+        let chain = Chain {
             _directory: directory,
-            state,
-            clock,
+            state: HypergraphState::new(crdt),
+            clock: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+        };
+        for frame in 10..=14u64 {
+            execute(&chain, frame);
         }
+        chain
+    }
+
+    /// Execute `frame` (one vertex: the receipt at `INCLUDED_AT`) and seed
+    /// header `frame + 1` naming the root after it.
+    fn execute(chain: &Chain, frame: u64) {
+        let address = if frame == INCLUDED_AT {
+            RECEIPT
+        } else {
+            [frame as u8; 32]
+        };
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0], &[frame as u8], &[], &num_bigint::BigInt::from(1))
+            .unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let disc = vertex_adds_discriminator().unwrap();
+        chain
+            .state
+            .set(&domains::GLOBAL, &address, &disc, frame, blob)
+            .unwrap();
+        chain.state.commit().unwrap();
+        let crdt = chain.state.crdt();
+        crdt.commit(frame).unwrap();
+        let root = crdt.compute_shard_root(
+            "vertex",
+            "adds",
+            &ShardKey {
+                l1: [0; 3],
+                l2: domains::GLOBAL,
+            },
+        );
+        chain.clock.seed_frame(GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: frame + 1,
+                prover_tree_commitment: root,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
+    /// A serving view taken at head 15, then frame 15 executed: header 16's
+    /// root is in the live index (as between a commit and its view's
+    /// publish) but not in the view.
+    fn view_then_newer_root(chain: &Chain) -> quil_hypergraph::crdt::ServedGlobalReads<'_> {
+        let reads = chain.state.crdt().served_global_reads().unwrap();
+        execute(chain, 15);
+        let (_, live) = crate::token_intrinsic::reward_witness::newest_retained_global_root(
+            &chain.state,
+            chain.clock.as_ref(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(live.frame_number, 16, "premise: the live index holds 16");
+        reads
     }
 
     fn status_of(
@@ -786,5 +836,138 @@ mod tests {
                 (INCLUDED_AT, INCLUDED_AT)
             );
         });
+    }
+
+    fn witness_of(chain: &Chain, anchor: Option<u64>) -> MintAuthorizationWitnessData {
+        witness(&chain.state, chain.clock.as_ref(), &RECEIPT, anchor).unwrap()
+    }
+
+    /// A claim's witness read answers while a GLOBAL finalization holds the
+    /// commit lock, with the witness it gave before the holder took it.
+    #[test]
+    fn the_witness_answers_while_a_finalization_holds_the_commit_lock() {
+        let chain = chain();
+        let crdt = chain.state.crdt().clone();
+        // A running node's periodic health read has captured a view by now.
+        crdt.committed_global_view().unwrap();
+        let before = witness_of(&chain, Some(14));
+        assert!(before.found, "premise: the receipt is citable at the cap");
+        let held = crdt.hold_commit_lock();
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(witness(
+                    &chain.state,
+                    chain.clock.as_ref(),
+                    &RECEIPT,
+                    Some(14),
+                ));
+            });
+            // It answers in milliseconds; a read waiting for the holder never
+            // does, so the generous bound only ends a failing run.
+            let answered = answers.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            let now = answered
+                .expect("witness_blocked_by_commit_lock: no answer while the lock was held")
+                .unwrap();
+            assert_eq!(format!("{now:?}"), format!("{before:?}"));
+        });
+    }
+
+    /// The witness is byte for byte the proof the commit-locked read builds
+    /// for the root it cites, and verifies against that root.
+    #[test]
+    fn the_witness_is_the_locked_reads_proof_for_the_cited_root() {
+        let chain = chain();
+        let witness = witness_of(&chain, Some(14));
+        assert!(witness.found, "premise: the receipt is citable at the cap");
+        let root: [u8; 32] = witness.global_root.as_slice().try_into().unwrap();
+        let header = chain
+            .clock
+            .get_global_clock_frame(witness.cited_frame)
+            .unwrap()
+            .header
+            .unwrap();
+        assert_eq!(header.prover_tree_commitment, witness.global_root);
+        let locked = chain
+            .state
+            .crdt()
+            .global_vertex_membership_at_root(&root, &RECEIPT)
+            .unwrap()
+            .expect("premise: the locked read finds the receipt");
+        quil_forest::verify_vertex_membership(&root, &locked, &[]).unwrap();
+        let expected = quil_forest::MembershipProof {
+            inputs: vec![locked],
+        }
+        .to_bytes();
+        assert!(
+            witness.forest_proof == expected,
+            "witness_differs_from_locked_read: {} bytes against {}",
+            witness.forest_proof.len(),
+            expected.len()
+        );
+    }
+
+    /// A claim cites the newest root of the view its proof is read from, never
+    /// a root committed after the view was taken.
+    #[test]
+    fn the_witness_cites_the_newest_root_of_its_own_view() {
+        let chain = chain();
+        let reads = view_then_newer_root(&chain);
+        let (frame, witness) = witness_from(&reads, chain.clock.as_ref(), &RECEIPT, 99)
+            .expect("witness_root_outside_view: no witness from the view's roots");
+        assert_eq!(
+            (frame, witness.found, witness.cited_frame),
+            (15, true, 15),
+            "witness_root_outside_view"
+        );
+        let root = chain
+            .clock
+            .get_global_clock_frame(15)
+            .unwrap()
+            .header
+            .unwrap()
+            .prover_tree_commitment;
+        assert_eq!(witness.global_root, root);
+        let proof = quil_forest::MembershipProof::from_bytes(&witness.forest_proof).unwrap();
+        quil_forest::verify_vertex_membership(
+            &root.as_slice().try_into().unwrap(),
+            &proof.inputs[0],
+            &[],
+        )
+        .unwrap();
+    }
+
+    /// The status chooses its roots from the view it reads the receipt from,
+    /// so it names the root a claim over that view cites.
+    #[test]
+    fn the_status_chooses_roots_from_its_own_view() {
+        let chain = chain();
+        let reads = view_then_newer_root(&chain);
+        let clock = chain.clock.as_ref();
+        let claimable = status_from(&reads, clock, &RECEIPT, Some(99))
+            .expect("status_root_outside_view: no status from the view's roots");
+        assert_eq!(
+            (claimable.state, claimable.cited_frame),
+            (MintAuthorizationState::Claimable, 15),
+            "status_root_outside_view: at the cap"
+        );
+        // Below the first root holding it: the newest root of the view
+        // (15, not the live 16) is searched and holds it.
+        let awaiting = status_from(&reads, clock, &RECEIPT, Some(12))
+            .expect("status_root_outside_view: no status from the view's roots");
+        assert_eq!(
+            (
+                awaiting.state,
+                awaiting.cited_frame,
+                awaiting.searched_frame
+            ),
+            (MintAuthorizationState::AwaitingCitableRoot, 12, 15),
+            "status_root_outside_view: above the cap"
+        );
+        assert_eq!(
+            (awaiting.first_root_frame, awaiting.inclusion_frame),
+            (13, INCLUDED_AT)
+        );
     }
 }

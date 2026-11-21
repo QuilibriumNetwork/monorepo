@@ -23,7 +23,7 @@ const MAX_GRANT_SECS: u64 = 365 * 86_400;
 
 /// What a peer on the list gets, from `HealthReport`.
 const SHARED: &str =
-    "It gets, per request: this node's release and build fingerprint, GLOBAL head \
+    "It gets, per request: this node's release, build fingerprint and source commit, GLOBAL head \
 frame, worker count, store write state and store and disk read times; its stores' and storage \
 labels' disk size, free space and size on disk, and how often labels were refused disk \
 space at a snapshot since it started; its machine's Mac model and CPU vendor as numbers, core \
@@ -419,6 +419,8 @@ mod tests {
             health: _,
             store_space: _,
             machine: _,
+            build_commit: _,
+            build_dirty: _,
         } = report;
         let WorkerHealth {
             core_id: _,

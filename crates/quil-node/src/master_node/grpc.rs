@@ -278,10 +278,14 @@ pub(crate) struct GrpcArgs {
 pub(crate) struct CrdtForestServer(pub(crate) Arc<quil_hypergraph::HypergraphCrdt>);
 
 impl quil_rpc::global_service::ForestServer for CrdtForestServer {
+    /// Served without the commit lock
+    /// ([`quil_hypergraph::crdt::ServedGlobalReads`]), so a GLOBAL
+    /// finalization holding it holds no server task.
     fn global_vertex_proof(&self, root: [u8; 32], address: [u8; 32]) -> Option<Vec<u8>> {
         let proof = self
             .0
-            .global_vertex_membership_at_root(&root, &address)
+            .served_global_reads()
+            .and_then(|reads| reads.membership(&root, &address))
             .ok()??;
         let bytes = quil_forest::MembershipProof {
             inputs: vec![proof],
@@ -614,7 +618,7 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 9] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 10] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
@@ -624,6 +628,7 @@ const SUBMIT_REFUSAL_NAMES: [&str; 9] = [
     "invalid_alt_shard_update",
     "shield_claimed",
     "unsendable_seal",
+    "applied_seat_part",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -638,6 +643,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::InvalidAltShardUpdate => 6,
         Refusal::ShieldClaimed => 7,
         Refusal::UnsendableSeal => 8,
+        Refusal::AppliedSeatPart => 9,
     }
 }
 
@@ -4858,6 +4864,7 @@ fn health_inputs(
             quil_engine::storage_labels::installed().map(|labels| labels.space()),
         ),
         machine: Some(quil_rpc::machine::current()),
+        build_commit: Some((crate::build_commit::id_bytes(), crate::build_commit::DIRTY)),
     }
 }
 
@@ -6506,6 +6513,59 @@ mod forest_sync_wire_tests {
         (dir, crdt)
     }
 
+    /// A peer's GLOBAL vertex proof request answers while a finalization
+    /// holds the commit lock, with the proof it gave before the holder took
+    /// it.
+    #[test]
+    fn a_peer_vertex_proof_answers_while_a_finalization_holds_the_commit_lock() {
+        use quil_rpc::global_service::ForestServer;
+        // A GLOBAL commit as the materializer makes one, which indexes its
+        // root for proofs at it.
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let crdt = super::super::worker_manager::build_thread_worker_hypergraph(
+            &db,
+            Arc::new(quil_tries::ShaInclusionProver),
+            false,
+        );
+        crdt.set_unified_tree(true);
+        let app = [0xffu8; 32];
+        let address = [5u8; 32];
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0], &[9], &[], &num_bigint::BigInt::from(1))
+            .unwrap();
+        crdt.add_vertex(
+            &quil_hypergraph::Location {
+                app_address: app,
+                data_address: address,
+            },
+            &quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+        )
+        .unwrap();
+        crdt.commit_with_global_cursor(3, &quil_store::encoding::global_materialized_cursor_key())
+            .unwrap();
+        let root = crdt.current_forest_phase_root(&app, 0).unwrap();
+        // A running node's master loop captures a committed view every 5 s.
+        crdt.committed_global_view().unwrap();
+        let server = CrdtForestServer(crdt.clone());
+        let before = server
+            .global_vertex_proof(root, address)
+            .expect("premise: the vertex is proved at its root");
+        let held = crdt.hold_commit_lock();
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(server.global_vertex_proof(root, address));
+            });
+            // It answers in milliseconds; a read waiting for the holder never
+            // does, so the generous bound only ends a failing run.
+            let answered = answers.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            let now = answered
+                .expect("peer_proof_blocked_by_commit_lock: no answer while the lock was held");
+            assert!(now == Some(before), "the proof differs from the one before");
+        });
+    }
+
     /// The prover tree syncs over real gRPC through the batched reads (nodes,
     /// values, blobs) to the archive's exact root with readable data, and a
     /// second syncing node is answered largely from the archive's cache.
@@ -6971,7 +7031,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -6991,7 +7051,7 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0],
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),

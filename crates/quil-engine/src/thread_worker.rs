@@ -510,23 +510,16 @@ impl ThreadWorkerManager {
     ///   * `> 0` → honor it exactly (the operator asked for N local workers);
     ///     this is what makes a `dataWorkerCount: 1` localnet run a single
     ///     worker instead of silently spinning up `cpu-1`.
-    ///   * `<= 0` (the default) → auto-size to `available_parallelism - 1`,
-    ///     at least one. Unlike the core list used for pinning, this honors
-    ///     cgroup CPU quotas.
+    ///   * `<= 0` → auto-size to `available_parallelism - 1`, at least one
+    ///     ([`crate::worker_count::cpu_count`]). Unlike the core list used
+    ///     for pinning, this honors cgroup CPU quotas. A node's master
+    ///     passes the count its CPUs, memory and disk hold
+    ///     ([`crate::worker_count::init`]) instead.
     ///
     /// This count is also the node's allocation capacity.
     pub fn new_with_count(configured: i32) -> Self {
         let layout = crate::worker_pinning::PinLayout::detect();
-        let cpu_default = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(4)
-            .saturating_sub(1)
-            .max(1);
-        let num_cores = if configured > 0 {
-            configured as u32
-        } else {
-            cpu_default
-        };
+        let num_cores = crate::worker_count::cpu_count(configured);
 
         let (master_tx, master_rx) = mpsc::channel(256);
 

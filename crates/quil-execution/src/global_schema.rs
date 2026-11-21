@@ -859,6 +859,12 @@ pub fn type_hash_leaf_root_registration() -> [u8; 32] {
     RUNTIME_TYPE_HASHES[1].0
 }
 
+/// The type hashes [`compute_type_hash`] has computed on this thread.
+#[cfg(test)]
+pub(crate) fn type_hashes_computed() -> usize {
+    tests::COMPUTED.with(std::cell::Cell::get)
+}
+
 // =====================================================================
 // Tree field reader
 // =====================================================================
@@ -898,13 +904,23 @@ pub fn write_field(
         .map_err(|e| quil_types::error::QuilError::Internal(format!("write_field insert: {}", e)))
 }
 
+/// `class`'s type hash: a verified constant or one computed once per
+/// process; computed here only for a class outside both tables.
+fn type_hash(class: &str) -> [u8; 32] {
+    TYPE_HASH_TABLE
+        .iter()
+        .chain(RUNTIME_TYPE_HASHES.iter())
+        .find(|(_, name)| *name == class)
+        .map_or_else(|| compute_type_hash(class), |(hash, _)| *hash)
+}
+
 /// Write the type hash at key `[0xFF; 32]` into a vertex tree.
 pub fn write_type(
     tree: &mut quil_tries::VectorCommitmentTree,
     class: &str,
 ) -> quil_types::error::Result<()> {
     use num_bigint::BigInt;
-    let hash = compute_type_hash(class);
+    let hash = type_hash(class);
     tree.insert(&[0xFFu8; 32], &hash, &[], &BigInt::from(32))
         .map_err(|e| quil_types::error::QuilError::Internal(format!("write_type insert: {}", e)))
 }
@@ -1336,5 +1352,41 @@ mod tests {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         write_type(&mut tree, "allocation:ProverAllocation").unwrap();
         assert_eq!(read_type(&tree), Some("allocation:ProverAllocation"));
+    }
+    /// Every class's vertex holds `compute_type_hash` of its name, however
+    /// `write_type` obtains it.
+    #[test]
+    fn write_type_stores_the_computed_hash_of_every_class() {
+        for class in GLOBAL_CLASSES.iter().map(|c| c.name) {
+            let mut tree = quil_tries::VectorCommitmentTree::new();
+            write_type(&mut tree, class).unwrap();
+            assert_eq!(
+                tree.get(&[0xFFu8; 32]),
+                Some(compute_type_hash(class).as_slice()),
+                "{class}: written type hash differs from its computed hash"
+            );
+        }
+    }
+
+    /// A vertex write hashes no class name: each storage seat write hashed
+    /// its class again, 97% of a seat write's time on an archive
+    /// (2026-11-19).
+    #[test]
+    fn writing_a_type_computes_no_type_hash() {
+        // The one-time computations, on whichever thread comes first.
+        let _ = (type_hash_storage_seat(), class_for_type_hash(&[0; 32]));
+        let before = COMPUTED.with(|computed| computed.get());
+        for _ in 0..100 {
+            for class in GLOBAL_CLASSES {
+                write_type(&mut quil_tries::VectorCommitmentTree::new(), class.name).unwrap();
+            }
+        }
+        let computed = COMPUTED.with(|computed| computed.get()) - before;
+        assert_eq!(
+            computed,
+            0,
+            "type hashes computed writing {} vertices",
+            100 * GLOBAL_CLASSES.len()
+        );
     }
 }

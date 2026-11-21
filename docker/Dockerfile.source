@@ -198,6 +198,8 @@ WORKDIR /opt/ceremonyclient/node
 # serve amd64/arm64 Linux builds without a platform switch. build.sh writes to
 # node/build/<platform>/, outside the cache-mounted target/, so the cp after the
 # && finds the binary on the real filesystem.
+ARG QUIL_BUILD_COMMIT
+ENV QUIL_BUILD_COMMIT=$QUIL_BUILD_COMMIT
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
@@ -219,6 +221,8 @@ WORKDIR /opt/ceremonyclient
 # so bring in just that data dir here.
 COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
 COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+ARG QUIL_BUILD_COMMIT
+ENV QUIL_BUILD_COMMIT=$QUIL_BUILD_COMMIT
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \

@@ -61,6 +61,10 @@ pub(super) struct RecipientWallet {
     /// The keys that open this wallet's coins, derived on first use: a scan
     /// opens every coin of the application with them.
     opening: std::sync::OnceLock<OpeningKeys>,
+    /// Whether this run said a cited root's age is unknown
+    /// ([`RecipientWallet::check_cited_root`]); a run loads its wallet once.
+    #[cfg(feature = "native-proof")]
+    root_age_unknown_said: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -136,6 +140,14 @@ pub(super) struct OwnedCoin {
     pub(super) output: Output,
     pub(super) amount: Zeroizing<u128>,
     image: [u8; IDENTITY_BYTES],
+}
+
+/// A spend's inputs with their membership paths against one root.
+#[cfg(feature = "native-proof")]
+pub(super) struct Spend {
+    pub(super) coins: Vec<([u8; 32], Output)>,
+    pub(super) root: quil_lattice_ct::confidential::coin_tree::RootRecord,
+    pub(super) paths: Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
 }
 
 /// Of two unspent coins of this wallet sharing a spend image, each with its
@@ -294,8 +306,10 @@ where
 /// Page cap of a witness rebuild's scan until a balance scan sets one: none,
 /// as `--max-pages` sets none by default.
 const DEFAULT_SCAN_PAGES: usize = super::SCAN_PAGES_UNCAPPED;
-/// Most coins a witness rebuild keeps: those under the subtrees the selected
-/// coins' addresses can sit in. One full block holds 65,536.
+/// Most coins one witness pass takes: the subtrees its coins' addresses can
+/// sit in report at most this many together ([`segment_groups`]), or with
+/// no index the whole tree holds at most this many. One full block holds
+/// 65,536.
 const MAX_WITNESS_SUBTREE_COINS: usize = 1 << 16;
 /// Rebuilds a spend tries while the scanned snapshot and the accumulator
 /// records it reads are out of step, and the wait between them.
@@ -339,6 +353,30 @@ impl ReportedSubtree {
         let leading = u64::from_be_bytes(address[..8].try_into().expect("eight bytes"));
         depth == 0 || leading >> (64 - depth) == path
     }
+}
+
+/// The reported subtrees (indices into `subtrees`) a coin at any of
+/// `addresses` can sit under: those a witness rebuild keeps the coins of.
+fn candidate_subtrees<'a>(
+    subtrees: &[ReportedSubtree],
+    addresses: impl IntoIterator<Item = &'a [u8; 32]>,
+) -> std::collections::BTreeSet<usize> {
+    addresses
+        .into_iter()
+        .flat_map(|address| {
+            subtrees
+                .iter()
+                .enumerate()
+                .filter(move |(_, subtree)| subtree.may_hold(address))
+                .map(|(i, _)| i)
+        })
+        .collect()
+}
+
+/// A witness rebuild's refusal: its selected coins' subtrees hold more than
+/// `cap` coins, more than it keeps.
+fn witness_cap_exceeded(cap: usize) -> anyhow::Error {
+    anyhow::anyhow!("the selected coins' subtrees hold more than {cap} coins")
 }
 
 /// The canonical accumulator as GLOBAL records it: every reported subtree
@@ -1145,18 +1183,20 @@ impl RecipientWallet {
         ))
     }
 
-    /// Submit one already-built operation using the node's authenticated Send
-    /// transport, returning the signed bundle's id ([`bundle_id`]). Successful
-    /// delivery does not establish transaction finality.
+    /// Submit one already-built operation, its cited root checked
+    /// ([`RootChecked`]), using the node's authenticated Send transport,
+    /// returning the signed bundle's id ([`bundle_id`]). Successful delivery
+    /// does not establish transaction finality.
+    #[cfg(feature = "native-proof")]
     pub(super) async fn submit(
         &self,
         client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
             tonic::transport::Channel,
         >,
         key_manager: &quil_keys::FileKeyManager,
-        bytes: Vec<u8>,
+        operation: RootChecked,
     ) -> anyhow::Result<[u8; 32]> {
-        let (domain, request) = self.prepare_submission(bytes)?;
+        let (domain, request) = self.prepare_submission(operation.into_bytes())?;
         let bundle = quil_types::proto::global::MessageBundle {
             requests: vec![request],
             timestamp: crate::send::now_millis(),
@@ -2201,7 +2241,6 @@ impl RecipientWallet {
         limits: quil_lattice_ct::confidential::transfer::CompileLimits,
         budget: quil_lattice_ct::confidential::relation::backend::native::NativeBudget,
     ) -> anyhow::Result<Vec<u8>> {
-        use quil_lattice_ct::confidential::{relation::backend::native, transfer::Transfer};
         // Native calls serialize internally, but waiting after compilation would
         // let concurrent requests retain multiple large private relations. Hold
         // this permit through the worker, even if its async caller is cancelled.
@@ -2212,6 +2251,26 @@ impl RecipientWallet {
             .collect();
         let (root, paths) = self.witnesses(client, &selected).await?;
         drop(selected);
+        let spend = Spend { coins, root, paths };
+        self.prove_transfer(permit, spend, recipients, fee, limits, budget)
+            .await
+    }
+
+    /// [`Self::create_transfer`]'s proving half, for coins whose witnesses
+    /// the caller already holds: prepare, prove and verify off the async
+    /// runtime while holding `permit`.
+    #[cfg(feature = "native-proof")]
+    async fn prove_transfer(
+        self: std::sync::Arc<Self>,
+        permit: tokio::sync::SemaphorePermit<'static>,
+        spend: Spend,
+        recipients: Vec<(RecipientAddress, u128)>,
+        fee: u128,
+        limits: quil_lattice_ct::confidential::transfer::CompileLimits,
+        budget: quil_lattice_ct::confidential::relation::backend::native::NativeBudget,
+    ) -> anyhow::Result<Vec<u8>> {
+        use quil_lattice_ct::confidential::{relation::backend::native, transfer::Transfer};
+        let Spend { coins, root, paths } = spend;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let selected: Vec<_> = coins
@@ -3479,6 +3538,8 @@ impl RecipientWallet {
             scan_pages: std::sync::atomic::AtomicUsize::new(DEFAULT_SCAN_PAGES),
             prepared: std::sync::Mutex::new(None),
             opening: std::sync::OnceLock::new(),
+            #[cfg(feature = "native-proof")]
+            root_age_unknown_said: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -3510,17 +3571,50 @@ impl RecipientWallet {
             !coins.is_empty() && coins.len() <= 4,
             "select one to four coins per witness request"
         );
+        let (_, root, paths) = self
+            .witness_pass(client, &[coins], MAX_WITNESS_SUBTREE_COINS)
+            .await?;
+        Ok((root, paths))
+    }
+
+    /// One witness pass: the paths of the leading `groups` it serves, all
+    /// against one root, with how many groups it took. It takes the most
+    /// whose coins' candidate subtrees report at most `cap` coins together
+    /// ([`segment_groups`]), counted on the accumulator the paths are built
+    /// from: the selection scan's when that scan kept the coins, else each
+    /// rebuild attempt's own read. A first group over `cap` is refused
+    /// there, a single spend's as a batch's; nothing later refuses what
+    /// that count took. `token merge --batch` builds a segment of planned
+    /// merges this way; each spend still cites at most the circuit's inputs.
+    async fn witness_pass(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        groups: &[&[([u8; 32], &Output)]],
+        cap: usize,
+    ) -> anyhow::Result<(
+        usize,
+        quil_lattice_ct::confidential::coin_tree::RootRecord,
+        Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
+    )> {
         anyhow::ensure!(
-            coins
+            !groups.is_empty() && groups.iter().all(|group| !group.is_empty()),
+            "select at least one coin"
+        );
+        anyhow::ensure!(
+            groups
                 .iter()
-                .map(|(address, _)| address)
+                .flat_map(|group| group.iter().map(|(address, _)| address))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
-                == coins.len(),
+                == groups.iter().map(|group| group.len()).sum::<usize>(),
             "duplicate selected coins"
         );
         let prepared = self.prepared.lock().expect("spend scan lock").take();
         if let Some(prepared) = prepared {
+            let taken = segment_of(prepared.accumulator.as_ref(), groups, cap)?;
+            let coins = groups[..taken].concat();
             let positions: Vec<Option<u64>> = coins
                 .iter()
                 .map(|(address, _)| prepared.owned.get(address).copied())
@@ -3529,7 +3623,7 @@ impl RecipientWallet {
                 let (started, kept) = (std::time::Instant::now(), prepared.kept.len());
                 match self
                     .paths_from_scan(
-                        coins,
+                        &coins,
                         positions,
                         prepared.accumulator,
                         prepared.lookup,
@@ -3539,12 +3633,12 @@ impl RecipientWallet {
                     .await
                 {
                     Ok((root, paths)) => {
-                        self.verify_paths(coins, &root, &paths)?;
+                        self.verify_paths(&coins, &root, &paths)?;
                         super::output::detail(format!(
                             "Spend witnesses rebuilt from the selection scan ({kept} coins under the wallet's subtrees, {:.1} s); the node was not told which coins this spends.",
                             started.elapsed().as_secs_f64()
                         ));
-                        return Ok((root, paths));
+                        return Ok((taken, root, paths));
                     }
                     Err(error) if error.downcast_ref::<StaleWitness>().is_some() => {
                         super::output::detail(format!(
@@ -3561,11 +3655,8 @@ impl RecipientWallet {
         );
         let mut attempt = 1;
         loop {
-            match self.rebuild_witnesses(client, coins).await {
-                Ok((root, paths)) => {
-                    self.verify_paths(coins, &root, &paths)?;
-                    return Ok((root, paths));
-                }
+            match self.rebuild_attempt(client, groups, cap).await {
+                Ok(built) => return Ok(built),
                 Err(error)
                     if attempt < WITNESS_ATTEMPTS
                         && error.downcast_ref::<StaleWitness>().is_some() =>
@@ -3580,6 +3671,34 @@ impl RecipientWallet {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// One rebuild of [`Self::witness_pass`]: read the accumulator once,
+    /// take the groups it serves under `cap`, and rebuild their paths from a
+    /// scan placed by that same read. A stale read or scan is retried whole,
+    /// so a retry sizes again on its own read.
+    async fn rebuild_attempt(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        groups: &[&[([u8; 32], &Output)]],
+        cap: usize,
+    ) -> anyhow::Result<(
+        usize,
+        quil_lattice_ct::confidential::coin_tree::RootRecord,
+        Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
+    )> {
+        // Read before the scan, so the scanned snapshot holds every coin these
+        // reports cover; a scan answered from an older snapshot is retried.
+        let accumulator = self.read_accumulator(client).await?;
+        let taken = segment_of(accumulator.as_ref(), groups, cap)?;
+        let coins = groups[..taken].concat();
+        let (root, paths) = self
+            .rebuild_witnesses(client, &coins, accumulator, cap)
+            .await?;
+        self.verify_paths(&coins, &root, &paths)?;
+        Ok((taken, root, paths))
     }
 
     /// GLOBAL's accumulator: every reported subtree at its tree position and
@@ -3665,33 +3784,112 @@ impl RecipientWallet {
         Ok(Some(Accumulator { subtrees, root }))
     }
 
-    /// One rebuild: read the accumulator, then scan every coin, keeping only
-    /// those under a subtree some selected coin's address could sit in, and
-    /// rebuild each selected coin's subtree from the coins its report covers.
+    /// How many roots GLOBAL's canonical history published after `root`
+    /// ([`RootAge`]). Admission takes a spend citing `root` only while the
+    /// history retains it.
+    #[cfg(feature = "native-proof")]
+    pub(super) async fn root_age(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        root: &quil_lattice_ct::confidential::coin_tree::RootRecord,
+    ) -> anyhow::Result<RootAge> {
+        use quil_execution::token_intrinsic::global_accumulator as records;
+        let (present, blob) = self
+            .global_record(client, &records::root_history_address(&self.application)?)
+            .await?;
+        if !present || records::decode_root_history_record(&blob, &self.context)?.is_none() {
+            return Ok(RootAge::Unknown);
+        }
+        Ok(
+            match records::decode_root_history_age(&blob, &self.context, root.depth, &root.root)? {
+                Some(age) => RootAge::Retained(age),
+                None => RootAge::Evicted,
+            },
+        )
+    }
+
+    /// Refuse to submit `bytes` when the coin root it cites is past `limit`
+    /// ([`StaleRoot`]): the root dates from the scan before minutes of
+    /// proving. Read after proving, right before any journal write or
+    /// submission. An operation citing no root passes, as does one whose
+    /// root's age the node cannot tell (no root history record): admission
+    /// decides, and the run says so once on stderr.
+    #[cfg(feature = "native-proof")]
+    pub(super) async fn check_cited_root(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        bytes: &[u8],
+        limit: RootLimit,
+    ) -> anyhow::Result<()> {
+        let Some(root) = cited_root(bytes, &self.network, &self.application, &self.context)? else {
+            return Ok(());
+        };
+        let age = self.root_age(client, &root).await?;
+        if age == RootAge::Unknown
+            && !self
+                .root_age_unknown_said
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            super::output::err_line(format!(
+                "The node serves no root history for application {}, so the age of the coin root this operation cites is unknown; submitting unchecked, the network's admission checks it.",
+                hex::encode(self.application)
+            ));
+        }
+        match stale_root(age, limit) {
+            Some(stale) => Err(anyhow::Error::new(stale)),
+            None => Ok(()),
+        }
+    }
+
+    /// Scan every coin, keeping only those under a subtree some selected
+    /// coin's address could sit in, and rebuild each selected coin's subtree
+    /// from the coins its report in `accumulator` covers.
+    ///
+    /// Under an index the scan keeps, per candidate subtree, its earliest
+    /// coins by creation frame and position, one more than its report
+    /// covers: all [`covered_coins`] reads (the covered coins, and the next,
+    /// which shows a report ending inside a frame). Coins newer than the
+    /// reports therefore take no memory, and the keep is at most the
+    /// candidates' reported coins plus one per candidate, which the sizing
+    /// on this `accumulator` held to `cap`: no keep-time refusal. With no
+    /// index one tree holds every coin, and over `cap` of them is refused.
     async fn rebuild_witnesses(
         &self,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
             tonic::transport::Channel,
         >,
         coins: &[([u8; 32], &Output)],
+        accumulator: Option<Accumulator>,
+        cap: usize,
     ) -> anyhow::Result<(
         quil_lattice_ct::confidential::coin_tree::RootRecord,
         Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
     )> {
         use quil_lattice_ct::confidential::relation::membership::MembershipKey;
         let started = std::time::Instant::now();
-        // Read before the scan, so the scanned snapshot holds every coin these
-        // reports cover; a scan answered from an older snapshot is retried.
-        let accumulator = self.read_accumulator(client).await?;
         let lookup = accumulator.as_ref().map(Accumulator::lookup);
         let candidates: std::collections::BTreeSet<usize> = accumulator
             .as_ref()
             .map(|accumulator| {
-                (0..accumulator.subtrees.len())
-                    .filter(|&i| {
-                        coins
-                            .iter()
-                            .any(|(address, _)| accumulator.subtrees[i].may_hold(address))
+                candidate_subtrees(
+                    &accumulator.subtrees,
+                    coins.iter().map(|(address, _)| address),
+                )
+            })
+            .unwrap_or_default();
+        // How many coins each candidate subtree keeps; with no index, all.
+        let keeps: std::collections::BTreeMap<usize, usize> = accumulator
+            .as_ref()
+            .map(|accumulator| {
+                candidates
+                    .iter()
+                    .map(|&i| {
+                        let coins = usize::try_from(accumulator.subtrees[i].coins);
+                        (i, coins.map_or(usize::MAX, |coins| coins.saturating_add(1)))
                     })
                     .collect()
             })
@@ -3699,7 +3897,12 @@ impl RecipientWallet {
         let key = std::sync::Arc::new(MembershipKey::derive(&self.context));
         let mut scan = CoinScan::new(self.scan_pages.load(std::sync::atomic::Ordering::Relaxed))?;
         let mut found: Vec<Option<(u64, u64)>> = vec![None; coins.len()];
-        let mut kept: Vec<KeptCoin> = Vec::new();
+        // Kept coins per subtree, by creation frame and position.
+        let mut kept: std::collections::BTreeMap<
+            usize,
+            std::collections::BTreeMap<(u64, u64), KeptCoin>,
+        > = Default::default();
+        let mut whole = 0usize;
         let (mut pages, mut scanned) = (0usize, 0usize);
         while !scan.finished() {
             let page = self.scan_next_records(client, &mut scan).await?;
@@ -3732,13 +3935,37 @@ impl RecipientWallet {
                 };
                 batch.push((subtree, coin));
             }
-            anyhow::ensure!(
-                kept.len() + batch.len() <= MAX_WITNESS_SUBTREE_COINS,
-                "the selected coins' subtrees hold more than {MAX_WITNESS_SUBTREE_COINS} coins"
-            );
-            kept.extend(hash_kept(key.clone(), batch).await?);
+            if lookup.is_none() {
+                whole += batch.len();
+                if whole > cap {
+                    return Err(witness_cap_exceeded(cap));
+                }
+            } else {
+                // A coin later than a full subtree's last kept one is not
+                // hashed at all.
+                batch.retain(|(subtree, coin)| {
+                    kept.get(subtree).is_none_or(|held| {
+                        held.len() < keeps.get(subtree).copied().unwrap_or(usize::MAX)
+                            || held
+                                .last_key_value()
+                                .is_some_and(|(last, _)| (coin.frame, coin.position) < *last)
+                    })
+                });
+            }
+            for coin in hash_kept(key.clone(), batch).await? {
+                let limit = keeps.get(&coin.subtree).copied().unwrap_or(usize::MAX);
+                let held = kept.entry(coin.subtree).or_default();
+                held.insert((coin.frame, coin.position), coin);
+                if held.len() > limit {
+                    held.pop_last();
+                }
+            }
         }
         anyhow::ensure!(!scan.rootless, "the application holds no confidential coin");
+        let kept: Vec<KeptCoin> = kept
+            .into_values()
+            .flat_map(std::collections::BTreeMap::into_values)
+            .collect();
         let kept_coins = kept.len();
         let (root, paths) = self
             .paths_from_scan(
@@ -4543,6 +4770,394 @@ pub(super) fn merge_selection(
     Ok((selected, total))
 }
 
+/// `token merge --batch`'s journal in the config directory: one
+/// `<unix seconds> <address hex>` line per coin of each submitted merge.
+/// Later runs leave a coin it lists for two hours
+/// (`legacy::SUBMITTED_EXCLUSION_SECS`).
+#[cfg(feature = "native-proof")]
+pub(super) const MERGE_JOURNAL: &str = "token-merge-journal.txt";
+
+/// Roots GLOBAL may publish after the coin root a batch merge cites before
+/// the wallet refuses to submit it ([`RootLimit::HalfHistory`]): half the
+/// history admission checks a spend's root against, the other half left for
+/// that spend's inclusion. Only a batch merge after its scan's first
+/// submitted merge keeps this margin. GLOBAL may
+/// publish more than one root per frame: each certified shard header in a
+/// frame materializes its shard's report (`materialize_report` per header
+/// op, quil-execution global_intrinsic/intrinsic.rs:3509; a globally
+/// executed application's at token_intrinsic/commit_apply.rs:165) and each
+/// changed report publishes a root, so the rate per proof is not bounded by
+/// the frame rate. A single
+/// operation therefore refuses only an evicted root ([`RootLimit::Retained`]):
+/// a margin would refuse a finished spend admission may still take. So does
+/// a batch's first merge from a fresh scan, which a rescan cannot make
+/// younger; a later merge of the batch rescans on a refusal, so its margin
+/// costs a reproof, never a refused spend.
+#[cfg(feature = "native-proof")]
+pub(super) const SUBMIT_ROOT_MAX_AGE: usize =
+    quil_execution::token_intrinsic::roots::HISTORY_LIMIT / 2;
+
+/// `token merge --batch`'s plan over one scan's coins: `coins` largest
+/// first (address breaks ties), cut into disjoint groups of at most the
+/// circuit's inputs.
+#[cfg(feature = "native-proof")]
+#[derive(Default)]
+pub(super) struct MergePlan {
+    pub(super) coins: Vec<OwnedCoin>,
+    /// Each merge's coins (a range of `coins`) and their total.
+    pub(super) groups: Vec<(std::ops::Range<usize>, u128)>,
+    /// Coins left out as submitted earlier (the journal, this run).
+    pub(super) excluded: usize,
+    /// Groups whose total does not exceed the fee, left unmerged.
+    pub(super) below_fee: usize,
+    /// A last coin with no other to merge with.
+    pub(super) lone: usize,
+}
+
+/// Plan merges of `coins` but those in `exclude`: largest first, each group
+/// the next `max_inputs` coins; a last group of one coin is left, as is any
+/// group whose total does not exceed `fee`.
+#[cfg(feature = "native-proof")]
+pub(super) fn merge_plan(
+    mut coins: Vec<OwnedCoin>,
+    exclude: &std::collections::BTreeSet<[u8; 32]>,
+    max_inputs: usize,
+    fee: u128,
+) -> anyhow::Result<MergePlan> {
+    anyhow::ensure!(max_inputs >= 2, "a merge needs at least two inputs");
+    coins.retain(|coin| *coin.amount > 0);
+    let listed = coins.len();
+    coins.retain(|coin| !exclude.contains(&coin.address));
+    let excluded = listed - coins.len();
+    coins.sort_by(|a, b| (*b.amount).cmp(&*a.amount).then(a.address.cmp(&b.address)));
+    let mut plan = MergePlan {
+        excluded,
+        ..MergePlan::default()
+    };
+    let mut start = 0;
+    while start < coins.len() {
+        let end = start.saturating_add(max_inputs).min(coins.len());
+        let group = start..end;
+        start = end;
+        if group.len() < 2 {
+            plan.lone += group.len();
+            continue;
+        }
+        let total = coins[group.clone()]
+            .iter()
+            .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+            .ok_or_else(|| anyhow::anyhow!("merged total overflows"))?;
+        if total <= fee {
+            plan.below_fee += 1;
+            continue;
+        }
+        plan.groups.push((group, total));
+    }
+    plan.coins = coins;
+    Ok(plan)
+}
+
+/// How many of `groups` (each a spend's coin addresses), in order, one
+/// witness pass serves: the most whose coins' candidate subtrees
+/// ([`candidate_subtrees`]) report at most `cap` coins together, each
+/// subtree once ([`RecipientWallet::witness_pass`]). The only refusal by
+/// coin count: a first group over `cap`, a single spend's as a batch's.
+/// With no index (`None`) one tree holds every coin, whichever are spent:
+/// all groups, and the rebuild bounds the whole tree.
+fn segment_groups<'a, G>(
+    subtrees: Option<&[ReportedSubtree]>,
+    groups: impl IntoIterator<Item = G>,
+    cap: usize,
+) -> anyhow::Result<usize>
+where
+    G: IntoIterator<Item = &'a [u8; 32]>,
+{
+    let Some(subtrees) = subtrees else {
+        return Ok(groups.into_iter().count());
+    };
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX);
+    let mut held = std::collections::BTreeSet::new();
+    let mut coins = 0u64;
+    let mut taken = 0;
+    for group in groups {
+        for i in candidate_subtrees(subtrees, group) {
+            if held.insert(i) {
+                coins = coins.saturating_add(subtrees[i].coins);
+            }
+        }
+        if coins > limit {
+            return match taken {
+                0 => Err(witness_cap_exceeded(cap)),
+                taken => Ok(taken),
+            };
+        }
+        taken += 1;
+    }
+    Ok(taken)
+}
+
+/// [`segment_groups`] of a witness pass's `groups` on `accumulator`.
+fn segment_of(
+    accumulator: Option<&Accumulator>,
+    groups: &[&[([u8; 32], &Output)]],
+    cap: usize,
+) -> anyhow::Result<usize> {
+    segment_groups(
+        accumulator.map(|accumulator| accumulator.subtrees.as_slice()),
+        groups
+            .iter()
+            .map(|group| group.iter().map(|(address, _)| address)),
+        cap,
+    )
+}
+
+/// What GLOBAL's root history says of a cited coin root.
+#[cfg(feature = "native-proof")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootAge {
+    /// No root history record: the node serves none, or the application
+    /// never reported. Only admission can tell.
+    Unknown,
+    /// Retained; the roots published after it (0 while current).
+    Retained(usize),
+    /// No longer in the history.
+    Evicted,
+}
+
+/// How old a cited root a submission takes ([`SUBMIT_ROOT_MAX_AGE`] says
+/// why the two differ).
+#[cfg(feature = "native-proof")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootLimit {
+    /// Any root GLOBAL's history retains: a single operation, or a batch's
+    /// first merge from a fresh scan.
+    Retained,
+    /// At most [`SUBMIT_ROOT_MAX_AGE`] roots old: a batch merge after its
+    /// scan's first submitted one, which rescans when refused.
+    HalfHistory,
+}
+
+/// The refusal of an operation citing a root of `age` under `limit`: evicted,
+/// or for [`RootLimit::HalfHistory`] over [`SUBMIT_ROOT_MAX_AGE`]. An unknown
+/// age is admission's call.
+#[cfg(feature = "native-proof")]
+pub(super) fn stale_root(age: RootAge, limit: RootLimit) -> Option<StaleRoot> {
+    match age {
+        RootAge::Retained(age) if limit == RootLimit::HalfHistory && age > SUBMIT_ROOT_MAX_AGE => {
+            Some(StaleRoot(Some(age)))
+        }
+        RootAge::Evicted => Some(StaleRoot(None)),
+        RootAge::Unknown | RootAge::Retained(_) => None,
+    }
+}
+
+/// The one form of a proved operation the wallet delivers
+/// ([`RecipientWallet::submit`], [`deliver_operation`],
+/// [`paid_bundle::submit_paid`]): only its constructors make one, and each
+/// checks the coin root the operation cites, so no submission path skips
+/// the check. A saved custom-mint bundle `--resume` sends cites no root.
+#[cfg(feature = "native-proof")]
+mod root_checked {
+    use super::{RecipientWallet, RootLimit};
+
+    pub(in crate::commands::token) struct RootChecked(Vec<u8>);
+
+    impl RootChecked {
+        /// `bytes` once its cited root passed `limit`
+        /// ([`RecipientWallet::check_cited_root`]).
+        pub(in crate::commands::token) async fn check(
+            wallet: &RecipientWallet,
+            client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+                tonic::transport::Channel,
+            >,
+            bytes: Vec<u8>,
+            limit: RootLimit,
+        ) -> anyhow::Result<Self> {
+            wallet.check_cited_root(client, &bytes, limit).await?;
+            Ok(Self(bytes))
+        }
+
+        /// `bytes` of an operation that cites no coin root (a mint, say),
+        /// refused when it cites one.
+        pub(in crate::commands::token) fn citing_none(
+            wallet: &RecipientWallet,
+            bytes: Vec<u8>,
+        ) -> anyhow::Result<Self> {
+            anyhow::ensure!(
+                super::cited_root(
+                    &bytes,
+                    &wallet.network,
+                    &wallet.application,
+                    &wallet.context
+                )?
+                .is_none(),
+                "this operation cites a coin root, which must be checked before submitting"
+            );
+            Ok(Self(bytes))
+        }
+
+        pub(in crate::commands::token) fn bytes(&self) -> &[u8] {
+            &self.0
+        }
+
+        pub(in crate::commands::token) fn into_bytes(self) -> Vec<u8> {
+            self.0
+        }
+    }
+}
+#[cfg(feature = "native-proof")]
+pub(super) use root_checked::RootChecked;
+
+/// A proved operation cites a coin root too old to submit ([`None`]: no
+/// longer retained). Nothing was journaled or submitted.
+#[cfg(feature = "native-proof")]
+#[derive(Debug)]
+pub(super) struct StaleRoot(pub(super) Option<usize>);
+
+#[cfg(feature = "native-proof")]
+impl std::fmt::Display for StaleRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(age) => write!(
+                f,
+                "the coin root this operation cites is {age} roots old, over the {SUBMIT_ROOT_MAX_AGE} a submission may cite (the rest of GLOBAL's history is left for inclusion); nothing was submitted; rerun to read a fresh root"
+            ),
+            None => f.write_str(
+                "the coin root this operation cites is no longer in GLOBAL's history; nothing was submitted; rerun to read a fresh root",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl std::error::Error for StaleRoot {}
+
+/// The coin root a proved operation cites: transfers and merges, escrow
+/// funding and settlements spend coins against one; other operations cite
+/// none.
+#[cfg(feature = "native-proof")]
+pub(super) fn cited_root(
+    bytes: &[u8],
+    network: &[u8; 32],
+    application: &[u8; 32],
+    context: &[u8; 32],
+) -> anyhow::Result<Option<quil_lattice_ct::confidential::coin_tree::RootRecord>> {
+    use quil_lattice_ct::confidential::{
+        pending_create::PendingCreate, settlement::Settlement, transfer::Transfer,
+    };
+    anyhow::ensure!(bytes.len() >= 4, "operation too short");
+    let decoded = |e| anyhow::anyhow!("decode the operation's cited root: {e:?}");
+    let statement = match u32::from_be_bytes(bytes[..4].try_into()?) {
+        0x0512 => {
+            Transfer::decode(bytes, network, application)
+                .map_err(decoded)?
+                .statement
+        }
+        0x0514 => {
+            PendingCreate::decode(bytes, network, application)
+                .map_err(decoded)?
+                .statement
+                .funding
+        }
+        0x0518 => {
+            Settlement::decode(bytes, network, application)
+                .map_err(decoded)?
+                .statement
+                .funding
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(quil_lattice_ct::confidential::coin_tree::RootRecord {
+        context: *context,
+        depth: statement.depth,
+        coins: 0,
+        root: statement.root,
+    }))
+}
+
+/// A [`MergePlan`] with every planned coin's path against one root, from
+/// one scan: what a segment of `token merge --batch` spends.
+#[cfg(feature = "native-proof")]
+pub(super) struct MergeSegment {
+    pub(super) plan: MergePlan,
+    pub(super) root: quil_lattice_ct::confidential::coin_tree::RootRecord,
+    /// The path of each of `plan.coins` a group holds.
+    paths: Vec<Option<quil_lattice_ct::confidential::coin_tree::AuthPath>>,
+}
+
+#[cfg(feature = "native-proof")]
+impl MergeSegment {
+    /// The `index`th planned merge's inputs, paths and total; its paths are
+    /// taken, so each serves one spend.
+    pub(super) fn take_spend(&mut self, index: usize) -> anyhow::Result<(Spend, u128)> {
+        let (group, total) = self
+            .plan
+            .groups
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no planned merge {index}"))?;
+        let coins = self.plan.coins[group.clone()]
+            .iter()
+            .map(|coin| (coin.address, coin.output.clone()))
+            .collect();
+        let paths = group
+            .map(|i| {
+                self.paths[i]
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("a planned coin's path was already spent"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let spend = Spend {
+            coins,
+            root: self.root.clone(),
+            paths,
+        };
+        Ok((spend, total))
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl RecipientWallet {
+    /// The leading groups of `plan` one witness pass serves under `cap`
+    /// ([`Self::witness_pass`]), each coin with its path against one root,
+    /// and how many groups are left for the next scan. The pass builds from
+    /// the kept coins of this wallet's last scan (the one `plan` came from)
+    /// when it kept them, else from a rescan, sizing on the accumulator it
+    /// builds from.
+    pub(super) async fn merge_segment(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        mut plan: MergePlan,
+        cap: usize,
+    ) -> anyhow::Result<(MergeSegment, usize)> {
+        anyhow::ensure!(!plan.groups.is_empty(), "no planned merge");
+        let selected: Vec<Vec<_>> = plan
+            .groups
+            .iter()
+            .map(|(group, _)| {
+                plan.coins[group.clone()]
+                    .iter()
+                    .map(|coin| (coin.address, &coin.output))
+                    .collect()
+            })
+            .collect();
+        let groups: Vec<&[_]> = selected.iter().map(Vec::as_slice).collect();
+        let (taken, root, found) = self.witness_pass(client, &groups, cap).await?;
+        drop(groups);
+        drop(selected);
+        let left = plan.groups.len() - taken;
+        plan.groups.truncate(taken);
+        let mut paths: Vec<_> = plan.coins.iter().map(|_| None).collect();
+        let planned = plan.groups.iter().flat_map(|(group, _)| group.clone());
+        for (i, path) in planned.zip(found) {
+            paths[i] = Some(path);
+        }
+        Ok((MergeSegment { plan, root, paths }, left))
+    }
+}
+
 /// What `token confidential-address` prints on stderr before each address
 /// line; stdout keeps the bare hex lines for scripts.
 fn address_label(escrow: bool) -> &'static str {
@@ -4929,7 +5544,7 @@ pub(crate) async fn run_transfer(
         }
     })
     .await?;
-    let submitted = submit_refreshed_operation(tc, &wallet, bytes).await?;
+    let submitted = submit_refreshed_operation(tc, &wallet, &client, bytes).await?;
     let follow = Follow { wait, max_pages };
     inclusion::follow(tc, &wallet, "transfer", submitted, follow).await
 }
@@ -5065,6 +5680,7 @@ pub(super) async fn run_pay(
             .map_err(|e| anyhow::anyhow!("settlement decode: {e:?}"))?
             .statement,
     )?;
+    let settlement = RootChecked::check(&wallet, &client, bytes, RootLimit::Retained).await?;
     if let Some(before_submit) = before_submit {
         before_submit(&receipt)?;
     }
@@ -5072,7 +5688,7 @@ pub(super) async fn run_pay(
         .submit(
             &mut crate::retry::connect(|| tc.connect_submit()).await?,
             &tc.submit_key_manager,
-            bytes,
+            settlement,
         )
         .await?;
     println!(
@@ -5569,24 +6185,40 @@ async fn submit_operation(
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         refresh_submission_fee(tc, client, &bytes).await?;
     }
-    submit_refreshed_operation(tc, wallet, bytes).await
+    submit_refreshed_operation(tc, wallet, client, bytes).await
 }
 
 /// [`submit_operation`] for a caller that has just refreshed the fee itself
-/// and rebuilt if it had moved — the price is not quoted twice.
+/// and rebuilt if it had moved — the price is not quoted twice. The coin root
+/// the operation cites is checked first ([`RecipientWallet::check_cited_root`]).
 #[cfg(feature = "native-proof")]
 async fn submit_refreshed_operation(
     tc: &TokenCtx,
     wallet: &RecipientWallet,
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
     bytes: Vec<u8>,
 ) -> anyhow::Result<Option<Submitted>> {
+    let operation = RootChecked::check(wallet, client, bytes, RootLimit::Retained).await?;
+    deliver_operation(tc, wallet, operation).await
+}
+
+/// Deliver an operation whose fee and cited root were checked: QUIL
+/// operations to the node, others in a paid bundle.
+#[cfg(feature = "native-proof")]
+async fn deliver_operation(
+    tc: &TokenCtx,
+    wallet: &RecipientWallet,
+    operation: RootChecked,
+) -> anyhow::Result<Option<Submitted>> {
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
-        let mut submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
+        let mut submitted = Submitted::of(&wallet.network, wallet.application, operation.bytes());
         let bundle = wallet
             .submit(
                 &mut crate::retry::connect(|| tc.connect_submit()).await?,
                 &tc.submit_key_manager,
-                bytes,
+                operation,
             )
             .await?;
         if let Some(submitted) = &mut submitted {
@@ -5594,7 +6226,7 @@ async fn submit_refreshed_operation(
         }
         return Ok(submitted);
     }
-    paid_bundle::submit_paid(tc, wallet, bytes, None, SETTLEMENT_WAIT, false).await
+    paid_bundle::submit_paid(tc, wallet, operation, None, SETTLEMENT_WAIT, false).await
 }
 
 /// Build a token's mint-entitlement tree from a file of
@@ -5908,6 +6540,278 @@ pub(crate) async fn run_merge(
     let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
     let follow = Follow { wait, max_pages };
     inclusion::follow(tc, &wallet, "merge", submitted, follow).await
+}
+
+/// `token merge --batch`'s run lock in the config directory: one batch at a
+/// time per wallet, so two runs never plan the same coins.
+#[cfg(feature = "native-proof")]
+pub(super) const MERGE_BATCH_LOCK: &str = "token-merge-batch.lock";
+
+/// Hold [`MERGE_BATCH_LOCK`] for a batch run; refused while another run holds
+/// it. The lock ends with the returned file.
+#[cfg(feature = "native-proof")]
+pub(super) fn lock_merge_batch(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let path = dir.join(MERGE_BATCH_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another `token merge --batch` is running for this wallet (it holds {}); nothing done",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => anyhow::bail!("lock {}: {e}", path.display()),
+    }
+}
+
+/// Journal, then deliver, one proved batch merge: refresh the fee and check
+/// the cited root under `limit` first, so a refusal leaves nothing
+/// journaled. Its coins are journaled before delivery ([`MERGE_JOURNAL`]): a
+/// rerun must never spend a coin whose merge may already be on its way, so a
+/// failed delivery leaves them out for two hours, and its error says so.
+#[cfg(feature = "native-proof")]
+async fn submit_batch_merge(
+    tc: &TokenCtx,
+    wallet: &RecipientWallet,
+    client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
+    addresses: &[[u8; 32]],
+    bytes: Vec<u8>,
+    limit: RootLimit,
+) -> anyhow::Result<Option<Submitted>> {
+    refresh_submission_fee(tc, client, &bytes).await?;
+    let merge = RootChecked::check(wallet, client, bytes, limit).await?;
+    super::legacy::record_journaled(
+        &tc.config_dir,
+        MERGE_JOURNAL,
+        RecipientWallet::unix_now(),
+        addresses.iter().copied(),
+    )?;
+    deliver_operation(tc, wallet, merge).await.map_err(|error| {
+        error.context(format!(
+            "this merge's {} coins were journaled before its delivery failed; later runs leave them out for two hours",
+            addresses.len()
+        ))
+    })
+}
+
+/// `token merge --batch`: merge the wallet's unspent coins in disjoint groups
+/// of at most the circuit's inputs, largest first, in segments: each the
+/// groups one witness pass serves ([`segment_groups`]), their paths from one
+/// coin scan; the next scan plans the groups left. One run at a time
+/// ([`lock_merge_batch`]). Each merge's coins are journaled before it is
+/// submitted ([`MERGE_JOURNAL`], reread before each merge), and later merges
+/// and later runs leave them for two hours, so no coin is spent twice. Every
+/// merge cites its scan's root. Until a merge
+/// from the scan is submitted, the scan is fresh: its merge is refused only
+/// once GLOBAL has evicted that root, as a single operation's, and the run
+/// stops, as scanning again cannot cure it. After that, a proved merge whose
+/// root has aged past [`SUBMIT_ROOT_MAX_AGE`] is dropped unjournaled and the
+/// run rescans. A rescan plans the coins left, merged outputs among them, so
+/// how many merges a run makes depends on how fast GLOBAL publishes roots.
+/// The first error stops the run; merges submitted before it stand, and a
+/// rerun merges the rest.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn run_merge_batch(
+    tc: &TokenCtx,
+    application: &str,
+    fee: u128,
+    max_pages: usize,
+    max_coins: usize,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
+    let prove = |wallet: std::sync::Arc<RecipientWallet>, spend, recipients, limits| async move {
+        let permit = PROVING.acquire().await?;
+        wallet
+            .prove_transfer(permit, spend, recipients, fee, limits, native_budget())
+            .await
+    };
+    run_merge_batch_proving(
+        tc,
+        application,
+        fee,
+        (max_pages, max_coins),
+        wait,
+        MAX_WITNESS_SUBTREE_COINS,
+        prove,
+    )
+    .await
+}
+
+/// [`run_merge_batch`] with its scan's page and coin caps in `scan`, each
+/// merge's operation from `prove` (its spend, outputs and limits; the fee
+/// is the run's) and each segment sized to `witness_cap` coins under its
+/// subtrees.
+#[cfg(feature = "native-proof")]
+async fn run_merge_batch_proving<P, F>(
+    tc: &TokenCtx,
+    application: &str,
+    fee: u128,
+    (max_pages, max_coins): (usize, usize),
+    wait: std::time::Duration,
+    witness_cap: usize,
+    prove: P,
+) -> anyhow::Result<()>
+where
+    P: Fn(
+        std::sync::Arc<RecipientWallet>,
+        Spend,
+        Vec<(RecipientAddress, u128)>,
+        quil_lattice_ct::confidential::transfer::CompileLimits,
+    ) -> F,
+    F: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let application = identifier(application)?;
+    anyhow::ensure!(
+        application == quil_execution::domains::QUIL_TOKEN || fee == 0,
+        "custom-token outflow cannot pay a QUIL fee"
+    );
+    let _lock = lock_merge_batch(&tc.config_dir)?;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let limits = compile_limits();
+    let mut client = tc.connect().await?;
+    let waits = !wait.is_zero();
+    let started = std::time::Instant::now();
+    let mut exclude = super::legacy::recently_journaled(&tc.config_dir, MERGE_JOURNAL);
+    let mut submitted = Vec::new();
+    let mut merges = 0usize;
+    let outcome = async {
+        loop {
+            let owned = wallet
+                .clone()
+                .scan_spendable(&client, max_pages, max_coins)
+                .await?;
+            let plan = merge_plan(owned, &exclude, limits.max_inputs, fee)?;
+            let say = |plan: &MergePlan, taken: usize, left: usize| {
+                let deferred = match left {
+                    0 => String::new(),
+                    left => format!(
+                        ", {taken} from this scan and {left} after a rescan (one witness pass keeps at most {witness_cap} coins under their subtrees)"
+                    ),
+                };
+                super::output::line(format!(
+                    "Merge plan: {} merges{deferred}; left out: {} coins submitted in the last two hours, {} groups not above the fee, {} lone coins.",
+                    taken + left,
+                    plan.excluded,
+                    plan.below_fee,
+                    plan.lone
+                ));
+            };
+            if plan.groups.is_empty() {
+                say(&plan, 0, 0);
+                return anyhow::Ok(());
+            }
+            let (mut segment, left) = wallet.merge_segment(&client, plan, witness_cap).await?;
+            let planned = segment.plan.groups.len();
+            say(&segment.plan, planned, left);
+            let mut rescan = false;
+            // Whether a merge from this scan was submitted: until one is, a
+            // stale root is not cured by scanning again.
+            let mut fresh = true;
+            for index in 0..planned {
+                exclude.extend(super::legacy::recently_journaled(
+                    &tc.config_dir,
+                    MERGE_JOURNAL,
+                ));
+                let (group, total) = segment.plan.groups[index].clone();
+                if segment.plan.coins[group]
+                    .iter()
+                    .any(|coin| exclude.contains(&coin.address))
+                {
+                    super::output::line(format!(
+                        "Merge {} of {planned}: a coin was journaled since the plan; skipped.",
+                        index + 1
+                    ));
+                    continue;
+                }
+                let (spend, _) = segment.take_spend(index)?;
+                let merged = total
+                    .checked_sub(fee)
+                    .filter(|merged| *merged > 0)
+                    .ok_or_else(|| anyhow::anyhow!("merged coins must exceed the fee"))?;
+                let addresses: Vec<[u8; 32]> =
+                    spend.coins.iter().map(|(address, _)| *address).collect();
+                super::output::line(format!(
+                    "Merge {} of {planned}: proving {} coins ({total} base units); {merges} submitted, {}s elapsed.",
+                    index + 1,
+                    addresses.len(),
+                    started.elapsed().as_secs()
+                ));
+                let bytes = prove(
+                    wallet.clone(),
+                    spend,
+                    vec![(wallet.address().clone(), merged)],
+                    limits,
+                )
+                .await?;
+                let limit = if fresh {
+                    RootLimit::Retained
+                } else {
+                    RootLimit::HalfHistory
+                };
+                let result =
+                    submit_batch_merge(tc, &wallet, &mut client, &addresses, bytes, limit).await;
+                let sent = match result {
+                    Err(error) if !fresh && error.is::<StaleRoot>() => {
+                        super::output::line(format!(
+                            "Merge {} of {planned}: {error}. Rescanning for the remaining merges.",
+                            index + 1
+                        ));
+                        rescan = true;
+                        break;
+                    }
+                    result => result?,
+                };
+                exclude.extend(addresses);
+                merges += 1;
+                fresh = false;
+                match sent {
+                    Some(sent) => {
+                        inclusion::announce(tc, "merge", &sent, waits).await;
+                        submitted.push(sent);
+                    }
+                    None => super::output::line("Confidential merge submitted.".into()),
+                }
+            }
+            if !rescan && left == 0 {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    if let Err(error) = outcome {
+        return Err(if merges == 0 {
+            error
+        } else {
+            error.context(format!(
+                "{merges} merges submitted before this failure stand; rerun to merge the rest"
+            ))
+        });
+    }
+    super::output::line(format!(
+        "{merges} merges submitted in {}s.",
+        started.elapsed().as_secs()
+    ));
+    if !waits || submitted.is_empty() {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + wait;
+    inclusion::settle(
+        tc,
+        &wallet,
+        "merge",
+        &submitted,
+        Follow { wait, max_pages },
+        deadline,
+    )
+    .await
 }
 
 /// Fund a escrow for a recipient's escrow address. This wallet's
@@ -7474,7 +8378,8 @@ pub(super) async fn run_custom_mint(
         Some((payee, price, wait)) => ("paid custom-token mint", Some((payee, price)), wait),
         None => ("custom-token mint", None, SETTLEMENT_WAIT),
     };
-    let submitted = paid_bundle::submit_paid(tc, &wallet, bytes, payment, wait, true).await?;
+    let mint = RootChecked::citing_none(&wallet, bytes)?;
+    let submitted = paid_bundle::submit_paid(tc, &wallet, mint, payment, wait, true).await?;
     inclusion::follow(tc, &wallet, what, submitted, follow).await
 }
 

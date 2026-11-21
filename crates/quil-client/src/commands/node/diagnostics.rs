@@ -915,6 +915,21 @@ fn health_lines(health: Option<&HealthConditions>) -> String {
     out
 }
 
+/// The report's source commit, its first 4 bytes: `commit 0123abcd`,
+/// `+dirty` appended when tracked files differed from it; `commit unknown`
+/// when the node's build could not read one, `commit not reported` from
+/// nodes that predate the field.
+fn commit_label(report: &HealthReport) -> String {
+    match report.build_commit.as_deref() {
+        None => "commit not reported".to_string(),
+        Some([]) => "commit unknown".to_string(),
+        Some(id) => {
+            let dirty = if report.build_dirty { "+dirty" } else { "" };
+            format!("commit {}{dirty}", hex::encode(&id[..id.len().min(4)]))
+        }
+    }
+}
+
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     let mut out = String::new();
     let build = report
@@ -936,8 +951,9 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     };
     let _ = writeln!(
         out,
-        "Health report of {target}: release {}, build {build}, GLOBAL head frame {}; {} workers{configured}{omitted}.",
+        "Health report of {target}: release {}, build {build}, {}, GLOBAL head frame {}; {} workers{configured}{omitted}.",
         release(report),
+        commit_label(report),
         report.global_head_frame,
         report.workers.len()
     );
@@ -1061,6 +1077,8 @@ mod tests {
             store_io: None,
             store_space: None,
             machine: None,
+            build_commit: None,
+            build_dirty: false,
         }
     }
 
@@ -1121,7 +1139,7 @@ mod tests {
         let a1 = "a1".repeat(32);
         let b2 = "b2".repeat(32);
         assert_eq!(text, format!("\
-Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame 90001; 2 workers.
+Health report of …Ab12cd: release 2.1.0.25.88, build abababab, commit not reported, GLOBAL head frame 90001; 2 workers.
 CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL                FILTER                                                            RECOVERY
    1  yes    serve    -                   1204       1204  g7   <60s     -                   {a1}  idle >60s, attempts 1 (0 failing in a row)
   12  yes    blocked  state unavailable   1180       1204  g7   >60s     g6 awaiting GLOBAL  {b2}  installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 archive_state:1, last failure connect <60s, longest turn wait 95s
@@ -1210,7 +1228,7 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let text = render_report("…Ab12cd", &with_count);
         assert!(
             text.starts_with(
-                "Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame \
+                "Health report of …Ab12cd: release 2.1.0.25.88, build abababab, commit not reported, GLOBAL head frame \
             90001; 2 workers of 1 configured, 1 draining.\n"
             ),
             "{text}"
@@ -1625,8 +1643,105 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
     #[test]
     fn an_empty_report_says_no_workers() {
         assert_eq!(render_report("…Ab12cd", &report(Vec::new(), 0)),
-            "Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame 90001; 0 workers.\n\
+            "Health report of …Ab12cd: release 2.1.0.25.88, build abababab, commit not reported, GLOBAL head frame 90001; 0 workers.\n\
              No data workers reported.\n");
+    }
+
+    #[test]
+    fn the_header_names_the_source_commit() {
+        let header = |report: &HealthReport| {
+            let text = render_report("…Ab12cd", report);
+            text.lines().next().unwrap().to_string()
+        };
+        let mut new = report(Vec::new(), 0);
+        let cases = [
+            (None, false, "commit not reported"),
+            (Some(Vec::new()), false, "commit unknown"),
+            (
+                Some([0x01, 0x23, 0xab, 0xcd].repeat(5)),
+                false,
+                "commit 0123abcd",
+            ),
+            (
+                Some([0x01, 0x23, 0xab, 0xcd].repeat(5)),
+                true,
+                "commit 0123abcd+dirty",
+            ),
+        ];
+        for (commit, dirty, label) in cases {
+            (new.build_commit, new.build_dirty) = (commit, dirty);
+            let line = header(&new);
+            assert!(
+                line.contains(&format!(", build abababab, {label}, GLOBAL head frame")),
+                "COMMIT-RENDER {label}: {line}"
+            );
+        }
+    }
+
+    /// A report as nodes that predate the source commit encode it.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldHealthReport {
+        #[prost(bytes = "vec", tag = "5")]
+        build_fingerprint: Vec<u8>,
+        #[prost(uint64, tag = "6")]
+        global_head_frame: u64,
+    }
+
+    #[test]
+    fn an_old_peer_report_decodes_without_a_commit() {
+        use prost::Message as _;
+        let old = OldHealthReport {
+            build_fingerprint: vec![0xab; 32],
+            global_head_frame: 7,
+        };
+        let decoded = HealthReport::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            (decoded.build_commit.as_deref(), decoded.build_dirty),
+            (None, false)
+        );
+        let text = render_report("…Ab12cd", &decoded);
+        assert!(
+            text.contains(", build abababab, commit not reported, "),
+            "COMMIT-RENDER-OLD: {text}"
+        );
+        // An unread commit stays distinct from none on the wire; old readers
+        // skip both fields.
+        let new = HealthReport {
+            build_commit: Some(Vec::new()),
+            build_dirty: true,
+            ..decoded
+        };
+        let bytes = new.encode_to_vec();
+        assert_eq!(HealthReport::decode(bytes.as_slice()).unwrap(), new);
+        assert_eq!(OldHealthReport::decode(bytes.as_slice()).unwrap(), old);
+    }
+
+    /// A report from a node that names its source commit, by wire tag
+    /// only, so the test builds on releases without the field too.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct CommitWire {
+        #[prost(bytes = "vec", tag = "5")]
+        build_fingerprint: Vec<u8>,
+        #[prost(bytes = "vec", optional, tag = "16")]
+        build_commit: Option<Vec<u8>>,
+        #[prost(bool, tag = "17")]
+        build_dirty: bool,
+    }
+
+    #[test]
+    fn a_reported_source_commit_is_rendered() {
+        use prost::Message as _;
+        let wire = CommitWire {
+            build_fingerprint: vec![0xab; 32],
+            build_commit: Some([0x01, 0x23, 0xab, 0xcd].repeat(5)),
+            build_dirty: true,
+        };
+        let report = HealthReport::decode(wire.encode_to_vec().as_slice()).unwrap();
+        let text = render_report("…Ab12cd", &report);
+        assert!(
+            text.contains(", build abababab, commit 0123abcd+dirty, GLOBAL head frame"),
+            "COMMIT-RENDER-WIRE: {text}"
+        );
     }
 
     #[test]

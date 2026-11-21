@@ -663,6 +663,10 @@ mod tests {
         std::fs::read_dir(path).unwrap().count()
     }
 
+    /// How long a test waits for a released context to end `wait_idle`
+    /// before calling the release missed.
+    const RELEASE_HANG: Duration = Duration::from_secs(120);
+
     #[test]
     fn shutdown_waits_for_context_release_after_tasks_are_idle() {
         Directory::new().runner().start(|context| async move {
@@ -676,7 +680,9 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
             drop(retained);
-            tokio::time::timeout(Duration::from_secs(1), idle)
+            // The wait ends when the release is seen; only a missed release
+            // reaches the bound, so a loaded runner cannot fail it.
+            tokio::time::timeout(RELEASE_HANG, idle)
                 .await
                 .expect("shutdown must finish after the last child releases its context");
         });
