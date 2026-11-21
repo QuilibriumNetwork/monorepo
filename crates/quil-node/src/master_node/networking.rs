@@ -655,14 +655,6 @@ mod tests {
         }
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     type Inbound = tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>;
 
     /// Three nodes on loopback subscribed to the same topics. The source and
@@ -695,9 +687,12 @@ mod tests {
         };
         let node = quil_p2p::node::P2PNode::new_with_options(&config, true, None).unwrap();
         let id = node.peer_id;
-        let port = free_port();
-        let (handle, inbound) = node
-            .start(sup, &format!("/ip4/127.0.0.1/tcp/{port}"))
+        let (handle, inbound, port) = node
+            .start_on_loopback(
+                sup,
+                quil_p2p::node::ListenTransport::Tcp,
+                quil_p2p::node::ListenFamily::Ip4,
+            )
             .await
             .unwrap();
         (handle, id, port, inbound)

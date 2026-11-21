@@ -4,15 +4,8 @@
 
 use std::time::Duration;
 
+use quil_p2p::node::{ListenFamily, ListenTransport};
 use quil_p2p::{DirectOutcome, P2PNode};
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 #[tokio::test]
 async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
@@ -24,9 +17,8 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
 
     let receiver = P2PNode::new_with_options(&config, true, None).unwrap();
     let receiver_id = receiver.peer_id;
-    let receiver_port = free_port();
-    let (receiver, mut inbound) = receiver
-        .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{receiver_port}"))
+    let (receiver, mut inbound, receiver_port) = receiver
+        .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
         .await
         .unwrap();
 
@@ -36,8 +28,8 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
     )];
     let sender = P2PNode::new_with_options(&sender_config, true, None).unwrap();
     let sender_id = sender.peer_id;
-    let (sender, _) = sender
-        .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{}", free_port()))
+    let (sender, _, _) = sender
+        .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
         .await
         .unwrap();
 
