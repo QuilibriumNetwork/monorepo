@@ -900,15 +900,15 @@ mod supply_observer_tests {
         assert!(changes.keys.is_empty());
         assert!(!changes.overflowed);
         key[..32].fill(7);
-        // The consumer accepts at most 16,384 distinct addresses per adoption.
-        for n in 0..16_384 {
+        // Fill the shared limit; duplicate addresses must not consume capacity.
+        for n in 0..MAX_EXECUTION_OBSERVER_KEYS {
             key[32..40].copy_from_slice(&(n as u64).to_be_bytes());
             changes.record(&key);
             changes.record(&key);
         }
-        assert_eq!(changes.keys.len(), 16_384);
+        assert_eq!(changes.keys.len(), MAX_EXECUTION_OBSERVER_KEYS);
         assert!(!changes.overflowed);
-        key[32..40].copy_from_slice(&16_384u64.to_be_bytes());
+        key[32..40].copy_from_slice(&(MAX_EXECUTION_OBSERVER_KEYS as u64).to_be_bytes());
         changes.record(&key);
         assert!(changes.keys.is_empty());
         assert!(changes.overflowed);
