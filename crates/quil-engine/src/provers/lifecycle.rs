@@ -14507,9 +14507,10 @@ mod proposal_loop_tests {
     /// draining seat whose shard sits at halt risk stays (the halt-risk
     /// shield), so a kept seat leaves in its place. Once the leaves depart
     /// the node holds its count with that kept worker idle: the shield still
-    /// holds the draining seat, so nothing joins or leaves. Once the shard
-    /// grows past the shield, the draining seat yields to the idle kept
-    /// worker: it leaves, its worker retires, and the kept worker joins.
+    /// holds the draining seat, so nothing joins or leaves. Once one more
+    /// prover lifts the shard past the shield, the draining seat yields to
+    /// the idle kept worker: it leaves, its worker retires, and the kept
+    /// worker joins.
     #[test]
     fn a_memory_bound_restart_drains_a_shielded_seat_into_an_idle_kept_worker() {
         use crate::worker_count as wc;
@@ -14619,11 +14620,12 @@ mod proposal_loop_tests {
             "the drained workers retire; core 9 keeps its shielded seat: {actions:?}"
         );
 
-        // Shard 9 grows to 10 active provers: the shield no longer holds the
-        // draining seat, and it yields to the idle kept worker.
+        // Shard 9 gains one active prover, to the shield's edge: the shield
+        // no longer holds the draining seat, and it yields to the idle kept
+        // worker.
         reg.set_summaries(
             (1..=10u32)
-                .map(|core| shard_summary(seat(core), 10))
+                .map(|core| shard_summary(seat(core), actives(core) + u32::from(core == 9)))
                 .collect(),
         );
         let grown = after + 1;
@@ -14804,6 +14806,108 @@ mod proposal_loop_tests {
             (decided(true), decided(false)),
             (vec![draining], Vec::<Vec<u8>>::new()),
             "YIELD-CONFIRM: {actions:?}"
+        );
+    }
+
+    /// One evaluation of a node at its count of `count`: kept worker 1
+    /// serves a seat, kept worker 2 is free, and worker `count + 1` drains
+    /// on a seat past the halt-risk shield; `alter` adds seats first. At
+    /// count 2 the draining seat yields to worker 2 (`shed_count`). Returns
+    /// the actions and the draining seat.
+    fn evaluate_beside_a_free_kept_worker(
+        count: u32,
+        alter: impl FnOnce(&mut Vec<ProverAllocationInfo>),
+    ) -> (Vec<LifecycleAction>, Vec<u8>) {
+        let address = vec![0xCDu8; 32];
+        let (kept, draining) = (filter_bytes(0xE1), filter_bytes(0xE2));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, kept.clone()));
+        wm.add(idle_worker(2));
+        wm.add(allocated_worker(count + 1, draining.clone()));
+        wm.set_configured_count(count);
+        let mut allocs = vec![
+            alloc(kept, ProverStatus::Active, 10),
+            alloc(draining.clone(), ProverStatus::Active, 10),
+        ];
+        alter(&mut allocs);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_summaries(
+            allocs
+                .iter()
+                .map(|a| shard_summary(a.confirmation_filter.clone(), 10))
+                .collect(),
+        );
+        reg.set_prover(prover(address.clone(), allocs));
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        (actions, draining)
+    }
+
+    /// The setup the idle-kept tests below vary: at count 2 the free kept
+    /// worker idles, and the draining seat yields to it.
+    fn assert_the_draining_seat_yields_at_the_count() {
+        let (actions, draining) = evaluate_beside_a_free_kept_worker(2, |_| {});
+        assert_eq!(
+            proposed_leaves(&actions),
+            vec![draining],
+            "IDLE-BASE: at its count the draining seat yields to the free kept worker: \
+             {actions:?}"
+        );
+    }
+
+    /// Below its count, a free kept worker has an open slot: it joins, so
+    /// no draining seat yields to it and nothing leaves a healthy shard.
+    #[test]
+    fn a_draining_seat_does_not_yield_to_a_kept_worker_with_an_open_slot() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert_the_draining_seat_yields_at_the_count();
+        let (actions, _) = evaluate_beside_a_free_kept_worker(3, |_| {});
+        assert_eq!(
+            proposed_leaves(&actions),
+            Vec::<Vec<u8>>::new(),
+            "IDLE-OPEN: below its count no seat leaves: {actions:?}"
+        );
+    }
+
+    /// A free kept worker owed a seat the node holds with no worker bound
+    /// to it is not idle: the reconcile binds it there, so no draining seat
+    /// yields to it.
+    #[test]
+    fn a_draining_seat_does_not_yield_to_a_kept_worker_owed_an_unbound_seat() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert_the_draining_seat_yields_at_the_count();
+        let (actions, _) = evaluate_beside_a_free_kept_worker(3, |allocs| {
+            allocs.push(alloc(filter_bytes(0xE3), ProverStatus::Active, 10));
+        });
+        assert_eq!(
+            proposed_leaves(&actions),
+            Vec::<Vec<u8>>::new(),
+            "IDLE-OWED: with the free worker owed a held seat, no seat leaves: {actions:?}"
+        );
+    }
+
+    /// A free kept worker whose store stopped writing takes no new seat, so
+    /// no draining seat yields to it: the leave would drop a seat with no
+    /// worker to replace it.
+    #[test]
+    fn a_draining_seat_does_not_yield_to_a_kept_worker_whose_store_stopped() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert_the_draining_seat_yields_at_the_count();
+        let role = quil_forest::StoreRole::Worker(2);
+        quil_forest::storage_health::hold_store(role);
+        let (actions, _) = evaluate_beside_a_free_kept_worker(2, |_| {});
+        quil_forest::storage_health::release_store(role);
+        assert_eq!(
+            proposed_leaves(&actions),
+            Vec::<Vec<u8>>::new(),
+            "IDLE-UNFIT: with the free worker's store stopped, no seat leaves: {actions:?}"
         );
     }
 
