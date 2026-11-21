@@ -59,7 +59,7 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
 
     let allowed = vec![1, 7, 7];
     receiver.allow_direct(allowed.clone()).await;
-    // The sender dials its bootstrap peer on its first discovery tick.
+    // The sender dials its bootstrap peer once its listener binds.
     let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     let outcome = loop {
         let outcome = sender

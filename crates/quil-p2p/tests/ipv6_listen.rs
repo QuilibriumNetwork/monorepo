@@ -95,7 +95,7 @@ async fn publish_over(
     let node = P2PNode::new_with_options(config, true, None).unwrap();
     let (sender, _rx) = node.start(sup, listen).await.unwrap();
     sender.subscribe_confirmed(topic()).await.unwrap();
-    // The sender dials its bootstrap peer on its first discovery tick, and
+    // The sender dials its bootstrap peer once its listener binds, and
     // publishing fails until it knows the receiver's subscription.
     let data = [&[0x80u8][..], &[1u8; 8][..], payload].concat();
     let deadline = tokio::time::Instant::now() + CONNECT_WAIT;

@@ -1048,7 +1048,7 @@ impl P2PNode {
                             if ticks_without_listener % 120 == 2 {
                                 warn!(
                                     listen = %configured_listen,
-                                    waited_secs = u64::from(ticks_without_listener - 1) * 30,
+                                    waited_secs = u64::from(ticks_without_listener - 1) * DISCOVERY_INTERVAL.as_secs(),
                                     "no p2p listener has an address, so this node dials no peer \
                                      and peers cannot dial it; check that the host has an address \
                                      in the family of p2p.listenMultiaddr, and that its port is free"

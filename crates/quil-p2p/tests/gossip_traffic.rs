@@ -38,7 +38,7 @@ async fn gossip_messages_are_counted_by_class_on_both_nodes() {
     receiver.subscribe_confirmed(cw.clone()).await.unwrap();
     sender.subscribe_confirmed(cw.clone()).await.unwrap();
 
-    // The sender dials its bootstrap peer on its first discovery tick, and
+    // The sender dials its bootstrap peer once its listener binds, and
     // publishing fails until it knows the receiver's subscription.
     let vote = [&[0x80u8][..], &[1u8; 8][..], &b"a vote"[..]].concat();
     let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
