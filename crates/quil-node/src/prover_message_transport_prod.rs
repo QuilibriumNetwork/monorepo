@@ -115,7 +115,8 @@ fn freshest_verified_header(
 /// goes to the archives one after another when sent again. Rounds
 /// back off from 5 s to a minute. A message is given up after ten minutes, a
 /// storage epoch proof once this node's GLOBAL frame reaches its window's
-/// end, and either oldest first once the queue is full. Until 2026-10-15 a
+/// end, and either oldest first once the queue is full. An archive that
+/// refused a proof for room rests ([`ArchiveRests`]). Until 2026-10-15 a
 /// refused submission was simply dropped: during the 880,560 halt every
 /// regular's reward proofs and seals were lost. Until 2026-10-30 a storage
 /// epoch proof that timed out on every archive was dropped too, and GLOBAL
@@ -140,6 +141,71 @@ pub(crate) struct SubmitRetryQueue {
     /// ([`SubmitRetryQueue::warn_settled`]). Locked after `pending` when
     /// both are.
     settled_lines: std::sync::Mutex<ArchiveRefusals>,
+    /// The archives resting after a refusal for room, first sends and
+    /// resends alike. Never locked with another lock held.
+    rests: ArchiveRests,
+}
+
+/// The archives that refused this node's storage epoch proof for room (a
+/// full rank or share of held proofs), each resting until a time: sent no
+/// proof whose window ends no sooner than the one it refused, as it would
+/// refuse that too. A proof due sooner still goes: an archive makes room
+/// for it by dropping proofs due later. The share of held proofs is full
+/// for most of an epoch at about 8 MiB carried a GLOBAL frame, one frame
+/// about 18.5 s, and one sender's share holds about one proof: rounds 5 s
+/// apart sent every queued proof to every archive, and four archives
+/// refused about 130,000 sends an epoch each, against about 1,100 seats
+/// (2026-11-21). An archive taking a proof is sent at most one more before
+/// it refuses and rests.
+#[derive(Default)]
+struct ArchiveRests {
+    rests: std::sync::Mutex<std::collections::HashMap<String, Rest>>,
+}
+
+/// An archive resting ([`ArchiveRests`]): until when, and the earliest
+/// window end of the proofs it refused for room meanwhile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rest {
+    until: Instant,
+    window_end: u64,
+}
+
+impl ArchiveRests {
+    /// How long `archive` still rests at `now` for a proof whose window ends
+    /// at `window_end`; `None` when it is sent.
+    fn rests(&self, archive: &str, window_end: u64, now: Instant) -> Option<Duration> {
+        let rests = self.rests.lock().unwrap();
+        rests
+            .get(archive)
+            .filter(|rest| rest.until > now && window_end >= rest.window_end)
+            .map(|rest| rest.until - now)
+    }
+
+    /// `archive` refused a proof whose window ends at `window_end` for room
+    /// at `now`: it rests `rest` from now.
+    fn refused_room(&self, archive: &str, window_end: u64, now: Instant, rest: Duration) {
+        let mut rests = self.rests.lock().unwrap();
+        rests.retain(|_, rest| rest.until > now);
+        let until = now + rest;
+        rests
+            .entry(archive.to_string())
+            .and_modify(|rest| {
+                rest.until = rest.until.max(until);
+                rest.window_end = rest.window_end.min(window_end);
+            })
+            .or_insert(Rest { until, window_end });
+    }
+}
+
+/// A storage epoch proof's send, skipping the archives resting for it
+/// ([`ArchiveRests`]).
+#[derive(Clone, Copy)]
+struct Resting<'a> {
+    rests: &'a ArchiveRests,
+    /// The proof's window end ([`StorageProofSubmission::window_end`]).
+    window_end: u64,
+    /// How long an archive refusing it for room rests, before jitter.
+    rest: Duration,
 }
 
 /// What this node's view of GLOBAL shows of `member`'s seat slot on a
@@ -380,6 +446,9 @@ struct RetryTiming {
     proof_give_up: Duration,
     /// How often a storage epoch proof's failed resends are logged.
     proof_log_every: Duration,
+    /// How long an archive refusing a storage epoch proof for room rests
+    /// ([`ArchiveRests`]), before jitter ([`jittered`]).
+    room_rest: Duration,
 }
 
 const RETRY_TIMING: RetryTiming = RetryTiming {
@@ -388,6 +457,9 @@ const RETRY_TIMING: RetryTiming = RetryTiming {
     give_up: Duration::from_secs(600),
     proof_give_up: Duration::from_secs(4 * 3600),
     proof_log_every: Duration::from_secs(300),
+    // Two GLOBAL frames at mainnet's pace (about 18.5 s each, 2026-11-21):
+    // a frame carrying held proofs frees the room.
+    room_rest: Duration::from_secs(40),
 };
 const RETRY_MAX_MESSAGES: usize = 256;
 const RETRY_MAX_BYTES: usize = 32 << 20;
@@ -541,6 +613,14 @@ impl SubmitRetryQueue {
         tally.get(&window_end).map_or(0, |t| t.settled)
     }
 
+    /// Proofs of the window ending at `window_end` undelivered
+    /// ([`WindowTally::undelivered`]).
+    #[cfg(test)]
+    fn undelivered_in(&self, window_end: u64) -> u64 {
+        let tally = self.tally.lock().unwrap();
+        tally.get(&window_end).map_or(0, |t| t.undelivered)
+    }
+
     /// Whether queued storage epoch proofs of `proof`'s member cover each of
     /// its seats: sent at once, it would go to the archives beside them.
     fn holds(&self, proof: &StorageProofSubmission) -> bool {
@@ -620,6 +700,16 @@ struct Delivery {
     /// Every refusing archive's refusal, `<archive>: <reason>`, in the
     /// pool's order: at most one per archive ([`archive_name`]).
     refusals: Vec<String>,
+    /// Of the refusals for room, archives not sent to as they rest
+    /// ([`ArchiveRests`]).
+    rested: usize,
+}
+
+impl Delivery {
+    /// No archive was sent to: each was resting ([`ArchiveRests`]).
+    fn unsent(&self) -> bool {
+        self.rested > 0 && self.rested == self.refusals.len() && self.accepted == 0
+    }
 }
 
 /// What `delivery` tells the node's storage epoch proof batching
@@ -783,6 +873,10 @@ fn resent(
     let Some(index) = pending.iter().position(|queued| queued.id == id) else {
         return Resent::Done;
     };
+    // Not sent: every archive rests ([`ArchiveRests`]).
+    if pending[index].proof.is_some() && delivery.unsent() {
+        return Resent::ProofFailed;
+    }
     if let Some(proof) = &pending[index].proof {
         note_answer(proof, delivery, false);
         queue.tally(proof.window_end, |t| {
@@ -936,22 +1030,25 @@ fn latest_frame(clock_store: &dyn ClockStore) -> Option<u64> {
 
 /// Submit `bytes` to every archive in `pool` over mTLS, each request allowed
 /// a deadline for its size (`quil_rpc::archive_client::submit_deadline`).
+#[cfg(test)]
 async fn submit_to_archives(
     pool: &ArchiveEndpointPool,
     seed: Option<Vec<u8>>,
     bytes: Vec<u8>,
 ) -> (usize, Delivery) {
-    submit_to_archives_with(pool, seed, bytes, false).await
+    submit_to_archives_with(pool, seed, bytes, false, None).await
 }
 
 /// [`submit_to_archives`]; `resending_proof` sends a storage epoch proof again
-/// (see [`fan_out_to_archives`]). A storage epoch proof is sent again after
+/// (see [`fan_out_to_archives`]), and `resting` skips the archives resting
+/// for it ([`fan_out_resting`]). A storage epoch proof is sent again after
 /// any transient failure, and when no archive is known yet.
 async fn submit_to_archives_with(
     pool: &ArchiveEndpointPool,
     seed: Option<Vec<u8>>,
     bytes: Vec<u8>,
     resending_proof: bool,
+    resting: Option<Resting<'_>>,
 ) -> (usize, Delivery) {
     let Some(seed) = seed else {
         return (0, Delivery::default());
@@ -985,7 +1082,8 @@ async fn submit_to_archives_with(
             }
         }
     };
-    let mut delivery = fan_out_to_archives(archive_addrs, bytes, submit, resending_proof).await;
+    let mut delivery =
+        fan_out_resting(archive_addrs, bytes, submit, resending_proof, resting).await;
     if archives == 0 && proof {
         delivery.retry = 1;
         delivery.refusals = vec!["no archive known yet".to_string()];
@@ -1141,6 +1239,18 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 self.retry_queue.count_settled(proof);
                 return Ok(());
             }
+            // GLOBAL refuses it whole: its window ended before it came.
+            let frame = latest_frame(self.clock_store.as_ref());
+            if let Some(frame) = frame.filter(|&frame| frame >= proof.window_end) {
+                self.retry_queue
+                    .tally(proof.window_end, |t| t.undelivered += 1);
+                let (member, shards, epochs) = proof.fields();
+                warn!(member, ?shards, ?epochs, bytes, window_end = proof.window_end, frame,
+                    consequence = proof.consequence(),
+                    "storage epoch proof not sent: its window ended before it was handed over (GLOBAL refuses it whole); \
+                     check what held up its proving");
+                return Ok(());
+            }
             // A worker sends a seat's part again while no archive has taken
             // the last one (about every ten GLOBAL frames): with the queue
             // holding its seats, it takes the queued copy's place and goes
@@ -1160,10 +1270,19 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // Fan out to archives concurrently. Each closure connects + submits
         // independently so a slow / unreachable archive does not block the
         // others.
-        let grpc_future = submit_to_archives(
+        // A storage epoch proof skips the archives resting after refusing
+        // one for room ([`ArchiveRests`]).
+        let resting = proof.as_ref().map(|proof| Resting {
+            rests: &self.retry_queue.rests,
+            window_end: proof.window_end,
+            rest: RETRY_TIMING.room_rest,
+        });
+        let grpc_future = submit_to_archives_with(
             &self.archive_pool,
             self.falcon_signing_key.clone(),
             bundle_bytes.clone(),
+            false,
+            resting,
         );
 
         // BlossomSub publish runs concurrently with the gRPC fan-out
@@ -1211,9 +1330,14 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         if queued && self.retry_queue.push(bundle_bytes) {
             self.start_retries();
         }
+        // No archive was sent to: each rests.
+        let unsent = delivery.unsent();
         if let Some(proof) = &proof {
             note_answer(proof, &delivery, publish_bs && bs_result.is_ok());
             self.retry_queue.tally(proof.window_end, |t| {
+                if unsent {
+                    return;
+                }
                 t.sent += 1;
                 if grpc_ok_count > 0 {
                     t.accepted += 1;
@@ -1242,6 +1366,11 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 info!(member, ?shards, ?epochs, bytes, accepted = grpc_ok_count, archives = archive_count,
                     secs = started.elapsed().as_secs_f64(), window_end, %frames_left, superseded,
                     "storage epoch proof delivered");
+            } else if queued && unsent {
+                info!(member, ?shards, ?epochs, bytes, archives = archive_count, refusals = %refusals(&delivery),
+                    window_end, %frames_left, %mins_left, queued = self.retry_queue.len(),
+                    "storage epoch proof queued unsent: every archive refused an earlier proof for room and rests; \
+                     it goes at the retry queue's rounds, soonest window first");
             } else if queued {
                 warn!(member, ?shards, ?epochs, bytes, archives = archive_count,
                     deadline_secs = quil_rpc::archive_client::submit_deadline(bytes).as_secs(),
@@ -1286,14 +1415,21 @@ impl ProdProverMessageTransport {
     fn start_retries(&self) {
         let (pool, seed) = (self.archive_pool.clone(), self.falcon_signing_key.clone());
         let clock_store = self.clock_store.clone();
+        let queue = self.retry_queue.clone();
         tokio::spawn(run_retries(
             self.retry_queue.clone(),
             RETRY_TIMING,
             move |bytes| {
-                let (pool, seed) = (pool.clone(), seed.clone());
+                let (pool, seed, queue) = (pool.clone(), seed.clone(), queue.clone());
                 let resending_proof = carries_storage_proof(&bytes);
+                let window_end = StorageProofSubmission::of(&bytes).map(|proof| proof.window_end);
                 async move {
-                    submit_to_archives_with(&pool, seed, bytes, resending_proof)
+                    let resting = window_end.map(|window_end| Resting {
+                        rests: &queue.rests,
+                        window_end,
+                        rest: RETRY_TIMING.room_rest,
+                    });
+                    submit_to_archives_with(&pool, seed, bytes, resending_proof, resting)
                         .await
                         .1
                 }
@@ -1340,6 +1476,7 @@ fn combine_publish_outcome(
 /// to carry to every archive within its deadline would time out everywhere at
 /// each resend, and an archive holds what it took for its own proposals only.
 /// Its refusals log at debug: the resends' summary names them.
+#[cfg(test)]
 async fn fan_out_to_archives<F, Fut>(
     archive_addrs: Vec<String>,
     bundle_bytes: Vec<u8>,
@@ -1352,12 +1489,42 @@ where
         + Send
         + 'static,
 {
+    fan_out_resting(archive_addrs, bundle_bytes, submit, resending_proof, None).await
+}
+
+/// [`fan_out_to_archives`], a storage epoch proof skipping the archives
+/// `resting` names resting for it and resting each that refuses it for room
+/// ([`ArchiveRests`]). A skipped archive counts as a refusal for room.
+async fn fan_out_resting<F, Fut>(
+    archive_addrs: Vec<String>,
+    bundle_bytes: Vec<u8>,
+    submit: F,
+    resending_proof: bool,
+    resting: Option<Resting<'_>>,
+) -> Delivery
+where
+    F: Fn(String, Vec<u8>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<String, (String, String, bool)>>
+        + Send
+        + 'static,
+{
     let mut handles = Vec::with_capacity(archive_addrs.len());
     let mut results = Vec::with_capacity(archive_addrs.len());
-    for addr in archive_addrs {
+    let mut skipped = Vec::new();
+    for (place, addr) in archive_addrs.into_iter().enumerate() {
         // Archive peer-info multiaddrs use the pubsub port (:8336);
         // the gRPC stream service listens on :8340.
         let stream_addr = crate::util::multiaddr::pubsub_to_stream_endpoint(&addr);
+        if let Some(resting) = resting {
+            if let Some(left) =
+                resting
+                    .rests
+                    .rests(&stream_addr, resting.window_end, Instant::now())
+            {
+                skipped.push((place, stream_addr, left));
+                continue;
+            }
+        }
         let bytes = bundle_bytes.clone();
         let submit = submit.clone();
         // Parallel fan-out: each handle's result is awaited below, so
@@ -1365,17 +1532,18 @@ where
         // logged individually. This is the correct use of bare spawn.
         let handle = tokio::spawn(async move { submit(stream_addr, bytes).await });
         if resending_proof {
-            results.push(handle.await);
+            results.push((place, handle.await));
         } else {
-            handles.push(handle);
+            handles.push((place, handle));
         }
     }
-    for handle in handles {
-        results.push(handle.await);
+    for (place, handle) in handles {
+        results.push((place, handle.await));
     }
     let mut delivery = Delivery::default();
     let mut refused = Vec::new();
-    for (place, result) in results.into_iter().enumerate() {
+    let mut named = Vec::new();
+    for (place, result) in results {
         match result {
             Ok(Ok(addr)) => {
                 debug!(%addr, "prover message submitted via gRPC");
@@ -1387,10 +1555,19 @@ where
                     // The collector's refusal for room (`Refusal::RankFull`).
                     if reason.contains("rank buffer full") {
                         delivery.room += 1;
+                        if let Some(resting) = resting {
+                            let rest = jittered(resting.rest);
+                            let now = Instant::now();
+                            resting
+                                .rests
+                                .refused_room(&addr, resting.window_end, now, rest);
+                        }
                     }
                 }
-                let archive = archive_name(&addr, place + 1);
-                delivery.refusals.push(format!("{archive}: {reason}"));
+                named.push((
+                    place,
+                    format!("{}: {reason}", archive_name(&addr, place + 1)),
+                ));
                 refused.push((addr, reason, retry));
             }
             Err(e) => {
@@ -1398,6 +1575,19 @@ where
             }
         }
     }
+    for (place, addr, left) in skipped {
+        delivery.retry += 1;
+        delivery.room += 1;
+        delivery.rested += 1;
+        let archive = archive_name(&addr, place + 1);
+        let secs = left.as_secs();
+        named.push((
+            place,
+            format!("{archive}: not sent, resting {secs} s more after refusing an earlier proof for room"),
+        ));
+    }
+    named.sort_by_key(|(place, _)| *place);
+    delivery.refusals = named.into_iter().map(|(_, refusal)| refusal).collect();
     // A refusal another archive made up for loses nothing: summarize each
     // such archive at most every ARCHIVE_REFUSAL_EVERY, its reason naming
     // its state (a stale archive reports its executed frame against its
@@ -1663,15 +1853,15 @@ impl StorageProofSubmission {
 #[cfg(test)]
 mod tests {
     use super::{
-        asks_for_retry, combine_publish_outcome, describe_bundle, fan_out_to_archives,
-        refusal_reason, refusals, retryable, run_retries, submit_to_archives,
-        submit_to_archives_with, ArchiveRefusals, Delivery, RetryTiming, StorageProofSubmission,
-        SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY,
+        asks_for_retry, combine_publish_outcome, describe_bundle, fan_out_resting,
+        fan_out_to_archives, refusal_reason, refusals, retryable, run_retries, submit_to_archives,
+        submit_to_archives_with, ArchiveRefusals, ArchiveRests, Delivery, Resting, RetryTiming,
+        StorageProofSubmission, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY,
     };
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn publish_errors_distinguish_skipped_and_failed_paths() {
@@ -1800,6 +1990,7 @@ mod tests {
                     "unpinned#2: rank buffer full".to_string(),
                     "unpinned#3: invalid".to_string(),
                 ],
+                rested: 0,
             }
         );
     }
@@ -1931,6 +2122,7 @@ mod tests {
         give_up: Duration::from_secs(60),
         proof_give_up: Duration::from_secs(60),
         proof_log_every: Duration::from_secs(60),
+        room_rest: Duration::from_secs(60),
     };
 
     #[tokio::test]
@@ -2396,7 +2588,7 @@ mod tests {
             (0, 4),
             "the first send, to all at once, times out everywhere: {first:?}"
         );
-        let (_, resent) = submit_to_archives_with(&pool, Some(key), bundle, true).await;
+        let (_, resent) = submit_to_archives_with(&pool, Some(key), bundle, true, None).await;
         assert_eq!(
             resent.accepted, 4,
             "the resend, to one after another, reaches every archive: {resent:?}"
@@ -2679,7 +2871,8 @@ mod tests {
     /// A worker's next part for a seat the retry queue holds, sent while
     /// every archive is full, takes the queued copy's place and goes at the
     /// queue's next round: the archives see one send of the seat, not that
-    /// and another at once.
+    /// and another at once. Another seat's proof due no sooner is queued
+    /// unsent while the archive rests; one due sooner goes at once.
     #[tokio::test]
     async fn a_seat_sent_again_while_queued_goes_at_the_queues_round() {
         use quil_engine::prover_message_transport::ProverMessageTransport;
@@ -2714,11 +2907,206 @@ mod tests {
         let _ = transport
             .publish_prover_bundle(storage_proof_bundle(1, &[(8, 1335, false, true)], 64))
             .await;
+        let sends = seen.load(Ordering::SeqCst);
+        eprintln!("REACH room-rest publish sends={sends}");
+        assert_eq!(
+            sends, 1,
+            "room_rest: a proof due no sooner went to the archive resting after a refusal for room"
+        );
+        assert_eq!(transport.retry_queue.len(), 2, "queued unsent");
+        let _ = transport
+            .publish_prover_bundle(storage_proof_bundle(1, &[(9, 1334, false, true)], 64))
+            .await;
         assert_eq!(
             seen.load(Ordering::SeqCst),
             2,
-            "a seat not queued goes at once"
+            "a proof due sooner goes at once"
         );
+    }
+
+    /// An archive refusing a proof for room rests: proofs whose window ends
+    /// no sooner skip it until the rest ends, a proof due sooner does not,
+    /// and the skipped send counts as a refusal for room, not a send.
+    #[tokio::test]
+    async fn an_archive_refusing_for_room_rests() {
+        let rests = ArchiveRests::default();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let submit = move |addr: String, _bytes: Vec<u8>| {
+            log.lock().unwrap().push(addr.clone());
+            async move {
+                if addr.contains("full") {
+                    Err((
+                        addr,
+                        "message collector rejected: rank buffer full".to_string(),
+                        true,
+                    ))
+                } else {
+                    Ok(addr)
+                }
+            }
+        };
+        let archives = vec!["full".to_string(), "taking".to_string()];
+        let resting = |window_end| {
+            Some(Resting {
+                rests: &rests,
+                window_end,
+                rest: Duration::from_secs(60),
+            })
+        };
+        let first = fan_out_resting(
+            archives.clone(),
+            vec![1],
+            submit.clone(),
+            true,
+            resting(100),
+        )
+        .await;
+        assert_eq!((first.accepted, first.room, first.rested), (1, 1, 0));
+        let later = fan_out_resting(
+            archives.clone(),
+            vec![1],
+            submit.clone(),
+            true,
+            resting(100),
+        )
+        .await;
+        let full_sends = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|addr| addr.contains("full"))
+            .count();
+        eprintln!("REACH room-rest fan-out full_sends={full_sends}");
+        assert_eq!(
+            full_sends, 1,
+            "room_rest: the archive refusing for room was sent the next proof due no sooner"
+        );
+        assert_eq!(
+            (later.accepted, later.retry, later.room, later.rested),
+            (1, 1, 1, 1)
+        );
+        assert!(!later.unsent(), "the taking archive was sent to");
+        assert!(
+            later.refusals[0].contains("resting"),
+            "{:?}",
+            later.refusals
+        );
+        let sooner = fan_out_resting(archives, vec![1], submit, true, resting(99)).await;
+        assert_eq!(
+            sooner.rested, 0,
+            "a proof due sooner goes to the resting archive"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 5);
+        // The rest ends at its time, and keeps the earliest refused window.
+        let now = Instant::now();
+        rests.refused_room("a", 200, now, Duration::from_secs(10));
+        rests.refused_room("a", 150, now, Duration::from_secs(5));
+        assert_eq!(rests.rests("a", 150, now), Some(Duration::from_secs(10)));
+        assert_eq!(rests.rests("a", 149, now), None);
+        assert_eq!(rests.rests("a", 200, now + Duration::from_secs(10)), None);
+        assert_eq!(rests.rests("b", 200, now), None);
+    }
+
+    /// Queued proofs sent again while the only archive refuses each for
+    /// room: rounds every few milliseconds, against an archive rest far
+    /// longer, reach the archive once, not once a round.
+    #[tokio::test]
+    async fn queued_proofs_reach_a_full_archive_once_a_rest() {
+        let queue = Arc::new(SubmitRetryQueue::default());
+        for seat in 1..=3 {
+            queue.push(storage_proof_bundle(1, &[(seat, 1335, false, true)], 64));
+        }
+        let sends = Arc::new(AtomicUsize::new(0));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let (counted, queue_in) = (sends.clone(), queue.clone());
+        let rounds_in = rounds.clone();
+        let task = tokio::spawn(run_retries(
+            queue.clone(),
+            FAST,
+            move |bytes| {
+                let (counted, queue_in) = (counted.clone(), queue_in.clone());
+                rounds_in.fetch_add(1, Ordering::SeqCst);
+                let window_end = StorageProofSubmission::of(&bytes).unwrap().window_end;
+                async move {
+                    let submit = move |addr: String, _bytes: Vec<u8>| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            Err((
+                                addr,
+                                "message collector rejected: rank buffer full".to_string(),
+                                true,
+                            ))
+                        }
+                    };
+                    let resting = Resting {
+                        rests: &queue_in.rests,
+                        window_end,
+                        rest: FAST.room_rest,
+                    };
+                    fan_out_resting(vec!["full".into()], bytes, submit, true, Some(resting)).await
+                }
+            },
+            || None,
+        ));
+        while rounds.load(Ordering::SeqCst) < 30 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        task.abort();
+        let sends = sends.load(Ordering::SeqCst);
+        eprintln!("REACH room-rest rounds sends={sends}");
+        assert_eq!(
+            sends, 1,
+            "room_rest: queued proofs went to the resting archive at each round"
+        );
+        assert_eq!(queue.len(), 3, "all still queued");
+    }
+
+    /// A proof handed over once its window ended is not sent: GLOBAL
+    /// refuses it whole. Its window counts it undelivered.
+    #[tokio::test]
+    async fn a_proof_whose_window_ended_is_not_sent() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        use quil_types::store::ClockStore;
+        let (address, seen) = full_archive().await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(address).await;
+        let late = storage_proof_bundle(1, &[(7, 1335, false, true)], 64);
+        let window_end = StorageProofSubmission::of(&late).unwrap().window_end;
+        let clock_store = quil_store::testing::InMemoryClockStore::new();
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: window_end,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let txn = clock_store.new_transaction(false).unwrap();
+        clock_store
+            .put_global_clock_frame(&frame, txn.as_ref())
+            .unwrap();
+        let transport = super::ProdProverMessageTransport {
+            archive_pool: pool,
+            clock_store: Arc::new(clock_store),
+            p2p_handle: quil_p2p::node::P2PHandle::for_test(false),
+            falcon_signing_key: Some(quil_p2p::generate_falcon_signing_key()),
+            publish_to_blossomsub: false,
+            retry_queue: Default::default(),
+            join_header_check: Arc::new(|_: &quil_types::proto::global::GlobalFrame| true),
+        };
+        let _ = transport.publish_prover_bundle(late).await;
+        let sends = seen.load(Ordering::SeqCst);
+        eprintln!("REACH late-proof publish sends={sends}");
+        assert_eq!(
+            sends, 0,
+            "late_skip: a proof whose window ended went to the archives"
+        );
+        assert_eq!(transport.retry_queue.len(), 0, "nor queued");
+        assert_eq!(transport.retry_queue.undelivered_in(window_end), 1);
+        let due = storage_proof_bundle(1, &[(7, 1336, false, true)], 64);
+        let _ = transport.publish_prover_bundle(due).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a proof still due went");
     }
 
     /// A round sends the storage epoch proof whose window ends soonest first,
