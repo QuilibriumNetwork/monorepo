@@ -5610,10 +5610,16 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// `frame_number` cannot carry ([`bundle_shard_frames_in_lockstep`]) is
 /// anchored ahead of its window, at least one: a later frame may carry
 /// them. One behind the window, or naming no anchor, rides no later frame.
-/// Nor does one anchored past the window's newest anchor plus
-/// `RETENTION_WINDOW`: its rank ages out (`age_ranks`) before any frame's
-/// window reaches it. Held (until 2026-11-20), any anchor up to `u64::MAX`
-/// stayed in the mempool, never carried and never refused.
+/// Nor is one anchored past the window's newest anchor plus
+/// `RETENTION_WINDOW` held: that bound approximates how long its rank stays
+/// (`age_ranks`, `RETENTION_WINDOW` finalizations), and a message can
+/// outlive it by a frame or more (filed at the consensus rank, longer under
+/// rank timeouts), so a header just past it may be refused that a later
+/// frame could have carried. An honest anchor names a GLOBAL frame that
+/// exists (`latest - K`), never this far ahead, so none is lost. Held (until
+/// 2026-11-20), any anchor up to `u64::MAX` stayed in the mempool, never
+/// carried and never refused. An archive's collector holds by this bound
+/// too (`execution_deferral::held_unverified`).
 pub fn bundle_shard_frames_ahead(data: &[u8], frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::{
         anchor_window, FrameHeader, TYPE_FRAME_HEADER,

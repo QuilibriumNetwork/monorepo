@@ -39,19 +39,25 @@ pub fn awaits_execution(error: &QuilError, anchor: u64, executed: u64) -> bool {
         && quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(error)
 }
 
-/// Whether a shard frame that verification for the GLOBAL frame after the
-/// head refused with `error` is held unverified, for the leader to verify
-/// when it packs one: the state verification needs is unavailable now, or the
-/// frame's anchor lies ahead of that GLOBAL frame's lockstep window
-/// ([`anchor_ahead_of_window`]). Such a frame rides a later GLOBAL frame once
-/// the head reaches its anchor, so it is held as it was while GLOBAL read the
-/// anchor first and found no such frame. One behind the window can ride no
-/// frame after the head: it is refused, and its sender hears so.
+/// Whether a shard frame in `bundle` that verification for GLOBAL frame
+/// `verified_for`, the one after the head, refused with `error` is held
+/// unverified, for the leader to verify when it packs one: the state
+/// verification needs is unavailable now, or the frame's anchor lies ahead of
+/// that GLOBAL frame's lockstep window ([`anchor_ahead_of_window`]) no further
+/// than the leader holds one ([`bundle_shard_frames_ahead`]). Such a frame
+/// rides a later GLOBAL frame once the head reaches its anchor, so it is held
+/// as it was while GLOBAL read the anchor first and found no such frame. One
+/// behind the window, or ahead past the leader's bound, can ride no frame
+/// after the head: it is refused, and its sender hears so. Held (until
+/// 2026-11-21), a header anchored up to `u64::MAX` stayed in an archive's
+/// mempool, its certificate unchecked, until a leader refused it.
 ///
 /// [`anchor_ahead_of_window`]: quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window
-pub fn held_unverified(error: &QuilError) -> bool {
+/// [`bundle_shard_frames_ahead`]: crate::message_collector::bundle_shard_frames_ahead
+pub fn held_unverified(error: &QuilError, bundle: &[u8], verified_for: u64) -> bool {
     error.is_execution_unavailable()
-        || quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window(error)
+        || (quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window(error)
+            && crate::message_collector::bundle_shard_frames_ahead(bundle, verified_for))
 }
 
 /// The verifier of the message collector that feeds an archive's GLOBAL
@@ -76,7 +82,7 @@ pub fn collector_verifier(
         let verified_for = current.effective().saturating_add(1);
         match manager.validate_message(verified_for, &[0xff; 32], bundle) {
             Ok(()) => ShardFrameVerdict::Valid,
-            Err(error) if held_unverified(&error) => {
+            Err(error) if held_unverified(&error, bundle, verified_for) => {
                 ShardFrameVerdict::Unavailable(error.to_string())
             }
             Err(error) => {

@@ -31,6 +31,18 @@ fn install_header_deps(source: &FrameMaterializer) {
 /// A shard frame header anyone can write, anchored to GLOBAL frame `anchor`:
 /// no certificate or signature, an output that matches nothing.
 fn junk_header_bundle(anchor: u64) -> quil_types::proto::global::MessageBundle {
+    junk_header_bundle_voting(anchor, 0)
+}
+
+/// [`junk_header_bundle`] voting inside the fee bounds: at no anchor is it
+/// fee vote fence evidence, which a collector files without verifying it
+/// (`fee_fence_keys`), so a collector verifies it for every anchor.
+fn junk_header_bundle_in_bounds(anchor: u64) -> quil_types::proto::global::MessageBundle {
+    junk_header_bundle_voting(anchor, crate::fees::MIN_FEE_MULTIPLIER_VOTE as i64)
+}
+
+/// [`junk_header_bundle`] voting `vote`.
+fn junk_header_bundle_voting(anchor: u64, vote: i64) -> quil_types::proto::global::MessageBundle {
     let header = quil_execution::global_intrinsic::frame_header::FrameHeader {
         address: vec![0x77; 32],
         frame_number: 9,
@@ -40,6 +52,7 @@ fn junk_header_bundle(anchor: u64) -> quil_types::proto::global::MessageBundle {
         parent_selector: vec![0x11; 32],
         requests_root: vec![0; 32],
         state_roots: vec![vec![0; 32]; 4],
+        fee_multiplier_vote: vote,
         ..Default::default()
     };
     quil_types::proto::global::MessageBundle {
@@ -297,8 +310,9 @@ fn fh_fix_an_output_its_fields_do_not_reproduce_warns() {
 
 /// What an archive's collector does with each anchor, through the verifier it
 /// installs: it holds what a later GLOBAL frame can carry, ahead of the
-/// window or a local gap inside it, and refuses what none can, behind the
-/// window, so its sender hears it. The anchors are junk: anyone can send one.
+/// window within the leader's bound or a local gap inside it, and refuses
+/// what none can, behind the window or far ahead of it, so its sender hears
+/// it. The anchors are junk: anyone can send one.
 #[test]
 fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
     use crate::execution_deferral::{collector_verifier, CollectorDeferrals};
@@ -319,15 +333,15 @@ fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
     collector.set_shard_frame_verifier_with_provenance(verifier.clone());
     for (anchor, held) in [
         (101, true),
-        (UNHELD_ANCHOR, true),
-        (u64::MAX, true),
+        (UNHELD_ANCHOR, false),
+        (u64::MAX, false),
         (88, true),
         (100, true),
         (87, false),
         (1, false),
     ] {
         let bytes = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(
-            &junk_header_bundle(anchor),
+            &junk_header_bundle_in_bounds(anchor),
         )
         .unwrap();
         let verdict = verifier(&bytes, Provenance::Other);
@@ -341,8 +355,7 @@ fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
         } else {
             assert!(
                 matches!(&verdict, ShardFrameVerdict::Invalid(reason) if reason.contains(ANCHOR_OUTSIDE_WINDOW)),
-                "FH FIX: anchor {anchor} is behind the window and rides no later frame: refused, \
-                 got {verdict:?}"
+                "FH FIX: anchor {anchor} rides no later frame: refused, got {verdict:?}"
             );
             assert_eq!(
                 outcome,
@@ -352,6 +365,73 @@ fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
         }
     }
     eprintln!("FH FIX: a collector holds only anchors a later frame can carry");
+}
+
+/// An archive's collector holds a header anchored ahead of the window only
+/// as far as the leader does (`bundle_shard_frames_ahead`): the newest anchor
+/// plus `RETENTION_WINDOW` is held unverified, and one past it, or at
+/// `u64::MAX`, is refused, so its sender hears it and it never waits in the
+/// mempool with its certificate unchecked. Held (until 2026-11-21), every
+/// anchor ahead of the window was, until a leading archive refused it.
+#[test]
+fn fh_fix_a_collector_refuses_an_anchor_past_the_leaders_bound() {
+    use crate::execution_deferral::{collector_verifier, CollectorDeferrals};
+    use crate::message_collector::{
+        MessageCollector, Provenance, Refusal, ShardFrameVerdict, SubmitOutcome, RETENTION_WINDOW,
+    };
+    use quil_execution::global_intrinsic::frame_header::{anchor_window, ANCHOR_AHEAD_OF_WINDOW};
+    let (fixture, _) = materializer_with_header_deps();
+    fixture.current.observe(100);
+    let (_, newest) = anchor_window(101);
+    assert_eq!(
+        newest, 100,
+        "the next GLOBAL frame's window ends at the head"
+    );
+    let edge = newest + RETENTION_WINDOW;
+    let verifier = collector_verifier(
+        fixture.source.execution_manager.clone(),
+        fixture.current.clone(),
+        fixture.source.hypergraph.clone(),
+        Arc::new(CollectorDeferrals::default()),
+    );
+    let collector = MessageCollector::new();
+    collector.set_shard_frame_verifier_with_provenance(verifier.clone());
+    for (anchor, held) in [(edge, true), (edge + 1, false), (u64::MAX, false)] {
+        let bytes = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(
+            &junk_header_bundle_in_bounds(anchor),
+        )
+        .unwrap();
+        assert!(
+            crate::message_collector::fee_fence_keys(&bytes).is_empty(),
+            "anchor {anchor}: fence evidence would skip verification"
+        );
+        let verdict = verifier(&bytes, Provenance::Other);
+        let outcome = collector.add_message_outcome(1, bytes);
+        if held {
+            assert!(
+                matches!(verdict, ShardFrameVerdict::Unavailable(ref reason) if reason.contains(ANCHOR_AHEAD_OF_WINDOW)),
+                "ADMIT-EDGE: anchor {anchor}, the leader's bound, must be held unverified as \
+                 ahead of the window, got {verdict:?}"
+            );
+            assert_eq!(
+                outcome,
+                SubmitOutcome::Accepted,
+                "ADMIT-EDGE: anchor {anchor}"
+            );
+        } else {
+            assert!(
+                matches!(verdict, ShardFrameVerdict::Invalid(ref reason) if reason.contains(ANCHOR_AHEAD_OF_WINDOW)),
+                "ADMIT-UNBOUNDED: anchor {anchor} is past the leader's bound {edge} and rides no \
+                 frame before it ages out: refused as ahead of the window, got {verdict:?}"
+            );
+            assert_eq!(
+                outcome,
+                SubmitOutcome::Filtered(Refusal::InvalidShardFrame),
+                "ADMIT-UNBOUNDED: anchor {anchor}: its sender hears the refusal"
+            );
+        }
+    }
+    eprintln!("FH FIX: a collector holds an ahead anchor only within the leader's bound");
 }
 
 // FH-R13, the member route. A GLOBAL member leading a view packs shard frame
