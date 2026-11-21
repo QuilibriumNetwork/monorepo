@@ -264,14 +264,6 @@ struct Turn {
 }
 
 impl Turn {
-    /// The turn of a proof handed to the setup labelling the sector again
-    /// ([`SetupFor::Again`]): that setup's end ends it.
-    fn again(self) -> Self {
-        #[cfg(test)]
-        tests::count_resume(&self.dir);
-        self
-    }
-
     /// End the turn on `result`, the one classifier of how its work ended:
     /// refunded, so the next is due at once, for a wait or a stop, which
     /// goes on from the whole layers it kept, or its goal reached (`goal`
@@ -1794,6 +1786,23 @@ fn certificate_sent(dir: &Path, target: u64, beacon_frame: u64, frame: u64) -> R
     )
 }
 
+/// Label the sector in `dir` again in its proof's `turn`, which the
+/// relabel takes over ([`SetupFor::Again`]): it runs at once, not an epoch
+/// later at the gate's next turn, and its end, not the proof's, spends or
+/// refunds that turn. The one way a proof hands its turn to a relabel: a
+/// damaged last layer without labels kept, damaged kept labels, and a
+/// failed proof without labels kept asked to be labelled again.
+fn relabel_in_turn(
+    store: &'static LabelStore,
+    member: &[u8; 32],
+    dir: PathBuf,
+    turn: Turn,
+) -> Result<()> {
+    #[cfg(test)]
+    tests::count_resume(&dir);
+    resume_reserved_sector(store, member, dir, turn)
+}
+
 // A lost shard or a restart must not strand the pool behind an unfinished
 // reservation. Capacity is independent of that shard's data; finish it here,
 // in the `turn` given ([`setup_turn`]): any way out before its end spends it.
@@ -2270,7 +2279,7 @@ pub(crate) fn poll_sector_certificates(
                                 // The relabel takes the turn over: its end
                                 // paces this check too.
                                 let dir = sector.dir.clone();
-                                resume_reserved_sector(store, &member, dir, turn.again())?;
+                                relabel_in_turn(store, &member, dir, turn)?;
                                 return Err(unavailable(
                                     "an uncertified sector's last layer differs from its \
                                      certificate; it is labelled again before its proof"
@@ -2292,7 +2301,7 @@ pub(crate) fn poll_sector_certificates(
                                 sector.cert.n,
                             );
                             let dir = sector.dir.clone();
-                            resume_reserved_sector(store, &member, dir, turn.again())?;
+                            relabel_in_turn(store, &member, dir, turn)?;
                             return Err(unavailable(
                                 "sector proof files differ from its certificate".into(),
                             ));
@@ -2342,7 +2351,7 @@ pub(crate) fn poll_sector_certificates(
                                 if kept.is_none() && sector.relabel() == Some(Relabel::Asked) =>
                             {
                                 let dir = sector.dir.clone();
-                                resume_reserved_sector(store, &member, dir, turn.again())?;
+                                relabel_in_turn(store, &member, dir, turn)?;
                                 return Err(error);
                             }
                             plain => plain?,
@@ -3154,7 +3163,7 @@ mod tests {
         assert!(
             now.cert == whole.cert && !whole.dir.join(RELABEL).exists(),
             "UNKEPT-RELABEL: a sector failing its proof without labels kept did not take the \
-             certificate its labels give"
+             certificate its labels give (RELABEL-IN-TURN)"
         );
         assert_eq!(
             unkept_proofs(&whole.dir),
@@ -3926,6 +3935,104 @@ mod tests {
         gates(false);
     }
 
+    /// Zero one node in the middle of the kept last layer of the sector
+    /// `pending` set up in the store at `store_dir`, as a damaged disk
+    /// leaves it.
+    fn damage_kept(store_dir: &Path, pending: &UnkeptPending) {
+        use std::os::unix::fs::FileExt;
+        let n = pending.sector.cert.n;
+        let layers = kept_layers(store_dir, n);
+        let at = fs::metadata(&layers).unwrap().len() - (n - n / 2 - 1) * 32;
+        let file = OpenOptions::new().write(true).open(&layers).unwrap();
+        file.write_all_at(&[0u8; 32], at).unwrap();
+    }
+
+    /// Lines of the captured `logs` reporting damaged kept labels of the
+    /// sector `id`.
+    fn kept_damage_reports(logs: &Mutex<Vec<u8>>, id: &str) -> usize {
+        String::from_utf8(logs.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("kept labels or last layer") && line.contains(id))
+            .count()
+    }
+
+    /// A sector whose kept labels are damaged is labelled again in its
+    /// proof's turn, which the relabel takes over: it keeps its labels
+    /// again and is proven from them in the same epoch, not an epoch later
+    /// at the gate's next turn (2026-11-21: this handover had no test).
+    #[test]
+    fn a_sector_with_damaged_kept_labels_is_labelled_again_in_its_proofs_turn() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"kept labels damaged", |_| {});
+        damage_kept(dir.path(), &pending);
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        let base = resumes(&at);
+        let proven = pending.proven_within(5);
+        println!("REACH sector-floor");
+        let held = store.holds(1500, &pending.member, &pending.sector.cert.sector);
+        let (reported, relabelled) = (kept_damage_reports(&logs, &id), resumes(&at) - base);
+        let (kept, unkept) = (kept_proofs(&at), unkept_proofs(&at));
+        assert!(
+            proven && held && reported == 1 && relabelled == 1 && kept == 1 && unkept == 0,
+            "KEPT-DAMAGED (RELABEL-IN-TURN): damaged kept labels were not labelled again and \
+             proven from the labels kept in five polls of one epoch (proven {proven}, held \
+             {held}, reported {reported}, relabelled {relabelled}, proofs kept {kept} unkept \
+             {unkept})"
+        );
+        gates(false);
+    }
+
+    /// A sector whose kept labels are damaged and whose relabel cannot
+    /// start, its reservation torn, reports that damage once, and its proof,
+    /// made then without labels kept, which labels the sector in full, runs
+    /// once an epoch however often it is polled: the relabel that failed
+    /// before it began still ended the proof's turn it took over
+    /// (2026-11-21: this handover had no test).
+    #[test]
+    fn damaged_kept_labels_whose_relabel_cannot_start_are_proven_once_an_epoch() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let mut pending = unkept_pending(b"kept labels damaged, reservation torn", |s| {
+            let reservation = fs::read(s.dir.join("reservation")).unwrap();
+            fs::write(s.dir.join("reservation"), &reservation[..16]).unwrap();
+        });
+        damage_kept(dir.path(), &pending);
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        pending.poll(5);
+        println!("REACH sector-floor");
+        let reported = kept_damage_reports(&logs, &id);
+        let proofs = kept_proofs(&at) + unkept_proofs(&at);
+        assert!(
+            reported == 1 && proofs == 0 && pending.sent.try_recv().is_err(),
+            "KEPT-HANDOFF: damaged kept labels whose relabel could not start were reported \
+             {reported} times and the sector proven {proofs} times in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        let (unkept, proofs) = (unkept_proofs(&at), kept_proofs(&at) + unkept_proofs(&at));
+        assert!(
+            unkept == 1 && proofs == 1 && pending.sent.try_recv().is_ok(),
+            "KEPT-HANDOFF-EPOCH: in the next epoch it was not proven exactly once, without \
+             labels kept, and sent ({proofs} proofs, {unkept} without labels kept)"
+        );
+        gates(false);
+    }
+
     /// Each sector's certificate proofs made from labels kept, by
     /// directory.
     static KEPT_PROOFS: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
@@ -4112,7 +4219,7 @@ mod tests {
         assert!(
             fs::read(pending.sector.dir.join("last")).unwrap() == whole && warned,
             "UNKEPT-TORN: a torn last layer without labels kept was not labelled again with a \
-             line naming what to check (warned: {warned})"
+             line naming what to check (warned: {warned}) (RELABEL-IN-TURN)"
         );
         gates(false);
     }
