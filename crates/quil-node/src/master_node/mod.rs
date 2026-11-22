@@ -832,6 +832,7 @@ pub(crate) async fn start(
                 Arc::downgrade(&worker_manager),
                 Arc::downgrade(&shard_engines),
             ),
+            crate::clock_retention::committed_tips(Arc::downgrade(&crdt)),
             "master".into(),
         );
     }

@@ -232,6 +232,7 @@ pub(crate) fn served_shards(
 pub(crate) fn spawn_unserved_frame_pruner(
     clock: &Arc<quil_store::RocksClockStore>,
     served: ServedShards,
+    tips: CommittedTips,
     label: String,
 ) {
     if !enabled("QUIL_PRUNE_UNSERVED_SHARD_FRAMES") {
@@ -261,12 +262,39 @@ pub(crate) fn spawn_unserved_frame_pruner(
                     overrun: UNSERVED_PASS_OVERRUN,
                     pause: Duration::from_millis(50),
                 };
-                prune_unserved(&store, served.as_ref(), &pass, &mut resume, &label);
+                prune_unserved(
+                    &store,
+                    served.as_ref(),
+                    tips.as_ref(),
+                    &pass,
+                    &mut resume,
+                    &label,
+                );
             }
         });
     if let Err(error) = spawned {
         warn!(%error, "unserved shard frame pruning not started");
     }
+}
+
+/// The frame GLOBAL committed for each of the given shards that has one;
+/// a shard left out keeps all its frames. `None` when GLOBAL's state
+/// cannot be read, which keeps every shard's frames.
+pub(crate) type TipReader<'a> =
+    dyn Fn(&[Vec<u8>]) -> Option<HashMap<Vec<u8>, u64>> + Send + Sync + 'a;
+
+/// A shared [`TipReader`].
+pub(crate) type CommittedTips = Arc<TipReader<'static>>;
+
+/// [`CommittedTips`] read from the node's GLOBAL state; none once it has
+/// gone or when it cannot be read.
+pub(crate) fn committed_tips(global: Weak<quil_hypergraph::HypergraphCrdt>) -> CommittedTips {
+    Arc::new(move |filters| {
+        let global = global.upgrade()?;
+        quil_engine::app_handoff::committed_tips(&global, filters)
+            .ok()
+            .map(|tips| tips.into_iter().collect())
+    })
 }
 
 /// The configured idle bound in seconds, defaulted and floored.
@@ -305,6 +333,20 @@ struct UnservedTotals {
     unreadable: u64,
     /// Unserved and idle with only the latest frame left: pruned before.
     latest_only: u64,
+    /// Kept whole: unserved and idle, but GLOBAL has no committed frame of
+    /// it this node could read.
+    no_tip: u64,
+    /// Unserved and idle with no frame below its committed one left.
+    above_tip: u64,
+    /// Frames of unserved idle shards kept only because GLOBAL has not
+    /// committed them, counted as the frame numbers above each shard's
+    /// committed frame, up to its latest.
+    above_tip_frames: u64,
+    /// Shards whose committed frame the pass read.
+    tips: u64,
+    /// GLOBAL's state, or the shards to read it for, could not be read:
+    /// every idle shard kept its frames.
+    tips_unreadable: bool,
 }
 
 impl UnservedTotals {
@@ -324,9 +366,17 @@ impl UnservedTotals {
                 KeptShard::Recent => self.recent += 1,
                 KeptShard::Unreadable => self.unreadable += 1,
                 KeptShard::LatestOnly => self.latest_only += 1,
+                KeptShard::NoTip => self.no_tip += 1,
+                KeptShard::AboveTip => self.above_tip += 1,
             }
         }
-        self.shards = self.pruned + self.served + self.recent + self.unreadable + self.latest_only;
+        self.shards = self.pruned
+            + self.served
+            + self.recent
+            + self.unreadable
+            + self.latest_only
+            + self.no_tip
+            + self.above_tip;
     }
 }
 
@@ -338,11 +388,14 @@ fn now_ms() -> i64 {
 
 /// One bounded pass from `resume`, which it leaves where the next pass goes
 /// on. The served set is read again for every step; when it cannot be read
-/// the pass stops. Every pass that reads it ends with one summary line: what
-/// went and why each other shard from `resume` on stayed.
+/// the pass stops. The frames GLOBAL committed are read once per pass, for
+/// every shard with an index; a shard without one keeps all its frames.
+/// Every pass that reads it ends with one summary line: what went and why
+/// each other shard from `resume` on stayed.
 fn prune_unserved(
     store: &quil_store::RocksClockStore,
     served: &(dyn Fn() -> Option<HashSet<Vec<u8>>> + Send + Sync),
+    tips: &TipReader<'_>,
     pass: &UnservedPass,
     resume: &mut Option<Vec<u8>>,
     label: &str,
@@ -352,6 +405,8 @@ fn prune_unserved(
     let mut totals = UnservedTotals::default();
     let mut shards: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
     let mut kept: HashMap<Vec<u8>, quil_store::KeptShard> = HashMap::new();
+    let mut above_tip: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut committed: Option<HashMap<Vec<u8>, u64>> = None;
     let (mut examined, mut announced, mut overran, mut listed) = (0u64, false, false, false);
     loop {
         let Some(set) = served() else {
@@ -360,6 +415,16 @@ fn prune_unserved(
         };
         listed = true;
         let is_served = |filter: &[u8]| set.contains(filter);
+        // Unlistable shards read no tip: every shard keeps its frames.
+        let committed = committed.get_or_insert_with(|| {
+            let read = store
+                .indexed_shard_filters()
+                .ok()
+                .and_then(|filters| tips(&filters));
+            totals.tips_unreadable = read.is_none();
+            read.unwrap_or_default()
+        });
+        let committed_tip = |filter: &[u8]| committed.get(filter).copied();
         let step = pass
             .step
             .min(pass.max.saturating_sub(examined) as usize)
@@ -370,6 +435,7 @@ fn prune_unserved(
         if !announced {
             match store.prune_unserved_shard_frames(
                 &is_served,
+                &committed_tip,
                 idle_before_ms,
                 resume.as_deref(),
                 step,
@@ -377,6 +443,7 @@ fn prune_unserved(
             ) {
                 Ok(dry) if dry.pruned.is_empty() && dry.next.is_none() => {
                     kept.extend(dry.kept);
+                    above_tip.extend(dry.above_tip);
                     *resume = None;
                     break;
                 }
@@ -392,6 +459,7 @@ fn prune_unserved(
         }
         let step = match store.prune_unserved_shard_frames(
             &is_served,
+            &committed_tip,
             idle_before_ms,
             resume.as_deref(),
             step,
@@ -405,6 +473,7 @@ fn prune_unserved(
         };
         examined += step.examined.max(1);
         kept.extend(step.kept);
+        above_tip.extend(step.above_tip);
         for shard in &step.pruned {
             let entry = shards.entry(shard.filter.clone()).or_default();
             entry.0 = entry.0.max(shard.below);
@@ -424,6 +493,8 @@ fn prune_unserved(
         std::thread::sleep(pass.pause);
     }
     totals.count(&shards, &kept);
+    totals.above_tip_frames = above_tip.values().sum();
+    totals.tips = committed.as_ref().map_or(0, |tips| tips.len() as u64);
     for (filter, (below, bytes)) in &shards {
         if *bytes >= quil_store::RocksClockStore::SHARD_FRAME_RECLAIM_BYTES {
             store.compact_pruned_shard_frames(filter, *below);
@@ -435,6 +506,9 @@ fn prune_unserved(
             frames = totals.frames, bytes = totals.bytes, compacted = totals.compacted,
             kept_served = totals.served, kept_recent = totals.recent,
             kept_unreadable = totals.unreadable, kept_latest_only = totals.latest_only,
+            kept_no_tip = totals.no_tip, kept_above_tip = totals.above_tip,
+            above_tip_frames = totals.above_tip_frames, tips = totals.tips,
+            tips_unreadable = totals.tips_unreadable,
             idle_secs = pass.idle.as_secs(), done = resume.is_none(),
             millis = started.elapsed().as_millis() as u64,
             "unserved shard frame pass finished");
@@ -583,6 +657,11 @@ mod unserved_tests {
 
     const DAY: Duration = Duration::from_secs(86_400);
 
+    /// GLOBAL committed every frame of every shard.
+    fn all_committed(filters: &[Vec<u8>]) -> Option<HashMap<Vec<u8>, u64>> {
+        Some(filters.iter().map(|f| (f.clone(), u64::MAX)).collect())
+    }
+
     /// A pass deletes the old frames of shards left more than the bound ago
     /// and keeps a served shard and one left within the bound whole.
     #[test]
@@ -597,7 +676,14 @@ mod unserved_tests {
         let listed = move || Some(set.clone());
         let mut resume = None;
 
-        let totals = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        let totals = prune_unserved(
+            &s,
+            &listed,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
 
         assert_eq!(
             frames(&s, &left, 12),
@@ -618,6 +704,97 @@ mod unserved_tests {
         assert_eq!(resume, None);
     }
 
+    /// An unserved shard idle past the bound keeps the frames from the one
+    /// GLOBAL committed on, and one without a committed frame keeps all;
+    /// the summary counts them.
+    #[test]
+    fn an_idle_unserved_shard_keeps_the_frames_global_has_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (lagging, unknown) = (vec![1u8; 35], vec![2u8; 35]);
+        serve(&s, &lagging, 12, 3 * DAY);
+        serve(&s, &unknown, 12, 3 * DAY);
+        let listed = || Some(HashSet::new());
+        let tips = |filters: &[Vec<u8>]| {
+            Some(
+                filters
+                    .iter()
+                    .filter(|f| **f == lagging)
+                    .map(|f| (f.clone(), 8))
+                    .collect(),
+            )
+        };
+        let mut resume = None;
+
+        let totals = prune_unserved(&s, &listed, &tips, &pass(1_000), &mut resume, "test");
+
+        assert_eq!(
+            (frames(&s, &lagging, 12), frames(&s, &unknown, 12)),
+            (5, 12),
+            "the frames from the committed one on stay; a shard without one keeps all"
+        );
+        assert_eq!(
+            (
+                totals.shards,
+                totals.pruned,
+                totals.no_tip,
+                totals.above_tip_frames,
+                totals.tips
+            ),
+            (2, 1, 1, 4, 1),
+            "tip_counts: (shards, pruned, kept_no_tip, above_tip_frames, tips)"
+        );
+
+        let again = prune_unserved(&s, &listed, &tips, &pass(1_000), &mut resume, "test");
+        assert_eq!(
+            (again.above_tip, again.latest_only),
+            (1, 0),
+            "with none left below it, a shard is kept above its committed frame"
+        );
+    }
+
+    /// A pass that cannot read GLOBAL's committed frames keeps every idle
+    /// unserved shard whole, and its summary says the read failed rather
+    /// than that no shard has a committed frame.
+    #[test]
+    fn a_pass_that_cannot_read_the_committed_frames_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (a, b) = (vec![1u8; 35], vec![2u8; 35]);
+        serve(&s, &a, 12, 3 * DAY);
+        serve(&s, &b, 12, 3 * DAY);
+        let listed = || Some(HashSet::new());
+        let unreadable = |_: &[Vec<u8>]| None;
+        let mut resume = None;
+
+        let totals = prune_unserved(&s, &listed, &unreadable, &pass(1_000), &mut resume, "test");
+
+        assert_eq!(
+            (frames(&s, &a, 12), frames(&s, &b, 12)),
+            (12, 12),
+            "an unreadable committed frame keeps every frame"
+        );
+        assert_eq!(
+            (totals.no_tip, totals.tips, totals.tips_unreadable),
+            (2, 0, true),
+            "tips_unreadable: (kept_no_tip, tips, tips_unreadable)"
+        );
+
+        let readable = prune_unserved(
+            &s,
+            &listed,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
+        assert_eq!(
+            (readable.tips, readable.tips_unreadable),
+            (2, false),
+            "tips_unreadable: a readable pass counts its committed frames"
+        );
+    }
+
     /// A pass's summary counts each shard once, whatever number of steps
     /// reached it: pruned, or kept as served, recent or already pruned; a
     /// pass with nothing to delete still counts every shard it kept.
@@ -636,7 +813,14 @@ mod unserved_tests {
         let mut resume = None;
 
         // Steps of 4 frame keys: the first shard takes several steps.
-        let first = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        let first = prune_unserved(
+            &s,
+            &listed,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
         let counts = |t: &UnservedTotals| {
             (
                 t.shards,
@@ -654,7 +838,14 @@ mod unserved_tests {
         );
         assert_eq!((first.frames, first.bytes > 0), (11, true));
 
-        let second = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        let second = prune_unserved(
+            &s,
+            &listed,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
         assert_eq!(
             counts(&second),
             (4, 0, 1, 1, 0, 2),
@@ -684,7 +875,14 @@ mod unserved_tests {
         };
         let mut resume = None;
 
-        let totals = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        let totals = prune_unserved(
+            &s,
+            &listed,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
         assert_eq!(frames(&s, &left, 12), 4, "two steps deleted 8 frames");
         assert_eq!(
             (totals.shards, totals.pruned, totals.served, totals.frames),
@@ -703,7 +901,14 @@ mod unserved_tests {
         let unlisted = || None;
         let mut resume = None;
 
-        let totals = prune_unserved(&s, &unlisted, &pass(1_000), &mut resume, "test");
+        let totals = prune_unserved(
+            &s,
+            &unlisted,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
         assert_eq!(frames(&s, &left, 12), 12, "nothing is deleted unlisted");
         assert_eq!(totals, UnservedTotals::default());
     }
@@ -719,10 +924,10 @@ mod unserved_tests {
         let none = || Some(HashSet::new());
         let mut resume = None;
 
-        let first = prune_unserved(&s, &none, &pass(8), &mut resume, "test");
+        let first = prune_unserved(&s, &none, &all_committed, &pass(8), &mut resume, "test");
         assert_eq!(first.frames, 8, "a pass stops at its budget");
         assert!(resume.is_some(), "and says where the next goes on");
-        let second = prune_unserved(&s, &none, &pass(1_000), &mut resume, "test");
+        let second = prune_unserved(&s, &none, &all_committed, &pass(1_000), &mut resume, "test");
         assert_eq!(first.frames + second.frames, 22);
         assert_eq!((frames(&s, &a, 12), frames(&s, &b, 12)), (1, 1));
         assert_eq!(resume, None);
@@ -742,14 +947,28 @@ mod unserved_tests {
         let only_b = || Some(HashSet::from([b.clone()]));
         let mut resume = None;
 
-        prune_unserved(&s, &only_a, &pass(4), &mut resume, "test");
+        prune_unserved(&s, &only_a, &all_committed, &pass(4), &mut resume, "test");
         assert!(
             resume.is_some(),
             "the first pass stops inside the second shard"
         );
         // The second shard is taken up and the first left.
-        prune_unserved(&s, &only_b, &pass(1_000), &mut resume, "test");
-        prune_unserved(&s, &only_b, &pass(1_000), &mut resume, "test");
+        prune_unserved(
+            &s,
+            &only_b,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
+        prune_unserved(
+            &s,
+            &only_b,
+            &all_committed,
+            &pass(1_000),
+            &mut resume,
+            "test",
+        );
         assert_eq!(
             frames(&s, &a, 12),
             1,
@@ -845,6 +1064,7 @@ mod unserved_tests {
             let step = s
                 .prune_unserved_shard_frames(
                     &is_served,
+                    &|_: &[u8]| Some(u64::MAX),
                     idle_before_ms,
                     next.as_deref(),
                     UNSERVED_STEP,
@@ -883,7 +1103,7 @@ mod unserved_tests {
                 pause: Duration::from_millis(50),
             };
             let t = std::time::Instant::now();
-            let done = prune_unserved(&s, &listed, &pass, &mut resume, "measure");
+            let done = prune_unserved(&s, &listed, &all_committed, &pass, &mut resume, "measure");
             passes += 1;
             println!(
                 "pass {passes}: shards {}, frames {}, bytes {}, compacted {}, {:.1}s",
