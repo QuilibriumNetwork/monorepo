@@ -527,6 +527,11 @@ fn claim(dir: &Path, n: u64) -> std::io::Result<Option<File>> {
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
         if is_at(&file, &path) {
+            // Stamped as claimed: one left by a process that exited
+            // without ending its claim dates that dead labelling instead
+            // ([`held_secs`]). Evidence only: a stamp that fails fails
+            // no labelling.
+            let _ = file.set_modified(std::time::SystemTime::now());
             return Ok(Some(file));
         }
     }
@@ -666,6 +671,9 @@ pub struct LabelStore {
     resumed: Arc<Mutex<Vec<(Vec<u8>, u64, usize)>>>,
     /// Leaves refused room, by epoch and stage, each logged once.
     refused: Arc<Mutex<HashSet<(u64, PathBuf, Stage)>>>,
+    /// Leaves found labelled by another worker process, by epoch, each
+    /// logged once ([`Self::admit_or_refusal`]).
+    busy_logged: Arc<Mutex<HashSet<(u64, PathBuf)>>>,
     /// The epoch before which labels were last removed ([`Self::sweep`]).
     swept: Arc<AtomicU64>,
     /// The release of labels for free space this process last saw
@@ -793,12 +801,81 @@ fn labelled_leaves_text(leaves: &[(String, u64, AheadReason)]) -> String {
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
-/// the leaves being labelled and above the floor, and the free bytes there
-/// were, if known.
+/// the leaves being labelled and above the floor, and the floor and free
+/// bytes there were, if known.
 #[derive(Debug, Clone, Copy)]
 struct Shortfall {
     needed: u64,
     free: Option<u64>,
+    floor: Option<u64>,
+}
+
+/// The start of a [`Refusal::Busy`]'s text, which the seal report files
+/// as occupied slots ([`crate::seal_report::Reason::classify`]).
+pub(crate) const BUSY: &str = "busy: the count is being labelled already";
+
+/// Why [`LabelStore::admit_or_refusal`] admitted no labelling of a leaf's
+/// count: the disk floor, or a labelling of that count already running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Too little free disk space: `needed` bytes free, above a `floor`,
+    /// where `free` were (each `None` when the filesystem could not be
+    /// read). The leaf is labelled where it is needed instead, as by a
+    /// process that keeps no labels.
+    Floor {
+        free: Option<u64>,
+        floor: Option<u64>,
+        needed: u64,
+    },
+    /// The count is being labelled already, in this process or in
+    /// another worker process (`elsewhere`), whose claim holds the writer
+    /// file `holder` ([`claim`]), made `held_secs` ago if it is there.
+    Busy {
+        elsewhere: bool,
+        holder: PathBuf,
+        held_secs: Option<u64>,
+    },
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = |bytes: &Option<u64>| bytes.map_or_else(|| "unknown".into(), |b| b.to_string());
+        match self {
+            Self::Floor {
+                free,
+                floor,
+                needed,
+            } => write!(
+                f,
+                "disk floor: {} bytes free on the labels' filesystem, {needed} needed with a \
+                 floor of {}",
+                shown(free),
+                shown(floor)
+            ),
+            Self::Busy {
+                elsewhere,
+                holder,
+                held_secs,
+            } => write!(
+                f,
+                "{BUSY} by {}, holding {} for {} s",
+                if *elsewhere {
+                    "another worker process of this node"
+                } else {
+                    "another task of this process"
+                },
+                holder.display(),
+                shown(held_secs)
+            ),
+        }
+    }
+}
+
+/// How long ago the writer file at `path` was claimed: how long its claim
+/// has been held ([`claim`] stamps it).
+fn held_secs(path: &Path) -> Option<u64> {
+    let made = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(made.elapsed().map_or(0, |held| held.as_secs()))
 }
 
 impl LabelStore {
@@ -845,6 +922,7 @@ impl LabelStore {
             #[cfg(test)]
             resumed: Arc::new(Mutex::new(Vec::new())),
             refused: Arc::new(Mutex::new(HashSet::new())),
+            busy_logged: Arc::new(Mutex::new(HashSet::new())),
             swept: Arc::new(AtomicU64::new(0)),
             seen: Arc::new(Mutex::new(None)),
             held: Arc::new(Mutex::new(HashMap::new())),
@@ -1122,6 +1200,16 @@ impl LabelStore {
         self.room_from(pending, bytes, false)
     }
 
+    /// Whether a sector's labels at `n` nodes would be admitted on free
+    /// space alone ([`Self::admit_or_refusal`] at [`Stage::Snapshot`]): a
+    /// free-space read that changes nothing, where an admission frees room
+    /// and checks the layers kept first.
+    pub(crate) fn sector_labels_fit(&self, n: u64) -> bool {
+        let pending = self.pending();
+        self.room(*pending, self.label_bytes(n).saturating_mul(DISK_MARGIN))
+            .is_ok()
+    }
+
     /// [`Self::room`] for a leaf labelled at `stage`: labelling ahead also
     /// waits, while labels are released for free space, until it is back at
     /// [`resume_free`] ([`Self::keep_floor`]).
@@ -1165,10 +1253,15 @@ impl LabelStore {
                     Err(Shortfall {
                         needed,
                         free: Some(usage.free_bytes),
+                        floor: Some((self.disk_floor)(usage.total_bytes)),
                     })
                 }
             }
-            None => Err(Shortfall { needed, free: None }),
+            None => Err(Shortfall {
+                needed,
+                free: None,
+                floor: None,
+            }),
         }
     }
 
@@ -1185,8 +1278,8 @@ impl LabelStore {
     /// `None` when refused, leaving none of its files, logged once a leaf,
     /// epoch and stage: the leaf is then labelled where it is needed, as by
     /// a process that keeps no labels. `None` too while that count is being
-    /// labelled: silently in this process, with a line when in another
-    /// ([`claim`]).
+    /// labelled: silently in this process, with a line once a leaf and
+    /// epoch when in another ([`claim`]).
     pub fn admit(
         &self,
         epoch: u64,
@@ -1195,9 +1288,27 @@ impl LabelStore {
         n: u64,
         stage: Stage,
     ) -> Option<Admitted<'_>> {
+        self.admit_or_refusal(epoch, member, leaf_id, n, stage).ok()
+    }
+
+    /// [`Self::admit`], with the cause of a refusal: the disk floor, or the
+    /// count being labelled already, and their evidence.
+    pub(crate) fn admit_or_refusal(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        leaf_id: &[u8],
+        n: u64,
+        stage: Stage,
+    ) -> std::result::Result<Admitted<'_>, Refusal> {
         let dir = self.leaf_dir(epoch, member, leaf_id);
         if !self.busy().insert((dir.clone(), n)) {
-            return None;
+            let holder = writer_path(&dir, n);
+            return Err(Refusal::Busy {
+                elsewhere: false,
+                held_secs: held_secs(&holder),
+                holder,
+            });
         }
         // Held to the labelling's end. A directory that cannot hold the
         // writer file fails the labelling as a disk error
@@ -1207,13 +1318,28 @@ impl LabelStore {
             Ok(Some(writer)) => Some(writer),
             Ok(None) => {
                 self.busy().remove(&(dir.clone(), n));
-                info!(epoch, leaf = %hex::encode(leaf_id), nodes = n, stage = stage.name(),
-                    scope = "local",
-                    "storage labels not computed here: another worker process of this node is \
-                     labelling the leaf at that count; its labels serve this node once complete, \
-                     and meanwhile the leaf is labelled where it is needed, as without labels \
-                     kept");
-                return None;
+                let holder = writer_path(&dir, n);
+                let held = held_secs(&holder);
+                if self
+                    .busy_logged
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert((epoch, dir.clone()))
+                {
+                    info!(epoch, leaf = %hex::encode(leaf_id), nodes = n, stage = stage.name(),
+                        scope = "local", cause = "busy", holder = %holder.display(),
+                        held_secs = ?held,
+                        "storage labels not computed here: another worker process of this node \
+                         is labelling the leaf at that count, holding its writer file; its \
+                         labels serve this node once complete, and meanwhile the leaf is \
+                         labelled where it is needed, as without labels kept; logged once a \
+                         leaf and epoch");
+                }
+                return Err(Refusal::Busy {
+                    elsewhere: true,
+                    holder,
+                    held_secs: held,
+                });
             }
             Err(_) => None,
         };
@@ -1283,7 +1409,7 @@ impl LabelStore {
                 drop(turn);
                 note_used(&dir, n, epoch);
                 drop(held);
-                Some(Admitted {
+                Ok(Admitted {
                     store: self,
                     dir,
                     epoch,
@@ -1313,7 +1439,11 @@ impl LabelStore {
                 }
                 self.busy().remove(&(dir.clone(), n));
                 self.refuse(epoch, &dir, leaf_id, n, stage, shortfall);
-                None
+                Err(Refusal::Floor {
+                    free: shortfall.free,
+                    floor: shortfall.floor,
+                    needed: shortfall.needed,
+                })
             }
         }
     }
@@ -1452,20 +1582,25 @@ impl LabelStore {
             return;
         }
         let (leaf, bytes) = (hex::encode(leaf_id), self.label_bytes(n));
-        let free = shortfall
-            .free
-            .map_or_else(|| "unknown".to_string(), |free| free.to_string());
+        let shown =
+            |bytes: Option<u64>| bytes.map_or_else(|| "unknown".to_string(), |b| b.to_string());
+        let (free, floor) = (shown(shortfall.free), shown(shortfall.floor));
         match stage {
             Stage::Ahead => info!(epoch, leaf = %leaf, label_bytes = bytes,
-                needed_bytes = shortfall.needed, free_bytes = %free,
-                "storage labels not computed ahead: too little free disk space on this node; \
-                 the leaf's snapshot labels it instead (about an hour per GiB on a core), and a \
-                 snapshot not encoded within the renewal's grace renews without a registration, \
-                 so the seat's frames that epoch forgo their storage reward"),
+                needed_bytes = shortfall.needed, free_bytes = %free, floor_bytes = %floor,
+                cause = "disk floor",
+                "storage labels not computed ahead: free disk space on this node is short of \
+                 the labels' floor plus room for these labels; the leaf's snapshot labels it \
+                 instead (about an hour per GiB on a core), and a snapshot not encoded within \
+                 the renewal's grace renews without a registration, so the seat's frames that \
+                 epoch forgo their storage reward"),
             Stage::Snapshot => info!(epoch, leaf = %leaf, label_bytes = bytes,
-                needed_bytes = shortfall.needed, free_bytes = %free,
-                "storage labels not kept at the snapshot: too little free disk space on this \
-                 node; the leaf's seal labels it again, as without labels kept"),
+                needed_bytes = shortfall.needed, free_bytes = %free, floor_bytes = %floor,
+                cause = "disk floor",
+                "storage labels not kept at the snapshot: free disk space on this node is \
+                 short of the labels' floor plus room for these labels; the leaf or sector is \
+                 labelled where it is needed instead, as without labels kept (about an hour \
+                 per GiB on a core)"),
         }
     }
 
@@ -1791,6 +1926,7 @@ impl LabelStore {
         let Err(Shortfall {
             needed,
             free: Some(free),
+            ..
         }) = self.room(pending, bytes)
         else {
             return;
@@ -2006,6 +2142,10 @@ impl LabelStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(e, _, _)| *e >= epoch);
+        self.busy_logged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(e, _)| *e >= epoch);
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -4513,6 +4653,73 @@ mod tests {
         assert!(store.find(9, &member, b"other", |_| true).is_some());
         store.evict_before(10);
         assert!(store.find(9, &member, leaf, |_| true).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A busy refusal dates the claim holding the count, not the writer
+    /// file a labelling that exited without ending its claim left
+    /// (2026-11-20: the claim reopened that file unstamped, so a refusal
+    /// named the dead labelling's age).
+    #[test]
+    fn a_busy_refusal_dates_the_claim_not_a_writer_file_left_before_it() {
+        let dir = temp_dir("held-age");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let other = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        fs::create_dir_all(&leaf_dir).unwrap();
+        let left = File::create(writer_path(&leaf_dir, n)).unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        left.set_modified(std::time::SystemTime::now() - day)
+            .unwrap();
+        drop(left);
+        let held = store
+            .admit(9, &member, leaf, n, Stage::Snapshot)
+            .expect("room");
+        let refusal = other
+            .admit_or_refusal(9, &member, leaf, n, Stage::Snapshot)
+            .err();
+        drop(held);
+        println!("REACH sector-floor");
+        let Some(Refusal::Busy {
+            elsewhere: true,
+            held_secs: Some(secs),
+            ..
+        }) = refusal
+        else {
+            panic!("HELD-AGE: no busy refusal naming its age: {refusal:?}");
+        };
+        assert!(
+            secs < 600,
+            "HELD-AGE: the claim is dated {secs} s ago, the left writer file's age"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Another process's hold, logged once a leaf and epoch, is forgotten
+    /// with its epoch's labels, as refusals are: the set stays bounded.
+    #[test]
+    fn a_hold_logged_once_is_forgotten_with_its_epoch() {
+        let dir = temp_dir("busy-logged");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let other = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        let held = store
+            .admit(9, &member, leaf, n, Stage::Snapshot)
+            .expect("room");
+        assert!(other.admit(9, &member, leaf, n, Stage::Snapshot).is_none());
+        drop(held);
+        assert_eq!(
+            other.busy_logged.lock().unwrap().len(),
+            1,
+            "the hold is logged"
+        );
+        other.evict_before(10);
+        println!("REACH sector-floor");
+        assert!(
+            other.busy_logged.lock().unwrap().is_empty(),
+            "BUSY-PRUNED: a hold logged once outlived its epoch"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

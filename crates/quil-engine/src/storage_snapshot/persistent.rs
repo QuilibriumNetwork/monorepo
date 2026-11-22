@@ -2,7 +2,7 @@
 //! logical shard ownership. Leases prevent two concurrent leaves selecting the
 //! same physical sector; GLOBAL independently enforces that invariant.
 use super::*;
-use crate::storage_labels::{LabelStore, Labelling, Stage};
+use crate::storage_labels::{LabelStore, Labelling, Refusal, Stage};
 use quil_crypto::{
     persistent_storage as sector, storage_hash as hash,
     storage_proof::{self as proof, LabelSource, MerkleCap, Node, Tree},
@@ -18,7 +18,9 @@ use std::{
 };
 
 /// An expected wait of a leaf's encode: on GLOBAL certifying its sector
-/// ([`UNCERTIFIED`]), or on a sector initialization slot. Its storage job
+/// ([`UNCERTIFIED`]), or on a sector initialization slot; or of a sector's
+/// set-up or repair on the labelling holding its count
+/// ([`Refusal::Busy`]). Its storage job
 /// logs it as one, never as a failure at each retry (2026-11-19: on a
 /// 9-seat node the two were 55 failure warns in 12 hours).
 fn waiting(what: &str) -> QuilError {
@@ -44,9 +46,17 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&tmp)
         .map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    file.sync_all().map_err(io)?;
-    fs::rename(&tmp, path).map_err(io)?;
+    // Failed, it removes its own file: a write retried at every poll left
+    // one more at each (2026-11-20).
+    if let Err(error) = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path))
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(io(error));
+    }
     File::open(path.parent().unwrap())
         .and_then(|f| f.sync_all())
         .map_err(io)
@@ -77,6 +87,261 @@ fn sector_directory(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The file a sector's [`Relabel`] is kept in, with the certificate it is
+/// for.
+const RELABEL: &str = "relabel";
+
+/// A sector's certificate proof made without labels kept failed, as a
+/// certificate whose columns differ from its labels fails it (2026-11-20:
+/// below the labels' disk floor such a sector labelled itself again at
+/// every poll to fail the same proof). It is labelled again once, as kept
+/// labels found damaged are, and takes the certificate its labels give;
+/// one whose labels give that same certificate is given up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relabel {
+    /// Labelled again ([`initialize`]) before any other proof.
+    Asked = 0,
+    /// Labelled again to this same certificate: one more failed proof
+    /// gives it up.
+    Done = 1,
+    /// No proof is made for it without labels kept: it is set up again at
+    /// each poll, so its labels are kept once there is room for them, and
+    /// it is proven from them.
+    GivenUp = 2,
+}
+
+/// What moves a sector's [`Relabel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelabelEvent {
+    /// Its certificate proof made without labels kept failed.
+    UnkeptProofFailed,
+    /// It was labelled again, to the same certificate or to another.
+    Relabelled { same: bool },
+    /// A certificate proof for it was made, with labels kept or not.
+    Proven,
+}
+
+/// What a poll does for a sector with no labels kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnkeptStep {
+    /// Prove it, labelled where the proof needs it.
+    Prove,
+    /// Label it again first ([`initialize`]).
+    Relabel,
+    /// Set it up again, so its labels are kept once there is room for
+    /// them; no proof is made before they are.
+    KeepLabels,
+}
+
+impl Relabel {
+    /// Where a sector stands after `event`, from `state`: the one owner of
+    /// every move, each state with its exit. A proof made ends every state.
+    fn after(state: Option<Relabel>, event: RelabelEvent) -> Option<Relabel> {
+        match (state, event) {
+            (_, RelabelEvent::Proven) => None,
+            (None, RelabelEvent::UnkeptProofFailed) => Some(Relabel::Asked),
+            (Some(Relabel::Done), RelabelEvent::UnkeptProofFailed) => Some(Relabel::GivenUp),
+            (Some(Relabel::Asked), RelabelEvent::Relabelled { same: true }) => Some(Relabel::Done),
+            (Some(Relabel::Asked), RelabelEvent::Relabelled { same: false }) => None,
+            // No proof without labels kept is made while asked or given up,
+            // and only an asked sector is labelled again for its state.
+            (state, _) => state,
+        }
+    }
+    /// What a poll does for a sector in `state` with no labels kept.
+    fn unkept_step(state: Option<Relabel>) -> UnkeptStep {
+        match state {
+            None | Some(Relabel::Done) => UnkeptStep::Prove,
+            Some(Relabel::Asked) => UnkeptStep::Relabel,
+            Some(Relabel::GivenUp) => UnkeptStep::KeepLabels,
+        }
+    }
+}
+
+/// Sectors whose [`Relabel`] could not be written, as a full disk refuses
+/// it, by directory: the certificate and the state they were to take. No
+/// proof is made for them without labels kept, nor are they labelled
+/// again, until that state is written (2026-11-20: unwritten, each poll
+/// labelled the sector in memory to fail the same proof).
+static UNMARKED: Mutex<std::collections::BTreeMap<PathBuf, (Vec<u8>, Relabel)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Why a sector is set up ([`setup_turn`]).
+#[derive(Clone, Copy)]
+enum SetupFor<'a> {
+    /// Its first setup: no certificate is on disk yet.
+    First,
+    /// Labelled again for its certificate on disk: its proof made without
+    /// labels kept failed ([`UnkeptStep::Relabel`]), or its last layer or
+    /// kept labels are damaged.
+    Again(&'a Sector),
+    /// To keep its labels, while refused room ([`UnkeptStep::KeepLabels`]).
+    KeepLabels(&'a Sector),
+    /// Its certificate proof: made without labels kept, it labels it in
+    /// full as a setup does ([`proof::prove_seal`]), or, its last layer
+    /// damaged or its proof failed, hands its turn to [`SetupFor::Again`];
+    /// made from labels kept, it reserves the labelling peak and reads and
+    /// hashes its whole last layer.
+    Prove(&'a Sector),
+}
+
+/// A sector's last setup ([`setup_due`]).
+struct SetupTried {
+    /// The certificate it was set up for; `None` for its first.
+    cert: Option<Vec<u8>>,
+    /// The epoch it began in.
+    began: u64,
+    /// Its [`Turn`] spent: `Some(None)` until a gate reads it, then the
+    /// epoch that gate ran in.
+    fruitless: Option<Option<u64>>,
+}
+
+/// Each sector's [`SetupTried`], by directory.
+static SETUP_TRIED: Mutex<std::collections::BTreeMap<PathBuf, SetupTried>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether the sector in `dir` is set up now, in `epoch`: the one gate of
+/// every way into a setup, and of its certificate proof ([`setup_turn`]).
+/// Each reserves its memory and labels the sector, or, refused room or
+/// damaged, reads and hashes its whole last layer (up to 2 GiB). One whose
+/// turn was spent ([`Turn`]) runs again, as does any other of the same
+/// certificate, only in an epoch after the one a gate first read that end
+/// in (2026-11-20: a first setup whose last layer could not be written, a
+/// relabel whose record could not, a run ending past its epoch, and a
+/// proof whose cache could not each labelled in full again at the next
+/// poll). One to keep its
+/// labels also runs once an epoch unless the free space read fits them,
+/// as room an admission makes ([`LabelStore::admit_or_refusal`]) is not
+/// read here.
+fn setup_due(store: &LabelStore, dir: &Path, setup: SetupFor, epoch: u64) -> bool {
+    let (cert, fits) = match setup {
+        SetupFor::First => (None, None),
+        SetupFor::Again(sector) | SetupFor::Prove(sector) => (Some(sector.cert.to_bytes()), None),
+        SetupFor::KeepLabels(sector) => (
+            Some(sector.cert.to_bytes()),
+            Some(
+                store
+                    .for_profile(sector.cert.profile)
+                    .sector_labels_fit(sector.cert.n),
+            ),
+        ),
+    };
+    let mut tried = SETUP_TRIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(last) = tried.get_mut(dir).filter(|last| last.cert == cert) {
+        if let Some(ended) = &mut last.fruitless {
+            if epoch <= *ended.get_or_insert(epoch) {
+                return false;
+            }
+        }
+        if fits == Some(false) && last.began == epoch {
+            return false;
+        }
+    }
+    let now = SetupTried {
+        cert,
+        began: epoch,
+        fruitless: None,
+    };
+    tried.insert(dir.to_owned(), now);
+    true
+}
+
+/// A sector's turn to be set up or proven, that [`setup_turn`] gave: it
+/// holds the sector's `resuming` lock. Dropped, it is spent: the next of
+/// the same certificate runs only in an epoch after the one a gate first
+/// reads that in ([`setup_due`]), unless [`Turn::end`] refunded it first.
+/// Each way out of its work, an error or one not named here, so costs at
+/// most an epoch, never a full labelling or a last layer read at every
+/// poll (2026-11-21: a turn stayed free unless its way out recorded its
+/// end, and each way out that did not repeated that work at every poll).
+struct Turn {
+    dir: PathBuf,
+    /// The certificate set up again or proven; `None` for a first setup.
+    cert: Option<sector::Certificate>,
+    refunded: std::sync::atomic::AtomicBool,
+    _lock: File,
+}
+
+impl Turn {
+    /// End the turn on `result`, the one classifier of how its work ended:
+    /// refunded, so the next is due at once, for a wait or a stop, which
+    /// goes on from the whole layers it kept, or its goal reached (`goal`
+    /// of what it made); spent otherwise.
+    fn end<T>(&self, result: &Result<T>, goal: impl FnOnce(&T) -> bool) {
+        let refunded = match result {
+            Ok(made) => goal(made),
+            Err(QuilError::StorageWaiting(_) | QuilError::StorageWorkStopped(_)) => true,
+            Err(_) => false,
+        };
+        self.refunded
+            .store(refunded, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// End a setup's turn. Its goal: the sector set up the first time, or,
+    /// set up again, another certificate or its labels kept (`kept`). One
+    /// refused room before it labelled (`labelled` false) waits for room,
+    /// as the gate paces it by its room probe ([`setup_due`]).
+    fn set_up(&self, result: &Result<Sector>, labelled: bool, kept: impl FnOnce(&Sector) -> bool) {
+        self.end(result, |sector| match &self.cert {
+            None => true,
+            Some(old) => sector.cert != *old || !labelled || kept(sector),
+        });
+    }
+
+    /// End a proof's turn: its goal is the proof made and cached.
+    fn proven(&self, result: &Result<Vec<u8>>) {
+        self.end(result, |_| true);
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        if self.refunded.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some(tried) = SETUP_TRIED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.dir)
+        {
+            tried.fruitless = Some(None);
+        }
+    }
+}
+
+/// The turn of the sector in `dir` to be set up or proven, `None` while
+/// another holds it or none is due ([`setup_due`]).
+fn setup_turn(store: &LabelStore, dir: &Path, setup: SetupFor, epoch: u64) -> Result<Option<Turn>> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("resuming"))
+        .map_err(io)?;
+    if lock.try_lock().is_err() || !setup_due(store, dir, setup, epoch) {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    if !matches!(setup, SetupFor::Prove(_)) {
+        tests::count_resume(dir);
+    }
+    let cert = match setup {
+        SetupFor::First => None,
+        SetupFor::Again(sector) | SetupFor::KeepLabels(sector) | SetupFor::Prove(sector) => {
+            Some(sector.cert)
+        }
+    };
+    Ok(Some(Turn {
+        dir: dir.to_owned(),
+        cert,
+        refunded: std::sync::atomic::AtomicBool::new(false),
+        _lock: lock,
+    }))
 }
 
 #[derive(Clone)]
@@ -144,10 +409,68 @@ impl Sector {
     fn last_matches(&self) -> bool {
         #[cfg(test)]
         tests::count_last_check(&self.dir);
-        self.last().is_ok_and(|last| {
-            let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(self.cert.n));
-            cap.commitment(Tree::Replica) == self.cert.labels
-        })
+        self.last()
+            .is_ok_and(|last| last_commits(&last, &self.cert))
+    }
+    /// Where its proof made without labels kept stands, for its certificate
+    /// on disk ([`Relabel`]): `None` when its proof never failed so.
+    fn relabel(&self) -> Option<Relabel> {
+        let bytes = fs::read(self.dir.join(RELABEL)).ok()?;
+        let (state, cert) = bytes.split_last()?;
+        if *cert != self.cert.to_bytes()[..] {
+            return None;
+        }
+        [Relabel::Asked, Relabel::Done, Relabel::GivenUp]
+            .into_iter()
+            .find(|relabel| *relabel as u8 == *state)
+    }
+    /// Record where its proof made without labels kept stands, for its
+    /// certificate on disk.
+    fn mark_relabel(&self, relabel: Relabel) -> Result<()> {
+        let mut bytes = self.cert.to_bytes();
+        bytes.push(relabel as u8);
+        atomic(&self.dir.join(RELABEL), &bytes)
+    }
+    /// Record `relabel`, or with `None` remove its record.
+    fn set_relabel(&self, relabel: Option<Relabel>) -> Result<()> {
+        match relabel {
+            Some(relabel) => self.mark_relabel(relabel),
+            None => match fs::remove_file(self.dir.join(RELABEL)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(e)),
+                _ => Ok(()),
+            },
+        }
+    }
+    /// Move its [`Relabel`] on `event`, written, and an unwritten one
+    /// forgotten once a proof is made.
+    fn relabel_event(&self, event: RelabelEvent) -> Result<Option<Relabel>> {
+        let relabel = Relabel::after(self.relabel(), event);
+        self.set_relabel(relabel)?;
+        if event == RelabelEvent::Proven {
+            self.unmarked_written();
+        }
+        Ok(relabel)
+    }
+    /// The [`Relabel`] it was to take when that could not be written
+    /// ([`UNMARKED`]), for its certificate on disk.
+    fn unmarked(&self) -> Option<Relabel> {
+        let unmarked = UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (cert, relabel) = unmarked.get(&self.dir)?;
+        (*cert == self.cert.to_bytes()).then_some(*relabel)
+    }
+    fn hold_unmarked(&self, relabel: Relabel) {
+        UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.dir.clone(), (self.cert.to_bytes(), relabel));
+    }
+    fn unmarked_written(&self) {
+        UNMARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.dir);
     }
     /// Whether a repair found the sector's labels, made again, to differ
     /// from its certificate: it is not labelled again, and no leaf is
@@ -343,6 +666,7 @@ fn try_reserve(
     Ok(Some((dir, id, n)))
 }
 
+#[cfg(test)]
 fn initialize(
     store: &LabelStore,
     member: &[u8],
@@ -412,31 +736,52 @@ fn initialize_with_progress(
     let (last, columns) = match kept {
         Some(pair) => pair,
         None => {
-            let Some(admitted) = store.admit(epoch, member, &id, n, Stage::Snapshot) else {
-                return Err(unavailable(
-                    "a new sector's labels not admitted to certify it: too little free disk \
-                     space, or the sector labelled already by another task or worker process"
-                        .into(),
-                ));
-            };
-            match admitted.label_kept(params, stop, layers)? {
-                Labelling::Labelled(labelled) if labelled.kept => (labelled.last, labelled.comm_c),
-                // Told to stop: it gave its memory back to more urgent work,
-                // or its caller stops. Not a failure: the next attempt goes
-                // on from the whole layers kept.
-                Labelling::Stopped { layers: kept } => {
-                    return Err(QuilError::StorageWorkStopped(format!(
-                        "initial labelling of sector {}, {kept} of {} whole layers kept to go \
-                         on from",
-                        hex::encode(id),
-                        params.layers
+            let labelled = match store.admit_or_refusal(epoch, member, &id, n, Stage::Snapshot) {
+                Ok(admitted) => match admitted.label_kept(params, stop, layers)? {
+                    // Kept, or labelled to its end past room that ran out
+                    // on the way and so not kept: the sector is set up
+                    // from them either way.
+                    Labelling::Labelled(labelled) => Some((labelled.last, labelled.comm_c)),
+                    // Told to stop: it gave its memory back to more urgent
+                    // work, or its caller stops. Not a failure: the next
+                    // attempt goes on from the whole layers kept.
+                    Labelling::Stopped { layers: kept } => {
+                        return Err(QuilError::StorageWorkStopped(format!(
+                            "initial labelling of sector {}, {kept} of {} whole layers kept \
+                             to go on from",
+                            hex::encode(id),
+                            params.layers
+                        )))
+                    }
+                    Labelling::Refused => None,
+                },
+                // The labelling that holds the count sets the sector up:
+                // an expected wait, logged as one by its job, not a failure.
+                Err(busy @ Refusal::Busy { .. }) => {
+                    return Err(waiting(&format!(
+                        "a new sector's labels not admitted to certify it: {busy}; it is set \
+                         up once that labelling ends"
                     )))
                 }
-                _ => {
-                    return Err(unavailable(
-                        "initial sector labelling could not be retained".into(),
-                    ))
+                // Below the disk floor, logged by the store once a sector
+                // and epoch: labelled where it is needed instead, as by a
+                // process that keeps no labels, its last layer kept as
+                // every sector's is. One set up so already is not labelled
+                // again: its proof labels it ([`poll_sector_certificates`]),
+                // unless that proof failed ([`Relabel::Asked`]).
+                Err(Refusal::Floor { .. }) => {
+                    if let Some(sector) = previous
+                        .as_ref()
+                        .filter(|s| s.relabel() != Some(Relabel::Asked) && s.last_matches())
+                    {
+                        return Ok(sector.clone());
+                    }
+                    None
                 }
+            };
+            match labelled {
+                Some(pair) => pair,
+                None => label_unkept(member, epoch, &id, n, params, stop, layers)?,
             }
         }
     };
@@ -487,7 +832,84 @@ fn initialize_with_progress(
         certified: false,
     };
     sector.save()?;
+    // Labelled again for a proof that failed: it is proven from the
+    // certificate its labels give, and given up should that same one fail.
+    if let Some(old) = previous.filter(|old| old.relabel() == Some(Relabel::Asked)) {
+        let same = old.cert == sector.cert;
+        sector.set_relabel(Relabel::after(
+            Some(Relabel::Asked),
+            RelabelEvent::Relabelled { same },
+        ))?;
+    }
     Ok(sector)
+}
+
+/// Label sector `id` at `n` nodes where it is needed, as by a process that
+/// keeps no labels: its last layer and column commitment, nothing on disk.
+/// Told to stop, it is a stop with nothing kept to go on from.
+fn label_unkept(
+    member: &[u8],
+    epoch: u64,
+    id: &[u8; 32],
+    n: u64,
+    params: &quil_crypto::sdr::SdrParams,
+    stop: &dyn Fn() -> bool,
+    layers: &dyn Fn(usize),
+) -> Result<(Vec<hash::Digest>, Node)> {
+    let key = quil_crypto::sdr::replica_key(member, id, epoch);
+    let labelled = proof::with_label_memory_budget(
+        crate::storage_jobs::label_scratch_bytes(n, params),
+        || proof::label_leaf_until(n, &key, params, &mut |index, _| layers(index + 1), stop),
+    );
+    let Some((last, columns)) = labelled else {
+        return Err(QuilError::StorageWorkStopped(format!(
+            "initial labelling of sector {} without labels kept, nothing kept to go on from",
+            hex::encode(id)
+        )));
+    };
+    let comm_c = MerkleCap::from_digests(&columns, proof::CAP_HEIGHT).commitment(Tree::Column);
+    Ok((last, comm_c))
+}
+
+/// A sector's certificate proof made without labels kept failed with
+/// `error`: the sector is labelled again once before another proof, and
+/// given up when its labels, made again, gave that same certificate
+/// ([`Relabel`]). Should that not be written, neither is done until it is
+/// ([`UNMARKED`]). The error, as the proof's caller reports it.
+fn unkept_proof_failed(sector: &Sector, target: u64, error: String) -> String {
+    let id = hex::encode(sector.cert.sector);
+    let relabel = match sector.relabel_event(RelabelEvent::UnkeptProofFailed) {
+        Ok(relabel) => relabel,
+        Err(marked) => {
+            let relabel = Relabel::after(sector.relabel(), RelabelEvent::UnkeptProofFailed);
+            if let Some(relabel) = relabel {
+                sector.hold_unmarked(relabel);
+            }
+            warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, %marked,
+                scope = "local",
+                action = "free disk space in this node's storage directory and check its disk; \
+                          the sector goes on once this is written or its labels are kept",
+                "an uncertified sector's certificate proof made without labels kept failed, \
+                 and that could not be written; until it is, the sector is neither proven nor \
+                 labelled again without labels kept");
+            return format!("{error}; not marked to be labelled again: {marked}");
+        }
+    };
+    if relabel == Some(Relabel::GivenUp) {
+        warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, scope = "local",
+            action = "free disk space above the labels' floor so its labels are kept, and \
+                      check this node's disk and memory if this recurs",
+            "an uncertified sector labelled again failed its certificate proof made without \
+             labels kept once more, with the same certificate; no proof is made for it until \
+             its labels are kept, which is tried at each poll");
+    } else {
+        warn!(epoch = target, sector = %id, nodes = sector.cert.n, %error, scope = "local",
+            action = "check this node's disk and its kernel log for I/O errors if this recurs",
+            "an uncertified sector's certificate proof made without labels kept failed, as a \
+             certificate written from damaged labels fails it; the sector is labelled again \
+             once and takes the certificate its labels give");
+    }
+    error
 }
 
 /// Write a sector's last layer whole, or leave the one there. Up to 2 GiB:
@@ -565,23 +987,34 @@ fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
                 memory.wait_while_paused(&crate::storage_jobs::stopping);
                 crate::storage_jobs::stopping() || memory.yield_requested()
             };
-            let admitted = store
-                .admit(epoch, &member, &id, n, Stage::Snapshot)
-                .ok_or_else(|| {
-                    unavailable(
-                        "a sector's labels not admitted to repair it: too little free disk \
-                         space, or the sector labelled already by another task or worker process"
-                            .into(),
-                    )
-                })?;
-            let labelled = match admitted.label_kept(store.params(), &stop, &|_| {})? {
-                Labelling::Labelled(labelled) => labelled,
-                _ => return Err(unavailable("sector repair stopped".into())),
-            };
+            let (last, comm_c) =
+                match store.admit_or_refusal(epoch, &member, &id, n, Stage::Snapshot) {
+                    Ok(admitted) => match admitted.label_kept(store.params(), &stop, &|_| {})? {
+                        Labelling::Labelled(labelled) => (labelled.last, labelled.comm_c),
+                        _ => return Err(unavailable("sector repair stopped".into())),
+                    },
+                    // An expected wait, as at its set-up: repaired once
+                    // the labelling holding the count ends.
+                    Err(busy @ Refusal::Busy { .. }) => {
+                        return Err(waiting(&format!(
+                            "a sector's labels not admitted to repair it: {busy}"
+                        )))
+                    }
+                    // Below the disk floor, logged by the store: labelled
+                    // where it is needed instead, nothing kept; stopped as
+                    // the kept labelling stops.
+                    Err(Refusal::Floor { .. }) => {
+                        match label_unkept(&member, epoch, &id, n, store.params(), &stop, &|_| {}) {
+                            Err(QuilError::StorageWorkStopped(_)) => {
+                                return Err(unavailable("sector repair stopped".into()))
+                            }
+                            labelled => labelled?,
+                        }
+                    }
+                };
             store.release_certified_sector(epoch, &member, &id);
-            let cap = MerkleCap::from_digests(&labelled.last, proof::seal_cap_height(n));
-            if cap.commitment(Tree::Replica) != sector.cert.labels
-                || labelled.comm_c != sector.cert.columns
+            let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(n));
+            if cap.commitment(Tree::Replica) != sector.cert.labels || comm_c != sector.cert.columns
             {
                 atomic(&sector.dir.join("repair-failed"), &sector.cert.to_bytes())?;
                 warn!(epoch, sector = %hex::encode(id), nodes = n, scope = "local",
@@ -594,7 +1027,7 @@ fn repair_last(store: &LabelStore, member: &[u8], epoch: u64, sector: &Sector) {
                     "relabelled sector differs from its certificate".into(),
                 ));
             }
-            write_last(&sector.dir, &labelled.last)?;
+            write_last(&sector.dir, &last)?;
             atomic(&sector.dir.join("cap"), &cap.to_bytes())?;
             info!(epoch, sector = %hex::encode(id), nodes = n,
                 "a certified sector was labelled again and its last layer rewritten");
@@ -686,16 +1119,21 @@ fn proof_inputs_whole(
     last: &[u8],
     cert: &sector::Certificate,
 ) -> bool {
-    let Some(last) = hash::digests_from_bytes(last) else {
-        return false;
-    };
-    if last.len() as u64 != cert.n {
-        return false;
-    }
-    let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(cert.n));
-    cap.commitment(Tree::Replica) == cert.labels
-        && kept.comm_c == cert.columns
-        && kept.verified_last_layer() == Some(last)
+    whole_last(last, cert)
+        .is_some_and(|last| kept.comm_c == cert.columns && kept.verified_last_layer() == Some(last))
+}
+
+/// A sector's last layer, from its bytes on disk, when it commits to its
+/// certificate.
+fn whole_last(last: &[u8], cert: &sector::Certificate) -> Option<Vec<hash::Digest>> {
+    let last = hash::digests_from_bytes(last)?;
+    (last.len() as u64 == cert.n && last_commits(&last, cert)).then_some(last)
+}
+
+/// Whether a sector's last layer commits to its certificate's labels.
+fn last_commits(last: &[hash::Digest], cert: &sector::Certificate) -> bool {
+    MerkleCap::from_digests(last, proof::seal_cap_height(cert.n)).commitment(Tree::Replica)
+        == cert.labels
 }
 
 /// Whether a sector's cached certificate proof verifies as GLOBAL verifies
@@ -1212,6 +1650,10 @@ pub(crate) fn prewarm_sectors(
         crate::storage_jobs::ahead_place(),
         &sizes,
     );
+    // Each sector's setup in its turn ([`setup_turn`]), at the epoch of
+    // the newest GLOBAL frame seen, or else the epoch warmed.
+    let current = crate::storage_snapshot::global_frame()
+        .map_or(captured.epoch, quil_types::consensus::epoch_for_frame);
     let mut tasks = Vec::new();
     for (prefix, order) in captured.prefixes.iter().zip(orders) {
         let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
@@ -1228,9 +1670,12 @@ pub(crate) fn prewarm_sectors(
         if Sector::load(dir.clone())?.is_some() {
             continue;
         }
-        tasks.push((dir, id, n, order));
+        let Some(turn) = setup_turn(store, &dir, SetupFor::First, current)? else {
+            continue;
+        };
+        tasks.push((dir, id, n, order, turn));
     }
-    crate::storage_jobs::for_each_parallel(&tasks, |(dir, id, n, order)| {
+    crate::storage_jobs::for_each_parallel(&tasks, |(dir, id, n, order, turn)| {
         let gone = || crate::storage_jobs::stopping();
         let memory = crate::storage_jobs::reserve_ahead(
             crate::storage_labels::label_ahead_bytes(*n),
@@ -1239,11 +1684,24 @@ pub(crate) fn prewarm_sectors(
             &gone,
         )
         .ok_or_else(|| unavailable("sector warmup stopped".into()))?;
-        initialize(store, member, captured.epoch, dir.clone(), *id, *n, &|| {
-            memory.wait_while_paused(&gone);
-            gone() || memory.yield_requested()
-        })
-        .map_err(|error| memory.named_stop(error))?;
+        let labelled = std::sync::atomic::AtomicBool::new(false);
+        let ended = initialize_with_progress(
+            store,
+            member,
+            captured.epoch,
+            dir.clone(),
+            *id,
+            *n,
+            &|| {
+                memory.wait_while_paused(&gone);
+                gone() || memory.yield_requested()
+            },
+            &|_| labelled.store(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        turn.set_up(&ended, labelled.into_inner(), |sector| {
+            store.holds(captured.epoch, member, &sector.cert.sector)
+        });
+        ended.map_err(|error| memory.named_stop(error))?;
         Ok(())
     })?;
     Ok(())
@@ -1434,12 +1892,31 @@ fn certificate_sent(dir: &Path, target: u64, beacon_frame: u64, frame: u64) -> R
     )
 }
 
+/// Label the sector in `dir` again in its proof's `turn`, which the
+/// relabel takes over ([`SetupFor::Again`]): it runs at once, not an epoch
+/// later at the gate's next turn, and its end, not the proof's, spends or
+/// refunds that turn. The one way a proof hands its turn to a relabel: a
+/// damaged last layer without labels kept, damaged kept labels, and a
+/// failed proof without labels kept asked to be labelled again.
+fn relabel_in_turn(
+    store: &'static LabelStore,
+    member: &[u8; 32],
+    dir: PathBuf,
+    turn: Turn,
+) -> Result<()> {
+    #[cfg(test)]
+    tests::count_resume(&dir);
+    resume_reserved_sector(store, member, dir, turn)
+}
+
 // A lost shard or a restart must not strand the pool behind an unfinished
-// reservation. Capacity is independent of that shard's data; finish it here.
+// reservation. Capacity is independent of that shard's data; finish it here,
+// in the `turn` given ([`setup_turn`]): any way out before its end spends it.
 fn resume_reserved_sector(
     store: &'static LabelStore,
     member: &[u8; 32],
     dir: PathBuf,
+    turn: Turn,
 ) -> Result<()> {
     let bytes = fs::read(dir.join("reservation")).map_err(io)?;
     if bytes.len() != 48 && bytes.len() != 52 {
@@ -1454,22 +1931,11 @@ fn resume_reserved_sector(
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| unavailable("sector directory identity".into()))?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("resuming"))
-        .map_err(io)?;
-    if lock.try_lock().is_err() {
-        return Ok(());
-    }
     let member = *member;
     crate::storage_jobs::spawn(
         &sector_lane(&member, &id),
         "sector initialization",
         move || {
-            let _lock = lock;
             let order = crate::storage_jobs::AheadOrder {
                 deferrable: false,
                 seat_leaves: 1,
@@ -1483,11 +1949,24 @@ fn resume_reserved_sector(
                 &crate::storage_jobs::stopping,
             )
             .ok_or_else(|| unavailable("sector initialization stopped".into()))?;
-            initialize(store, &member, epoch, dir, id, n, &|| {
-                memory.wait_while_paused(&crate::storage_jobs::stopping);
-                crate::storage_jobs::stopping() || memory.yield_requested()
-            })
-            .map_err(|error| memory.named_stop(error))?;
+            let labelled = std::sync::atomic::AtomicBool::new(false);
+            let ended = initialize_with_progress(
+                store,
+                &member,
+                epoch,
+                dir.clone(),
+                id,
+                n,
+                &|| {
+                    memory.wait_while_paused(&crate::storage_jobs::stopping);
+                    crate::storage_jobs::stopping() || memory.yield_requested()
+                },
+                &|_| labelled.store(true, std::sync::atomic::Ordering::Relaxed),
+            );
+            turn.set_up(&ended, labelled.into_inner(), |sector| {
+                store.holds(epoch, &member, &sector.cert.sector)
+            });
+            ended.map_err(|error| memory.named_stop(error))?;
             Ok(())
         },
     );
@@ -1661,7 +2140,9 @@ pub(crate) fn poll_sector_certificates(
     // from GLOBAL, is skipped and never holds back the others.
     let poll_one = |entry: fs::DirEntry| -> Result<()> {
         let Some(mut sector) = Sector::load(entry.path())? else {
-            resume_reserved_sector(store, member, entry.path())?;
+            if let Some(turn) = setup_turn(store, &entry.path(), SetupFor::First, current)? {
+                resume_reserved_sector(store, member, entry.path(), turn)?;
+            }
             return Ok(());
         };
         let initialized = fs::read(sector.dir.join("reservation")).map_err(io)?;
@@ -1794,9 +2275,46 @@ pub(crate) fn poll_sector_certificates(
             &sector.cert.sector,
             |n| n == sector.cert.n,
         );
-        if kept.is_none() && !cache.is_file() {
-            resume_reserved_sector(store, member, sector.dir.clone())?;
-            return Ok(());
+        // Labels not kept (refused room, or released for free space): the
+        // proof labels the sector where it is needed instead, as by a
+        // process that keeps no labels, from its last layer on disk. One
+        // whose proof so failed is labelled again first, once ([`Relabel`]).
+        if kept.is_none() {
+            let step = match sector.unmarked() {
+                // Its state could not be written: neither proven nor
+                // labelled again until it is, or its labels are kept.
+                Some(relabel) => match sector.mark_relabel(relabel) {
+                    Err(_) => UnkeptStep::KeepLabels,
+                    Ok(()) => {
+                        sector.unmarked_written();
+                        info!(frame, sector = %hex::encode(sector.cert.sector), ?relabel,
+                            "a sector's state after its failed certificate proof made without \
+                             labels kept is now written; it goes on from it");
+                        Relabel::unkept_step(Some(relabel))
+                    }
+                },
+                None => Relabel::unkept_step(sector.relabel()),
+            };
+            match step {
+                UnkeptStep::Prove => {}
+                // Labelled again past the disk floor while asked.
+                UnkeptStep::Relabel => {
+                    let again = SetupFor::Again(&sector);
+                    if let Some(turn) = setup_turn(store, &sector.dir, again, current)? {
+                        resume_reserved_sector(store, member, sector.dir.clone(), turn)?;
+                    }
+                    return Ok(());
+                }
+                // Set up again, paced, while refused room, and its labels
+                // kept once admitted, after which they prove it.
+                UnkeptStep::KeepLabels => {
+                    let keep = SetupFor::KeepLabels(&sector);
+                    if let Some(turn) = setup_turn(store, &sector.dir, keep, current)? {
+                        resume_reserved_sector(store, member, sector.dir.clone(), turn)?;
+                    }
+                    return Ok(());
+                }
+            }
         }
         if !certificate_due(&sector.dir, target, beacon_frame, frame) {
             tally(&PACING.certificates_held);
@@ -1824,9 +2342,14 @@ pub(crate) fn poll_sector_certificates(
                         ));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let kept = kept.ok_or_else(|| {
-                            unavailable("sector proof cache and temporary layers are absent".into())
-                        })?;
+                        // In the sector's turn, with labels kept or not: it
+                        // reserves the labelling peak and hashes the last
+                        // layer, or labels the sector in full, as a setup
+                        // does ([`setup_due`]).
+                        let prove = SetupFor::Prove(&sector);
+                        let Some(turn) = setup_turn(store, &sector.dir, prove, current)? else {
+                            return Ok(());
+                        };
                         let _memory = crate::storage_jobs::reserve(
                             proof::labelling_peak_bytes(sector.cert.n, &sector.cert.params())
                                 .saturating_add(400 << 20),
@@ -1840,11 +2363,35 @@ pub(crate) fn poll_sector_certificates(
                             proof: Vec::new(),
                         };
                         let root = message.root();
+                        #[cfg(test)]
+                        tests::proof_last_read(&sector.dir)?;
                         let last = fs::read(sector.dir.join("last")).map_err(io)?;
+                        let whole = match &kept {
+                            Some(kept) => proof_inputs_whole(kept, &last, &sector.cert),
+                            None => whole_last(&last, &sector.cert).is_some(),
+                        };
                         // Damaged labels or a damaged last layer fail the
                         // proof at every poll: they are removed instead, and
-                        // the sector is labelled again from the next poll.
-                        if !proof_inputs_whole(&kept, &last, &sector.cert) {
+                        // the sector is labelled again, the relabel taking
+                        // the turn over, before its proof.
+                        if !whole {
+                            let Some(kept) = kept else {
+                                warn!(epoch = target, sector = %hex::encode(sector.cert.sector),
+                                    scope = "local",
+                                    action = "check this node's disk and kernel log for I/O errors",
+                                    "an uncertified sector's last layer on disk does not match \
+                                     its certificate, as a damaged file leaves it, and no labels \
+                                     are kept for it; it is labelled again before its proof");
+                                // The relabel takes the turn over: its end
+                                // paces this check too.
+                                let dir = sector.dir.clone();
+                                relabel_in_turn(store, &member, dir, turn)?;
+                                return Err(unavailable(
+                                    "an uncertified sector's last layer differs from its \
+                                     certificate; it is labelled again before its proof"
+                                        .into(),
+                                ));
+                            };
                             warn!(epoch = target, sector = %hex::encode(sector.cert.sector),
                                 scope = "local",
                                 action = "check this node's disk and kernel log for I/O errors",
@@ -1859,6 +2406,8 @@ pub(crate) fn poll_sector_certificates(
                                 &sector.cert.sector,
                                 sector.cert.n,
                             );
+                            let dir = sector.dir.clone();
+                            relabel_in_turn(store, &member, dir, turn)?;
                             return Err(unavailable(
                                 "sector proof files differ from its certificate".into(),
                             ));
@@ -1879,15 +2428,41 @@ pub(crate) fn poll_sector_certificates(
                             registered: sector.cert.registered().unwrap(),
                             beacon: &challenge,
                         };
-                        let plain = proof::prove_seal_with_labels(
-                            &last,
-                            &statement,
-                            &sector.cert.params(),
-                            sector::CHALLENGES,
-                            &kept,
-                        )
-                        .map_err(QuilError::InvalidArgument)?;
-                        let bytes =
+                        let params = sector.cert.params();
+                        let plain = match &kept {
+                            Some(kept) => {
+                                #[cfg(test)]
+                                tests::count_kept_proof(&sector.dir);
+                                proof::prove_seal_with_labels(
+                                    &last,
+                                    &statement,
+                                    &params,
+                                    sector::CHALLENGES,
+                                    kept,
+                                )
+                            }
+                            None => {
+                                #[cfg(test)]
+                                tests::count_unkept_proof(&sector.dir);
+                                proof::prove_seal(&last, &statement, &params, sector::CHALLENGES)
+                                    .map_err(|error| unkept_proof_failed(&sector, target, error))
+                            }
+                        }
+                        .map_err(QuilError::InvalidArgument);
+                        // Failed without labels kept and asked to be
+                        // labelled again ([`Relabel::Asked`]): the relabel
+                        // takes the turn over.
+                        let plain = match plain {
+                            Err(error)
+                                if kept.is_none() && sector.relabel() == Some(Relabel::Asked) =>
+                            {
+                                let dir = sector.dir.clone();
+                                relabel_in_turn(store, &member, dir, turn)?;
+                                return Err(error);
+                            }
+                            plain => plain?,
+                        };
+                        let made =
                         quil_execution::global_intrinsic::persistent_storage::prove_certificate(
                             &member,
                             &sector.cert.sector,
@@ -1897,8 +2472,21 @@ pub(crate) fn poll_sector_certificates(
                             &beacon,
                             &plain,
                         )
-                        .map_err(QuilError::InvalidArgument)?;
-                        atomic(&cache, &bytes)?;
+                        .map_err(QuilError::InvalidArgument)
+                        .and_then(|bytes| {
+                            #[cfg(test)]
+                            tests::cache_write_fault(&sector.dir)?;
+                            atomic(&cache, &bytes).map(|()| bytes)
+                        });
+                        // Not kept, as a full disk refuses its cache, it
+                        // labelled the sector or hashed its last layer for
+                        // nothing: its turn is spent.
+                        turn.proven(&made);
+                        drop(turn);
+                        let bytes = made?;
+                        // A proof made ends where a failed one left it, so
+                        // a later failure is labelled again before given up.
+                        let _ = sector.relabel_event(RelabelEvent::Proven);
                         bytes
                     }
                     Err(e) => return Err(io(e)),
@@ -1988,6 +2576,17 @@ mod tests {
         assert_eq!(sector.cert.n, n);
     }
 
+    /// A labels' filesystem with no free bytes: every leaf's labels are
+    /// refused room at the disk floor.
+    fn full_disk() -> crate::storage_labels::SpaceSource {
+        Box::new(|_| {
+            Some(quil_forest::storage_health::FsUsage {
+                total_bytes: 1 << 40,
+                ..Default::default()
+            })
+        })
+    }
+
     /// A new sector refused room for its labels at its certification is
     /// counted, per attempt, with the free bytes its labels needed, for the
     /// health report.
@@ -2005,13 +2604,8 @@ mod tests {
         let member = [0xC8; 32];
         let (path, id, n) = reserve(&store, &member, b"full disk leaf", 1500, 100).unwrap();
         for _ in 0..2 {
-            let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
-                .err()
-                .expect("no room for the sector's labels");
-            assert!(
-                error.to_string().contains("too little free disk"),
-                "{error}"
-            );
+            initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                .unwrap_or_else(|error| panic!("set up without labels kept: {error}"));
         }
         let space = store.space();
         assert_eq!(
@@ -2054,6 +2648,1686 @@ mod tests {
             [("busy", 0, false), ("claimed", 0, false)],
             "BUSY-UNCOUNTED: a count labelled already is no disk refusal"
         );
+    }
+
+    /// A new sector refused room for its labels at the disk floor is set
+    /// up without labels kept, labelled as by a process that keeps none,
+    /// to the certificate labels kept give (2026-11-19: below the floor,
+    /// every attempt failed, so no sector was set up and none certified).
+    #[test]
+    fn a_sector_refused_room_at_the_floor_is_set_up_without_labels_kept() {
+        gates(true);
+        let member = [0xCA; 32];
+        let ample_dir = tempfile::tempdir().unwrap();
+        let ample = LabelStore::with_space(
+            ample_dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let (path, id, n) = reserve(&ample, &member, b"floor leaf", 1500, 100).unwrap();
+        let kept = initialize(&ample, &member, 1500, path, id, n, &|| false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let (path, id, n) = reserve(&store, &member, b"floor leaf", 1500, 100).unwrap();
+        let layers = std::sync::atomic::AtomicUsize::new(0);
+        let sector =
+            initialize_with_progress(&store, &member, 1500, path, id, n, &|| false, &|done| {
+                layers.store(done, std::sync::atomic::Ordering::Relaxed)
+            });
+        println!("REACH sector-floor");
+        let sector = sector.unwrap_or_else(|error| {
+            panic!("FLOOR-SETUP: a sector refused room at the floor was not set up: {error}")
+        });
+        assert_eq!(
+            sector.cert, kept.cert,
+            "FLOOR-CERT: labelled without labels kept, it differs from labels kept"
+        );
+        assert!(
+            sector.last_matches(),
+            "FLOOR-LAST: its last layer is not whole"
+        );
+        assert_eq!(
+            layers.load(std::sync::atomic::Ordering::Relaxed),
+            sector.cert.params().layers,
+            "FLOOR-PROGRESS: each layer's end is heard"
+        );
+        assert!(
+            store.find(1500, &member, &id, |count| count == n).is_none()
+                && !store.holds(1500, &member, &id),
+            "FLOOR-UNKEPT: labels were kept below the floor"
+        );
+    }
+
+    /// The line or error refusing a sector's labels names its cause and
+    /// its evidence: the disk floor with the free, floor and needed bytes,
+    /// or the labelling holding the count, with its writer file and how
+    /// long it has held it (2026-11-19: one text named both causes, so an
+    /// operator below the floor could not tell it from a busy holder).
+    #[test]
+    fn a_sector_refusal_names_the_floor_or_the_busy_holder() {
+        gates(true);
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let member = [0xCB; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let full = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let (path, id, n) = reserve(&full, &member, b"refused leaf", 1500, 100).unwrap();
+        let _ = initialize(&full, &member, 1500, path, id, n, &|| false);
+        println!("REACH sector-floor");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let floor: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("storage labels not kept"))
+            .collect();
+        assert!(
+            floor.len() == 1
+                && [
+                    "cause=\"disk floor\"",
+                    "free_bytes=0",
+                    "floor_bytes=",
+                    "needed_bytes="
+                ]
+                .iter()
+                .all(|field| floor[0].contains(field)),
+            "FLOOR-LINE: the floor refusal does not name its cause and bytes once: {floor:?}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let ample = crate::storage_labels::ample_space;
+        let store = LabelStore::with_space(dir.path().to_owned(), ample());
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let (path, id, n) = reserve(&store, &member, b"busy leaf", 1500, 100).unwrap();
+        for (holder, who) in [
+            (&store, "another task of this process"),
+            (&other, "another worker process of this node"),
+            (&other, "another worker process of this node"),
+        ] {
+            let held = holder
+                .admit(1500, &member, &id, n, Stage::Snapshot)
+                .expect("room for the sector's labels");
+            let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                .err()
+                .expect("the sector's count is labelled already")
+                .to_string();
+            drop(held);
+            assert!(
+                error.contains(&format!(
+                    "busy: the count is being labelled already by {who}"
+                )) && error.contains(&format!("{n}.writer"))
+                    && error.contains(" s;")
+                    && !error.contains("free disk"),
+                "BUSY-TEXT: a busy refusal does not name its holder alone: {error}"
+            );
+        }
+        // Each holder gone, the sector is set up.
+        initialize(&store, &member, 1500, path, id, n, &|| false)
+            .unwrap_or_else(|error| panic!("BUSY-END: not set up once the holders ended: {error}"));
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let busy: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("storage labels not computed here"))
+            .collect();
+        assert!(
+            busy.len() == 1
+                && ["cause=\"busy\"", "holder=", "held_secs="]
+                    .iter()
+                    .all(|field| busy[0].contains(field)),
+            "BUSY-LINE: the other process's hold is not named once: {busy:?}"
+        );
+    }
+
+    /// A new sector whose count another labelling holds, in this process
+    /// or another worker process, waits for it: an expected wait its job
+    /// logs as one, bounded, and the seal report files as occupied slots,
+    /// never a failure (2026-11-20: a failure warn at each retry).
+    #[test]
+    fn a_sector_set_up_behind_a_busy_count_waits_for_it() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let ample = crate::storage_labels::ample_space;
+        let store = LabelStore::with_space(dir.path().to_owned(), ample());
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let member = [0xCE; 32];
+        let (path, id, n) = reserve(&store, &member, b"busy wait leaf", 1500, 100).unwrap();
+        for holder in [&store, &other] {
+            let held = holder
+                .admit(1500, &member, &id, n, Stage::Snapshot)
+                .expect("room for the sector's labels");
+            let error = initialize(&store, &member, 1500, path.clone(), id, n, &|| false)
+                .err()
+                .expect("the sector's count is labelled already");
+            drop(held);
+            println!("REACH sector-floor");
+            assert!(
+                matches!(&error, QuilError::StorageWaiting(what)
+                    if what.contains(crate::storage_labels::BUSY)),
+                "BUSY-WAIT: a busy refusal of a sector's set-up is no wait: {error:?}"
+            );
+            assert_eq!(
+                crate::seal_report::Reason::classify(&error.to_string()),
+                crate::seal_report::Reason::SlotsOccupied,
+                "BUSY-SLOTS: the seal report does not file a busy refusal as occupied \
+                 slots: {error}"
+            );
+        }
+        gates(false);
+    }
+
+    /// A certified sector's repair whose count another worker process's
+    /// labelling holds waits for it, logged as a wait and not a failure,
+    /// and is repaired once that labelling ends.
+    #[test]
+    fn a_sector_repair_behind_a_busy_count_waits_for_it() {
+        gates(true);
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let ample = crate::storage_labels::ample_space;
+        let other = LabelStore::with_space(dir.path().to_owned(), ample());
+        let (member, app) = ([66; 32], [67; 32]);
+        let (_crdt, _prefix, path, id, n) = certified_leaf(&store, &member, app);
+        let whole = tear_last(&path, n);
+        let lane = sector_lane(&member, &id);
+        let idle = std::time::Duration::from_secs(120);
+        let repair = || {
+            let sector = Sector::load(path.clone()).unwrap().unwrap();
+            repair_last(&store, &member, 1500, &sector);
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, idle),
+                "the repair ends"
+            );
+        };
+        let held = other
+            .admit(1500, &member, &id, n, Stage::Snapshot)
+            .expect("room for the sector's labels");
+        repair();
+        println!("REACH sector-floor");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lines = |what: &str| {
+            text.lines()
+                .filter(|line| line.contains(what) && line.contains("not admitted to repair it"))
+                .count()
+        };
+        assert!(
+            lines("storage job waits") == 1
+                && lines("storage snapshot job failed") == 0
+                && fs::read(path.join("last")).unwrap() != whole,
+            "BUSY-REPAIR-WAIT: a busy refusal of a sector's repair is not logged as one wait: \
+             {text}"
+        );
+        drop(held);
+        repair();
+        assert!(
+            fs::read(path.join("last")).unwrap() == whole,
+            "BUSY-REPAIR-END: not repaired once the labelling holding its count ended"
+        );
+        gates(false);
+    }
+
+    /// A sector set up without labels kept is proven where its proof is
+    /// needed, labelled again as by a process that keeps none, and GLOBAL
+    /// takes the proof.
+    #[test]
+    fn a_sector_set_up_without_labels_kept_is_proven_where_needed() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+        use quil_execution::global_intrinsic::{materialize, persistent_storage as protocol};
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+        };
+        use quil_types::crypto::Signer;
+        use std::time::Duration;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let store = crate::storage_labels::installed().unwrap();
+        let member = materialize::prover_address_from_pubkey(TestIdentity.public_key()).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let tree = materialize::create_prover_vertex_tree(TestIdentity.public_key(), 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &vertex_adds_discriminator().unwrap(),
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"unkept proof", 1500, 100).unwrap();
+        let sector = initialize(store, &member, 1500, path.clone(), id, n, &|| false);
+        println!("REACH sector-floor");
+        sector.unwrap_or_else(|error| {
+            panic!("UNKEPT-SETUP: a sector refused room at the floor was not set up: {error}")
+        });
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        poll_sector_certificates(
+            frame + 1,
+            &member,
+            &global,
+            clock.clone(),
+            &TestIdentity,
+            publish.clone(),
+        )
+        .unwrap();
+        let precommit = StorageEpochProof::from_canonical_bytes(
+            &recv.recv_timeout(Duration::from_secs(5)).unwrap(),
+        )
+        .unwrap();
+        let state = HypergraphState::new(global.clone());
+        let records =
+            protocol::check_capacity(frame + 1, &precommit, &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        protocol::apply(&state, frame + 1, &records).unwrap();
+        state.commit().unwrap();
+        global.commit(frame + 1).unwrap();
+        let output = vec![9; 516];
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: frame + 2,
+                        output: output.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let mut at = frame + 3;
+        let mut sent = None;
+        while sent.is_none() && at < frame + 600 {
+            poll_sector_certificates(
+                at,
+                &member,
+                &global,
+                clock.clone(),
+                &TestIdentity,
+                publish.clone(),
+            )
+            .unwrap();
+            sent = recv.recv_timeout(Duration::from_millis(200)).ok();
+            at += 1;
+        }
+        let sent = sent.map(|bytes| StorageEpochProof::from_canonical_bytes(&bytes).unwrap());
+        let state = HypergraphState::new(global.clone());
+        let proven = sent.is_some_and(|certificate| {
+            protocol::check_capacity(frame + 4, &certificate, &state, &TestIdentity, &|at| {
+                assert_eq!(at, frame + 2);
+                Ok(output.clone())
+            })
+            .is_ok()
+        });
+        assert!(
+            proven,
+            "UNKEPT-PROOF: no certificate proof GLOBAL takes was made without labels kept"
+        );
+        assert!(
+            !store.holds(1500, &member, &id),
+            "UNKEPT-PROOF-KEPT: labels were kept below the floor"
+        );
+        gates(false);
+    }
+
+    /// A sector labelled without labels kept, told to stop, as when it
+    /// gives its memory back to more urgent work, is a stop with nothing
+    /// kept to go on from, not a failure, and leaves no sector set up: the
+    /// next attempt labels it from the start and sets it up.
+    #[test]
+    fn an_unkept_sector_labelling_told_to_stop_starts_again_after() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let member = [0xCC; 32];
+        let (path, id, n) = reserve(&store, &member, b"unkept stopped leaf", 1500, 100).unwrap();
+        let labelled = std::sync::atomic::AtomicBool::new(false);
+        let stopped = initialize_with_progress(
+            &store,
+            &member,
+            1500,
+            path.clone(),
+            id,
+            n,
+            &|| labelled.load(std::sync::atomic::Ordering::Relaxed),
+            &|_| labelled.store(true, std::sync::atomic::Ordering::Relaxed),
+        )
+        .err();
+        println!("REACH sector-floor");
+        let Some(QuilError::StorageWorkStopped(text)) = &stopped else {
+            panic!(
+                "UNKEPT-STOP: an unkept sector labelling told to stop failed instead: {stopped:?}"
+            );
+        };
+        assert!(
+            text.contains("nothing kept to go on from")
+                && Sector::load(path.clone()).unwrap().is_none(),
+            "UNKEPT-STOP: the stop claims work kept, or set a sector up: {text}"
+        );
+        let sector =
+            initialize(&store, &member, 1500, path, id, n, &|| false).unwrap_or_else(|error| {
+                panic!("UNKEPT-STOP-AFTER: the next attempt did not set it up: {error}")
+            });
+        assert_eq!(sector.cert.n, n);
+    }
+
+    /// A new sector whose labels run out of room midway, labelled to their
+    /// end but not kept, is set up from them, not labelled again.
+    #[test]
+    fn a_sector_whose_labels_run_out_of_room_midway_is_set_up_from_them() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        gates(true);
+        let full = Arc::new(AtomicBool::new(false));
+        let space: crate::storage_labels::SpaceSource = {
+            let full = full.clone();
+            Box::new(move |_| {
+                let free = if full.load(Ordering::SeqCst) {
+                    0
+                } else {
+                    1 << 40
+                };
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 1 << 40,
+                    free_bytes: free,
+                    ..Default::default()
+                })
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), space);
+        let member = [0xCD; 32];
+        let (path, id, n) = reserve(&store, &member, b"room ran out leaf", 1500, 100).unwrap();
+        // The room runs out once its first layer ends.
+        let heard = AtomicUsize::new(0);
+        let sector =
+            initialize_with_progress(&store, &member, 1500, path, id, n, &|| false, &|_| {
+                heard.fetch_add(1, Ordering::SeqCst);
+                full.store(true, Ordering::SeqCst);
+            });
+        println!("REACH sector-floor");
+        let sector = sector.unwrap_or_else(|error| {
+            panic!("ROOM-RAN-OUT: a sector whose labels ran out of room was not set up: {error}")
+        });
+        assert_eq!(
+            heard.load(Ordering::SeqCst),
+            sector.cert.params().layers,
+            "ROOM-RAN-OUT: a sector whose labels ran out of room was labelled again"
+        );
+        assert!(
+            sector.last_matches() && store.find(1500, &member, &id, |count| count == n).is_none(),
+            "ROOM-RAN-OUT-UNKEPT: its labels were kept, or its last layer is not whole"
+        );
+    }
+
+    /// A sector set up below the disk floor is not labelled again by a
+    /// later initialization, unless its proof made without labels kept
+    /// failed ([`Relabel::Asked`]): then it is labelled again once.
+    #[test]
+    fn a_sector_set_up_below_the_floor_is_labelled_again_only_for_a_failed_proof() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let member = [0xCE; 32];
+        let (path, id, n) = reserve(&store, &member, b"set up leaf", 1500, 100).unwrap();
+        let first = initialize(&store, &member, 1500, path.clone(), id, n, &|| false).unwrap();
+        let heard = AtomicUsize::new(0);
+        let again = || {
+            heard.store(0, Ordering::SeqCst);
+            let sector = initialize_with_progress(
+                &store,
+                &member,
+                1500,
+                path.clone(),
+                id,
+                n,
+                &|| false,
+                &|_| {
+                    heard.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+            (sector, heard.load(Ordering::SeqCst))
+        };
+        let (sector, layers) = again();
+        println!("REACH sector-floor");
+        assert!(
+            layers == 0 && sector.cert == first.cert,
+            "FLOOR-AGAIN: a sector set up below the floor was labelled again ({layers} layers)"
+        );
+        first.mark_relabel(Relabel::Asked).unwrap();
+        let (sector, layers) = again();
+        assert!(
+            layers == first.cert.params().layers
+                && sector.cert == first.cert
+                && sector.relabel() == Some(Relabel::Done),
+            "FLOOR-ASKED: a sector whose proof failed was not labelled again once ({layers} \
+             layers, {:?})",
+            sector.relabel()
+        );
+    }
+
+    /// A certified sector's torn last layer is repaired below the disk
+    /// floor, labelled as by a process that keeps no labels.
+    #[test]
+    fn a_certified_sector_below_the_floor_is_repaired_without_labels_kept() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let (member, app) = ([63; 32], [65; 32]);
+        let (crdt, prefix, path, id, n) = certified_leaf(&store, &member, app);
+        let whole = tear_last(&path, n);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let snap = capture_at(&crdt, &app, 1500, &[current_source(&crdt, &app, 1500)]).unwrap();
+        let _ = encode_leaf(&snap, &member, &prefix, &replicas, Some(&store), &|| false);
+        println!("REACH sector-floor");
+        let idle = std::time::Duration::from_secs(120);
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&sector_lane(&member, &id), idle),
+            "the repair ends"
+        );
+        assert!(
+            fs::read(path.join("last")).unwrap() == whole && !path.join("repair-failed").exists(),
+            "FLOOR-REPAIR: a certified sector's torn last layer was not repaired below the floor"
+        );
+        assert!(
+            !store.holds(1500, &member, &id),
+            "FLOOR-REPAIR-KEPT: labels were kept below the floor"
+        );
+        gates(false);
+    }
+
+    /// The sector a [`unkept_pending`] test proves: its directory, set
+    /// up below the floor, the GLOBAL and clock its poll reads, and the
+    /// frame its proof is first made at.
+    struct UnkeptPending {
+        sector: Sector,
+        member: [u8; 32],
+        global: Arc<HypergraphCrdt>,
+        clock: Arc<quil_store::testing::InMemoryClockStore>,
+        at: u64,
+        /// The frame its precommit was committed one after.
+        frame: u64,
+        publish: Publish,
+        sent: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+    impl UnkeptPending {
+        /// Poll from the next frame, `polls` times, each poll's jobs run
+        /// to their end.
+        fn poll(&mut self, polls: u64) {
+            let lane = sector_lane(&self.member, &self.sector.cert.sector);
+            for _ in 0..polls {
+                poll_sector_certificates(
+                    self.at,
+                    &self.member,
+                    &self.global,
+                    self.clock.clone(),
+                    &TestIdentity,
+                    self.publish.clone(),
+                )
+                .unwrap();
+                assert!(
+                    crate::storage_jobs::wait_lane_idle(&lane, std::time::Duration::from_secs(120)),
+                    "the sector's jobs end"
+                );
+                self.at += 1;
+            }
+        }
+        /// The sector as its directory holds it now.
+        fn now(&self) -> Sector {
+            Sector::load(self.sector.dir.clone()).unwrap().unwrap()
+        }
+        /// Poll until something is sent, at most `polls` times: whether
+        /// GLOBAL takes it as the sector's certificate proof.
+        fn proven_within(&mut self, polls: u64) -> bool {
+            use quil_execution::global_intrinsic::persistent_storage as protocol;
+            use quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof;
+            use quil_execution::hypergraph_state::HypergraphState;
+            for _ in 0..polls {
+                self.poll(1);
+                if let Ok(bytes) = self.sent.try_recv() {
+                    let sent = StorageEpochProof::from_canonical_bytes(&bytes).unwrap();
+                    let state = HypergraphState::new(self.global.clone());
+                    let beacon = self.frame + 2;
+                    return protocol::check_capacity(
+                        self.frame + 4,
+                        &sent,
+                        &state,
+                        &TestIdentity,
+                        &|at| {
+                            assert_eq!(at, beacon);
+                            Ok(vec![9; 516])
+                        },
+                    )
+                    .is_ok();
+                }
+            }
+            false
+        }
+    }
+    /// A sector of the installed store set up below the disk floor, turned
+    /// by `damage`, whose certificate's precommit then GLOBAL takes, with
+    /// the beacon frame its proof needs.
+    fn unkept_pending(label: &[u8], damage: impl FnOnce(&mut Sector)) -> UnkeptPending {
+        let (global, member, sector, frame) = unprecommitted_sector(label);
+        let mut damaged = sector.clone();
+        damage(&mut damaged);
+        damaged.save().unwrap();
+        commit_precommit(&global, &member, damaged.cert, 1500, frame + 1);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: frame + 2,
+                        output: vec![9; 516],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let (publish, sent) = published();
+        UnkeptPending {
+            sector,
+            member,
+            global,
+            clock,
+            at: frame + 3,
+            frame,
+            publish,
+            sent,
+        }
+    }
+
+    /// A sector set up below the disk floor whose certificate's columns
+    /// differ from its labels, as a certificate written from damaged labels
+    /// leaves it, fails its proof made without labels kept once, is
+    /// labelled again, and takes the certificate its labels give
+    /// (2026-11-20: it labelled itself again at every poll to fail the same
+    /// proof, about an hour a GiB each).
+    #[test]
+    fn a_sector_failing_its_proof_without_labels_kept_is_labelled_again_once() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"damaged columns", |s| s.cert.columns[0] ^= 1);
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let (now, whole) = (pending.now(), &pending.sector);
+        assert!(
+            now.cert == whole.cert && !whole.dir.join(RELABEL).exists(),
+            "UNKEPT-RELABEL: a sector failing its proof without labels kept did not take the \
+             certificate its labels give (RELABEL-IN-TURN)"
+        );
+        assert_eq!(
+            unkept_proofs(&whole.dir),
+            1,
+            "UNKEPT-RELABEL-ONCE: its proof was made other than once"
+        );
+        gates(false);
+    }
+
+    /// A sector whose proof made without labels kept fails again after it
+    /// was labelled again to the same certificate is given up: neither
+    /// labelled nor proven again while no labels are kept for it.
+    #[test]
+    fn a_sector_failing_its_proof_again_after_labelled_again_is_given_up() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"given up columns", |s| {
+            s.cert.columns[0] ^= 1;
+            s.mark_relabel(Relabel::Done).unwrap();
+        });
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let now = pending.now();
+        let proofs = unkept_proofs(&now.dir);
+        assert!(
+            now.cert != pending.sector.cert
+                && now.relabel() == Some(Relabel::GivenUp)
+                && proofs == 1,
+            "UNKEPT-GIVEN-UP: a sector failing its proof again was labelled or proven again \
+             ({proofs} proofs, {:?})",
+            now.relabel()
+        );
+        gates(false);
+    }
+
+    /// A filesystem of 1 PiB with `free` bytes of it free.
+    fn free_space(free: &Arc<std::sync::atomic::AtomicU64>) -> crate::storage_labels::SpaceSource {
+        let free = free.clone();
+        Box::new(move |_| {
+            Some(quil_forest::storage_health::FsUsage {
+                total_bytes: 1 << 50,
+                free_bytes: free.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            })
+        })
+    }
+
+    /// A sector given up on its proof made without labels kept is set up
+    /// again at each poll: once there is room, its labels are kept, it is
+    /// proven from them, and GLOBAL takes the proof (2026-11-20: nothing
+    /// kept its labels once given up, so it waited on its certificate for
+    /// good).
+    #[test]
+    fn a_sector_given_up_without_labels_kept_is_proven_once_they_are() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let free = Arc::new(AtomicU64::new(0));
+        crate::storage_labels::install_with_space(dir.path().to_owned(), free_space(&free));
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up then kept", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id) = (pending.member, pending.sector.cert.sector);
+        pending.poll(2);
+        assert!(
+            pending.sent.try_recv().is_err()
+                && unkept_proofs(&pending.sector.dir) == 0
+                && !store.holds(1500, &member, &id),
+            "below the floor a given-up sector is neither proven nor kept"
+        );
+        free.store(1 << 50, Ordering::SeqCst);
+        let proven = pending.proven_within(8);
+        println!("REACH sector-floor");
+        assert!(
+            proven && store.holds(1500, &member, &id) && unkept_proofs(&pending.sector.dir) == 0,
+            "GIVEN-UP-KEPT: a given-up sector was not proven from labels kept once there was room \
+             (proven: {proven})"
+        );
+        assert_eq!(
+            pending.now().relabel(),
+            None,
+            "its proof ends its given-up state"
+        );
+        gates(false);
+    }
+
+    /// A sector proven without labels kept after it was labelled again
+    /// leaves that state: a later failed proof labels it again before it
+    /// is given up (2026-11-20: the state outlived the proof, and a later
+    /// failure gave it up at once).
+    #[test]
+    fn a_sector_proven_after_labelled_again_leaves_that_state() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"labelled again then proven", |s| {
+            s.mark_relabel(Relabel::Done).unwrap();
+        });
+        let proven = pending.proven_within(8);
+        println!("REACH sector-floor");
+        let now = pending.now();
+        assert!(
+            proven && now.relabel().is_none() && !now.dir.join(RELABEL).exists(),
+            "DONE-CLEARED: a sector proven after labelled again kept that state (proven: \
+             {proven}, {:?})",
+            now.relabel()
+        );
+        gates(false);
+    }
+
+    /// A sector whose failed proof made without labels kept cannot be
+    /// recorded, as a full disk refuses it, is neither proven nor labelled
+    /// again, with a line naming what to do, until it is recorded; then it
+    /// goes on from the next epoch, as its failed proof was that epoch's
+    /// turn: labelled again, it takes the certificate its labels give.
+    #[test]
+    fn a_sector_whose_failed_proof_is_not_recorded_is_not_proven_again() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unrecorded columns", |s| {
+            s.cert.columns[0] ^= 1;
+            // A directory where its record goes: it cannot be written.
+            fs::create_dir_all(s.dir.join(RELABEL).join("held")).unwrap();
+        });
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let proofs = unkept_proofs(&pending.sector.dir);
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let warned = text
+            .lines()
+            .any(|line| line.contains("that could not be written") && line.contains("action="));
+        assert!(
+            proofs == 1 && pending.now().cert != pending.sector.cert && warned,
+            "UNMARKED-ONCE: a sector whose failed proof was not recorded was proven or labelled \
+             again, or without a line ({proofs} proofs, warned: {warned})"
+        );
+        fs::remove_dir_all(pending.sector.dir.join(RELABEL)).unwrap();
+        pending.at = next_epoch(pending.at);
+        pending.poll(4);
+        let now = pending.now();
+        assert!(
+            now.cert == pending.sector.cert && unkept_proofs(&now.dir) == 1,
+            "UNMARKED-WRITTEN: recorded at last, in the next epoch it was not labelled again to \
+             the certificate its labels give"
+        );
+        gates(false);
+    }
+
+    /// A given-up sector below the floor is set up again once an epoch
+    /// however often it is polled: each setup reserves its memory and,
+    /// refused room, reads its whole last layer (2026-11-20: both at every
+    /// poll, up to 2 GiB each).
+    #[test]
+    fn a_given_up_sector_below_the_floor_is_set_up_again_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"given up below the floor", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let at = pending.sector.dir.clone();
+        let (resumed, read) = (resumes(&at), last_reads(&at).len());
+        pending.poll(6);
+        println!("REACH sector-floor");
+        let (resumed, read) = (resumes(&at) - resumed, last_reads(&at).len() - read);
+        assert!(
+            resumed == 1 && read <= 1,
+            "GATE-ONCE: a given-up sector below the floor was set up {resumed} times and its last \
+             layer read {read} times in six polls of one epoch"
+        );
+        assert!(pending.sent.try_recv().is_err() && unkept_proofs(&at) == 0);
+        gates(false);
+    }
+
+    /// A sector whose failed proof made without labels kept cannot be
+    /// recorded is set up again once an epoch while that record fails,
+    /// however often it is polled: from the next, as its proof, which
+    /// labelled it in full, was that epoch's turn.
+    #[test]
+    fn an_unrecorded_sector_below_the_floor_is_set_up_again_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unrecorded below the floor", |s| {
+            s.cert.columns[0] ^= 1;
+            // A directory where its record goes: it cannot be written.
+            fs::create_dir_all(s.dir.join(RELABEL).join("held")).unwrap();
+        });
+        let at = pending.sector.dir.clone();
+        pending.poll(1);
+        assert!(
+            unkept_proofs(&at) == 1 && pending.now().unmarked() == Some(Relabel::Asked),
+            "premise: its proof failed and its state is held unwritten"
+        );
+        let (resumed, read) = (resumes(&at), last_reads(&at).len());
+        pending.poll(3);
+        let early = resumes(&at) - resumed;
+        assert!(
+            early == 0 && unkept_proofs(&at) == 1,
+            "GATE-UNMARKED-PROOF: an unrecorded sector below the floor was set up {early} times \
+             in the epoch its proof was made in"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(6);
+        println!("REACH sector-floor");
+        let (resumed, read) = (resumes(&at) - resumed, last_reads(&at).len() - read);
+        assert!(
+            resumed == 1 && read <= 1 && unkept_proofs(&at) == 1,
+            "GATE-UNMARKED: an unrecorded sector below the floor was set up {resumed} times and \
+             its last layer read {read} times in six polls of one epoch"
+        );
+        gates(false);
+    }
+
+    /// Whether a layer of any leaf's labels under `root` is on disk.
+    fn layer_written(root: &Path) -> bool {
+        let mut dirs = vec![root.to_owned()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "layers")
+                    && entry.metadata().is_ok_and(|meta| meta.len() > 0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A given-up sector whose labels, admitted, run out of room midway is
+    /// set up from them and not labelled again that epoch, however much
+    /// room the free space read shows after (2026-11-20: each poll
+    /// labelled it in full again, about an hour a GiB).
+    #[test]
+    fn a_given_up_sector_whose_labels_run_out_of_room_is_not_labelled_again_that_epoch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        // No room until `midway`; then room until a layer is on disk.
+        let midway = Arc::new(AtomicBool::new(false));
+        let space: crate::storage_labels::SpaceSource = {
+            let (root, midway) = (root.clone(), midway.clone());
+            Box::new(move |_| {
+                let room = midway.load(Ordering::SeqCst) && !layer_written(&root);
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 1 << 40,
+                    free_bytes: if room { 1 << 40 } else { 0 },
+                    ..Default::default()
+                })
+            })
+        };
+        crate::storage_labels::install_with_space(root.clone(), space);
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up, room ran out", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id, at) = (
+            pending.member,
+            pending.sector.cert.sector,
+            pending.sector.dir.clone(),
+        );
+        let resumed = resumes(&at);
+        midway.store(true, Ordering::SeqCst);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - resumed == 1
+                && !store.holds(1500, &member, &id)
+                && !layer_written(&root)
+                && pending.now().relabel() == Some(Relabel::GivenUp),
+            "premise: admitted, its labels ran out of room midway and it was set up from them"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - resumed;
+        assert_eq!(
+            resumed, 1,
+            "GATE-UNKEPT: a given-up sector labelled without its labels kept was set up again \
+             in the same epoch"
+        );
+        gates(false);
+    }
+
+    /// [`setup_due`] at its edges: a given-up sector is set up again
+    /// with free space exactly what its labels need, not one byte below,
+    /// and below that once in a new epoch.
+    #[test]
+    fn a_given_up_sector_is_set_up_again_at_room_for_its_labels_or_a_new_epoch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let free = Arc::new(AtomicU64::new(0));
+        crate::storage_labels::install_with_space(dir.path().to_owned(), free_space(&free));
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up at the edges", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id, at) = (
+            pending.member,
+            pending.sector.cert.sector,
+            pending.sector.dir.clone(),
+        );
+        let needed = crate::storage_labels::disk_floor(1 << 50)
+            + crate::storage_labels::DISK_MARGIN
+                * crate::storage_labels::label_bytes(pending.sector.cert.n);
+        let base = resumes(&at);
+        // The epoch's one setup, refused room.
+        pending.poll(1);
+        free.store(needed - 1, Ordering::SeqCst);
+        pending.poll(2);
+        assert_eq!(
+            resumes(&at) - base,
+            1,
+            "GATE-EDGE-BELOW: one byte short of the room its labels need, it was set up again \
+             within the epoch"
+        );
+        pending.at = 1500 * quil_types::consensus::epoch_length_frames() + 1;
+        pending.poll(3);
+        assert_eq!(
+            resumes(&at) - base,
+            2,
+            "GATE-EPOCH: short of room, it was not set up exactly once in a new epoch"
+        );
+        free.store(needed, Ordering::SeqCst);
+        pending.poll(1);
+        println!("REACH sector-floor");
+        assert!(
+            resumes(&at) - base == 3 && store.holds(1500, &member, &id),
+            "GATE-EDGE-AT: with exactly the room its labels need it was not set up again with \
+             them kept"
+        );
+        gates(false);
+    }
+
+    /// A directory where a sector's last layer is written: it cannot be
+    /// written, as a full disk or an I/O error refuses it.
+    fn hold_last(dir: &Path) {
+        fs::create_dir_all(dir.join("last.tmp").join("held")).unwrap();
+    }
+
+    /// The first frame of the epoch after the one `frame` lies in.
+    fn next_epoch(frame: u64) -> u64 {
+        let length = quil_types::consensus::epoch_length_frames();
+        (frame / length + 1) * length + 1
+    }
+
+    /// A first setup below the floor whose last layer cannot be written
+    /// runs once an epoch however often it is polled: each labels the
+    /// sector in full where the floor refused it cheaply before
+    /// (2026-11-20: at every poll).
+    #[test]
+    fn a_first_setup_whose_last_layer_is_not_written_runs_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"first setup, last layer held", |_| {});
+        let at = pending.sector.dir.clone();
+        fs::remove_file(at.join("certificate")).unwrap();
+        hold_last(&at);
+        let base = resumes(&at);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - base == 1 && Sector::load(at.clone()).unwrap().is_none(),
+            "premise: its first setup ran and failed"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - base;
+        assert_eq!(
+            resumed, 1,
+            "SETUP-FIRST: a first setup that could not write its last layer ran {resumed} times \
+             in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        assert_eq!(
+            resumes(&at) - base,
+            2,
+            "SETUP-FIRST-EPOCH: in the next epoch it did not run exactly once more"
+        );
+        gates(false);
+    }
+
+    /// A sector asked to be labelled again ([`Relabel::Asked`]) below the
+    /// floor whose last layer cannot be written is labelled again once an
+    /// epoch however often it is polled (2026-11-20: at every poll, as
+    /// that relabel was not paced).
+    #[test]
+    fn an_asked_relabel_whose_last_layer_is_not_written_runs_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"asked relabel, last layer held", |s| {
+            s.mark_relabel(Relabel::Asked).unwrap();
+            hold_last(&s.dir);
+        });
+        let at = pending.sector.dir.clone();
+        let base = resumes(&at);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - base == 1
+                && pending.now().relabel() == Some(Relabel::Asked)
+                && unkept_proofs(&at) == 0,
+            "premise: it was labelled again, failed, and is still asked"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - base;
+        assert_eq!(
+            resumed, 1,
+            "SETUP-AGAIN: an asked relabel that could not write its last layer ran {resumed} \
+             times in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        assert_eq!(
+            resumes(&at) - base,
+            2,
+            "SETUP-AGAIN-EPOCH: in the next epoch it did not run exactly once more"
+        );
+        gates(false);
+    }
+
+    /// A setup labelled without its labels kept whose next poll lies in a
+    /// later epoch, as a run longer than an epoch leaves it, does not run
+    /// again in that epoch: its pace counts from the epoch it ended in,
+    /// not the one it began in (2026-11-20: a 2 GiB sector, labelled about
+    /// two hours, an epoch, ran back to back).
+    #[test]
+    fn a_setup_ending_in_a_later_epoch_does_not_run_again_in_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        // No room until `midway`; then room until a layer is on disk.
+        let midway = Arc::new(AtomicBool::new(false));
+        let space: crate::storage_labels::SpaceSource = {
+            let (root, midway) = (root.clone(), midway.clone());
+            Box::new(move |_| {
+                let room = midway.load(Ordering::SeqCst) && !layer_written(&root);
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 1 << 40,
+                    free_bytes: if room { 1 << 40 } else { 0 },
+                    ..Default::default()
+                })
+            })
+        };
+        crate::storage_labels::install_with_space(root.clone(), space);
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"given up, ends an epoch on", |s| {
+            s.mark_relabel(Relabel::GivenUp).unwrap();
+        });
+        let (member, id, at) = (
+            pending.member,
+            pending.sector.cert.sector,
+            pending.sector.dir.clone(),
+        );
+        let base = resumes(&at);
+        midway.store(true, Ordering::SeqCst);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - base == 1
+                && !store.holds(1500, &member, &id)
+                && pending.now().relabel() == Some(Relabel::GivenUp),
+            "premise: admitted, its labels ran out of room midway and were not kept"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - base;
+        assert_eq!(
+            resumed, 1,
+            "SETUP-END-EPOCH: a setup labelled without its labels kept ran again in the epoch \
+             it was first found ended in ({resumed} setups)"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(1);
+        assert_eq!(
+            resumes(&at) - base,
+            2,
+            "SETUP-END-NEXT: in the epoch after that it did not run again"
+        );
+        gates(false);
+    }
+
+    /// A sector warmup below the floor whose last layer cannot be written
+    /// runs once an epoch however often GLOBAL frames warm it: each labels
+    /// the sector in full (2026-11-20: at every frame).
+    #[test]
+    fn a_warmup_whose_last_layer_is_not_written_runs_once_an_epoch() {
+        gates(true);
+        quil_types::consensus::set_min_sector_nodes_for_thread(Some(64));
+        crate::storage_jobs::set_available_for_test(Some(64 << 30));
+        let graph = super::super::tests::test_crdt();
+        let filter = [0xB5; 32];
+        graph
+            .add_vertex(
+                &quil_hypergraph::Location {
+                    app_address: filter,
+                    data_address: [1; 32],
+                },
+                &[7; 100],
+            )
+            .unwrap();
+        graph.commit(1).unwrap();
+        let captured = capture_at(
+            &graph,
+            &filter,
+            1500,
+            &[current_source(&graph, &filter, 1500)],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), full_disk());
+        let member = [0xC5; 32];
+        prewarm_sectors(&captured, &store, &member).unwrap();
+        let sector = fs::read_dir(home(&store, &member))
+            .unwrap()
+            .flatten()
+            .filter(|entry| sector_directory(&entry.path()))
+            .find_map(|entry| Sector::load(entry.path()).unwrap())
+            .expect("premise: warmed below the floor, its sector is set up");
+        fs::remove_file(sector.dir.join("certificate")).unwrap();
+        hold_last(&sector.dir);
+        let failed = (0..5)
+            .filter(|_| prewarm_sectors(&captured, &store, &member).is_err())
+            .count();
+        println!("REACH sector-floor");
+        assert!(
+            failed == 1 && Sector::load(sector.dir.clone()).unwrap().is_none(),
+            "SETUP-WARMUP: a warmup that could not write its last layer failed {failed} times \
+             in five warmups of one epoch"
+        );
+        crate::storage_snapshot::note_global_frame(quil_types::consensus::epoch_start_frame(1501));
+        let failed = (0..3)
+            .filter(|_| prewarm_sectors(&captured, &store, &member).is_err())
+            .count();
+        assert_eq!(
+            failed, 1,
+            "SETUP-WARMUP-EPOCH: once GLOBAL reached the next epoch, it did not run exactly once \
+             more in three warmups"
+        );
+        quil_types::consensus::set_min_sector_nodes_for_thread(None);
+        crate::storage_jobs::set_available_for_test(None);
+        gates(false);
+    }
+
+    /// Sectors whose certificate proof cannot be cached, by directory: its
+    /// write fails as a full disk refuses it ([`cache_write_fault`]).
+    static CACHE_HELD: Mutex<std::collections::BTreeSet<PathBuf>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    pub(super) fn cache_write_fault(dir: &Path) -> Result<()> {
+        if CACHE_HELD.lock().unwrap().contains(dir) {
+            return Err(io(std::io::Error::other("no space left on device")));
+        }
+        Ok(())
+    }
+
+    /// A sector's proof made without labels kept whose cache cannot be
+    /// written, as a full disk refuses it, is made again once an epoch
+    /// however often it is polled: each labels the sector in full
+    /// (2026-11-21: at every poll, as nothing recorded that it ended
+    /// without effect).
+    #[test]
+    fn an_unkept_proof_whose_cache_is_not_written_runs_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unkept proof, cache held", |_| {});
+        let at = pending.sector.dir.clone();
+        CACHE_HELD.lock().unwrap().insert(at.clone());
+        pending.poll(1);
+        assert!(
+            unkept_proofs(&at) == 1
+                && pending.sent.try_recv().is_err()
+                && pending.now().relabel().is_none(),
+            "premise: its proof was made once and not cached, and nothing was sent"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let proofs = unkept_proofs(&at);
+        assert_eq!(
+            proofs, 1,
+            "PROOF-CACHE: a proof without labels kept whose cache could not be written was made \
+             {proofs} times in five polls of one epoch"
+        );
+        CACHE_HELD.lock().unwrap().remove(&at);
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        assert!(
+            unkept_proofs(&at) == 2 && pending.sent.try_recv().is_ok(),
+            "PROOF-CACHE-EPOCH: in the next epoch, its cache written, it was not made exactly \
+             once more and sent"
+        );
+        gates(false);
+    }
+
+    /// A sector without labels kept whose last layer is damaged and whose
+    /// relabel cannot write it reads, hashes and reports that layer once an
+    /// epoch however often it is polled (2026-11-21: up to 2 GiB read and
+    /// hashed, and two warns, at every poll, though its relabel was paced).
+    #[test]
+    fn an_unkept_damaged_last_layer_whose_relabel_fails_is_checked_once_an_epoch() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"torn unkept, relabel held", |s| {
+            tear_last(&s.dir, s.cert.n);
+            hold_last(&s.dir);
+        });
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        let checked = || {
+            String::from_utf8(logs.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("no labels are kept for it") && line.contains(&id))
+                .count()
+        };
+        let base = resumes(&at);
+        pending.poll(1);
+        assert!(
+            checked() == 1 && resumes(&at) - base == 1 && unkept_proofs(&at) == 0,
+            "premise: its damage was reported once, and its relabel ran"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let (reported, resumed) = (checked(), resumes(&at) - base);
+        assert!(
+            reported == 1 && resumed == 1,
+            "UNKEPT-DAMAGED: a damaged last layer without labels kept was checked {reported} \
+             times and labelled again {resumed} times in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        let (reported, resumed) = (checked(), resumes(&at) - base);
+        assert!(
+            reported == 2 && resumed == 2,
+            "UNKEPT-DAMAGED-EPOCH: in the next epoch it was checked {reported} and labelled \
+             again {resumed} times in all, not exactly once more"
+        );
+        gates(false);
+    }
+
+    /// Sectors whose last layer cannot be read for their certificate
+    /// proof, as an I/O error on a damaged disk refuses it, and each such
+    /// read tried, by directory ([`proof_last_read`]).
+    static PROOF_LAST: Mutex<std::collections::BTreeMap<PathBuf, (bool, usize)>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn proof_last_read(dir: &Path) -> Result<()> {
+        let mut reads = PROOF_LAST.lock().unwrap();
+        let (held, tried) = reads.entry(dir.to_owned()).or_default();
+        *tried += 1;
+        if *held {
+            return Err(io(std::io::Error::from_raw_os_error(5)));
+        }
+        Ok(())
+    }
+    fn hold_proof_last(dir: &Path, held: bool) {
+        PROOF_LAST
+            .lock()
+            .unwrap()
+            .entry(dir.to_owned())
+            .or_default()
+            .0 = held;
+    }
+    fn proof_last_reads(dir: &Path) -> usize {
+        PROOF_LAST
+            .lock()
+            .unwrap()
+            .get(dir)
+            .map_or(0, |(_, tried)| *tried)
+    }
+
+    /// A sector's certificate proof whose last layer cannot be read, as an
+    /// I/O error on a damaged disk refuses it, is tried once an epoch
+    /// however often it is polled: each reserves the labelling peak and
+    /// reads up to 2 GiB (2026-11-21: at every poll, as that way out of
+    /// its turn recorded no end).
+    #[test]
+    fn a_proof_whose_last_layer_cannot_be_read_runs_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"unkept proof, last unread", |_| {});
+        let at = pending.sector.dir.clone();
+        hold_proof_last(&at, true);
+        pending.poll(1);
+        assert!(
+            proof_last_reads(&at) == 1
+                && unkept_proofs(&at) == 0
+                && pending.sent.try_recv().is_err(),
+            "premise: its last layer was read once, failing, and nothing was proven or sent"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let reads = proof_last_reads(&at);
+        assert_eq!(
+            reads, 1,
+            "PROOF-LAST-EIO: a proof whose last layer could not be read read it {reads} times in \
+             five polls of one epoch"
+        );
+        hold_proof_last(&at, false);
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        assert!(
+            proof_last_reads(&at) == 2 && pending.sent.try_recv().is_ok(),
+            "PROOF-LAST-EIO-EPOCH: in the next epoch, readable, it was not read exactly once more \
+             and sent"
+        );
+        gates(false);
+    }
+
+    /// A sector without labels kept whose last layer is damaged and whose
+    /// relabel cannot start, its reservation damaged too, reads, hashes
+    /// and reports that layer once an epoch however often it is polled
+    /// (2026-11-21: the relabel failed before it took the turn over, which
+    /// stayed free, so up to 2 GiB was read and hashed at every poll).
+    #[test]
+    fn an_unkept_damaged_last_layer_whose_relabel_cannot_start_is_checked_once_an_epoch() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut pending = unkept_pending(b"torn unkept, reservation torn", |s| {
+            tear_last(&s.dir, s.cert.n);
+            let reservation = fs::read(s.dir.join("reservation")).unwrap();
+            fs::write(s.dir.join("reservation"), &reservation[..16]).unwrap();
+        });
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        let checked = || {
+            String::from_utf8(logs.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("no labels are kept for it") && line.contains(&id))
+                .count()
+        };
+        pending.poll(1);
+        assert!(
+            checked() == 1
+                && fs::read(at.join("reservation")).unwrap().len() == 16
+                && unkept_proofs(&at) == 0,
+            "premise: its damage was reported once, its reservation is torn, nothing was proven"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let reported = checked();
+        assert_eq!(
+            reported, 1,
+            "UNKEPT-HANDOFF: a damaged last layer whose relabel could not start was checked \
+             {reported} times in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        assert_eq!(
+            checked(),
+            2,
+            "UNKEPT-HANDOFF-EPOCH: in the next epoch it was not checked exactly once more"
+        );
+        gates(false);
+    }
+
+    /// Zero one node in the middle of the kept last layer of the sector
+    /// `pending` set up in the store at `store_dir`, as a damaged disk
+    /// leaves it.
+    fn damage_kept(store_dir: &Path, pending: &UnkeptPending) {
+        use std::os::unix::fs::FileExt;
+        let n = pending.sector.cert.n;
+        let layers = kept_layers(store_dir, n);
+        let at = fs::metadata(&layers).unwrap().len() - (n - n / 2 - 1) * 32;
+        let file = OpenOptions::new().write(true).open(&layers).unwrap();
+        file.write_all_at(&[0u8; 32], at).unwrap();
+    }
+
+    /// Lines of the captured `logs` reporting damaged kept labels of the
+    /// sector `id`.
+    fn kept_damage_reports(logs: &Mutex<Vec<u8>>, id: &str) -> usize {
+        String::from_utf8(logs.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("kept labels or last layer") && line.contains(id))
+            .count()
+    }
+
+    /// A sector whose kept labels are damaged is labelled again in its
+    /// proof's turn, which the relabel takes over: it keeps its labels
+    /// again and is proven from them in the same epoch, not an epoch later
+    /// at the gate's next turn (2026-11-21: this handover had no test).
+    #[test]
+    fn a_sector_with_damaged_kept_labels_is_labelled_again_in_its_proofs_turn() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"kept labels damaged", |_| {});
+        damage_kept(dir.path(), &pending);
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        let base = resumes(&at);
+        let proven = pending.proven_within(5);
+        println!("REACH sector-floor");
+        let held = store.holds(1500, &pending.member, &pending.sector.cert.sector);
+        let (reported, relabelled) = (kept_damage_reports(&logs, &id), resumes(&at) - base);
+        let (kept, unkept) = (kept_proofs(&at), unkept_proofs(&at));
+        assert!(
+            proven && held && reported == 1 && relabelled == 1 && kept == 1 && unkept == 0,
+            "KEPT-DAMAGED (RELABEL-IN-TURN): damaged kept labels were not labelled again and \
+             proven from the labels kept in five polls of one epoch (proven {proven}, held \
+             {held}, reported {reported}, relabelled {relabelled}, proofs kept {kept} unkept \
+             {unkept})"
+        );
+        gates(false);
+    }
+
+    /// A sector whose kept labels are damaged and whose relabel cannot
+    /// start, its reservation torn, reports that damage once, and its proof,
+    /// made then without labels kept, which labels the sector in full, runs
+    /// once an epoch however often it is polled: the relabel that failed
+    /// before it began still ended the proof's turn it took over
+    /// (2026-11-21: this handover had no test).
+    #[test]
+    fn damaged_kept_labels_whose_relabel_cannot_start_are_proven_once_an_epoch() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let mut pending = unkept_pending(b"kept labels damaged, reservation torn", |s| {
+            let reservation = fs::read(s.dir.join("reservation")).unwrap();
+            fs::write(s.dir.join("reservation"), &reservation[..16]).unwrap();
+        });
+        damage_kept(dir.path(), &pending);
+        let at = pending.sector.dir.clone();
+        let id = hex::encode(pending.sector.cert.sector);
+        pending.poll(5);
+        println!("REACH sector-floor");
+        let reported = kept_damage_reports(&logs, &id);
+        let proofs = kept_proofs(&at) + unkept_proofs(&at);
+        assert!(
+            reported == 1 && proofs == 0 && pending.sent.try_recv().is_err(),
+            "KEPT-HANDOFF: damaged kept labels whose relabel could not start were reported \
+             {reported} times and the sector proven {proofs} times in five polls of one epoch"
+        );
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        let (unkept, proofs) = (unkept_proofs(&at), kept_proofs(&at) + unkept_proofs(&at));
+        assert!(
+            unkept == 1 && proofs == 1 && pending.sent.try_recv().is_ok(),
+            "KEPT-HANDOFF-EPOCH: in the next epoch it was not proven exactly once, without \
+             labels kept, and sent ({proofs} proofs, {unkept} without labels kept)"
+        );
+        gates(false);
+    }
+
+    /// Each sector's certificate proofs made from labels kept, by
+    /// directory.
+    static KEPT_PROOFS: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_kept_proof(dir: &Path) {
+        *KEPT_PROOFS
+            .lock()
+            .unwrap()
+            .entry(dir.to_owned())
+            .or_default() += 1;
+    }
+    fn kept_proofs(dir: &Path) -> usize {
+        KEPT_PROOFS.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+
+    /// A sector's proof made from labels kept whose cache cannot be
+    /// written, as a full disk refuses it, is made again once an epoch
+    /// however often it is polled: each reserves the labelling peak and
+    /// hashes the whole last layer (2026-11-21: at every poll).
+    #[test]
+    fn a_kept_proof_whose_cache_is_not_written_runs_once_an_epoch() {
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"kept proof, cache held", |_| {});
+        let at = pending.sector.dir.clone();
+        CACHE_HELD.lock().unwrap().insert(at.clone());
+        pending.poll(1);
+        assert!(
+            store.holds(1500, &pending.member, &pending.sector.cert.sector)
+                && kept_proofs(&at) == 1
+                && unkept_proofs(&at) == 0
+                && pending.sent.try_recv().is_err(),
+            "premise: its labels are kept, its proof was made from them once and not cached"
+        );
+        pending.poll(4);
+        println!("REACH sector-floor");
+        let proofs = kept_proofs(&at);
+        assert_eq!(
+            proofs, 1,
+            "PROOF-KEPT-CACHE: a proof from labels kept whose cache could not be written was \
+             made {proofs} times in five polls of one epoch"
+        );
+        CACHE_HELD.lock().unwrap().remove(&at);
+        pending.at = next_epoch(pending.at);
+        pending.poll(3);
+        let proofs = kept_proofs(&at) + unkept_proofs(&at);
+        assert!(
+            proofs == 2 && pending.sent.try_recv().is_ok(),
+            "PROOF-KEPT-CACHE-EPOCH: in the next epoch, its cache written, it was not made \
+             exactly once more and sent ({proofs} proofs)"
+        );
+        gates(false);
+    }
+
+    /// A sector's first setup refused while another labelling holds its
+    /// count waits for it: its turn is refunded, so it is tried again at
+    /// the next poll, not paced to the next epoch, and set up once that
+    /// labelling ends.
+    #[test]
+    fn a_busy_first_setup_is_tried_again_at_the_next_poll() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let free = Arc::new(AtomicU64::new(0));
+        crate::storage_labels::install_with_space(dir.path().to_owned(), free_space(&free));
+        let store = crate::storage_labels::installed().unwrap();
+        let mut pending = unkept_pending(b"busy first setup", |_| {});
+        let at = pending.sector.dir.clone();
+        fs::remove_file(at.join("certificate")).unwrap();
+        free.store(1 << 50, Ordering::SeqCst);
+        let (member, cert) = (pending.member, pending.sector.cert);
+        let held = store
+            .admit(1500, &member, &cert.sector, cert.n, Stage::Snapshot)
+            .expect("room for the sector's labels");
+        let base = resumes(&at);
+        pending.poll(3);
+        println!("REACH sector-floor");
+        let resumed = resumes(&at) - base;
+        assert!(
+            resumed == 3 && Sector::load(at.clone()).unwrap().is_none(),
+            "BUSY-NEXT-POLL: a first setup refused while its count was busy ran {resumed} times \
+             in three polls of one epoch, not at each"
+        );
+        drop(held);
+        pending.poll(1);
+        assert!(
+            resumes(&at) - base == 4 && Sector::load(at.clone()).unwrap().is_some(),
+            "BUSY-ENDED: once that labelling ended, it was not set up at the next poll"
+        );
+        gates(false);
+    }
+
+    /// A write that fails, here renamed onto a directory, leaves no file
+    /// of its own (2026-11-20: a record retried at every poll left one
+    /// more at each).
+    #[test]
+    fn a_failed_write_leaves_no_file_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        fs::create_dir_all(path.join("held")).unwrap();
+        assert!(
+            atomic(&path, b"bytes").is_err(),
+            "premise: a write onto a directory fails"
+        );
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "record")
+            .collect();
+        assert!(left.is_empty(), "ATOMIC-TMP: a failed write left {left:?}");
+    }
+
+    /// Each [`Relabel`] state moves on each event as this table says, and
+    /// a poll without labels kept takes its step, so every state has an
+    /// exit: a proof made, or labels kept for one.
+    #[test]
+    fn a_relabel_state_moves_as_its_table_says() {
+        use Relabel::{Asked, Done, GivenUp};
+        use RelabelEvent::{Proven, Relabelled, UnkeptProofFailed};
+        let (same, other) = (Relabelled { same: true }, Relabelled { same: false });
+        let moves = [
+            (None, UnkeptProofFailed, Some(Asked)),
+            (None, same, None),
+            (None, other, None),
+            (None, Proven, None),
+            (Some(Asked), UnkeptProofFailed, Some(Asked)),
+            (Some(Asked), same, Some(Done)),
+            (Some(Asked), other, None),
+            (Some(Asked), Proven, None),
+            (Some(Done), UnkeptProofFailed, Some(GivenUp)),
+            (Some(Done), same, Some(Done)),
+            (Some(Done), other, Some(Done)),
+            (Some(Done), Proven, None),
+            (Some(GivenUp), UnkeptProofFailed, Some(GivenUp)),
+            (Some(GivenUp), same, Some(GivenUp)),
+            (Some(GivenUp), other, Some(GivenUp)),
+            (Some(GivenUp), Proven, None),
+        ];
+        for (state, event, after) in moves {
+            assert_eq!(
+                Relabel::after(state, event),
+                after,
+                "RELABEL-TABLE: {state:?} on {event:?}"
+            );
+        }
+        let steps = [
+            (None, UnkeptStep::Prove),
+            (Some(Asked), UnkeptStep::Relabel),
+            (Some(Done), UnkeptStep::Prove),
+            (Some(GivenUp), UnkeptStep::KeepLabels),
+        ];
+        for (state, step) in steps {
+            assert_eq!(
+                Relabel::unkept_step(state),
+                step,
+                "RELABEL-TABLE: {state:?}"
+            );
+        }
+    }
+
+    /// An uncertified sector set up below the disk floor whose last layer
+    /// is torn before its proof is labelled again, with a line naming what
+    /// to check, as its sibling with labels kept is.
+    #[test]
+    fn an_unkept_sector_with_a_torn_last_layer_is_labelled_again_before_its_proof() {
+        let logs = super::super::tests::capture_logs();
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(dir.path().to_owned(), full_disk());
+        let mut whole = Vec::new();
+        let mut pending = unkept_pending(b"torn unkept", |s| whole = tear_last(&s.dir, s.cert.n));
+        pending.poll(2);
+        println!("REACH sector-floor");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let warned = text
+            .lines()
+            .any(|line| line.contains("no labels are kept for it") && line.contains("action="));
+        assert!(
+            fs::read(pending.sector.dir.join("last")).unwrap() == whole && warned,
+            "UNKEPT-TORN: a torn last layer without labels kept was not labelled again with a \
+             line naming what to check (warned: {warned}) (RELABEL-IN-TURN)"
+        );
+        gates(false);
     }
 
     #[test]
@@ -3769,6 +6043,30 @@ mod tests {
     }
     fn last_checks(dir: &Path) -> usize {
         LAST_CHECKS.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+    /// Each sector's certificate proofs made without labels kept, by
+    /// directory.
+    static UNKEPT_PROOFS: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_unkept_proof(dir: &Path) {
+        *UNKEPT_PROOFS
+            .lock()
+            .unwrap()
+            .entry(dir.to_owned())
+            .or_default() += 1;
+    }
+    fn unkept_proofs(dir: &Path) -> usize {
+        UNKEPT_PROOFS.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+    /// Each reserved sector's setups begun ([`resume_reserved_sector`]), by
+    /// directory.
+    static RESUMES: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    pub(super) fn count_resume(dir: &Path) {
+        *RESUMES.lock().unwrap().entry(dir.to_owned()).or_default() += 1;
+    }
+    fn resumes(dir: &Path) -> usize {
+        RESUMES.lock().unwrap().get(dir).copied().unwrap_or(0)
     }
     /// Each read of a sector's last layer (`Sector::last`), by directory:
     /// the bytes this process held reserved as it began.

@@ -517,8 +517,9 @@ impl Jobs {
                 %stopped,
                 seconds = started.elapsed().as_secs_f64(),
                 scope = "local",
-                "storage job ahead stopped to give its memory back to more urgent work; it \
-                 goes on from what it kept when next asked: an expected wait"
+                "storage job ahead stopped to give its memory back to more urgent work; \
+                 when next asked it goes on from what it kept, as `stopped` says, or starts \
+                 again where it kept nothing: an expected wait"
             ),
             Err(QuilError::StorageWaiting(why)) => match wait {
                 Some(WaitLine::Start) => info!(
