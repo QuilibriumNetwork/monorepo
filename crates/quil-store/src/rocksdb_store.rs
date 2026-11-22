@@ -675,6 +675,20 @@ mod read_only_tests {
         assert_eq!(store.snapshots(), none);
     }
 
+    /// The replica store's eviction reads the free space of the store's own
+    /// filesystem: without it a short disk would never trigger compaction.
+    #[test]
+    fn disk_space_reads_the_filesystem_holding_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open(directory.path()).unwrap();
+        let space = store::KvDb::disk_space(&store).expect("STORE-DISK-SPACE read");
+        assert!(space.total_bytes > 0, "STORE-DISK-SPACE {space:?}");
+        assert!(
+            space.free_bytes <= space.total_bytes,
+            "STORE-DISK-SPACE {space:?}"
+        );
+    }
+
     #[test]
     fn an_archive_block_cache_is_a_quarter_of_memory_within_bounds() {
         const GB: u64 = 1 << 30;
@@ -1037,6 +1051,14 @@ impl store::KvDb for RocksDb {
 
     fn open_snapshots(&self) -> Option<store::OpenSnapshots> {
         Some(self.snapshots())
+    }
+
+    fn disk_space(&self) -> Option<store::DiskSpace> {
+        let usage = quil_forest::storage_health::fs_usage(self.db.path())?;
+        Some(store::DiskSpace {
+            total_bytes: usage.total_bytes,
+            free_bytes: usage.free_bytes,
+        })
     }
 }
 
