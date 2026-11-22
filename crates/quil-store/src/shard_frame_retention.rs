@@ -35,6 +35,12 @@ pub enum KeptShard {
     Unreadable,
     /// Unserved and idle, but no frame below its latest is left.
     LatestOnly,
+    /// Unserved and idle, but GLOBAL has committed no frame of it that the
+    /// caller could read: no archive is known to hold its frames.
+    NoTip,
+    /// Unserved and idle, but no frame below its committed one is left; the
+    /// frames from it on stay until GLOBAL commits them.
+    AboveTip,
 }
 
 /// One call of [`RocksClockStore::prune_unserved_shard_frames`].
@@ -49,6 +55,9 @@ pub struct UnservedFramePrune {
     pub examined: u64,
     /// Shards whose old frames were deleted (or, in a dry run, deletable).
     pub pruned: Vec<PrunedShard>,
+    /// Idle unserved shards whose committed frame is below their latest,
+    /// with how many frame numbers above it, up to the latest, stay.
+    pub above_tip: Vec<(Vec<u8>, u64)>,
     /// Resume at this canonical frame key; `None` once every shard is done.
     pub next: Option<Vec<u8>>,
 }
@@ -118,7 +127,11 @@ impl RocksClockStore {
 
     /// Delete the canonical frames of shards the caller does not serve and
     /// whose latest frame's timestamp (milliseconds) is below
-    /// `idle_before_ms`, keeping each shard's latest frame and its index.
+    /// `idle_before_ms`, keeping each shard's latest frame and its index,
+    /// and every frame from the one GLOBAL committed for it on
+    /// (`committed_tip`): an archive holds a shard's frames only up to what
+    /// GLOBAL executed, so a former member may hold the only copy of the
+    /// rest. A shard without a committed frame keeps all of them.
     /// `served` is asked for each shard before it is scanned and again before
     /// its deletion is written; a shard whose latest index moves meanwhile is
     /// kept. Nothing else is touched: staged frames, fee, settlement,
@@ -133,6 +146,7 @@ impl RocksClockStore {
     pub fn prune_unserved_shard_frames(
         &self,
         served: &dyn Fn(&[u8]) -> bool,
+        committed_tip: &dyn Fn(&[u8]) -> Option<u64>,
         idle_before_ms: i64,
         resume: Option<&[u8]>,
         max_frames: usize,
@@ -176,8 +190,16 @@ impl RocksClockStore {
                 }
                 Some(_) => {}
             }
+            let Some(tip) = committed_tip(&filter) else {
+                result.kept.push((filter, KeptShard::NoTip));
+                continue;
+            };
+            let below = head.min(tip);
+            if below < head {
+                result.above_tip.push((filter.clone(), head - below));
+            }
             let budget = max_frames.saturating_sub(result.examined as usize);
-            let scan = self.old_frames(&filter, from, head, budget)?;
+            let scan = self.old_frames(&filter, from, below, budget)?;
             result.examined += scan.examined;
             if !scan.keys.is_empty() {
                 // The shard may have been taken up while it was scanned.
@@ -199,13 +221,18 @@ impl RocksClockStore {
                     }
                     result.pruned.push(PrunedShard {
                         filter: filter.clone(),
-                        below: head,
+                        below,
                         frames: scan.keys.len() as u64,
                         bytes: scan.bytes,
                     });
                 }
             } else if scan.stopped.is_none() {
-                result.kept.push((filter.clone(), KeptShard::LatestOnly));
+                let why = if below < head {
+                    KeptShard::AboveTip
+                } else {
+                    KeptShard::LatestOnly
+                };
+                result.kept.push((filter.clone(), why));
             }
             if scan.stopped.is_some() {
                 result.next = scan.stopped;
@@ -214,6 +241,22 @@ impl RocksClockStore {
         }
         shards.status().map_err(store)?;
         Ok(result)
+    }
+
+    /// The filters of every shard with a latest-frame index.
+    pub fn indexed_shard_filters(&self) -> Result<Vec<Vec<u8>>> {
+        let mut filters = Vec::new();
+        let mut it = self.db.raw_iterator();
+        it.seek(LATEST_PREFIX);
+        while let Some(key) = it.key() {
+            if !key.starts_with(&LATEST_PREFIX) {
+                break;
+            }
+            filters.push(key[LATEST_PREFIX.len()..].to_vec());
+            it.next();
+        }
+        it.status().map_err(store)?;
+        Ok(filters)
     }
 
     /// Compact the frame keys of `filter` below `below`, which a prune pass
@@ -359,6 +402,78 @@ mod tests {
     const BOUND: i64 = 100_000;
     const NEW: i64 = 200_000;
 
+    /// GLOBAL committed every frame of every shard.
+    fn all_committed(_: &[u8]) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
+    /// An idle unserved shard keeps every frame from the one GLOBAL
+    /// committed on, which no archive may hold yet, and a shard without a
+    /// committed frame keeps all of them.
+    #[test]
+    fn an_unserved_shard_keeps_the_frames_global_has_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        let lagging = vec![0x11; 35];
+        let unknown = vec![0x22; 35];
+        serve(&s, &lagging, 40, OLD, 8);
+        serve(&s, &unknown, 40, OLD, 8);
+        let tip = |f: &[u8]| (f == lagging.as_slice()).then_some(30);
+
+        let pass = s
+            .prune_unserved_shard_frames(&|_| false, &tip, BOUND, None, usize::MAX, false)
+            .unwrap();
+
+        assert_eq!(
+            stored(&s, &lagging),
+            (30..=40).collect::<Vec<_>>(),
+            "the frames from the committed one on stay"
+        );
+        assert_eq!(
+            stored(&s, &unknown),
+            (1..=40).collect::<Vec<_>>(),
+            "a shard without a committed frame keeps them all: the committed one on stay"
+        );
+        assert_eq!(pass.above_tip, vec![(lagging.clone(), 10)]);
+        assert!(pass.kept.contains(&(unknown.clone(), KeptShard::NoTip)));
+
+        let again = s
+            .prune_unserved_shard_frames(&|_| false, &tip, BOUND, None, usize::MAX, false)
+            .unwrap();
+        assert!(
+            again.kept.contains(&(lagging.clone(), KeptShard::AboveTip)),
+            "with none left below it, a shard is kept above its committed frame: {:?}",
+            again.kept
+        );
+    }
+
+    /// An idle unserved shard GLOBAL committed up to its latest frame keeps
+    /// only that frame, as before committed frames were read: nothing of it
+    /// is held above its committed frame.
+    #[test]
+    fn an_unserved_shard_committed_to_its_latest_keeps_only_that_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        let done = vec![0x11; 35];
+        serve(&s, &done, 40, OLD, 8);
+        let tip = |_: &[u8]| Some(40);
+
+        let pass = s
+            .prune_unserved_shard_frames(&|_| false, &tip, BOUND, None, usize::MAX, false)
+            .unwrap();
+        let again = s
+            .prune_unserved_shard_frames(&|_| false, &tip, BOUND, None, usize::MAX, false)
+            .unwrap();
+
+        assert_eq!(stored(&s, &done), vec![40], "only the latest frame stays");
+        assert_eq!(
+            (pass.above_tip.len(), again.kept(KeptShard::LatestOnly)),
+            (0, 1),
+            "a shard committed to its latest is not held above it: {:?}",
+            again.kept
+        );
+    }
+
     /// An unserved shard idle past the bound keeps only its latest frame;
     /// a served shard, a recently left one and a served shard whose filter
     /// extends the pruned one (its keys sort inside the pruned range) keep
@@ -392,7 +507,7 @@ mod tests {
         let is_served = |f: &[u8]| f == served.as_slice() || f == longer.as_slice();
 
         let pass = s
-            .prune_unserved_shard_frames(&is_served, BOUND, None, usize::MAX, false)
+            .prune_unserved_shard_frames(&is_served, &all_committed, BOUND, None, usize::MAX, false)
             .unwrap();
 
         assert_eq!(
@@ -436,7 +551,7 @@ mod tests {
         );
         assert_eq!(pass.next, None);
         let again = s
-            .prune_unserved_shard_frames(&is_served, BOUND, None, usize::MAX, false)
+            .prune_unserved_shard_frames(&is_served, &all_committed, BOUND, None, usize::MAX, false)
             .unwrap();
         assert!(again.pruned.is_empty());
         assert_eq!(
@@ -465,7 +580,14 @@ mod tests {
         let (mut next, mut calls, mut frames) = (None::<Vec<u8>>, 0, 0);
         loop {
             let pass = s
-                .prune_unserved_shard_frames(&is_served, BOUND, next.as_deref(), 7, false)
+                .prune_unserved_shard_frames(
+                    &is_served,
+                    &all_committed,
+                    BOUND,
+                    next.as_deref(),
+                    7,
+                    false,
+                )
                 .unwrap();
             assert!(pass.examined <= 7, "a call stays within its budget");
             calls += 1;
@@ -493,12 +615,12 @@ mod tests {
         let none = |_: &[u8]| false;
 
         let dry = s
-            .prune_unserved_shard_frames(&none, BOUND, None, usize::MAX, true)
+            .prune_unserved_shard_frames(&none, &all_committed, BOUND, None, usize::MAX, true)
             .unwrap();
         assert_eq!(dry.frames(), 19, "a dry run counts the old frames");
         assert_eq!(stored(&s, &left).len(), 20, "a dry run deletes nothing");
         let real = s
-            .prune_unserved_shard_frames(&none, BOUND, None, usize::MAX, false)
+            .prune_unserved_shard_frames(&none, &all_committed, BOUND, None, usize::MAX, false)
             .unwrap();
         assert_eq!(real, dry);
         assert!(real.bytes() > 19 * 100);
@@ -525,7 +647,7 @@ mod tests {
         };
 
         let pass = s
-            .prune_unserved_shard_frames(&is_served, BOUND, None, usize::MAX, false)
+            .prune_unserved_shard_frames(&is_served, &all_committed, BOUND, None, usize::MAX, false)
             .unwrap();
         assert_eq!(
             stored(&s, &left),
@@ -557,7 +679,7 @@ mod tests {
         };
         let before = sst(&s);
         let pass = s
-            .prune_unserved_shard_frames(&|_| false, BOUND, None, usize::MAX, false)
+            .prune_unserved_shard_frames(&|_| false, &all_committed, BOUND, None, usize::MAX, false)
             .unwrap();
         assert_eq!(pass.frames(), 199, "the old frames are deleted");
         s.compact_pruned_shard_frames(&left, pass.pruned[0].below);
