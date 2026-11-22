@@ -305,12 +305,14 @@ impl SubmitRetryQueue {
             return;
         };
         let (member, _, epochs) = proof.fields();
-        warn!(member, digest, seats = proof.seats.len(), ?settled, ?epochs, bytes,
-            frame = %or_unknown(frame), action, times, secs,
+        let (window_end, frames_left, _) = proof.time_left(frame);
+        let owed = proof.owed_beside(settled);
+        warn!(member, digest, seats = proof.seats.len(), ?settled, ?owed, ?epochs, bytes,
+            frame = %or_unknown(frame), window_end, %frames_left, action, times, secs,
             "storage epoch proof holds a seat this node's view shows settled or closed, or seals a registration it \
              shows sealed: GLOBAL refuses the whole proof (a duplicate or late), so it is not sent (again) and its \
-             acceptance drops no other queued proof; the workers of its other seats send them again while their \
-             slots show them owed");
+             acceptance drops no other queued proof; the workers of its other seats (owed) send them again while \
+             their slots show them owed, and one not taken by window_end is lost");
     }
 
     /// Drop the queued storage epoch proofs holding a seat this node's view
@@ -364,12 +366,21 @@ impl SubmitRetryQueue {
             let Some(proof) = &queued.proof else {
                 continue;
             };
+            refused_whole(proof);
             let digest = proof_digest(&queued.bytes);
             let sent = (digest.as_str(), queued.bytes.len());
             self.warn_settled(proof, sent, &settled, frame, "dropped from the retry queue");
             self.count_settled(proof);
         }
     }
+}
+
+/// Tell the node's storage epoch proof batching that GLOBAL refuses `proof`
+/// whole, holding a seat settled or sealed already
+/// (`storage_epoch_batch::note_proof_refused`): its other seats' retries go
+/// at once.
+fn refused_whole(proof: &StorageProofSubmission) {
+    quil_engine::storage_epoch_batch::note_proof_refused(&proof.member, &proof.seats);
 }
 
 /// How long a proof's last line on a settled seat is kept to bound the next
@@ -946,6 +957,7 @@ fn resent(
                 .is_some_and(|old| proof.supersedes(old))
         });
     } else {
+        refused_whole(proof);
         let digest = proof_digest(&queued.bytes);
         let sent = (digest.as_str(), queued.bytes.len());
         queue.warn_settled(proof, sent, &settled, frame(), "taken by an archive");
@@ -1367,6 +1379,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 proof.time_left(latest_frame(self.clock_store.as_ref()));
             if grpc_ok_count > 0 {
                 if let Some((settled, digest)) = &taken_settled {
+                    refused_whole(proof);
                     let frame = latest_frame(self.clock_store.as_ref());
                     let sent = (digest.as_str(), bytes);
                     self.retry_queue.warn_settled(
@@ -1831,6 +1844,23 @@ impl StorageProofSubmission {
         self.seats
             .iter()
             .any(|(s, e, se, st)| s == shard && e == epoch && (*se || !seals) && (*st || !settles))
+    }
+
+    /// Its seats `settled` ([`SubmitRetryQueue::settled_seats`]) does not
+    /// name, `<shard>@<epoch>` each: GLOBAL refusing the proof whole leaves
+    /// them owed.
+    fn owed_beside(&self, settled: &[String]) -> Vec<String> {
+        self.seats
+            .iter()
+            .filter(|(shard, epoch, seals, settles)| {
+                let shard = hex::encode(shard);
+                let closed = *settles && settled.contains(&format!("{shard}@{epoch}"));
+                let sealed = *seals
+                    && settled.contains(&format!("{shard}@{} sealed", epoch.saturating_add(2)));
+                !closed && !sealed
+            })
+            .map(|(shard, epoch, _, _)| format!("{}@{epoch}", hex::encode(shard)))
+            .collect()
     }
 
     /// Its member, shards and epochs, for log lines.
@@ -4018,6 +4048,40 @@ mod tests {
             view(&[2; 32], &[7; 35], 1496),
             super::SlotState::default(),
             "another member's seat shows open"
+        );
+    }
+
+    /// A queued proof dropped for one seat this node's view shows sealed
+    /// names the seats it leaves owed and its window's end: the other seat
+    /// of such a proof was sent again a frame after its window, and no line
+    /// named it (devnet, 2026-11-22).
+    #[test]
+    fn a_proof_dropped_for_a_sealed_seat_names_the_seats_it_leaves_owed() {
+        let (settled, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let group = storage_proof_bundle(1, &[(7, 1495, true, false), (9, 1495, true, false)], 8);
+        let window_end = super::StorageProofSubmission::of(&group)
+            .expect("premise: a storage epoch proof")
+            .window_end;
+        queue.push(group);
+        settled.lock().unwrap().sealed.insert((9, 1497));
+        let logs = Logs::capture();
+        queue.drop_settled(FAST, &|| Some(5));
+        assert_eq!(queue.len(), 0, "premise: the proof was dropped");
+        let lines = logs.lines("holds a seat this node's view");
+        eprintln!("REACH seat-hold-owed-named lines={}", lines.len());
+        assert_eq!(lines.len(), 1, "premise: one line: {lines:?}");
+        let owed = lines[0]
+            .split("owed=[")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_default();
+        assert!(
+            owed.contains(&format!("{}@1495", hex::encode([7u8; 35])))
+                && !owed.contains(&hex::encode([9u8; 35]))
+                && lines[0].contains(&format!("window_end={window_end}")),
+            "OWED-UNNAMED: the line does not name the seat left owed and the window's end: {}",
+            lines[0]
         );
     }
 }

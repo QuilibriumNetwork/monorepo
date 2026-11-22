@@ -1919,31 +1919,169 @@ pub fn prove(seats: Vec<PreparedSeat>) -> Result<Vec<u8>> {
     .to_canonical_bytes())
 }
 
-/// How long after a seat's proof went out a retried part for it is dropped.
+/// How long after a seat's proof went out a retried part for it is dropped,
+/// unless that proof failed or GLOBAL refuses it ([`Stamped`]).
 const RECENTLY_PROVED: Duration = Duration::from_secs(60);
 
-/// When each member's seat parts were last proved, by member and part.
-fn proved() -> &'static Mutex<HashMap<([u8; 32], SeatKey), Instant>> {
-    static PROVED: OnceLock<Mutex<HashMap<([u8; 32], SeatKey), Instant>>> = OnceLock::new();
+/// A proof's seats as its message names them, sorted: each part's shard,
+/// the epoch it settles, and whether it seals and settles. All a transport
+/// knows of a proof GLOBAL refuses ([`note_proof_refused`]).
+type ProofSeats = Vec<(Vec<u8>, u64, bool, bool)>;
+
+/// When each member's seat parts were last proved, by member and part, and
+/// the seats of the proof that did.
+type ProvedSeats = HashMap<([u8; 32], SeatKey), (Instant, Arc<ProofSeats>)>;
+
+fn proved() -> &'static Mutex<ProvedSeats> {
+    static PROVED: OnceLock<Mutex<ProvedSeats>> = OnceLock::new();
     PROVED.get_or_init(Default::default)
 }
 
-fn note_proved(seats: &[PreparedSeat]) {
+fn named_seats(seats: &[PreparedSeat]) -> ProofSeats {
+    let mut named: ProofSeats = seats
+        .iter()
+        .map(|seat| {
+            let part = &seat.part;
+            let filter = part.shard_filter.clone();
+            (filter, part.epoch, part.seals, part.settles)
+        })
+        .collect();
+    named.sort_unstable();
+    named
+}
+
+/// A proof made: its member and seats.
+#[cfg(test)]
+type MadeProof = ([u8; 32], Arc<ProofSeats>);
+
+/// Each proof made ([`note_proved`]), by member: tests see a proof made of
+/// seats whose fake leaves fail to prove, the stamps going with it.
+#[cfg(test)]
+fn proofs_made() -> &'static Mutex<Vec<MadeProof>> {
+    static MADE: OnceLock<Mutex<Vec<MadeProof>>> = OnceLock::new();
+    MADE.get_or_init(Default::default)
+}
+
+/// Stamp `seats` proved now by one proof, whose seats it returns.
+fn note_proved(seats: &[PreparedSeat]) -> Arc<ProofSeats> {
+    let proof = Arc::new(named_seats(seats));
+    #[cfg(test)]
+    if let (Some(seat), Ok(mut made)) = (seats.first(), proofs_made().lock()) {
+        made.push((seat.member, proof.clone()));
+    }
     if let Ok(mut proved) = proved().lock() {
-        proved.retain(|_, at| at.elapsed() < RECENTLY_PROVED);
+        proved.retain(|_, (at, _)| at.elapsed() < RECENTLY_PROVED);
         for seat in seats {
-            proved.insert((seat.member, seat.key()), Instant::now());
+            proved.insert((seat.member, seat.key()), (Instant::now(), proof.clone()));
+        }
+    }
+    proof
+}
+
+/// Take back the stamps `member`'s proof of `proof` set ([`note_proved`])
+/// that no later proof replaced: it settles none of its seats.
+fn unnote_proved(member: &[u8; 32], proof: &[(Vec<u8>, u64, bool, bool)]) {
+    if let Ok(mut proved) = proved().lock() {
+        proved.retain(|(of, _), (_, by)| !(of == member && by.as_slice() == proof));
+    }
+}
+
+/// Note that GLOBAL refuses `member`'s proof of `seats` (shard, epoch
+/// settled, seals and settles each) whole, as this node's transport saw it:
+/// a seat beside the others was settled or sealed already. Their workers'
+/// retries are taken at once ([`unnote_proved`]); stamped proved, each was
+/// dropped for a minute, and one sent near its window's end missed it.
+pub fn note_proof_refused(member: &[u8; 32], seats: &[(Vec<u8>, u64, bool, bool)]) {
+    let mut proof = seats.to_vec();
+    proof.sort_unstable();
+    unnote_proved(member, &proof);
+}
+
+/// A proof's stamps on its seats ([`note_proved`]), taken back unless it
+/// was published or another proof covers its seats: one that failed, was
+/// dropped or left every seat out settles none, and its workers send each
+/// again alone at once.
+struct Stamped {
+    member: [u8; 32],
+    proof: Arc<ProofSeats>,
+    kept: bool,
+}
+
+impl Drop for Stamped {
+    fn drop(&mut self) {
+        if !self.kept {
+            unnote_proved(&self.member, &self.proof);
         }
     }
 }
 
+/// Whether a proof covering `seat` went out within [`RECENTLY_PROVED`] or
+/// is on its way ([`Proving`]).
 fn recently_proved(seat: &PreparedSeat) -> bool {
     let key = seat.key();
-    proved().lock().is_ok_and(|proved| {
-        proved.iter().any(|((member, proved_key), at)| {
+    let held = proving().lock().is_ok_and(|proving| {
+        proving
+            .keys()
+            .any(|(member, held)| *member == seat.member && held.overlaps(&key))
+    });
+    held || proved().lock().is_ok_and(|proved| {
+        proved.iter().any(|((member, proved_key), (at, _))| {
             *member == seat.member && proved_key.overlaps(&key) && at.elapsed() < RECENTLY_PROVED
         })
     })
+}
+
+/// Seats by member and part, each with the [`Proving`] holds on it.
+type HeldSeats = HashMap<([u8; 32], SeatKey), usize>;
+
+/// The seats proofs are being made of.
+fn proving() -> &'static Mutex<HeldSeats> {
+    static PROVING: OnceLock<Mutex<HeldSeats>> = OnceLock::new();
+    PROVING.get_or_init(Default::default)
+}
+
+/// A proof's hold on its seats ([`recently_proved`]), taken under the lock
+/// that removes its parts from their collection or gather and released when
+/// the last proof job sharing it ends: published, failed or dropped. A part
+/// sent again meanwhile is dropped, as the proof covers it. Taken only as
+/// the proof was queued, a retry let in between proved its seat twice: four
+/// archives refused the proof of two seats as one seat's duplicate, and the
+/// other seat's resend came a frame after its window (devnet, 2026-11-22).
+struct Proving {
+    seats: Vec<([u8; 32], SeatKey)>,
+    held: bool,
+}
+
+impl Proving {
+    fn hold(seats: &[PreparedSeat]) -> Arc<Proving> {
+        let seats: Vec<([u8; 32], SeatKey)> =
+            seats.iter().map(|seat| (seat.member, seat.key())).collect();
+        let held = proving().lock().is_ok_and(|mut proving| {
+            for key in &seats {
+                *proving.entry(key.clone()).or_default() += 1;
+            }
+            true
+        });
+        Arc::new(Proving { seats, held })
+    }
+}
+
+impl Drop for Proving {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        if let Ok(mut proving) = proving().lock() {
+            for key in &self.seats {
+                if let Some(count) = proving.get_mut(key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        proving.remove(key);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A member's parts being collected for one proof.
@@ -2337,15 +2475,17 @@ fn gather_settlement(seat: PreparedSeat, publish: Publish) {
     );
 }
 
+/// Each member's seals sent again, gathered ([`gather_seals`]).
+fn seal_gathers() -> &'static Mutex<HashMap<[u8; 32], SettlementGather>> {
+    static GATHERS: OnceLock<Mutex<HashMap<[u8; 32], SettlementGather>>> = OnceLock::new();
+    GATHERS.get_or_init(Default::default)
+}
+
 /// Gather `seat`, a seal sent again whose last proof every archive refused
 /// for room, with the member's others sent within [`SETTLEMENT_GATHER`]
 /// (its workers' retry clocks run from one proof's publication), then
 /// prove them ([`seal_retry_proofs`]).
 fn gather_seals(seat: PreparedSeat, publish: Publish) {
-    fn seal_gathers() -> &'static Mutex<HashMap<[u8; 32], SettlementGather>> {
-        static GATHERS: OnceLock<Mutex<HashMap<[u8; 32], SettlementGather>>> = OnceLock::new();
-        GATHERS.get_or_init(Default::default)
-    }
     gather(seal_gathers(), seat, publish, seal_retry_proofs);
 }
 
@@ -2364,6 +2504,13 @@ fn gather(
             prove_and_publish(vec![seat], publish);
             return;
         };
+        // A seal sent again while the gather that took it is being proved:
+        // read under the lock the gather's proof takes its hold in.
+        if seat.part.seals && recently_proved(&seat) {
+            tracing::debug!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
+                "storage epoch proof part retried while its proof may still be on its way; dropped");
+            return;
+        }
         let start = !gathers.contains_key(&member);
         let gather = gathers.entry(member).or_insert_with(|| SettlementGather {
             parts: Vec::new(),
@@ -2381,15 +2528,15 @@ fn gather(
             .name("settle-gather".into())
             .spawn(move || {
                 std::thread::sleep(SETTLEMENT_GATHER);
-                let Some(gather) = gathers
-                    .lock()
-                    .ok()
-                    .and_then(|mut gathers| gathers.remove(&member))
-                else {
+                let Some((gather, held)) = gathers.lock().ok().and_then(|mut gathers| {
+                    let gather = gathers.remove(&member)?;
+                    let held = Proving::hold(&gather.parts);
+                    Some((gather, held))
+                }) else {
                     return;
                 };
                 for proof in plan(gather.parts) {
-                    prove_and_publish(proof, gather.publish.clone());
+                    prove_held(proof, gather.publish.clone(), held.clone());
                 }
             })
             .expect("spawn a storage settlement gather thread");
@@ -2424,8 +2571,11 @@ pub fn deliver(message: SeatMessage, publish: Publish) {
                     // covers it.
                     return;
                 }
+                // Read under the lock a collection's proof takes its hold
+                // in ([`watch`]).
+                let covered = recently_proved(&seat);
                 drop(collections);
-                if recently_proved(&seat) {
+                if covered {
                     tracing::debug!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
                         "storage epoch proof part retried while its proof may still be on its way; dropped");
                     return;
@@ -2548,6 +2698,7 @@ fn watch(member: [u8; 32]) {
             continue;
         }
         let collection = collections.remove(&member).expect("present");
+        let held = Proving::hold(&collection.parts);
         drop(collections);
         let missing: Vec<String> = collection
             .announced
@@ -2567,7 +2718,7 @@ fn watch(member: [u8; 32]) {
         let (proofs, alone) = chunks_why(parts, chunk_leaves(), chunk_bytes());
         log_batching("collection", &member, due, &seats_in(&proofs), alone);
         for chunk in proofs {
-            prove_and_publish(chunk, collection.publish.clone());
+            prove_held(chunk, collection.publish.clone(), held.clone());
         }
         return;
     }
@@ -2712,13 +2863,26 @@ fn proof_reservation(seats: &[PreparedSeat], persistent: bool) -> Result<u64> {
 /// proofs, and its memory never waits behind seals
 /// (`crate::storage_jobs::reserve_settlement`).
 fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
-    note_proved(&seats);
+    let held = Proving::hold(&seats);
+    prove_held(seats, publish, held);
+}
+
+/// [`prove_and_publish`], `held` ([`Proving`]) until its job ends.
+fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
+    let stamped = Stamped {
+        member: seats.first().map(|seat| seat.member).unwrap_or_default(),
+        proof: note_proved(&seats),
+        kept: false,
+    };
     let alone = seats
         .iter()
         .all(|seat| seat.solo && seat.part.settles && !seat.part.seals);
     let persistent = persistent_schedule(&seats);
     let lane = proof_lane(&seats, alone, persistent);
     crate::storage_jobs::spawn(&lane, "member epoch proof", move || {
+        let _held = held;
+        // Taken whole: its drop takes the stamps back.
+        let mut stamped = stamped;
         // Queued in its lane, or sent again, a proof leaves out what would
         // make GLOBAL refuse it whole.
         let Some(seats) = rebuilt(seats, &publish) else {
@@ -2727,6 +2891,7 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
         // Sent again from the same part, a settlement alone goes as the
         // proof made of it before: nothing is proved again.
         if alone && resend_settlement(&seats, &publish) {
+            stamped.kept = true;
             return Ok(());
         }
         let bytes = proof_reservation(&seats, persistent)?;
@@ -2741,6 +2906,8 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
         };
         let (seats, claimed) = claim_settlements(seats);
         if seats.is_empty() {
+            // Claimed by a proof on its way, which covers them.
+            stamped.kept = true;
             return Ok(());
         }
         let kept = alone.then(|| parts_digest(&seats));
@@ -2801,6 +2968,7 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
                     keep_settlement_proof(parts, &proved, &bytes);
                 }
                 publish(bytes);
+                stamped.kept = true;
                 if let Some(key) = alone_key {
                     note_published_alone(key);
                 }
@@ -3684,6 +3852,16 @@ mod tests {
         }
     }
 
+    /// Whether a proof was made of `part` ([`proofs_made`]).
+    fn proof_made(part: &PreparedSeat) -> bool {
+        let named = named_seats(std::slice::from_ref(part)).remove(0);
+        proofs_made()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(member, seats)| *member == part.member && seats.contains(&named))
+    }
+
     /// Settlements a member's workers send alone at once are gathered and
     /// proved in one proof.
     #[test]
@@ -3702,11 +3880,11 @@ mod tests {
             deliver(SeatMessage::Part(part.clone()), publish.clone());
         }
         let deadline = Instant::now() + SETTLEMENT_GATHER + Duration::from_secs(30);
-        while !parts.iter().all(recently_proved) && Instant::now() < deadline {
+        while !parts.iter().all(proof_made) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            parts.iter().all(recently_proved),
+            parts.iter().all(proof_made),
             "the gathered settlements were not proved"
         );
         let batching = batching().lock().unwrap();
@@ -4143,11 +4321,11 @@ mod tests {
         alone.member = member;
         deliver(SeatMessage::Part(alone.clone()), publish.clone());
         let deadline = Instant::now() + SETTLEMENT_GATHER + Duration::from_secs(30);
-        while !recently_proved(&alone) && Instant::now() < deadline {
+        while !proof_made(&alone) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            recently_proved(&alone),
+            proof_made(&alone),
             "the settlement sent alone waited for its seat's slow part in the member's collection"
         );
         // A seal sent again still waits for the collection's proof.
@@ -5129,6 +5307,230 @@ mod tests {
         assert_eq!(
             halves, None,
             "STALE-SEAL: a part past its window went out, its seal or its settlement"
+        );
+    }
+
+    /// The member whose epoch batch thread [`GateWriter`] stops.
+    const GATED_MEMBER: [u8; 32] = [0x71; 32];
+
+    /// Every thread's log lines, and the gate [`GateWriter`] holds.
+    struct Gate {
+        lines: Mutex<String>,
+        /// Whether the epoch batch thread reached the gate, and whether the
+        /// test let it go.
+        state: Mutex<(bool, bool)>,
+        turn: std::sync::Condvar,
+    }
+
+    fn gate() -> &'static Gate {
+        static GATE: OnceLock<Gate> = OnceLock::new();
+        GATE.get_or_init(|| Gate {
+            lines: Mutex::new(String::new()),
+            state: Mutex::new((false, false)),
+            turn: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Writes log lines to [`gate`], stopping the thread that writes
+    /// [`GATED_MEMBER`]'s "collection" batching line until the test lets it
+    /// go: there [`watch`] has taken the collection and not yet queued its
+    /// proof.
+    struct GateWriter;
+
+    impl std::io::Write for GateWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let line = String::from_utf8_lossy(bytes).into_owned();
+            let gate = gate();
+            gate.lines.lock().unwrap().push_str(&line);
+            let collection =
+                line.contains("route=\"collection\"") || line.contains("route=collection");
+            if collection && line.contains(&hex::encode(GATED_MEMBER)) {
+                let mut state = gate.state.lock().unwrap();
+                state.0 = true;
+                gate.turn.notify_all();
+                let cap = Instant::now() + Duration::from_secs(120);
+                while !state.1 && Instant::now() < cap {
+                    state = gate
+                        .turn
+                        .wait_timeout(state, Duration::from_millis(200))
+                        .unwrap()
+                        .0;
+                }
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A seat's part sent again alone (a worker's retry) just as the epoch
+    /// batch thread takes the member's collection holding that seat is not
+    /// proved beside the collection's proof: proved twice, the seat made
+    /// four archives refuse the collection's proof of two seats as a
+    /// duplicate, and the other seat missed its window (devnet, 2026-11-22).
+    #[test]
+    fn a_seat_sent_again_as_its_collection_is_taken_is_not_proved_twice() {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| GateWriter)
+                .finish(),
+        );
+        let publish: Publish = Arc::new(|_| {});
+        let mut first = seat(0x30, 1, false);
+        first.member = GATED_MEMBER;
+        let mut second = seat(0x32, 1, false);
+        second.member = GATED_MEMBER;
+        deliver(SeatMessage::Part(first), publish.clone());
+        deliver(SeatMessage::Part(second), publish.clone());
+        let gate = gate();
+        let reached = {
+            let cap = Instant::now() + Duration::from_secs(collect_secs() + 60);
+            let mut state = gate.state.lock().unwrap();
+            while !state.0 && Instant::now() < cap {
+                state = gate
+                    .turn
+                    .wait_timeout(state, Duration::from_millis(200))
+                    .unwrap()
+                    .0;
+            }
+            state.0
+        };
+        assert!(
+            reached,
+            "premise: the epoch batch thread took the member's collection and logged it"
+        );
+        let mut retry = seat(0x30, 1, true);
+        retry.member = GATED_MEMBER;
+        deliver(SeatMessage::Part(retry), publish);
+        let member = hex::encode(GATED_MEMBER);
+        let alone: Vec<String> = gate
+            .lines
+            .lock()
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(&member) && line.contains("part sent alone"))
+            .map(str::to_owned)
+            .collect();
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.1 = true;
+            gate.turn.notify_all();
+        }
+        eprintln!("REACH seat-hold-collection-taken alone={}", alone.len());
+        assert!(
+            alone.is_empty(),
+            "SEAT-PROVED-TWICE: a part sent again as its collection was taken was proved alone beside it: {alone:?}"
+        );
+    }
+
+    /// A proof that failed to prove leaves its seats unstamped: its line
+    /// says their workers send each again alone, and stamped proved, each
+    /// retry was dropped for a minute, one near its window's end past it.
+    #[test]
+    fn a_failed_proofs_seats_are_taken_again_at_once() {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| GateWriter)
+                .finish(),
+        );
+        let mut part = seat(0x38, 1, false);
+        part.member = [0x75; 32];
+        prove_and_publish(vec![part.clone()], Arc::new(|_| {}));
+        let ended = || {
+            gate().lines.lock().unwrap().lines().any(|line| {
+                line.contains("member epoch proof") && line.contains("storage snapshot job failed")
+            })
+        };
+        let cap = Instant::now() + Duration::from_secs(60);
+        while !ended() && Instant::now() < cap {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (ended, taken) = (ended(), !recently_proved(&part));
+        eprintln!("REACH seat-hold-stamp-failed ended={ended} taken={taken}");
+        assert!(ended, "premise: the proof failed");
+        assert!(
+            taken,
+            "STAMP-KEPT: a seat of a proof that failed stayed stamped proved, its retries dropped"
+        );
+    }
+
+    /// GLOBAL refusing a proof whole takes back the stamps it set on its
+    /// seats, so their retries go at once, and none a later proof set.
+    #[test]
+    fn a_proof_refused_whole_lets_its_seats_be_sent_again_at_once() {
+        let member = [0x76; 32];
+        let mut sealing = seat(0x3a, 1, false);
+        sealing.member = member;
+        let mut settling = seat(0x3b, 0, false);
+        settling.member = member;
+        note_proved(&[sealing.clone(), settling.clone()]);
+        // The settlement sent again and proved alone since.
+        note_proved(std::slice::from_ref(&settling));
+        // As the transport names them, in its message's order.
+        note_proof_refused(
+            &member,
+            &[(vec![0x3b], 0, false, true), (vec![0x3a], 0, true, false)],
+        );
+        let (freed, kept) = (!recently_proved(&sealing), recently_proved(&settling));
+        eprintln!("REACH seat-hold-stamp-refused freed={freed} kept={kept}");
+        assert!(
+            freed,
+            "REFUSED-KEPT: a seat of a proof GLOBAL refuses whole stayed stamped proved"
+        );
+        assert!(
+            kept,
+            "a later proof's stamp on a seat was taken back with a refused proof's"
+        );
+    }
+
+    /// A proof's hold on its seats ends with its job, whether it proves,
+    /// fails or leaves every seat out: a hold kept would drop each later
+    /// retry of those seats for good.
+    #[test]
+    fn a_proofs_hold_on_its_seats_ends_with_its_job() {
+        let mut part = seat(0x34, 1, true);
+        part.member = [0x73; 32];
+        let holding = || {
+            proving()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(member, _)| *member == [0x73; 32])
+        };
+        let held = Proving::hold(std::slice::from_ref(&part));
+        assert!(holding(), "premise: the proof holds its seat");
+        prove_held(vec![part], Arc::new(|_| {}), held);
+        let cap = Instant::now() + Duration::from_secs(60);
+        while holding() && Instant::now() < cap {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("REACH seat-hold-hold-released holding={}", holding());
+        assert!(
+            !holding(),
+            "HOLD-KEPT: the seat stayed held after its proof job ended"
+        );
+    }
+
+    /// A seal sent again while the proof of the gather that took it is on
+    /// its way is dropped, not gathered for a second proof of its seat.
+    #[test]
+    fn a_seal_sent_again_while_its_gathers_proof_is_on_its_way_is_dropped() {
+        let mut part = seat(0x36, 1, true);
+        part.member = [0x74; 32];
+        let held = Proving::hold(std::slice::from_ref(&part));
+        gather_seals(part, Arc::new(|_| {}));
+        let gathered = seal_gathers().lock().unwrap().contains_key(&[0x74; 32]);
+        drop(held);
+        eprintln!("REACH seat-hold-gather-held gathered={gathered}");
+        assert!(
+            !gathered,
+            "GATHERED-TWICE: a seal sent again while its proof was on its way was gathered for another"
         );
     }
 }
