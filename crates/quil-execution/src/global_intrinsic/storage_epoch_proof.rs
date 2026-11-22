@@ -58,6 +58,41 @@ pub const REFUSED_DUPLICATE: &str = "a duplicate";
 /// How a refusal names a seal or settlement past its deadline that GLOBAL
 /// has not applied.
 pub const REFUSED_LATE: &str = "a deadline miss";
+/// How a refusal names a part sent before it may land: a settlement before
+/// its window, a seal before its beacon frame.
+pub const REFUSED_EARLY: &str = "too early";
+/// How a refusal names a proof that does not verify.
+pub const REFUSED_INVALID: &str = "the proof does not verify";
+
+/// Why GLOBAL refused a storage epoch proof, by the `REFUSED_*` name its
+/// refusal carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// [`REFUSED_DUPLICATE`]
+    Duplicate,
+    /// [`REFUSED_LATE`]
+    Late,
+    /// [`REFUSED_EARLY`]
+    Early,
+    /// [`REFUSED_INVALID`]
+    Invalid,
+    /// None of them.
+    Other,
+}
+
+/// The kind of refusal `reason` names. A late copy of an applied part reads
+/// as a duplicate.
+pub fn refusal_kind(reason: &str) -> RefusalKind {
+    [
+        (REFUSED_DUPLICATE, RefusalKind::Duplicate),
+        (REFUSED_LATE, RefusalKind::Late),
+        (REFUSED_EARLY, RefusalKind::Early),
+        (REFUSED_INVALID, RefusalKind::Invalid),
+    ]
+    .into_iter()
+    .find(|(name, _)| reason.contains(name))
+    .map_or(RefusalKind::Other, |(_, kind)| kind)
+}
 
 const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// More than a seat commits in an epoch: one per app frame it proposed.
@@ -663,11 +698,11 @@ pub fn check(
         .any(|seat| seat.seals.iter().any(|leaf| leaf.persistent.is_some()));
     let records = if persistent {
         super::persistent_storage::check(state, &claim, &proof.proof)
-            .map_err(|error| invalid(format!("rejected: {error}")))?
+            .map_err(|error| invalid(format!("{REFUSED_INVALID}: {error}")))?
     } else {
         claim
             .verify(&proof.proof)
-            .map_err(|error| invalid(format!("rejected: {error}")))?;
+            .map_err(|error| invalid(format!("{REFUSED_INVALID}: {error}")))?;
         Vec::new()
     };
     Ok(Some(
@@ -883,7 +918,7 @@ fn check_seat(
         let beacon_frame = slot.registered_at + 1;
         if frame_number <= beacon_frame {
             return Err(invalid(format!(
-                "its beacon, frame {beacon_frame}, is not yet before this frame"
+                "its beacon, frame {beacon_frame}, is not yet before this frame: {REFUSED_EARLY}"
             )));
         }
         let beacon =
@@ -989,7 +1024,7 @@ fn check_seat(
             });
             let window = format!("epoch {} settles in frames [{from}, {until})", part.epoch);
             return Err(invalid(if frame_number < from {
-                window
+                format!("{window}: {REFUSED_EARLY}")
             } else {
                 let past = frame_number + 1 - until;
                 match settled {
@@ -1483,9 +1518,16 @@ mod tests {
         };
         let mut tampered = proof.clone();
         tampered.proof[100] ^= 1;
-        assert!(
-            check_at(&tampered).is_err(),
-            "tampered_group_accepted: GLOBAL accepted a tampered proof of several seats"
+        let refused = match check_at(&tampered) {
+            Ok(_) => {
+                panic!("tampered_group_accepted: GLOBAL accepted a tampered proof of several seats")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            refusal_kind(&refused),
+            RefusalKind::Invalid,
+            "tampered_not_invalid: {refused}"
         );
         let settled = check_at(&proof)
             .unwrap_or_else(|error| {
@@ -1509,5 +1551,95 @@ mod tests {
             refused.contains(REFUSED_DUPLICATE),
             "refused for its settled seat: {refused}"
         );
+    }
+
+    /// Each refusal of a part names its kind, which the engine's proof logs
+    /// count by: early (both windows), late, duplicate, other. The tampered
+    /// proof in the test above is the invalid one.
+    #[test]
+    fn each_refusal_of_a_part_names_its_kind() {
+        use crate::global_intrinsic::storage_seat;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(1));
+        let state = crate::hypergraph_state::HypergraphState::new(std::sync::Arc::new(
+            quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+            ),
+        ));
+        let length = quil_types::consensus::epoch_length_frames();
+        let member = [0x47u8; 32];
+        let epoch = 7;
+        let registered_at = (epoch - 1) * length + 5;
+        let (sealed, unsealed, unseated) = (vec![1u8; 35], vec![2u8; 35], vec![3u8; 35]);
+        for (filter, seal) in [(&sealed, true), (&unsealed, false)] {
+            let mut seat = storage_seat::Seat::new(member, filter.clone());
+            seat.register(epoch, &[vec![0]], registered_at);
+            assert!(!seal || seat.seal(epoch, registered_at + 2));
+            storage_seat::write(&state, registered_at + 2, &seat).unwrap();
+        }
+        let bits = |_: &[u8]| -> Option<Vec<bool>> { None };
+        let context = SealContext {
+            changes: &[],
+            bits: &bits,
+        };
+        // A part sealing `epoch` or settling it.
+        let refusal = |frame: u64, filter: &[u8], seals: bool| {
+            let proof = StorageEpochProof {
+                member,
+                seats: vec![SeatProof {
+                    shard_filter: filter.to_vec(),
+                    epoch: if seals { epoch - 2 } else { epoch },
+                    seals,
+                    settles: !seals,
+                    ..Default::default()
+                }],
+                proof: Vec::new(),
+            };
+            let checked = check(
+                frame,
+                &proof,
+                &state,
+                |_| Ok(Vec::new()),
+                |frame| Ok(frame as i64 * 1_000),
+                &context,
+            );
+            match checked {
+                Ok(_) => panic!("a part was accepted at frame {frame}"),
+                Err(error) => error.to_string(),
+            }
+        };
+        let (from, until) = storage_seat::settlement_window(epoch);
+        let cases = [
+            (
+                refusal(from - 1, &sealed, false),
+                "settles in frames",
+                RefusalKind::Early,
+            ),
+            (
+                refusal(registered_at + 1, &unsealed, true),
+                "is not yet before",
+                RefusalKind::Early,
+            ),
+            (
+                refusal(until, &sealed, false),
+                "frames past the deadline",
+                RefusalKind::Late,
+            ),
+            (
+                refusal(registered_at + 3, &sealed, true),
+                "is sealed",
+                RefusalKind::Duplicate,
+            ),
+            (
+                refusal(registered_at + 3, &unseated, true),
+                "no storage seat",
+                RefusalKind::Other,
+            ),
+        ];
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        for (refused, premise, kind) in cases {
+            assert!(refused.contains(premise), "premise: {refused}");
+            assert_eq!(refusal_kind(&refused), kind, "refusal kind: {refused}");
+        }
     }
 }
