@@ -125,14 +125,15 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// (materialization, recovery) time to take them. A reader that takes them
 /// later than that holds the window at the lowest view it still has to take
 /// ([`BlockStore::hold_from`]). Past `keep_bytes` after a finalization,
-/// the blocks of views below the latest `protected_views` views leave the
-/// window early, as over the byte cap. The candidates' bodies (of blocks no
-/// certificate names and this node never verified) have caps of their own,
-/// those of the sender holding the most going first, and so do the other bodies
-/// held beside a certified block's first while none is verified, the oldest
-/// views' first. Over the byte cap, the latter go first, then the blocks of
-/// views below the latest `protected_views` views, candidates before vouched
-/// blocks and the oldest views first, and only then the candidates' bodies of
+/// the verified or certified blocks of views below both the finalized view
+/// and the latest `protected_views` views leave the window early.
+/// The candidates' bodies (of blocks no certificate names and this node
+/// never verified) have caps of their own, those of the sender holding the
+/// most going first, and so do the other bodies held beside a certified
+/// block's first while none is verified, the oldest views' first. Over the byte
+/// cap, the latter go first, then the blocks of views below the latest
+/// `protected_views` views, candidates before vouched blocks and the oldest
+/// views first, and only then the candidates' bodies of
 /// later views: an application shard's finalized bodies older than the
 /// protected views thus go before a new proposal, and a later reader of one
 /// (recovery) reads it from storage or fetches it again. Over the block cap
@@ -165,9 +166,12 @@ impl WeakBlockStore {
 pub struct BlockStoreLimits {
     /// Views below the latest finalized view whose blocks are kept.
     pub keep_views: u64,
-    /// Bytes held at most after a finalization: past them, the blocks of
-    /// views below the protected ones, and below what a reader still has
-    /// to take, leave the window early, as they would over the byte cap.
+    /// Bytes held at most after a finalization: past them, the verified or
+    /// certified blocks of views below the finalized one, the protected ones
+    /// and what a reader still has to take leave the window early. While
+    /// finalization lags, the blocks above the finalized view stay past
+    /// them, bounded by the byte cap alone; candidates stay under their own
+    /// caps.
     pub keep_bytes: usize,
     /// Views below the latest certified view whose verified or certified
     /// blocks are never evicted over a cap.
@@ -223,12 +227,15 @@ impl BlockStoreLimits {
     /// window suffices. Its frames grew from about 4 MB to about 9 MB, and
     /// may reach 16 MiB: 128 views of 9 MB frames fill the byte cap. A
     /// finalization therefore keeps at most half the cap, 512 MiB, about 59
-    /// frames of 9 MB, the frames of views below the protected ones going
-    /// first. Of 16 MiB frames the 33 protected views alone take 528 MiB;
-    /// with the candidate budget full and a new proposal, 672 MiB stays
-    /// below three quarters of the cap (768 MiB), where the store warns.
-    /// With the alternates' budget full too the store passes that mark:
-    /// peers delivering bodies can raise the warn, at most once a minute.
+    /// frames of 9 MB, the finalized frames of views below the protected
+    /// ones going first. Of 16 MiB frames the 33 protected views alone take
+    /// 528 MiB; with the candidate budget full and a new proposal, 672 MiB
+    /// stays below three quarters of the cap (768 MiB), where the store
+    /// warns. With the alternates' budget full too the store passes that
+    /// mark: peers delivering bodies can raise the warn, at most once a
+    /// minute. So can finalization lagging: the certified frames above the
+    /// finalized view stay until the byte cap, as their finalization reads
+    /// them.
     pub fn global() -> Self {
         Self {
             keep_views: 128,
@@ -453,8 +460,9 @@ enum PressureLine {
     },
 }
 
-/// The lines one change of a store logs: what it evicted over a cap and
-/// its bytes nearing the byte cap.
+/// The lines one change of a store logs: what it evicted over a cap, what a
+/// finalization trimmed past `keep_bytes`, and its bytes nearing the byte
+/// cap.
 struct CapReport {
     scope: String,
     candidates: u64,
@@ -465,14 +473,42 @@ struct CapReport {
     max_bytes: usize,
     candidate_bytes: usize,
     alternate_bytes: usize,
+    keep_bytes: usize,
     since_previous: Option<std::time::Duration>,
     pressure: Option<PressureLine>,
+    trim: Option<WindowTrim>,
+}
+
+/// What a finalization took out of the window past `keep_bytes`: `blocks`
+/// of `bytes`, all of views below `floor`, when `finalized` finalized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowTrim {
+    blocks: u64,
+    bytes: u64,
+    floor: u64,
+    finalized: u64,
 }
 
 impl CapReport {
     fn log(&self) {
         if self.candidates > 0 || self.vouched > 0 {
             self.log_evictions();
+        }
+        if let Some(trim) = self.trim {
+            tracing::info!(
+                scope = %self.scope,
+                trimmed_blocks = trim.blocks,
+                trimmed_bytes = trim.bytes,
+                floor_view = trim.floor,
+                finalized_view = trim.finalized,
+                held_blocks = self.held_blocks,
+                held_bytes = self.held_bytes,
+                keep_bytes = self.keep_bytes,
+                "consensus block store trimmed verified or certified blocks of old views past \
+                 its byte budget at a finalization: only views below floor_view went; \
+                 held_bytes above keep_bytes are newer blocks and candidates, held until \
+                 they finalize, leave the window or the byte cap evicts them"
+            );
         }
         match self.pressure {
             Some(PressureLine::Above { lasted, peak }) => tracing::warn!(
@@ -926,17 +962,34 @@ impl Blocks {
         }
         self.certified_digests
             .retain(|_, certified| *certified >= below);
-        // Past `keep_bytes`, the blocks of old views leave the window early,
-        // so that frames larger than its views were sized for do not fill
-        // the byte cap: candidates first, then the oldest views.
-        let floor = self.eviction_floor();
+        // Past `keep_bytes`, the verified or certified blocks of old views
+        // leave the window early, so that frames larger than its views were
+        // sized for do not fill the byte cap, the oldest views first. Only
+        // views below the finalized one go: while finalization lags, a
+        // certified block above it is one its finalization still has to
+        // read, and only the byte cap bounds those. Candidates stay: a body
+        // is stored at the certified view when it arrives, only a lower
+        // bound of its block's view, so a member catching up holds peers'
+        // bodies of later views at old ones until their certificates come.
+        let floor = self.eviction_floor().min(anchor);
+        let mut trim = WindowTrim {
+            blocks: 0,
+            bytes: 0,
+            floor,
+            finalized: view,
+        };
         while self.bytes > self.limits.keep_bytes {
-            let Some(victim) = self.eviction_victim(|block| block.view < floor) else {
+            let Some(victim) = self.eviction_victim(|block| block.vouched() && block.view < floor)
+            else {
                 break;
             };
-            self.take(&victim);
+            if let Some(block) = self.take(&victim) {
+                trim.blocks += 1;
+                trim.bytes += block.size() as u64;
+            }
         }
-        self.cap_report(std::time::Instant::now())
+        let trim = (trim.blocks > 0).then_some(trim);
+        self.cap_report(std::time::Instant::now(), trim)
     }
 
     /// Blocks of views below this one may go over a cap: below the
@@ -1021,7 +1074,7 @@ impl Blocks {
             };
             self.evict(&victim);
         }
-        self.cap_report(std::time::Instant::now())
+        self.cap_report(std::time::Instant::now(), None)
     }
 
     /// The block to evict first among the `eligible`: candidates before
@@ -1049,8 +1102,13 @@ impl Blocks {
     }
 
     /// Evictions at most once per [`EVICTION_REPORT_INTERVAL`], the first
-    /// after a quiet interval at once; and the [`PressureLine`] due.
-    fn cap_report(&mut self, now: std::time::Instant) -> Option<CapReport> {
+    /// after a quiet interval at once; the [`PressureLine`] due; and `trim`,
+    /// a finalization's trim of the window past `keep_bytes`.
+    fn cap_report(
+        &mut self,
+        now: std::time::Instant,
+        trim: Option<WindowTrim>,
+    ) -> Option<CapReport> {
         let pressure = self.pressure_line(now);
         let since_previous = self
             .evicted
@@ -1058,7 +1116,7 @@ impl Blocks {
             .map(|last| now.saturating_duration_since(last));
         let evictions = (self.evicted.candidates > 0 || self.evicted.vouched > 0)
             && since_previous.is_none_or(|elapsed| elapsed >= EVICTION_REPORT_INTERVAL);
-        if !evictions && pressure.is_none() {
+        if !evictions && pressure.is_none() && trim.is_none() {
             return None;
         }
         let (candidates, vouched, bytes) = if evictions {
@@ -1081,8 +1139,10 @@ impl Blocks {
             max_bytes: self.limits.max_bytes,
             candidate_bytes: self.candidate_bytes,
             alternate_bytes: self.certified_alternate_bytes,
+            keep_bytes: self.limits.keep_bytes,
             since_previous,
             pressure,
+            trim,
         })
     }
 
@@ -1304,7 +1364,11 @@ impl BlockStore {
     }
 
     /// `view` finalized: drop the blocks more than `keep_views` below it, or
-    /// below the view the hold reports if that is lower.
+    /// below the view the hold reports if that is lower. Past `keep_bytes`
+    /// ([`BlockStoreLimits::keep_bytes`]), the verified or certified blocks
+    /// of views below `view`, the protected views and the held view go too,
+    /// the oldest views first; one line reports such a trim. Candidates and
+    /// the blocks of `view` and above stay.
     pub fn finalized(&self, view: u64) {
         // Asked outside the store's lock: the reader takes its own lock, and
         // holds it while it reads the store.
@@ -3158,6 +3222,183 @@ mod block_store_bound_tests {
         }
     }
 
+    /// Seal and certify a frame of `frame` bytes for each view while
+    /// finalization lags: no finalization names them.
+    fn fill_certified(store: &BlockStore, views: std::ops::RangeInclusive<u32>, frame: usize) {
+        for view in views {
+            store.observe_certificate(view.into());
+            store.seal(digest_n(view), vec![0; frame]);
+            store.certified(&digest_n(view), view.into());
+        }
+    }
+
+    /// GLOBAL's history of `MAX_GLOBAL_FRAME` frames finalized to view
+    /// `finalized`, then the frames of the next `lag + 1` views certified
+    /// and the first of them finalized: its finalization leaves `lag`
+    /// certified frames above it. Returns the store, the history still held
+    /// before that finalization, and the newly finalized view.
+    fn lag_finalization(lag: u32) -> (BlockStore, usize, u32) {
+        let limits = BlockStoreLimits::global();
+        let finalized = 2 * limits.keep_views as u32;
+        let next = finalized + 1;
+        let store = BlockStore::with_limits(limits, "GLOBAL");
+        fill_frames(&store, 1..=finalized, MAX_GLOBAL_FRAME);
+        fill_certified(&store, next..=next + lag, MAX_GLOBAL_FRAME);
+        let history = held(&store, 1..=finalized);
+        assert_eq!(
+            held(&store, next..=next + lag) as u32,
+            lag + 1,
+            "rig check: every certified frame held before {next} finalizes"
+        );
+        assert!(history > 0, "rig check: finalized history to trim");
+        println!("REACH global-lag {lag}");
+        store.finalized(next.into());
+        (store, history, next)
+    }
+
+    /// While finalization lags, the byte budget trims finalized frames
+    /// only: a certified frame above the finalized view is one its own
+    /// finalization still reads. Trimmed at the certified view's protected
+    /// floor, 16 MiB frames 40 views behind lost the next frames to
+    /// finalize, which then waited on peers.
+    #[test]
+    fn lagging_finalization_keeps_every_unfinalized_certified_frame() {
+        let lag = 40;
+        let (store, _, next) = lag_finalization(lag);
+        let unfinalized = held(&store, next + 1..=next + lag) as u32;
+        assert_eq!(
+            unfinalized,
+            lag,
+            "GLOBAL-LAG: {} of {lag} certified 16 MiB frames above finalized view {next} went",
+            lag - unfinalized
+        );
+        assert!(
+            store.get(&digest_n(next)).is_some(),
+            "GLOBAL-LAG: the frame of finalized view {next} went"
+        );
+        assert_eq!(
+            held(&store, 1..next),
+            0,
+            "the trim leaves finalized history while the store is past its byte budget"
+        );
+    }
+
+    /// At a lag of exactly 32 views, the protected views' floor is the
+    /// finalized view; at 33 it is above it, and the trim must stop at the
+    /// finalized view all the same, after every frame of the history below.
+    #[test]
+    fn trim_at_the_lag_edges_keeps_the_finalized_view_and_above() {
+        for lag in [32, 33] {
+            let (store, history, next) = lag_finalization(lag);
+            let kept = held(&store, next..=next + lag) as u32;
+            assert_eq!(
+                kept,
+                lag + 1,
+                "GLOBAL-LAG: at a lag of {lag} views {} frames of finalized view {next} or \
+                 above went",
+                lag + 1 - kept
+            );
+            assert_eq!(
+                held(&store, 1..next),
+                0,
+                "at a lag of {lag} views the trim left finalized history ({history} frames \
+                 before)"
+            );
+        }
+    }
+
+    /// A store at exactly `keep_bytes` keeps every block; one byte past it,
+    /// a finalization trims the oldest view's block, and its report names
+    /// the blocks, bytes and floor of the trim for its line.
+    #[test]
+    fn trim_starts_one_byte_past_keep_bytes_and_reports_it() {
+        let limits = BlockStoreLimits {
+            keep_bytes: 8 << 10,
+            protected_views: 2,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        fill_frames(&store, 1..=7, 1 << 10);
+        let finalize = |view: u32, frame: usize| {
+            store.observe_certificate(view.into());
+            store.seal(digest_n(view), vec![0; frame]);
+            store.certified(&digest_n(view), view.into());
+            store
+                .inner
+                .lock()
+                .finalize(view.into(), None)
+                .and_then(|report| report.trim)
+        };
+        let trim = finalize(8, 1 << 10);
+        println!("REACH window-trim");
+        assert_eq!(
+            store.usage(),
+            (8, 8 << 10),
+            "TRIM-EDGE: a block went at keep_bytes"
+        );
+        assert_eq!(trim, None, "TRIM-EDGE: a trim reported at keep_bytes");
+        let trim = finalize(9, 1);
+        assert_eq!(
+            store.usage(),
+            (8, (7 << 10) + 1),
+            "TRIM-EDGE: one byte past keep_bytes, not the oldest block alone went"
+        );
+        assert_eq!(held(&store, 2..=9), 8);
+        assert_eq!(
+            trim,
+            Some(WindowTrim {
+                blocks: 1,
+                bytes: 1 << 10,
+                floor: 7,
+                finalized: 9,
+            }),
+            "TRIM-EDGE: the trim's report"
+        );
+    }
+
+    /// A member that is catching up stores a peer's body of a later view
+    /// at its own certified view, only a lower bound of the block's view,
+    /// until a certificate names it. Finalizations that pass that view past
+    /// `keep_bytes` must leave the body: the next certificates need it, and
+    /// trimmed, it was fetched from peers again.
+    #[test]
+    fn trim_past_keep_bytes_keeps_a_body_stored_at_an_old_view() {
+        let limits = BlockStoreLimits {
+            keep_bytes: 8 << 10,
+            protected_views: 2,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        fill_frames(&store, 1..=4, 1 << 10);
+        let early = digest_n(10);
+        store.put_from(early, vec![7; 4 << 10], b"peer");
+        let stored_view = || store.inner.lock().map.get(&early).map(|block| block.view);
+        assert_eq!(
+            stored_view(),
+            Some(4),
+            "rig check: the body is held at the certified view"
+        );
+        fill_frames(&store, 5..=8, 1 << 10);
+        println!("REACH trim-early-body");
+        let floor = store.inner.lock().eviction_floor().min(8);
+        assert!(
+            stored_view().is_none_or(|view| view < floor),
+            "rig check: the body's view is below the trim's floor ({floor})"
+        );
+        assert!(
+            held(&store, 1..=8) < 8,
+            "rig check: the finalizations trimmed past keep_bytes"
+        );
+        store.certified(&early, 10);
+        assert!(
+            store
+                .get(&early)
+                .is_some_and(|body| body.len() == 4 << 10 && body.iter().all(|byte| *byte == 7)),
+            "TRIM-EARLY: the trim took a peer's body stored at view 4 before its \
+             certificate of view 10 arrived"
+        );
+    }
+
     /// Whether `digest`'s body is the leader's frame of `GLOBAL_FRAME` ones.
     fn holds_leader_frame(store: &BlockStore, digest: &Digest) -> bool {
         store
@@ -3415,7 +3656,7 @@ mod block_store_bound_tests {
         let secs = std::time::Duration::from_secs;
         let line = |blocks: &mut Blocks, at: u64| {
             blocks
-                .cap_report(start + secs(at))
+                .cap_report(start + secs(at), None)
                 .and_then(|report| report.pressure)
         };
         for n in 1..=4u32 {
