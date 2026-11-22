@@ -21,6 +21,7 @@ pub mod pqnoise_channel;
 pub mod prover_counts;
 pub mod proxy_pubsub;
 pub mod pubsub_proxy;
+mod queue_place;
 pub mod quil_tls;
 pub mod reachability;
 pub mod shard_info_refresh;

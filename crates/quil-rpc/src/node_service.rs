@@ -96,12 +96,16 @@ pub fn legacy_coins_response(
 
 // Rebuilding an entire domain accumulator is CPU/memory intensive. Acquire
 // before spawning, and retain the permit in the worker even if the RPC cancels.
-static COIN_WITNESS_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const COIN_WITNESS_SLOTS: usize = 2;
+static COIN_WITNESS_WORKERS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(COIN_WITNESS_SLOTS);
 // A scan or escrow page is one bounded read of a retained snapshot. Every
 // wallet whose own node lacks the application pages through an archive, and
 // with two shared slots and no queue a few wallets refused everyone else
 // ("no node serving application ... answered this node").
-static COIN_SCAN_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+const COIN_SCAN_SLOTS: usize = 8;
+static COIN_SCAN_WORKERS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(COIN_SCAN_SLOTS);
 static COIN_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// How long a coin read waits for a worker before the node answers busy.
 const COIN_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -117,27 +121,189 @@ static RETRO_SENIORITY_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::
 /// briefly under the commit lock, so they run one at a time.
 static MINT_STATUS_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+/// Coin reads since the last summary, by how they got a worker or why not.
+struct CoinReadCounts {
+    at_once: AtomicU64,
+    after_wait: AtomicU64,
+    refused_queue_full: AtomicU64,
+    refused_after_wait: AtomicU64,
+    /// Cancelled by their caller while waiting.
+    abandoned: AtomicU64,
+    peak_waiting: std::sync::atomic::AtomicUsize,
+}
+
+static COIN_READS: CoinReadCounts = CoinReadCounts {
+    at_once: AtomicU64::new(0),
+    after_wait: AtomicU64::new(0),
+    refused_queue_full: AtomicU64::new(0),
+    refused_after_wait: AtomicU64::new(0),
+    abandoned: AtomicU64::new(0),
+    peak_waiting: std::sync::atomic::AtomicUsize::new(0),
+};
+
 /// A worker slot from `workers`, waiting briefly in a bounded queue when all
 /// are busy.
 async fn coin_read_permit(
     workers: &'static tokio::sync::Semaphore,
     what: &str,
 ) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
-    use std::sync::atomic::Ordering;
     if let Ok(permit) = workers.try_acquire() {
+        COIN_READS.at_once.fetch_add(1, Ordering::Relaxed);
         return Ok(permit);
     }
     let busy = || Status::resource_exhausted(format!("{what} workers busy; retry later"));
-    if COIN_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_COIN_READ_WAITERS {
-        COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    // A cancelled RPC drops this future mid-wait; the place still leaves.
+    let Some(place) =
+        crate::queue_place::QueuePlace::take(&COIN_READ_WAITERS, MAX_COIN_READ_WAITERS)
+    else {
+        COIN_READS
+            .refused_queue_full
+            .fetch_add(1, Ordering::Relaxed);
         return Err(busy());
-    }
+    };
+    let place = place.abandoned_into(&COIN_READS.abandoned);
+    COIN_READS
+        .peak_waiting
+        .fetch_max(place.queued(), Ordering::Relaxed);
     let acquired = tokio::time::timeout(COIN_READ_WAIT, workers.acquire()).await;
-    COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    place.leave();
     match acquired {
-        Ok(Ok(permit)) => Ok(permit),
-        _ => Err(busy()),
+        Ok(Ok(permit)) => {
+            COIN_READS.after_wait.fetch_add(1, Ordering::Relaxed);
+            Ok(permit)
+        }
+        _ => {
+            COIN_READS
+                .refused_after_wait
+                .fetch_add(1, Ordering::Relaxed);
+            Err(busy())
+        }
     }
+}
+
+/// Coin reads (wallet scans, legacy pages, witnesses, mint status) a node
+/// served to wallets since the last call, and its slots and queue now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoinReadInterval {
+    /// Slots held now, of `COIN_SCAN_SLOTS` scan, `COIN_WITNESS_SLOTS`
+    /// witness and 1 mint status.
+    pub scan_held: usize,
+    pub witness_held: usize,
+    pub mint_status_held: usize,
+    /// Reads waiting for a slot now, and the most at once this interval.
+    pub waiting: usize,
+    pub peak_waiting: usize,
+    pub at_once: u64,
+    pub after_wait: u64,
+    /// Refused at once: `MAX_COIN_READ_WAITERS` already waited.
+    pub refused_queue_full: u64,
+    /// Refused after waiting `COIN_READ_WAIT` for a slot.
+    pub refused_after_wait: u64,
+    pub abandoned: u64,
+}
+
+impl CoinReadInterval {
+    /// The counts since the last call; each call starts a new interval.
+    pub fn take() -> Self {
+        let take = |count: &AtomicU64| count.swap(0, Ordering::Relaxed);
+        let held = |workers: &tokio::sync::Semaphore, slots: usize| {
+            slots.saturating_sub(workers.available_permits())
+        };
+        let waiting = COIN_READ_WAITERS.load(Ordering::Relaxed);
+        Self {
+            scan_held: held(&COIN_SCAN_WORKERS, COIN_SCAN_SLOTS),
+            witness_held: held(&COIN_WITNESS_WORKERS, COIN_WITNESS_SLOTS),
+            mint_status_held: held(&MINT_STATUS_WORKER, 1),
+            waiting,
+            peak_waiting: COIN_READS
+                .peak_waiting
+                .swap(waiting, Ordering::Relaxed)
+                .max(waiting),
+            at_once: take(&COIN_READS.at_once),
+            after_wait: take(&COIN_READS.after_wait),
+            refused_queue_full: take(&COIN_READS.refused_queue_full),
+            refused_after_wait: take(&COIN_READS.refused_after_wait),
+            abandoned: take(&COIN_READS.abandoned),
+        }
+    }
+
+    fn refused(&self) -> u64 {
+        self.refused_queue_full + self.refused_after_wait
+    }
+
+    /// The summary's level: none for an idle node, warn when it refused.
+    fn level(&self) -> Option<tracing::Level> {
+        if self.refused() > 0 {
+            Some(tracing::Level::WARN)
+        } else if *self == Self::default() {
+            None
+        } else {
+            Some(tracing::Level::INFO)
+        }
+    }
+
+    fn log(&self, seconds: u64) {
+        macro_rules! summary {
+            ($level:ident, $message:literal) => {
+                tracing::$level!(
+                    interval_s = seconds,
+                    scan_held = self.scan_held,
+                    witness_held = self.witness_held,
+                    mint_status_held = self.mint_status_held,
+                    waiting = self.waiting,
+                    peak_waiting = self.peak_waiting,
+                    at_once = self.at_once,
+                    after_wait = self.after_wait,
+                    refused_queue_full = self.refused_queue_full,
+                    refused_after_wait = self.refused_after_wait,
+                    abandoned = self.abandoned,
+                    $message
+                )
+            };
+        }
+        match self.level() {
+            Some(tracing::Level::WARN) => summary!(
+                warn,
+                "coin reads refused busy: wallets retry and scan slowly; if \
+                 refusals persist, check this host's CPU and store I/O (slow \
+                 pages hold the slots) and how many wallets scan through it"
+            ),
+            Some(_) => summary!(info, "coin reads served"),
+            None => {}
+        }
+    }
+}
+
+/// Coin reads are summarized at most this often.
+pub const COIN_READ_SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Log the coin reads since the last summary, once `COIN_READ_SUMMARY_EVERY`
+/// has passed; the first call only starts the interval, so the first summary
+/// also counts reads served before it. Call it from a periodic tick.
+pub fn log_coin_reads() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(elapsed) = coin_read_summary_due(&mut last, std::time::Instant::now()) {
+        CoinReadInterval::take().log(elapsed.as_secs());
+    }
+}
+
+/// The time since the summary before when one is due at `now`, which then
+/// starts the next interval; the first call only starts one.
+fn coin_read_summary_due(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let Some(since) = *last else {
+        *last = Some(now);
+        return None;
+    };
+    let elapsed = now.saturating_duration_since(since);
+    if elapsed < COIN_READ_SUMMARY_EVERY {
+        return None;
+    }
+    *last = Some(now);
+    Some(elapsed)
 }
 
 /// One page of a wallet scan as a provider answers it.
@@ -2108,6 +2274,158 @@ mod coin_witness_tests {
         drop(release);
         let error = second.await.unwrap().unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+}
+
+#[cfg(test)]
+mod coin_read_queue_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Semaphore;
+
+    /// Yields until `count` reads `want`; the paused clock never moves.
+    async fn until_counted(count: &AtomicUsize, want: usize) {
+        for _ in 0..1_000_000 {
+            if count.load(Ordering::Relaxed) == want {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the queue never counted {want} (counts {})",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
+    /// The first call starts the interval; a summary is due once 300 s have
+    /// passed since, and that summary starts the next interval.
+    #[test]
+    fn a_coin_read_summary_is_due_once_its_interval_has_passed() {
+        let secs = std::time::Duration::from_secs;
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert_eq!(
+            coin_read_summary_due(&mut last, start),
+            None,
+            "the first call only starts the interval"
+        );
+        println!("REACH coin-read-queue summary gate");
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(299)),
+            None,
+            "no summary before 300 s"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(300)),
+            Some(secs(300)),
+            "a summary is due at 300 s"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(599)),
+            None,
+            "the summary starts the next interval"
+        );
+        assert_eq!(
+            coin_read_summary_due(&mut last, start + secs(600)),
+            Some(secs(300))
+        );
+    }
+
+    /// A wallet that resets its stream while its coin read waits for a slot
+    /// gives its queue place back. A place once stayed counted for the life
+    /// of the process; once 128 were, a read that found every slot busy was
+    /// refused at once instead of waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiting_coin_read_gives_its_queue_place_back() {
+        static NO_SLOT: Semaphore = Semaphore::const_new(0);
+        let waiting: Vec<_> = (0..MAX_COIN_READ_WAITERS)
+            .map(|_| tokio::spawn(coin_read_permit(&NO_SLOT, "coin scan")))
+            .collect();
+        until_counted(&COIN_READ_WAITERS, MAX_COIN_READ_WAITERS).await;
+        let full = coin_read_permit(&NO_SLOT, "coin scan").await.unwrap_err();
+        assert_eq!(full.code(), tonic::Code::ResourceExhausted);
+        for read in &waiting {
+            read.abort();
+        }
+        for read in waiting {
+            assert!(read.await.unwrap_err().is_cancelled());
+        }
+        println!("REACH coin-read-queue cancelled waiters");
+        assert_eq!(
+            COIN_READ_WAITERS.load(Ordering::Relaxed),
+            0,
+            "cancelled coin reads still hold their queue places"
+        );
+        let next = tokio::spawn(coin_read_permit(&NO_SLOT, "coin scan"));
+        until_counted(&COIN_READ_WAITERS, 1).await;
+        NO_SLOT.add_permits(1);
+        assert!(next.await.unwrap().is_ok(), "a later read waits for a slot");
+    }
+
+    /// One summary per interval: the reads by outcome, then a fresh count.
+    /// Refusals warn; an idle node logs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn coin_reads_are_summarized_per_interval_and_refusals_warn() {
+        static NO_SLOT: Semaphore = Semaphore::const_new(0);
+        let busy = |result: Result<tokio::sync::SemaphorePermit<'static>, Status>| {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        };
+        CoinReadInterval::take();
+        let held = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan")
+            .await
+            .unwrap();
+        // The paused clock runs through the wait once the runtime idles.
+        busy(coin_read_permit(&NO_SLOT, "coin scan").await);
+        let cancelled = tokio::spawn(coin_read_permit(&NO_SLOT, "coin scan"));
+        until_counted(&COIN_READ_WAITERS, 1).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let queue: Vec<_> = (0..MAX_COIN_READ_WAITERS)
+            .map(|_| {
+                crate::queue_place::QueuePlace::take(&COIN_READ_WAITERS, MAX_COIN_READ_WAITERS)
+                    .unwrap()
+            })
+            .collect();
+        busy(coin_read_permit(&NO_SLOT, "coin scan").await);
+        drop(queue);
+        let interval = CoinReadInterval::take();
+        println!("REACH coin-read-queue summary {interval:?}");
+        assert_eq!(
+            interval,
+            CoinReadInterval {
+                scan_held: 1,
+                peak_waiting: 1,
+                at_once: 1,
+                refused_queue_full: 1,
+                refused_after_wait: 1,
+                abandoned: 1,
+                ..Default::default()
+            },
+            "the interval counts each outcome"
+        );
+        assert_eq!(
+            interval.level(),
+            Some(tracing::Level::WARN),
+            "refusals warn"
+        );
+
+        let queued = tokio::spawn(coin_read_permit(&NO_SLOT, "coin scan"));
+        until_counted(&COIN_READ_WAITERS, 1).await;
+        NO_SLOT.add_permits(1);
+        drop(queued.await.unwrap().unwrap());
+        drop(held);
+        let next = CoinReadInterval::take();
+        assert_eq!(
+            next,
+            CoinReadInterval {
+                peak_waiting: 1,
+                after_wait: 1,
+                ..Default::default()
+            },
+            "each interval counts afresh"
+        );
+        assert_eq!(next.level(), Some(tracing::Level::INFO));
+        assert_eq!(CoinReadInterval::take().level(), None, "an idle node");
     }
 }
 
