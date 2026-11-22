@@ -27,7 +27,7 @@ use quil_rpc::reachability::{ip_class, IpClass};
 use quil_types::proto::diagnostics::{
     Blocker, ConditionKind, ConditionSeverity, CpuVendor, GetHealthReportRequest, HealthConditions,
     HealthReport, MacFamily, Machine, Phase, RecoveryFailure, RecoveryPhase, StoreIoHealth,
-    StoreIoVerdict, StoreSpace, WorkerHealth,
+    StoreIoVerdict, StoreSpace, WorkerBuild, WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -62,10 +62,12 @@ pub enum DiagnosticsCommand {
     /// generation of the shard's session in committed GLOBAL state as the
     /// target sees it, ADVANCE the age of LOCAL's last advance (unobserved:
     /// none since the engine started), SEAL the session's finalized seal and
-    /// whether GLOBAL recorded it, RECOVERY the archive recovery phase and
-    /// its attempts since the engine started, with failed attempts by class
-    /// and the longest wait for a recovery turn. Ages are <60s or >60s
-    /// before the report, on the target's clock. The Store I/O line gives
+    /// whether GLOBAL recorded it, BUILD the release and source commit the
+    /// worker's process runs (unknown while it runs no engine and from
+    /// workers or nodes that predate it), RECOVERY the archive recovery
+    /// phase and its attempts since the engine started, with failed attempts
+    /// by class and the longest wait for a recovery turn. Ages are <60s
+    /// or >60s before the report, on the target's clock. The Store I/O line gives
     /// the latest minute's master store canary reads and disk await, and
     /// whether they are too slow; the Store space line the free space of
     /// the master store's disk, the size of the stores and of the storage
@@ -541,18 +543,54 @@ pub(crate) fn render_addresses(
 }
 
 fn release(report: &HealthReport) -> String {
-    if report.version.len() != 3 {
+    release_text(&report.version, report.patch, report.subpatch)
+}
+
+/// `version.patch[.subpatch]`, or `unknown` without 3 version bytes.
+fn release_text(version: &[u8], patch: u32, subpatch: u32) -> String {
+    if version.len() != 3 {
         return "unknown".into();
     }
-    let mut release = format!(
-        "{}.{}",
-        quil_config::format_version(&report.version),
-        report.patch
-    );
-    if report.subpatch > 0 {
-        release += &format!(".{}", report.subpatch);
+    let mut release = format!("{}.{patch}", quil_config::format_version(version));
+    if subpatch > 0 {
+        release += &format!(".{subpatch}");
     }
     release
+}
+
+/// A build as the BUILD column gives it: its release and the first 4 bytes
+/// of its source commit, `+dirty` appended when tracked files differed
+/// from it, the commit left out when the build read none.
+fn worker_build(build: &WorkerBuild) -> String {
+    let release = release_text(&build.version, build.patch, build.subpatch);
+    match build.commit.as_slice() {
+        [] => release,
+        id => {
+            let dirty = if build.dirty { "+dirty" } else { "" };
+            format!("{release} {}{dirty}", hex::encode(&id[..id.len().min(4)]))
+        }
+    }
+}
+
+/// The report's own build as the BUILD column gives it.
+fn node_build(report: &HealthReport) -> String {
+    worker_build(&WorkerBuild {
+        version: report.version.clone(),
+        patch: report.patch,
+        subpatch: report.subpatch,
+        commit: report.build_commit.clone().unwrap_or_default(),
+        dirty: report.build_dirty,
+    })
+}
+
+/// A worker's BUILD cell: the build it reports, the node's (`node`) when
+/// it reports that one, `unknown` when the report names none.
+fn build_cell(worker: &WorkerHealth, node: &str) -> String {
+    match (&worker.build, worker.build_is_node) {
+        (Some(build), _) => worker_build(build),
+        (None, true) => node.into(),
+        (None, false) => "unknown".into(),
+    }
 }
 
 /// The age of `at` at the time of the report.
@@ -624,7 +662,7 @@ fn recovery(worker: &WorkerHealth, now: u64) -> String {
     text
 }
 
-const COLUMNS: [(&str, bool); 11] = [
+const COLUMNS: [(&str, bool); 12] = [
     ("CORE", true),
     ("ALLOC", false),
     ("PHASE", false),
@@ -634,6 +672,7 @@ const COLUMNS: [(&str, bool); 11] = [
     ("GEN", false),
     ("ADVANCE", false),
     ("SEAL", false),
+    ("BUILD", false),
     ("FILTER", false),
     ("RECOVERY", false),
 ];
@@ -648,7 +687,7 @@ fn join_reason(worker: &WorkerHealth) -> Option<String> {
     }
 }
 
-fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
+fn row(worker: &WorkerHealth, now: u64, node: &str) -> [String; 12] {
     let blocker = Blocker::try_from(worker.blocker).map_or("unrecognized", diag::blocker_text);
     let waiting = worker.phase == Phase::Waiting as i32;
     let mut reason = match (join_reason(worker), worker.awaited_frame) {
@@ -693,6 +732,7 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
             .map_or_else(|| "-".into(), |generation| format!("g{generation}")),
         age(worker.last_advance_unix_ms, now).into(),
         seal,
+        build_cell(worker, node),
         if worker.filter.is_empty() {
             "-".into()
         } else {
@@ -983,10 +1023,11 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         let _ = writeln!(out, "No data workers reported.");
         return out;
     }
-    let rows: Vec<[String; 11]> = report
+    let node = node_build(report);
+    let rows: Vec<[String; 12]> = report
         .workers
         .iter()
-        .map(|w| row(w, report.generated_unix_ms))
+        .map(|w| row(w, report.generated_unix_ms, &node))
         .collect();
     let mut widths = COLUMNS.map(|(title, _)| title.len());
     for row in &rows {
@@ -1095,6 +1136,7 @@ mod tests {
             recovery_phase_since_unix_ms: NOW - 600_000,
             recovery_attempts: 1,
             last_success_unix_ms: NOW - 600_000,
+            build_is_node: true,
             ..Default::default()
         };
         serving.set_phase(Phase::Serving);
@@ -1140,9 +1182,9 @@ mod tests {
         let b2 = "b2".repeat(32);
         assert_eq!(text, format!("\
 Health report of …Ab12cd: release 2.1.0.25.88, build abababab, commit not reported, GLOBAL head frame 90001; 2 workers.
-CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL                FILTER                                                            RECOVERY
-   1  yes    serve    -                   1204       1204  g7   <60s     -                   {a1}  idle >60s, attempts 1 (0 failing in a row)
-  12  yes    blocked  state unavailable   1180       1204  g7   >60s     g6 awaiting GLOBAL  {b2}  installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 archive_state:1, last failure connect <60s, longest turn wait 95s
+CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL                BUILD        FILTER                                                            RECOVERY
+   1  yes    serve    -                   1204       1204  g7   <60s     -                   2.1.0.25.88  {a1}  idle >60s, attempts 1 (0 failing in a row)
+  12  yes    blocked  state unavailable   1180       1204  g7   >60s     g6 awaiting GLOBAL  unknown      {b2}  installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 archive_state:1, last failure connect <60s, longest turn wait 95s
 "));
     }
 
@@ -1162,7 +1204,7 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             lines[0]
         );
         assert!(lines[2].contains(" stale "), "{}", lines[2]);
-        assert_eq!(lines[3], "   3  no     unobserved  -           -          -  -    unobserved  -     -                                                                 -");
+        assert_eq!(lines[3], "   3  no     unobserved  -           -          -  -    unobserved  -     unknown      -                                                                 -");
     }
 
     /// A joining worker says what it awaits instead of reading as
@@ -1741,6 +1783,104 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         assert!(
             text.contains(", build abababab, commit 0123abcd+dirty, GLOBAL head frame"),
             "COMMIT-RENDER-WIRE: {text}"
+        );
+    }
+
+    /// A worker's build names its release and the first 4 bytes of its
+    /// commit, marked when dirty; a build that read no commit gives only
+    /// its release, and the node's own build reads as the report's.
+    #[test]
+    fn a_worker_build_names_its_release_and_commit() {
+        let mut build = WorkerBuild {
+            version: vec![2, 1, 0],
+            patch: 26,
+            subpatch: 3,
+            commit: [0x01, 0x23, 0xab, 0xcd].repeat(5),
+            dirty: true,
+        };
+        let mut worker = WorkerHealth {
+            build: Some(build.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_cell(&worker, "node"),
+            "2.1.0.26.3 0123abcd+dirty",
+            "worker_build_text"
+        );
+        build.dirty = false;
+        assert_eq!(
+            worker_build(&build),
+            "2.1.0.26.3 0123abcd",
+            "worker_build_text"
+        );
+        build.commit.clear();
+        assert_eq!(worker_build(&build), "2.1.0.26.3", "worker_build_text");
+        // The node's own build, sent as a flag, reads as the report's.
+        worker.build = None;
+        worker.build_is_node = true;
+        let mut node = report(vec![worker], 0);
+        node.build_commit = Some([0x45, 0x67, 0x89, 0xab].repeat(5));
+        let text = render_report("…Ab12cd", &node);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("   0  no ")
+                    && line.contains("  2.1.0.25.88 456789ab  ")),
+            "node_build_text: {text}"
+        );
+    }
+
+    /// A worker as a node that predates its build sends it, by wire tag
+    /// only.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldWorker {
+        #[prost(uint32, tag = "1")]
+        core_id: u32,
+        #[prost(bool, tag = "3")]
+        allocated: bool,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldWorkerReport {
+        #[prost(bytes = "vec", tag = "2")]
+        version: Vec<u8>,
+        #[prost(message, repeated, tag = "8")]
+        workers: Vec<OldWorker>,
+    }
+
+    /// A worker from a node that predates the field renders its build as
+    /// unknown, and a node that predates it reads a report with one.
+    #[test]
+    fn an_old_peer_worker_renders_build_unknown() {
+        use prost::Message as _;
+        let old = OldWorkerReport {
+            version: vec![2, 1, 0],
+            workers: vec![OldWorker {
+                core_id: 5,
+                allocated: true,
+            }],
+        };
+        let decoded = HealthReport::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.workers[0].build, None);
+        let text = render_report("…Ab12cd", &decoded);
+        let mut lines = text.lines().skip_while(|line| !line.starts_with("CORE"));
+        let (header, worker) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+        let column = header.find("BUILD").expect("no BUILD column");
+        assert_eq!(
+            worker
+                .get(column..)
+                .and_then(|cells| cells.split_whitespace().next()),
+            Some("unknown"),
+            "build_not_unknown: {text}"
+        );
+        let mut new = decoded;
+        new.workers[0].build = Some(WorkerBuild {
+            version: vec![2, 1, 0],
+            patch: 26,
+            ..Default::default()
+        });
+        assert_eq!(
+            OldWorkerReport::decode(new.encode_to_vec().as_slice()).unwrap(),
+            old
         );
     }
 

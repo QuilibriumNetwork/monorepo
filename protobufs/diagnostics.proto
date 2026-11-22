@@ -176,6 +176,32 @@ message WorkerHealth {
   // Above the node's configured worker count: the worker takes no new seat
   // or join and stops once it holds none. Readers that predate it ignore it.
   bool draining = 25;
+  // The build the worker's process runs, as the worker reports it, when it
+  // differs from the node's own; absent when it is the node's
+  // (`build_is_node`), while the worker runs no engine, when its version is
+  // not 3 bytes or its commit exceeds 32 bytes, and from workers or nodes
+  // that predate it.
+  WorkerBuild build = 26;
+  // The worker reports the node's own build, the release and source commit
+  // this report gives: a flag instead of a copy keeps the report small.
+  // A peer gets neither field unless its grant listed them.
+  bool build_is_node = 27;
+}
+
+// The build a worker's process runs, as it reports it: the same release
+// and source commit a `HealthReport` gives for its node. A worker in the
+// node's process reports the node's build; a standalone worker its own.
+message WorkerBuild {
+  // The release, `version.patch.subpatch`: 3 version bytes.
+  bytes version = 1;
+  uint32 patch = 2;
+  // 0 when the build has no subpatch counter.
+  uint32 subpatch = 3;
+  // The source commit's object ID bytes; empty when the build could not
+  // read one.
+  bytes commit = 4;
+  // Tracked files differed from that commit when the worker was built.
+  bool dirty = 5;
 }
 
 message HealthReport {

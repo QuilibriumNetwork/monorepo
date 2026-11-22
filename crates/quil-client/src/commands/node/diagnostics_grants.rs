@@ -38,8 +38,9 @@ health conditions \
 (kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
 a slow store fsync time, the GLOBAL frames an expected wait ends at, and for GLOBAL's progress \
 its head, its recent frame rate and how many GLOBAL provers this node hears); and per worker \
-its core ID, public shard filter, allocation, phase, blocker, frames, committee generation, \
-recovery state and failure counts, and when these last changed.\n\
+its core ID, worker build (release and source commit), public shard filter, allocation, phase, \
+blocker, frames, committee generation, recovery state and failure counts, and when these last \
+changed.\n\
 It gets no log text, addresses or keys, and no condition about this node's rewards or \
 addresses.\n";
 
@@ -69,6 +70,20 @@ its core ID, public shard filter, allocation, phase, blocker, frames, committee 
 recovery state and failure counts, and when these last changed.\n\
 It gets no log text, addresses or keys, and no condition about this node's rewards or \
 addresses.\n",
+    "It gets, per request: this node's release, build fingerprint and source commit, GLOBAL head \
+frame, worker count, store write state and store and disk read times; its stores' and storage \
+labels' disk size, free space and size on disk, and how often labels were refused disk \
+space at a snapshot since it started; its machine's Mac model and CPU vendor as numbers, core \
+counts and how often its CPU throttled for heat (no name, serial number, hostname or UUID); its \
+health conditions \
+(kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
+a slow store fsync time, the GLOBAL frames an expected wait ends at, and for GLOBAL's progress \
+its head, its recent frame rate and how many GLOBAL provers this node hears); and per worker \
+its core ID, worker build (release and source commit), public shard filter, allocation, phase, \
+blocker, frames, committee generation, recovery state and failure counts, and when these last \
+changed.\n\
+It gets no log text, addresses or keys, and no condition about this node's rewards or \
+addresses.\n",
 ];
 
 /// The field groups each consent level adds to the one before, as its
@@ -83,6 +98,7 @@ const ADDED_AT: [&[&str]; HEALTH_REPORT_CONSENT as usize + 1] = [
         "machine",
         "source commit",
     ],
+    &["worker build"],
 ];
 
 /// What a grant at consent `level` does not get: the groups each later
@@ -419,9 +435,15 @@ mod tests {
     fn the_list_shows_each_grants_state_and_the_log_request_peers() {
         let mut report = HealthReportConfig {
             enabled: true,
-            allowed_peers: vec!["QmEnded".into(), "QmLeft".into(), "QmHand".into()],
+            allowed_peers: vec![
+                "QmEnded".into(),
+                "QmLeft".into(),
+                "QmHand".into(),
+                "QmFirst".into(),
+            ],
             ..Default::default()
         };
+        report.allowed_consent.insert("QmFirst".into(), 1);
         report.allowed_until.insert("QmEnded".into(), NOW - 1);
         report
             .allowed_until
@@ -442,8 +464,9 @@ mod tests {
              Health report: on; each peer once per 60 s.\n  \
              QmEnded  ended 2027-01-15 07:59:59Z\n  \
              QmLeft  until 2027-01-17 08:00:00Z (2 d left)\n  \
-             QmHand  no end; shares no health conditions, disk space, machine or source \
-             commit until allowed again\n\
+             QmHand  no end; shares no health conditions, disk space, machine, source \
+             commit or worker build until allowed again\n  \
+             QmFirst  no end; shares no worker build until allowed again\n\
              Log requests: off.\n  \
              QmLogs  no end; edit the config to change\n",
             "LIST-EARLIER-CONSENT: each grant's state and earlier consent"
@@ -556,7 +579,13 @@ mod tests {
                 "activation_frame",
                 "awaited_frame",
                 "draining",
+                "build",
+                "build_is_node",
             ],
+        ),
+        (
+            "WorkerBuild",
+            &["version", "patch", "subpatch", "commit", "dirty"],
         ),
         ("FailureCount", &["class", "count"]),
         (
@@ -675,7 +704,8 @@ mod tests {
     fn the_shared_text_is_reviewed_against_the_report() {
         use quil_rpc::diagnostics_service::withhold_unconsented;
         use quil_types::proto::diagnostics::{
-            HealthConditions, HealthReport, Machine, StoreIoHealth, StoreSpace, WorkerHealth,
+            HealthConditions, HealthReport, Machine, StoreIoHealth, StoreSpace, WorkerBuild,
+            WorkerHealth,
         };
         use std::cell::RefCell;
         use std::collections::{BTreeMap, BTreeSet};
@@ -698,7 +728,12 @@ mod tests {
             build_fingerprint: vec![5],
             global_head_frame: 6,
             generated_unix_ms: 7,
-            workers: vec![WorkerHealth::default()],
+            workers: vec![WorkerHealth {
+                // Later levels: the group of ADDED_AT each field falls in.
+                build: share(level_of("worker build")).then(WorkerBuild::default),
+                build_is_node: share(level_of("worker build")),
+                ..Default::default()
+            }],
             omitted_workers: 9,
             master_store_write_failed: true,
             worker_capacity: 11,
@@ -809,6 +844,7 @@ mod tests {
         let (node_key, node) = identity();
         let (config, _) = read_config(path).unwrap();
         let admission = diag::Admission::new(&config.diagnostics.health_report, node);
+        quil_engine::worker_execution::set_build_commit(vec![0x12; 20], false);
         let source: diag::HealthSource = std::sync::Arc::new(|| diag::HealthInputs {
             global_head_frame: 9,
             health: Some(HealthConditions {
@@ -826,7 +862,6 @@ mod tests {
                 cpus: 8,
                 ..Default::default()
             }),
-            build_commit: Some((vec![0x12; 20], false)),
             ..Default::default()
         });
         let service = tonic::service::interceptor::InterceptedService::new(

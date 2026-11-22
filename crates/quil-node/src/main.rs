@@ -511,6 +511,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         network = args.network,
         "starting quil-node"
     );
+    // Each worker report names this process's build.
+    quil_engine::worker_execution::set_build_commit(build_commit::id_bytes(), build_commit::DIRTY);
 
     // Canonical paths: `--config` may be relative or a symlink, and an
     // operator comparing against the client needs the files actually read.

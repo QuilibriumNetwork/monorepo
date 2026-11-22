@@ -6238,6 +6238,7 @@ dependencies = [
  "prost 0.13.5",
  "quil-config",
  "quil-crypto",
+ "quil-engine",
  "quil-execution",
  "quil-forest",
  "quil-hypergraph",
