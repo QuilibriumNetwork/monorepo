@@ -4195,7 +4195,7 @@ impl StorageEpochCheck {
                 && hash_storage_proofs_at(epoch)
                 && slot.sealed_at.is_some()
                 && slot.frames > 0
-                && !crate::storage_snapshot::settlement_closed(epoch, global_frame_number)
+                && !crate::storage_epoch_batch::epoch_window_closed(epoch, global_frame_number)
         });
         // How each settlement this worker sent ended, logged once.
         if own_seat {
@@ -4418,13 +4418,23 @@ impl StorageEpochCheck {
                     );
                     error
                 };
-                // A job queued behind others may start past the window.
-                if settles && crate::storage_snapshot::settlement_closed(epoch, 0) {
-                    return Err(withdraw(
-                        quil_types::error::QuilError::ExecutionUnavailable(format!(
-                            "the settlement window of epoch {epoch} has closed"
-                        )),
+                // A job queued behind others may start past the window,
+                // which a seal's half shares with its settlement's: GLOBAL
+                // refuses either from then, so it neither labels nor proves.
+                if crate::storage_epoch_batch::epoch_window_closed(epoch, 0) {
+                    let error = withdraw(quil_types::error::QuilError::ExecutionUnavailable(
+                        format!("the window of epoch {epoch} has closed"),
                     ));
+                    if settles {
+                        return Err(error);
+                    }
+                    let seal_epoch = epoch + 2;
+                    let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
+                    warn!(epoch, seal_epoch, attempt, global_frame, filter = %hex::encode(&filter),
+                        unsealed = crate::storage_epoch_batch::unsealed_seat_outcome(seal_epoch),
+                        "storage seal part not proved: its window closed while its job waited behind this shard's other storage \
+                         work, so GLOBAL would refuse it; check this shard's storage job backlog");
+                    return Ok(());
                 }
                 // A retry queued before the seal failed for good does not
                 // relabel the leaves again.
@@ -4538,7 +4548,7 @@ impl StorageEpochCheck {
             // catches up); a first part never sent leaves the roots unproven.
             let frames = settle.as_ref().map_or(0, |slot| slot.frames);
             let closed = |result: quil_types::error::Result<()>| match result {
-                Err(error) if crate::storage_snapshot::settlement_closed(epoch, 0) => {
+                Err(error) if crate::storage_epoch_batch::epoch_window_closed(epoch, 0) => {
                     let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
                     if attempt == 1 && !resend {
                         warn!(epoch, frames, global_frame, %error, filter = %hex::encode(&filter),
@@ -22927,6 +22937,59 @@ mod tests {
                 .any(|message| matches!(message, SeatMessage::Withdraw(..))),
             "the announced part is withdrawn"
         );
+    }
+
+    /// A seal queued in its seat's lane while GLOBAL passed its window's end,
+    /// which it shares with its settlement's, is neither labelled nor proved
+    /// when its job runs: GLOBAL refuses it. The part the node was told of
+    /// is withdrawn, with a warning naming the closed window.
+    #[tokio::test]
+    async fn a_seal_queued_past_its_window_neither_labels_nor_proves() {
+        use crate::storage_epoch_batch::SeatMessage;
+        let warnings = capture_warnings();
+        let (mut engine, published, (from, until)) = engine_owing_a_settlement(5, true, true);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        crate::storage_jobs::spawn(&engine.filter, "ahead in the lane", move || {
+            let _ = held.recv_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+        at_global_frame(&mut engine, from + 1);
+        crate::storage_snapshot::note_global_frame(until);
+        drop(release);
+        seat_lanes_idle(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
+            .collect();
+        let logged = String::from_utf8_lossy(&warnings.lock().unwrap()).into_owned();
+        let late = logged
+            .lines()
+            .filter(|line| line.contains("storage seal part not proved: its window closed"))
+            .count();
+        println!("REACH late seal job: closed-window lines={late}");
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Announce(_, key) if key.seals)),
+            "the seal was due when queued"
+        );
+        assert!(
+            !logged.contains("storage seal part not prepared"),
+            "late_seal_job: a seal past its window's end was labelled: {logged}"
+        );
+        assert!(
+            !sent.iter().any(|message| matches!(message,
+                SeatMessage::Part(part) if part.part.seals)),
+            "late_seal_job: a seal past its window's end was proved"
+        );
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Withdraw(_, key) if key.seals)),
+            "the announced seal part is withdrawn"
+        );
+        assert_eq!(late, 1, "the dropped seal is reported once: {logged}");
     }
 
     /// A seal part that cannot be prepared (here no snapshot to read it

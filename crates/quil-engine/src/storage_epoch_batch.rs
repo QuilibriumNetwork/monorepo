@@ -1027,8 +1027,8 @@ fn settlements_sent() -> &'static Mutex<HashMap<SettlementKey, Instant>> {
 /// else. A node's own view of GLOBAL frames may stand still (one whose
 /// workers run apart notes an epoch's start only), and a guard of 720 s of
 /// wall time dropped every other one of its worker's sends at mainnet's
-/// incident pace (2026-11-08). None is sent once its window has closed
-/// (`crate::storage_snapshot::settlement_closed`): GLOBAL refuses it.
+/// incident pace (2026-11-08). No part is sent once its window has closed
+/// ([`window_closed`]): GLOBAL refuses its settlement and its seal.
 fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<SettlementKey>) {
     let Ok(mut sent) = settlements_sent().lock() else {
         return (seats, Vec::new());
@@ -1037,17 +1037,15 @@ fn claim_settlements(seats: Vec<PreparedSeat>) -> (Vec<PreparedSeat>, Vec<Settle
     sent.retain(|(_, _, e), _| e.saturating_add(1) >= newest);
     let (mut out, mut claimed) = (Vec::with_capacity(seats.len()), Vec::new());
     for seat in seats {
-        if !seat.part.settles {
-            out.push(seat);
+        if window_closed(&seat) {
+            info!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
+                epoch = seat.part.epoch, seals = seat.part.seals, settles = seat.part.settles,
+                "storage epoch proof: this seat's window has closed, for its seal as for its settlement \
+                 (both end as the epoch it seals begins); GLOBAL refuses either, so the part is not sent");
             continue;
         }
-        if crate::storage_snapshot::settlement_closed(seat.part.epoch, 0) {
-            info!(member = %hex::encode(seat.member), shard = %hex::encode(&seat.part.shard_filter),
-                epoch = seat.part.epoch, seals = seat.part.seals,
-                "storage epoch proof: this seat's settlement window has closed; the part is not sent with it");
-            if let (Some(seal), _) = seat.halves() {
-                out.push(seal);
-            }
+        if !seat.part.settles {
+            out.push(seat);
             continue;
         }
         let key = (seat.member, seat.part.shard_filter.clone(), seat.part.epoch);
@@ -1148,10 +1146,7 @@ fn reuse_settlement_proof(seats: &[PreparedSeat]) -> Option<(Arc<Vec<u8>>, u32)>
 /// proof made of them before ([`reuse_settlement_proof`]). False when there
 /// is none, or a window has closed (the proving path drops it and logs why).
 fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
-    if seats
-        .iter()
-        .any(|seat| crate::storage_snapshot::settlement_closed(seat.part.epoch, 0))
-    {
+    if seats.iter().any(window_closed) {
         return false;
     }
     let Some((bytes, resends)) = reuse_settlement_proof(seats) else {
@@ -1229,10 +1224,26 @@ fn note_published_alone(key: SettlementKey) {
     }
 }
 
-/// Why a settlement left a proof before it went out ([`batch_to_send`]).
+/// Whether the window of a seat's part for `epoch` has closed at `frame`
+/// or this node's later view of GLOBAL: its settlement's
+/// (`storage_seat::settlement_window`) and its seal's, which ends as the
+/// epoch it seals begins, at the same frame (`storage_epoch_proof::check`).
+/// GLOBAL refuses either half from then. The one rule for every part:
+/// queued, batched or sent again.
+pub(crate) fn epoch_window_closed(epoch: u64, frame: u64) -> bool {
+    crate::storage_snapshot::settlement_closed(epoch, frame)
+}
+
+/// Whether `seat`'s window has closed ([`epoch_window_closed`]).
+fn window_closed(seat: &PreparedSeat) -> bool {
+    epoch_window_closed(seat.part.epoch, 0)
+}
+
+/// Why a seat left a proof before it went out ([`batch_to_send`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeftOut {
-    /// Its window has closed: GLOBAL refuses it.
+    /// Its window has closed ([`window_closed`]): GLOBAL refuses its
+    /// settlement and its seal.
     Closed,
     /// Committed GLOBAL state shows it settled at this frame: GLOBAL refuses
     /// it as a duplicate.
@@ -1252,14 +1263,15 @@ impl std::fmt::Display for LeftOut {
 }
 
 /// `seats`, a proof about to be made or sent again, rebuilt without each
-/// settlement that would make GLOBAL refuse it, and with it every other
-/// seat in it: one whose window has closed, one committed GLOBAL state
-/// shows settled ([`set_settled_view`]), and, in a proof of several, one
-/// that went out in a proof of its own ([`note_published_alone`]). A part
-/// that also seals keeps its seal. A settlement left out for going alone
-/// is returned apart, to prove alone, when its seat proves alone
-/// (`solo`); else it is dropped: a proof of several would skip it as
-/// already sent ([`claim_settlements`]). Proofs wait in their lane, and a
+/// part that would make GLOBAL refuse it, and with it every other seat in
+/// it: one whose window has closed, seal and settlement alike
+/// ([`window_closed`]), a settlement committed GLOBAL state shows settled
+/// ([`set_settled_view`]), and, in a proof of several, a settlement that
+/// went out in a proof of its own ([`note_published_alone`]). A part that
+/// also seals keeps its seal while its window is open. A settlement left
+/// out for going alone is returned apart, to prove alone, when its seat
+/// proves alone (`solo`); else it is dropped: a proof of several would
+/// skip it as already sent ([`claim_settlements`]). Proofs wait in their lane, and a
 /// worker's view of its slot may trail GLOBAL: re-sent batches carried
 /// seats settled 3 to 498 frames before, and GLOBAL refused each whole, so
 /// the open seats in them missed their window (mainnet, 2026-11-13). `None`
@@ -1271,14 +1283,21 @@ fn batch_to_send(seats: Vec<PreparedSeat>) -> Option<(Vec<PreparedSeat>, Vec<Pre
     let alone = published_alone().lock().ok().map(|alone| alone.clone());
     let (mut kept, mut apart, mut left) = (Vec::with_capacity(total), Vec::new(), Vec::new());
     for seat in seats {
+        let key = settlement_key(&seat);
+        if window_closed(&seat) {
+            left.push(format!(
+                "{}@{}: {}",
+                hex::encode(&key.1),
+                key.2,
+                LeftOut::Closed
+            ));
+            continue;
+        }
         if !seat.part.settles {
             kept.push(seat);
             continue;
         }
-        let key = settlement_key(&seat);
-        let why = if crate::storage_snapshot::settlement_closed(key.2, 0) {
-            Some(LeftOut::Closed)
-        } else if let Some(at) = view.as_ref().and_then(|view| view(&key.0, &key.1, key.2)) {
+        let why = if let Some(at) = view.as_ref().and_then(|view| view(&key.0, &key.1, key.2)) {
             Some(LeftOut::Settled(at))
         } else if settling > 1 && alone.as_ref().is_some_and(|alone| alone.contains(&key)) {
             Some(LeftOut::SentAlone)
@@ -1305,8 +1324,8 @@ fn batch_to_send(seats: Vec<PreparedSeat>) -> Option<(Vec<PreparedSeat>, Vec<Pre
         epochs.dedup();
         info!(member = %member.map(hex::encode).unwrap_or_default(), seats = total, kept = kept.len(),
             alone = apart.len(), ?epochs, left_out = ?left,
-            "storage epoch proof rebuilt before sending: left out settlements GLOBAL would refuse, which would make it refuse \
-             the proof whole; those sent alone before go alone");
+            "storage epoch proof rebuilt before sending: left out parts GLOBAL would refuse, which would make it refuse \
+             the proof whole (a closed window takes the seal too); settlements sent alone before go alone");
     }
     (!kept.is_empty() || !apart.is_empty()).then_some((kept, apart))
 }
@@ -1431,6 +1450,12 @@ fn settles_only_persistent(seat: &PreparedSeat) -> bool {
         && quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch)
 }
 
+/// [`chunks_why`]'s proofs.
+#[cfg(test)]
+fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<PreparedSeat>> {
+    chunks_why(seats, leaves, bytes).0
+}
+
 /// Split `seats` into the proofs to make: each solo part alone but a
 /// settlement on persistent storage's schedule, the others in chunks of at
 /// most `leaves` sealed leaves and `bytes` of parts, each shard once and one
@@ -1442,8 +1467,15 @@ fn settles_only_persistent(seat: &PreparedSeat) -> bool {
 /// to [`SETTLEMENT_PROOF_BYTES`] of proving memory and as many seats as
 /// each may share a proof with ([`proof_seats`]): one STARK carries them,
 /// where alone each took about 0.66 MB of GLOBAL's 4 MiB a frame (mainnet,
-/// 2026-11-09).
-fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<PreparedSeat>> {
+/// 2026-11-09). Also returns why each proof of one seat went alone.
+fn chunks_why(
+    seats: Vec<PreparedSeat>,
+    leaves: usize,
+    bytes: usize,
+) -> (Vec<Vec<PreparedSeat>>, Alone) {
+    let mut alone = Alone::default();
+    // Why the last proof closed before a seat that could not join it.
+    let mut closed_for = None;
     let constrained = crate::storage_jobs::constrained_memory();
     let native = |seat: &PreparedSeat| {
         !seat.part.settles
@@ -1494,6 +1526,11 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
         {
             // A part that seals and settles keeps its persistent settlement
             // AIR seat-sized, a memory-admitted proof of its own.
+            if seat.solo && !settling {
+                alone.solo += 1;
+            } else {
+                alone.seal_settle += 1;
+            }
             out.push(vec![seat]);
             continue;
         }
@@ -1517,13 +1554,20 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
                     .map(proof_seats)
                     .min()
                     .unwrap_or(usize::MAX);
-        if !open.is_empty()
-            && (apart
-                || over_memory
-                || over_count
-                || weight + seat.weight() > leaf_limit
-                || size + part > budget)
-        {
+        let why = if apart {
+            Some(Cause::Apart)
+        } else if over_count {
+            Some(Cause::Bound)
+        } else if over_memory || weight + seat.weight() > leaf_limit || size + part > budget {
+            Some(Cause::Limits)
+        } else {
+            None
+        };
+        if let (false, Some(why)) = (open.is_empty(), why) {
+            if open.len() == 1 {
+                alone.count(why);
+            }
+            closed_for = Some(why);
             out.push(std::mem::take(&mut open));
             (weight, size) = (0, 0);
         }
@@ -1532,9 +1576,102 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
         open.push(seat);
     }
     if !open.is_empty() {
+        if open.len() == 1 {
+            alone.count(closed_for.unwrap_or(Cause::Only));
+        }
         out.push(open);
     }
-    out
+    (out, alone)
+}
+
+/// The seats in each of `proofs`, for [`log_batching`].
+fn seats_in(proofs: &[Vec<PreparedSeat>]) -> Vec<usize> {
+    proofs.iter().map(Vec::len).collect()
+}
+
+/// Why each proof of one seat a batching decision made went alone
+/// ([`log_batching`]), by cause.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Alone {
+    /// No other seat due could share its proof.
+    only: usize,
+    /// A part sent alone (`solo`) that is no settlement on persistent
+    /// storage's schedule: it proves alone by design.
+    solo: usize,
+    /// A part that seals and settles on persistent storage's schedule: it
+    /// proves alone by design ([`chunks_why`]).
+    seal_settle: usize,
+    /// A settlement before persistent storage's schedule: one a proof.
+    unscheduled: usize,
+    /// A settlement whose proofs may hold fewer seats ([`proof_seats`]):
+    /// halved after a proof too large, or alone after one that failed.
+    bound: usize,
+    /// The seat beside it was of another epoch, the same shard, or another
+    /// kind of part.
+    apart: usize,
+    /// The seat beside it would have gone over a proof's proving memory,
+    /// sealed leaves or message bytes.
+    limits: usize,
+}
+
+/// Why a proof closed before a seat that could not join it ([`Alone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    Only,
+    Bound,
+    Apart,
+    Limits,
+}
+
+impl Alone {
+    fn count(&mut self, cause: Cause) {
+        let count = match cause {
+            Cause::Only => &mut self.only,
+            Cause::Bound => &mut self.bound,
+            Cause::Apart => &mut self.apart,
+            Cause::Limits => &mut self.limits,
+        };
+        *count += 1;
+    }
+}
+
+impl std::fmt::Display for Alone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let causes = [
+            ("only", self.only),
+            ("solo", self.solo),
+            ("seal_settle", self.seal_settle),
+            ("unscheduled", self.unscheduled),
+            ("bound", self.bound),
+            ("apart", self.apart),
+            ("limits", self.limits),
+        ];
+        let mut any = false;
+        for (cause, count) in causes.into_iter().filter(|(_, count)| *count > 0) {
+            write!(f, "{}{cause}={count}", if any { " " } else { "" })?;
+            any = true;
+        }
+        if !any {
+            write!(f, "none")?;
+        }
+        Ok(())
+    }
+}
+
+/// Log one batching decision of `member`'s seats (`route`: how they were
+/// gathered): the seats due, the proofs made of them (`seats` in each),
+/// the seats in each proof of several and why each proof of one went alone
+/// (`alone`).
+fn log_batching(route: &'static str, member: &[u8; 32], due: usize, seats: &[usize], alone: Alone) {
+    let together: Vec<usize> = seats.iter().copied().filter(|&n| n > 1).collect();
+    let single = seats.iter().filter(|&&n| n == 1).count();
+    info!(member = %hex::encode(member), route, due, proofs = seats.len(), together = ?together,
+        alone = single, why_alone = %alone,
+        "storage epoch proof batching: the member's seats due together, the proofs made of them, the seats in each proof \
+         of several, and why each proof of one went alone. A proof of one takes more of GLOBAL's seal bytes a seat; \
+         only: no other seat due could share it; solo, seal_settle, unscheduled: such parts prove alone; bound: halved \
+         or stopped after a proof too large or failed; apart, limits: another epoch, the same shard or a memory, leaf or \
+         byte bound");
 }
 
 /// Proving memory a proof of several settlements takes per seat beyond
@@ -1945,12 +2082,16 @@ fn proved_alone(seat: &PreparedSeat) -> bool {
 }
 
 /// The proofs to make of a member's seals sent again together
-/// ([`gather_seals`]): in [`chunks`], as a collection's.
+/// ([`gather_seals`]): in [`chunks_why`], as a collection's.
 fn seal_retry_proofs(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSeat>> {
     for part in &mut parts {
         part.solo = false;
     }
-    let proofs = chunks(parts, chunk_leaves(), chunk_bytes());
+    let (member, due) = (parts.first().map(|seat| seat.member), parts.len());
+    let (proofs, alone) = chunks_why(parts, chunk_leaves(), chunk_bytes());
+    if let Some(member) = member {
+        log_batching("seals sent again", &member, due, &seats_in(&proofs), alone);
+    }
     for proof in &proofs {
         seal_proof_made(proof, proof.len() > 1);
     }
@@ -1959,14 +2100,31 @@ fn seal_retry_proofs(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSeat>> {
 
 /// The proofs to make of a member's settlements sent alone together: those
 /// on persistent storage's schedule that may still share a proof
-/// ([`proof_seats`]) in [`chunks`], one epoch each, ordered by epoch and
+/// ([`proof_seats`]) in [`chunks_why`], one epoch each, ordered by epoch and
 /// shard so that sent again unchanged they make the same proof
 /// ([`reuse_settlement_proof`]); the others one each, as before persistent
 /// storage. Each proof of several counts a send of each of its
 /// settlements, taken back if every archive refused it for room each time
 /// ([`note_archive_answer`]); a group sent [`BATCHED_SETTLEMENT_SENDS`]
-/// times goes in proofs of half as many seats.
-fn settlement_proofs_to_make(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSeat>> {
+/// times goes in proofs of half as many seats. Logs the decision
+/// ([`log_batching`]).
+fn settlement_proofs_to_make(parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSeat>> {
+    let (member, due) = (parts.first().map(|seat| seat.member), parts.len());
+    let (proofs, alone) = plan_settlements(parts);
+    if let Some(member) = member {
+        log_batching(
+            "settlements sent alone",
+            &member,
+            due,
+            &seats_in(&proofs),
+            alone,
+        );
+    }
+    proofs
+}
+
+/// [`settlement_proofs_to_make`], and why each proof of one seat went alone.
+fn plan_settlements(mut parts: Vec<PreparedSeat>) -> (Vec<Vec<PreparedSeat>>, Alone) {
     parts.sort_by(|a, b| {
         (a.part.epoch, &a.part.shard_filter).cmp(&(b.part.epoch, &b.part.shard_filter))
     });
@@ -1986,7 +2144,17 @@ fn settlement_proofs_to_make(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSe
     let (together, apart): (Vec<PreparedSeat>, Vec<PreparedSeat>) = parts
         .into_iter()
         .partition(|seat| settles_only_persistent(seat) && proof_seats(seat) > 1);
-    let mut proofs = chunks(together, chunk_leaves(), chunk_bytes());
+    let only = together.len() + apart.len() == 1;
+    let (mut proofs, mut alone) = chunks_why(together, chunk_leaves(), chunk_bytes());
+    for seat in &apart {
+        if only {
+            alone.only += 1;
+        } else if !settles_only_persistent(seat) {
+            alone.unscheduled += 1;
+        } else {
+            alone.bound += 1;
+        }
+    }
     if let Ok(mut batching) = batching().lock() {
         for proof in proofs.iter().filter(|proof| proof.len() > 1) {
             for seat in proof {
@@ -2000,7 +2168,7 @@ fn settlement_proofs_to_make(mut parts: Vec<PreparedSeat>) -> Vec<Vec<PreparedSe
         }
     }
     proofs.extend(apart.into_iter().map(|seat| vec![seat]));
-    proofs
+    (proofs, alone)
 }
 
 /// Gather `seat`, a settlement sent alone, with the member's others sent
@@ -2114,6 +2282,11 @@ pub fn deliver(message: SeatMessage, publish: Publish) {
                 }
                 if proved_alone(&seat) {
                     seal_proof_made(std::slice::from_ref(&seat), false);
+                    let alone = Alone {
+                        solo: 1,
+                        ..Alone::default()
+                    };
+                    log_batching("part sent alone", &seat.member, 1, &[1], alone);
                     prove_and_publish(vec![seat], publish);
                 } else {
                     gather_seals(seat, publish);
@@ -2239,7 +2412,11 @@ fn watch(member: [u8; 32]) {
         if collection.parts.is_empty() {
             return;
         }
-        for chunk in chunks(join_halves(collection.parts), chunk_leaves(), chunk_bytes()) {
+        let parts = join_halves(collection.parts);
+        let due = parts.len();
+        let (proofs, alone) = chunks_why(parts, chunk_leaves(), chunk_bytes());
+        log_batching("collection", &member, due, &seats_in(&proofs), alone);
+        for chunk in proofs {
             prove_and_publish(chunk, collection.publish.clone());
         }
         return;
@@ -2650,6 +2827,61 @@ mod tests {
         assert!(estimate
             .iter()
             .all(|bytes| bytes.as_ref().is_ok_and(|&b| b > 0)));
+    }
+
+    /// Each batching decision names why each proof of one seat went alone:
+    /// 91% of the proofs an archive took proved one seat (2026-11-21), and
+    /// no line told why ([`log_batching`]).
+    #[test]
+    fn a_batching_decision_names_why_each_proof_of_one_went_alone() {
+        let mut joint = sealing_and_settling(15);
+        joint.part.epoch = 1500;
+        joint.claim.settle_epoch = 1500;
+        joint.claim.seal_epoch = 1502;
+        let parts = vec![
+            settling(11, 1500, false),
+            settling(12, 1500, true),
+            settling(13, 1501, true),
+            joint,
+        ];
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let (proofs, alone) = chunks_why(parts, 24, chunk_bytes());
+        let (_, only) = chunks_why(vec![settling(16, 1500, true)], 24, chunk_bytes());
+        let member = settlements_of(0x57, &[(1, 1500), (2, 1500), (3, 1500)]);
+        stop_batching(&[settlement_key(&member[2])]);
+        let (planned, planned_alone) = plan_settlements(member);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        eprintln!("REACH why-alone {alone} | {only} | {planned_alone}");
+        assert_eq!(seats_in(&proofs), vec![1, 2, 1], "premise: the proofs made");
+        assert_eq!(
+            alone,
+            Alone {
+                seal_settle: 1,
+                apart: 1,
+                ..Alone::default()
+            },
+            "WHY-ALONE: a proof of one went alone for a cause the line does not name"
+        );
+        assert_eq!(
+            only,
+            Alone {
+                only: 1,
+                ..Alone::default()
+            },
+            "WHY-ALONE: the only seat due was named another cause"
+        );
+        assert_eq!(
+            (seats_in(&planned), planned_alone),
+            (
+                vec![2, 1],
+                Alone {
+                    bound: 1,
+                    ..Alone::default()
+                }
+            ),
+            "WHY-ALONE: a settlement bound to proofs of one was named another cause"
+        );
+        assert_eq!(planned_alone.to_string(), "bound=1");
     }
 
     /// A proof carries one epoch's parts: GLOBAL refuses it whole once its
@@ -3744,29 +3976,68 @@ mod tests {
         );
     }
 
-    /// No proof carries a settlement once this node saw GLOBAL past its
-    /// window's end: GLOBAL refuses it, losing the seals proved with it.
+    /// No proof carries a part once this node saw GLOBAL past its window's
+    /// end, its seal no more than its settlement: the seal's window ends as
+    /// the epoch it seals begins, the same frame, so GLOBAL refuses either
+    /// (2026-11-21: 55% of one node's refused sends went with no frames
+    /// left).
     #[test]
-    fn a_settlement_past_its_window_is_not_sent() {
+    fn a_part_past_its_window_is_not_sent() {
         let mut joint = sealing_and_settling(0xA1);
         joint.member = [0xA1; 32];
         let (_, until) =
             quil_execution::global_intrinsic::storage_seat::settlement_window(joint.part.epoch);
         crate::storage_snapshot::note_global_frame(until);
+        assert!(
+            window_closed(&joint),
+            "premise: this node's view of GLOBAL is at the window's end"
+        );
         let (out, claimed) = claim_settlements(vec![joint.clone()]);
+        eprintln!("REACH stale-seal claim out={}", out.len());
         assert!(
             claimed.is_empty(),
             "a settlement past its window was claimed"
         );
-        assert_eq!(out.len(), 1);
-        assert!(
-            out[0].part.seals && !out[0].part.settles,
-            "the part proves its seal only"
+        let halves: Vec<(bool, bool)> = out
+            .iter()
+            .map(|seat| (seat.part.seals, seat.part.settles))
+            .collect();
+        assert_eq!(
+            halves,
+            Vec::<(bool, bool)>::new(),
+            "STALE-SEAL: a part past its window still sent its seal"
         );
-        let (_, alone) = joint.halves();
+        let (seal, alone) = joint.halves();
         let mut alone = alone.unwrap();
         alone.solo = true;
         assert!(claim_settlements(vec![alone]).0.is_empty());
+        assert!(
+            claim_settlements(vec![seal.unwrap()]).0.is_empty(),
+            "STALE-SEAL: a seal past its window was sent"
+        );
+    }
+
+    /// A seal's window ends where its seat's settlement window does: GLOBAL
+    /// refuses a seal from the frame the epoch it seals begins
+    /// (`storage_epoch_proof::check`), two epochs after the one settled, as
+    /// the settlement window ends ([`window_closed`] reads one for both).
+    #[test]
+    fn a_seals_window_ends_with_its_settlements() {
+        let length = quil_types::consensus::epoch_length_frames();
+        for epoch in [3, 1500, 1541] {
+            let part = epoch_proof::SeatProof {
+                epoch,
+                ..Default::default()
+            };
+            let (_, until) =
+                quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+            eprintln!("REACH seal-window epoch={epoch} until={until}");
+            assert_eq!(
+                part.seal_epoch() * length,
+                until,
+                "the seal's window ends apart from the settlement's at epoch {epoch}"
+            );
+        }
     }
 
     /// A settlement sent alone goes out each time its worker sends it again,
@@ -4493,10 +4764,10 @@ mod tests {
         );
     }
 
-    /// A settlement whose window has closed leaves the proof, and a part
-    /// that also seals keeps its seal.
+    /// A part whose window has closed leaves the proof, its seal with its
+    /// settlement: GLOBAL refuses both from the same frame.
     #[test]
-    fn a_batch_leaves_out_a_settlement_whose_window_closed() {
+    fn a_batch_leaves_out_a_part_whose_window_closed() {
         let epoch = 3;
         let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
         crate::storage_snapshot::note_global_frame(until);
@@ -4504,22 +4775,28 @@ mod tests {
         joint.part.epoch = epoch;
         joint.claim.settle_epoch = epoch;
         let mut parts = settlements_of(1, &[(6, epoch)]);
+        let (seal, _) = joint.clone().halves();
+        let mut seal = seal.expect("a seal half");
+        seal.part.shard_filter = vec![7];
         parts.push(joint);
-        let (kept, apart) = batch_to_send(parts).expect("the seal is left to send");
-        let halves: Vec<(u8, bool, bool)> = kept
-            .iter()
-            .map(|seat| {
-                (
-                    seat.part.shard_filter[0],
-                    seat.part.seals,
-                    seat.part.settles,
-                )
-            })
-            .collect();
+        parts.push(seal);
+        let halves = batch_to_send(parts).map(|(kept, apart)| {
+            let kept: Vec<(u8, bool, bool)> = kept
+                .iter()
+                .map(|seat| {
+                    (
+                        seat.part.shard_filter[0],
+                        seat.part.seals,
+                        seat.part.settles,
+                    )
+                })
+                .collect();
+            (kept, apart.len())
+        });
+        eprintln!("REACH stale-seal batch kept={halves:?}");
         assert_eq!(
-            (halves, apart.len()),
-            (vec![(5, true, false)], 0),
-            "closed_settlement_sent: a settlement past its window went out, or its seal was lost"
+            halves, None,
+            "STALE-SEAL: a part past its window went out, its seal or its settlement"
         );
     }
 }
