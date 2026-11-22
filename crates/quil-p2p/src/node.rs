@@ -982,13 +982,13 @@ impl P2PNode {
             // rate-limit, opening DHT substreams to many peers. Burst
             // floods pushed per-connection stream counts past yamux's
             // 8192 cap, breaking connections with "maximum number of
-            // streams reached". The periodic `discovery_timer` below
-            // already runs the same query every 30 s, so this
-            // throttle suppresses redundant NeedPeers re-issues
-            // inside the window. 30 s matches the timer cadence —
-            // any tighter is wasteful, any looser delays recovery
-            // from a real partition.
-            let need_peers_throttle = Duration::from_secs(30);
+            // streams reached". The periodic `discovery_timer` above
+            // already runs the same query every [`DISCOVERY_INTERVAL`],
+            // so this throttle suppresses redundant NeedPeers re-issues
+            // inside that window. It is the timer's cadence — any
+            // tighter is wasteful, any looser delays recovery from a
+            // real partition.
+            let need_peers_throttle = DISCOVERY_INTERVAL;
             let mut last_need_peers_query: Option<std::time::Instant> = None;
             // Operator lines on QUIC connections that end on a transport error.
             let mut quic_closes = crate::quic_close::QuicCloses::default();
@@ -1045,7 +1045,7 @@ impl P2PNode {
                         // IPv6 disabled does. The first tick fires at once.
                         if !bootstrapped {
                             ticks_without_listener = ticks_without_listener.saturating_add(1);
-                            if ticks_without_listener % 120 == 2 {
+                            if ticks_without_listener % NO_LISTENER_WARN_TICKS == 2 {
                                 warn!(
                                     listen = %configured_listen,
                                     waited_secs = u64::from(ticks_without_listener - 1) * DISCOVERY_INTERVAL.as_secs(),
@@ -1779,9 +1779,18 @@ impl P2PNode {
 #[doc(hidden)]
 pub const CONNECT_WAIT: Duration = Duration::from_secs(DISCOVERY_INTERVAL.as_secs() + 10);
 
+/// A wait that ends before the discovery tick's first re-dial: a test
+/// that sees a bootstrap peer connect sooner saw the node's first dial.
+#[doc(hidden)]
+pub const BEFORE_A_TICK: Duration = Duration::from_secs(DISCOVERY_INTERVAL.as_secs() - 5);
+
 /// How often the node runs peer discovery and re-dials a bootstrap peer it
 /// is not connected to; the first round runs at the start.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Discovery ticks between repeats of the no-listener warning: about an
+/// hour.
+const NO_LISTENER_WARN_TICKS: u32 = (3600 / DISCOVERY_INTERVAL.as_secs()) as u32;
 
 /// A listener's transport, for [`P2PNode::start_on_loopback`] and
 /// [`P2PHandle::bound_port`].

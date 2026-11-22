@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
+use quil_p2p::node::{ListenFamily, ListenTransport, BEFORE_A_TICK, CONNECT_WAIT};
 use quil_p2p::{P2PHandle, P2PNode, ReceivedMessage};
 use tokio::sync::mpsc;
 
@@ -575,11 +575,6 @@ async fn an_archive_listed_at_both_families_is_reached_over_the_listened_one() {
         );
     }
 }
-
-/// The node dials an archive's first address at once, and a tick redial
-/// comes 30 s later: an archive reached sooner was reached by the first
-/// dial.
-const BEFORE_A_TICK: Duration = Duration::from_secs(25);
 
 /// An archive whose listened-family addresses `dead` do not answer is
 /// reached over its address in the other family by the same dial, before
