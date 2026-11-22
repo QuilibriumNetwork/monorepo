@@ -5345,6 +5345,7 @@ dependencies = [
  "aes-gcm",
  "bs58",
  "hex",
+ "lru",
  "memchr",
  "metrics",
  "num-bigint 0.4.6",
@@ -5410,6 +5411,7 @@ dependencies = [
 name = "quil-hypergraph"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "getrandom 0.2.15",
  "hex",
  "num-bigint 0.4.6",
