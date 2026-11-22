@@ -2388,3 +2388,49 @@ mod grid_clobber_repro {
         // is the accept once the grid stops being clobbered.
     }
 }
+
+#[cfg(test)]
+mod genesis_archive_pool_tests {
+    use std::collections::BTreeSet;
+
+    /// The mainnet archive pool holds each bootstrap archive once, at its
+    /// IPv4 address on port 8340 and pinned to that archive: the archives
+    /// serve `tcp/8340` over IPv4 only, while the bootstrap list names
+    /// them over both families.
+    #[test]
+    fn the_genesis_archive_pool_holds_each_archive_once_over_ipv4() {
+        let entries = quil_config::MAINNET_BOOTSTRAP_PEERS;
+        assert!(
+            entries.iter().any(|entry| entry.starts_with("/ip6/")),
+            "premise: the bootstrap list names the archives over IPv6 too"
+        );
+        let expected: BTreeSet<(String, String)> = entries
+            .iter()
+            .filter_map(|entry| {
+                let rest = entry.strip_prefix("/ip4/")?;
+                let ip = rest.split('/').next()?;
+                let peer = entry.rsplit("/p2p/").next()?;
+                Some((format!("{ip}:8340"), peer.to_string()))
+            })
+            .collect();
+        let endpoints = super::pin_genesis_archive_endpoints();
+        let pooled: BTreeSet<(String, String)> = endpoints
+            .iter()
+            .map(|endpoint| {
+                let peer = quil_rpc::archive_client::pinned_archive_peer(endpoint)
+                    .unwrap_or_else(|| panic!("archive pool endpoint {endpoint} unpinned"));
+                (endpoint.clone(), peer.to_string())
+            })
+            .collect();
+        let peers: BTreeSet<&String> = pooled.iter().map(|(_, peer)| peer).collect();
+        assert_eq!(
+            pooled, expected,
+            "archive pool endpoints are not the bootstrap list's IPv4 entries at 8340"
+        );
+        assert_eq!(
+            (endpoints.len(), peers.len()),
+            (4, 4),
+            "archive pool endpoints and their archives"
+        );
+    }
+}

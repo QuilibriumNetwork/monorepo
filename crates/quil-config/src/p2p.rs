@@ -185,7 +185,7 @@ impl Default for P2PConfig {
     }
 }
 
-/// Current mainnet bootstrap peers = the five genesis ARCHIVE servers (which
+/// Current mainnet bootstrap peers = the four genesis ARCHIVE servers (which
 /// double as the DHT bootstrap nodes). Their `/p2p/<peer_id>` MUST be the
 /// Falcon-derived peer IDs the archives actually present post-migration —
 /// these are `peer_id_from_falcon_pubkey(archive_pubkey)` for each genesis
@@ -197,9 +197,65 @@ impl Default for P2PConfig {
 /// archive `:8340` discovery (and thus prover submits) silently dies.
 /// Update when an operator rotates IPs.
 ///
+/// Each archive is listed at its IPv4 address, then at its IPv6 one, so an
+/// IPv6-only node bootstraps too. A node dials a peer's entries over the
+/// listened family first; the other family only after that dial fails
+/// (a 5 s handshake wait), and a configured peer listed twice stays one
+/// AutoNAT server and one archive. The archive pool takes the IPv4
+/// entries alone: the archives serve `tcp/8340` over IPv4 only.
+///
 /// A decommissioned archive leaves this list but stays in the genesis
 /// `archive_peers` (see [`DECOMMISSIONED_GENESIS_ARCHIVES`]).
 pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
+    "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
+    "/ip4/147.124.202.2/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
+    "/ip4/23.239.107.34/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
+    "/ip4/146.71.104.122/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
+    "/ip6/2604:f440:4:29::2/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
+    "/ip6/2604:f440:1:c::2/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
+    "/ip6/2606:c700:4020:ba:9e6b:ff:fec3:765e/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
+    "/ip6/2606:c700:8410:62:a236:9fff:fee8:88cc/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
+];
+
+/// How many peers the multiaddr `entries` name: their distinct
+/// `/p2p/<peer-id>` segments (the last of each entry), plus their distinct
+/// entries without one, each naming a peer of unknown ID. A peer listed at
+/// several addresses, such as an archive at both address families, is one
+/// peer.
+pub fn distinct_peer_count<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> usize {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Named {
+        Peer(String),
+        Entry(String),
+    }
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.as_ref().trim();
+            let peer = entry
+                .rsplit_once("/p2p/")
+                .and_then(|(_, peer)| peer.split('/').next())
+                .filter(|peer| !peer.is_empty());
+            match peer {
+                Some(peer) => Some(Named::Peer(peer.to_owned())),
+                None => (!entry.is_empty()).then(|| Named::Entry(entry.to_owned())),
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// How many archives [`MAINNET_BOOTSTRAP_PEERS`] names: its distinct peers
+/// ([`distinct_peer_count`]), as it lists each archive once per address
+/// family.
+pub(crate) fn mainnet_bootstrap_archive_count() -> usize {
+    distinct_peer_count(MAINNET_BOOTSTRAP_PEERS)
+}
+
+/// The mainnet bootstrap list releases before the IPv6 entries built in.
+/// A config saved by one of them holds it; it names no peer the node does
+/// not dial, so it is not reported as replaced.
+const EARLIER_MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
     "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
     "/ip4/147.124.202.2/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
     "/ip4/23.239.107.34/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
@@ -217,17 +273,26 @@ pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] =
 
 /// How many configured bootstrap peers [`P2PConfig::apply_defaults`]
 /// replaces with [`MAINNET_BOOTSTRAP_PEERS`]: the number of distinct
-/// configured entries on mainnet when they differ from the built-in list,
-/// otherwise `None` (another network, an empty list or the same peers).
+/// configured peers ([`distinct_peer_count`]) on mainnet when the entries,
+/// blank ones ignored, differ from the built-in list and from
+/// [`EARLIER_MAINNET_BOOTSTRAP_PEERS`] and name a peer, otherwise `None`
+/// (another network, a list naming no peer, such as an empty or blank one,
+/// or the same entries).
 pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> Option<usize> {
-    if network != 0 || configured.is_empty() {
+    if network != 0 {
         return None;
     }
-    let configured: std::collections::BTreeSet<&str> =
-        configured.iter().map(|peer| peer.trim()).collect();
-    let built_in: std::collections::BTreeSet<&str> =
-        MAINNET_BOOTSTRAP_PEERS.iter().copied().collect();
-    (configured != built_in).then_some(configured.len())
+    use std::collections::BTreeSet;
+    let configured: BTreeSet<&str> = configured
+        .iter()
+        .map(|peer| peer.trim())
+        .filter(|peer| !peer.is_empty())
+        .collect();
+    let same = |list: &[&str]| configured == list.iter().copied().collect::<BTreeSet<_>>();
+    let differs = !same(MAINNET_BOOTSTRAP_PEERS) && !same(EARLIER_MAINNET_BOOTSTRAP_PEERS);
+    differs
+        .then(|| distinct_peer_count(&configured))
+        .filter(|&peers| peers > 0)
 }
 
 impl P2PConfig {
@@ -385,6 +450,129 @@ mod tests {
         assert!(
             on(1) && on(99),
             "devnet onion dials refuse private addresses"
+        );
+    }
+
+    /// The IPv4 entries of the built-in list.
+    fn ipv4_entries() -> Vec<String> {
+        MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .filter(|entry| entry.starts_with("/ip4/"))
+            .map(|entry| entry.to_string())
+            .collect()
+    }
+
+    /// Every mainnet archive bootstraps over both families: the built-in
+    /// list holds one IPv6 entry per IPv4 entry, under the same peer ID,
+    /// each address in the form log redaction keeps.
+    #[test]
+    fn each_mainnet_archive_bootstraps_over_both_families() {
+        let peer = |entry: &str| entry.rsplit("/p2p/").next().unwrap().to_string();
+        let mut ipv4: Vec<String> = ipv4_entries().iter().map(|e| peer(e)).collect();
+        let mut ipv6 = Vec::new();
+        for entry in MAINNET_BOOTSTRAP_PEERS {
+            let Some(rest) = entry.strip_prefix("/ip6/") else {
+                continue;
+            };
+            let address = rest.split('/').next().unwrap();
+            let parsed: std::net::Ipv6Addr = address.parse().unwrap();
+            assert_eq!(parsed.to_string(), address, "IPv6 entry not canonical");
+            assert!(
+                entry.ends_with(&format!("/udp/8336/quic-v1/p2p/{}", peer(entry))),
+                "IPv6 entry not on the archives' QUIC port: {entry}"
+            );
+            ipv6.push(peer(entry));
+        }
+        ipv4.sort();
+        ipv6.sort();
+        eprintln!("REACH v6-bootstrap checked");
+        assert_eq!(ipv4.len(), 4, "IPv4 archive entries");
+        assert_eq!(ipv6, ipv4, "an archive without its IPv6 entry");
+        assert_eq!(MAINNET_BOOTSTRAP_PEERS.len(), ipv4.len() + ipv6.len());
+    }
+
+    /// A replaced list is counted in peers, not entries: an archive listed
+    /// at both address families is one peer, and each distinct entry
+    /// without a peer ID one more, so a list naming no peer ID is not
+    /// reported as 0 peers. A list naming no peer at all, such as a blank
+    /// entry, is not reported, nor is the built-in list with a blank entry.
+    #[test]
+    fn a_replaced_bootstrap_list_counts_peers_not_entries() {
+        let peerless: Vec<String> = [
+            "/ip4/192.0.2.1/udp/8336/quic-v1",
+            "/ip4/192.0.2.2/udp/8336/quic-v1",
+            " /ip4/192.0.2.1/udp/8336/quic-v1 ",
+        ]
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect();
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &peerless),
+            Some(2),
+            "a list naming no peer ID counted as fewer peers than its entries"
+        );
+        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        let archives = ipv4_entries().len();
+        let mut entries = built_in[..built_in.len() - 1].to_vec();
+        entries.push("/ip4/192.0.2.1/udp/8336/quic-v1".into());
+        assert!(
+            entries.len() > archives + 2,
+            "premise: archives listed twice"
+        );
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &entries),
+            Some(archives + 1),
+            "a replaced list counted in entries, not peers"
+        );
+        assert_eq!(
+            distinct_peer_count(["/p2p/QmA/p2p-circuit/p2p/QmB", " /p2p/QmB "]),
+            1
+        );
+        for blank in [&[][..], &[""][..], &[" ", "\t"][..]] {
+            let blank: Vec<String> = blank.iter().map(|entry| entry.to_string()).collect();
+            assert_eq!(
+                replaced_mainnet_bootstrap_peers(0, &blank),
+                None,
+                "a list naming no peer reported as 0 configured peers"
+            );
+        }
+        let mut padded = built_in;
+        padded.push(String::new());
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &padded),
+            None,
+            "the built-in list with a blank entry reported as replaced"
+        );
+    }
+
+    /// A config saved by a release whose built-in list held the IPv4
+    /// entries only names no peer the node does not dial: it is not
+    /// reported as replaced, with a blank entry or without. One differing
+    /// entry still is.
+    #[test]
+    fn a_config_saved_with_the_ipv4_bootstrap_list_is_not_reported() {
+        let saved = ipv4_entries();
+        eprintln!("REACH v6-bootstrap checked");
+        for list in [saved.clone(), saved.iter().rev().cloned().collect()] {
+            assert_eq!(
+                replaced_mainnet_bootstrap_peers(0, &list),
+                None,
+                "the IPv4-only list reported as replaced"
+            );
+        }
+        let mut padded = saved.clone();
+        padded.push(" ".into());
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &padded),
+            None,
+            "the IPv4-only list with a blank entry reported as replaced"
+        );
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &saved[1..]),
+            Some(saved.len() - 1)
         );
     }
 }
