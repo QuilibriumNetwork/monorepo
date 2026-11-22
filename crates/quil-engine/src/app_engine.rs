@@ -30618,6 +30618,102 @@ mod tests {
         assert!(crdt.get_vertex_data(&location).is_some());
     }
 
+    /// A QUIL token shard's frame executes every bundle at the QUIL token's
+    /// address, where settlement admission is skipped (QUIL operations pay in
+    /// QUIL). A token deploy any peer gossips to that shard created its
+    /// application with no payment, where the same frame at the token base
+    /// domain skips it for want of a settlement claim.
+    #[test]
+    fn reproduces_an_unpaid_token_deploy_created_by_a_quil_token_shard_frame() {
+        use quil_execution::token_intrinsic::{
+            constants::token_base_domain, conversions::token_deploy_to_proto, materialize,
+            TokenConfiguration, TokenDeploy,
+        };
+        use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+        use std::sync::Arc;
+
+        let config = TokenConfiguration {
+            behavior: 1,
+            units: vec![1],
+            name: b"unpaid".to_vec(),
+            symbol: b"FREE".to_vec(),
+            owner_public_key: vec![7; 897],
+            ..Default::default()
+        };
+        let created = materialize::token_deploy_domain(&config).unwrap();
+        let deploy = TokenDeploy {
+            config: config.to_canonical_bytes().unwrap(),
+            rdf_schema: Vec::new(),
+        };
+        let bundle = MessageBundle {
+            requests: vec![MessageRequest {
+                timestamp: 1,
+                request: Some(Request::TokenDeploy(
+                    token_deploy_to_proto(&deploy).unwrap(),
+                )),
+            }],
+            timestamp: 1,
+        };
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let mgr = quil_execution::ExecutionEngineManager::new(
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+            Arc::new(crate::test_support::AcceptAllKeyManager),
+            crdt.clone(),
+            crypto.circuit_compiler.clone(),
+            crypto.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            false, // application mode
+        );
+        let exists = || {
+            crdt.get_vertex_data(&quil_hypergraph::addressing::Location {
+                app_address: created,
+                data_address: [0xff; 32],
+            })
+            .is_some()
+        };
+
+        let at_base = materialize_app_shard_requests(
+            &mgr,
+            std::slice::from_ref(&bundle),
+            1,
+            50_000,
+            0,
+            100,
+            &token_base_domain(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (at_base.processed, at_base.skipped, exists()),
+            (0, 1, false),
+            "harness check: at the token base domain the unclaimed deploy is skipped"
+        );
+
+        let at_quil = materialize_app_shard_requests(
+            &mgr,
+            std::slice::from_ref(&bundle),
+            2,
+            50_000,
+            0,
+            100,
+            &quil_execution::domains::QUIL_TOKEN,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (at_quil.processed, at_quil.skipped, exists()),
+            (0, 1, false),
+            "VULNERABLE: unpaid_deploy_at_quil_token: a QUIL token shard frame at fee \
+             vote 100 took the unclaimed token deploy (processed, skipped, application \
+             {} exists)",
+            hex::encode(created)
+        );
+    }
+
     #[test]
     fn validation_rejects_short_consensus_message() {
         assert_eq!(

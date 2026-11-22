@@ -232,3 +232,113 @@ fn every_live_token_type_is_in_the_settlement_parity_table() {
         "token types without a settlement parity row: {missing:?}"
     );
 }
+
+/// Whether the token engine's state holds an application's metadata vertex,
+/// what routes messages to it as a deployed application.
+fn application_exists(engine: &TokenExecutionEngine, application: [u8; 32]) -> bool {
+    let state = engine
+        .state
+        .as_ref()
+        .expect("harness: an engine with state");
+    state
+        .crdt()
+        .get_vertex_data(&quil_hypergraph::addressing::Location {
+            app_address: application,
+            data_address: [0xff; 32],
+        })
+        .is_some()
+}
+
+/// The base reproducer for a deploy addressed to the QUIL token: the QUIL
+/// token's own messages skip settlement admission, so a token deploy
+/// carried there created an application with no payment, where the same
+/// deploy at the token base domain needs a settlement claim.
+fn reproduce_at_quil_token(lone: bool) {
+    let (engine, token) = engine(true);
+    let (base, inner) = operation(TYPE_TOKEN_DEPLOY, token);
+    let created = materialize::token_deploy_domain(&config(b"new")).unwrap();
+    let refused = run(&engine, &base, &inner, lone, 1).unwrap_err();
+    assert!(
+        refused.to_string().contains("requires a settlement claim"),
+        "harness check: at the token base domain the deploy requires a claim: {refused}"
+    );
+    assert!(
+        !application_exists(&engine, created),
+        "harness check: no application before the deploy at the QUIL token"
+    );
+    let outcome = run(&engine, &crate::domains::QUIL_TOKEN, &inner, lone, 1);
+    let exists = application_exists(&engine, created);
+    assert!(
+        outcome.is_err() && !exists,
+        "VULNERABLE: unpaid_deploy_at_quil_token: a token deploy ({}) addressed to the \
+         QUIL token at fee multiplier 1 returned {outcome:?} and the application {} \
+         exists: {exists}; at the token base domain it was refused: {refused}",
+        if lone { "lone request" } else { "bundle" },
+        hex::encode(created),
+    );
+}
+
+#[test]
+fn reproduces_an_unpaid_token_deploy_bundle_addressed_to_the_quil_token() {
+    reproduce_at_quil_token(false);
+}
+
+#[test]
+fn reproduces_an_unpaid_lone_token_deploy_addressed_to_the_quil_token() {
+    reproduce_at_quil_token(true);
+}
+
+/// A deploy at its base domain still creates its application where its
+/// price is zero: the refusal is of the address, not of the deploy.
+#[test]
+fn a_token_deploy_at_its_base_domain_creates_its_application_at_a_zero_price() {
+    for lone in [false, true] {
+        let (engine, token) = engine(true);
+        let (base, inner) = operation(TYPE_TOKEN_DEPLOY, token);
+        let created = materialize::token_deploy_domain(&config(b"new")).unwrap();
+        let outcome = run(&engine, &base, &inner, lone, 0);
+        assert!(
+            outcome.is_ok() && application_exists(&engine, created),
+            "base_domain_deploy_refused: lone={lone}: {outcome:?}"
+        );
+    }
+}
+
+/// A QUIL-token bundle creating no application still skips settlement
+/// admission: its operations pay in QUIL, never through a claim. A request
+/// the token engine does not run stands in for one, so the bundle's priced
+/// bytes (`settlement_claim::request_cost`) are nonzero.
+#[test]
+fn a_quil_token_bundle_creating_no_application_needs_no_claim() {
+    let (engine, _) = engine(true);
+    let mut inner = crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_UPDATE
+        .to_be_bytes()
+        .to_vec();
+    inner.extend_from_slice(&[1; 60]);
+    let request = CanonicalMessageRequest::wrap(inner).unwrap();
+    assert!(
+        crate::token_intrinsic::settlement_claim::request_cost(&request).unwrap() > 0,
+        "harness check: the request is priced"
+    );
+    let message = CanonicalMessageBundle {
+        requests: vec![Some(request)],
+        timestamp: 1,
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    let outcome = engine.process_message_with_context(
+        FrameExecutionContext {
+            frame_number: 10,
+            finalized_global_frame: Some(9),
+            venue: None,
+            shard: quil_types::execution::ShardPath::WHOLE,
+        },
+        &num_bigint::BigInt::from(1),
+        &crate::domains::QUIL_TOKEN,
+        &message,
+    );
+    assert!(
+        outcome.is_ok(),
+        "quil_token_bundle_refused: a QUIL-token bundle creating no application: {outcome:?}"
+    );
+}
