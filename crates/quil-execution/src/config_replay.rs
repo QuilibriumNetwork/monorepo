@@ -301,6 +301,7 @@ mod tests {
                 finalized_global_frame,
                 shard: quil_types::execution::ShardPath::WHOLE,
                 venue: None,
+                pomw_basis: None,
             })
         };
         assert!(!at(500, Some(99)));

@@ -562,6 +562,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         config_replay_frame = config_replay_from,
         "deploys onto deployed applications refused and updates signed over the metadata they replace"
     );
+    let app_creation_floor_from =
+        quil_execution::token_intrinsic::settlement_claim::init_app_creation_floor_frame(
+            args.network,
+        );
+    info!(
+        app_creation_floor_frame = %if app_creation_floor_from == u64::MAX { "never".to_string() } else { app_creation_floor_from.to_string() },
+        "deploys pay at least a quarter of the PoMW basis per application they create"
+    );
     let compute_domain_from =
         quil_execution::compute_domain::init_compute_domain_frame(args.network);
     info!(

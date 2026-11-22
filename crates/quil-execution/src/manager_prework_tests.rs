@@ -786,6 +786,7 @@ fn the_global_venue_refuses_what_its_commit_refuses_before_any_proof_work() {
         finalized_global_frame: Some(101),
         shard: quil_types::execution::ShardPath::WHOLE,
         venue: Some(quil_types::execution::Venue::Global),
+        pomw_basis: None,
     };
     let refused: Vec<String> = [transfer(9, 0x64, 0x65), transfer(3, 0x61, 0x63)]
         .iter()
@@ -844,6 +845,7 @@ fn an_operation_of_another_network_never_reaches_proof_work() {
         finalized_global_frame: Some(101),
         shard: quil_types::execution::ShardPath::WHOLE,
         venue: Some(quil_types::execution::Venue::Global),
+        pomw_basis: None,
     };
     let inline = policy().dispatch_commit_inline(
         &state,
@@ -1038,6 +1040,7 @@ fn the_owner_read_ahead_refuses_only_where_every_executing_frame_does() {
                     finalized_global_frame: anchor,
                     shard: quil_types::execution::ShardPath::WHOLE,
                     venue: None,
+                    pomw_basis: None,
                 },
                 clock.as_ref(),
                 &APPLICATION,
@@ -1157,6 +1160,7 @@ fn every_owner_execution_refuses_before_its_proof_is_read_ahead() {
                         finalized_global_frame: anchor,
                         shard: quil_types::execution::ShardPath::WHOLE,
                         venue: None,
+                        pomw_basis: None,
                     };
                     let executed = policy.dispatch_for_commit(
                         &store,
@@ -1262,6 +1266,7 @@ fn a_spend_naming_a_key_image_twice_never_reaches_proof_work() {
             finalized_global_frame: Some(101),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         },
         clock.as_ref(),
         &APPLICATION,
@@ -1436,6 +1441,7 @@ fn a_frames_execution_tells_the_memory_admission_the_frame_waits() {
             finalized_global_frame: Some(101),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: Some(quil_types::execution::Venue::Application),
+            pomw_basis: None,
         },
         &BigInt::from(0),
         &APPLICATION,

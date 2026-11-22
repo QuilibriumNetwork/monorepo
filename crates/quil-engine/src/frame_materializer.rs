@@ -837,6 +837,11 @@ impl FrameMaterializer {
         };
         let pricing_network = self.execution_manager.pricing_network();
         let difficulty: u64 = header.difficulty as u64;
+        // What a deploy's creation floor is a quarter of, at this frame's
+        // pricing snapshot.
+        let pomw_basis = Some(quil_execution::pricing::frame_pomw_basis(
+            difficulty, world_size,
+        )?);
         let global_addr = vec![0xFFu8; 32];
         // Uncovered-shard global execution gate (new consensus rule,
         // activates at FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX). Below the
@@ -1186,6 +1191,7 @@ impl FrameMaterializer {
                     // The global venue is not a sub-shard of any application.
                     shard: quil_types::execution::ShardPath::WHOLE,
                     venue: Some(quil_types::execution::Venue::Global),
+                    pomw_basis,
                 },
                 &fee_multiplier,
                 &route_addr,

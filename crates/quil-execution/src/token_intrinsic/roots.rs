@@ -2759,6 +2759,7 @@ mod tests {
                             finalized_global_frame: Some(certified),
                             venue: Some(Venue::Application),
                             shard: ShardPath::from_bits(&shard),
+                            pomw_basis: None,
                         },
                         &num_bigint::BigInt::from(1),
                         &application,

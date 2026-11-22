@@ -531,6 +531,7 @@ fn metadata_vertex_ops_apply_as_before_until_the_strict_epoch() {
             finalized_global_frame: Some(anchor),
             venue: None,
             shard: quil_types::execution::ShardPath::WHOLE,
+            pomw_basis: None,
         };
         engine
             .process_message_with_context(context, &num_bigint::BigInt::from(0), domain, &message)

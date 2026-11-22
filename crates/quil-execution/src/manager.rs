@@ -1811,6 +1811,26 @@ impl ExecutionEngineManager {
         assert!(self.engines.is_poisoned());
     }
 
+    /// Wraps the engine `name` so it records the execution context of every
+    /// message it processes: how a caller's frame reaches the engines.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn record_contexts_for_test(
+        &self,
+        name: &str,
+    ) -> Arc<std::sync::Mutex<Vec<quil_types::execution::FrameExecutionContext>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engines = self.engines.write().unwrap();
+        let inner = engines.remove(name).expect("a registered engine");
+        engines.insert(
+            name.into(),
+            Box::new(crate::testing::ContextRecorder {
+                inner,
+                seen: seen.clone(),
+            }),
+        );
+        seen
+    }
+
     /// Shard metadata bound to this manager's execution state.
     pub fn shards_store(&self) -> Option<Arc<dyn quil_types::store::ShardsStore>> {
         self.shards_store.clone()
@@ -2208,6 +2228,7 @@ impl ExecutionEngineManager {
                 finalized_global_frame: None,
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             },
             fee_multiplier,
             address,
@@ -4632,6 +4653,7 @@ mod tests {
             finalized_global_frame: Some(913),
             shard: ShardPath::WHOLE,
             venue: Some(Venue::Application),
+            pomw_basis: None,
         };
         // Refused by the check, by a frame's dispatch with the same error, and
         // on the QUIL token by the whole execution path.
@@ -5341,6 +5363,7 @@ mod tests {
             finalized_global_frame: Some(913),
             venue: None,
             shard: quil_types::execution::ShardPath::WHOLE,
+            pomw_basis: None,
         };
         m.process_message_with_context(context, &BigInt::from(0), &domains::QUIL_TOKEN, b"")
             .unwrap();
@@ -5354,7 +5377,8 @@ mod tests {
                     frame_number: 8,
                     finalized_global_frame: None,
                     venue: None,
-                    shard: quil_types::execution::ShardPath::WHOLE
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                    pomw_basis: None,
                 }
             ]
         );

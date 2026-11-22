@@ -439,6 +439,7 @@ mod tests {
                 finalized_global_frame: Some(frame - 1),
                 shard: quil_types::execution::ShardPath::WHOLE,
                 venue: None,
+                pomw_basis: None,
             };
             let compile = quil_lattice_ct::confidential::transfer::CompileLimits {
                 max_inputs: 1,
@@ -623,6 +624,7 @@ mod tests {
             finalized_global_frame: Some(1),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         };
         let tp = crate::token_engine::TYPE_LATTICE_SHIELD;
         let compile = quil_lattice_ct::confidential::transfer::CompileLimits {
@@ -1101,6 +1103,7 @@ mod tests {
             finalized_global_frame: Some(anchor),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         };
         let verify = |anchor| {
             crate::token_intrinsic::commit_verify::verify_for_commit(

@@ -732,6 +732,7 @@ mod tests {
                     finalized_global_frame: None,
                     venue: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
+                    pomw_basis: None,
                 },
                 fee,
                 app,
@@ -1081,6 +1082,7 @@ mod tests {
             finalized_global_frame: Some(3),
             venue: None,
             shard: quil_types::execution::ShardPath::WHOLE,
+            pomw_basis: None,
         };
         let verify_claim = || {
             super::super::mint_claim::verify_from_clock(
@@ -1151,6 +1153,7 @@ mod tests {
                             finalized_global_frame: Some(2),
                             venue: None,
                             shard: quil_types::execution::ShardPath::WHOLE,
+                            pomw_basis: None,
                         },
                         &num_bigint::BigInt::from(0),
                         &s.application,

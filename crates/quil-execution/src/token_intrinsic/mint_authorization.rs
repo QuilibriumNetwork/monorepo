@@ -390,6 +390,7 @@ mod tests {
                 finalized_global_frame: Some(9),
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             };
             let verify = |context| {
                 verify_from_clock(clock.as_ref(), context, &network, &app, &claim_bytes, 2)
@@ -485,6 +486,7 @@ mod tests {
                                 finalized_global_frame: Some(9),
                                 venue: Some(quil_types::execution::Venue::Application),
                                 shard: partial,
+                                pomw_basis: None,
                             },
                             &0.into(),
                             &app,
@@ -505,6 +507,7 @@ mod tests {
                             finalized_global_frame: Some(9),
                             shard: quil_types::execution::ShardPath::WHOLE,
                             venue: Some(quil_types::execution::Venue::Application),
+                            pomw_basis: None,
                         },
                         &0.into(),
                         &app,
@@ -524,6 +527,7 @@ mod tests {
                                 finalized_global_frame: Some(8),
                                 venue: None,
                                 shard: quil_types::execution::ShardPath::WHOLE,
+                                pomw_basis: None,
                             },
                             &0.into(),
                             &app,
@@ -545,6 +549,7 @@ mod tests {
                             },
                             venue: None,
                             shard: quil_types::execution::ShardPath::WHOLE,
+                            pomw_basis: None,
                         },
                         &0.into(),
                         &app,
@@ -558,6 +563,7 @@ mod tests {
                         finalized_global_frame: Some(9),
                         venue: None,
                         shard: quil_types::execution::ShardPath::WHOLE,
+                        pomw_basis: None,
                     },
                     &0.into(),
                     &app,

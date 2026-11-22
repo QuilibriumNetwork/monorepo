@@ -479,6 +479,7 @@ fn a_frame_anchored_before_the_replay_frame_reapplies_a_replaced_update() {
                     finalized_global_frame: Some(anchor),
                     shard: quil_types::execution::ShardPath::WHOLE,
                     venue: Some(quil_types::execution::Venue::Application),
+                    pomw_basis: None,
                 },
                 &num_bigint::BigInt::from(0),
                 &domain,

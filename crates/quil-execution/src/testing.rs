@@ -530,3 +530,69 @@ impl Default for NoopExecutionCrypto {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Execution context recorder
+// ---------------------------------------------------------------------------
+
+/// An engine that records the execution context of every message it
+/// processes, then hands the message to the engine it wraps.
+pub struct ContextRecorder {
+    pub inner: Box<dyn quil_types::execution::ShardExecutionEngine>,
+    pub seen: Arc<std::sync::Mutex<Vec<quil_types::execution::FrameExecutionContext>>>,
+}
+
+impl quil_types::execution::ShardExecutionEngine for ContextRecorder {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        self.inner.as_any_mut()
+    }
+    fn get_name(&self) -> &str {
+        self.inner.get_name()
+    }
+    fn validate_message(&self, frame: u64, address: &[u8], message: &[u8]) -> Result<()> {
+        self.inner.validate_message(frame, address, message)
+    }
+    fn process_message(
+        &self,
+        frame: u64,
+        fee: &BigInt,
+        address: &[u8],
+        message: &[u8],
+    ) -> Result<quil_types::execution::ProcessMessageResult> {
+        self.inner.process_message(frame, fee, address, message)
+    }
+    fn process_message_with_context(
+        &self,
+        context: quil_types::execution::FrameExecutionContext,
+        fee: &BigInt,
+        address: &[u8],
+        message: &[u8],
+    ) -> Result<quil_types::execution::ProcessMessageResult> {
+        self.seen.lock().unwrap().push(context);
+        self.inner
+            .process_message_with_context(context, fee, address, message)
+    }
+    fn prove(
+        &self,
+        address: &[u8],
+        frame: u64,
+        message: &[u8],
+    ) -> Result<proto::global::MessageRequest> {
+        self.inner.prove(address, frame, message)
+    }
+    fn lock(&self, frame: u64, address: &[u8], message: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.inner.lock(frame, address, message)
+    }
+    fn unlock(&self) -> Result<()> {
+        self.inner.unlock()
+    }
+    fn get_cost(&self, message: &[u8]) -> Result<BigInt> {
+        self.inner.get_cost(message)
+    }
+    fn get_capabilities(&self) -> Vec<proto::node::Capability> {
+        self.inner.get_capabilities()
+    }
+}
