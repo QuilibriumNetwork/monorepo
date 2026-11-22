@@ -427,11 +427,15 @@ pub fn build_report(
             .clone()
             .map(|health| match requester {
                 Requester::Own => health,
-                Requester::Peer(_) => crate::health_conditions::for_peer(health),
+                Requester::Peer(..) => crate::health_conditions::for_peer(health),
             })
             .map(bound_health),
         ..Default::default()
     };
+    // Before the size bound: a withheld field takes no room.
+    if let Requester::Peer(_, consent) = requester {
+        withhold_unconsented(&mut report, consent);
+    }
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
     entries.sort_by_key(|entry| (!entry.allocated, entry.core_id));
     // Room for the omitted-worker count (a tag and a varint).
@@ -460,6 +464,58 @@ pub fn build_report(
     }
     report.omitted_workers = omitted;
     report
+}
+
+/// Clear each field of `report` that a grant of consent `level` did not
+/// list ([`quil_config::HEALTH_REPORT_CONSENT`]): the table of the first
+/// level that shares each field with a peer. It names every field, so a new
+/// one does not compile until it is given a level; a field the text `qclient
+/// node diagnostics allow` showed at an earlier level never takes a later
+/// one, and a new field takes a new level.
+pub fn withhold_unconsented(report: &mut HealthReport, level: u32) {
+    fn from<T: Default>(first: u32, level: u32, field: &mut T) {
+        if level < first {
+            *field = T::default();
+        }
+    }
+    let HealthReport {
+        schema,
+        version,
+        patch,
+        subpatch,
+        build_fingerprint,
+        global_head_frame,
+        generated_unix_ms,
+        workers,
+        omitted_workers,
+        master_store_write_failed,
+        worker_capacity,
+        store_io,
+        health,
+        store_space,
+        machine,
+        build_commit,
+        build_dirty,
+    } = report;
+    // 0: what the first `allow` listed, and grants that record no level.
+    from(0, level, schema);
+    from(0, level, version);
+    from(0, level, patch);
+    from(0, level, subpatch);
+    from(0, level, build_fingerprint);
+    from(0, level, global_head_frame);
+    from(0, level, generated_unix_ms);
+    from(0, level, workers);
+    from(0, level, omitted_workers);
+    from(0, level, master_store_write_failed);
+    from(0, level, worker_capacity);
+    from(0, level, store_io);
+    // 1: health conditions, disk space, machine and source commit.
+    from(1, level, health);
+    from(1, level, store_space);
+    from(1, level, machine);
+    from(1, level, build_commit);
+    from(1, level, build_dirty);
 }
 
 /// `health` within [`MAX_HEALTH_BYTES`]: the last listed shards of the
@@ -507,7 +563,9 @@ impl Refusal {
 pub enum Requester {
     /// This node itself (its operator's qclient holds the node key).
     Own,
-    Peer(PeerId),
+    /// A listed peer, with the consent level of its grant
+    /// ([`quil_config::HEALTH_REPORT_CONSENT`]).
+    Peer(PeerId, u32),
 }
 
 /// Refused requests since the last summary line.
@@ -596,6 +654,8 @@ pub struct Admission {
     /// When the grants of allowed peers end; a peer without an entry has no
     /// end.
     grant_ends: HashMap<PeerId, Instant>,
+    /// The consent level of each grant that records one.
+    consent: HashMap<PeerId, u32>,
     own: PeerId,
     min_interval: Duration,
     served: Mutex<HashMap<PeerId, Instant>>,
@@ -617,6 +677,15 @@ fn grant_ends(
             let left = Duration::from_secs(until.saturating_sub(unix_now));
             Some((peer, now.checked_add(left)?))
         })
+        .collect()
+}
+
+/// The consent level of each grant of `allowed_consent`, by peer ID; keys
+/// that are not peer IDs are left out.
+fn grant_consent(allowed_consent: &BTreeMap<String, u32>) -> HashMap<PeerId, u32> {
+    allowed_consent
+        .iter()
+        .filter_map(|(peer, level)| Some((PeerId::from_str(peer.trim()).ok()?, *level)))
         .collect()
 }
 
@@ -656,7 +725,16 @@ impl Admission {
             .unwrap_or_default()
             .as_secs();
         let grant_ends = grant_ends(&config.allowed_until, Instant::now(), unix_now);
+        let consent = grant_consent(&config.allowed_consent);
         if config.enabled {
+            let earlier_consent = allowed
+                .iter()
+                .filter(|peer| {
+                    consent
+                        .get(peer)
+                        .is_none_or(|level| *level < quil_config::HEALTH_REPORT_CONSENT)
+                })
+                .count();
             info!(
                 health_peers = allowed.len(),
                 peers_with_an_end = grant_ends.len(),
@@ -668,6 +746,11 @@ impl Admission {
                 },
                 "diagnostics enabled"
             );
+            if earlier_consent > 0 {
+                info!(peers = earlier_consent, scope = "this node",
+                    action = "expected; to share these too, run `qclient node diagnostics allow` for each peer again and restart",
+                    "diagnostics peers granted before the report's current fields were listed get only the fields their grant listed");
+            }
         } else if !config.allowed_peers.is_empty() {
             info!(allowed_peers = config.allowed_peers.len(),
                 "diagnostics.healthReport.allowedPeers is ignored until diagnostics.healthReport.enabled is set");
@@ -680,6 +763,7 @@ impl Admission {
                 HashSet::new()
             },
             grant_ends,
+            consent,
             own,
             min_interval: Duration::from_secs(min_interval_secs),
             served: Mutex::default(),
@@ -698,7 +782,7 @@ impl Admission {
     /// Give back the interval `requester` was charged at `at`, for a report
     /// that could not be built.
     pub fn refund(&self, requester: Requester, at: Instant) {
-        let Requester::Peer(peer) = requester else {
+        let Requester::Peer(peer, _) = requester else {
             return;
         };
         let mut served = self.served.lock().unwrap_or_else(PoisonError::into_inner);
@@ -728,7 +812,12 @@ impl Admission {
             return Err(Refusal::RateLimited);
         }
         served.insert(*caller, now);
-        Ok(Requester::Peer(*caller))
+        let consent = self
+            .consent
+            .get(caller)
+            .copied()
+            .unwrap_or(quil_config::HEALTH_REPORT_CONSENT_UNRECORDED);
+        Ok(Requester::Peer(*caller, consent))
     }
 
     /// Admit `caller` at `now`, or the status to answer with; refusals are
@@ -838,8 +927,8 @@ impl DiagnosticsService for DiagnosticsServer {
                 bytes = report.encoded_len(),
                 "diagnostics health report served to this node"
             ),
-            Requester::Peer(peer) => {
-                info!(requester = %peer_tail(&peer), workers = report.workers.len(),
+            Requester::Peer(peer, consent) => {
+                info!(requester = %peer_tail(&peer), consent, workers = report.workers.len(),
                     omitted_workers = report.omitted_workers, bytes = report.encoded_len(),
                     "diagnostics health report served")
             }
@@ -884,6 +973,7 @@ mod renewal_blocker_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_config::{HEALTH_REPORT_CONSENT, HEALTH_REPORT_CONSENT_UNRECORDED};
     use quil_engine::worker_execution::{
         BLOCKERS as ENGINE_BLOCKERS, FAILURE_CLASSES, RECOVERY_PHASES as ENGINE_RECOVERY_PHASES,
         STATES,
@@ -967,13 +1057,13 @@ mod tests {
         let refused = (tonic::Code::PermissionDenied, DENIED.to_string());
         assert_eq!(
             admission.admit(Some(&ending), now).unwrap(),
-            Requester::Peer(ending)
+            Requester::Peer(ending, HEALTH_REPORT_CONSENT_UNRECORDED)
         );
         assert_eq!(denied(&ending, later), refused, "past its end");
         assert_eq!(denied(&lapsed, now), refused, "ended before this start");
         assert_eq!(
             admission.admit(Some(&lasting), later).unwrap(),
-            Requester::Peer(lasting),
+            Requester::Peer(lasting, HEALTH_REPORT_CONSENT_UNRECORDED),
             "a listed peer without an end stays served"
         );
         assert_eq!(admission.admit(Some(&own), later).unwrap(), Requester::Own);
@@ -998,7 +1088,10 @@ mod tests {
             build_commit: Some((vec![0x12; 20], true)),
             ..Default::default()
         };
-        for requester in [Requester::Own, Requester::Peer(peer())] {
+        for requester in [
+            Requester::Own,
+            Requester::Peer(peer(), HEALTH_REPORT_CONSENT),
+        ] {
             let report = build_report(&inputs, &[], 1, requester);
             assert_eq!(
                 (report.build_commit, report.build_dirty),
@@ -1065,7 +1158,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             admission.admit(Some(&listed), start).unwrap(),
-            Requester::Peer(listed)
+            Requester::Peer(listed, HEALTH_REPORT_CONSENT_UNRECORDED)
         );
         let again = admission
             .admit(Some(&listed), start + Duration::from_secs(59))
@@ -1088,6 +1181,71 @@ mod tests {
         );
         let disabled = Admission::new(&config(false, &[listed]), own);
         assert_eq!(disabled.check(Some(&listed), start), Err(Refusal::Disabled));
+    }
+
+    /// A peer gets the health conditions, disk space, machine and source
+    /// commit only under a grant whose recorded level listed them: a grant
+    /// that records none listed none of them. This node always gets them.
+    #[test]
+    fn a_peer_gets_health_disk_machine_and_commit_only_under_a_grant_that_listed_them() {
+        use quil_types::proto::diagnostics::{ConditionKind, HealthCondition};
+        let (own, earlier, now) = (peer(), peer(), peer());
+        let mut granted = config(true, &[earlier, now]);
+        granted.allowed_consent = BTreeMap::from([
+            (now.to_base58(), HEALTH_REPORT_CONSENT),
+            ("not a peer ID".to_string(), HEALTH_REPORT_CONSENT),
+        ]);
+        let admission = Admission::new(&granted, own);
+        let start = Instant::now();
+        assert_eq!(
+            admission.admit(Some(&earlier), start).unwrap(),
+            Requester::Peer(earlier, HEALTH_REPORT_CONSENT_UNRECORDED),
+            "CONSENT-UNRECORDED: a grant without a level has the unrecorded one"
+        );
+        let listed = admission.admit(Some(&now), start).unwrap();
+        assert_eq!(
+            listed,
+            Requester::Peer(now, HEALTH_REPORT_CONSENT),
+            "CONSENT-RECORDED: the grant's level is read"
+        );
+        let inputs = HealthInputs {
+            health: Some(HealthConditions {
+                conditions: vec![HealthCondition {
+                    kind: ConditionKind::StoreIoSlow as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            store_space: Some(StoreSpace {
+                total_bytes: 1 << 40,
+                ..Default::default()
+            }),
+            machine: Some(Machine {
+                cpus: 8,
+                ..Default::default()
+            }),
+            build_commit: Some((vec![0x12; 20], true)),
+            global_head_frame: 9,
+            ..Default::default()
+        };
+        let shared = |requester| {
+            let report = build_report(&inputs, &[], 1, requester);
+            assert_eq!(report.global_head_frame, 9, "the rest is served");
+            (
+                report.health.is_some(),
+                report.store_space.is_some(),
+                report.machine.is_some(),
+                report.build_commit.is_some(),
+                report.build_dirty,
+            )
+        };
+        assert_eq!(
+            shared(Requester::Peer(earlier, HEALTH_REPORT_CONSENT_UNRECORDED)),
+            (false, false, false, false, false),
+            "EARLIER-GRANT-SHARED: a grant without a level gets none of them"
+        );
+        assert_eq!(shared(listed), (true, true, true, true, true));
+        assert_eq!(shared(Requester::Own), (true, true, true, true, true));
     }
 
     /// A report that fails to build does not use up the requester's
@@ -1425,7 +1583,7 @@ mod tests {
             store_space: Some(space),
             ..Default::default()
         };
-        let to_peer = Requester::Peer(peer());
+        let to_peer = Requester::Peer(peer(), HEALTH_REPORT_CONSENT);
         let report = build_report(&inputs, &[], 3_000, to_peer);
         let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.store_space, Some(space));
@@ -1457,7 +1615,12 @@ mod tests {
             machine: Some(machine),
             ..Default::default()
         };
-        let report = build_report(&inputs, &[], 3_000, Requester::Peer(peer()));
+        let report = build_report(
+            &inputs,
+            &[],
+            3_000,
+            Requester::Peer(peer(), HEALTH_REPORT_CONSENT),
+        );
         let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(
             decoded.machine,
@@ -1922,7 +2085,7 @@ mod tests {
             conditions
         };
         assert_eq!(kinds(Requester::Own).len(), KINDS.len());
-        let peer = kinds(Requester::Peer(peer()));
+        let peer = kinds(Requester::Peer(peer(), HEALTH_REPORT_CONSENT));
         for kind in [
             ConditionKind::RewardDrop,
             ConditionKind::PeersCannotDial,

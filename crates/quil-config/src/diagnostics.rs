@@ -12,6 +12,16 @@ fn default_min_interval_secs() -> u64 {
     60
 }
 
+/// The consent level of a grant written now: the health report fields the
+/// text `qclient node diagnostics allow` shows lists. A peer is served only
+/// the fields its grant's level covers; a new field takes a new level. The
+/// fields of each level are the node's table (`withhold_unconsented`) and
+/// the client's frozen texts, not listed here.
+pub const HEALTH_REPORT_CONSENT: u32 = 1;
+/// The level of a grant that records none (written before levels were):
+/// the fields the first `allow` listed.
+pub const HEALTH_REPORT_CONSENT_UNRECORDED: u32 = 0;
+
 /// Bounds of `diagnostics.logRequests.requestsPerDay`.
 pub const LOG_REQUESTS_PER_DAY: std::ops::RangeInclusive<u32> = 1..=24;
 /// Bounds of `diagnostics.logRequests.maxPending`.
@@ -74,6 +84,16 @@ pub struct HealthReportConfig {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub allowed_until: BTreeMap<String, u64>,
+    /// The fields each listed peer's grant consented to, as a level by peer
+    /// ID ([`HEALTH_REPORT_CONSENT`]), as `qclient node diagnostics allow`
+    /// writes it. A listed peer without an entry gets the fields of
+    /// [`HEALTH_REPORT_CONSENT_UNRECORDED`].
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub allowed_consent: BTreeMap<String, u32>,
     /// Seconds before the same peer is served again (10..=3600).
     #[serde(default = "default_min_interval_secs")]
     pub min_interval_secs: u64,
@@ -85,6 +105,7 @@ impl Default for HealthReportConfig {
             enabled: false,
             allowed_peers: Vec::new(),
             allowed_until: BTreeMap::new(),
+            allowed_consent: BTreeMap::new(),
             min_interval_secs: default_min_interval_secs(),
         }
     }
@@ -172,16 +193,19 @@ mod tests {
     fn grant_ends_stay_out_of_a_config_without_any_and_are_known_keys() {
         for yaml in [
             "healthReport: {}\n",
-            "healthReport:\n  allowedUntil: null\n",
+            "healthReport:\n  allowedUntil: null\n  allowedConsent: null\n",
         ] {
             let parsed: DiagnosticsConfig = serde_yaml::from_str(yaml).unwrap();
             assert!(parsed.health_report.allowed_until.is_empty());
+            assert!(parsed.health_report.allowed_consent.is_empty());
             let encoded = serde_yaml::to_string(&parsed).unwrap();
             assert!(!encoded.contains("allowedUntil"), "{encoded}");
+            assert!(!encoded.contains("allowedConsent"), "{encoded}");
         }
-        let yaml = "healthReport:\n  enabled: true\n  allowedPeers: [QmPeer]\n  allowedUntil:\n    QmPeer: 1800000000\n";
+        let yaml = "healthReport:\n  enabled: true\n  allowedPeers: [QmPeer]\n  allowedUntil:\n    QmPeer: 1800000000\n  allowedConsent:\n    QmPeer: 2\n";
         let parsed: DiagnosticsConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(parsed.health_report.allowed_until["QmPeer"], 1_800_000_000);
+        assert_eq!(parsed.health_report.allowed_consent["QmPeer"], 2);
         assert_eq!(
             serde_yaml::from_str::<DiagnosticsConfig>(&serde_yaml::to_string(&parsed).unwrap())
                 .unwrap(),
