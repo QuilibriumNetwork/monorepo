@@ -2390,7 +2390,7 @@ where
         // inherit the covered archive subtree unpinned, as before.
         recovery_phase("installing_leaves");
         if !origin_anchors.is_empty() {
-            let mut pinned = true;
+            let mut unsynced = None;
             for (source, roots) in origin_anchors {
                 let pinned_roots: Vec<Vec<u8>> = roots.iter().map(|root| root.to_vec()).collect();
                 let failure = match syncer.sync_shard_tree(source, &pinned_roots).await {
@@ -2401,17 +2401,15 @@ where
                     Err(error) if crate::worker_execution::turn_spent(&error) => return Err(error),
                     Err(error) => error.to_string(),
                 };
-                tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source),
-                    sealed_roots = ?roots.iter().map(hex::encode).collect::<Vec<_>>(), %failure,
-                    "origin's sealed state could not be synced");
-                pinned = false;
+                unsynced = Some((source, roots, failure));
                 break;
             }
-            if pinned {
+            let Some((source, roots, failure)) = unsynced else {
                 tracing::info!(filter = %hex::encode(filter), origins = origin_anchors.len(),
                     "shard bootstrapped from its origins' sealed state");
                 return Ok(ShardSyncResult::Inherited { pinned: true });
-            }
+            };
+            let sealed_roots = roots.iter().map(hex::encode).collect::<Vec<_>>();
             // A same-filter origin's sealed roots are what this shard's
             // successor requires at startup (`successor_state_matches`): an
             // unpinned copy is refused there unless it equals them, and the
@@ -2421,14 +2419,16 @@ where
                 .iter()
                 .any(|(source, _)| source.as_slice() == filter)
             {
-                tracing::warn!(filter = %hex::encode(filter),
-                    "the predecessor's sealed state is not available from the archive; not inheriting unpinned state its successor would refuse");
+                tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source),
+                    ?sealed_roots, %failure,
+                    "the predecessor's sealed state could not be synced; not inheriting unpinned state its successor would refuse");
                 return Ok(ShardSyncResult::NotReady(
-                    "the predecessor's sealed state is not available from the archive",
+                    "the predecessor's sealed state could not be synced",
                 ));
             }
-            tracing::warn!(filter = %hex::encode(filter),
-                "origins' sealed state is not available from the archive; inheriting the covered subtree unpinned");
+            tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source),
+                ?sealed_roots, %failure,
+                "an origin's sealed state could not be synced; inheriting the covered subtree unpinned");
         } else {
             tracing::info!(filter = %hex::encode(filter),
                 "no certified origin state for this shard; inheriting the covered subtree unpinned");
@@ -5378,6 +5378,118 @@ mod tests {
             .unwrap();
         assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), [(5, Some(0x71))], "pinned only");
+    }
+
+    /// Fails every pinned origin sync with `failure`; serves the covered
+    /// subtree unpinned.
+    struct FailingOriginArchive {
+        failure: &'static str,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for FailingOriginArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> {
+            unreachable!()
+        }
+        async fn get_app_shard_frame(&self, _: &[u8], _: u64) -> Result<Option<AppShardFrame>> {
+            Ok(None)
+        }
+        async fn sync_shard_tree(&self, _: &[u8], roots: &[Vec<u8>]) -> Result<bool> {
+            if roots.is_empty() {
+                return Ok(true);
+            }
+            Err(quil_types::error::QuilError::Internal(self.failure.into()))
+        }
+    }
+
+    const ORIGIN_SYNC_FAILURE: &str =
+        "stage sync chunk: reconstructed subtree differs from the authenticated source";
+
+    /// Asserts `line` names the shard, the origin synced from and its
+    /// sealed roots, each with its value.
+    fn assert_origin_fields(line: &str, filter: [u8; 32], source: [u8; 32], root: [u8; 32]) {
+        for field in [
+            format!("filter={}", hex::encode(filter)),
+            format!("source={}", hex::encode(source)),
+            format!("sealed_roots={:?}", vec![hex::encode(root); 4]),
+        ] {
+            assert!(line.contains(&field), "{field}: {line}");
+        }
+    }
+
+    /// The warnings `logs` captured.
+    fn warnings(logs: &Mutex<Vec<u8>>) -> Vec<String> {
+        String::from_utf8(logs.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(" WARN "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An origin whose sealed state fails to sync for a reason other than
+    /// the archive lacking it is named once, with that reason, as the shard
+    /// inherits unpinned: never as state the archive does not hold.
+    #[tokio::test]
+    async fn an_origin_sync_failure_is_logged_once_with_its_reason() {
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let anchors = vec![(vec![1; 32], [[0x51; 32]; 4])];
+        let never =
+            |_: AppShardFrame, _: Option<AppShardFrame>| async { panic!("no frame to validate") };
+        let archive = FailingOriginArchive {
+            failure: ORIGIN_SYNC_FAILURE,
+        };
+        let result = sync_shard_from_latest(&archive, &[5; 32], None, &anchors, None, never)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ShardSyncResult::Inherited { pinned: false }
+        ));
+        let warnings = warnings(&logs);
+        assert_eq!(warnings.len(), 1, "one line: {warnings:?}");
+        let line = &warnings[0];
+        assert!(
+            line.contains(
+                "an origin's sealed state could not be synced; inheriting the covered subtree unpinned"
+            ) && line.contains(ORIGIN_SYNC_FAILURE)
+                && !line.contains("not available from the archive"),
+            "{line}"
+        );
+        assert_origin_fields(line, [5; 32], [1; 32], [0x51; 32]);
+    }
+
+    /// A same-filter predecessor's sealed state that fails to sync is
+    /// waited for with the failure named, never as state the archive does
+    /// not hold.
+    #[tokio::test]
+    async fn a_predecessor_sync_failure_is_logged_with_its_reason() {
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        let filter = vec![5; 32];
+        let anchors = vec![(filter.clone(), [[0x71; 32]; 4])];
+        let never =
+            |_: AppShardFrame, _: Option<AppShardFrame>| async { panic!("no frame to validate") };
+        let archive = FailingOriginArchive {
+            failure: ORIGIN_SYNC_FAILURE,
+        };
+        let result = sync_shard_from_latest(&archive, &filter, None, &anchors, None, never)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ShardSyncResult::NotReady("the predecessor's sealed state could not be synced")
+        ));
+        let warnings = warnings(&logs);
+        assert_eq!(warnings.len(), 1, "one line: {warnings:?}");
+        let line = &warnings[0];
+        assert!(
+            line.contains(
+                "the predecessor's sealed state could not be synced; not inheriting unpinned state its successor would refuse"
+            ) && line.contains(ORIGIN_SYNC_FAILURE)
+                && !line.contains("not available from the archive"),
+            "{line}"
+        );
+        assert_origin_fields(line, [5; 32], [5; 32], [0x71; 32]);
     }
 
     /// Serves frames through 140, reports `tip` as its latest (`None`: no
