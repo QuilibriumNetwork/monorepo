@@ -2803,7 +2803,7 @@ fn log_local_prover_diff(before: Option<&ProverInfo>, after: Option<&ProverInfo>
             for (filter, alloc) in &after_map {
                 match before_map.get(filter) {
                     None => log_local_alloc_appear(alloc),
-                    Some(prev) => log_local_alloc_diff(prev, alloc),
+                    Some(prev) => log_local_alloc_diff(&a.address, prev, alloc),
                 }
             }
             for (filter, prev) in &before_map {
@@ -2820,6 +2820,9 @@ fn log_local_prover_diff(before: Option<&ProverInfo>, after: Option<&ProverInfo>
     }
 }
 
+/// The appear line is a state dump (every restart logs each retained
+/// allocation), so a leave that departed long ago shows its frames here and
+/// logs no leave event; 0 is unset, as in the other frame fields.
 fn log_local_alloc_appear(alloc: &ProverAllocationInfo) {
     tracing::info!(
         filter = %hex::encode(&alloc.confirmation_filter),
@@ -2829,12 +2832,42 @@ fn log_local_alloc_appear(alloc: &ProverAllocationInfo) {
         kick_frame = alloc.kick_frame_number,
         join_confirm_frame = alloc.join_confirm_frame_number,
         join_reject_frame = alloc.join_reject_frame_number,
+        leave_confirm_frame = alloc.leave_confirm_frame_number,
+        departs_at_frame = departs_at_frame(alloc).unwrap_or(0),
         last_active_frame = alloc.last_active_frame_number,
         "local prover allocation appeared"
     );
 }
 
-fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo) {
+/// The frame a leaving allocation departs at: the start of its
+/// `departure_epoch`, where `effective_status` turns it `ExpiredLeaving`.
+fn departs_at_frame(alloc: &ProverAllocationInfo) -> Option<u64> {
+    alloc
+        .departure_epoch()
+        .map(quil_types::consensus::epoch_start_frame)
+}
+
+/// Logs a leave confirmed just now (the allocation diff saw the confirm
+/// change) with the frame it departs at. A leave not (or no longer)
+/// confirmed logs nothing.
+fn log_leave_confirmed(prover: &[u8], alloc: &ProverAllocationInfo) {
+    if alloc.leave_confirm_frame_number == 0 {
+        return;
+    }
+    let Some(departs_at_frame) = departs_at_frame(alloc) else {
+        return;
+    };
+    tracing::info!(
+        prover = %hex::encode(prover),
+        allocation = %hex::encode(&alloc.vertex_address),
+        filter = %hex::encode(&alloc.confirmation_filter),
+        confirm_frame = alloc.leave_confirm_frame_number,
+        departs_at_frame,
+        "leave confirmed; departs at departs_at_frame"
+    );
+}
+
+fn log_local_alloc_diff(prover: &[u8], prev: &ProverAllocationInfo, new: &ProverAllocationInfo) {
     if prev.status != new.status {
         tracing::info!(
             filter = %hex::encode(&new.confirmation_filter),
@@ -2876,12 +2909,7 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
         );
     }
     if prev.leave_confirm_frame_number != new.leave_confirm_frame_number {
-        tracing::info!(
-            filter = %hex::encode(&new.confirmation_filter),
-            prev = prev.leave_confirm_frame_number,
-            new = new.leave_confirm_frame_number,
-            "local allocation leave_confirm_frame_number changed"
-        );
+        log_leave_confirmed(prover, new);
     }
     if prev.kick_frame_number != new.kick_frame_number {
         tracing::info!(
@@ -7158,6 +7186,149 @@ mod tests {
             epoch,
             ring: 0,
             vertex_address: Vec::new(),
+        }
+    }
+
+    /// Records the fields of each info event it sees, one line per event.
+    #[derive(Clone, Default)]
+    struct InfoLines(Arc<std::sync::Mutex<Vec<String>>>);
+    struct Text<'a>(&'a mut String);
+    impl tracing::field::Visit for Text<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+    impl tracing::Subscriber for InfoLines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::INFO {
+                let mut line = String::new();
+                event.record(&mut Text(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A confirmed leave of a local allocation says, in one info line, who
+    /// leaves which shard, the confirm frame and the frame it departs at:
+    /// the first frame of the epoch after the confirm, where
+    /// `effective_status` turns it `ExpiredLeaving`.
+    #[test]
+    fn a_confirmed_leave_logs_its_departure_frame() {
+        let len = quil_types::consensus::epoch_length_frames();
+        let confirm = 3 * len + 5;
+        let filter = vec![0xAB; 32];
+        let prev = leaving_alloc(filter.clone(), 3, 2 * len + 7, 0);
+        let mut new = leaving_alloc(filter, 3, 2 * len + 7, confirm);
+        new.vertex_address = vec![0xCD; 32];
+        let departs = 4 * len;
+        assert_eq!(new.effective_status(departs - 1), EffectiveStatus::Leaving);
+        assert_eq!(
+            new.effective_status(departs),
+            EffectiveStatus::ExpiredLeaving
+        );
+
+        let lines = InfoLines::default();
+        tracing::subscriber::with_default(lines.clone(), || {
+            log_local_alloc_diff(&[0xEF; 32], &prev, &new);
+            // A confirm cleared by a reused filter is no confirmed leave.
+            log_local_alloc_diff(&[0xEF; 32], &new, &prev);
+        });
+        let lines = lines.0.lock().unwrap().clone();
+        eprintln!("REACH leave-confirmed {} lines", lines.len());
+        assert_eq!(lines.len(), 1, "leave lines: {lines:?}");
+        assert_leave_line(&lines[0], confirm, departs);
+    }
+
+    /// The leave line of prover 0xEF.., allocation 0xCD.. on shard 0xAB...
+    fn assert_leave_line(line: &str, confirm: u64, departs: u64) {
+        for field in [
+            "message=leave confirmed; departs at departs_at_frame ".to_string(),
+            format!("prover={} ", hex::encode([0xEF; 32])),
+            format!("allocation={} ", hex::encode([0xCD; 32])),
+            format!("filter={} ", hex::encode([0xAB; 32])),
+            format!("confirm_frame={confirm} "),
+            format!("departs_at_frame={departs} "),
+        ] {
+            assert!(
+                line.contains(&field),
+                "{field:?} missing from the leave line {line:?}"
+            );
+        }
+    }
+
+    /// Every restart logs each retained allocation as appearing (the
+    /// registry refresh diffs no prover to the prover, or a prover without
+    /// the allocation to one with it), and a confirmed leave keeps its
+    /// Leaving status after it departs. So the appear line carries the
+    /// leave's frames, and a leave that departed long ago logs no leave
+    /// event.
+    #[test]
+    fn a_restart_logs_a_departed_leave_on_its_appear_line_only() {
+        let len = quil_types::consensus::epoch_length_frames();
+        let confirm = 3 * len + 5;
+        let mut departed = leaving_alloc(vec![0xAB; 32], 3, 2 * len + 7, confirm);
+        departed.vertex_address = vec![0xCD; 32];
+        let departs = 4 * len;
+        assert_eq!(
+            departed.effective_status(departs - 1),
+            EffectiveStatus::Leaving
+        );
+        assert_eq!(
+            departed.effective_status(departs + 100 * len),
+            EffectiveStatus::ExpiredLeaving
+        );
+        let after = ProverInfo {
+            public_key: Vec::new(),
+            address: vec![0xEF; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![departed],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: Vec::new(),
+        };
+        let without = ProverInfo {
+            allocations: Vec::new(),
+            ..after.clone()
+        };
+
+        for before in [None, Some(&without)] {
+            let lines = InfoLines::default();
+            tracing::subscriber::with_default(lines.clone(), || {
+                log_local_prover_diff(before, Some(&after));
+            });
+            let lines = lines.0.lock().unwrap().clone();
+            eprintln!("REACH leave-confirmed appear {} lines", lines.len());
+            assert!(
+                !lines.iter().any(|l| l.contains("message=leave confirmed")),
+                "leave event on the appear path: {lines:?}"
+            );
+            let appear: Vec<&String> = lines
+                .iter()
+                .filter(|l| l.contains("message=local prover allocation appeared"))
+                .collect();
+            assert_eq!(appear.len(), 1, "appear lines: {lines:?}");
+            for field in [
+                format!("filter={} ", hex::encode([0xAB; 32])),
+                format!("leave_confirm_frame={confirm} "),
+                format!("departs_at_frame={departs} "),
+            ] {
+                assert!(
+                    appear[0].contains(&field),
+                    "{field:?} missing from the appear line {:?}",
+                    appear[0]
+                );
+            }
         }
     }
 
