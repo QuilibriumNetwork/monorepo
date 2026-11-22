@@ -3479,6 +3479,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             store_gossip_frame(
                                                 &frame,
                                                 |frame| pipeline.is_some_and(|pipeline| pipeline.offer_synced(frame)),
+                                                gossip_block_held(&frame_validator_for_recv, &clock_store_recv),
                                                 |frame| clock_store_recv.put_global_frame(frame, None),
                                             )
                                         };
@@ -4100,17 +4101,32 @@ where
 /// The duty of storing a gossiped GLOBAL frame canonically.
 const GOSSIP_FRAME_STORE: &str = "store gossiped GLOBAL frame";
 
+/// Gossip's held check: `clock`'s canonical record holds a received frame's
+/// block as `verifier` judges it ([`GlobalFrameVerifier::holds_global_block`]).
+///
+/// [`GlobalFrameVerifier::holds_global_block`]: quil_engine::frame_validator::GlobalFrameVerifier::holds_global_block
+fn gossip_block_held<'a>(
+    verifier: &'a quil_engine::frame_validator::GlobalFrameVerifier,
+    clock: &'a quil_store::RocksClockStore,
+) -> impl FnOnce(&quil_types::proto::global::GlobalFrame) -> bool + 'a {
+    move |frame| verifier.holds_global_block(clock, frame)
+}
+
 /// Store a gossiped GLOBAL frame: the finalization pipeline keeps it as a
-/// certified candidate (`offer` true), else `put` writes it canonically. A
+/// certified candidate (`offer` true), else `put` writes it canonically
+/// unless the canonical record already holds its block (`held` true; a
+/// rewrite would only make an in-flight atomic execution fall back). A
 /// store that refuses writes fails every received frame, so the canonical
 /// write's outcome is logged bounded per [`GOSSIP_FRAME_STORE`]; a frame the
-/// pipeline took is no canonical write and ends no condition.
+/// pipeline took or the record held is no canonical write and ends no
+/// condition.
 fn store_gossip_frame<E: std::fmt::Display>(
     frame: &quil_types::proto::global::GlobalFrame,
     offer: impl FnOnce(&quil_types::proto::global::GlobalFrame) -> bool,
+    held: impl FnOnce(&quil_types::proto::global::GlobalFrame) -> bool,
     put: impl FnOnce(&quil_types::proto::global::GlobalFrame) -> Result<(), E>,
 ) -> Result<(), E> {
-    if offer(frame) {
+    if offer(frame) || held(frame) {
         return Ok(());
     }
     let stored = put(frame);
@@ -4146,7 +4162,12 @@ mod tests {
         let _logs = logs.install();
         let refused = "store error: database has a failed write; reopen and reconcile durable state before writing again";
         for number in 1..=50 {
-            let stored = store_gossip_frame(&global_frame(number), |_| false, |_| Err(refused));
+            let stored = store_gossip_frame(
+                &global_frame(number),
+                |_| false,
+                |_| false,
+                |_| Err(refused),
+            );
             assert!(stored.is_err(), "premise: frame {number} refused");
         }
         assert_eq!(
@@ -4160,16 +4181,129 @@ mod tests {
             Some(50),
             "gossip_store_unbounded"
         );
-        assert!(store_gossip_frame(&global_frame(60), |_| true, |_| Err(refused)).is_ok());
-        assert!(store_gossip_frame(&global_frame(49), |_| false, |_| Ok::<(), &str>(())).is_ok());
+        assert!(
+            store_gossip_frame(&global_frame(60), |_| true, |_| false, |_| Err(refused)).is_ok()
+        );
+        assert!(store_gossip_frame(
+            &global_frame(49),
+            |_| false,
+            |_| false,
+            |_| Ok::<(), &str>(())
+        )
+        .is_ok());
         assert!(
             logs.lines_with("succeeded after failures").is_empty(),
             "gossip_store_ended_early"
         );
-        assert!(store_gossip_frame(&global_frame(50), |_| false, |_| Ok::<(), &str>(())).is_ok());
+        assert!(store_gossip_frame(
+            &global_frame(50),
+            |_| false,
+            |_| false,
+            |_| Ok::<(), &str>(())
+        )
+        .is_ok());
         let ended = logs.lines_with("store gossiped GLOBAL frame succeeded after failures");
         assert_eq!(ended.len(), 1, "gossip_store_end_missing");
         assert!(ended[0].contains("attempts=50"), "{ended:?}");
+    }
+
+    /// The leader gossips the parent frame under its own finalization
+    /// certificate after this archive executed and stored it under another.
+    /// Receiving it is no canonical write, so the atomic execution of the
+    /// next frame keeps its base; a different block at that height is still
+    /// written.
+    #[test]
+    fn a_gossiped_parent_under_another_certificate_is_not_rewritten() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let signed = |output: u8, certificate: &[u8]| {
+            let mut frame = global_frame(8);
+            let header = frame.header.as_mut().unwrap();
+            header.output = vec![output; 516];
+            header.public_key_signature_bls48581 =
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature: certificate.to_vec(),
+                    ..Default::default()
+                });
+            frame
+        };
+        let receive = |frame: &quil_types::proto::global::GlobalFrame| {
+            store_gossip_frame(
+                frame,
+                |_| false,
+                |frame| clock.holds_global_block(frame, |_| true),
+                |frame| clock.put_global_frame(frame, None),
+            )
+        };
+        let stored = signed(1, b"local");
+        clock.put_global_frame(&stored, None).unwrap();
+        let sequence = db.inner().latest_sequence_number();
+        receive(&signed(1, b"leader")).unwrap();
+        eprintln!("REACH global-block checked");
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "same block rewritten"
+        );
+        assert_eq!(clock.get_global_frame(8).unwrap(), stored);
+
+        let other = signed(2, b"leader");
+        receive(&other).unwrap();
+        assert_ne!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "other block kept out"
+        );
+        assert_eq!(clock.get_global_frame(8).unwrap(), other);
+    }
+
+    /// Gossip's held check is the verifier's: the leader's copy of the block
+    /// a member finalized at its own view is no write; a record finalized
+    /// at another view (the gossip check passes it, execution refuses it)
+    /// is replaced by the copy.
+    #[test]
+    fn a_gossiped_copy_is_held_only_by_a_record_at_its_own_view() {
+        use quil_engine::test_support::{global_committee_verifier, global_frame_finalized_at};
+        use quil_types::crypto::Signer as _;
+        let member = quil_crypto::FalconSigner::generate();
+        let leader = quil_crypto::FalconSigner::generate();
+        let verifier = global_committee_verifier(vec![member.public_key().to_vec()]);
+        let copy = global_frame_finalized_at(&leader, 9, 9);
+        for (stored, rewritten) in [
+            (global_frame_finalized_at(&member, 9, 9), false),
+            (global_frame_finalized_at(&member, 9, 10), true),
+        ] {
+            assert!(
+                verifier.verify_global_finalization_cert(stored.header.as_ref().unwrap()),
+                "premise: the gossip check passes"
+            );
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let clock = quil_store::RocksClockStore::new(db.inner());
+            clock.put_global_frame(&stored, None).unwrap();
+            let sequence = db.inner().latest_sequence_number();
+            store_gossip_frame(
+                &copy,
+                |_| false,
+                gossip_block_held(&verifier, &clock),
+                |frame| clock.put_global_frame(frame, None),
+            )
+            .unwrap();
+            eprintln!("REACH global-block checked");
+            if rewritten {
+                assert_eq!(
+                    clock.get_global_frame(9).unwrap(),
+                    copy,
+                    "held at another view"
+                );
+            } else {
+                assert_eq!(
+                    db.inner().latest_sequence_number(),
+                    sequence,
+                    "same block rewritten"
+                );
+                assert_eq!(clock.get_global_frame(9).unwrap(), stored);
+            }
+        }
     }
 
     /// A store error while summarizing the prover registry after the prover

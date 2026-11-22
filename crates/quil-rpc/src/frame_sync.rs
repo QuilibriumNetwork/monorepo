@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use quil_engine::frame_validator::GlobalFrameVerifier;
 use quil_store::RocksClockStore;
 use quil_types::proto::global::GlobalFrame;
 use quil_types::thread_probe::{self as probe, Section as ProbeSection};
@@ -369,6 +370,11 @@ pub type FrameStoreHook = Arc<dyn Fn(&[GlobalFrame]) -> bool + Send + Sync>;
 /// stores links to it.
 pub type FrameCertified = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
 
+/// Whether the canonical record already holds a frame's block, so storing
+/// it changes nothing but the store's sequence. The node's poller runs
+/// [`GlobalFrameVerifier::holds_global_block`].
+pub(crate) type BlockHeld = Arc<dyn Fn(&RocksClockStore, &GlobalFrame) -> bool + Send + Sync>;
+
 /// Uncertified frames held per poller at most; the lowest go first.
 const MAX_HELD_UNCERTIFIED: usize = 256;
 
@@ -394,10 +400,11 @@ fn store_chain_noted(
     duty: &'static str,
     frame: u64,
     config: &ArchivePollerConfig,
+    block_held: &BlockHeld,
     clock_store: &RocksClockStore,
     chain: &[GlobalFrame],
 ) -> Option<StoreTiming> {
-    match store_chain(config, clock_store, chain) {
+    match store_chain(config, block_held, clock_store, chain) {
         Ok(stored) => {
             if let Some(written) = stored.written {
                 quil_engine::bounded_warn::note_retry::<quil_types::error::QuilError>(
@@ -414,10 +421,12 @@ fn store_chain_noted(
 }
 
 /// Store an admitted chain (lowest first) through the store hook, else
-/// canonically, and fire `on_frame` for each stored frame in order. A failed
-/// canonical write stops at that frame, so no later frame is stored above it.
+/// canonically unless the record already `held` the frame's block, and fire
+/// `on_frame` for each stored frame in order. A failed canonical write stops
+/// at that frame, so no later frame is stored above it.
 fn store_chain(
     config: &ArchivePollerConfig,
+    block_held: &BlockHeld,
     clock_store: &RocksClockStore,
     chain: &[GlobalFrame],
 ) -> quil_types::error::Result<StoreTiming> {
@@ -435,7 +444,7 @@ fn store_chain(
         let started = Instant::now();
         if !taken {
             let _store = probe::section(ProbeSection::GlobalFrameStore);
-            if !already_canonical(clock_store, frame) {
+            if !block_held(clock_store, frame) {
                 clock_store.put_global_frame(frame, None)?;
                 timing.written = frame.header.as_ref().map(|h| h.frame_number);
             }
@@ -558,18 +567,6 @@ where
         connection.fetched(addr, number, frame, started);
     }
     result
-}
-
-/// Whether the canonical clock already holds exactly `frame`, as it does for a
-/// head the poller reads again after reconnecting, at or below what execution
-/// published. Rewriting it changes nothing but advances the store's sequence
-/// under an in-flight atomic execution plan, which then falls back.
-fn already_canonical(clock_store: &RocksClockStore, frame: &GlobalFrame) -> bool {
-    frame
-        .header
-        .as_ref()
-        .and_then(|header| clock_store.get_global_frame(header.frame_number).ok())
-        .is_some_and(|stored| stored == *frame)
 }
 
 fn frame_identity(frame: &GlobalFrame) -> Option<[u8; 32]> {
@@ -858,21 +855,37 @@ impl PollerFrameSource for ArchiveClient {
     }
 }
 
+/// The poller's held check: the canonical record holds a fetched frame's
+/// block as `verifier` judges it ([`GlobalFrameVerifier::holds_global_block`]).
+fn verifier_block_held(verifier: Arc<GlobalFrameVerifier>) -> BlockHeld {
+    Arc::new(move |clock, frame| verifier.holds_global_block(clock, frame))
+}
+
 /// Long-running task that polls a chosen archive endpoint for the current
 /// head, and forward-fills any gap from the previously seen head. The
 /// returned future runs until `cancel` fires; callers register it with
-/// their supervisor (e.g. `sup.spawn(...)`) so a panic propagates.
+/// their supervisor (e.g. `sup.spawn(...)`) so a panic propagates. A fetched
+/// frame whose block the canonical record already holds is not written
+/// again ([`GlobalFrameVerifier::holds_global_block`] over `verifier`).
 pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     falcon_signing_key: Vec<u8>,
     config: ArchivePollerConfig,
+    verifier: Arc<GlobalFrameVerifier>,
     cancel: CancellationToken,
 ) {
-    run_archive_poller_with_connector(pool, clock_store, config, cancel, move |addr: String| {
-        let key = falcon_signing_key.clone();
-        async move { ArchiveClient::connect_archive(&addr, &key).await }
-    })
+    run_archive_poller_with_connector(
+        pool,
+        clock_store,
+        config,
+        verifier_block_held(verifier),
+        cancel,
+        move |addr: String| {
+            let key = falcon_signing_key.clone();
+            async move { ArchiveClient::connect_archive(&addr, &key).await }
+        },
+    )
     .await
 }
 
@@ -884,6 +897,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     mut config: ArchivePollerConfig,
+    block_held: BlockHeld,
     cancel: CancellationToken,
     connect: C,
 ) where
@@ -1356,6 +1370,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                             CATCHUP_FRAME_STORE,
                             fn_,
                             &config,
+                            &block_held,
                             &clock_store,
                             &chain,
                         )
@@ -1517,6 +1532,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             HEAD_FRAME_STORE,
             new_number,
             &config,
+            &block_held,
             &clock_store,
             &admitted,
         ) else {
@@ -1950,6 +1966,13 @@ mod admit_tests {
     use super::*;
     use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
 
+    /// The poller's held check over a stored certificate `verified` accepts.
+    fn held_if(verified: fn(&GlobalFrameHeader) -> bool) -> BlockHeld {
+        Arc::new(move |clock: &RocksClockStore, frame: &GlobalFrame| {
+            clock.holds_global_block(frame, verified)
+        })
+    }
+
     #[test]
     fn an_archive_holding_only_genesis_fills_from_frame_one() {
         // A localnet archive that started as frame 1 was finalized: its first
@@ -2072,7 +2095,13 @@ mod admit_tests {
         let stored = frame(6, 6, None, true);
         clock.put_global_frame(&stored, None).unwrap();
         let sequence = db.inner().latest_sequence_number();
-        store_chain(&config, &clock, &[stored.clone()]).unwrap();
+        store_chain(
+            &config,
+            &held_if(|_| false),
+            &clock,
+            std::slice::from_ref(&stored),
+        )
+        .unwrap();
         assert_eq!(
             db.inner().latest_sequence_number(),
             sequence,
@@ -2081,10 +2110,165 @@ mod admit_tests {
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let other = frame(6, 7, None, true);
-        store_chain(&config, &clock, &[other.clone()]).unwrap();
+        store_chain(
+            &config,
+            &held_if(|_| false),
+            &clock,
+            std::slice::from_ref(&other),
+        )
+        .unwrap();
         assert_ne!(db.inner().latest_sequence_number(), sequence);
         assert_eq!(clock.get_global_frame(6).unwrap(), other);
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The executed parent's canonical record carries this archive's own
+    /// finalization certificate; a peer archive serves the same block under
+    /// its own. Polling that copy is no write (an in-flight atomic execution
+    /// plan survives), yet still reaches `on_frame`; a different block at
+    /// that height still replaces the record.
+    #[test]
+    fn a_canonical_block_under_another_certificate_is_not_rewritten() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fired.clone();
+        let config = ArchivePollerConfig {
+            on_frame: Some(Arc::new(move |_: &GlobalFrame| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            ..Default::default()
+        };
+        let signed = |output: u8, certificate: &[u8]| {
+            let mut frame = frame(6, output, None, true);
+            frame.header.as_mut().unwrap().public_key_signature_bls48581 =
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature: certificate.to_vec(),
+                    ..Default::default()
+                });
+            frame
+        };
+        let stored = signed(6, b"local");
+        clock.put_global_frame(&stored, None).unwrap();
+        let sequence = db.inner().latest_sequence_number();
+        store_chain(&config, &held_if(|_| true), &clock, &[signed(6, b"peer")]).unwrap();
+        eprintln!("REACH global-block checked");
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "same block rewritten"
+        );
+        assert_eq!(clock.get_global_frame(6).unwrap(), stored);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let other = signed(7, b"peer");
+        store_chain(
+            &config,
+            &held_if(|_| true),
+            &clock,
+            std::slice::from_ref(&other),
+        )
+        .unwrap();
+        assert_ne!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "other block kept out"
+        );
+        assert_eq!(clock.get_global_frame(6).unwrap(), other);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A node that did not know the committee stored a block under a
+    /// certificate nobody checked. A later copy under a certificate that
+    /// verifies replaces it; from then on the record holds the block.
+    #[test]
+    fn an_unverified_stored_certificate_is_replaced_by_a_later_copy() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        let config = ArchivePollerConfig::default();
+        let held = held_if(|header| {
+            header
+                .public_key_signature_bls48581
+                .as_ref()
+                .is_some_and(|s| s.signature == b"valid")
+        });
+        let signed = |certificate: &[u8]| {
+            let mut frame = frame(6, 6, None, true);
+            frame.header.as_mut().unwrap().public_key_signature_bls48581 =
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature: certificate.to_vec(),
+                    ..Default::default()
+                });
+            frame
+        };
+        clock.put_global_frame(&signed(b"forged"), None).unwrap();
+        let valid = signed(b"valid");
+        store_chain(&config, &held, &clock, std::slice::from_ref(&valid)).unwrap();
+        eprintln!("REACH global-block checked");
+        assert_eq!(
+            clock.get_global_frame(6).unwrap(),
+            valid,
+            "unverified record kept"
+        );
+
+        let sequence = db.inner().latest_sequence_number();
+        store_chain(&config, &held, &clock, &[signed(b"peer")]).unwrap();
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "verified record rewritten"
+        );
+    }
+
+    /// The poller's held check is the verifier's: a peer archive's copy of
+    /// the block a member finalized at its own view is no write; a record
+    /// finalized at another view (the gossip check passes it, execution
+    /// refuses it) is replaced by the copy.
+    #[test]
+    fn a_polled_copy_is_held_only_by_a_record_at_its_own_view() {
+        use quil_engine::test_support::{global_committee_verifier, global_frame_finalized_at};
+        use quil_types::crypto::Signer as _;
+        let member = quil_crypto::FalconSigner::generate();
+        let peer = quil_crypto::FalconSigner::generate();
+        let committee = vec![member.public_key().to_vec()];
+        let verifier = Arc::new(global_committee_verifier(committee));
+        let gossip_check = |stored: &GlobalFrame| {
+            verifier.verify_global_finalization_cert(stored.header.as_ref().unwrap())
+        };
+        let config = ArchivePollerConfig::default();
+        let copy = global_frame_finalized_at(&peer, 9, 9);
+        for (stored, rewritten) in [
+            (global_frame_finalized_at(&member, 9, 9), false),
+            (global_frame_finalized_at(&member, 9, 10), true),
+        ] {
+            assert!(gossip_check(&stored), "premise: the gossip check passes");
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let clock = RocksClockStore::new(db.inner());
+            clock.put_global_frame(&stored, None).unwrap();
+            let sequence = db.inner().latest_sequence_number();
+            store_chain(
+                &config,
+                &verifier_block_held(verifier.clone()),
+                &clock,
+                std::slice::from_ref(&copy),
+            )
+            .unwrap();
+            eprintln!("REACH global-block checked");
+            if rewritten {
+                assert_eq!(
+                    clock.get_global_frame(9).unwrap(),
+                    copy,
+                    "held at another view"
+                );
+            } else {
+                assert_eq!(
+                    db.inner().latest_sequence_number(),
+                    sequence,
+                    "same block rewritten"
+                );
+                assert_eq!(clock.get_global_frame(9).unwrap(), stored);
+            }
+        }
     }
 
     /// A store that refuses writes fails every polled frame's canonical
@@ -2095,6 +2279,7 @@ mod admit_tests {
     fn a_store_refusing_writes_bounds_each_poll_duty() {
         use quil_engine::bounded_warn::failing_attempts;
         let config = ArchivePollerConfig::default();
+        let unverified = held_if(|_| false);
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = RocksClockStore::new(db.inner());
         db.inner().refuse_writes(
@@ -2110,7 +2295,7 @@ mod admit_tests {
             for number in 10..60u64 {
                 let chain = [frame(number, number as u8, None, true)];
                 assert!(
-                    store_chain_noted(duty, number, &config, &clock, &chain).is_none(),
+                    store_chain_noted(duty, number, &config, &unverified, &clock, &chain).is_none(),
                     "premise: {duty}: frame {number} refused"
                 );
             }
@@ -2119,18 +2304,30 @@ mod admit_tests {
                 Some(50),
                 "poll_store_unbounded: {duty}"
             );
-            let skipped =
-                store_chain_noted(duty, 3, &config, &healthy, std::slice::from_ref(&held))
-                    .expect("an identical frame is not rewritten");
+            let skipped = store_chain_noted(
+                duty,
+                3,
+                &config,
+                &unverified,
+                &healthy,
+                std::slice::from_ref(&held),
+            )
+            .expect("an identical frame is not rewritten");
             assert_eq!(skipped.written, None, "{duty}: an identical frame");
             assert_eq!(
                 failing_attempts(duty),
                 Some(50),
                 "{duty}: ended by no write"
             );
-            let written =
-                store_chain_noted(duty, 59, &config, &healthy, &[frame(59, 59, None, true)])
-                    .expect("a healthy store writes");
+            let written = store_chain_noted(
+                duty,
+                59,
+                &config,
+                &unverified,
+                &healthy,
+                &[frame(59, 59, None, true)],
+            )
+            .expect("a healthy store writes");
             assert_eq!(written.written, Some(59), "{duty}: a healthy write");
             assert_eq!(
                 failing_attempts(duty),
@@ -2392,6 +2589,9 @@ mod forward_fill_tests {
             pool,
             store.clone(),
             config,
+            Arc::new(|clock: &RocksClockStore, frame: &GlobalFrame| {
+                clock.holds_global_block(frame, |_| false)
+            }),
             cancel.clone(),
             move |_addr: String| {
                 let f = fake.clone();
