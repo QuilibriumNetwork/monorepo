@@ -2619,6 +2619,51 @@ mod mint_authorization_status_tests {
         drop(held_status);
     }
 
+    /// While the status worker is busy, eight status reads wait for it and
+    /// a ninth is answered busy at once rather than waiting behind them.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_read_past_a_full_queue_is_refused_at_once() {
+        const QUEUE: usize = 8;
+        let held_status = MINT_STATUS_WORKER.acquire().await.unwrap();
+        let server = Arc::new(server(false));
+        let mut queue = tokio::task::JoinSet::new();
+        for _ in 0..QUEUE {
+            let server = server.clone();
+            queue.spawn(async move {
+                server
+                    .get_mint_authorization_status(request(32))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        // The paused clock stands still while this task yields.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            COIN_READ_WAITERS.load(Ordering::Relaxed),
+            QUEUE,
+            "the status reads wait for the busy worker"
+        );
+        let started = tokio::time::Instant::now();
+        let answered = tokio::time::timeout(
+            COIN_READ_WAIT * 2,
+            server.get_mint_authorization_status(request(32)),
+        )
+        .await;
+        let waited = started.elapsed();
+        let code = answered.ok().and_then(|r| r.err()).map(|s| s.code());
+        eprintln!("REACH status-queue-cap code={code:?} waited={waited:?}");
+        assert!(
+            code == Some(tonic::Code::ResourceExhausted)
+                && waited < std::time::Duration::from_secs(1),
+            "STATUS-QUEUE-PAST-CAP: the read past {QUEUE} waiting was answered \
+             {code:?} after {waited:?}"
+        );
+        queue.abort_all();
+        drop(held_status);
+    }
+
     #[tokio::test]
     async fn status_rpc_carries_every_field_and_classifies_failures() {
         assert_eq!(
@@ -4069,6 +4114,47 @@ mod retro_seniority_tests {
             tonic::Code::ResourceExhausted,
             "RETRO-QUEUE-UNBOUNDED"
         );
+        drop(held);
+    }
+
+    /// While the lookup worker is busy, eight lookups wait for it and a
+    /// ninth is answered busy at once rather than waiting behind them.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_past_a_full_queue_is_refused_at_once() {
+        const QUEUE: usize = 8;
+        let held = RETRO_SENIORITY_WORKER.acquire().await.unwrap();
+        let server = Arc::new(NodeRpcServer::new());
+        let lookup = || {
+            Request::new(node::GetRetroSeniorityRequest {
+                public_keys: Vec::new(),
+            })
+        };
+        let mut queue = tokio::task::JoinSet::new();
+        for _ in 0..QUEUE {
+            let server = server.clone();
+            queue.spawn(async move { server.get_retro_seniority(lookup()).await.map(|_| ()) });
+        }
+        // The paused clock stands still while this task yields.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            queue.try_join_next().is_none(),
+            "the lookups wait for the busy worker"
+        );
+        let started = tokio::time::Instant::now();
+        let answered =
+            tokio::time::timeout(COIN_READ_WAIT * 2, server.get_retro_seniority(lookup())).await;
+        let waited = started.elapsed();
+        let code = answered.ok().and_then(|r| r.err()).map(|s| s.code());
+        eprintln!("REACH retro-queue-cap code={code:?} waited={waited:?}");
+        assert!(
+            code == Some(tonic::Code::ResourceExhausted)
+                && waited < std::time::Duration::from_secs(1),
+            "RETRO-QUEUE-PAST-CAP: the lookup past {QUEUE} waiting was answered \
+             {code:?} after {waited:?}"
+        );
+        queue.abort_all();
         drop(held);
     }
 
