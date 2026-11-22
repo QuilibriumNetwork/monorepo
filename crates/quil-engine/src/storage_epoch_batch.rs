@@ -1277,16 +1277,15 @@ fn reuse_settlement_proof(seats: &[PreparedSeat]) -> Option<(Arc<Vec<u8>>, u32)>
     reused
 }
 
-/// Send `seats`, settlements sent alone again from the same parts, as the
-/// proof made of them before ([`reuse_settlement_proof`]). False when there
-/// is none, or a window has closed (the proving path drops it and logs why).
-fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
+/// The proof to send `seats`, settlements sent alone again from the same
+/// parts, as: the one made of them before ([`reuse_settlement_proof`]),
+/// published through [`publish_stamped`]. `None` when there is none, or a
+/// window has closed (the proving path drops it and logs why).
+fn resend_settlement(seats: &[PreparedSeat]) -> Option<Arc<Vec<u8>>> {
     if seats.iter().any(window_closed) {
-        return false;
+        return None;
     }
-    let Some((bytes, resends)) = reuse_settlement_proof(seats) else {
-        return false;
-    };
+    let (bytes, resends) = reuse_settlement_proof(seats)?;
     if let Ok(mut sent) = settlements_sent().lock() {
         for seat in seats {
             sent.insert(
@@ -1302,8 +1301,7 @@ fn resend_settlement(seats: &[PreparedSeat], publish: &Publish) -> bool {
     tracing::debug!(member = %seats.first().map(|seat| hex::encode(seat.member)).unwrap_or_default(),
         ?shards, resends, bytes = bytes.len(),
         "storage settlements sent again alone, as the proof made before");
-    publish(bytes.to_vec());
-    true
+    Some(bytes)
 }
 
 /// Give back the settlements a proof that failed claimed.
@@ -1924,28 +1922,61 @@ pub fn prove(seats: Vec<PreparedSeat>) -> Result<Vec<u8>> {
 const RECENTLY_PROVED: Duration = Duration::from_secs(60);
 
 /// A proof's seats as its message names them, sorted: each part's shard,
-/// the epoch it settles, and whether it seals and settles. All a transport
-/// knows of a proof it gives up ([`note_proof_abandoned`]).
+/// the epoch it settles, and whether it seals and settles.
 type ProofSeats = Vec<(Vec<u8>, u64, bool, bool)>;
 
-/// When each member's seat parts were last proved, by member and part, and
-/// the seats of the proof that did.
-type ProvedSeats = HashMap<([u8; 32], SeatKey), (Instant, Arc<ProofSeats>)>;
+/// A published proof's id: the SHA3-256 of its bytes, the request a
+/// transport bundle carries. Its stamps are keyed by it
+/// ([`publish_stamped`]), and a transport giving the proof up names it
+/// alike ([`note_proof_abandoned`]). Two copies of the same bytes are one
+/// proof: a settlement sent again goes as the bytes made before.
+pub type ProofId = [u8; 32];
+
+/// The id of the proof published as `bytes` ([`ProofId`]).
+pub fn proof_id(bytes: &[u8]) -> ProofId {
+    use sha3::Digest;
+    sha3::Sha3_256::digest(bytes).into()
+}
+
+/// The proof a seat's stamp is of: one being made, by its number, or one
+/// published, by its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampedBy {
+    Making(u64),
+    Sent(ProofId),
+}
+
+/// When each member's seat parts were proved, by member and part: one
+/// stamp per proof covering the part, so each proof sets, re-keys and
+/// takes back only its own. One stamp per part, its proof named by its
+/// seat list, let a proof given up take back a later proof's stamps of the
+/// same seats, and kept a proof's stamps it no longer carried (read,
+/// 2026-11-23).
+type ProvedSeats = HashMap<([u8; 32], SeatKey), Vec<(Instant, StampedBy)>>;
 
 fn proved() -> &'static Mutex<ProvedSeats> {
     static PROVED: OnceLock<Mutex<ProvedSeats>> = OnceLock::new();
     PROVED.get_or_init(Default::default)
 }
 
+/// Take back the stamps of `member`'s proof `by`, and every stamp lapsed.
+fn take_back(proved: &mut ProvedSeats, member: &[u8; 32], by: StampedBy) {
+    proved.retain(|(of, _), stamps| {
+        stamps.retain(|(at, of_proof)| {
+            at.elapsed() < RECENTLY_PROVED && !(of == member && *of_proof == by)
+        });
+        !stamps.is_empty()
+    });
+}
+
+#[cfg(test)]
 fn named_seats(seats: &[PreparedSeat]) -> ProofSeats {
     named_proof_seats(seats.iter().map(|seat| &seat.part))
 }
 
 /// The seats a proof's message names (`StorageEpochProof::seats`), sorted:
 /// each part's shard, the epoch it settles, and whether it seals and
-/// settles. A proof's stamps are keyed by these ([`note_proved`]), and a
-/// transport giving a proof up names its seats alike
-/// ([`note_proof_abandoned`]).
+/// settles. A transport reads a proof's seats alike.
 pub fn named_proof_seats<'a>(
     parts: impl IntoIterator<Item = &'a SeatProof>,
 ) -> Vec<(Vec<u8>, u64, bool, bool)> {
@@ -1974,86 +2005,88 @@ fn proofs_made() -> &'static Mutex<Vec<MadeProof>> {
 
 /// Stamp `seats` proved now by one proof, whose stamps it returns.
 fn note_proved(seats: &[PreparedSeat]) -> Stamped {
-    let proof = Arc::new(named_seats(seats));
+    static MAKING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let by = StampedBy::Making(MAKING.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let at = Instant::now();
     #[cfg(test)]
     if let (Some(seat), Ok(mut made)) = (seats.first(), proofs_made().lock()) {
-        made.push((seat.member, proof.clone()));
+        made.push((seat.member, Arc::new(named_seats(seats))));
     }
     if let Ok(mut proved) = proved().lock() {
-        proved.retain(|_, (at, _)| at.elapsed() < RECENTLY_PROVED);
+        proved.retain(|_, stamps| {
+            stamps.retain(|(at, _)| at.elapsed() < RECENTLY_PROVED);
+            !stamps.is_empty()
+        });
         for seat in seats {
-            proved.insert((seat.member, seat.key()), (at, proof.clone()));
+            proved
+                .entry((seat.member, seat.key()))
+                .or_default()
+                .push((at, by));
         }
     }
     Stamped {
         member: seats.first().map(|seat| seat.member).unwrap_or_default(),
-        proof,
+        by,
         at,
         kept: false,
     }
 }
 
-/// Take back the stamps `member`'s proof of `proof` set ([`note_proved`])
-/// that no later proof replaced: it settles none of its seats.
-fn unnote_proved(member: &[u8; 32], proof: &[(Vec<u8>, u64, bool, bool)]) {
+/// Note that this node's transport gave up `member`'s proof `proof`
+/// ([`proof_id`] of the bytes it was published as) unsettled: GLOBAL
+/// refuses it whole, a seat beside the others settled or sealed already;
+/// every archive refused it for good; a full retry queue dropped it; or a
+/// later proof superseded it. The one call for each such path: the stamps
+/// that proof set are taken back, and its seats' retries go at once, while
+/// another proof's stamps of the same seats stay; stamped proved, each was
+/// dropped for a minute, and one sent near its window's end missed it.
+pub fn note_proof_abandoned(member: &[u8; 32], proof: &ProofId) {
     if let Ok(mut proved) = proved().lock() {
-        proved.retain(|(of, _), (_, by)| !(of == member && by.as_slice() == proof));
+        take_back(&mut proved, member, StampedBy::Sent(*proof));
     }
 }
 
-/// Note that this node's transport gave up `member`'s proof of `seats`
-/// (shard, epoch settled, seals and settles each, as its message names
-/// them) unsettled: GLOBAL refuses it whole, a seat beside the others
-/// settled or sealed already; every archive refused it for good; or a full
-/// retry queue dropped it. The one call for each such path: their workers'
-/// retries are taken at once ([`unnote_proved`]); stamped proved, each was
-/// dropped for a minute, and one sent near its window's end missed it.
-pub fn note_proof_abandoned(member: &[u8; 32], seats: &[(Vec<u8>, u64, bool, bool)]) {
-    let mut proof = seats.to_vec();
-    proof.sort_unstable();
-    unnote_proved(member, &proof);
-}
-
 /// A proof's stamps on its seats ([`note_proved`]), taken back unless it
-/// was published or another proof covers its seats: one that failed, was
-/// dropped or left every seat out settles none, and its workers send each
-/// again alone at once.
-#[must_use = "dropped unkept, it takes its stamps back"]
+/// was published ([`publish_stamped`]): one that failed, was dropped, left
+/// every seat out or found them all claimed settles none, and its workers
+/// send each again alone at once.
+#[must_use = "dropped unpublished, it takes its stamps back"]
 struct Stamped {
     member: [u8; 32],
-    proof: Arc<ProofSeats>,
+    by: StampedBy,
     /// When its proof stamped its seats.
     at: Instant,
     kept: bool,
 }
 
-impl Stamped {
-    /// Key its stamps to `published`, the seats of the message going out,
-    /// keeping their time; a stamp a later proof set stays. The job may
-    /// leave seats out or cut one to its seal half after stamping them
-    /// ([`rebuilt`], [`claim_settlements`]), and a transport giving the
-    /// message up names the seats it carries ([`note_proof_abandoned`]):
-    /// keyed as queued, they stayed stamped (read, 2026-11-23).
-    fn publishing(&mut self, published: ProofSeats) {
-        let proof = Arc::new(published);
-        if let Ok(mut proved) = proved().lock() {
-            proved.retain(|(of, _), (_, by)| !(*of == self.member && Arc::ptr_eq(by, &self.proof)));
-            if self.at.elapsed() < RECENTLY_PROVED {
-                for (filter, _, seals, settles) in proof.iter() {
-                    let key = SeatKey {
-                        filter: filter.clone(),
-                        seals: *seals,
-                        settles: *settles,
-                    };
-                    proved
-                        .entry((self.member, key))
-                        .or_insert_with(|| (self.at, proof.clone()));
+/// Publish `bytes`, the proof of the seats `carried` (the parts its
+/// message names), whose job `stamped` its seats as it began: its stamps
+/// are first keyed to the message ([`proof_id`]) and to those seats,
+/// keeping their time, so a transport giving the message up takes back
+/// exactly them ([`note_proof_abandoned`]). The one way a proof job
+/// publishes: after stamping, the job may leave seats out or cut one to
+/// its seal half ([`rebuilt`], [`claim_settlements`]), and a settlement
+/// sent again goes as the bytes made before ([`resend_settlement`]);
+/// keyed as queued, such stamps outlived the message given up (read,
+/// 2026-11-23).
+fn publish_stamped(mut stamped: Stamped, carried: &[SeatKey], bytes: Vec<u8>, publish: &Publish) {
+    let sent = StampedBy::Sent(proof_id(&bytes));
+    if let Ok(mut proved) = proved().lock() {
+        take_back(&mut proved, &stamped.member, stamped.by);
+        if stamped.at.elapsed() < RECENTLY_PROVED {
+            for key in carried {
+                let stamps = proved.entry((stamped.member, key.clone())).or_default();
+                match stamps.iter_mut().find(|(_, by)| *by == sent) {
+                    // The same bytes went out before: stamped from now.
+                    Some((at, _)) => *at = (*at).max(stamped.at),
+                    None => stamps.push((stamped.at, sent)),
                 }
             }
         }
-        self.proof = proof;
     }
+    stamped.by = sent;
+    stamped.kept = true;
+    publish(bytes);
 }
 
 impl Drop for Stamped {
@@ -2062,7 +2095,7 @@ impl Drop for Stamped {
             return;
         }
         if let Ok(mut proved) = proved().lock() {
-            proved.retain(|(of, _), (_, by)| !(*of == self.member && Arc::ptr_eq(by, &self.proof)));
+            take_back(&mut proved, &self.member, self.by);
         }
     }
 }
@@ -2077,8 +2110,10 @@ fn recently_proved(seat: &PreparedSeat) -> bool {
             .any(|(member, held)| *member == seat.member && held.overlaps(&key))
     });
     held || proved().lock().is_ok_and(|proved| {
-        proved.iter().any(|((member, proved_key), (at, _))| {
-            *member == seat.member && proved_key.overlaps(&key) && at.elapsed() < RECENTLY_PROVED
+        proved.iter().any(|((member, proved_key), stamps)| {
+            *member == seat.member
+                && proved_key.overlaps(&key)
+                && stamps.iter().any(|(at, _)| at.elapsed() < RECENTLY_PROVED)
         })
     })
 }
@@ -2934,8 +2969,8 @@ fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
     let lane = proof_lane(&seats, alone, persistent);
     crate::storage_jobs::spawn(&lane, "member epoch proof", move || {
         let _held = held;
-        // Taken whole: its drop takes the stamps back.
-        let mut stamped = stamped;
+        // Dropped before the hold, unpublished, it takes its stamps back.
+        let stamped = stamped;
         // Queued in its lane, or sent again, a proof leaves out what would
         // make GLOBAL refuse it whole.
         let Some(seats) = rebuilt(seats, &publish) else {
@@ -2943,8 +2978,9 @@ fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
         };
         // Sent again from the same part, a settlement alone goes as the
         // proof made of it before: nothing is proved again.
-        if alone && resend_settlement(&seats, &publish) {
-            stamped.kept = true;
+        if let Some(bytes) = alone.then(|| resend_settlement(&seats)).flatten() {
+            let carried: Vec<SeatKey> = seats.iter().map(PreparedSeat::key).collect();
+            publish_stamped(stamped, &carried, bytes.to_vec(), &publish);
             return Ok(());
         }
         let bytes = proof_reservation(&seats, persistent)?;
@@ -2959,8 +2995,9 @@ fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
         };
         let (seats, claimed) = claim_settlements(seats);
         if seats.is_empty() {
-            // Claimed by a proof on its way, which covers them.
-            stamped.kept = true;
+            // Claimed by a proof on its way, which covers them with stamps
+            // of its own: kept, these outlived that proof given up (read,
+            // 2026-11-23).
             return Ok(());
         }
         let kept = alone.then(|| parts_digest(&seats));
@@ -2998,7 +3035,7 @@ fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
         let together =
             (count > 1 && seats.iter().all(settles_only_persistent)).then(|| seats.clone());
         let alone_key = alone_in(&seats);
-        let published = named_seats(&seats);
+        let carried: Vec<SeatKey> = seats.iter().map(PreparedSeat::key).collect();
         let proof = prove(seats);
         watch.finish();
         match proof {
@@ -3021,9 +3058,7 @@ fn prove_held(seats: Vec<PreparedSeat>, publish: Publish, held: Arc<Proving>) {
                 if let Some(parts) = kept {
                     keep_settlement_proof(parts, &proved, &bytes);
                 }
-                stamped.publishing(published);
-                publish(bytes);
-                stamped.kept = true;
+                publish_stamped(stamped, &carried, bytes, &publish);
                 if let Some(key) = alone_key {
                     note_published_alone(key);
                 }
@@ -3909,8 +3944,22 @@ mod tests {
 
     /// Stamp `seats` proved by a proof published ([`note_proved`]).
     fn stamp_published(seats: &[PreparedSeat]) {
-        let mut stamped = note_proved(seats);
-        stamped.kept = true;
+        publish_as(seats, b"a proof");
+    }
+
+    /// Stamp `seats` proved by a proof published as `bytes`, as a proof job
+    /// does ([`publish_stamped`]).
+    fn publish_as(seats: &[PreparedSeat], bytes: &[u8]) {
+        let carried: Vec<SeatKey> = seats.iter().map(PreparedSeat::key).collect();
+        let publish: Publish = Arc::new(|_| {});
+        publish_stamped(note_proved(seats), &carried, bytes.to_vec(), &publish);
+    }
+
+    /// Give up the proof of `seats` published as `bytes`, as this node's
+    /// transport does ([`note_proof_abandoned`]).
+    fn give_up(seats: &[PreparedSeat], bytes: &[u8]) {
+        let member = seats.first().map(|seat| seat.member).unwrap_or_default();
+        note_proof_abandoned(&member, &proof_id(bytes));
     }
 
     /// Whether a proof was made of `part` ([`proofs_made`]).
@@ -5537,14 +5586,11 @@ mod tests {
         sealing.member = member;
         let mut settling = seat(0x3b, 0, false);
         settling.member = member;
-        stamp_published(&[sealing.clone(), settling.clone()]);
+        let both = [sealing.clone(), settling.clone()];
+        publish_as(&both, b"a proof GLOBAL refuses whole");
         // The settlement sent again and proved alone since.
-        stamp_published(std::slice::from_ref(&settling));
-        // Named as its message names them ([`named_proof_seats`]), in
-        // another order.
-        let mut named = named_proof_seats([&settling.part, &sealing.part]);
-        named.reverse();
-        note_proof_abandoned(&member, &named);
+        publish_as(std::slice::from_ref(&settling), b"a later proof");
+        give_up(&both, b"a proof GLOBAL refuses whole");
         let (freed, kept) = (!recently_proved(&sealing), recently_proved(&settling));
         eprintln!("REACH seat-hold-stamp-refused freed={freed} kept={kept}");
         assert!(
@@ -5647,12 +5693,160 @@ mod tests {
             !holding() && recently_proved(&a) && recently_proved(&b),
             "premise: its job ended and the seats it carried stay stamped"
         );
-        note_proof_abandoned(&member, &published);
+        note_proof_abandoned(&member, &proof_id(&sent[0]));
         let freed = !recently_proved(&a) && !recently_proved(&b);
         eprintln!("REACH seat-hold-stamp-published freed={freed}");
         assert!(
             freed,
             "STAMP-UNKEYED: the seats of a proof given up as published stayed stamped proved"
+        );
+    }
+
+    /// A settlement sent again as the proof made before
+    /// ([`resend_settlement`]) keys its stamps to the seats that proof
+    /// carries: a transport giving it up frees them. Its job stamped the
+    /// seats it was queued with, one GLOBAL settled since among them, and
+    /// published the kept bytes unkeyed: given up, its seats stayed stamped
+    /// proved for a minute, each retry dropped (read, 2026-11-23).
+    #[test]
+    fn a_settlement_sent_again_and_given_up_frees_the_seats_it_carried() {
+        let member = [0x7d; 32];
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let publish: Publish = {
+            let sent = sent.clone();
+            Arc::new(move |bytes| sent.lock().unwrap().push(bytes))
+        };
+        let seat = |shard: u8| provable_settlement(member, vec![shard; 35], 1500, 4, 2, 1 << 10);
+        let (a, b, left) = (seat(0x84), seat(0x85), seat(0x86));
+        let holding = || {
+            proving()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(of, _)| *of == member)
+        };
+        let wait = |sends: usize| {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while (sent.lock().unwrap().len() < sends || holding()) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        prove_and_publish(vec![a.clone(), b.clone()], publish.clone());
+        wait(1);
+        // GLOBAL settles `left` since: the retry of the three leaves it out
+        // and goes as the proof made of the other two.
+        let view_key = settlement_key(&left);
+        set_settled_view(Arc::new(move |of: &[u8; 32], filter: &[u8], epoch: u64| {
+            (*of == view_key.0 && filter == view_key.1.as_slice() && epoch == view_key.2)
+                .then_some(1_070_300)
+        }));
+        prove_and_publish(vec![a.clone(), left, b.clone()], publish);
+        wait(2);
+        let sent = sent.lock().unwrap().clone();
+        assert!(
+            sent.len() == 2 && sent[0] == sent[1],
+            "premise: sent again as the proof made before ({} sends)",
+            sent.len()
+        );
+        assert!(
+            !holding() && recently_proved(&a) && recently_proved(&b),
+            "premise: its job ended and the seats it carried stay stamped"
+        );
+        give_up(&[a.clone(), b.clone()], &sent[1]);
+        let freed = !recently_proved(&a) && !recently_proved(&b);
+        eprintln!("REACH seat-hold-resent-given-up freed={freed}");
+        assert!(
+            freed,
+            "RESENT-KEPT: the seats of a settlement sent again and given up stayed stamped proved"
+        );
+    }
+
+    /// A proof given up takes back only its own stamps: a later proof of
+    /// the same seats keeps them stamped. With one stamp per seat, its
+    /// proof named by its seat list, an earlier proof given up (a full
+    /// queue dropped it, or every archive refused it sent again) took back
+    /// the later proof's stamps, and their retries were proved again beside
+    /// it (read, 2026-11-23).
+    #[test]
+    fn a_proof_given_up_leaves_a_later_proofs_stamps_of_the_same_seats() {
+        let member = [0x7e; 32];
+        let mut sealing = seat(0x3d, 1, false);
+        sealing.member = member;
+        let mut settling = seat(0x3e, 0, false);
+        settling.member = member;
+        let both = [sealing.clone(), settling.clone()];
+        publish_as(&both, b"an earlier proof");
+        publish_as(&both, b"a later proof");
+        give_up(&both, b"an earlier proof");
+        let kept = recently_proved(&sealing) && recently_proved(&settling);
+        eprintln!("REACH seat-hold-later-kept kept={kept}");
+        assert!(
+            kept,
+            "LATER-TAKEN: a proof given up took back a later proof's stamps of the same seats"
+        );
+    }
+
+    /// A proof whose seats a proof on its way all claimed
+    /// ([`claim_settlements`]) keeps no stamps of its own: the claiming
+    /// proof's cover them, and given up, it frees them. Kept, its stamps
+    /// outlived the claiming proof given up, each retry dropped for a
+    /// minute (read, 2026-11-23).
+    #[test]
+    fn a_proof_whose_seats_another_claimed_keeps_no_stamps_of_its_own() {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| GateWriter)
+                .finish(),
+        );
+        let member = [0x7f; 32];
+        let settling = |shard: u8| {
+            let mut part = seat(shard, 0, false);
+            part.member = member;
+            part.part.epoch = 1500;
+            part
+        };
+        let (s, t, u) = (settling(0x3f), settling(0x40), settling(0x41));
+        let claiming = [s.clone(), t.clone(), u];
+        let (_, claimed) = claim_settlements(claiming.to_vec());
+        assert_eq!(
+            claimed.len(),
+            3,
+            "premise: the first proof claimed the settlements"
+        );
+        publish_as(&claiming, b"the claiming proof");
+        prove_and_publish(vec![s.clone(), t.clone()], Arc::new(|_| {}));
+        let holding = || {
+            proving()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(of, _)| *of == member)
+        };
+        let cap = Instant::now() + Duration::from_secs(60);
+        while holding() && Instant::now() < cap {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cut = gate()
+            .lines
+            .lock()
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains(&hex::encode(member)) && line.contains("not sent again with it")
+            })
+            .count();
+        assert!(
+            !holding() && cut == 2,
+            "premise: the job ended, both its settlements claimed ({cut} cut)"
+        );
+        give_up(&claiming, b"the claiming proof");
+        let freed = !recently_proved(&s) && !recently_proved(&t);
+        eprintln!("REACH seat-hold-claimed-stamps freed={freed}");
+        assert!(
+            freed,
+            "CLAIMED-KEPT: a proof whose seats another claimed kept them stamped after that one was given up"
         );
     }
 
