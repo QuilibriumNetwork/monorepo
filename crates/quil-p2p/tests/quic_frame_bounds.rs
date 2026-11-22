@@ -795,14 +795,13 @@ async fn start_node() -> NodeUnderTest {
     config.network = 99;
     config.bootstrap_peers = Vec::new();
     config.direct_peers = Vec::new();
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let node = P2PNode::new_with_options(&config, true, None).unwrap();
-    let (handle, inbound) = node
-        .start(&mut sup, &format!("/ip4/127.0.0.1/udp/{port}/quic-v1"))
+    let (handle, inbound, port) = node
+        .start_on_loopback(
+            &mut sup,
+            quil_p2p::node::ListenTransport::QuicV1,
+            quil_p2p::node::ListenFamily::Ip4,
+        )
         .await
         .unwrap();
     NodeUnderTest {

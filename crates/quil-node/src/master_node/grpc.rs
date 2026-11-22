@@ -7099,15 +7099,9 @@ mod shard_submission_tests {
     struct LoneNode {
         p2p: quil_p2p::node::P2PHandle,
         inbound: mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
+        /// The loopback TCP port it listens on.
+        port: u16,
         _sup: Supervisor<anyhow::Error>,
-    }
-
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     fn p2p_config() -> quil_config::P2PConfig {
@@ -7119,22 +7113,27 @@ mod shard_submission_tests {
         }
     }
 
-    async fn start_node(config: &quil_config::P2PConfig, port: u16) -> LoneNode {
+    async fn start_node(config: &quil_config::P2PConfig) -> LoneNode {
         let mut sup = Supervisor::<anyhow::Error>::new();
         let node = quil_p2p::P2PNode::new_with_options(config, true, None).unwrap();
-        let (p2p, inbound) = node
-            .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{port}"))
+        let (p2p, inbound, port) = node
+            .start_on_loopback(
+                &mut sup,
+                quil_p2p::node::ListenTransport::Tcp,
+                quil_p2p::node::ListenFamily::Ip4,
+            )
             .await
             .unwrap();
         LoneNode {
             p2p,
             inbound,
+            port,
             _sup: sup,
         }
     }
 
     async fn lone_node() -> LoneNode {
-        start_node(&p2p_config(), free_port()).await
+        start_node(&p2p_config()).await
     }
 
     fn engines_of(applications: &[[u8; 32]]) -> Engines {
@@ -7360,8 +7359,7 @@ mod shard_submission_tests {
     async fn a_send_with_a_peer_on_the_topic_is_gossiped_and_ends_the_condition() {
         let app = [0x46u8; 32];
         let topic = quil_engine::bitmasks::app_prover_bitmask(&app);
-        let receiver_port = free_port();
-        let mut receiver = start_node(&p2p_config(), receiver_port).await;
+        let mut receiver = start_node(&p2p_config()).await;
         receiver
             .p2p
             .subscribe_confirmed(topic.clone())
@@ -7369,10 +7367,10 @@ mod shard_submission_tests {
             .unwrap();
         let mut sender_config = p2p_config();
         sender_config.bootstrap_peers = vec![format!(
-            "/ip4/127.0.0.1/tcp/{receiver_port}/p2p/{}",
-            receiver.p2p.peer_id
+            "/ip4/127.0.0.1/tcp/{}/p2p/{}",
+            receiver.port, receiver.p2p.peer_id
         )];
-        let sender = start_node(&sender_config, free_port()).await;
+        let sender = start_node(&sender_config).await;
         let cap = std::time::Duration::from_secs(120);
         let deadline = tokio::time::Instant::now() + cap;
         while sender

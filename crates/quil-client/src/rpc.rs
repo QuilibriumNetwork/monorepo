@@ -242,9 +242,11 @@ mod tests {
     /// A refused connection names its cause, not only "transport error".
     #[tokio::test]
     async fn a_failed_connection_names_its_cause() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // A bound socket that never listens: a dial is refused, and no other
+        // socket can take the port while the test dials it.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = closed.local_addr().unwrap().port();
         let opts = ConnectOpts {
             public_rpc: false,
             custom_rpc: String::new(),

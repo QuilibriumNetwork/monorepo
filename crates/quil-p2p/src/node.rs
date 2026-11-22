@@ -970,7 +970,7 @@ impl P2PNode {
             // queue's share kept for gossip ([`crate::direct::DirectAdmission`]).
             let mut direct_admission = crate::direct::DirectAdmission::default();
             let mut bootstrapped = false;
-            let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
+            let mut discovery_timer = tokio::time::interval(DISCOVERY_INTERVAL);
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
             let mut ticks_without_listener = 0u32;
@@ -982,13 +982,13 @@ impl P2PNode {
             // rate-limit, opening DHT substreams to many peers. Burst
             // floods pushed per-connection stream counts past yamux's
             // 8192 cap, breaking connections with "maximum number of
-            // streams reached". The periodic `discovery_timer` below
-            // already runs the same query every 30 s, so this
-            // throttle suppresses redundant NeedPeers re-issues
-            // inside the window. 30 s matches the timer cadence —
-            // any tighter is wasteful, any looser delays recovery
-            // from a real partition.
-            let need_peers_throttle = Duration::from_secs(30);
+            // streams reached". The periodic `discovery_timer` above
+            // already runs the same query every [`DISCOVERY_INTERVAL`],
+            // so this throttle suppresses redundant NeedPeers re-issues
+            // inside that window. It is the timer's cadence — any
+            // tighter is wasteful, any looser delays recovery from a
+            // real partition.
+            let need_peers_throttle = DISCOVERY_INTERVAL;
             let mut last_need_peers_query: Option<std::time::Instant> = None;
             // Operator lines on QUIC connections that end on a transport error.
             let mut quic_closes = crate::quic_close::QuicCloses::default();
@@ -1045,10 +1045,10 @@ impl P2PNode {
                         // IPv6 disabled does. The first tick fires at once.
                         if !bootstrapped {
                             ticks_without_listener = ticks_without_listener.saturating_add(1);
-                            if ticks_without_listener % 120 == 2 {
+                            if ticks_without_listener % NO_LISTENER_WARN_TICKS == 2 {
                                 warn!(
                                     listen = %configured_listen,
-                                    waited_secs = u64::from(ticks_without_listener - 1) * 30,
+                                    waited_secs = u64::from(ticks_without_listener - 1) * DISCOVERY_INTERVAL.as_secs(),
                                     "no p2p listener has an address, so this node dials no peer \
                                      and peers cannot dial it; check that the host has an address \
                                      in the family of p2p.listenMultiaddr, and that its port is free"
@@ -1753,6 +1753,133 @@ impl P2PNode {
             msg_rx,
         ))
     }
+
+    /// Start the node on port 0 of the loopback in `family`, over
+    /// `transport`, and return the port once its listener holds it; for
+    /// tests. A port probed free before the start can be taken by another
+    /// socket before the node binds it, which leaves the node with no
+    /// listener.
+    #[doc(hidden)]
+    pub async fn start_on_loopback(
+        self,
+        sup: &mut quil_lifecycle::Supervisor<anyhow::Error>,
+        transport: ListenTransport,
+        family: ListenFamily,
+    ) -> quil_types::error::Result<(P2PHandle, mpsc::Receiver<ReceivedMessage>, u16)> {
+        let (handle, inbound) = self
+            .start(sup, &family.loopback_port_zero(transport))
+            .await?;
+        let port = handle.bound_port(transport, family).await?;
+        Ok((handle, inbound, port))
+    }
+}
+
+/// How long a test waits for a node's bootstrap peer to connect: past the
+/// discovery tick, which re-dials a bootstrap peer whose first dial failed.
+#[doc(hidden)]
+pub const CONNECT_WAIT: Duration = Duration::from_secs(DISCOVERY_INTERVAL.as_secs() + 10);
+
+/// A wait that ends before the discovery tick's first re-dial: a test
+/// that sees a bootstrap peer connect sooner saw the node's first dial.
+#[doc(hidden)]
+pub const BEFORE_A_TICK: Duration = Duration::from_secs(DISCOVERY_INTERVAL.as_secs() - 5);
+
+/// How often the node runs peer discovery and re-dials a bootstrap peer it
+/// is not connected to; the first round runs at the start.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Discovery ticks between repeats of the no-listener warning: about an
+/// hour.
+const NO_LISTENER_WARN_TICKS: u32 = (3600 / DISCOVERY_INTERVAL.as_secs()) as u32;
+
+/// A listener's transport, for [`P2PNode::start_on_loopback`] and
+/// [`P2PHandle::bound_port`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenTransport {
+    Tcp,
+    /// QUIC v1, over UDP.
+    QuicV1,
+}
+
+/// A listener's address family, for [`P2PNode::start_on_loopback`] and
+/// [`P2PHandle::bound_port`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenFamily {
+    Ip4,
+    Ip6,
+}
+
+impl ListenFamily {
+    /// Port 0 of this family's loopback over `transport`.
+    fn loopback_port_zero(self, transport: ListenTransport) -> String {
+        let ip = match self {
+            ListenFamily::Ip4 => "/ip4/127.0.0.1",
+            ListenFamily::Ip6 => "/ip6/::1",
+        };
+        match transport {
+            ListenTransport::Tcp => format!("{ip}/tcp/0"),
+            ListenTransport::QuicV1 => format!("{ip}/udp/0/quic-v1"),
+        }
+    }
+}
+
+/// How long [`P2PHandle::bound_port`] waits for its listener's address; it
+/// comes on the swarm's first poll, so reaching this is a failure.
+const LISTEN_PORT_CAP: Duration = Duration::from_secs(60);
+
+/// The port of `addr` when it is a bound listener's whole address over
+/// `transport` in `family`: `/ip4/HOST/tcp/PORT` or
+/// `/ip6/HOST/udp/PORT/quic-v1`, nothing after it, and a port other than 0.
+fn bound_port_of(addr: &str, transport: ListenTransport, family: ListenFamily) -> Option<u16> {
+    let addr: Multiaddr = addr.parse().ok()?;
+    let mut parts = addr.iter();
+    match (parts.next()?, family) {
+        (Protocol::Ip4(_), ListenFamily::Ip4) | (Protocol::Ip6(_), ListenFamily::Ip6) => {}
+        _ => return None,
+    }
+    let port = match (parts.next()?, transport) {
+        (Protocol::Tcp(port), ListenTransport::Tcp) => port,
+        (Protocol::Udp(port), ListenTransport::QuicV1)
+            if matches!(parts.next(), Some(Protocol::QuicV1)) =>
+        {
+            port
+        }
+        _ => return None,
+    };
+    (port != 0 && parts.next().is_none()).then_some(port)
+}
+
+/// Why [`wait_for_bound_port`] returned no port.
+#[derive(Debug, PartialEq, Eq)]
+enum PortWait {
+    /// No such listener was listed within the cap.
+    Timeout,
+    /// The node stopped: its listen-address watch closed.
+    Closed,
+}
+
+/// The port of a bound listener over `transport` in `family`, once
+/// `addrs` lists one; waits at most `cap`.
+async fn wait_for_bound_port(
+    addrs: &mut tokio::sync::watch::Receiver<Vec<String>>,
+    transport: ListenTransport,
+    family: ListenFamily,
+    cap: Duration,
+) -> Result<u16, PortWait> {
+    let mut port = None;
+    let listed = addrs.wait_for(|addrs| {
+        port = addrs
+            .iter()
+            .find_map(|a| bound_port_of(a, transport, family));
+        port.is_some()
+    });
+    match tokio::time::timeout(cap, listed).await {
+        Ok(Ok(_)) => port.ok_or(PortWait::Closed),
+        Ok(Err(_)) => Err(PortWait::Closed),
+        Err(_) => Err(PortWait::Timeout),
+    }
 }
 
 #[derive(Clone)]
@@ -2192,6 +2319,27 @@ impl P2PHandle {
     /// interface's address).
     pub fn listen_addresses(&self) -> Vec<String> {
         self.listen_addrs.borrow().clone()
+    }
+
+    /// The port of this node's bound listener over `transport` in
+    /// `family`, once the node lists one; for tests that start a node on
+    /// port 0 and dial the port the kernel gave it.
+    #[doc(hidden)]
+    pub async fn bound_port(
+        &self,
+        transport: ListenTransport,
+        family: ListenFamily,
+    ) -> quil_types::error::Result<u16> {
+        let mut addrs = self.listen_addrs.clone();
+        wait_for_bound_port(&mut addrs, transport, family, LISTEN_PORT_CAP)
+            .await
+            .map_err(|why| {
+                QuilError::P2p(format!(
+                    "no {transport:?} listener in {family:?} bound ({why:?}, cap \
+                     {LISTEN_PORT_CAP:?}); listening on {:?}",
+                    self.listen_addresses()
+                ))
+            })
     }
 
     /// Whether AutoNAT probes IPv6 rather than IPv4: its servers and the
@@ -3171,5 +3319,131 @@ mod listen_addr_tests {
             ]
         ));
         assert!(addrs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::{
+        bound_port_of, wait_for_bound_port, ListenFamily, ListenTransport, P2PNode, PortWait,
+    };
+    use std::time::Duration;
+
+    /// The node holds the port it returns: no other socket can bind it, as
+    /// another test could bind a port only probed free.
+    #[tokio::test]
+    async fn a_node_started_on_loopback_holds_the_port_it_returns() {
+        let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+        let config = quil_config::P2PConfig {
+            network: 99,
+            bootstrap_peers: Vec::new(),
+            direct_peers: Vec::new(),
+            ..Default::default()
+        };
+        let node = P2PNode::new_with_options(&config, true, None).unwrap();
+        let (node, _inbound, port) = node
+            .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
+            .await
+            .unwrap();
+        let listening = node.listen_addresses();
+        assert!(
+            listening
+                .iter()
+                .any(|a| bound_port_of(a, ListenTransport::Tcp, ListenFamily::Ip4) == Some(port)),
+            "port {port} is not among {listening:?}"
+        );
+        let other = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(
+            other.is_err(),
+            "another socket bound port {port}, which the node should hold"
+        );
+    }
+
+    #[test]
+    fn only_a_bound_tcp_port_is_read() {
+        let tcp = |addr| bound_port_of(addr, ListenTransport::Tcp, ListenFamily::Ip4);
+        assert_eq!(tcp("/ip4/127.0.0.1/tcp/4001"), Some(4001));
+        assert_eq!(
+            tcp("/ip4/127.0.0.1/tcp/0"),
+            None,
+            "tcp/0 asks for a port; it names none"
+        );
+        assert_eq!(tcp("not an address"), None);
+    }
+
+    /// A listener's address is read only when its whole address is the
+    /// transport and family asked for.
+    #[test]
+    fn a_listen_address_is_read_only_for_its_transport_and_family() {
+        use ListenFamily::{Ip4, Ip6};
+        use ListenTransport::{QuicV1, Tcp};
+        let quic4 = "/ip4/127.0.0.1/udp/4002/quic-v1";
+        let tcp6 = "/ip6/::1/tcp/4003";
+        assert_eq!(bound_port_of(quic4, QuicV1, Ip4), Some(4002));
+        assert_eq!(bound_port_of(tcp6, Tcp, Ip6), Some(4003));
+        assert_eq!(bound_port_of(tcp6, Tcp, Ip4), None, "another family");
+        assert_eq!(bound_port_of(quic4, QuicV1, Ip6), None, "another family");
+        assert_eq!(bound_port_of(quic4, Tcp, Ip4), None, "another transport");
+        assert_eq!(bound_port_of(tcp6, QuicV1, Ip6), None, "another transport");
+        assert_eq!(
+            bound_port_of("/ip4/127.0.0.1/udp/4004", QuicV1, Ip4),
+            None,
+            "UDP without QUIC"
+        );
+        assert_eq!(
+            bound_port_of("/ip4/127.0.0.1/tcp/4005/ws", Tcp, Ip4),
+            None,
+            "a protocol after the port"
+        );
+        assert_eq!(
+            bound_port_of("/dns4/localhost/tcp/4006", Tcp, Ip4),
+            None,
+            "a name, not an address"
+        );
+    }
+
+    /// A port listed after the wait starts ends it, and an address of
+    /// another transport listed before does not.
+    #[tokio::test]
+    async fn the_wait_returns_a_port_listed_after_it_starts() {
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::<String>::new());
+        let listing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_replace(vec!["/ip4/127.0.0.1/udp/4007/quic-v1".to_string()]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_modify(|addrs| addrs.push("/ip4/127.0.0.1/tcp/4008".to_string()));
+            tx
+        });
+        let cap = Duration::from_secs(60);
+        let found =
+            wait_for_bound_port(&mut rx, ListenTransport::Tcp, ListenFamily::Ip4, cap).await;
+        assert_eq!(found, Ok(4008), "a listed tcp port ends the wait");
+        drop(listing.await.unwrap());
+    }
+
+    /// Without such a listener the wait ends at its cap, as a timeout.
+    #[tokio::test]
+    async fn the_wait_ends_at_its_cap_without_such_a_listener() {
+        let (tx, mut rx) =
+            tokio::sync::watch::channel(vec!["/ip4/127.0.0.1/udp/4009/quic-v1".to_string()]);
+        let cap = Duration::from_millis(200);
+        let started = tokio::time::Instant::now();
+        let found =
+            wait_for_bound_port(&mut rx, ListenTransport::Tcp, ListenFamily::Ip4, cap).await;
+        assert_eq!(found, Err(PortWait::Timeout), "no such listener: a timeout");
+        assert!(started.elapsed() >= cap, "ended before its cap");
+        drop(tx);
+    }
+
+    /// A node that stops before it lists the listener ends the wait at
+    /// once, as closed.
+    #[tokio::test]
+    async fn the_wait_ends_when_the_node_stops() {
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::<String>::new());
+        drop(tx);
+        let cap = Duration::from_secs(60);
+        let found =
+            wait_for_bound_port(&mut rx, ListenTransport::Tcp, ListenFamily::Ip4, cap).await;
+        assert_eq!(found, Err(PortWait::Closed), "a stopped node: closed");
     }
 }

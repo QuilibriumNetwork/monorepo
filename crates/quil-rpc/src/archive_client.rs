@@ -3490,9 +3490,11 @@ mod endpoint_load_tests {
             (0, 0),
             "the connection stayed counted"
         );
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A bound socket that never listens: a dial is refused, and no other
+        // socket can take the port while the test dials it.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = closed.local_addr().unwrap().to_string();
-        drop(closed);
         assert!(ArchiveClient::connect_mtls(&refused, &key).await.is_err());
         assert_eq!(
             endpoint_load(&refused),

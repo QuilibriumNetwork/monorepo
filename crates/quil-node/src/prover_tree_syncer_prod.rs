@@ -2586,13 +2586,11 @@ mod archive_routing_tests {
     /// shard read does, so the next attempt asks another archive.
     #[tokio::test]
     async fn a_failed_global_prover_tree_sync_passes_its_archive_over() {
-        // Nothing listens on a port just released: the dial is refused.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .to_string();
+        // A bound socket that never listens: a dial is refused, and no other
+        // socket can take the port while the test dials it.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = closed.local_addr().unwrap().to_string();
         let other = "192.0.2.31:8340";
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));

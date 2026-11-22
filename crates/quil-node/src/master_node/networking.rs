@@ -655,14 +655,6 @@ mod tests {
         }
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     type Inbound = tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>;
 
     /// Three nodes on loopback subscribed to the same topics. The source and
@@ -695,9 +687,12 @@ mod tests {
         };
         let node = quil_p2p::node::P2PNode::new_with_options(&config, true, None).unwrap();
         let id = node.peer_id;
-        let port = free_port();
-        let (handle, inbound) = node
-            .start(sup, &format!("/ip4/127.0.0.1/tcp/{port}"))
+        let (handle, inbound, port) = node
+            .start_on_loopback(
+                sup,
+                quil_p2p::node::ListenTransport::Tcp,
+                quil_p2p::node::ListenFamily::Ip4,
+            )
             .await
             .unwrap();
         (handle, id, port, inbound)
@@ -722,7 +717,7 @@ mod tests {
                 p2p.subscribe(topic.to_vec()).await;
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
         for topic in topics {
             loop {
                 let peers = relay
@@ -772,7 +767,7 @@ mod tests {
         /// of the other topics.
         async fn wait_for_meshes(&mut self) {
             let alert = quil_engine::bitmasks::GLOBAL_ALERT.to_vec();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
             let mut n = 0;
             'publish: loop {
                 let _ = self.source.publish(alert.clone(), control_alert(n)).await;
@@ -1022,7 +1017,7 @@ mod tests {
             start_node(&mut chain._sup, Some((chain.relay_port, chain.relay_id))).await;
         chain._inbound.push(member_rx);
         member.subscribe(alert.to_vec()).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + quil_p2p::node::CONNECT_WAIT;
         while chain
             .relay
             .subscribed_peer_count(alert.to_vec())

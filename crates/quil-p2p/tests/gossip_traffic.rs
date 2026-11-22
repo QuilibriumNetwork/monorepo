@@ -4,15 +4,8 @@
 
 use std::time::Duration;
 
+use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
 use quil_p2p::{ClassTraffic, Flow, GossipClass, P2PNode};
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 #[tokio::test]
 async fn gossip_messages_are_counted_by_class_on_both_nodes() {
@@ -24,9 +17,8 @@ async fn gossip_messages_are_counted_by_class_on_both_nodes() {
 
     let receiver = P2PNode::new_with_options(&config, true, None).unwrap();
     let receiver_id = receiver.peer_id;
-    let receiver_port = free_port();
-    let (receiver, mut inbound) = receiver
-        .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{receiver_port}"))
+    let (receiver, mut inbound, receiver_port) = receiver
+        .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
         .await
         .unwrap();
 
@@ -35,8 +27,8 @@ async fn gossip_messages_are_counted_by_class_on_both_nodes() {
         "/ip4/127.0.0.1/tcp/{receiver_port}/p2p/{receiver_id}"
     )];
     let sender = P2PNode::new_with_options(&sender_config, true, None).unwrap();
-    let (sender, _) = sender
-        .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{}", free_port()))
+    let (sender, _, _) = sender
+        .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
         .await
         .unwrap();
 
@@ -46,10 +38,10 @@ async fn gossip_messages_are_counted_by_class_on_both_nodes() {
     receiver.subscribe_confirmed(cw.clone()).await.unwrap();
     sender.subscribe_confirmed(cw.clone()).await.unwrap();
 
-    // The sender dials its bootstrap peer on its first discovery tick, and
+    // The sender dials its bootstrap peer once its listener binds, and
     // publishing fails until it knows the receiver's subscription.
     let vote = [&[0x80u8][..], &[1u8; 8][..], &b"a vote"[..]].concat();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
     loop {
         match sender.publish(cw.clone(), vote.clone()).await {
             Ok(()) => break,
