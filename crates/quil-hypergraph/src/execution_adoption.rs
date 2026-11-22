@@ -32,6 +32,16 @@ pub struct PreparedCrdtAdoption<'a> {
     sizes: RwLockWriteGuard<'a, HashMap<Vec<u8>, (u64, i128)>>,
     covered: RwLockWriteGuard<'a, Vec<i32>>,
     state: Option<Metadata>,
+    notifications: Vec<PreparedVertexNotification>,
+    // Registration takes this lock for writing. Retain it through publication
+    // so a cache either participates below or bootstraps after this adoption.
+    _observers: RwLockReadGuard<'a, Vec<Arc<dyn quil_types::store::LocalVertexCommitObserver>>>,
+}
+
+struct PreparedVertexNotification {
+    observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>,
+    keys: Vec<[u8; 64]>,
+    overflowed: bool,
 }
 
 fn unavailable(message: &str) -> QuilError {
@@ -39,7 +49,7 @@ fn unavailable(message: &str) -> QuilError {
 }
 
 /// Readers hold these briefly; waiting them out keeps an executed frame
-/// from being discarded. One deadline covers every lock an adoption takes.
+/// from being discarded. One deadline covers the metadata write locks below.
 fn write<'a, T>(
     patience: &quil_types::lock_patience::Patience,
     lock: &'a RwLock<T>,
@@ -105,6 +115,51 @@ impl ExecutionCapture<'_> {
         captured.overlay.close();
         let state = Arc::try_unwrap(captured.crdt)
             .map_err(|_| unavailable("prepared CRDT metadata has another owner"))?;
+        let source = self.source;
+        let observers = source
+            .local_vertex_key_observers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let changes = state
+            .execution_vertex_changes
+            .map(|changes| changes.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_default();
+        let mut notifications = Vec::new();
+        for observer in observers.iter() {
+            // A live index may have registered after this branch was captured.
+            // Such an index has no complete delta: invalidate once, rather
+            // than silently adopting data newer than its bootstrap snapshot.
+            let incoming = changes
+                .iter()
+                .find(|change| Arc::ptr_eq(&change.observer, observer));
+            if incoming.is_none()
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    !observer.execution_key_domains().is_empty()
+                }))
+                .unwrap_or(false)
+            {
+                notifications.push(PreparedVertexNotification {
+                    observer: observer.clone(),
+                    keys: Vec::new(),
+                    overflowed: true,
+                });
+            }
+        }
+        notifications.extend(
+            changes
+                .into_iter()
+                .filter(|change| {
+                    (change.overflowed || !change.keys.is_empty())
+                        && observers
+                            .iter()
+                            .any(|observer| Arc::ptr_eq(observer, &change.observer))
+                })
+                .map(|change| PreparedVertexNotification {
+                    observer: change.observer,
+                    keys: change.keys.into_iter().collect(),
+                    overflowed: change.overflowed,
+                }),
+        );
         let state = Metadata {
             forest_version: state.forest_version.load(Ordering::Acquire),
             unified: state.unified_tree.load(Ordering::Acquire),
@@ -119,7 +174,6 @@ impl ExecutionCapture<'_> {
             sizes: take(state.sub_meta)?,
             covered: take(state.covered_prefix)?,
         };
-        let source = self.source;
         // Forest readers commonly acquire version/prefix locks afterwards.
         // Acquire this first and use bounded try-locks throughout to avoid
         // inversion: no wait outlasts the deadline.
@@ -161,13 +215,17 @@ impl ExecutionCapture<'_> {
             sizes,
             covered,
             state: Some(state),
+            notifications,
+            _observers: observers,
         })
     }
 }
 
 impl PreparedCrdtAdoption<'_> {
     /// Call only after the matching overlay has committed, while retaining its
-    /// database write barrier. This does no I/O, locking or allocation.
+    /// database write barrier. Metadata adoption does no I/O, locking or
+    /// allocation. Best-effort observer callbacks obey their nonblocking,
+    /// no-I/O, no-CRDT-reentry contract and cannot fail publication.
     pub fn adopt(&mut self) {
         let Some(state) = self.state.take() else {
             return;
@@ -191,5 +249,18 @@ impl PreparedCrdtAdoption<'_> {
             .exact_sizes
             .store(state.exact, Ordering::Release);
         self.source.sizes_warmed.store(true, Ordering::Release);
+        for notification in self.notifications.drain(..) {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if notification.overflowed {
+                    notification.observer.invalidated();
+                } else {
+                    notification.observer.committed_keys(notification.keys);
+                }
+            }))
+            .is_err()
+            {
+                tracing::warn!("local vertex observer panicked after canonical adoption");
+            }
+        }
     }
 }

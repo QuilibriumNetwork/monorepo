@@ -2166,9 +2166,15 @@ pub(crate) async fn start(
         // Final production-history rows survive a restart: it then
         // backfills only the rows after the last saved one.
         let state = state.with_history_file(config_dir.join("explorer-history.json"), network);
-        let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {
             Ok(listener) => {
+                let (supply_index, supply_runner) = quil_explorer::supply_index::SupplyIndex::start(
+                    crdt.clone(),
+                    hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                    db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
+                );
+                let state = state.with_supply_index(supply_index);
+                let router = quil_explorer::router(state.clone());
                 info!(addr = %listen_addr, "explorer REST API listening");
                 sup.spawn("explorer-http", move |token| async move {
                     quil_explorer::serve(listener, router, async move {
@@ -2176,6 +2182,27 @@ pub(crate) async fn start(
                     })
                     .await
                     .map_err(anyhow::Error::from)
+                });
+                sup.spawn("explorer-token-supply", move |token| async move {
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let worker_stop = stop.clone();
+                    let mut worker =
+                        tokio::task::spawn_blocking(move || supply_runner.run(&worker_stop));
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                            if let Err(error) = worker.await {
+                                warn!(%error, "explorer supply worker failed during shutdown");
+                            }
+                        }
+                        result = &mut worker => {
+                            warn!(?result, "explorer supply worker stopped; full-scan fallback remains available");
+                            // This is an optional cache. Report its failure now,
+                            // but do not turn it into a canonical node shutdown.
+                            token.cancelled().await;
+                        }
+                    }
+                    Ok(())
                 });
                 // App-shard production index for `/shards/production`; it
                 // saves the history rows on cancellation.

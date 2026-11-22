@@ -911,6 +911,46 @@ impl store::KvDb for RocksDb {
         self.make_iter(lower, upper)
     }
 
+    fn write_disjoint(
+        &self,
+        prefixes: &'static [[u8; 2]],
+        mutations: &[store::RecordMutation],
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let store_error = |e: quil_forest::DatabaseCommitError| QuilError::Store(e.to_string());
+        let mut batch = quil_forest::DisjointBatch::new(prefixes);
+        for mutation in mutations {
+            match &mutation.value {
+                Some(value) => batch.put(&mutation.key, value),
+                None => batch.delete(&mutation.key),
+            }
+            .map_err(store_error)?;
+        }
+        self.db
+            .write_disjoint(batch, &rocksdb::WriteOptions::default())
+            .map_err(store_error)
+    }
+
+    fn key_page(&self, lower: &[u8], upper: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        if lower >= upper || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_upper_bound(upper.to_vec());
+        options.fill_cache(false);
+        let mut iter = self.db.raw_iterator_opt(options);
+        iter.seek(lower);
+        let mut keys = Vec::new();
+        while let Some(key) = iter.key().filter(|_| keys.len() < limit) {
+            keys.push(key.to_vec());
+            iter.next();
+        }
+        iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(keys)
+    }
+
     /// One seek of a bounded iterator, its key copied alone: the
     /// [`RocksIterator`] of [`Self::new_iter`] copies every value in its
     /// bounds first. The blocks it reads stay out of the block cache.
@@ -1230,6 +1270,45 @@ impl store::Iterator for RocksIterator {
 mod first_key_tests {
     use super::*;
     use quil_types::store::KvDb;
+
+    #[test]
+    fn disjoint_batch_rejects_an_outside_key_without_partial_writes() {
+        let rocks = RocksDb::open_in_memory().unwrap();
+        let db: &dyn KvDb = &rocks;
+        let before = rocks.inner().latest_sequence_number();
+        let result = db.write_disjoint(
+            &[[0x0e, 1]],
+            &[
+                store::RecordMutation {
+                    key: vec![0x0e, 1, 7],
+                    value: Some(vec![1]),
+                },
+                store::RecordMutation {
+                    key: vec![0, 0],
+                    value: None,
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(rocks.inner().latest_sequence_number(), before);
+        assert!(db.get(&[0x0e, 1, 7]).unwrap().is_none());
+        db.write_disjoint(&[[0x0e, 1]], &[]).unwrap();
+        assert_eq!(rocks.inner().latest_sequence_number(), before);
+    }
+
+    #[test]
+    fn key_pages_are_bounded_ordered_and_skip_deleted_ranges() {
+        let rocks = RocksDb::open_in_memory().unwrap();
+        let db: &dyn KvDb = &rocks;
+        for key in [b"a1", b"a2", b"a3", b"b1"] {
+            db.set(key, &[7; 1024]).unwrap();
+        }
+        db.delete_range(b"a2", b"a3").unwrap();
+        assert_eq!(db.key_page(b"a", b"b", 1).unwrap(), vec![b"a1".to_vec()]);
+        assert_eq!(db.key_page(b"a1\0", b"b", 2).unwrap(), vec![b"a3".to_vec()]);
+        assert!(db.key_page(b"a", b"b", 0).unwrap().is_empty());
+        assert!(db.key_page(b"b", b"a", 2).unwrap().is_empty());
+    }
 
     #[test]
     fn prefix_batch_checks_full_keys_and_both_range_endpoints() {

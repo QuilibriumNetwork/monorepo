@@ -351,6 +351,7 @@ macro_rules! impl_hypergraph_storage {
                     after,
                     limits,
                     &|_| false,
+                    true,
                 )
             }
         }
@@ -773,6 +774,66 @@ macro_rules! impl_hypergraph_storage {
                 self.for_each_vertex_underlying_matching(
                     set_type, phase_type, shard_key, &|_| true, callback,
                 )
+            }
+
+            fn range_vertex_adds_domains(&self) -> Result<Vec<[u8; 32]>> {
+                let zero = ShardKey {
+                    l1: [0; 3],
+                    l2: [0; 32],
+                };
+                let mut tree_prefix =
+                    crate::encoding::hypergraph_tree_blob_key("vertex", "adds", &zero);
+                tree_prefix.truncate(3);
+                let old_prefix = vec![
+                    crate::encoding::HYPERGRAPH_SHARD,
+                    crate::encoding::HG_VERTEX_ADDS_TREE_ROOT,
+                ];
+                let mut found = std::collections::HashSet::new();
+                for prefix in [&tree_prefix, &old_prefix] {
+                    // The legacy tree value can contain an entire shard.
+                    // Inspect only borrowed keys and stop at this prefix's end.
+                    let mut options = sweep_read_options();
+                    if let Some(upper) = prefix_successor(prefix) {
+                        options.set_iterate_upper_bound(upper);
+                    }
+                    let mut iter = self.db.raw_iterator_opt(options);
+                    iter.seek(prefix);
+                    while let Some(key) = iter.key() {
+                        if !key.starts_with(prefix) {
+                            break;
+                        }
+                        if key.len() == prefix.len() + 35 {
+                            found.insert(key[prefix.len() + 3..].try_into().unwrap());
+                        }
+                        iter.next();
+                    }
+                    iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                }
+                // The active JMT forest stores one head marker per app/phase:
+                // namespace, 0xfe, level, ID length, phase, then app ID.
+                let forest_prefix = [crate::FOREST_NAMESPACE[0], 0xfe, 3];
+                let mut options = sweep_read_options();
+                if let Some(upper) = prefix_successor(&forest_prefix) {
+                    options.set_iterate_upper_bound(upper);
+                }
+                let mut iter = self.db.raw_iterator_opt(options);
+                iter.seek(&forest_prefix);
+                while let Some(key) = iter.key() {
+                    if !key.starts_with(&forest_prefix) {
+                        break;
+                    }
+                    if key.len() >= 37
+                        && key.len() == 4 + key[3] as usize
+                        && key[4] == quil_forest::Phase::VertexAdds as u8
+                    {
+                        found.insert(key[5..37].try_into().unwrap());
+                    }
+                    iter.next();
+                }
+                iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                let mut domains: Vec<_> = found.into_iter().collect();
+                domains.sort();
+                Ok(domains)
             }
 
             fn for_each_vertex_underlying_matching(
