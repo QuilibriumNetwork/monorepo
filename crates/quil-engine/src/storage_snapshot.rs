@@ -1162,11 +1162,16 @@ fn encode_member_until(
         captured.filter.clone(),
         captured.plan.clone(),
     )]);
+    let tally = persistent::Tally::default();
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         if quil_types::consensus::persistent_storage_at(captured.epoch) {
             // A persistent sector fails rather than goes on unkept.
-            return persistent::encode_leaf(captured, member, prefix, replicas, store, stop)
-                .map(|(n, ahead, resumed)| (n, ahead, resumed, None, false));
+            return persistent::encode_leaf(captured, member, prefix, replicas, store, stop).map(
+                |(n, stored)| {
+                    tally.count(n, stored);
+                    (n, true, 0, None, stored == persistent::LeafStored::Kept)
+                },
+            );
         }
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         if stop() {
@@ -1475,7 +1480,11 @@ fn encode_member_until(
         replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
         progress.end(LeafOutcome::Completed);
         Ok((encoded.n, ahead, resumed, unkept, false))
-    })?;
+    });
+    if quil_types::consensus::persistent_storage_at(captured.epoch) {
+        tally.log(captured, encoded.is_ok(), started.elapsed().as_secs());
+    }
+    let encoded = encoded?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
         labelled_ahead = encoded.iter().filter(|(_, ahead, ..)| *ahead).count(),
         layers_resumed = encoded.iter().map(|(_, _, resumed, ..)| resumed).sum::<usize>(),
