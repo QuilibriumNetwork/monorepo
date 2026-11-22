@@ -979,7 +979,7 @@ mod tests {
     fn a_renewal_after_a_wait_names_the_wait_not_load() {
         let logs = crate::storage_snapshot::tests::capture_logs();
         let (member, filter, epoch) = (vec![0x3A; 32], vec![0x3B; 32], 77);
-        let why = "sector certification must finish before data registration";
+        let why = crate::storage_snapshot::UNCERTIFIED;
         crate::storage_jobs::spawn_in_epoch(&filter, "member", Some(epoch), move || {
             Err(quil_types::error::QuilError::StorageWaiting(why.into()))
         });

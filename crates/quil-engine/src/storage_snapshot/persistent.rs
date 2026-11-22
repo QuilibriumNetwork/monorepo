@@ -487,9 +487,17 @@ fn reserve(
     epoch: u64,
     exact: u64,
 ) -> Result<(PathBuf, [u8; 32], u64)> {
-    try_reserve(store, member, leaf, epoch, exact)?
-        .ok_or_else(|| waiting("sector initialization slots are occupied"))
+    try_reserve(store, member, leaf, epoch, exact)?.ok_or_else(|| waiting(SLOTS_OCCUPIED))
 }
+
+/// The refusal of a reservation while every sector initialization slot is
+/// held; the seal report classifies by it
+/// (`crate::seal_report::Reason::classify`).
+pub(crate) const SLOTS_OCCUPIED: &str = "sector initialization slots are occupied";
+
+/// The refusal of a sector's set-up while another task initializes it; the
+/// seal report classifies by it (`crate::seal_report::Reason::classify`).
+pub(crate) const INITIALIZING: &str = "sector initialization already runs";
 
 fn sector_lane(member: &[u8], id: &[u8; 32]) -> Vec<u8> {
     [b"persistent sector/".as_slice(), member, id].concat()
@@ -707,7 +715,7 @@ fn initialize_with_progress(
         .open(dir.join("initializing"))
         .map_err(io)?;
     if guard.try_lock().is_err() {
-        return Err(unavailable("sector initialization already runs".into()));
+        return Err(unavailable(INITIALIZING.into()));
     }
     let previous = Sector::load(dir.clone())?;
     if let Some(sector) = &previous {
@@ -1158,8 +1166,9 @@ fn proof_verifies(
     protocol::verify_certificate(member, &cert.sector, epoch, cert.n, &root, beacon, bytes).is_ok()
 }
 
-/// The refusal of a leaf's encode while its sector is not certified.
-const UNCERTIFIED: &str = "sector certification must finish before data registration";
+/// The refusal of a leaf's encode while its sector is not certified; the
+/// seal report classifies by it (`crate::seal_report::Reason::classify`).
+pub(crate) const UNCERTIFIED: &str = "sector certification must finish before data registration";
 
 /// Fail unless every leaf of `captured` has a certified sector to be
 /// encoded into ([`reserve`]), before any leaf asks for memory. The leaves

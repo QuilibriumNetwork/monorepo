@@ -49,7 +49,9 @@ pub use persistent::readiness::{
 /// changed-data encoding fit ordinary 8 GiB nodes. The protocol accepts larger
 /// certified capacities, but never requires a worker to allocate one.
 const WORKER_SECTOR_NODES: u64 = 1 << 24;
-pub(crate) use persistent::{poll_sector_certificates, prewarm_sectors};
+pub(crate) use persistent::{
+    poll_sector_certificates, prewarm_sectors, INITIALIZING, SLOTS_OCCUPIED, UNCERTIFIED,
+};
 
 /// A snapshot source's subtree synced into a store of its own, kept for as
 /// long as the capture reading it.
