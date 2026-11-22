@@ -368,6 +368,8 @@ impl ExecutionCapture<'_> {
                 covered_prefix: RwLock::new(covered.to_vec()),
                 commit_lock: Default::default(),
                 unified_tree: AtomicBool::new(source.unified_tree.load(Ordering::Acquire)),
+                // A fork installs no sync anyone waits on.
+                sync_completions: Default::default(),
             });
             Ok(ExecutionFork {
                 crdt,

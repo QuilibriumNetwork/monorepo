@@ -1333,3 +1333,69 @@ fn a_rebase_cannot_remove_application_keys() {
     let error = target.rebase_phase_sync(&mut plan).unwrap_err();
     assert!(sync_phase_advanced(&error), "{error}");
 }
+
+/// A sync's subscribers see its completion at the commit installing its
+/// last chunk: not at an earlier chunk, not again when nothing is left,
+/// and not for another shard.
+#[test]
+fn a_sync_signals_its_completion_at_its_last_chunk() {
+    use quil_forest::{bit_path_to_prefix, shard_prefix_to_filter, SubtreeSyncAnchor};
+    let app = [0x74; 32];
+    let bits = [true, false];
+    let filter = shard_prefix_to_filter(&app, &bit_path_to_prefix(&bits));
+    let location = |byte| Location {
+        app_address: app,
+        data_address: [byte; 32],
+    };
+    let source = fresh_crdt();
+    source.set_unified_tree(true);
+    for byte in [0x80, 0x88, 0x90] {
+        source.add_vertex(&location(byte), &[byte; 48]).unwrap();
+    }
+    source.commit(1).unwrap();
+    let (version, _) = source.serve_forest_head(&app, 0).unwrap();
+    let root = source
+        .sub_shard_commitment_for_filter("vertex", "adds", &filter)
+        .try_into()
+        .unwrap();
+    let reader = InProcTreeReader {
+        source,
+        shard_id: app.to_vec(),
+        phase: 0,
+    };
+    let target = fresh_crdt();
+    target.set_unified_tree(true);
+    let mut completions = target.sync_completions(&app);
+    let other = target.sync_completions(&[0x75; 32]);
+    let mut plan = target
+        .prepare_phase_sync(
+            &reader,
+            version,
+            &app,
+            0,
+            &bits,
+            Some(SubtreeSyncAnchor::SubtreeRoot(root)),
+        )
+        .unwrap();
+    assert_eq!(plan.remaining().len(), 3);
+    while let Some((key, _)) = plan.remaining().first() {
+        assert!(
+            !completions.has_changed().unwrap(),
+            "{} leaves left",
+            plan.remaining().len()
+        );
+        let byte = key[0];
+        target
+            .apply_sync_chunk(&mut plan, &[vec![byte; 48]])
+            .unwrap();
+    }
+    assert!(
+        completions.has_changed().unwrap(),
+        "the install completed at its last chunk"
+    );
+    completions.borrow_and_update();
+    assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+    assert!(!completions.has_changed().unwrap(), "nothing left");
+    assert!(!target.sync_incomplete(&app, &bits).unwrap());
+    assert!(!other.has_changed().unwrap(), "another shard");
+}

@@ -2929,7 +2929,7 @@ pub fn rebase_for_reanchor(
 }
 
 #[cfg(test)]
-mod successor_tests {
+pub(crate) mod successor_tests {
     use super::*;
     use quil_cw_consensus::handoff::{Checkpoint, Seal};
     use quil_execution::global_intrinsic::handoff::{CertificateSubmission, DesiredCommittee};
@@ -2973,13 +2973,13 @@ mod successor_tests {
         ]
     }
 
-    fn global_state() -> (Arc<HypergraphCrdt>, HypergraphState) {
+    pub(crate) fn global_state() -> (Arc<HypergraphCrdt>, HypergraphState) {
         let global = crdt();
         let state = HypergraphState::new(global.clone());
         (global, state)
     }
 
-    fn commit(global: &Arc<HypergraphCrdt>, state: &HypergraphState, frame: u64) {
+    pub(crate) fn commit(global: &Arc<HypergraphCrdt>, state: &HypergraphState, frame: u64) {
         state.commit().unwrap();
         state.abort();
         global
@@ -3021,7 +3021,7 @@ mod successor_tests {
     }
 
     /// A first session on `filter` with a successor scheduled at frame 3.
-    fn closing_session(
+    pub(crate) fn closing_session(
         global: &Arc<HypergraphCrdt>,
         state: &HypergraphState,
         filter: &[u8],
@@ -3184,7 +3184,7 @@ mod successor_tests {
     /// Install `archive`'s GLOBAL records into `global` as a regular node's
     /// verified prover-tree sync does, in one chunk, before its cursor is
     /// recorded.
-    fn sync_global_from(archive: &Arc<HypergraphCrdt>, global: &Arc<HypergraphCrdt>) {
+    pub(crate) fn sync_global_from(archive: &Arc<HypergraphCrdt>, global: &Arc<HypergraphCrdt>) {
         let address = [0xff; 32];
         let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
         let reader = quil_hypergraph::testing::CrdtTreeReader {
