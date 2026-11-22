@@ -114,13 +114,9 @@ use tracing::{info, warn};
 
 use crate::storage_ledger::HostLedger;
 
-/// Percent of the labels' filesystem that labels leave free, unless
-/// [`DISK_FLOOR_MIN_BYTES`] is more. The stores sharing the filesystem stop
-/// writing far below it (`quil_forest::storage_health::FLOOR_FREE_BYTES`).
-pub const DISK_FLOOR_PERCENT: u64 = 10;
-
-/// The least free space labels leave on their filesystem, however small it is.
-pub const DISK_FLOOR_MIN_BYTES: u64 = 8 << 30;
+pub use quil_forest::storage_health::{
+    disk_floor, release_band, DISK_FLOOR_MIN_BYTES, DISK_FLOOR_PERCENT,
+};
 
 /// A leaf is labelled and kept only with this many times its labels' bytes
 /// free above the floor: room for whatever else writes to the filesystem
@@ -181,13 +177,6 @@ const SHORT_LOGGED_EVERY: Duration = Duration::from_secs(60 * 60);
 /// shared by every process keeping labels there.
 const SHORT_MARKER: &str = "short-of-space";
 
-/// Free space a release of labels restores above a `floor`
-/// ([`disk_floor`]): a quarter of it, so the stores beside them grow a while
-/// before the next.
-pub fn release_band(floor: u64) -> u64 {
-    floor / 4
-}
-
 /// Free space on a filesystem of `total_bytes` from which labelling ahead
 /// resumes after labels were released ([`LabelStore::keep_floor`]): the
 /// floor and twice [`release_band`], so labels just released are not
@@ -195,11 +184,6 @@ pub fn release_band(floor: u64) -> u64 {
 pub fn resume_free(total_bytes: u64) -> u64 {
     let floor = disk_floor(total_bytes);
     floor.saturating_add(release_band(floor).saturating_mul(2))
-}
-
-/// The free space labels leave on a filesystem of `total_bytes`.
-pub fn disk_floor(total_bytes: u64) -> u64 {
-    (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
 }
 
 /// Bytes of a leaf's labels written to disk at a time ([`ChunkedWriter`]),

@@ -53,6 +53,14 @@ pub struct OpenSnapshots {
 /// ASCII keys beginning with `quil/` but live outside this namespace.
 pub const LOCAL_WITNESS_INDEX_PREFIX: &[u8] = b"quil/local/qct3-witness/v3/";
 
+/// The size and free space of the filesystem holding a database's files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub total_bytes: u64,
+    /// What an unprivileged writer may still use.
+    pub free_bytes: u64,
+}
+
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -126,6 +134,11 @@ pub trait KvDb: Send + Sync {
     /// Open point-in-time snapshots, for diagnostics. `None` where the store
     /// does not track them (in-memory / test impls).
     fn open_snapshots(&self) -> Option<OpenSnapshots> {
+        None
+    }
+    /// The filesystem holding the store's files, as it is now. `None`
+    /// where the store keeps no files or it cannot be read.
+    fn disk_space(&self) -> Option<DiskSpace> {
         None
     }
 }

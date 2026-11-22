@@ -255,6 +255,26 @@ fn corruption_next_step_as(role: Option<StoreRole>, archive: bool) -> String {
 pub const FLOOR_FREE_BYTES: u64 = 2 << 30;
 pub const FLOOR_FREE_INODES: u64 = 10_000;
 
+/// Percent of a filesystem that storage labels leave free, unless
+/// [`DISK_FLOOR_MIN_BYTES`] is more ([`disk_floor`]). The stores sharing
+/// the filesystem stop writing far below it ([`FLOOR_FREE_BYTES`]).
+pub const DISK_FLOOR_PERCENT: u64 = 10;
+
+/// The least free space labels leave on their filesystem, however small it is.
+pub const DISK_FLOOR_MIN_BYTES: u64 = 8 << 30;
+
+/// The free space storage labels leave on a filesystem of `total_bytes`.
+pub fn disk_floor(total_bytes: u64) -> u64 {
+    (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
+}
+
+/// Free space a release of storage labels restores above a `floor`
+/// ([`disk_floor`]): a quarter of it, so the stores beside them grow a while
+/// before the next.
+pub fn release_band(floor: u64) -> u64 {
+    floor / 4
+}
+
 /// Whether `usage` is below the floor where the stores stop writing.
 pub fn below_floor(usage: &FsUsage) -> bool {
     usage.free_bytes < FLOOR_FREE_BYTES

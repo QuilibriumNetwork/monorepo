@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use quil_crypto::storage_proof::{MerkleCap, NODE_BYTES};
 use quil_types::error::{QuilError, Result};
-use quil_types::store::KvDb;
+use quil_types::store::{DiskSpace, KvDb};
 
 use crate::encoding::STORAGE_REPLICA;
 
@@ -118,6 +118,23 @@ const EVICTED_COMPACTION_BUDGET: std::time::Duration = std::time::Duration::from
 /// leaves take at most a quarter of the kept ones' space, plus one
 /// epoch's.
 const EVICTED_GARBAGE_SHARE: u64 = 4;
+/// Free space on a store's filesystem of `total_bytes` below which an
+/// eviction compacts once the bytes it can free reach
+/// 1/[`EVICTED_LOW_DISK_SHARE`] of its kept chunks ([`evicted_compaction`]):
+/// the floor storage labels leave free
+/// (`quil_forest::storage_health::disk_floor`). Labels keep a node between
+/// it and the band above it by design, labelling ahead into the space a
+/// compaction frees, and release themselves below it; only there, where
+/// they no longer keep up, do deferred dead chunks take the room the
+/// stores need.
+fn compact_below_free(total_bytes: u64) -> u64 {
+    quil_forest::storage_health::disk_floor(total_bytes)
+}
+/// An eviction compacts its range while free space is below
+/// [`compact_below_free`] once the bytes it can free reach this share of
+/// the chunks the range keeps ([`evicted_compaction`]), 1/16: at most 16
+/// bytes written per byte freed, and never for an estimate's noise.
+const EVICTED_LOW_DISK_SHARE: u64 = 16;
 /// Most epochs a store's evicted range goes uncompacted in this process
 /// ([`evicted_compaction`]): the exit for what its estimate cannot see,
 /// such as space a snapshot held at the last compaction, and a bound on
@@ -473,19 +490,30 @@ struct EvictedCompaction {
     compact_at: u64,
     /// The epoch below which it compacts whatever it can free.
     by_epoch: u64,
+    /// Free bytes on the store's filesystem, where it reads them.
+    free: Option<u64>,
+    /// The free bytes below which it compacts for
+    /// [`EvictedCompaction::low_disk_at`] ([`compact_below_free`]), where
+    /// the filesystem reads.
+    compact_below: Option<u64>,
+    /// The fewest bytes it can free it compacts for below `compact_below`.
+    low_disk_at: u64,
 }
 
 /// [`EvictedCompaction`] for a range of `range` bytes in table files, of
 /// which the chunks live leaves read take `kept`, below `keep_from`, after
-/// `last`. It compacts once the bytes it can free reach
-/// 1/[`EVICTED_GARBAGE_SHARE`] of `kept`, or [`EVICTED_COMPACTION_EPOCHS`]
-/// epochs after `last` (after this eviction, without one): space comes
-/// back within that many epochs, or sooner as dead chunks pile up.
+/// `last`, on a filesystem with `space`. It compacts once the bytes it can
+/// free reach 1/[`EVICTED_GARBAGE_SHARE`] of `kept`, 1/[`EVICTED_LOW_DISK_SHARE`]
+/// while free space is below [`compact_below_free`], or
+/// [`EVICTED_COMPACTION_EPOCHS`] epochs after `last` (after this eviction,
+/// without one): space comes back within that many epochs, sooner as dead
+/// chunks pile up, and sooner still once labels can no longer make room.
 fn evicted_compaction(
     range: u64,
     kept: u64,
     last: Option<LastCompaction>,
     keep_from: u64,
+    space: Option<DiskSpace>,
 ) -> EvictedCompaction {
     let since = last.map_or(keep_from, |last| last.below);
     let garbage = range
@@ -493,8 +521,14 @@ fn evicted_compaction(
         .saturating_sub(last.map_or(0, |last| last.residual));
     let compact_at = (kept / EVICTED_GARBAGE_SHARE).max(1);
     let by_epoch = since.saturating_add(EVICTED_COMPACTION_EPOCHS);
+    let compact_below = space.map(|space| compact_below_free(space.total_bytes));
+    let free = space.map(|space| space.free_bytes);
+    let low_disk_at = (kept / EVICTED_LOW_DISK_SHARE).max(1);
     let reason = if garbage >= compact_at {
         Some("garbage")
+    } else if garbage >= low_disk_at && free.zip(compact_below).is_some_and(|(free, at)| free < at)
+    {
+        Some("low disk")
     } else if keep_from >= by_epoch {
         Some("epochs")
     } else {
@@ -505,6 +539,9 @@ fn evicted_compaction(
         garbage,
         compact_at,
         by_epoch,
+        free,
+        compact_below,
+        low_disk_at,
     }
 }
 
@@ -601,8 +638,15 @@ fn compact_evicted(
         .get(&id)
         .filter(|(open, _)| open.strong_count() > 0)
         .map(|&(_, last)| last);
-    let decided = evicted_compaction(in_range, kept, last, keep_from);
+    let decided = evicted_compaction(in_range, kept, last, keep_from, db.disk_space());
+    let mb = |bytes: Option<u64>| bytes.map(|bytes| bytes >> 20);
     let Some(reason) = decided.reason else {
+        // Free space is named only where the store's filesystem reads.
+        let low_disk = if decided.compact_below.is_some() {
+            ", or low_disk_at_mb while free_mb is below compact_below_free_mb"
+        } else {
+            ""
+        };
         if last.is_none() {
             note_evicted_compaction(
                 db,
@@ -620,10 +664,13 @@ fn compact_evicted(
             garbage_mb = decided.garbage >> 20,
             compact_at_mb = decided.compact_at >> 20,
             compact_by_epoch = decided.by_epoch,
+            free_mb = mb(decided.free),
+            compact_below_free_mb = mb(decided.compact_below),
+            low_disk_at_mb = decided.low_disk_at >> 20,
             reason = "little to free",
             "evicted storage replicas left uncompacted: a compaction would write their kept \
-             chunks again for little space; it runs once garbage_mb reaches compact_at_mb, or \
-             at the eviction below compact_by_epoch"
+             chunks again for little space; it runs once garbage_mb reaches compact_at_mb\
+             {low_disk}, or at the eviction below compact_by_epoch"
         );
         return;
     };
@@ -634,6 +681,8 @@ fn compact_evicted(
         kept_mb = kept >> 20,
         garbage_mb = decided.garbage >> 20,
         store_mb = before >> 20,
+        free_mb = mb(decided.free),
+        compact_below_free_mb = mb(decided.compact_below),
         budget_s = EVICTED_COMPACTION_BUDGET.as_secs(),
         reason,
         "compacting evicted storage replicas: their disk space returns when it ends"
@@ -2747,10 +2796,12 @@ mod tests {
     }
 
     /// A store on disk counting the compactions of evicted chunks it ran,
-    /// and its range deletions of chunks.
+    /// and its range deletions of chunks, on a filesystem reading `space`
+    /// (none: the store's own disk is never read).
     struct CountingCompactions {
         inner: Arc<crate::RocksDb>,
         counts: Arc<Counts>,
+        space: Option<DiskSpace>,
     }
 
     impl KvDb for CountingCompactions {
@@ -2811,6 +2862,9 @@ mod tests {
         fn close(&self) -> Result<()> {
             self.inner.close()
         }
+        fn disk_space(&self) -> Option<DiskSpace> {
+            self.space
+        }
         fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
             if start.starts_with(&[STORAGE_REPLICA, META, HASH_NODES]) {
                 self.counts.chunk_ranges.fetch_add(1, Ordering::SeqCst);
@@ -2829,10 +2883,19 @@ mod tests {
     fn counting_over(
         inner: Arc<crate::RocksDb>,
     ) -> (ReplicaStore, Arc<crate::RocksDb>, Arc<Counts>) {
+        counting_on(inner, None)
+    }
+
+    /// [`counting_over`], its filesystem reading `space`.
+    fn counting_on(
+        inner: Arc<crate::RocksDb>,
+        space: Option<DiskSpace>,
+    ) -> (ReplicaStore, Arc<crate::RocksDb>, Arc<Counts>) {
         let counts = Arc::new(Counts::default());
         let db = CountingCompactions {
             inner: inner.clone(),
             counts: counts.clone(),
+            space,
         };
         (ReplicaStore::new(Arc::new(db)), inner, counts)
     }
@@ -2884,6 +2947,136 @@ mod tests {
         );
         let read = s.get_hash(4, b"leaf").unwrap().unwrap();
         assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+    }
+
+    /// A store on a filesystem of 1 TiB with `free_gib` GiB free, holding
+    /// a leaf of 64 chunks at epoch 3 and at epoch 4 eight of them changed;
+    /// the compactions an eviction below 4 runs. Eight dead chunks of 56
+    /// kept lie between the low-disk share (1/16) and the garbage share
+    /// (1/4).
+    fn evict_eight_dead_chunks_with_free(free_gib: u64) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let space = DiskSpace {
+            total_bytes: 1 << 40,
+            free_bytes: free_gib << 30,
+        };
+        let (s, db, counts) = counting_on(
+            Arc::new(crate::RocksDb::open(dir.path()).unwrap()),
+            Some(space),
+        );
+        let c = CHUNK_NODES as usize;
+        let (e3, cap3) = hash_leaf(64 * c, 59);
+        put_epoch(&s, &db, 3, &e3, &cap3);
+        let nodes: Vec<usize> = (0..8).map(|k| k * 8 * c + 4).collect();
+        let (e4, cap4) = changed(&e3, &nodes);
+        put_epoch(&s, &db, 4, &e4, &cap4);
+        let compactions = evict_counted(&s, 4, &counts);
+        let read = s.get_hash(4, b"leaf").unwrap().unwrap();
+        assert!(read.replica[..] == e4[..], "the live leaf reads as written");
+        compactions
+    }
+
+    /// An eviction with too little to free for the garbage share compacts
+    /// its range at once while its filesystem's free space is below the
+    /// labels' floor (102.4 GiB of 1 TiB): labels no longer make room
+    /// there, and deferring left the dead chunks of several epochs,
+    /// gigabytes each on a large node.
+    #[test]
+    fn an_eviction_with_little_to_free_compacts_its_range_when_disk_runs_short() {
+        // 1 TiB: floor 102.4 GiB; 100 GiB free.
+        let compactions = evict_eight_dead_chunks_with_free(100);
+        assert_eq!(
+            compactions, 1,
+            "EVICT-LOW-DISK: an eviction freeing 8 chunks of 64 with 100 GiB of 1 TiB free \
+             ran {compactions} compactions of its range"
+        );
+    }
+
+    /// Above the labels' floor, inside the band labels keep a node in by
+    /// design, an eviction with too little to free for the garbage share
+    /// still leaves its range uncompacted: labels label ahead into the
+    /// space a compaction frees, so compacting there undid the deferral at
+    /// every eviction.
+    #[test]
+    fn an_eviction_with_little_to_free_defers_inside_the_labels_band() {
+        // 1 TiB: floor 102.4 GiB, band up to 128 GiB; 110 GiB free.
+        let compactions = evict_eight_dead_chunks_with_free(110);
+        assert_eq!(
+            compactions, 0,
+            "EVICT-IN-BAND: an eviction freeing 8 chunks of 64 with 110 GiB of 1 TiB free \
+             compacted its range, writing the 56 kept chunks again"
+        );
+    }
+
+    /// The decision for a range keeping 16 GiB with `garbage` bytes past
+    /// them, first evicted below epoch 4, on a 1 TiB filesystem with `free`
+    /// bytes free: below the garbage share (4 GiB) and the eight epochs.
+    fn decide_on_tib(garbage: u64, free: u64) -> Option<&'static str> {
+        let kept = 16u64 << 30;
+        let space = DiskSpace {
+            total_bytes: 1 << 40,
+            free_bytes: free,
+        };
+        evicted_compaction(kept + garbage, kept, None, 4, Some(space)).reason
+    }
+
+    /// The low-disk trigger starts strictly below the labels' floor: at
+    /// the floor labels still release themselves to make room.
+    #[test]
+    fn low_disk_compaction_starts_just_below_the_labels_floor() {
+        let floor = quil_forest::storage_health::disk_floor(1 << 40);
+        let garbage = 1 << 30;
+        assert_eq!(
+            decide_on_tib(garbage, floor - 1),
+            Some("low disk"),
+            "EVICT-BELOW-FLOOR: 1 GiB to free for 16 GiB kept one byte below the floor"
+        );
+        assert_eq!(
+            decide_on_tib(garbage, floor),
+            None,
+            "EVICT-AT-FLOOR: 1 GiB to free for 16 GiB kept with free space at the floor \
+             compacted"
+        );
+    }
+
+    /// Between the labels' floor and the top of their release band, where
+    /// labels keep a node by design, the low-disk trigger stays off.
+    #[test]
+    fn low_disk_compaction_leaves_the_labels_band_alone() {
+        let floor = quil_forest::storage_health::disk_floor(1 << 40);
+        let band = quil_forest::storage_health::release_band(floor);
+        for free in [floor + 1, floor + band / 2, floor + band - 1] {
+            assert_eq!(
+                decide_on_tib(1 << 30, free),
+                None,
+                "EVICT-IN-BAND-EDGE: 1 GiB to free for 16 GiB kept with {free} bytes free, \
+                 inside the labels' band from {floor}, compacted"
+            );
+        }
+    }
+
+    /// Below the labels' floor an eviction compacts only once the bytes it
+    /// can free reach 1/16 of those it keeps (1 GiB of 16): never for an
+    /// estimate's noise, nor for nothing.
+    #[test]
+    fn low_disk_compaction_needs_a_sixteenth_of_the_kept_chunks_to_free() {
+        let free = quil_forest::storage_health::disk_floor(1 << 40) - 1;
+        assert_eq!(
+            decide_on_tib(0, free),
+            None,
+            "EVICT-NOTHING-TO-FREE: nothing to free below the floor compacted"
+        );
+        assert_eq!(
+            decide_on_tib((1 << 30) - 1, free),
+            None,
+            "EVICT-SIXTEENTH: a byte under 1 GiB to free for 16 GiB kept below the floor \
+             compacted"
+        );
+        assert_eq!(
+            decide_on_tib(1 << 30, free),
+            Some("low disk"),
+            "EVICT-SIXTEENTH: 1 GiB to free for 16 GiB kept below the floor"
+        );
     }
 
     /// An eviction freeing at least a quarter of what its range keeps
