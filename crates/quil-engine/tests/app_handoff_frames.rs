@@ -1065,7 +1065,22 @@ impl ArchiveLeader {
             seniority: 1,
             delegate_address: Vec::new(),
         }]));
+        // An archive's collector feeds GLOBAL proposals: it verifies what it
+        // holds, as the node wires it.
         let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+        let current = quil_engine::current_frame::CurrentFrame::new();
+        current.observe(CROWD_FRAME - 1);
+        collector.set_shard_frame_verifier_with_provenance(
+            quil_engine::execution_deferral::collector_verifier(
+                manager.clone(),
+                current,
+                fixture.state.crdt().clone(),
+                Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default()),
+            ),
+        );
+        collector.set_certificate_committees(quil_engine::message_collector::session_committees(
+            fixture.state.crdt().clone(),
+        ));
         let leader = quil_engine::leader_provider::GlobalLeaderProvider::new(
             registry,
             Arc::new(CrowdFrameProver),
@@ -3722,6 +3737,36 @@ impl FenceRig {
             .unwrap()
     }
 
+    /// The canonical header of frame `frame` of `session`, a session GLOBAL
+    /// has not authorized, voting `vote` at rank `rank`, anchored at GLOBAL
+    /// frame 4 whose output is `anchor_output`, certified by three members.
+    fn unauthorized(
+        &self,
+        session: &Session,
+        frame: u64,
+        vote: u64,
+        rank: u64,
+        anchor_output: &[u8],
+    ) -> Vec<u8> {
+        let mut header = FrameHeader {
+            address: session.filter.clone(),
+            frame_number: frame,
+            rank,
+            difficulty: 1,
+            timestamp: self.timestamp,
+            global_frame_number: 4,
+            fee_multiplier_vote: vote,
+            parent_selector: vec![0x5a; 32],
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify_anchored_by(&mut header, session, &self.keys, 1, anchor_output, 3);
+        quil_execution::global_intrinsic::conversions::frame_header_from_proto(&header)
+            .to_canonical_bytes()
+            .unwrap()
+    }
+
     fn propose(&self, rank: u64) -> Vec<Vec<u8>> {
         propose(&self.archive.leader, &self.archive.parent, rank)
     }
@@ -3942,5 +3987,183 @@ fn a_header_voting_out_of_bounds_without_a_session_certificate_fences_nothing() 
             .unwrap()
             .generation,
         1
+    );
+}
+
+/// An archive whose collector verifies what it holds files certified fee
+/// vote fence evidence in its window as verified, once: a second copy is a
+/// duplicate. A private proposal copy keeps it, as it keeps what the
+/// collector held verified, and the leader carries it in its GLOBAL
+/// proposal, whose execution fences the session at the executed tip.
+/// Answered as a duplicate instead, the evidence was never filed, its
+/// sender never sent it again, and no fixed archive fenced the session.
+#[test]
+fn an_archive_files_certified_fence_evidence_verified_and_its_leader_fences() {
+    use quil_engine::message_collector::{MessageCollector, SubmitOutcome};
+    let rig = FenceRig::new(0x6b);
+    let anchor_output = vec![0x4a; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let header = rig.second(0, 4, &anchor_output, 3);
+    let evidence = header_bundle(header.clone());
+    rig.validate(&evidence)
+        .unwrap_or_else(|error| panic!("SETUP: the evidence must validate: {error}"));
+
+    let collector = &rig.archive.collector;
+    assert_eq!(
+        collector.add_message_outcome(1, evidence.clone()),
+        SubmitOutcome::Accepted,
+        "EVIDENCE-DROPPED: the archive did not file certified fence evidence in its window"
+    );
+    assert!(
+        collector.is_verified(&evidence),
+        "EVIDENCE-UNVERIFIED: certified fence evidence was filed unverified"
+    );
+    assert_eq!(
+        collector.add_message_outcome(1, evidence.clone()),
+        SubmitOutcome::Duplicate,
+        "a second copy of the evidence is a duplicate"
+    );
+    // A private proposal copy admits what the collector held verified so
+    // (`MessageCollector::proposal_copy`).
+    let copy = MessageCollector::new();
+    assert!(
+        copy.add_verified_message(1, evidence.clone()),
+        "EVIDENCE-COPY-DROPPED: a proposal copy dropped the verified evidence"
+    );
+    assert!(copy.is_verified(&evidence));
+
+    assert!(
+        rig.propose(1).contains(&evidence),
+        "EVIDENCE-NEVER-RODE: the leader's proposal left the evidence out"
+    );
+    assert!(!rig.fenced());
+    rig.fixture
+        .intrinsic()
+        .invoke_step(CROWD_FRAME, &header, &rig.fixture.state)
+        .unwrap_or_else(|error| panic!("the carried evidence did not fence: {error}"));
+    commit(&rig.fixture.state, CROWD_FRAME);
+    assert!(
+        rig.fenced(),
+        "EVIDENCE-UNFENCED: the evidence the leader carried fenced nothing"
+    );
+}
+
+/// Fee vote fence evidence an archive cannot verify yet, its session
+/// authorized by no GLOBAL frame executed here while it is anchored past
+/// execution, from a sender not known as a prover, is filed unverified for
+/// the leader to verify, as before the archive verified evidence. Refused as
+/// awaiting execution, it was never offered again.
+#[test]
+fn fence_evidence_a_lagging_archive_cannot_verify_is_filed_unverified() {
+    use quil_engine::message_collector::{Provenance, SubmitOutcome};
+    let rig = FenceRig::new(0x6c);
+    let anchor_output = vec![0x4b; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let successor = session(&rig.keys, vec![0x6d; 32]);
+    let evidence = header_bundle(rig.unauthorized(&successor, 2, 0, 7, &anchor_output));
+    let error = rig
+        .validate(&evidence)
+        .expect_err("SETUP: no GLOBAL frame executed here authorized the session");
+    assert!(
+        quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(&error),
+        "SETUP: the evidence must be refused as unauthorized: {error}"
+    );
+
+    let collector = &rig.archive.collector;
+    assert_eq!(
+        collector.add_message_outcome_from(1, evidence.clone(), Provenance::Other),
+        SubmitOutcome::Accepted,
+        "EVIDENCE-AWAITS: an archive whose execution lags refused fence evidence"
+    );
+    assert!(!collector.is_verified(&evidence));
+    assert_eq!(collector.total_pending(), 1);
+}
+
+/// Fee vote fence evidence that waits for execution takes no place among
+/// its shard's frames held while they wait: after it, a copy of the lowest
+/// held frame is still admitted. Counted as a frame, a header voting out of
+/// bounds, higher than every held frame, evicted the lowest one.
+#[test]
+fn fence_evidence_waiting_for_execution_leaves_its_shards_held_frames() {
+    use quil_engine::execution_deferral::MAX_HELD_PER_SHARD;
+    use quil_engine::message_collector::SubmitOutcome;
+    let rig = FenceRig::new(0x6e);
+    let anchor_output = vec![0x4c; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let successor = session(&rig.keys, vec![0x6f; 32]);
+    let collector = &rig.archive.collector;
+    let held = 2..2 + MAX_HELD_PER_SHARD as u64;
+    for frame in held.clone() {
+        let bundle = header_bundle(rig.unauthorized(&successor, frame, 100, 7, &anchor_output));
+        let error = rig
+            .validate(&bundle)
+            .expect_err("SETUP: no GLOBAL frame executed here authorized the session");
+        assert!(
+            quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(&error),
+            "SETUP: frame {frame} must be refused as unauthorized: {error}"
+        );
+        assert_eq!(
+            collector.add_message_outcome(1, bundle),
+            SubmitOutcome::Accepted,
+            "SETUP: frame {frame} must be held while it waits"
+        );
+    }
+    let evidence = header_bundle(rig.unauthorized(&successor, held.end, 0, 7, &anchor_output));
+    assert_eq!(
+        collector.add_message_outcome(1, evidence.clone()),
+        SubmitOutcome::Accepted
+    );
+    assert!(!collector.is_verified(&evidence));
+
+    let lowest = header_bundle(rig.unauthorized(&successor, held.start, 100, 8, &anchor_output));
+    assert_eq!(
+        collector.add_message_outcome(1, lowest),
+        SubmitOutcome::Accepted,
+        "EVIDENCE-EVICTED: fence evidence took the place of its shard's lowest held frame"
+    );
+}
+
+/// A bundle carrying fee vote fence evidence beside a frame the archive
+/// already holds verified files the evidence. Judged whole by the frame's
+/// keys, the bundle was a duplicate and the evidence was dropped with it.
+#[test]
+fn a_bundle_carrying_fence_evidence_beside_a_held_frame_files_the_evidence() {
+    use quil_engine::message_collector::SubmitOutcome;
+    let rig = FenceRig::new(0x70);
+    let anchor_output = vec![0x4d; 516];
+    store_global_frame(&rig.fixture, 4, &anchor_output);
+    let frame = rig.second(100, 4, &anchor_output, 3);
+    let collector = &rig.archive.collector;
+    assert_eq!(
+        collector.add_message_outcome(1, header_bundle(frame.clone())),
+        SubmitOutcome::Accepted,
+        "SETUP: the archive must hold the frame"
+    );
+    assert!(
+        collector.is_verified(&header_bundle(frame.clone())),
+        "SETUP: the archive must hold the frame verified"
+    );
+    let evidence = rig.second(0, 4, &anchor_output, 3);
+    let request = |inner_bytes| {
+        Some(quil_execution::message_envelope::CanonicalMessageRequest {
+            inner_type_prefix: quil_execution::global_intrinsic::frame_header::TYPE_FRAME_HEADER,
+            inner_bytes,
+        })
+    };
+    let mixed = quil_execution::message_envelope::CanonicalMessageBundle {
+        requests: vec![request(frame), request(evidence.clone())],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap();
+
+    assert_eq!(
+        collector.add_message_outcome(1, mixed),
+        SubmitOutcome::Accepted,
+        "MIXED-DROPPED: a held frame beside fence evidence dropped the evidence"
+    );
+    assert!(
+        collector.is_verified(&header_bundle(evidence)),
+        "MIXED-DROPPED: the archive does not hold the evidence verified"
     );
 }

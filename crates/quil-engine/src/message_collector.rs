@@ -3404,9 +3404,6 @@ impl MessageCollector {
     /// `data` carries shard frames this collector would verify before holding
     /// them: a caller on an async runtime admits it off the runtime.
     pub fn requires_verification(&self, data: &[u8]) -> bool {
-        if let Some(verifies) = self.union_requires_verification(data) {
-            return verifies;
-        }
         if self.shard_frame_verifier.read().unwrap().is_none() {
             return false;
         }
@@ -3414,9 +3411,13 @@ impl MessageCollector {
             .into_iter()
             .partition(|(_, fence)| *fence);
         // Fee vote fence evidence is verified like a shard frame
-        // ([`Self::admit`]), and nothing supersedes it.
+        // ([`Self::admit`]), and nothing supersedes it, whatever a frame
+        // beside it is: a copy of a held one is split from it.
         if !evidence.is_empty() {
             return true;
+        }
+        if let Some(verifies) = self.union_requires_verification(data) {
+            return verifies;
         }
         let checks: Vec<ShardFrameCheck> = checks.into_iter().map(|(check, _)| check).collect();
         let signers = match checks.as_slice() {
@@ -3433,8 +3434,15 @@ impl MessageCollector {
     /// Every frame in `keys` is at or below a verified frame of its shard.
     /// A single shard's copy of its verified frame (`signers` is `Some`)
     /// adds something only with more signers than the verified copy: GLOBAL
-    /// pays each signer of the certificate it carries.
+    /// pays each signer of the certificate it carries. No frame (fee vote
+    /// fence evidence alone, which no frame supersedes) is never superseded:
+    /// answered so (until 2026-11-22), verified evidence was refused as a
+    /// duplicate at every admission, split and proposal copy, and no leader
+    /// fenced the session.
     fn superseded(&self, keys: &[(Vec<u8>, u64)], signers: Option<usize>) -> bool {
+        if keys.is_empty() {
+            return false;
+        }
         let tips = self.verified_tips.lock().unwrap();
         keys.iter().all(|(address, frame)| {
             tips.get(address).is_some_and(|tip| match signers {
@@ -3853,8 +3861,12 @@ impl MessageCollector {
 
         if !verified {
             // A bundle of several shard frames could not be compared with the
-            // copies of each: its frames are admitted one by one.
-            if checks.len() > 1 && self.shard_frame_verifier.read().unwrap().is_some() {
+            // copies of each: its frames are admitted one by one. So is one
+            // carrying fee vote fence evidence beside a frame: judged whole
+            // by the frame's keys and verdict (until 2026-11-22), a frame
+            // superseded, waiting or refused dropped new evidence with it.
+            let split = checks.len() > 1 || (!checks.is_empty() && !evidence.is_empty());
+            if split && self.shard_frame_verifier.read().unwrap().is_some() {
                 return self.admit_parts(rank, &message.data, provenance, sender);
             }
             // A copy of a verified frame adds the signers the held copy lacks.
@@ -3940,6 +3952,18 @@ impl MessageCollector {
                 if let Some(slot) = slot {
                     let verdict = verify(&message.data, provenance);
                     drop(slot);
+                    // Fee vote fence evidence (a bundle carrying it beside a
+                    // frame is split above) waits for no shard's held frames:
+                    // only an invalid verdict refuses it, and any other files
+                    // it unverified for the leader to verify, as before it was
+                    // verified here. Refused as awaiting execution (until
+                    // 2026-11-22), it was never offered again.
+                    let verdict = match verdict {
+                        ShardFrameVerdict::Full(reason) if checks.is_empty() => {
+                            ShardFrameVerdict::Unavailable(reason)
+                        }
+                        verdict => verdict,
+                    };
                     match verdict {
                         ShardFrameVerdict::Valid => message.verified = true,
                         ShardFrameVerdict::Invalid(reason) => {

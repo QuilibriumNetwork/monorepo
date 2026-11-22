@@ -129,6 +129,9 @@ pub struct ShardClaim {
     pub frame: u64,
     pub anchor: u64,
     pub generation: Option<u64>,
+    /// It votes out of bounds at its anchor: fee vote fence evidence, which
+    /// GLOBAL takes as a fence rather than a frame of its shard.
+    pub evidence: bool,
 }
 
 /// Every shard frame header a canonical `MessageBundle` carries.
@@ -147,6 +150,10 @@ pub fn bundle_shard_claims(data: &[u8]) -> Vec<ShardClaim> {
         .filter(|header| !header.address.is_empty())
         .map(|header| ShardClaim {
             generation: claimed_generation(&header.public_key_signature_bls48581),
+            evidence: quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                header.global_frame_number,
+                header.fee_multiplier_vote as u64,
+            ),
             address: header.address,
             frame: header.frame_number,
             anchor: header.global_frame_number,
@@ -215,6 +222,8 @@ impl CollectorDeferrals {
     /// ([`awaits_execution`]), and a [`Provenance::Prover`] delivered it;
     /// [`ShardFrameVerdict::Full`] (refused, retryably) when such a frame came
     /// from any other sender or does not fit the caps; otherwise invalid.
+    /// Fee vote fence evidence it carries is judged so but never held here:
+    /// it takes no frame's place, and the collector refuses it only invalid.
     pub fn verdict_from(
         &self,
         error: &QuilError,
@@ -250,9 +259,11 @@ impl CollectorDeferrals {
             let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
             forget_reached(&mut held, executed);
             // Admit into copies of the touched shards, written back only if
-            // every claim fits.
+            // every claim fits. Fee vote fence evidence is no frame of its
+            // shard: counted here (until 2026-11-22), a header voting out of
+            // bounds took or evicted a held frame's place.
             let mut touched: HashMap<Vec<u8>, BTreeMap<u64, u64>> = HashMap::new();
-            for claim in &claims {
+            for claim in claims.iter().filter(|claim| !claim.evidence) {
                 let frames = touched
                     .entry(claim.address.clone())
                     .or_insert_with(|| held.get(&claim.address).cloned().unwrap_or_default());
@@ -286,7 +297,7 @@ impl CollectorDeferrals {
             held.extend(touched);
             held.len()
         };
-        for claim in &claims {
+        for claim in claims.iter().filter(|claim| !claim.evidence) {
             self.log.deferred(
                 &claim.address,
                 claim.frame,
