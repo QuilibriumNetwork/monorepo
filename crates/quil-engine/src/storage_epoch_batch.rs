@@ -1369,6 +1369,21 @@ pub(crate) fn epoch_window_closed(epoch: u64, frame: u64) -> bool {
     crate::storage_snapshot::settlement_closed(epoch, frame)
 }
 
+/// The refusal of a storage job for `epoch` started once its window had
+/// closed ([`epoch_window_closed`]).
+pub(crate) fn window_closed_error(epoch: u64) -> String {
+    format!("{WINDOW_OF_EPOCH}{epoch}{HAS_CLOSED}")
+}
+
+/// Whether `error` is a [`window_closed_error`]; the seal report classifies
+/// by it (`crate::seal_report::Reason::classify`).
+pub(crate) fn names_window_closed(error: &str) -> bool {
+    error.contains(WINDOW_OF_EPOCH) && error.ends_with(HAS_CLOSED)
+}
+
+const WINDOW_OF_EPOCH: &str = "the window of epoch ";
+const HAS_CLOSED: &str = " has closed";
+
 /// Whether `seat`'s window has closed ([`epoch_window_closed`]).
 fn window_closed(seat: &PreparedSeat) -> bool {
     epoch_window_closed(seat.part.epoch, 0)

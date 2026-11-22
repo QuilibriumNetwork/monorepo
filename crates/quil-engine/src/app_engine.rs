@@ -3910,13 +3910,19 @@ struct StorageEpochCheck {
 }
 
 impl StorageEpochCheck {
-    /// The newest GLOBAL frame stored.
+    /// The newest GLOBAL frame stored, noted as read: one above the first
+    /// read is live (`crate::seal_report::note_head`).
     fn head(&self) -> Option<u64> {
-        self.global_anchor_store
+        let head = self
+            .global_anchor_store
             .get_latest_global_clock_frame()
             .ok()
             .and_then(|frame| frame.header)
-            .map(|header| header.frame_number)
+            .map(|header| header.frame_number);
+        if let Some(head) = head {
+            crate::seal_report::note_head(head);
+        }
+        head
     }
 
     /// Hash storage proofs (decided 2026-10-26): label the leaves this member
@@ -4108,8 +4114,6 @@ impl StorageEpochCheck {
         if !hash_storage_proofs_at(epoch) && !hash_storage_proofs_at(seal_epoch) {
             return;
         }
-        // The first frame checked bounds which sends this process saw.
-        crate::seal_report::note_frame(global_frame_number);
         let (Some(kv), Some(publish)) = (self.kv_db.clone(), self.coverage_publish.clone()) else {
             return;
         };
@@ -4124,15 +4128,16 @@ impl StorageEpochCheck {
         };
         // How the seal of the epoch just begun ended, once per seat: at once
         // when sealed, else once the view has had time to show a late seal
-        // (`seal_report::CONCLUDE_HOLD_FRAMES`).
+        // (`seal_report::CONCLUDE_HOLD`).
         if hash_storage_proofs_at(current) {
+            let now = std::time::Instant::now();
             let ended = slot(current);
             let view = ended.as_ref().map(|slot| crate::seal_report::SlotView {
                 sealed_at: slot.sealed_at,
                 has_leaves: !slot.leaves.is_empty(),
                 registered_at: slot.registered_at,
             });
-            if crate::seal_report::due(shard, current, global_frame_number, view.as_ref()) {
+            if crate::seal_report::due(shard, current, global_frame_number, view.as_ref(), now) {
                 crate::seal_report::conclude(
                     shard,
                     current,
@@ -4148,6 +4153,7 @@ impl StorageEpochCheck {
                             &slot.leaves,
                         )
                     }),
+                    now,
                 );
             }
         }
@@ -4420,7 +4426,7 @@ impl StorageEpochCheck {
         let settlement_lane = [b"settlement ".as_slice(), &filter].concat();
         let job = move |seals_here: bool, settles_here: bool| -> quil_types::error::Result<()> {
             let prove = |seals: bool, settles: bool| -> quil_types::error::Result<()> {
-                let withdraw = |error: quil_types::error::QuilError| {
+                let retract = || {
                     use crate::storage_epoch_batch::{SeatKey, SeatMessage};
                     publish(
                         SeatMessage::Withdraw(
@@ -4433,6 +4439,14 @@ impl StorageEpochCheck {
                         )
                         .to_bytes(),
                     );
+                };
+                // The one place a seal attempt's refusal is noted for its
+                // epoch's line (`seal_report`), once per attempt.
+                let withdraw = |error: quil_types::error::QuilError| {
+                    if seals && seal.is_some() {
+                        crate::seal_report::note_refusal(&filter, epoch + 2, &error.to_string());
+                    }
+                    retract();
                     error
                 };
                 // A job queued behind others may start past the window,
@@ -4440,7 +4454,7 @@ impl StorageEpochCheck {
                 // refuses either from then, so it neither labels nor proves.
                 if crate::storage_epoch_batch::epoch_window_closed(epoch, 0) {
                     let error = withdraw(quil_types::error::QuilError::ExecutionUnavailable(
-                        format!("the window of epoch {epoch} has closed"),
+                        crate::storage_epoch_batch::window_closed_error(epoch),
                     ));
                     if settles {
                         return Err(error);
@@ -4466,11 +4480,8 @@ impl StorageEpochCheck {
                         )
                     })
                 {
-                    drop(withdraw(
-                        quil_types::error::QuilError::ExecutionUnavailable(
-                            "the registration cannot be sealed".into(),
-                        ),
-                    ));
+                    // Not an attempt: the line says it was not attempted.
+                    retract();
                     return Ok(());
                 }
                 let started = std::time::Instant::now();
@@ -4520,7 +4531,6 @@ impl StorageEpochCheck {
                         let seal_epoch = epoch + 2;
                         let unsealed = crate::storage_epoch_batch::unsealed_seat_outcome(seal_epoch);
                         let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
-                        crate::seal_report::note_refusal(&filter, seal_epoch, &error.to_string());
                         if !crate::storage_epoch_batch::seal_failed_for_good(&error.to_string()) {
                             warn!(epoch, seal_epoch, attempt, global_frame, filter = %hex::encode(&filter), %error, unsealed,
                                 "storage seal part not prepared: withdrawn from the node's batch, so the member's other seats are proved \
@@ -12919,7 +12929,9 @@ impl AppConsensusEngine {
         // registration must be sealed before consensus starts, and a member
         // whose committee stalls in the settlement window must still settle
         // what it committed, or GLOBAL withholds its storage share (before
-        // epoch 1342: kicks it).
+        // epoch 1342: kicks it). A frame received here is live: the first
+        // bounds which seal sends this process saw (`crate::seal_report`).
+        crate::seal_report::note_live(global_frame_number);
         self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(
             global_frame_number,
         ));
@@ -22959,7 +22971,8 @@ mod tests {
     /// A seal queued in its seat's lane while GLOBAL passed its window's end,
     /// which it shares with its settlement's, is neither labelled nor proved
     /// when its job runs: GLOBAL refuses it. The part the node was told of
-    /// is withdrawn, with a warning naming the closed window.
+    /// is withdrawn, with a warning naming the closed window, and the
+    /// epoch's seal line names it (`seal_report::Reason::WindowClosed`).
     #[tokio::test]
     async fn a_seal_queued_past_its_window_neither_labels_nor_proves() {
         use crate::storage_epoch_batch::SeatMessage;
@@ -22974,6 +22987,7 @@ mod tests {
         crate::storage_snapshot::note_global_frame(until);
         drop(release);
         seat_lanes_idle(&engine);
+        conclude_epoch_7(&mut engine, until);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         let sent: Vec<_> = published
             .lock()
@@ -22981,6 +22995,7 @@ mod tests {
             .iter()
             .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
             .collect();
+        let lines = seal_lines(&warnings);
         let logged = String::from_utf8_lossy(&warnings.lock().unwrap()).into_owned();
         let late = logged
             .lines()
@@ -22993,7 +23008,10 @@ mod tests {
             "the seal was due when queued"
         );
         assert!(
-            !logged.contains("storage seal part not prepared"),
+            !logged
+                .lines()
+                .any(|line| line.contains("storage seal part not prepared")
+                    && !line.contains("seal=epoch=")),
             "late_seal_job: a seal past its window's end was labelled: {logged}"
         );
         assert!(
@@ -23007,6 +23025,107 @@ mod tests {
             "the announced seal part is withdrawn"
         );
         assert_eq!(late, 1, "the dropped seal is reported once: {logged}");
+        assert_eq!(lines.len(), 1, "one seal line for the epoch: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("outcome=refused")
+                && line.contains("reason=\"queued past its window\"")
+                && line.contains(" refusals=1 ")
+                && line.contains("check=\"the 'storage seal part not proved' warnings"),
+            "window_closed_line: the line names the closed window and its warning: {line}"
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    /// Past epoch 7's first frame (`until`, where the seal's window ends)
+    /// and through the seal line's hold (`seal_report::CONCLUDE_HOLD`):
+    /// the seat's epoch-7 seal line is logged.
+    fn conclude_epoch_7(engine: &mut AppConsensusEngine, until: u64) {
+        assert_eq!(until, quil_types::consensus::epoch_start_frame(7));
+        at_global_frame(engine, until + 1);
+        skew_seal_clock(crate::seal_report::CONCLUDE_HOLD);
+        at_global_frame(engine, until + 2);
+        seat_lanes_idle(engine);
+    }
+
+    /// A seal queued before this process found its registration cannot
+    /// be sealed is skipped when its job runs: not an attempt, so the
+    /// epoch's line says not attempted, with no refusal.
+    #[tokio::test]
+    async fn a_seal_skipped_as_unprovable_is_not_attempted() {
+        use crate::storage_epoch_batch::SeatMessage;
+        let warnings = capture_warnings();
+        let (mut engine, published, (from, until)) = engine_owing_a_settlement(5, true, true);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        crate::storage_jobs::spawn(&engine.filter, "ahead in the lane", move || {
+            let _ = held.recv_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+        at_global_frame(&mut engine, from + 1);
+        assert!(crate::storage_epoch_batch::note_unprovable_seal(
+            &[1; 32],
+            &engine.filter,
+            5,
+            from - 10,
+            &[vec![0]],
+        ));
+        drop(release);
+        seat_lanes_idle(&engine);
+        conclude_epoch_7(&mut engine, until);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
+            .collect();
+        let lines = seal_lines(&warnings);
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Announce(_, key) if key.seals)),
+            "the seal was due when queued"
+        );
+        assert!(
+            !sent.iter().any(|message| matches!(message,
+                SeatMessage::Part(part) if part.part.seals)),
+            "a seal found unprovable was proved"
+        );
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Withdraw(_, key) if key.seals)),
+            "the announced seal part is withdrawn"
+        );
+        assert_eq!(lines.len(), 1, "one seal line for the epoch: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("outcome=not attempted")
+                && line.contains("reason=\"label not retained\"")
+                && !line.contains("refusals="),
+            "unprovable_skip_line: a skipped seal is not an attempt: {line}"
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    /// A seal part that fails to prepare is one refused attempt in its
+    /// epoch's line, however many places see the error.
+    #[tokio::test]
+    async fn a_seal_refused_preparing_counts_one_refusal() {
+        let warnings = capture_warnings();
+        let (mut engine, _published, (from, until)) = engine_owing_a_settlement(5, true, true);
+        at_global_frame(&mut engine, from + 1);
+        seat_lanes_idle(&engine);
+        conclude_epoch_7(&mut engine, until);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let lines = seal_lines(&warnings);
+        assert_eq!(lines.len(), 1, "one seal line for the epoch: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("outcome=refused")
+                && line.contains(" refusals=1 ")
+                && !line.contains("queued past its window"),
+            "prepare_refusal_once: one attempt, one refusal: {line}"
+        );
+        println!("seal-report reached: {line}");
     }
 
     /// A seal part that cannot be prepared (here no snapshot to read it
@@ -23276,8 +23395,8 @@ mod tests {
 
     /// A seat's registration unsealed in this node's view at its epoch's
     /// first frame is concluded only once the hold ends
-    /// (`seal_report::CONCLUDE_HOLD_FRAMES`), when a seal GLOBAL took late
-    /// in the window has had time to reach the view.
+    /// (`seal_report::CONCLUDE_HOLD`), when a seal GLOBAL took late in the
+    /// window has had time to reach the view.
     #[tokio::test]
     async fn an_unsealed_seat_logs_its_seal_line_when_the_hold_ends() {
         use quil_types::consensus::{epoch_start_frame, StorageSeatSlot};
@@ -23289,6 +23408,7 @@ mod tests {
         let sink = published.clone();
         engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
         engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.storage_epoch_check_inline = true;
         let current = 7;
         let start = epoch_start_frame(current);
         registry.set_storage_seat_slot(
@@ -23305,18 +23425,16 @@ mod tests {
                 open: true,
             },
         );
-        let seal_lines = || {
-            String::from_utf8_lossy(&logs.lock().unwrap())
-                .lines()
-                .filter(|line| line.contains("seal=epoch=7 "))
-                .count()
-        };
-        engine.prove_storage_epoch_if_due(start);
-        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES - 1);
-        let held = seal_lines();
-        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES);
-        engine.prove_storage_epoch_if_due(start + crate::seal_report::CONCLUDE_HOLD_FRAMES + 1);
-        let ended = seal_lines();
+        // A run watching from before the seal's send window opened.
+        receive_global_frame(&mut engine, epoch_start_frame(current - 1));
+        receive_global_frame(&mut engine, start);
+        receive_global_frame(&mut engine, start + 1);
+        receive_global_frame(&mut engine, start + 40);
+        let held = seal_lines(&logs).len();
+        skew_seal_clock(crate::seal_report::CONCLUDE_HOLD);
+        receive_global_frame(&mut engine, start + 41);
+        receive_global_frame(&mut engine, start + 42);
+        let ended = seal_lines(&logs).len();
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         assert_eq!(
             held, 0,
@@ -23327,6 +23445,197 @@ mod tests {
             "a seat still unsealed when the hold ends is concluded"
         );
         println!("seal-report reached: app engine concluded at the hold's end");
+    }
+
+    /// GLOBAL frames past an epoch's first, received at once as from a
+    /// backlog, end no seal line's hold: the hold is time, not frames
+    /// (`seal_report::CONCLUDE_HOLD`).
+    #[tokio::test]
+    async fn a_backlog_of_global_frames_does_not_end_the_hold() {
+        use quil_types::consensus::epoch_start_frame;
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let (mut engine, _handle, _events) = restarted_unsealed_seat();
+        let start = epoch_start_frame(7);
+        // A run live from before the seal's send window opened.
+        receive_global_frame(&mut engine, epoch_start_frame(6) + 1);
+        for frame in start..=start + 400 {
+            receive_global_frame(&mut engine, frame);
+        }
+        let backlog = seal_lines(&logs);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            backlog,
+            Vec::<String>::new(),
+            "401 frames from the epoch's first, received at once, end no hold"
+        );
+        println!("seal-report reached: no line through a 401-frame backlog");
+    }
+
+    /// The engines' `now` moved `by` later for this test's seal lines
+    /// (`seal_report::SKEW`).
+    fn skew_seal_clock(by: Duration) {
+        crate::seal_report::SKEW.with(|skew| skew.set(by));
+    }
+
+    /// GLOBAL frame `number` received as a standalone worker receives it,
+    /// live ([`AppConsensusEngine::handle_global_frame_message`]).
+    fn receive_global_frame(engine: &mut AppConsensusEngine, number: u64) {
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: number,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        engine.handle_global_frame_message(
+            &crate::consensus_wire::encode_global_frame(&frame).unwrap(),
+        );
+    }
+
+    /// GLOBAL frame `number` stored as the head this engine's checks read.
+    fn store_global_head(engine: &AppConsensusEngine, number: u64) {
+        engine
+            .global_anchor_store
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: number,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &AppNoopTxn,
+            )
+            .unwrap();
+    }
+
+    /// The seal lines logged for epoch 7.
+    fn seal_lines(logs: &std::sync::Mutex<Vec<u8>>) -> Vec<String> {
+        String::from_utf8_lossy(&logs.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains("seal=epoch=7 "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// An engine checking inline whose seat registered for epoch 7 in the
+    /// seal's send window and is unsealed, its stored GLOBAL head from
+    /// before the window opened, as at a restart; and that head's first
+    /// read.
+    fn restarted_unsealed_seat() -> (
+        AppConsensusEngine,
+        AppEngineHandle,
+        mpsc::UnboundedReceiver<AppEngineEvent>,
+    ) {
+        use quil_types::consensus::{epoch_start_frame, StorageSeatSlot};
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, events) = test_engine(registry.clone());
+        engine.coverage_publish = Some(Arc::new(|_: Vec<u8>| {}));
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.storage_epoch_check_inline = true;
+        registry.set_storage_seat_slot(
+            &[1; 32],
+            &engine.filter,
+            StorageSeatSlot {
+                epoch: 7,
+                leaves: vec![vec![0]],
+                registered_at: epoch_start_frame(6) + 5,
+                sealed_at: None,
+                frames: 0,
+                accumulator: [0; 32],
+                chained: Vec::new(),
+                open: true,
+            },
+        );
+        store_global_head(&engine, epoch_start_frame(6) - 5);
+        engine.request_storage_epoch_check(crate::storage_epoch_check::Ask::Head);
+        (engine, handle, events)
+    }
+
+    /// A run begun after a restart first reads a stale stored head: its
+    /// seal line is held `seal_report::CONCLUDE_HOLD` from its first check
+    /// past the epoch's first frame, on any path, here a head read. Live
+    /// frames decide only whether it restarted; its first, a head stored
+    /// while it ran (an in-process engine receives no GLOBAL frames),
+    /// follows the send window, so the line says the run began after the
+    /// window opened.
+    #[tokio::test]
+    async fn a_restarted_run_holds_its_seal_line_from_its_first_live_frame() {
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let (engine, _handle, _events) = restarted_unsealed_seat();
+        let read_head = |number| {
+            store_global_head(&engine, number);
+            engine.request_storage_epoch_check(crate::storage_epoch_check::Ask::Head);
+        };
+        let live = quil_types::consensus::epoch_start_frame(7) + 40;
+        read_head(live);
+        read_head(live + 31);
+        let held = seal_lines(&logs);
+        skew_seal_clock(crate::seal_report::CONCLUDE_HOLD);
+        read_head(live + 32);
+        let ended = seal_lines(&logs);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(held, Vec::<String>::new(), "heads read at once end no hold");
+        assert_eq!(ended.len(), 1, "concluded once the hold ends");
+        let line = &ended[0];
+        assert!(
+            line.contains("outcome=unknown")
+                && line.contains("node restarted since the send")
+                && line.contains(&format!("watching_from={live} ")),
+            "a run whose first live frame follows the send window says it restarted: {line}"
+        );
+        println!("seal-report reached: {line}");
+    }
+
+    /// Catch-up frames' anchors, checked in ascending order from inside
+    /// the send window, are not live: the seal line is held
+    /// `seal_report::CONCLUDE_HOLD` from the first check past the epoch's
+    /// first frame, on any path (here the anchor 32 frames past it), and
+    /// never says the run watched the whole window. Live frames decide
+    /// only whether it restarted.
+    #[tokio::test]
+    async fn a_catch_up_anchor_is_not_a_live_frame() {
+        use quil_types::consensus::epoch_start_frame;
+        let logs = crate::storage_snapshot::tests::capture_logs();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let (mut engine, _handle, _events) = restarted_unsealed_seat();
+        let start = epoch_start_frame(7);
+        // Anchors a materialization asks for, the first before the seat's
+        // registration could be sent.
+        for anchor in [epoch_start_frame(6) + 1, start, start + 32, start + 40] {
+            engine.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(anchor));
+        }
+        let caught_up = seal_lines(&logs);
+        let live = start + 41;
+        receive_global_frame(&mut engine, live);
+        receive_global_frame(&mut engine, live + 31);
+        let held = seal_lines(&logs);
+        skew_seal_clock(crate::seal_report::CONCLUDE_HOLD);
+        receive_global_frame(&mut engine, live + 32);
+        let ended = seal_lines(&logs);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            caught_up,
+            Vec::<String>::new(),
+            "an unsealed seat's line holds through catch-up anchors checked at once"
+        );
+        assert_eq!(
+            held,
+            Vec::<String>::new(),
+            "frames received at once end no hold"
+        );
+        assert_eq!(ended.len(), 1, "concluded once the hold ends");
+        let line = &ended[0];
+        assert!(
+            line.contains("outcome=unknown")
+                && line.contains("node restarted since the send")
+                && line.contains(&format!("watching_from={live} "))
+                && !line.contains("watched the whole send window"),
+            "a run caught up from inside the window cannot say it watched it: {line}"
+        );
+        println!("seal-report reached: {line}");
     }
 
     /// A panic preparing a part is an error, so the part is withdrawn.
