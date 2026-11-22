@@ -657,6 +657,7 @@ impl Committee {
                 write_buffer,
                 page_cache,
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             },
         );
         let engine = engine.start(

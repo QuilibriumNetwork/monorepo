@@ -129,6 +129,7 @@ fn own_nullify_echoed_before_constructed_counts_once() {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             },
         );
         let _engine = engine.start(

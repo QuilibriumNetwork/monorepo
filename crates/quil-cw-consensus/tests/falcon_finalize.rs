@@ -160,6 +160,7 @@ fn falcon_simplex_finalizes() {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&vctx, NZU16!(1024), NZUsize!(10)),
                 forwarding: ForwardingPolicy::Disabled,
+                certificate_fanout: None,
             };
             let engine = Engine::new(vctx.child("engine"), cfg);
 

@@ -2728,6 +2728,21 @@ impl AppConsensusCwHandle {
     }
 }
 
+/// An application shard's engine tunables. Its transport is the shard's
+/// gossip ([`AppConsensusTransport`]), which relays every copy to every
+/// member, so certificates go out from `f+1` members
+/// ([`GlobalEngineParams::certificate_fanout`]).
+fn app_engine_params(
+    partition: String,
+    epoch: u64,
+    genesis_digest: Digest,
+    leader_timeout_secs: u64,
+) -> GlobalEngineParams {
+    GlobalEngineParams::new(partition, epoch, genesis_digest)
+        .with_leader_timeout_secs(leader_timeout_secs)
+        .with_relaying_transport()
+}
+
 /// Assemble + start the simplex-backed app-shard consensus for one shard.
 /// Must be called from within the node's tokio runtime (spawns the outbound
 /// drain there); the engine runs on its own runtime thread.
@@ -2911,8 +2926,7 @@ pub fn activate_app_consensus_cw(
         tracing::info!(filter = %hex::encode(&proposer.filter),
             "replaying authenticated closing certificate after restart");
     }
-    let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
-        .with_leader_timeout_secs(leader_timeout_secs);
+    let mut params = app_engine_params(partition, epoch, genesis_digest, leader_timeout_secs);
     params.liveness = session.as_ref().map(|host| host.liveness.clone());
     params.thread_tag = reporting.thread_tag;
     params.late_finalizes = late_finalizes;
@@ -3082,6 +3096,23 @@ pub fn activate_app_consensus_cw(
 mod tests {
     use super::*;
     use quil_types::crypto::Signer as _;
+
+    /// An application shard's certificates go out from `f+1` members over
+    /// its gossip, with waits from the engine's `fetch_timeout`.
+    #[test]
+    fn app_shard_certificates_fan_out_from_f_plus_one() {
+        use quil_cw_consensus::_consensus::simplex::CertificateFanout;
+        let genesis = digest_from_identity([0; 32]);
+        let params = app_engine_params("app-fanout".into(), 1, genesis, 0);
+        let fanout = params
+            .certificate_fanout()
+            .expect("an app shard fans out certificates over its gossip");
+        let waits = CertificateFanout::from_fetch_timeout(params.fetch_timeout);
+        assert_eq!(
+            fanout, waits,
+            "an app shard fans out, waiting from fetch_timeout"
+        );
+    }
 
     /// A consensus frame past the bundles and requests a frame may carry is
     /// refused unread; one at the bound decodes.
