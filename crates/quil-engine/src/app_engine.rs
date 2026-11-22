@@ -4189,14 +4189,31 @@ impl StorageEpochCheck {
             && (next.is_some() || (slot(seal_epoch).is_none() && !registration_closed));
         // The frame this runs from and the slot may trail GLOBAL; past the
         // window's end as this process saw GLOBAL, the settlement cannot land
-        // and its replicas are evicted.
-        let owed = slot(epoch).filter(|slot| {
-            own_seat
-                && hash_storage_proofs_at(epoch)
-                && slot.sealed_at.is_some()
-                && slot.frames > 0
-                && !crate::storage_epoch_batch::epoch_window_closed(epoch, global_frame_number)
-        });
+        // and its replicas are evicted. Nor does it go from a registry view
+        // short of its window's start, which may list too few of its frames
+        // (`storage_epoch_batch::settlement_view_ready`); the view is noted
+        // after the registry's refresh, so the slot is read after it.
+        let refresh = crate::global_view_refresh::shared();
+        let registry_view = refresh.registry_view();
+        let owed = slot(epoch)
+            .filter(|slot| {
+                own_seat
+                    && hash_storage_proofs_at(epoch)
+                    && slot.sealed_at.is_some()
+                    && slot.frames > 0
+                    && !crate::storage_epoch_batch::epoch_window_closed(epoch, global_frame_number)
+            })
+            .filter(|slot| {
+                !slot.open
+                    || crate::storage_epoch_batch::settlement_view_ready(
+                        &member,
+                        shard,
+                        epoch,
+                        global_frame_number,
+                        registry_view,
+                        &refresh,
+                    )
+            });
         // How each settlement this worker sent ended, logged once.
         if own_seat {
             crate::storage_epoch_batch::settlement_outcomes(
@@ -23570,6 +23587,12 @@ mod tests {
     /// jobs log on their own. Installs this process's subscriber (nextest
     /// runs each test in its own process).
     fn capture_warnings() -> Arc<std::sync::Mutex<Vec<u8>>> {
+        capture_lines(tracing::Level::WARN)
+    }
+
+    /// The lines logged at `level` or above from now on, by any thread
+    /// ([`capture_warnings`]).
+    fn capture_lines(level: tracing::Level) -> Arc<std::sync::Mutex<Vec<u8>>> {
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -23585,7 +23608,7 @@ mod tests {
         let sink = Sink(lines.clone());
         tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
+                .with_max_level(level)
                 .with_ansi(false)
                 .with_writer(move || sink.clone())
                 .finish(),
@@ -23767,6 +23790,205 @@ mod tests {
         assert!(
             logged.contains("storage settlement window closed"),
             "the dropped first part is reported: {logged}"
+        );
+    }
+
+    /// The epoch proof part jobs of `engine`'s seat finish: its seal's lane
+    /// and its settlement's.
+    fn wait_part_jobs(engine: &AppConsensusEngine) {
+        let settlement_lane = [b"settlement ".as_slice(), &engine.filter].concat();
+        for lane in [engine.filter.clone(), settlement_lane] {
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, Duration::from_secs(30)),
+                "the epoch proof part job finishes"
+            );
+        }
+    }
+
+    /// A regular node's registry, pulled from an archive every few minutes,
+    /// showed a frame before the settlement window's start (devnet: 12
+    /// frames short): the seat's slot listed 14 of the 15 frames it
+    /// committed, the settlement went from it and GLOBAL refused the proof.
+    /// It waits for a view at the window's start, asking for an early pull
+    /// reaching it.
+    #[tokio::test]
+    async fn reproduces_settlement_sent_from_a_registry_view_short_of_its_window() {
+        use crate::storage_epoch_batch::SeatMessage;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 5;
+        let (engine, _handle, _events, published) = engine_owing_settlement(epoch);
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let refresh = crate::global_view_refresh::shared();
+        refresh.note_registry_pulled();
+        refresh.enable(quil_types::consensus::epoch_length_frames());
+        refresh.note_registry_view(from - 12);
+        assert_eq!(
+            refresh.requested(crate::global_view_refresh::Reason::StorageRecordAwaited),
+            None,
+            "no pull is asked before the check"
+        );
+        let frame = from + crate::storage_snapshot::seal_retry_frames();
+        engine.prove_storage_epoch_if_due(frame);
+        eprintln!("REACH settlement-view");
+        wait_part_jobs(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
+            .collect();
+        assert!(
+            sent.is_empty()
+                && crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch)
+                    .is_none(),
+            "HELD-SENT: the settlement went from a registry view short of its window's start: \
+             {} messages to the node",
+            sent.len()
+        );
+        assert_eq!(
+            refresh.requested(crate::global_view_refresh::Reason::StorageRecordAwaited),
+            Some(from),
+            "NO-PULL: no early pull reaching the window's start was asked"
+        );
+    }
+
+    /// A registry view at the settlement window's start lists every frame
+    /// the seat committed: the settlement goes from it.
+    #[tokio::test]
+    async fn a_settlement_goes_once_the_registry_view_reaches_its_window_start() {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 5;
+        let (engine, _handle, _events, _published) = engine_owing_settlement(epoch);
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let refresh = crate::global_view_refresh::shared();
+        refresh.note_registry_pulled();
+        refresh.enable(quil_types::consensus::epoch_length_frames());
+        refresh.note_registry_view(from);
+        let frame = from + crate::storage_snapshot::seal_retry_frames();
+        engine.prove_storage_epoch_if_due(frame);
+        eprintln!("REACH settlement-view");
+        wait_part_jobs(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch),
+            Some(frame),
+            "AT-START-HELD: the settlement did not go from a view at its window's start"
+        );
+    }
+
+    /// A registry view still short of the settlement window's start at its
+    /// closing frames: the settlement no longer waits for it, so the wait
+    /// never outlasts the window, and the node warns once that it goes from
+    /// that view.
+    #[tokio::test]
+    async fn a_settlement_still_short_of_its_view_near_the_window_end_goes_with_a_warning() {
+        let warnings = capture_warnings();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 5;
+        let (engine, _handle, _events, _published) = engine_owing_settlement(epoch);
+        let (from, until) =
+            quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let refresh = crate::global_view_refresh::shared();
+        refresh.note_registry_pulled();
+        refresh.enable(quil_types::consensus::epoch_length_frames());
+        refresh.note_registry_view(from - 12);
+        let frame = until - crate::storage_epoch_batch::settle_closing_frames();
+        engine.prove_storage_epoch_if_due(frame);
+        engine.prove_storage_epoch_if_due(frame + 1);
+        eprintln!("REACH settlement-view");
+        wait_part_jobs(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch),
+            Some(frame),
+            "OVERRUN-HELD: the settlement still waited for the view in its window's closing frames"
+        );
+        let logged = String::from_utf8_lossy(&warnings.lock().unwrap()).into_owned();
+        assert_eq!(
+            logged
+                .matches("registry view is still short of the window's start")
+                .count(),
+            1,
+            "OVERRUN-QUIET: the overrun is not warned once: {logged}"
+        );
+    }
+
+    /// A held settlement goes once a pull brings the registry view to its
+    /// window's start: on the same engine, the next check after that pull
+    /// sends it and logs once that its wait ended.
+    #[tokio::test]
+    async fn a_held_settlement_goes_once_a_pull_brings_the_view_to_its_window_start() {
+        let lines = capture_lines(tracing::Level::INFO);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 5;
+        let (engine, _handle, _events, _published) = engine_owing_settlement(epoch);
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let refresh = crate::global_view_refresh::shared();
+        refresh.note_registry_pulled();
+        refresh.enable(quil_types::consensus::epoch_length_frames());
+        refresh.note_registry_view(from - 1);
+        let held = from + crate::storage_snapshot::seal_retry_frames();
+        engine.prove_storage_epoch_if_due(held);
+        eprintln!("REACH settlement-view");
+        wait_part_jobs(&engine);
+        assert_eq!(
+            crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch),
+            None,
+            "WAIT-SENT: the settlement went from a view one frame short of its window's start"
+        );
+        refresh.note_registry_view(from);
+        engine.prove_storage_epoch_if_due(held + 1);
+        wait_part_jobs(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(
+            crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch),
+            Some(held + 1),
+            "WAIT-STUCK: the settlement still waited once the view reached its window's start"
+        );
+        let logged = String::from_utf8_lossy(&lines.lock().unwrap()).into_owned();
+        assert_eq!(
+            logged
+                .matches("storage settlement goes: this node's registry view reached")
+                .count(),
+            1,
+            "GOES-UNLOGGED: the wait's end is not logged once: {logged}"
+        );
+    }
+
+    /// A node that pulls its registry restarts inside a settlement window:
+    /// until its first pull ends, its registry is the one loaded from its
+    /// store, of no known view. The settlement waits, also where this
+    /// process's sync task takes no early-pull requests.
+    #[tokio::test]
+    async fn a_settlement_waits_while_a_pulled_registry_has_no_view_yet() {
+        use crate::storage_epoch_batch::SeatMessage;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let epoch = 5;
+        let (engine, _handle, _events, published) = engine_owing_settlement(epoch);
+        let (from, _) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let refresh = crate::global_view_refresh::shared();
+        refresh.note_registry_pulled();
+        assert!(
+            refresh.registry_view().is_none() && !refresh.enabled(),
+            "premise: no view pulled yet, no early pulls taken"
+        );
+        let frame = from + crate::storage_snapshot::seal_retry_frames();
+        engine.prove_storage_epoch_if_due(frame);
+        eprintln!("REACH settlement-view");
+        wait_part_jobs(&engine);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|bytes| SeatMessage::from_bytes(bytes).is_ok())
+            .count();
+        assert!(
+            sent == 0
+                && crate::storage_snapshot::epoch_proof_sent_at(&[1; 32], &engine.filter, epoch)
+                    .is_none(),
+            "UNVIEWED-SENT: the settlement went before the first registry pull: {sent} messages"
         );
     }
 
