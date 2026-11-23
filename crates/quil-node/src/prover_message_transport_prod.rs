@@ -113,7 +113,8 @@ fn freshest_verified_header(
 /// gets one submission per node per round rather than a resend of
 /// everything, and an undelivered proof holds back no other message. A proof
 /// goes to the archives one after another when sent again. Rounds
-/// back off from 5 s to a minute. A message is given up after ten minutes, a
+/// back off from 5 s to a minute, or less while proofs are refused only for
+/// room ([`run_retries`]). A message is given up after ten minutes, a
 /// storage epoch proof once this node's GLOBAL frame reaches its window's
 /// end, and either oldest first once the queue is full. An archive that
 /// refused a proof for room rests ([`ArchiveRests`]). Until 2026-10-15 a
@@ -169,7 +170,11 @@ const HANDOVERS_HELD: usize = 4096;
 /// archive holds capacity messages in shares of their own and refuses
 /// room in each alike, so it rests per [`Share`]: a precommit refused for
 /// room rests no seat proof, and a seat proof refused rests no
-/// certificate (106 room refusals an hour on one node, 2026-11-22).
+/// certificate (106 room refusals an hour on one node, 2026-11-22). A
+/// rest ends within one GLOBAL frame: an archive frees room each frame,
+/// and a sender resting longer leaves it to those sending sooner. Nodes
+/// resting 40-60 s had 113 of 218 seats withheld, others 115 of 3,520
+/// (three epochs, 2026-11-23).
 #[derive(Default)]
 struct ArchiveRests {
     rests: std::sync::Mutex<std::collections::HashMap<(String, Share), Rest>>,
@@ -229,6 +234,16 @@ impl ArchiveRests {
                 rest.window_end = rest.window_end.min(window_end);
             })
             .or_insert(Rest { until, window_end });
+    }
+
+    /// How long until the soonest rest still running at `now` ends.
+    fn soonest_end(&self, now: Instant) -> Option<Duration> {
+        let rests = self.rests.lock().unwrap();
+        rests
+            .values()
+            .filter(|rest| rest.until > now)
+            .map(|rest| rest.until - now)
+            .min()
     }
 }
 
@@ -570,7 +585,7 @@ struct RetryTiming {
     /// How often a storage epoch proof's failed resends are logged.
     proof_log_every: Duration,
     /// How long an archive refusing a storage epoch proof for room rests
-    /// at least ([`ArchiveRests`]), before jitter adds up to half
+    /// at least ([`ArchiveRests`]), before jitter adds up to a quarter
     /// ([`jittered_up`]).
     room_rest: Duration,
 }
@@ -581,10 +596,11 @@ const RETRY_TIMING: RetryTiming = RetryTiming {
     give_up: Duration::from_secs(600),
     proof_give_up: Duration::from_secs(4 * 3600),
     proof_log_every: Duration::from_secs(300),
-    // Over two GLOBAL frames at mainnet's pace (about 18.5 s each,
-    // 2026-11-21), so a frame carrying held proofs frees the room; jitter
-    // makes it 40-60 s.
-    room_rest: Duration::from_secs(40),
+    // Under one GLOBAL frame at mainnet's pace (18.5-23 s each,
+    // 2026-11-23), so a refused proof goes again in the frame that frees
+    // the room, and over half of one, so an archive gets about one a
+    // frame; jitter makes it 12-15 s.
+    room_rest: Duration::from_secs(12),
 };
 const RETRY_MAX_MESSAGES: usize = 256;
 const RETRY_MAX_BYTES: usize = 32 << 20;
@@ -872,10 +888,10 @@ fn jittered(delay: Duration) -> Duration {
     delay - random_part(delay / 2)
 }
 
-/// `delay` plus a random part of up to half of it: [`jittered`] for a wait
-/// that must last at least `delay`.
+/// `delay` plus a random part of up to a quarter of it: [`jittered`] for a
+/// wait that must last at least `delay` and not much longer.
 fn jittered_up(delay: Duration) -> Duration {
-    delay + random_part(delay / 2)
+    delay + random_part(delay / 4)
 }
 
 /// A random duration of up to `most`.
@@ -906,6 +922,12 @@ impl Delivery {
     /// No archive was sent to: each was resting ([`ArchiveRests`]).
     fn unsent(&self) -> bool {
         self.rested > 0 && self.rested == self.refusals.len() && self.accepted == 0
+    }
+
+    /// Every archive refused it for room, or was not sent to as it rests
+    /// ([`ArchiveRests`]).
+    fn refused_for_room(&self) -> bool {
+        self.room > 0 && self.room == self.refusals.len() && self.accepted == 0
     }
 }
 
@@ -979,8 +1001,11 @@ fn asks_for_retry(error: &ArchiveClientError, proof: bool) -> bool {
 /// still refused for now everywhere. Rounds start a jittered back-off apart:
 /// from `timing.first`, doubling after a round that ended at a message still
 /// refused, up to `timing.longest`, each wait a random part of up to half
-/// shorter ([`jittered`]). `frame` reads this node's latest GLOBAL frame, at
-/// which a storage epoch proof's window ends.
+/// shorter ([`jittered`]). After a round whose undelivered messages were all
+/// storage epoch proofs refused for room, the next starts no later than the
+/// soonest archive rest ends ([`ArchiveRests`]): the back-off reaches 30-60
+/// s, past the GLOBAL frame that frees the room. `frame` reads this node's
+/// latest GLOBAL frame, at which a storage epoch proof's window ends.
 async fn run_retries<F, Fut, G>(
     queue: Arc<SubmitRetryQueue>,
     timing: RetryTiming,
@@ -992,13 +1017,16 @@ async fn run_retries<F, Fut, G>(
     G: Fn() -> Option<u64>,
 {
     let mut delay = timing.first;
+    let mut wait = jittered(delay);
     loop {
-        tokio::time::sleep(jittered(delay)).await;
+        tokio::time::sleep(wait).await;
         // Once a round: a proof settled while it ran goes at most once more,
         // and its acceptance drops no queued proof ([`resent`]).
         queue.drop_settled(timing, &frame);
         let mut sent = std::collections::HashSet::new();
         let mut failed = false;
+        // Each message still undelivered is a proof refused for room.
+        let mut for_room = true;
         loop {
             let next = {
                 let frame = frame();
@@ -1038,12 +1066,24 @@ async fn run_retries<F, Fut, G>(
             sent.insert(id);
             match resent(&queue, id, &delivery, timing, &frame) {
                 Resent::Done => delay = timing.first,
-                Resent::ProofFailed => failed = true,
-                Resent::Failed => break,
+                Resent::ProofFailed => {
+                    failed = true;
+                    for_room &= delivery.refused_for_room();
+                }
+                Resent::Failed => {
+                    for_room = false;
+                    break;
+                }
             }
         }
         // The round ended at a message still undelivered.
         delay = (delay * 2).min(timing.longest);
+        wait = jittered(delay);
+        if for_room {
+            if let Some(left) = queue.rests.soonest_end(Instant::now()) {
+                wait = wait.min(left);
+            }
+        }
     }
 }
 
@@ -2460,6 +2500,28 @@ mod tests {
         room_rest: Duration::from_secs(60),
     };
 
+    /// A GLOBAL frame at mainnet's fastest measured pace (2026-11-21).
+    const MAINNET_FRAME: Duration = Duration::from_millis(18_500);
+
+    /// A GLOBAL frame at mainnet's slowest measured pace (2026-11-23).
+    const SLOWEST_FRAME: Duration = Duration::from_secs(23);
+
+    /// The shortest room rest keeping an archive's refused sends from one
+    /// node to twice a frame at most, at the slowest frame's pace.
+    const LEAST_ROOM_REST: Duration = SLOWEST_FRAME.checked_div(2).unwrap();
+
+    /// `timing` with each wait divided by `by`: mainnet's pace, faster.
+    fn scaled(timing: RetryTiming, by: u32) -> RetryTiming {
+        RetryTiming {
+            first: timing.first / by,
+            longest: timing.longest / by,
+            give_up: timing.give_up / by,
+            proof_give_up: timing.proof_give_up / by,
+            proof_log_every: timing.proof_log_every / by,
+            room_rest: timing.room_rest / by,
+        }
+    }
+
     #[tokio::test]
     async fn queued_submissions_are_resent_oldest_first_until_accepted() {
         let queue = Arc::new(SubmitRetryQueue::default());
@@ -3768,11 +3830,12 @@ mod tests {
         assert_eq!(queue.len(), 3, "all still queued");
     }
 
-    /// An archive refusing a proof for room rests at least two GLOBAL
-    /// frames at mainnet's pace (`RETRY_TIMING.room_rest`, 40 s), and
-    /// jitter adds up to half: never less.
+    /// An archive refusing a proof for room rests over half the slowest
+    /// GLOBAL frame (11.5 s) at mainnet's pace (`RETRY_TIMING.room_rest`,
+    /// 12 s), and jitter adds up to a quarter: it ends within the fastest
+    /// frame (18.5 s).
     #[tokio::test]
-    async fn a_room_rest_lasts_at_least_two_frames() {
+    async fn a_room_rest_ends_within_a_frame() {
         let rests = ArchiveRests::default();
         let submit = |addr: String, _bytes: Vec<u8>| async move {
             Err((
@@ -3802,14 +3865,16 @@ mod tests {
             })
             .collect();
         eprintln!("REACH room rest lengths={lefts:?}");
-        let (least, most) = (Duration::from_secs(40), Duration::from_secs(60) + sent);
+        let most = Duration::from_secs(15) + sent;
         assert!(
-            lefts.iter().all(|left| *left >= least),
-            "room_jitter: a rest shorter than two GLOBAL frames: {lefts:?}"
+            lefts.iter().all(|left| *left >= LEAST_ROOM_REST),
+            "room_rest_short: a rest shorter than half the slowest GLOBAL frame: {lefts:?}"
         );
         assert!(
-            lefts.iter().all(|left| *left <= most),
-            "a rest longer than 60 s: {lefts:?}"
+            lefts
+                .iter()
+                .all(|left| *left <= most && *left < MAINNET_FRAME),
+            "room_rest_long: a rest past the GLOBAL frame that frees the room: {lefts:?}"
         );
     }
 
@@ -3895,6 +3960,199 @@ mod tests {
             "sent again before its rest ended"
         );
         assert_eq!(queue.len(), 0, "delivered once sent again");
+    }
+
+    /// A proof the only archive refused for room, its share full until the
+    /// next GLOBAL frame frees room, goes to it again in that frame and is
+    /// taken before its window ends a frame later (mainnet's timing, ten
+    /// times faster). An archive resting two frames or more was sent it
+    /// again only once its window had ended.
+    #[tokio::test]
+    async fn a_room_refused_proof_is_taken_in_the_frame_freeing_room() {
+        const BY: u32 = 10;
+        let timing = scaled(RETRY_TIMING, BY);
+        let frame_len = MAINNET_FRAME / BY;
+        let queue = Arc::new(SubmitRetryQueue::default());
+        let bundle = storage_proof_bundle(1, &[(1, 1335, false, true)], 64);
+        let window_end = StorageProofSubmission::of(&bundle).unwrap().window_end;
+        // Frame window_end - 2 begins now: the archive frees room as the
+        // next begins, and the window ends as the one after begins.
+        let start = Instant::now();
+        let frame_at = move |at: Instant| {
+            let frames = (at - start).as_nanos() / frame_len.as_nanos();
+            window_end - 2 + u64::try_from(frames).unwrap()
+        };
+        let sends = Arc::new(std::sync::Mutex::new(Vec::<(u64, bool)>::new()));
+        let archive = {
+            let sends = sends.clone();
+            move |addr: String, _bytes: Vec<u8>| {
+                let frame = frame_at(Instant::now());
+                let taken = frame >= window_end - 1;
+                sends.lock().unwrap().push((frame, taken));
+                async move {
+                    if taken {
+                        Ok(addr)
+                    } else {
+                        Err((
+                            addr,
+                            "message collector rejected: rank buffer full".to_string(),
+                            true,
+                        ))
+                    }
+                }
+            }
+        };
+        // Handed over: refused for room, so queued.
+        let resting = Resting {
+            rests: &queue.rests,
+            share: Share::Seats,
+            window_end,
+            rest: timing.room_rest,
+        };
+        let first = fan_out_resting(
+            vec!["full".into()],
+            bundle.clone(),
+            archive.clone(),
+            false,
+            Some(resting),
+        )
+        .await;
+        assert_eq!(first.room, 1, "premise: the archive refused for room");
+        assert!(
+            queue
+                .rests
+                .rests("full", Share::Seats, window_end, Instant::now())
+                .is_some(),
+            "premise: the archive rests"
+        );
+        assert!(queue.push(bundle), "premise: the worker starts");
+        let queue_in = queue.clone();
+        let task = tokio::spawn(run_retries(
+            queue.clone(),
+            timing,
+            move |bytes| {
+                let (archive, queue_in) = (archive.clone(), queue_in.clone());
+                async move {
+                    let resting = Resting {
+                        rests: &queue_in.rests,
+                        share: Share::Seats,
+                        window_end,
+                        rest: timing.room_rest,
+                    };
+                    fan_out_resting(vec!["full".into()], bytes, archive, true, Some(resting)).await
+                }
+            },
+            move || Some(frame_at(Instant::now())),
+        ));
+        // Progress: the proof taken, or given up as its window ended.
+        let guard = Instant::now();
+        while queue.len() > 0 && guard.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        task.abort();
+        let sends = sends.lock().unwrap().clone();
+        eprintln!("REACH room frame window_end={window_end} sends(frame, taken)={sends:?}");
+        assert!(
+            sends.iter().any(|&(frame, taken)| taken && frame < window_end),
+            "rest_past_frame: room freed a frame before the window ended, and the proof was not sent again in it: {sends:?}"
+        );
+        assert_eq!(queue.len(), 0, "taken, so no longer queued");
+    }
+
+    /// Queued proofs that two archives keep refusing for room, frame after
+    /// frame, go to each again within every frame, and at most twice a
+    /// frame: sends to one archive come no closer than half the slowest
+    /// GLOBAL frame and no further apart than the fastest one (mainnet's
+    /// timing, ten times faster).
+    #[tokio::test]
+    async fn room_refusals_reach_each_archive_once_or_twice_a_frame() {
+        const BY: u32 = 10;
+        const SENDS: usize = 6;
+        let timing = scaled(RETRY_TIMING, BY);
+        let frame_len = MAINNET_FRAME / BY;
+        let queue = Arc::new(SubmitRetryQueue::default());
+        for seat in 1..=3 {
+            queue.push(storage_proof_bundle(1, &[(seat, 1335, false, true)], 64));
+        }
+        let archives = ["full-a", "full-b"];
+        type Sends = std::collections::HashMap<String, Vec<Instant>>;
+        let sends = Arc::new(std::sync::Mutex::new(Sends::new()));
+        let (sends_in, queue_in) = (sends.clone(), queue.clone());
+        let task = tokio::spawn(run_retries(
+            queue.clone(),
+            timing,
+            move |bytes| {
+                let (sends_in, queue_in) = (sends_in.clone(), queue_in.clone());
+                let window_end = StorageProofSubmission::of(&bytes).unwrap().window_end;
+                async move {
+                    let submit = move |addr: String, _bytes: Vec<u8>| {
+                        let mut sends = sends_in.lock().unwrap();
+                        sends.entry(addr.clone()).or_default().push(Instant::now());
+                        async move {
+                            Err((
+                                addr,
+                                "message collector rejected: rank buffer full".to_string(),
+                                true,
+                            ))
+                        }
+                    };
+                    let resting = Resting {
+                        rests: &queue_in.rests,
+                        share: Share::Seats,
+                        window_end,
+                        rest: timing.room_rest,
+                    };
+                    let archives = archives.iter().map(|addr| addr.to_string()).collect();
+                    fan_out_resting(archives, bytes, submit, true, Some(resting)).await
+                }
+            },
+            || None,
+        ));
+        // Progress: SENDS to each archive, or one gone without a send for
+        // two frames.
+        let enough = |sends: &Sends| {
+            archives
+                .iter()
+                .all(|addr| sends.get(*addr).is_some_and(|at| at.len() >= SENDS))
+        };
+        let stalled = |sends: &Sends| {
+            sends.values().any(|at| {
+                at.last()
+                    .is_some_and(|last| last.elapsed() >= frame_len * 2)
+            })
+        };
+        let guard = Instant::now();
+        loop {
+            {
+                let sends = sends.lock().unwrap();
+                if enough(&sends) || stalled(&sends) || guard.elapsed() >= Duration::from_secs(60) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        task.abort();
+        let ended = Instant::now();
+        let sends = sends.lock().unwrap().clone();
+        assert_eq!(queue.len(), 3, "premise: all still queued");
+        for addr in archives {
+            let at = sends.get(addr).cloned().unwrap_or_default();
+            let gaps: Vec<Duration> = at.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            // Since the last send, when the wait ended short of SENDS.
+            let waiting = (at.len() < SENDS).then(|| ended - at.last().copied().unwrap_or(guard));
+            eprintln!(
+                "REACH room frames {addr} sends={} gaps={gaps:?} waiting={waiting:?}",
+                at.len()
+            );
+            assert!(
+                gaps.iter().all(|gap| *gap >= LEAST_ROOM_REST / BY),
+                "room_unbounded: {addr} sent again within half the slowest GLOBAL frame: {gaps:?}"
+            );
+            assert!(
+                gaps.iter().chain(&waiting).all(|gap| *gap < frame_len),
+                "rest_past_frame: {addr} not sent again within a GLOBAL frame: {gaps:?}, waiting {waiting:?}"
+            );
+        }
     }
 
     /// A proof handed over once its window ended is not sent: GLOBAL
