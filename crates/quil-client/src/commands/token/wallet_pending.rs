@@ -81,6 +81,9 @@ impl PendingSpend {
     /// custom mint's receipt. `coins` names an input's coin by marker. `None`
     /// for an operation that consumes nothing: an escrow claim, which spends
     /// its escrow record, and the QUIL reward mint, which GLOBAL executes.
+    /// Not journaled either: a custom mint's entitlement leaf, which only
+    /// its deployed policy names, so a custom mint whose entitlement another
+    /// mint consumed still waits out its deadline.
     pub(super) fn of(
         network: &[u8; 32],
         application: &[u8; 32],
@@ -544,6 +547,52 @@ impl RecipientWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node that accepts a connection and never answers holds a read
+    /// until the wait's deadline, not past it.
+    #[tokio::test]
+    async fn a_poll_whose_reads_hang_ends_at_the_wait_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted, mut accepts) = tokio::sync::mpsc::unbounded_channel();
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+                let _ = accepted.send(());
+            }
+        });
+        let client = Client::new(
+            tonic::transport::Endpoint::from_shared(endpoint)
+                .unwrap()
+                .connect_lazy(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut watch = InputWatch {
+            spends: PendingSpends::at(directory.path()),
+            spend: Some(spend(2, RecipientWallet::unix_now(), &[3])),
+            what: "transfer".to_string(),
+        };
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(300);
+        let polled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watch.poll(&client, deadline),
+        )
+        .await
+        .expect("read_unbounded: a hung read held the poll past its deadline");
+        assert!(polled.is_ok(), "a hung read says nothing");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(250),
+            "the poll ended before its read reached the node"
+        );
+        assert!(
+            accepts.try_recv().is_ok(),
+            "the read never reached the silent node"
+        );
+        assert!(watch.spend.is_some(), "a hung read keeps the watch");
+        holding.abort();
+    }
 
     fn spend(operation: u8, at: u64, markers: &[u8]) -> PendingSpend {
         PendingSpend {
