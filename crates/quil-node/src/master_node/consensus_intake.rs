@@ -372,6 +372,7 @@ impl ConsensusIntake {
                 via: from.clone(),
                 from,
                 direct: false,
+                ack: None,
             },
             _admission: admission,
         };

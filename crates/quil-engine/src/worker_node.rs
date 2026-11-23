@@ -34,6 +34,30 @@ static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate =
 static COMMITTEE_RELAY_TASKS: crate::spawn_gate::SpawnGate =
     crate::spawn_gate::SpawnGate::new("committee-relay", 256);
 
+/// How the pump sends a CW message that names its recipients.
+#[derive(Debug)]
+enum CwRelay {
+    /// Through the master, in a task holding this place.
+    Relay(tokio::sync::SemaphorePermit<'static>),
+    /// To the topic now: the committee's relay tasks are full, and consensus
+    /// waits on votes, certificates and blocks.
+    Topic,
+    /// Not at all: the resolver's relay tasks are full. A peer's resolver
+    /// requests drive these, and a dropped reply is re-asked.
+    Drop,
+}
+
+fn cw_relay(
+    channel: u64,
+    resolver: &'static crate::spawn_gate::SpawnGate,
+    committee: &'static crate::spawn_gate::SpawnGate,
+) -> CwRelay {
+    if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+        return resolver.try_enter().map_or(CwRelay::Drop, CwRelay::Relay);
+    }
+    committee.try_enter().map_or(CwRelay::Topic, CwRelay::Relay)
+}
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -976,22 +1000,17 @@ impl WorkerOnlyNode {
                                         // other members drop it unread.
                                         let worker = worker_for_pump.clone();
                                         let publish = publish.clone();
-                                        let permit = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
-                                            // A peer's resolver requests drive these; each can wait
-                                            // out the master's timeout. A dropped reply is re-asked.
-                                            let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
-                                            permit
-                                        } else {
-                                            // Consensus waits on these: never dropped.
-                                            let Some(permit) = COMMITTEE_RELAY_TASKS.try_enter() else {
+                                        let permit = match cw_relay(channel, &RESOLVER_RELAY_TASKS, &COMMITTEE_RELAY_TASKS) {
+                                            CwRelay::Relay(permit) => permit,
+                                            CwRelay::Drop => continue,
+                                            CwRelay::Topic => {
                                                 publish(
                                                     crate::bitmasks::shard_cw_bitmask(&filter),
                                                     crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients),
                                                 )
                                                 .await;
                                                 continue;
-                                            };
-                                            permit
+                                            }
                                         };
                                         tokio::spawn(async move {
                                             let _permit = permit;
@@ -2220,12 +2239,12 @@ fn deliver_to_engine(
             crate::resolver_traffic::Addressed::Here,
         );
     }
-    handle.send(crate::app_engine::AppEngineMessage::CwIn {
+    // Its sender was told "delivered" only if the engine took it.
+    handle.try_deliver(crate::app_engine::AppEngineMessage::CwIn {
         channel: request.channel,
         from: request.from,
         data: request.data,
-    });
-    true
+    })
 }
 
 /// Start the eviction passes for `keep` unless the binding of `handle`
@@ -3108,6 +3127,77 @@ mod tests {
             }
             _ => panic!("expected CwIn"),
         }
+    }
+
+    /// A vote, certificate or block finding every committee relay task busy
+    /// goes to the topic, never dropped; a resolver message is dropped (its
+    /// requester asks again). A place frees as its relay ends.
+    #[test]
+    fn a_full_committee_relay_sends_to_the_topic_and_a_full_resolver_relay_drops() {
+        static RESOLVER: crate::spawn_gate::SpawnGate =
+            crate::spawn_gate::SpawnGate::new("test-resolver", 64);
+        static COMMITTEE: crate::spawn_gate::SpawnGate =
+            crate::spawn_gate::SpawnGate::new("test-committee", 256);
+        let resolver = crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL;
+        let block = crate::cw_app_seams::CW_APP_BLOCK_CHANNEL;
+        let mut relaying = Vec::new();
+        for channel in [0, 1, block].into_iter().cycle().take(256) {
+            match cw_relay(channel, &RESOLVER, &COMMITTEE) {
+                CwRelay::Relay(permit) => relaying.push(permit),
+                other => panic!(
+                    "channel {channel} with {} relaying: {other:?}",
+                    relaying.len()
+                ),
+            }
+        }
+        for channel in [0, 1, block] {
+            assert!(
+                matches!(cw_relay(channel, &RESOLVER, &COMMITTEE), CwRelay::Topic),
+                "channel {channel}"
+            );
+        }
+        assert!(
+            matches!(cw_relay(resolver, &RESOLVER, &COMMITTEE), CwRelay::Relay(_)),
+            "the resolver's own places"
+        );
+        relaying.pop();
+        assert!(
+            matches!(cw_relay(0, &RESOLVER, &COMMITTEE), CwRelay::Relay(_)),
+            "a freed place"
+        );
+        let resolving: Vec<_> = (0..64)
+            .map(|_| cw_relay(resolver, &RESOLVER, &COMMITTEE))
+            .collect();
+        assert!(resolving
+            .iter()
+            .all(|relay| matches!(relay, CwRelay::Relay(_))));
+        assert!(matches!(
+            cw_relay(resolver, &RESOLVER, &COMMITTEE),
+            CwRelay::Drop
+        ));
+    }
+
+    /// The master tells a direct message's sender "delivered" from this
+    /// answer, and the sender then sends no topic copy: a message the
+    /// engine's full queue drops must be answered "not delivered".
+    #[test]
+    fn a_message_the_engines_full_queue_drops_is_not_reported_delivered() {
+        let request = || quil_types::proto::node::DeliverShardConsensusRequest {
+            filter: vec![1; 32],
+            channel: 0,
+            data: b"vote".to_vec(),
+            from: vec![5; 897],
+        };
+        let (handle, _engine) = crate::app_engine::AppEngineHandle::for_test(vec![1; 32]);
+        let mut taken = 0;
+        while deliver_to_engine(Some(handle.clone()), request()) {
+            taken += 1;
+            assert!(
+                taken <= 1024,
+                "every message reported delivered, though the queue holds 16"
+            );
+        }
+        assert_eq!(taken, 16, "the queue's capacity, then refused");
     }
 
     #[tokio::test]

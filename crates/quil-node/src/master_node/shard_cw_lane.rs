@@ -77,6 +77,7 @@ mod tests {
             from: Vec::new(),
             via: Vec::new(),
             direct: false,
+            ack: None,
         }
     }
 

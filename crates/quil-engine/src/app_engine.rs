@@ -446,19 +446,22 @@ impl AppEngineHandle {
     /// Frame-topic gossip goes to its own queue, which the engine reads
     /// after every other message.
     pub fn send(&self, msg: AppEngineMessage) {
+        self.try_deliver(msg);
+    }
+
+    /// [`Self::send`], saying whether the engine's queue took the message.
+    pub fn try_deliver(&self, msg: AppEngineMessage) -> bool {
         match (msg, self.frame_tx.as_ref()) {
-            (AppEngineMessage::Frame(data), Some(frames)) => {
-                let _ = frames.try_send(data);
-            }
-            (msg, _) => {
-                if matches!(
-                    self.msg_tx.try_send(msg),
-                    Err(mpsc::error::TrySendError::Full(_))
-                ) {
+            (AppEngineMessage::Frame(data), Some(frames)) => frames.try_send(data).is_ok(),
+            (msg, _) => match self.msg_tx.try_send(msg) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
                     self.inbound_dropped
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    false
                 }
-            }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            },
         }
     }
 

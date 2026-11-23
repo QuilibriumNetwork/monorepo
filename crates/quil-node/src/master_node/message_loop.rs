@@ -1892,6 +1892,7 @@ pub(crate) fn gap_fetched_frame_message(
         from: Vec::new(),
         via: Vec::new(),
         direct: false,
+        ack: None,
     }
 }
 
@@ -2052,6 +2053,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         super::shard_sender::ShardSenderKeys::default(),
     ));
     let loop_queue_drops = Arc::new(super::shard_cw_lane::LoopQueueDrops::default());
+    // Shard CW topics whose standalone worker lacks direct delivery.
+    let remote_direct_unsupported: Arc<parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>> =
+        Default::default();
     let inbound = msg_rx;
     let (to_loop, mut msg_rx) = tokio::sync::mpsc::channel(LOOP_QUEUE);
     {
@@ -2061,13 +2065,80 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let keys = shard_sender_keys.clone();
         let ring = recent_messages_for_recv.clone();
         let drops = loop_queue_drops.clone();
+        let remote_workers = remote_workers_for_recv.clone();
+        let unsupported = remote_direct_unsupported.clone();
+        let p2p = p2p_for_recv.clone();
+        let spawner = spawner.clone();
         sup.run_until_cancelled("shard-cw-lane", move |_| async move {
             super::shard_cw_lane::run(inbound, to_loop, drops, move |received| {
                 let Some((filter, handle)) = engines.read().iter().find_map(|(filter, handle)| {
                     (quil_engine::bitmasks::shard_cw_bitmask(filter) == received.bitmask)
                         .then(|| (filter.clone(), handle.clone()))
                 }) else {
-                    return false;
+                    // A committee member's message sent to this node
+                    // directly, for a shard one of its standalone workers
+                    // runs: handed to that worker here, not behind the
+                    // loop's queue, and its sender answered once the
+                    // worker takes it.
+                    if !received.direct {
+                        return false;
+                    }
+                    let Some(remote) = remote_workers.get().cloned() else {
+                        return false;
+                    };
+                    let Some(filter) = remote
+                        .served_filters()
+                        .into_iter()
+                        .find(|filter| quil_engine::bitmasks::shard_cw_bitmask(filter) == received.bitmask)
+                    else {
+                        return false;
+                    };
+                    // The worker counts what it is handed.
+                    let Some((channel, cw_bytes)) =
+                        quil_engine::bitmasks::shard_cw_admit(&filter, &received.data, &local_cw_tag)
+                    else {
+                        return true;
+                    };
+                    let peer_info_key = peer_infos
+                        .read()
+                        .get(&received.from)
+                        .map(|info| info.public_key.clone());
+                    let from_key = shard_sender_key(
+                        &mut keys
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        &received.from,
+                        peer_info_key,
+                        &global,
+                        &filter,
+                    );
+                    let data = cw_bytes.to_vec();
+                    let topic = received.bitmask.clone();
+                    let ack = received.ack.take();
+                    let (p2p, unsupported) = (p2p.clone(), unsupported.clone());
+                    spawner.detach("shard-cw-forward", async move {
+                        use quil_engine::remote_worker::RemoteDelivery;
+                        match remote.deliver_shard_consensus(&filter, channel, data, from_key).await {
+                            RemoteDelivery::Accepted => {
+                                if let Some(ack) = ack {
+                                    ack.taken();
+                                }
+                            }
+                            RemoteDelivery::Unsupported => {
+                                // Senders fall back to the topic, which the
+                                // worker hears itself.
+                                warn!(filter = %hex::encode(&filter),
+                                    "standalone worker lacks direct shard delivery; refusing direct messages for its shard");
+                                unsupported.lock().insert(topic.clone());
+                                p2p.revoke_direct(topic).await;
+                            }
+                            // Answered "not delivered" as `ack` drops: the
+                            // sender sends its topic copy.
+                            RemoteDelivery::Refused | RemoteDelivery::Failed => {}
+                        }
+                        Ok(())
+                    });
+                    return true;
                 };
                 if let Some(ring) = &ring {
                     ring.push_received(&received.from, &received.bitmask, &received.data);
@@ -2092,11 +2163,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     tracing::debug!(filter = %hex::encode(&filter), channel,
                         sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                         "routing shard CW message to its engine");
-                    handle.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                    // A direct sender is told "delivered" only if the engine
+                    // took it.
+                    if handle.try_deliver(quil_engine::app_engine::AppEngineMessage::CwIn {
                         channel,
                         from: from_key,
                         data: cw_bytes.to_vec(),
-                    });
+                    }) {
+                        received.taken();
+                    }
                 }
                 true
             })
@@ -2275,8 +2350,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut epoch_writes = super::disk_writes::EpochWrites::default();
         let mut pending_committee_policy: Option<(std::collections::HashSet<quil_p2p::PeerId>, Arc<std::sync::atomic::AtomicBool>)> = None;
         let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        let remote_direct_unsupported: Arc<parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>> =
-            Default::default();
+        // When the committee sends were last logged, and their counts then.
+        let mut committee_sends_logged = (
+            tokio::time::Instant::now(),
+            <[super::direct_delivery::ChannelSendCounts; 4]>::default(),
+        );
         // Track the highest frame number we've fully executed (through
         // the execution manager + lifecycle). New frames arriving via
         // gossip can be wildly out of order; only execute consecutive
@@ -2485,6 +2563,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
+                    let since_sends = committee_sends_logged.0.elapsed();
+                    if since_sends >= super::direct_delivery::COMMITTEE_SENDS_EVERY {
+                        committee_sends_logged = (
+                            tokio::time::Instant::now(),
+                            super::direct_delivery::log_committee_sends(
+                                committee_sends_logged.1,
+                                since_sends.as_secs(),
+                            ),
+                        );
+                    }
                     let sender_keys = {
                         let keys = shard_sender_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         (keys.peer_info, keys.session, keys.cached, keys.unresolved)
@@ -2587,6 +2675,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         direct_failed = direct.failed,
                         direct_received = direct.received,
                         direct_received_refused = direct.received_refused,
+                        direct_queued = direct.queued,
+                        direct_received_untaken = direct.received_untaken,
                         gossip_received = direct.gossip_received,
                         gossip_received_queue_full = direct.gossip_received_queue_full,
                         gossip_received_queue_closed = direct.gossip_received_queue_closed,
@@ -3932,59 +4022,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             tracing::debug!(filter = %hex::encode(filter), channel,
                                                 sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                                                 "routing shard CW message to its engine");
-                                            handle.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                            if handle.try_deliver(quil_engine::app_engine::AppEngineMessage::CwIn {
                                                 channel,
                                                 from: from_key,
                                                 data: cw_bytes.to_vec(),
-                                            });
+                                            }) {
+                                                received.taken();
+                                            }
                                         }
                                         routed = true;
                                         break;
-                                    }
-                                }
-                                // A committee member's message sent to this node
-                                // directly, for a shard one of its standalone
-                                // workers runs: hand it to that worker.
-                                if !routed && received.direct {
-                                    if let Some(remote) = remote_workers_for_recv.get().cloned() {
-                                        let served = remote
-                                            .served_filters()
-                                            .into_iter()
-                                            .find(|filter| quil_engine::bitmasks::shard_cw_bitmask(filter).as_slice() == bm);
-                                        if let Some(filter) = served {
-                                            // The worker counts what it is handed.
-                                            let elsewhere = quil_engine::bitmasks::shard_cw_addressee(&received.data)
-                                                .is_some_and(|tag| tag != local_cw_tag);
-                                            if let Some((channel, cw_bytes)) =
-                                                quil_engine::bitmasks::shard_cw_split_payload(&received.data)
-                                                    .filter(|_| !elsewhere)
-                                            {
-                                                let peer_info_key = pic_for_recv.read().get(&received.from)
-                                                    .map(|info| info.public_key.clone());
-                                                let from_key = shard_sender_key(
-                                                    &mut shard_sender_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                                                    &received.from, peer_info_key, &crdt_for_recv, &filter);
-                                                let data = cw_bytes.to_vec();
-                                                let topic = bm.to_vec();
-                                                let p2p = p2p_for_recv.clone();
-                                                let unsupported = remote_direct_unsupported.clone();
-                                                spawner.detach("shard-cw-forward", async move {
-                                                    use quil_engine::remote_worker::RemoteDelivery;
-                                                    if remote.deliver_shard_consensus(&filter, channel, data, from_key).await
-                                                        == RemoteDelivery::Unsupported
-                                                    {
-                                                        // Senders fall back to the topic,
-                                                        // which the worker hears itself.
-                                                        warn!(filter = %hex::encode(&filter),
-                                                            "standalone worker lacks direct shard delivery; refusing direct messages for its shard");
-                                                        unsupported.lock().insert(topic.clone());
-                                                        p2p.revoke_direct(topic).await;
-                                                    }
-                                                    Ok(())
-                                                });
-                                            }
-                                            routed = true;
-                                        }
                                     }
                                 }
                                 if !routed {
@@ -5449,6 +5496,7 @@ mod tests {
                 from: from.to_vec(),
                 via: via.to_vec(),
                 direct: false,
+                ack: None,
             };
             let data = std::mem::take(&mut received.data);
             assert!(unrouted_shard_message(
@@ -5510,6 +5558,7 @@ mod tests {
                 from: from.to_vec(),
                 via: b"relay".to_vec(),
                 direct: false,
+                ack: None,
             };
             assert!(unrouted_shard_message(
                 &topic,

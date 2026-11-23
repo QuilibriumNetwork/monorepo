@@ -1833,6 +1833,7 @@ async fn deliver_shard_submission<H>(
         from: Vec::new(),
         via: Vec::new(),
         direct: false,
+        ack: None,
     }) {
         Ok(()) if no_peer => {
             if let Some((attempts, ongoing_secs)) = submission_undelivered_report(domain) {
@@ -2383,24 +2384,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     // to the members they name (the worker's own connections cannot be
     // attributed to its committee key). Members not served directly get a
     // topic copy sent from here, after the answer: the worker sends to the
-    // topic itself only when this node does not take the request (an
-    // earlier build answers "not delivered").
+    // topic itself only when this node does not take the request (too many
+    // copies in flight, or an earlier build's "not delivered").
     .with_shard_direct_relay({
         let p2p = p2p_handle.clone();
         let peers = super::direct_delivery::CommitteePeers::new(peer_info_cache.clone());
         Arc::new(move |filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>| {
             let (p2p, peers) = (p2p.clone(), peers.clone());
             Box::pin(async move {
-                let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
-                let undelivered =
-                    super::direct_delivery::deliver_direct(&p2p, &peers, channel, &data, &recipients, &topic).await;
-                if let Some(payload) = super::direct_delivery::fallback_payload(channel, &data, &undelivered) {
-                    p2p.note_direct_fallback();
-                    tokio::spawn(async move {
-                        super::cw_publish::publish_shard_cw(&p2p, 0, &filter, topic, payload).await;
-                    });
-                }
-                true
+                super::direct_delivery::relay_for_worker(
+                    &p2p,
+                    &peers,
+                    &super::direct_delivery::WORKER_TOPIC_COPIES,
+                    filter,
+                    channel,
+                    data,
+                    recipients,
+                )
+                .await
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         }) as quil_rpc::global_service::ShardDirectRelay
     })
@@ -6890,6 +6891,7 @@ mod submit_sender_tests {
             from: from.to_vec(),
             via: PeerId::random().to_bytes(),
             direct: false,
+            ack: None,
         }
     }
 
@@ -7347,6 +7349,7 @@ mod shard_submission_tests {
                 from: Vec::new(),
                 via: Vec::new(),
                 direct: false,
+                ack: None,
             })
             .unwrap();
         let server = node_rpc(node.p2p.clone(), loopback, engines_of(&[app]));

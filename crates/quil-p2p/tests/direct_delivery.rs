@@ -1,11 +1,25 @@
 //! Two real nodes on loopback: a direct message reaches the one peer it is
 //! sent to, as a message on its bitmask from the sender, only on a bitmask
-//! the receiver allows.
+//! the receiver allows, and is reported delivered once the receiver's
+//! application takes it.
 
 use std::time::Duration;
 
 use quil_p2p::node::{ListenFamily, ListenTransport, CONNECT_WAIT};
-use quil_p2p::{DirectOutcome, P2PHandle, P2PNode};
+use quil_p2p::{DirectOutcome, P2PHandle, P2PNode, ReceivedMessage};
+use tokio::sync::mpsc::{unbounded_channel, Receiver, UnboundedReceiver};
+
+/// An application that takes every message as it arrives, then hands it on.
+fn take_each(mut inbound: Receiver<ReceivedMessage>) -> UnboundedReceiver<ReceivedMessage> {
+    let (taken, out) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = inbound.recv().await {
+            message.taken();
+            let _ = taken.send(message);
+        }
+    });
+    out
+}
 
 /// The connection counters [`connection_state`] reports.
 const COUNTERS: [&str; 3] = [
@@ -41,10 +55,11 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
 
     let receiver = P2PNode::new_with_options(&config, true, None).unwrap();
     let receiver_id = receiver.peer_id;
-    let (receiver, mut inbound, receiver_port) = receiver
+    let (receiver, inbound, receiver_port) = receiver
         .start_on_loopback(&mut sup, ListenTransport::Tcp, ListenFamily::Ip4)
         .await
         .unwrap();
+    let mut inbound = take_each(inbound);
 
     let mut sender_config = config.clone();
     sender_config.bootstrap_peers = vec![format!(
@@ -185,7 +200,8 @@ async fn a_bootstrap_peer_that_listens_late_is_connected_by_the_discovery_tick()
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let (receiver, mut inbound) = receiver.start(&mut sup, &receiver_addr).await.unwrap();
+    let (receiver, inbound) = receiver.start(&mut sup, &receiver_addr).await.unwrap();
+    let mut inbound = take_each(inbound);
     let allowed = vec![1, 7, 7];
     receiver.allow_direct(allowed.clone()).await;
     let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
