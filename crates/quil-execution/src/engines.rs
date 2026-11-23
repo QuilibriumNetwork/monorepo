@@ -1454,6 +1454,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
+                refuse_creation_off_base_domain(_address, bundle.requests.iter().flatten())?;
                 let claim_checkpoint = self.state.as_ref().map(|s| s.changeset_len());
                 // Operations on any application other than QUIL carry a QUIL
                 // fee. A custom-token bundle that grows state at a nonzero
@@ -1521,6 +1522,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             }
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
+                refuse_creation_off_base_domain(_address, std::iter::once(&req))?;
                 // A claim funds the bundle it opens, so a lone custom-token
                 // request carrying one is refused by every replica alike. Any
                 // other is admitted only when it grows no state or the price
@@ -2025,6 +2027,27 @@ fn publish_execution_changes(
         // Published data is now readable through the CRDT fallback. Do not
         // accumulate and replay successful changesets on subsequent messages.
         state.abort();
+    }
+    Ok(())
+}
+
+/// Refuse a token message creating an application unless it is addressed to
+/// the token base domain. Settlement admission prices a creation by the
+/// message's address, and the QUIL token's own messages skip it (they pay in
+/// QUIL), so a token deploy carried there created an application unpaid. The
+/// client and the global frame address every deploy to the base domain.
+fn refuse_creation_off_base_domain<'a>(
+    address: &[u8],
+    mut requests: impl Iterator<Item = &'a CanonicalMessageRequest>,
+) -> Result<()> {
+    let base = crate::token_intrinsic::constants::token_base_domain();
+    if address.get(..32) == Some(&base[..]) {
+        return Ok(());
+    }
+    if requests.any(|r| r.inner_type_prefix == crate::token_intrinsic::TYPE_TOKEN_DEPLOY) {
+        return Err(QuilError::InvalidArgument(
+            "token: a deploy creates an application only at the token base domain".into(),
+        ));
     }
     Ok(())
 }
