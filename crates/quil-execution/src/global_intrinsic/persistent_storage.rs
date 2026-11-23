@@ -21,7 +21,7 @@ const MAX_BYTES: usize = super::storage_epoch_proof::MAX_PROOF_LEN as usize;
 mod capacity;
 pub use capacity::{
     capacity_domain, capacity_message, check_capacity, pending_certificate, CapacityMessage,
-    PendingCertificate,
+    PendingCertificate, CERTIFICATE_LATE_EPOCHS,
 };
 
 #[derive(Debug, Clone)]

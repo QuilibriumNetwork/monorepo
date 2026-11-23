@@ -127,9 +127,10 @@ pub(crate) struct SubmitRetryQueue {
     running: AtomicBool,
     ids: AtomicU64,
     /// What became of the storage epoch proofs of each window, summarized
-    /// once it ends ([`SubmitRetryQueue::report_windows`]). Locked after
+    /// once it ends ([`SubmitRetryQueue::report_windows`]): per window end
+    /// and kind ([`StorageProofSubmission::tally_key`]). Locked after
     /// `pending` when both are.
-    tally: std::sync::Mutex<std::collections::BTreeMap<u64, WindowTally>>,
+    tally: std::sync::Mutex<std::collections::BTreeMap<(u64, SubmissionKind), WindowTally>>,
     /// Messages dropped from the full queue, logged at most once per
     /// [`RETRY_DROP_LOG_EVERY`]. Never locked with `pending` or `tally`
     /// held.
@@ -144,7 +145,15 @@ pub(crate) struct SubmitRetryQueue {
     /// The archives resting after a refusal for room, first sends and
     /// resends alike. Never locked with another lock held.
     rests: ArchiveRests,
+    /// How often each storage epoch proof was handed over, per digest, with
+    /// its window's end ([`SubmitRetryQueue::handed_over`]). Never locked
+    /// with another lock held.
+    handovers: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
+
+/// The most digests [`SubmitRetryQueue::handed_over`] counts: about the
+/// proofs and capacity messages of a node's seats and sectors over a window.
+const HANDOVERS_HELD: usize = 4096;
 
 /// The archives that refused this node's storage epoch proof for room (a
 /// full rank or share of held proofs), each resting until a time: sent no
@@ -156,10 +165,22 @@ pub(crate) struct SubmitRetryQueue {
 /// apart sent every queued proof to every archive, and four archives
 /// refused about 130,000 sends an epoch each, against about 1,100 seats
 /// (2026-11-21). The rests are read as each send starts: an archive is
-/// sent past its refusal only the proofs already on their way to it.
+/// sent past its refusal only the proofs already on their way to it. An
+/// archive holds capacity messages in shares of their own and refuses
+/// room in each alike, so it rests per [`Share`]: a precommit refused for
+/// room rests no seat proof, and a seat proof refused rests no
+/// certificate (106 room refusals an hour on one node, 2026-11-22).
 #[derive(Default)]
 struct ArchiveRests {
-    rests: std::sync::Mutex<std::collections::HashMap<String, Rest>>,
+    rests: std::sync::Mutex<std::collections::HashMap<(String, Share), Rest>>,
+}
+
+/// The share of an archive's held proofs a storage epoch proof envelope
+/// takes room in ([`ArchiveRests`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Share {
+    Seats,
+    Capacity,
 }
 
 /// An archive resting ([`ArchiveRests`]): until when, and the earliest
@@ -171,24 +192,38 @@ struct Rest {
 }
 
 impl ArchiveRests {
-    /// How long `archive` still rests at `now` for a proof whose window ends
-    /// at `window_end`; `None` when it is sent.
-    fn rests(&self, archive: &str, window_end: u64, now: Instant) -> Option<Duration> {
+    /// How long `archive` still rests at `now` for a proof of `share` whose
+    /// window ends at `window_end`; `None` when it is sent.
+    fn rests(
+        &self,
+        archive: &str,
+        share: Share,
+        window_end: u64,
+        now: Instant,
+    ) -> Option<Duration> {
         let rests = self.rests.lock().unwrap();
         rests
-            .get(archive)
+            .get(&(archive.to_string(), share))
             .filter(|rest| rest.until > now && window_end >= rest.window_end)
             .map(|rest| rest.until - now)
     }
 
-    /// `archive` refused a proof whose window ends at `window_end` for room
-    /// at `now`: it rests `rest` from now.
-    fn refused_room(&self, archive: &str, window_end: u64, now: Instant, rest: Duration) {
+    /// `archive` refused a proof of `share` whose window ends at
+    /// `window_end` for room at `now`: it rests `rest` from now for that
+    /// share.
+    fn refused_room(
+        &self,
+        archive: &str,
+        share: Share,
+        window_end: u64,
+        now: Instant,
+        rest: Duration,
+    ) {
         let mut rests = self.rests.lock().unwrap();
         rests.retain(|_, rest| rest.until > now);
         let until = now + rest;
         rests
-            .entry(archive.to_string())
+            .entry((archive.to_string(), share))
             .and_modify(|rest| {
                 rest.until = rest.until.max(until);
                 rest.window_end = rest.window_end.min(window_end);
@@ -202,6 +237,8 @@ impl ArchiveRests {
 #[derive(Clone, Copy)]
 struct Resting<'a> {
     rests: &'a ArchiveRests,
+    /// The share the proof takes room in ([`SubmissionKind::share`]).
+    share: Share,
     /// The proof's window end ([`StorageProofSubmission::window_end`]).
     window_end: u64,
     /// How long an archive refusing it for room rests at least, before
@@ -274,10 +311,28 @@ impl SubmitRetryQueue {
         found
     }
 
+    /// Count a handover of the storage epoch proof with `digest`, whose
+    /// window ends at `window_end`: the times these bytes were handed to
+    /// this transport, this one included. Once [`HANDOVERS_HELD`] digests
+    /// are counted, those whose window ended by `frame` are forgotten, and
+    /// all of them if that frees none.
+    fn handed_over(&self, digest: &str, window_end: u64, frame: Option<u64>) -> u64 {
+        let mut held = self.handovers.lock().unwrap();
+        if held.len() >= HANDOVERS_HELD && !held.contains_key(digest) {
+            held.retain(|_, (end, _)| frame.is_none_or(|frame| *end > frame));
+            if held.len() >= HANDOVERS_HELD {
+                held.clear();
+            }
+        }
+        let count = &mut held.entry(digest.to_owned()).or_insert((window_end, 0)).1;
+        *count += 1;
+        *count
+    }
+
     /// Count `proof`, not sent or dropped from the retry queue for a
     /// settled seat ([`Self::settled_seats`]), in its window's tally.
     fn count_settled(&self, proof: &StorageProofSubmission) {
-        self.tally(proof.window_end, |t| t.settled += 1);
+        self.tally_of(proof, |t| t.settled += 1);
     }
 
     /// Warn that `proof`, of `bytes` bytes digesting to `digest`
@@ -466,6 +521,16 @@ const RETRY_TIMING: RetryTiming = RetryTiming {
 };
 const RETRY_MAX_MESSAGES: usize = 256;
 const RETRY_MAX_BYTES: usize = 32 << 20;
+
+/// Whether the retry queue sends `proof`'s submission again: all but a
+/// capacity message, which the engine sends again itself until GLOBAL takes
+/// or refuses it (`precommit_due`, `certificate_due`). Queued, a sector's
+/// certificates took most of the queue's bytes (36 in an hour, 29 MB,
+/// 2026-11-22), and a full queue drops the oldest messages, seat proofs
+/// among them.
+fn retried(proof: Option<&StorageProofSubmission>) -> bool {
+    proof.is_none_or(|proof| proof.kind == SubmissionKind::SeatProof)
+}
 /// How often messages dropped from a full retry queue are logged: the first
 /// at once, then those of each interval in one line.
 const RETRY_DROP_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -473,9 +538,13 @@ const RETRY_DROP_LOG_EVERY: Duration = Duration::from_secs(60);
 impl SubmitRetryQueue {
     /// Queue `bytes` (once), in place of the queued storage epoch proofs it
     /// supersedes ([`StorageProofSubmission::supersedes`]); true if no
-    /// worker is running and the caller must start one.
+    /// worker is running and the caller must start one. A capacity message
+    /// is not queued ([`retried`]).
     fn push(&self, bytes: Vec<u8>) -> bool {
         let proof = StorageProofSubmission::of(&bytes);
+        if !retried(proof.as_ref()) {
+            return false;
+        }
         let mut pending = self.pending.lock().unwrap();
         if !pending.iter().any(|queued| queued.bytes == bytes) {
             if let Some(proof) = &proof {
@@ -613,7 +682,11 @@ impl SubmitRetryQueue {
     #[cfg(test)]
     fn settled_in(&self, window_end: u64) -> u64 {
         let tally = self.tally.lock().unwrap();
-        tally.get(&window_end).map_or(0, |t| t.settled)
+        tally
+            .iter()
+            .filter(|((end, _), _)| *end == window_end)
+            .map(|(_, t)| t.settled)
+            .sum()
     }
 
     /// Proofs of the window ending at `window_end` undelivered
@@ -621,7 +694,11 @@ impl SubmitRetryQueue {
     #[cfg(test)]
     fn undelivered_in(&self, window_end: u64) -> u64 {
         let tally = self.tally.lock().unwrap();
-        tally.get(&window_end).map_or(0, |t| t.undelivered)
+        tally
+            .iter()
+            .filter(|((end, _), _)| *end == window_end)
+            .map(|(_, t)| t.undelivered)
+            .sum()
     }
 
     /// Whether queued storage epoch proofs of `proof`'s member cover each of
@@ -636,9 +713,21 @@ impl SubmitRetryQueue {
         })
     }
 
-    /// Count in the tally of the window ending at `window_end`.
+    /// Count in the tally of the seat proofs' window ending at `window_end`.
     fn tally(&self, window_end: u64, count: impl FnOnce(&mut WindowTally)) {
-        count(self.tally.lock().unwrap().entry(window_end).or_default());
+        let key = (window_end, SubmissionKind::SeatProof);
+        count(self.tally.lock().unwrap().entry(key).or_default());
+    }
+
+    /// Count `proof` in its tally ([`StorageProofSubmission::tally_key`]).
+    fn tally_of(&self, proof: &StorageProofSubmission, count: impl FnOnce(&mut WindowTally)) {
+        count(
+            self.tally
+                .lock()
+                .unwrap()
+                .entry(proof.tally_key())
+                .or_default(),
+        );
     }
 
     /// Log, once, what became of the storage epoch proofs of each window
@@ -647,12 +736,35 @@ impl SubmitRetryQueue {
         let Some(frame) = frame else {
             return;
         };
-        let ended: Vec<(u64, WindowTally)> = {
+        let ended: Vec<((u64, SubmissionKind), WindowTally)> = {
             let mut tally = self.tally.lock().unwrap();
-            let open = tally.split_off(&frame.saturating_add(1));
+            let open = tally.split_off(&(frame.saturating_add(1), SubmissionKind::SeatProof));
             std::mem::replace(&mut *tally, open).into_iter().collect()
         };
-        for (window_end, t) in ended {
+        for ((window_end, kind), t) in ended {
+            if let SubmissionKind::CapacityCertificate { epoch }
+            | SubmissionKind::CapacityPrecommit { epoch } = kind
+            {
+                macro_rules! capacity_line {
+                    ($level:ident) => {
+                        $level!(kind = kind.label(), epoch, global_until = window_end,
+                            published = t.published, sent = t.sent, accepted = t.accepted,
+                            refused = t.refused, refused_for_good = t.refused_for_good,
+                            undelivered = t.undelivered,
+                            "capacity messages of an epoch whose window ended: handed over by the engine, sends to \
+                             the archives, sends an archive took, sends every archive refused for now (the engine \
+                             sends them again) or for good, and messages not sent as GLOBAL refused them already. \
+                             A certificate's commit shows in its 'sector certificate committed' line; undelivered \
+                             above 0 means the engine handed one over too late (check what held up its proving)")
+                    };
+                }
+                if t.undelivered > 0 {
+                    capacity_line!(warn);
+                } else {
+                    capacity_line!(info);
+                }
+                continue;
+            }
             // A window ending at the start of epoch E + 2 settles epoch E.
             let epoch = (window_end / quil_types::consensus::epoch_length_frames().max(1))
                 .saturating_sub(2);
@@ -990,7 +1102,7 @@ fn expire(pending: &mut VecDeque<Queued>, timing: RetryTiming, frame: Option<u64
         let closed = window_over(proof, queued.queued, timing, frame);
         if closed {
             let (member, shards, epochs) = proof.fields();
-            error!(member, ?shards, ?epochs, bytes = queued.bytes.len(), window_end = proof.window_end,
+            error!(kind = proof.kind.label(), member, ?shards, ?epochs, bytes = queued.bytes.len(), window_end = proof.window_end,
                 frame = %or_unknown(frame), attempts = queued.attempts + 1, secs = queued.queued.elapsed().as_secs(),
                 consequence = proof.consequence(),
                 "storage epoch proof undelivered when its window ended: no archive took it");
@@ -1234,14 +1346,18 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         let proof = StorageProofSubmission::of(&bundle_bytes);
         let bytes = bundle_bytes.len();
         if let Some(proof) = &proof {
+            let digest = proof_digest(&bundle_bytes);
+            let handovers = self.retry_queue.handed_over(
+                &digest,
+                proof.window_end,
+                latest_frame(self.clock_store.as_ref()),
+            );
             self.retry_queue
                 .report_windows(latest_frame(self.clock_store.as_ref()));
-            self.retry_queue
-                .tally(proof.window_end, |t| t.published += 1);
+            self.retry_queue.tally_of(proof, |t| t.published += 1);
             // GLOBAL refuses it whole: it would only take the archives' room.
             let settled = self.retry_queue.settled_seats(proof);
             if !settled.is_empty() {
-                let digest = proof_digest(&bundle_bytes);
                 self.retry_queue.warn_settled(
                     proof,
                     (&digest, bytes),
@@ -1257,10 +1373,10 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             if let Some(frame) =
                 frame.filter(|_| window_over(proof, Instant::now(), RETRY_TIMING, frame))
             {
-                self.retry_queue
-                    .tally(proof.window_end, |t| t.undelivered += 1);
+                self.retry_queue.tally_of(proof, |t| t.undelivered += 1);
                 let (member, shards, epochs) = proof.fields();
-                warn!(member, ?shards, ?epochs, bytes, window_end = proof.window_end, frame,
+                warn!(kind = proof.kind.label(), member, ?shards, ?epochs, bytes, %digest, handovers,
+                    global_until = proof.window_end, frame, frames_past = frame.saturating_sub(proof.window_end),
                     consequence = proof.consequence(),
                     "storage epoch proof not sent: its window ended before it was handed over (GLOBAL refuses it whole); \
                      check what held up its proving");
@@ -1272,7 +1388,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             // at the queue's next round, so each pending seat is sent once a
             // round instead of also at once to every archive.
             if self.retry_queue.holds(proof) {
-                self.retry_queue.tally(proof.window_end, |t| t.folded += 1);
+                self.retry_queue.tally_of(proof, |t| t.folded += 1);
                 if self.retry_queue.push(bundle_bytes) {
                     self.start_retries();
                 }
@@ -1289,6 +1405,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // one for room ([`ArchiveRests`]).
         let resting = proof.as_ref().map(|proof| Resting {
             rests: &self.retry_queue.rests,
+            share: proof.kind.share(),
             window_end: proof.window_end,
             rest: RETRY_TIMING.room_rest,
         });
@@ -1340,8 +1457,10 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             }
             _ => None,
         };
-        // Every archive refused it for now: resend it later.
-        let queued = outcome.is_err() && delivery.retry > 0;
+        // Every archive refused it for now: resend it later, from the retry
+        // queue unless the engine sends it again ([`retried`]).
+        let resent = outcome.is_err() && delivery.retry > 0;
+        let queued = resent && retried(proof.as_ref());
         if queued && self.retry_queue.push(bundle_bytes) {
             self.start_retries();
         }
@@ -1349,14 +1468,14 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         let unsent = delivery.unsent();
         if let Some(proof) = &proof {
             note_answer(proof, &delivery, publish_bs && bs_result.is_ok());
-            self.retry_queue.tally(proof.window_end, |t| {
+            self.retry_queue.tally_of(proof, |t| {
                 if unsent {
                     return;
                 }
                 t.sent += 1;
                 if grpc_ok_count > 0 {
                     t.accepted += 1;
-                } else if queued {
+                } else if resent {
                     t.refused += 1;
                 } else if outcome.is_err() {
                     t.refused_for_good += 1;
@@ -1392,6 +1511,12 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                     refusals = %refusals(&delivery), window_end, %frames_left, %mins_left,
                     consequence = proof.consequence(),
                     "storage epoch proof not delivered: no archive took it in time; sending it again until its window ends");
+            } else if resent {
+                info!(kind = proof.kind.label(), member, ?shards, ?epochs, bytes, archives = archive_count,
+                    refusals = %refusals(&delivery), global_until = window_end, %frames_left,
+                    "capacity message not delivered: every archive refused it for now; the engine sends it again \
+                     (a precommit every few frames, a certificate at widening intervals) until GLOBAL takes it or \
+                     global_until passes");
             } else if outcome.is_err() {
                 warn!(member, ?shards, ?epochs, bytes, archives = archive_count, refusals = %refusals(&delivery),
                     "storage epoch proof refused by every archive — not sent again");
@@ -1437,10 +1562,12 @@ impl ProdProverMessageTransport {
             move |bytes| {
                 let (pool, seed, queue) = (pool.clone(), seed.clone(), queue.clone());
                 let resending_proof = carries_storage_proof(&bytes);
-                let window_end = StorageProofSubmission::of(&bytes).map(|proof| proof.window_end);
+                let due = StorageProofSubmission::of(&bytes)
+                    .map(|proof| (proof.kind.share(), proof.window_end));
                 async move {
-                    let resting = window_end.map(|window_end| Resting {
+                    let resting = due.map(|(share, window_end)| Resting {
                         rests: &queue.rests,
+                        share,
                         window_end,
                         rest: RETRY_TIMING.room_rest,
                     });
@@ -1531,11 +1658,12 @@ where
         // the gRPC stream service listens on :8340.
         let stream_addr = crate::util::multiaddr::pubsub_to_stream_endpoint(&addr);
         if let Some(resting) = resting {
-            if let Some(left) =
-                resting
-                    .rests
-                    .rests(&stream_addr, resting.window_end, Instant::now())
-            {
+            if let Some(left) = resting.rests.rests(
+                &stream_addr,
+                resting.share,
+                resting.window_end,
+                Instant::now(),
+            ) {
                 skipped.push((place, stream_addr, left));
                 continue;
             }
@@ -1573,9 +1701,13 @@ where
                         if let Some(resting) = resting {
                             let rest = jittered_up(resting.rest);
                             let now = Instant::now();
-                            resting
-                                .rests
-                                .refused_room(&addr, resting.window_end, now, rest);
+                            resting.rests.refused_room(
+                                &addr,
+                                resting.share,
+                                resting.window_end,
+                                now,
+                                rest,
+                            );
                         }
                     }
                 }
@@ -1741,22 +1873,64 @@ fn carries_storage_proof(bundle: &[u8]) -> bool {
     })
 }
 
+/// What a storage epoch proof envelope carries: GLOBAL checks a capacity
+/// message (`persistent_storage::check_capacity`) instead of a seat proof
+/// (`storage_epoch_proof::check`), under its own deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SubmissionKind {
+    SeatProof,
+    /// A certificate for its sector's precommit of `epoch`.
+    CapacityCertificate {
+        epoch: u64,
+    },
+    /// A precommit for `epoch`.
+    CapacityPrecommit {
+        epoch: u64,
+    },
+}
+
+impl SubmissionKind {
+    /// The share of an archive's held proofs it takes room in.
+    fn share(self) -> Share {
+        match self {
+            Self::SeatProof => Share::Seats,
+            Self::CapacityCertificate { .. } | Self::CapacityPrecommit { .. } => Share::Capacity,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SeatProof => "storage epoch proof",
+            Self::CapacityCertificate { .. } => "capacity certificate",
+            Self::CapacityPrecommit { .. } => "capacity precommit",
+        }
+    }
+}
+
 /// The storage epoch proof a submission carries: its member, its seats and
 /// the GLOBAL frame from which GLOBAL refuses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StorageProofSubmission {
+    kind: SubmissionKind,
     member: [u8; 32],
     /// Each seat's shard filter, the epoch it settles, and whether it seals
     /// (the registration two epochs on) and settles.
     seats: Vec<(Vec<u8>, u64, bool, bool)>,
     /// The end of its earliest seat's window: a settlement's window ends as
     /// the epoch after the next begins, and a seal's as the epoch it seals
-    /// begins, the same frame (`storage_epoch_proof::check`).
+    /// begins, the same frame (`storage_epoch_proof::check`). A capacity
+    /// message's seat is only its envelope: its window ends where
+    /// `check_capacity` refuses it as late
+    /// (`CapacityMessage::refused_from`), for a certificate three epochs
+    /// after its envelope's seal epoch begins.
     window_end: u64,
 }
 
 impl StorageProofSubmission {
     fn of(bundle: &[u8]) -> Option<Self> {
+        use quil_execution::global_intrinsic::persistent_storage::{
+            capacity_message, CapacityMessage,
+        };
         use quil_execution::global_intrinsic::storage_epoch_proof::{
             StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
         };
@@ -1769,7 +1943,7 @@ impl StorageProofSubmission {
             .flatten()
             .find(|request| request.inner_type_prefix == TYPE_STORAGE_EPOCH_PROOF)?;
         let proof = StorageEpochProof::from_canonical_bytes(&request.inner_bytes).ok()?;
-        let window_end = proof
+        let seat_window_end = proof
             .seats
             .iter()
             .flat_map(|seat| {
@@ -1780,6 +1954,28 @@ impl StorageProofSubmission {
                 settles.into_iter().chain(seals)
             })
             .min()?;
+        // GLOBAL refuses a capacity message it cannot read at every frame:
+        // the seat rule bounds such a one as before.
+        let capacity = capacity_message(&proof)
+            .then(|| CapacityMessage::decode(&proof).ok())
+            .flatten();
+        let (kind, window_end) = match capacity {
+            Some(message) if message.proof.is_empty() => {
+                let epoch = message.epoch;
+                (
+                    SubmissionKind::CapacityPrecommit { epoch },
+                    message.refused_from(),
+                )
+            }
+            Some(message) => {
+                let epoch = message.epoch;
+                (
+                    SubmissionKind::CapacityCertificate { epoch },
+                    message.refused_from(),
+                )
+            }
+            None => (SubmissionKind::SeatProof, seat_window_end),
+        };
         Some(Self {
             member: proof.member,
             seats: proof
@@ -1795,6 +1991,7 @@ impl StorageProofSubmission {
                 })
                 .collect(),
             window_end,
+            kind,
         })
     }
 
@@ -1855,9 +2052,28 @@ impl StorageProofSubmission {
         (self.window_end, or_unknown(frames), or_unknown(mins))
     }
 
+    /// The tally it counts in ([`SubmitRetryQueue::report_windows`]): a
+    /// seat proof's that of its window, a capacity message's that of its
+    /// kind and epoch, which ends with GLOBAL's deadline for the epoch's
+    /// messages of that kind. Precommits are signed again every few frames
+    /// for a short freshness, so one line sums an epoch's.
+    fn tally_key(&self) -> (u64, SubmissionKind) {
+        match self.kind {
+            SubmissionKind::CapacityPrecommit { epoch } => (
+                quil_types::consensus::capacity_precommit_end(epoch),
+                self.kind,
+            ),
+            kind => (self.window_end, kind),
+        }
+    }
+
     /// What follows if no archive takes it before its window ends.
     fn consequence(&self) -> &'static str {
-        if self.seats.iter().any(|seat| seat.3) {
+        if let SubmissionKind::CapacityCertificate { .. } = self.kind {
+            "unless an archive takes it before the window ends, GLOBAL does not certify this sector and its precommit expires"
+        } else if let SubmissionKind::CapacityPrecommit { .. } = self.kind {
+            "GLOBAL refuses it as stale once the window ends: the sector waits for its next precommit"
+        } else if self.seats.iter().any(|seat| seat.3) {
             "unless an archive takes it before the window ends, GLOBAL withholds this prover's storage share on these shards (before epoch 1342: kicks it)"
         } else {
             "unless an archive takes it before the window ends, the registrations it seals stay unsealed"
@@ -1871,7 +2087,7 @@ mod tests {
         asks_for_retry, combine_publish_outcome, describe_bundle, fan_out_resting,
         fan_out_to_archives, refusal_reason, refusals, retryable, run_retries, submit_to_archives,
         submit_to_archives_with, ArchiveRefusals, ArchiveRests, Delivery, Resting, RetryTiming,
-        StorageProofSubmission, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY, RETRY_TIMING,
+        Share, StorageProofSubmission, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY, RETRY_TIMING,
     };
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2826,6 +3042,360 @@ mod tests {
         assert!(super::carries_storage_proof(&settles));
     }
 
+    /// A capacity message of `member` for `sector` and `epoch`, in its
+    /// storage epoch proof envelope: a certificate if `proof`, else a
+    /// precommit signed at `signed_at`.
+    fn capacity_bundle(member: u8, sector: u8, epoch: u64, signed_at: u64, proof: bool) -> Vec<u8> {
+        sized_capacity_bundle(member, sector, epoch, signed_at, if proof { 64 } else { 0 })
+    }
+
+    /// [`capacity_bundle`] with a proof of `proof_bytes` bytes: a precommit
+    /// if none.
+    fn sized_capacity_bundle(
+        member: u8,
+        sector: u8,
+        epoch: u64,
+        signed_at: u64,
+        proof_bytes: usize,
+    ) -> Vec<u8> {
+        use quil_execution::global_intrinsic::persistent_storage::CapacityMessage;
+        let proof = proof_bytes > 0;
+        let message = CapacityMessage {
+            member: [member; 32],
+            epoch,
+            certificate: quil_crypto::persistent_storage::Certificate {
+                profile: quil_types::consensus::StorageSealProfile::Eleven,
+                sector: [sector; 32],
+                n: 32,
+                columns: [0; 32],
+                labels: [0; 32],
+            },
+            signed_at: if proof { 0 } else { signed_at },
+            signature: if proof { Vec::new() } else { vec![1; 666] },
+            proof: vec![0x5a; proof_bytes],
+        };
+        crate::master_node::reward_proofs::prover_bundle(message.envelope().to_canonical_bytes())
+            .unwrap()
+    }
+
+    /// A capacity message's window ends where `check_capacity` refuses it
+    /// as late, not where its envelope's seat would: a certificate for
+    /// epoch E as epoch E + 3 begins (current > E + 2 refused), a precommit
+    /// once it is more than 10 frames old or its epoch has ended, whichever
+    /// comes first. The envelope's seat (epoch E - 2, sealing) ends at the
+    /// start of epoch E.
+    #[test]
+    fn a_capacity_messages_window_ends_where_global_refuses_it() {
+        use quil_types::consensus::epoch_start_frame;
+        let window_end = |bundle: &[u8]| StorageProofSubmission::of(bundle).unwrap().window_end;
+        let certificate = capacity_bundle(1, 3, 1500, 0, true);
+        eprintln!(
+            "REACH capacity-window certificate={}",
+            window_end(&certificate)
+        );
+        assert_eq!(
+            window_end(&certificate),
+            epoch_start_frame(1503),
+            "capacity_window: a certificate's window is not GLOBAL's"
+        );
+        let early = epoch_start_frame(1499) + 20;
+        assert_eq!(
+            window_end(&capacity_bundle(1, 3, 1500, early, false)),
+            early + 11,
+            "capacity_window: a precommit's window is not its freshness"
+        );
+        let late = epoch_start_frame(1501) - 3;
+        assert_eq!(
+            window_end(&capacity_bundle(1, 3, 1500, late, false)),
+            epoch_start_frame(1501),
+            "capacity_window: a precommit's window outlasts its epoch"
+        );
+    }
+
+    /// A capacity certificate handed over after its envelope's seal epoch
+    /// began goes to the archives while GLOBAL still takes it; one handed
+    /// over once GLOBAL refuses it does not, and counts undelivered.
+    #[tokio::test]
+    async fn a_capacity_certificate_goes_until_global_refuses_it() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        use quil_types::store::ClockStore;
+        let (address, seen) = full_archive().await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(address).await;
+        let deadline = quil_types::consensus::epoch_start_frame(1503);
+        eprintln!("REACH capacity-window publish at={deadline}");
+        let clock_store = quil_store::testing::InMemoryClockStore::new();
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: deadline,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let txn = clock_store.new_transaction(false).unwrap();
+        clock_store
+            .put_global_clock_frame(&frame, txn.as_ref())
+            .unwrap();
+        let transport = super::ProdProverMessageTransport {
+            archive_pool: pool,
+            clock_store: Arc::new(clock_store),
+            p2p_handle: quil_p2p::node::P2PHandle::for_test(false),
+            falcon_signing_key: Some(quil_p2p::generate_falcon_signing_key()),
+            publish_to_blossomsub: false,
+            retry_queue: Default::default(),
+            join_header_check: Arc::new(|_: &quil_types::proto::global::GlobalFrame| true),
+        };
+        let refused = capacity_bundle(1, 3, 1500, 0, true);
+        let _ = transport.publish_prover_bundle(refused).await;
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "a certificate GLOBAL refuses went"
+        );
+        assert_eq!(
+            transport.retry_queue.undelivered_in(deadline),
+            1,
+            "capacity_window: a refused certificate not counted at GLOBAL's deadline"
+        );
+        let taken = capacity_bundle(1, 4, 1501, 0, true);
+        let _ = transport.publish_prover_bundle(taken).await;
+        let sends = seen.load(Ordering::SeqCst);
+        eprintln!("REACH capacity-window publish sends={sends}");
+        assert_eq!(
+            sends, 1,
+            "capacity_window: a certificate GLOBAL still takes was not sent"
+        );
+    }
+
+    /// Capacity messages stay out of the retry queue: the engine sends them
+    /// again itself. Queued, every sector's message for one epoch shared
+    /// its envelope's seat, so one replaced or held back another.
+    #[test]
+    fn capacity_messages_stay_out_of_the_retry_queue() {
+        let queue = SubmitRetryQueue::default();
+        let first = capacity_bundle(1, 3, 1500, 0, true);
+        let second = capacity_bundle(1, 4, 1500, 0, true);
+        let precommit = capacity_bundle(1, 5, 1500, 7, false);
+        queue.push(first);
+        eprintln!("REACH capacity-window queue holds {}", queue.len());
+        let second_proof = StorageProofSubmission::of(&second).unwrap();
+        assert!(
+            !queue.holds(&second_proof),
+            "capacity_queued: another sector's queued certificate holds this one back"
+        );
+        queue.push(second);
+        queue.push(precommit);
+        assert_eq!(
+            queue.len(),
+            0,
+            "capacity_queued: the retry queue holds capacity messages"
+        );
+    }
+
+    /// A full burst of certificates every archive refuses (36 in an hour,
+    /// 29 MB, 2026-11-22) leaves every seat proof a retry queue near its
+    /// byte cap holds: the certificates are not queued.
+    #[tokio::test]
+    async fn seat_proofs_in_a_full_retry_queue_outlast_a_burst_of_certificates() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        let (address, _seen) = full_archive().await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(address).await;
+        let transport = super::ProdProverMessageTransport {
+            archive_pool: pool,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            p2p_handle: quil_p2p::node::P2PHandle::for_test(false),
+            falcon_signing_key: Some(quil_p2p::generate_falcon_signing_key()),
+            publish_to_blossomsub: false,
+            retry_queue: Default::default(),
+            join_header_check: Arc::new(|_: &quil_types::proto::global::GlobalFrame| true),
+        };
+        let held = |queue: &SubmitRetryQueue| {
+            let pending = queue.pending.lock().unwrap();
+            let bytes: usize = pending.iter().map(|queued| queued.bytes.len()).sum();
+            (pending.len(), bytes)
+        };
+        for shard in 0..24u8 {
+            let proof = storage_proof_bundle(1, &[(shard, 1500, false, true)], 1 << 20);
+            transport.retry_queue.push(proof);
+        }
+        let before = held(transport.retry_queue.as_ref());
+        assert_eq!(before.0, 24, "premise: every seat proof queued");
+        let mut burst = 0;
+        for sector in 0..36u8 {
+            let certificate = sized_capacity_bundle(sector, sector, 1500, 0, 800 << 10);
+            burst += certificate.len();
+            let _ = transport.publish_prover_bundle(certificate).await;
+        }
+        assert!(
+            before.1 + burst > super::RETRY_MAX_BYTES,
+            "premise: queued, the burst overflows the queue's bytes"
+        );
+        let after = held(transport.retry_queue.as_ref());
+        eprintln!("REACH capacity-burst burst={burst} before={before:?} after={after:?}");
+        assert_eq!(
+            after, before,
+            "capacity_queued: a burst of certificates changed the queued seat proofs"
+        );
+    }
+
+    /// An archive refusing a proof for room rests only that proof's share:
+    /// a precommit refused rests no seat proof, though its window ends
+    /// first, and a seat proof refused rests no certificate, whose window
+    /// ends after every seat proof's. Archives hold capacity messages in
+    /// shares of their own.
+    #[test]
+    fn a_room_refusal_rests_only_its_share() {
+        use quil_types::consensus::epoch_start_frame;
+        let of = |bundle: Vec<u8>| StorageProofSubmission::of(&bundle).unwrap();
+        let precommit = of(capacity_bundle(
+            1,
+            3,
+            1500,
+            epoch_start_frame(1499) + 20,
+            false,
+        ));
+        let seat = of(storage_proof_bundle(1, &[(7, 1500, false, true)], 64));
+        let certificate = of(capacity_bundle(1, 4, 1500, 0, true));
+        assert!(
+            precommit.window_end < seat.window_end && seat.window_end < certificate.window_end,
+            "premise: the precommit is due first, the certificate last"
+        );
+        let now = Instant::now();
+        let rested = |rests: &ArchiveRests, proof: &StorageProofSubmission| {
+            rests
+                .rests("a", proof.kind.share(), proof.window_end, now)
+                .is_some()
+        };
+        let refused = |proof: &StorageProofSubmission| {
+            let rests = ArchiveRests::default();
+            let share = proof.kind.share();
+            rests.refused_room("a", share, proof.window_end, now, Duration::from_secs(60));
+            rests
+        };
+        let after_precommit = refused(&precommit);
+        let after_seat = refused(&seat);
+        eprintln!(
+            "REACH capacity-rest seat_after_precommit={} certificate_after_seat={}",
+            rested(&after_precommit, &seat),
+            rested(&after_seat, &certificate)
+        );
+        assert!(
+            !rested(&after_precommit, &seat),
+            "capacity_rest: a precommit refused for room rests seat proofs"
+        );
+        assert!(
+            !rested(&after_seat, &certificate),
+            "capacity_rest: a seat proof refused for room rests certificates"
+        );
+        assert!(
+            rested(&after_precommit, &certificate) && rested(&after_seat, &seat),
+            "a refusal for room rests its own share's proofs due no sooner"
+        );
+    }
+
+    /// Capacity messages are summarized apart from seat proofs, per kind and
+    /// epoch: a certificate for epoch E, whose window ends with that of a
+    /// seat proof settling E + 1, stays out of that proof's line, and an
+    /// epoch's precommits, each fresh only briefly, share one line.
+    #[test]
+    fn capacity_messages_are_summarized_apart_from_seat_proofs() {
+        use quil_types::consensus::epoch_start_frame;
+        #[derive(Clone)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let writer = Lines(captured.clone());
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let of = |bundle: Vec<u8>| StorageProofSubmission::of(&bundle).unwrap();
+        let seat = of(storage_proof_bundle(1, &[(7, 1501, false, true)], 64));
+        let certificate = of(capacity_bundle(1, 4, 1500, 0, true));
+        assert_eq!(
+            seat.window_end, certificate.window_end,
+            "premise: one window end"
+        );
+        let precommits = [20, 40].map(|at| {
+            of(capacity_bundle(
+                1,
+                5,
+                1500,
+                epoch_start_frame(1500) + at,
+                false,
+            ))
+        });
+        let queue = SubmitRetryQueue::default();
+        for proof in [&seat, &certificate, &precommits[0], &precommits[1]] {
+            queue.tally_of(proof, |t| t.published += 1);
+        }
+        queue.report_windows(Some(certificate.window_end));
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let lines =
+            |what: &str| -> Vec<&str> { text.lines().filter(|line| line.contains(what)).collect() };
+        let seats = lines("storage epoch proofs of a window that ended");
+        let capacity = lines("capacity messages of an epoch whose window ended");
+        eprintln!(
+            "REACH capacity-tally seat_lines={} capacity_lines={}",
+            seats.len(),
+            capacity.len()
+        );
+        assert!(
+            seats.len() == 1 && seats[0].contains("epoch=1501") && seats[0].contains("published=1"),
+            "capacity_tally: seat proof lines {seats:?}"
+        );
+        let named = |kind: &str, published: &str| {
+            capacity.iter().any(|line| {
+                line.contains(kind) && line.contains("epoch=1500") && line.contains(published)
+            })
+        };
+        assert!(
+            capacity.len() == 2
+                && named("capacity certificate", "published=1")
+                && named("capacity precommit", "published=2"),
+            "capacity_tally: capacity lines {capacity:?}"
+        );
+    }
+
+    /// Handovers count per digest, repeats included, and the count holds
+    /// at most `HANDOVERS_HELD` digests, forgetting ended windows first.
+    #[test]
+    fn handovers_count_repeats_and_stay_bounded() {
+        let queue = SubmitRetryQueue::default();
+        assert_eq!(queue.handed_over("a", 100, Some(10)), 1);
+        assert_eq!(queue.handed_over("a", 100, Some(11)), 2);
+        for i in 1..super::HANDOVERS_HELD {
+            queue.handed_over(&format!("ended{i}"), 50, Some(10));
+        }
+        assert_eq!(
+            queue.handed_over("a", 100, Some(60)),
+            3,
+            "a repeat is counted"
+        );
+        assert_eq!(queue.handed_over("b", 100, Some(60)), 1);
+        let held = queue.handovers.lock().unwrap().len();
+        eprintln!("REACH handovers held={held}");
+        assert_eq!(held, 2, "handover_bound: ended windows were not forgotten");
+        for i in 0..2 * super::HANDOVERS_HELD {
+            queue.handed_over(&format!("live{i}"), 1000, Some(60));
+        }
+        let held = queue.handovers.lock().unwrap().len();
+        assert!(
+            held <= super::HANDOVERS_HELD,
+            "handover_bound: {held} digests held"
+        );
+    }
+
     /// An archive's peer listener whose collector is full: it refuses every
     /// submission for now. Returns its address and the submissions it saw.
     async fn full_archive() -> (String, Arc<AtomicUsize>) {
@@ -2967,6 +3537,7 @@ mod tests {
         let resting = |window_end| {
             Some(Resting {
                 rests: &rests,
+                share: Share::Seats,
                 window_end,
                 rest: Duration::from_secs(60),
             })
@@ -3017,12 +3588,18 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 5);
         // The rest ends at its time, and keeps the earliest refused window.
         let now = Instant::now();
-        rests.refused_room("a", 200, now, Duration::from_secs(10));
-        rests.refused_room("a", 150, now, Duration::from_secs(5));
-        assert_eq!(rests.rests("a", 150, now), Some(Duration::from_secs(10)));
-        assert_eq!(rests.rests("a", 149, now), None);
-        assert_eq!(rests.rests("a", 200, now + Duration::from_secs(10)), None);
-        assert_eq!(rests.rests("b", 200, now), None);
+        rests.refused_room("a", Share::Seats, 200, now, Duration::from_secs(10));
+        rests.refused_room("a", Share::Seats, 150, now, Duration::from_secs(5));
+        assert_eq!(
+            rests.rests("a", Share::Seats, 150, now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(rests.rests("a", Share::Seats, 149, now), None);
+        assert_eq!(
+            rests.rests("a", Share::Seats, 200, now + Duration::from_secs(10)),
+            None
+        );
+        assert_eq!(rests.rests("b", Share::Seats, 200, now), None);
     }
 
     /// Queued proofs sent again while the only archive refuses each for
@@ -3058,6 +3635,7 @@ mod tests {
                     };
                     let resting = Resting {
                         rests: &queue_in.rests,
+                        share: Share::Seats,
                         window_end,
                         rest: FAST.room_rest,
                     };
@@ -3096,6 +3674,7 @@ mod tests {
         let archives: Vec<String> = (0..8).map(|n| format!("full-{n}")).collect();
         let resting = Resting {
             rests: &rests,
+            share: Share::Seats,
             window_end: 100,
             rest: RETRY_TIMING.room_rest,
         };
@@ -3106,7 +3685,11 @@ mod tests {
         assert_eq!(delivery.room, 8, "each archive refused for room");
         let lefts: Vec<Duration> = archives
             .iter()
-            .map(|addr| rests.rests(addr, 100, before).expect("each archive rests"))
+            .map(|addr| {
+                rests
+                    .rests(addr, Share::Seats, 100, before)
+                    .expect("each archive rests")
+            })
             .collect();
         eprintln!("REACH room rest lengths={lefts:?}");
         let (least, most) = (Duration::from_secs(40), Duration::from_secs(60) + sent);
@@ -3162,6 +3745,7 @@ mod tests {
                     };
                     let resting = Resting {
                         rests: &queue_in.rests,
+                        share: Share::Seats,
                         window_end,
                         rest: timing.room_rest,
                     };

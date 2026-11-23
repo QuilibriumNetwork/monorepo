@@ -21,6 +21,13 @@ pub struct CapacityMessage {
     pub signature: Vec<u8>,
     pub proof: Vec<u8>,
 }
+/// Epochs after its own in which GLOBAL still takes a certificate
+/// ([`check_capacity`]): one for epoch E is refused from epoch E + 3. A
+/// precommit holds its slot as long, unless its sector is certified.
+pub const CERTIFICATE_LATE_EPOCHS: u64 = 2;
+/// Frames after its signing in which GLOBAL still takes a precommit
+/// ([`check_capacity`]).
+const PRECOMMIT_FRESH_FRAMES: u64 = 10;
 fn filter() -> Vec<u8> {
     Sha3_256::digest(b"quil/persistent-sector-capacity/v1").to_vec()
 }
@@ -130,6 +137,23 @@ impl CapacityMessage {
             proof: if !precommit { payload } else { Vec::new() },
         })
     }
+    /// The GLOBAL frame from which [`check_capacity`] refuses this message
+    /// as late. A certificate is refused once [`CERTIFICATE_LATE_EPOCHS`]
+    /// epochs past its own have ended. A precommit is refused once its
+    /// window has ended (`capacity_precommit_end`), or once it is more
+    /// than [`PRECOMMIT_FRESH_FRAMES`] frames old, whichever comes first.
+    pub fn refused_from(&self) -> u64 {
+        use quil_types::consensus::{capacity_precommit_end, epoch_start_frame};
+        if self.proof.is_empty() {
+            capacity_precommit_end(self.epoch).min(
+                self.signed_at
+                    .saturating_add(PRECOMMIT_FRESH_FRAMES)
+                    .saturating_add(1),
+            )
+        } else {
+            epoch_start_frame(self.epoch.saturating_add(CERTIFICATE_LATE_EPOCHS + 1))
+        }
+    }
     /// The initial certificate proves zero data under a fixed sector identity.
     pub fn root(&self) -> sector::Registration {
         sector::Registration {
@@ -235,7 +259,7 @@ pub fn check_capacity(
             )));
         }
         if message.signed_at > frame
-            || frame - message.signed_at > 10
+            || frame - message.signed_at > PRECOMMIT_FRESH_FRAMES
             || message.signature.len() > 2048
         {
             return Err(invalid("precommit freshness or signature length".into()));
@@ -263,7 +287,7 @@ pub fn check_capacity(
             if pending.epoch == message.epoch && pending.certificate == message.certificate {
                 return Ok(Vec::new());
             }
-            if pending.epoch >= current.saturating_sub(2)
+            if pending.epoch >= current.saturating_sub(CERTIFICATE_LATE_EPOCHS)
                 && certificate(state, &message.member, &pending.certificate.sector)?.is_none()
             {
                 return Err(invalid(format!(
@@ -292,7 +316,7 @@ pub fn check_capacity(
         return Err(invalid("certificate beacon is not yet known".into()));
     }
     let current = quil_types::consensus::epoch_for_frame(frame);
-    if current > message.epoch.saturating_add(2) {
+    if current > message.epoch.saturating_add(CERTIFICATE_LATE_EPOCHS) {
         return Err(invalid(format!(
             "precommit expired: epoch {}, current {current}",
             message.epoch
