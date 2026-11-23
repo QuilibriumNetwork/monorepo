@@ -7404,3 +7404,135 @@ fn iwant_answers_under_a_legacy_id_are_counted() {
         "taking resets the counts"
     );
 }
+
+/// QUILIBRIUM: a relayed message over `lazy_forward_threshold` goes to mesh
+/// peers as an IHAVE, never as the message, and an IWANT for it is answered
+/// from the cache; an explicit peer is still pushed the message.
+#[test]
+fn announces_a_large_relayed_message_to_mesh_peers() {
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(256)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mesh: HashSet<PeerId> = gs.mesh[&topic_hashes[0]].iter().copied().collect();
+    assert!(
+        !mesh.contains(&peers[0]) && mesh.contains(&peers[1]) && mesh.len() == 4,
+        "premise: the explicit peer is outside a mesh of the other four"
+    );
+
+    let raw_message = RawMessage {
+        source: Some(peers[1]),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert!(
+        raw_message.raw_protobuf_len() > 256,
+        "premise: over the threshold"
+    );
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    gs.handle_received_message(raw_message, &PeerId::random());
+
+    let mut announced = HashSet::new();
+    let mut pushed = HashSet::new();
+    let (_, receivers) = count_control_msgs(receivers, |peer_id, rpc| {
+        match rpc {
+            RpcOut::IHave(IHave {
+                topic_hash,
+                message_ids,
+            }) if *topic_hash == topic_hashes[0] && message_ids == &vec![msg_id.clone()] => {
+                announced.insert(*peer_id);
+            }
+            RpcOut::Forward { .. } => {
+                pushed.insert(*peer_id);
+            }
+            _ => {}
+        }
+        false
+    });
+    let others: HashSet<PeerId> = mesh.iter().copied().filter(|p| *p != peers[1]).collect();
+    assert_eq!(
+        announced, others,
+        "every mesh peer but the source gets an IHAVE"
+    );
+    assert_eq!(
+        pushed,
+        HashSet::from([peers[0]]),
+        "only the explicit peer is pushed the message"
+    );
+
+    let puller = *others.iter().next().unwrap();
+    gs.handle_iwant(&puller, vec![msg_id.clone()]);
+    let mut served = Vec::new();
+    count_control_msgs(receivers, |peer_id, rpc| {
+        if let RpcOut::Forward { message, .. } = rpc {
+            served.push((*peer_id, message.clone()));
+        }
+        false
+    });
+    assert_eq!(served.len(), 1, "one copy, to the peer that asked");
+    assert_eq!(served[0].0, puller);
+    let served = gs
+        .data_transform
+        .inbound_transform(served[0].1.clone())
+        .unwrap();
+    assert_eq!(gs.config.message_id(&served), msg_id);
+}
+
+/// QUILIBRIUM: a relayed message at or below `lazy_forward_threshold` is
+/// pushed to mesh peers as before, with no IHAVE.
+#[test]
+fn pushes_a_relayed_message_at_the_lazy_threshold() {
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(4096)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(4)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let raw_message = RawMessage {
+        source: Some(peers[0]),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert!(
+        raw_message.raw_protobuf_len() <= 4096,
+        "premise: at or below"
+    );
+    gs.handle_received_message(raw_message, &PeerId::random());
+    let mut pushed = HashSet::new();
+    let (ihaves, _) = count_control_msgs(receivers, |peer_id, rpc| {
+        if matches!(rpc, RpcOut::Forward { .. }) {
+            pushed.insert(*peer_id);
+        }
+        matches!(rpc, RpcOut::IHave(_))
+    });
+    assert_eq!(
+        ihaves, 0,
+        "no IHAVE for a message at or below the threshold"
+    );
+    assert_eq!(pushed, HashSet::from([peers[1], peers[2], peers[3]]));
+}

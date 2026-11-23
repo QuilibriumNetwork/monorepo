@@ -142,6 +142,7 @@ pub struct Config {
     connection_handler_forward_duration: Duration,
     idontwant_message_size_threshold: usize,
     idontwant_on_publish: bool,
+    lazy_forward_threshold: usize,
     topic_configuration: TopicConfigs,
     mcache_max_bytes: usize,
 }
@@ -506,6 +507,16 @@ impl Config {
     pub fn idontwant_on_publish(&self) -> bool {
         self.idontwant_on_publish
     }
+
+    /// QUILIBRIUM: the encoded size above which a relayed message is announced to mesh
+    /// peers with an IHAVE instead of being pushed to them; each peer that lacks it then
+    /// pulls one copy with IWANT. A peer can stop a push only after a whole copy has
+    /// arrived, so a message that takes long to transfer reaches a peer from most of its
+    /// mesh at once. Explicit and floodsub peers are still pushed to. Default
+    /// `usize::MAX` (off).
+    pub fn lazy_forward_threshold(&self) -> usize {
+        self.lazy_forward_threshold
+    }
 }
 
 impl Default for Config {
@@ -577,6 +588,7 @@ impl Default for ConfigBuilder {
                 connection_handler_forward_duration: Duration::from_secs(1),
                 idontwant_message_size_threshold: 1000,
                 idontwant_on_publish: false,
+                lazy_forward_threshold: usize::MAX,
                 topic_configuration: TopicConfigs::default(),
                 mcache_max_bytes: usize::MAX,
             },
@@ -1102,6 +1114,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// QUILIBRIUM: see [`Config::lazy_forward_threshold`].
+    pub fn lazy_forward_threshold(&mut self, size: usize) -> &mut Self {
+        self.config.lazy_forward_threshold = size;
+        self
+    }
+
     /// The topic configuration sets mesh parameter sizes for a given topic. Notes on default
     /// below.
     ///
@@ -1233,6 +1251,7 @@ impl std::fmt::Debug for Config {
             &self.idontwant_message_size_threshold,
         );
         let _ = builder.field("idontwant_on_publish", &self.idontwant_on_publish);
+        let _ = builder.field("lazy_forward_threshold", &self.lazy_forward_threshold);
         builder.finish()
     }
 }

@@ -100,6 +100,14 @@ pub mod params {
     /// bytes; this does. 512 MiB is far more than gossip recovery needs
     /// while keeping the cache from driving OOM.
     pub const MCACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+    /// Encoded size above which a relayed message is announced to mesh
+    /// peers (IHAVE) and pulled by each that lacks it (IWANT), instead of
+    /// pushed. A peer sends IDONTWANT only once a whole copy has arrived, so
+    /// a multi-megabyte GLOBAL frame reaches a node from most of its mesh at
+    /// once. At 256 KiB the transfer takes about a WAN round trip at
+    /// 50 Mbps, the cost of the pull; every other class of message is far
+    /// smaller.
+    pub const LAZY_FORWARD_THRESHOLD: usize = 256 * 1024;
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -125,6 +133,8 @@ pub struct BlossomsubParams {
     /// [`params::MCACHE_MAX_BYTES`]. Bounds memory under catch-up floods
     /// that window-count history alone cannot.
     pub mcache_max_bytes: usize,
+    /// See [`params::LAZY_FORWARD_THRESHOLD`].
+    pub lazy_forward_threshold: usize,
 }
 
 impl Default for BlossomsubParams {
@@ -142,6 +152,7 @@ impl Default for BlossomsubParams {
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
+            lazy_forward_threshold: params::LAZY_FORWARD_THRESHOLD,
         }
     }
 }
@@ -189,6 +200,7 @@ impl BlossomsubParams {
             // No P2PConfig field yet: a 512 MiB ceiling, enforced by
             // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,
+            lazy_forward_threshold: d.lazy_forward_threshold,
         }
     }
 }

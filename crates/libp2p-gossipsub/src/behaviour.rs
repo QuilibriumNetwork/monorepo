@@ -3025,15 +3025,35 @@ where
 
         // forward the message to peers
         // QUILIBRIUM: the last recipient takes `message` itself, not a copy.
+        // A message over `lazy_forward_threshold` is announced to gossipsub
+        // mesh peers instead (`Config::lazy_forward_threshold`): each that
+        // lacks it asks one announcer with IWANT, served from the cache.
+        let lazy = message.raw_protobuf_len() > self.config.lazy_forward_threshold();
         let mut targets = Vec::with_capacity(recipient_peers.len());
+        let mut announce_to = Vec::new();
         for peer_id in recipient_peers.iter() {
             if let Some(peer) = self.connected_peers.get_mut(peer_id) {
                 if peer.dont_send.contains_key(msg_id) {
                     tracing::debug!(%peer_id, message_id=%msg_id, "Peer doesn't want message");
                     continue;
                 }
+                if lazy && peer.kind != PeerKind::Floodsub && !self.explicit_peers.contains(peer_id)
+                {
+                    announce_to.push(*peer_id);
+                    continue;
+                }
                 targets.push(*peer_id);
             }
+        }
+        for peer_id in announce_to {
+            tracing::debug!(%peer_id, message_id=%msg_id, "Announcing message to peer");
+            self.send_message(
+                peer_id,
+                RpcOut::IHave(IHave {
+                    topic_hash: message.topic.clone(),
+                    message_ids: vec![msg_id.clone()],
+                }),
+            );
         }
         let mut message = Some(message);
         let last = targets.len().saturating_sub(1);

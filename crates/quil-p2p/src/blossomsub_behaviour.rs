@@ -1274,6 +1274,7 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
+        .lazy_forward_threshold(params.lazy_forward_threshold)
         // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
         // `protocol.rs` and is the smallest that carries the largest message
         // the node gossips: a GLOBAL frame of up to 15 MiB
@@ -1955,6 +1956,97 @@ mod propagation_tests {
             "a relay must receive IDONTWANT (published={published}, a={}, b={})",
             idontwants_received(&relay_a),
             idontwants_received(&relay_b)
+        );
+    }
+
+    /// IWANT requests `swarm` sent, from gossipsub's own per-topic counter.
+    fn iwants_sent(swarm: &Swarm<BlossomSubBehaviour>) -> u64 {
+        crate::metrics::render(&swarm.behaviour().metrics_registry())
+            .lines()
+            .filter(|line| line.starts_with("gossipsub_topic_iwant_msgs_total{"))
+            .filter_map(|line| line.rsplit(' ').next()?.trim().parse::<u64>().ok())
+            .sum()
+    }
+
+    /// A relay announces a message over the lazy-forward threshold to its
+    /// mesh, and a leaf that only the relay reaches pulls it with IWANT.
+    /// Chain hub - relay - leaf: the hub's flood publish reaches the relay
+    /// alone, so the leaf's copy comes from the relay, by IWANT (counted on
+    /// the leaf), not by a push.
+    #[tokio::test]
+    async fn a_large_message_crosses_a_relay_by_announce_and_pull() {
+        let bitmask = vec![0x80u8];
+        let payload = vec![9u8; crate::params::LAZY_FORWARD_THRESHOLD + 1];
+
+        let mut hub = build_swarm();
+        let mut relay = build_swarm();
+        let mut leaf = build_swarm();
+        let (relay_id, leaf_id) = (*relay.local_peer_id(), *leaf.local_peer_id());
+
+        for swarm in [&mut hub, &mut relay, &mut leaf] {
+            swarm.behaviour_mut().subscribe(bitmask.clone());
+        }
+        hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let hub_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
+                break address;
+            }
+        };
+        let relay_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                break address;
+            }
+        };
+        relay.dial(hub_addr).expect("relay dial hub");
+        leaf.dial(relay_addr).expect("leaf dial relay");
+
+        let mut published = false;
+        let mut leaf_got = false;
+        let ok = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                tokio::select! {
+                    _ = hub.select_next_some() => {}
+                    _ = relay.select_next_some() => {}
+                    ev = leaf.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BlossomSubEvent::Message { message, .. }) = ev {
+                            leaf_got |= message.data == payload;
+                        }
+                    }
+                }
+                if !published
+                    && hub.behaviour().peer_subscribed_to(&relay_id, &bitmask)
+                    && relay.behaviour().peer_subscribed_to(&leaf_id, &bitmask)
+                    && relay.behaviour().mesh_peers(&bitmask) >= 2
+                    && leaf.behaviour().mesh_peers(&bitmask) >= 1
+                {
+                    assert!(
+                        !hub.behaviour().peer_subscribed_to(&leaf_id, &bitmask),
+                        "premise: the hub does not reach the leaf"
+                    );
+                    published = hub
+                        .behaviour_mut()
+                        .publish(bitmask.clone(), payload.clone())
+                        .is_ok();
+                }
+                if leaf_got {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            ok,
+            "the leaf must receive the message (published={published})"
+        );
+        assert!(
+            iwants_sent(&leaf) >= 1,
+            "the leaf pulled its copy with IWANT after an IHAVE, not a push"
         );
     }
 }
