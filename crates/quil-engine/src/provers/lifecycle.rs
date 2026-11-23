@@ -1739,7 +1739,8 @@ impl ProverLifecycle {
                 if let Some(why) = planner_rejects.get(filter) {
                     if reported.insert((filter.clone(), *join_frame)) {
                         info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
-                            reason = why.reason, worker_cap = why.worker_cap, pending_joins = why.pending,
+                            reason = why.reason, ring = why.ring, ring_source = why.ring_source,
+                            worker_cap = why.worker_cap, pending_joins = why.pending,
                             active = why.active, joining = why.joining, workers = why.workers,
                             owed_workers = why.owed_workers, scope = "local",
                             "lifecycle: rejecting a join this node's planner proposed");
@@ -4196,10 +4197,21 @@ impl ProverLifecycle {
             );
             let mut note_rejects = |filters: &[Vec<u8>], reason, worker_cap, pending| {
                 for filter in filters {
+                    // The copy decide_joins_by_reason scored: it keeps a filter's last
+                    // copy. Without a ring estimate the copies differ: the proposal
+                    // copy carries the dampened joiner ring, the decide copy the
+                    // shard's current ring.
+                    let scored = decide_candidates.iter().rev().find(|d| &d.filter == filter);
                     planner_rejects.insert(
                         filter.clone(),
                         PlannerJoinReject {
                             reason,
+                            ring: scored.map(|d| d.ring),
+                            ring_source: match (scored, reward_rings.get(filter)) {
+                                (None, _) => "no_candidate",
+                                (Some(_), Some(estimate)) => estimate.source,
+                                (Some(_), None) => "shard_count",
+                            },
                             worker_cap,
                             pending,
                             active: active_filters.len(),
@@ -6075,6 +6087,11 @@ fn buckets_line_due(
 /// for the line `report_rejected_joins` gives it.
 struct PlannerJoinReject {
     reason: &'static str,
+    /// The ring the join was scored at; `None` when its shard was no candidate.
+    ring: Option<u8>,
+    /// Where that ring came from: a reward-ring estimate's source, or
+    /// `shard_count` (the shard's whole Active+Joining count).
+    ring_source: &'static str,
     worker_cap: usize,
     pending: usize,
     active: usize,
@@ -15512,6 +15529,128 @@ mod proposal_loop_tests {
         };
         for me in &joiners {
             assert_eq!(decide(me), (true, false), "joiner {:02x}", me[0]);
+        }
+    }
+
+    /// Past the committee handoff, this node's pending join of a 30-member
+    /// shard decides on the ring its committee will rank it at, among three
+    /// pending joiners (the other two of seniority 500 and 400), against a
+    /// 10-member shard of 1 GB. With seniority `own`: (confirmed, rejected,
+    /// the planner's reject line). A registry without committed ring rows,
+    /// as an own pending join has none.
+    fn decide_own_pending_join(own: u64) -> (bool, bool, String) {
+        use quil_types::consensus::{
+            committee_handoff_policy, set_committee_handoff_policy, CommitteeHandoffPolicy,
+            LegacyHistory,
+        };
+        struct RestorePolicy(Option<CommitteeHandoffPolicy>);
+        impl Drop for RestorePolicy {
+            fn drop(&mut self) {
+                set_committee_handoff_policy(self.0);
+            }
+        }
+        let _restore = RestorePolicy(committee_handoff_policy());
+        set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 0,
+            chain_id: [7; 32],
+            legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX,
+            first_session_boundary_frame: u64::MAX,
+        }));
+        let me = vec![0xCDu8; 32];
+        let (shard, other) = (filter_bytes(0xB4), filter_bytes(0xB5));
+        let member = |address: u8, filter: &Vec<u8>, status, seniority| {
+            let mut info = prover(vec![address; 32], vec![alloc(filter.clone(), status, 50)]);
+            info.status = status;
+            info.seniority = seniority;
+            info
+        };
+        let mut provers: Vec<ProverInfo> = (0x40u8..0x5E)
+            .map(|a| member(a, &shard, ProverStatus::Active, 10_000))
+            .chain((0x70u8..0x7A).map(|a| member(a, &other, ProverStatus::Active, 10_000)))
+            .chain(
+                [(0x31, 500), (0x32, 400)]
+                    .map(|(a, s)| member(a, &shard, ProverStatus::Joining, s)),
+            )
+            .collect();
+        let mut mine = member(0xCD, &shard, ProverStatus::Joining, own);
+        mine.address = me.clone();
+        provers.push(mine);
+        let reg = Arc::new(quil_execution::SharedProverRegistry::new());
+        // An empty store's refresh completes the first load.
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        reg.refresh_from_store(&quil_store::RocksHypergraphStore::new(db.inner()))
+            .unwrap();
+        reg.write_for_tests(|r| {
+            for info in provers {
+                r.insert_prover_for_tests(info);
+            }
+        });
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(WorkerInfo {
+            core_id: 1,
+            filter: shard.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        let lifecycle = make_lifecycle(
+            me,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        // Ring 3 of the 2.4 GB shard scores 60% of ring 1 of the 1 GB one,
+        // ring 4 30%: the 40% threshold splits them.
+        lifecycle.set_remote_shard_sizes(HashMap::from([
+            (shard.clone(), 2_400_000_000u64),
+            (other, 1_000_000_000u64),
+        ]));
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&shard), true, 50, "$")
+            .unwrap();
+        lifecycle.set_prover_root_verified_frame(800);
+        let (actions, logged) = evaluate_logged(&lifecycle, 800, reg.as_ref(), wm.as_ref());
+        let line = logged
+            .lines()
+            .find(|l| l.contains("lifecycle: rejecting a join this node's planner proposed"))
+            .unwrap_or_default()
+            .to_string();
+        (
+            count_confirms(&actions).contains(&shard),
+            count_reject_filters(&actions).contains(&shard),
+            line,
+        )
+    }
+
+    /// The most senior of three pending joiners ranks 30th (ring 3) and its
+    /// committee seats it there: it confirms. Before, every joiner scored
+    /// the shard-wide count's ring 4, and all three rejected.
+    #[test]
+    fn the_most_senior_pending_joiner_confirms_on_its_committee_ring() {
+        let (confirmed, rejected, line) = decide_own_pending_join(900);
+        assert!(
+            confirmed && !rejected,
+            "pending_join_misranked: senior joiner not confirmed {line}"
+        );
+    }
+
+    /// Mutation control: the least senior ranks 32nd (ring 4) and rejects,
+    /// its line naming the ring and where it came from.
+    #[test]
+    fn the_least_senior_pending_joiner_rejects_on_its_committee_ring() {
+        let (confirmed, rejected, line) = decide_own_pending_join(100);
+        assert!(
+            !confirmed && rejected,
+            "pending_join_misranked: junior joiner not rejected {line}"
+        );
+        for text in ["ring=4", "ring_source=\"join_rank\"", "pending_joins=1"] {
+            assert!(
+                line.contains(text),
+                "reject_line_lacks_ring: {text} in {line}"
+            );
         }
     }
 
