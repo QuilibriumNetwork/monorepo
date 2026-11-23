@@ -305,12 +305,14 @@ impl SubmitRetryQueue {
             return;
         };
         let (member, _, epochs) = proof.fields();
-        warn!(member, digest, seats = proof.seats.len(), ?settled, ?epochs, bytes,
-            frame = %or_unknown(frame), action, times, secs,
+        let (window_end, frames_left, _) = proof.time_left(frame);
+        let owed = proof.owed_beside(settled);
+        warn!(member, digest, seats = proof.seats.len(), ?settled, ?owed, ?epochs, bytes,
+            frame = %or_unknown(frame), window_end, %frames_left, action, times, secs,
             "storage epoch proof holds a seat this node's view shows settled or closed, or seals a registration it \
              shows sealed: GLOBAL refuses the whole proof (a duplicate or late), so it is not sent (again) and its \
-             acceptance drops no other queued proof; the workers of its other seats send them again while their \
-             slots show them owed");
+             acceptance drops no other queued proof; the workers of its other seats (owed) send them again while \
+             their slots show them owed, and one not taken by window_end is lost");
     }
 
     /// Drop the queued storage epoch proofs holding a seat this node's view
@@ -364,12 +366,77 @@ impl SubmitRetryQueue {
             let Some(proof) = &queued.proof else {
                 continue;
             };
+            abandoned(proof, "settled");
             let digest = proof_digest(&queued.bytes);
             let sent = (digest.as_str(), queued.bytes.len());
             self.warn_settled(proof, sent, &settled, frame, "dropped from the retry queue");
             self.count_settled(proof);
         }
     }
+}
+
+/// Tell the node's storage epoch proof batching that this transport gave
+/// `proof` up undelivered (`storage_epoch_batch::note_proof_abandoned`), so
+/// the stamps it set are taken back by its id and its seats' retries go at
+/// once; `why` names the path. Every path that removes a proof without an
+/// archive taking it calls this: GLOBAL refuses it whole (`settled`), every
+/// archive refused it for good (`refused`), a full queue dropped it
+/// (`evicted`), a later proof supersedes it (`superseded`, unless the same
+/// bytes: [`StorageProofSubmission::gives_up`]). Not a window's end, after
+/// which no retry lands.
+fn abandoned(proof: &StorageProofSubmission, why: &'static str) {
+    #[cfg(test)]
+    abandoned_proofs()
+        .lock()
+        .unwrap()
+        .push((why, proof.member, proof.id));
+    let (member, shards, epochs) = proof.fields();
+    debug!(
+        member,
+        ?shards,
+        ?epochs,
+        why,
+        "storage epoch proof given up undelivered: its seats' retries are proved at once"
+    );
+    quil_engine::storage_epoch_batch::note_proof_abandoned(&proof.member, &proof.id);
+}
+
+/// Remove from `pending` each storage epoch proof `by` supersedes
+/// ([`StorageProofSubmission::supersedes`]); returns those it gives up
+/// ([`StorageProofSubmission::gives_up`]), for the caller to pass to
+/// [`abandoned`] once it releases `pending`. The one supersede path for a
+/// proof queued, delivered or delivered when sent again.
+fn take_superseded(
+    pending: &mut VecDeque<Queued>,
+    by: &StorageProofSubmission,
+) -> Vec<StorageProofSubmission> {
+    let mut given_up = Vec::new();
+    pending.retain(|queued| {
+        let Some(old) = queued.proof.as_ref().filter(|old| by.supersedes(old)) else {
+            return true;
+        };
+        if by.gives_up(old) {
+            given_up.push(old.clone());
+        }
+        false
+    });
+    given_up
+}
+
+/// A proof given up ([`abandoned`]): why, its member and its id.
+#[cfg(test)]
+type AbandonedProof = (
+    &'static str,
+    [u8; 32],
+    quil_engine::storage_epoch_batch::ProofId,
+);
+
+/// Each proof given up ([`abandoned`]), so tests see each path call it.
+#[cfg(test)]
+fn abandoned_proofs() -> &'static std::sync::Mutex<Vec<AbandonedProof>> {
+    static ABANDONED: std::sync::OnceLock<std::sync::Mutex<Vec<AbandonedProof>>> =
+        std::sync::OnceLock::new();
+    ABANDONED.get_or_init(Default::default)
 }
 
 /// How long a proof's last line on a settled seat is kept to bound the next
@@ -478,24 +545,22 @@ impl SubmitRetryQueue {
         let proof = StorageProofSubmission::of(&bytes);
         let mut pending = self.pending.lock().unwrap();
         if !pending.iter().any(|queued| queued.bytes == bytes) {
-            if let Some(proof) = &proof {
-                let (mut replaced, mut replaced_bytes) = (0usize, 0usize);
-                pending.retain(|queued| {
-                    let gone = queued
-                        .proof
-                        .as_ref()
-                        .is_some_and(|old| proof.supersedes(old));
-                    replaced += usize::from(gone);
-                    replaced_bytes += if gone { queued.bytes.len() } else { 0 };
-                    !gone
-                });
+            let queued_bytes = |pending: &VecDeque<Queued>| -> usize {
+                pending.iter().map(|queued| queued.bytes.len()).sum()
+            };
+            let given_up = proof.as_ref().map_or_else(Vec::new, |proof| {
+                let (before, before_bytes) = (pending.len(), queued_bytes(&pending));
+                let given_up = take_superseded(&mut pending, proof);
+                let replaced = before - pending.len();
                 if replaced > 0 {
+                    let replaced_bytes = before_bytes - queued_bytes(&pending);
                     let (member, shards, epochs) = proof.fields();
                     info!(member, ?shards, ?epochs, bytes = bytes.len(), replaced, replaced_bytes,
                         "storage epoch proof queued in place of earlier proofs of the same settlements or seals: GLOBAL \
                          applies only the first of them to ride a frame, so the archives hold one copy");
                 }
-            }
+                given_up
+            });
             pending.push_back(Queued {
                 id: self.ids.fetch_add(1, Ordering::Relaxed),
                 bytes,
@@ -518,6 +583,9 @@ impl SubmitRetryQueue {
             drop(pending);
             if !dropped.is_empty() {
                 self.dropped(&dropped, queued);
+            }
+            for old in &given_up {
+                abandoned(old, "superseded");
             }
         } else {
             drop(pending);
@@ -543,6 +611,10 @@ impl SubmitRetryQueue {
             .map(|queued| queued.bytes.len() as u64)
             .sum::<u64>();
         Self::log_drops(&mut drops, queued, false);
+        drop(drops);
+        for proof in dropped.iter().filter_map(|queued| queued.proof.as_ref()) {
+            abandoned(proof, "evicted");
+        }
     }
 
     /// One line for the messages dropped from the full queue since the last
@@ -595,13 +667,13 @@ impl SubmitRetryQueue {
         }
         let mut pending = self.pending.lock().unwrap();
         let before = pending.len();
-        pending.retain(|queued| {
-            !queued
-                .proof
-                .as_ref()
-                .is_some_and(|old| delivered.supersedes(old))
-        });
-        before - pending.len()
+        let given_up = take_superseded(&mut pending, delivered);
+        let superseded = before - pending.len();
+        drop(pending);
+        for old in &given_up {
+            abandoned(old, "superseded");
+        }
+        superseded
     }
 
     fn len(&self) -> usize {
@@ -933,25 +1005,26 @@ fn resent(
         warn!(member, ?shards, ?epochs, bytes = queued.bytes.len(), attempts = queued.attempts + 1,
             refusals = %refusals(delivery),
             "storage epoch proof refused by every archive when sent again; an earlier send may have landed — not sent again");
+        abandoned(proof, "refused");
         return Resent::Done;
     }
     // Holding a seat settled meanwhile, it seals and settles none.
     let settled = queue.settled_seats(proof);
     let before = pending.len();
-    if settled.is_empty() {
-        pending.retain(|other| {
-            !other
-                .proof
-                .as_ref()
-                .is_some_and(|old| proof.supersedes(old))
-        });
+    let given_up = if settled.is_empty() {
+        take_superseded(&mut pending, proof)
     } else {
+        abandoned(proof, "settled");
         let digest = proof_digest(&queued.bytes);
         let sent = (digest.as_str(), queued.bytes.len());
         queue.warn_settled(proof, sent, &settled, frame(), "taken by an archive");
-    }
+        Vec::new()
+    };
     let superseded = before - pending.len();
     drop(pending);
+    for old in &given_up {
+        abandoned(old, "superseded");
+    }
     let (window_end, frames_left, _) = proof.time_left(frame());
     info!(member, ?shards, ?epochs, bytes = queued.bytes.len(), accepted = delivery.accepted,
         attempts = queued.attempts + 1,
@@ -1250,6 +1323,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                     "not sent",
                 );
                 self.retry_queue.count_settled(proof);
+                abandoned(proof, "settled");
                 return Ok(());
             }
             // GLOBAL refuses it whole: its window ended before it came.
@@ -1367,6 +1441,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 proof.time_left(latest_frame(self.clock_store.as_ref()));
             if grpc_ok_count > 0 {
                 if let Some((settled, digest)) = &taken_settled {
+                    abandoned(proof, "settled");
                     let frame = latest_frame(self.clock_store.as_ref());
                     let sent = (digest.as_str(), bytes);
                     self.retry_queue.warn_settled(
@@ -1395,6 +1470,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             } else if outcome.is_err() {
                 warn!(member, ?shards, ?epochs, bytes, archives = archive_count, refusals = %refusals(&delivery),
                     "storage epoch proof refused by every archive — not sent again");
+                abandoned(proof, "refused");
             }
         }
         if archive_count > 0 && grpc_ok_count == 0 && proof.is_none() {
@@ -1749,6 +1825,9 @@ struct StorageProofSubmission {
     /// Each seat's shard filter, the epoch it settles, and whether it seals
     /// (the registration two epochs on) and settles.
     seats: Vec<(Vec<u8>, u64, bool, bool)>,
+    /// Its id, as the node's batching keys its stamps
+    /// (`storage_epoch_batch::proof_id` of the request's bytes).
+    id: quil_engine::storage_epoch_batch::ProofId,
     /// The end of its earliest seat's window: a settlement's window ends as
     /// the epoch after the next begins, and a seal's as the epoch it seals
     /// begins, the same frame (`storage_epoch_proof::check`).
@@ -1781,6 +1860,7 @@ impl StorageProofSubmission {
             })
             .min()?;
         Some(Self {
+            id: quil_engine::storage_epoch_batch::proof_id(&request.inner_bytes),
             member: proof.member,
             seats: proof
                 .seats
@@ -1796,6 +1876,13 @@ impl StorageProofSubmission {
                 .collect(),
             window_end,
         })
+    }
+
+    /// Whether `old`, which this supersedes, is given up ([`abandoned`]):
+    /// unless it is the same bytes, the same proof going on as this, whose
+    /// stamps giving it up would take back.
+    fn gives_up(&self, old: &Self) -> bool {
+        self.id != old.id
     }
 
     /// Whether `other` is needless once this is delivered: the same member,
@@ -1831,6 +1918,23 @@ impl StorageProofSubmission {
         self.seats
             .iter()
             .any(|(s, e, se, st)| s == shard && e == epoch && (*se || !seals) && (*st || !settles))
+    }
+
+    /// Its seats `settled` ([`SubmitRetryQueue::settled_seats`]) does not
+    /// name, `<shard>@<epoch>` each: GLOBAL refusing the proof whole leaves
+    /// them owed.
+    fn owed_beside(&self, settled: &[String]) -> Vec<String> {
+        self.seats
+            .iter()
+            .filter(|(shard, epoch, seals, settles)| {
+                let shard = hex::encode(shard);
+                let closed = *settles && settled.contains(&format!("{shard}@{epoch}"));
+                let sealed = *seals
+                    && settled.contains(&format!("{shard}@{} sealed", epoch.saturating_add(2)));
+                !closed && !sealed
+            })
+            .map(|(shard, epoch, _, _)| format!("{}@{epoch}", hex::encode(shard)))
+            .collect()
     }
 
     /// Its member, shards and epochs, for log lines.
@@ -2829,18 +2933,6 @@ mod tests {
     /// An archive's peer listener whose collector is full: it refuses every
     /// submission for now. Returns its address and the submissions it saw.
     async fn full_archive() -> (String, Arc<AtomicUsize>) {
-        use quil_types::proto::global::global_service_server::GlobalServiceServer;
-        use quil_types::proto::global::GlobalFrame;
-        use tokio::net::TcpListener;
-        struct NoFrames;
-        impl quil_rpc::FrameLookup for NoFrames {
-            fn get_latest_frame(&self) -> Result<GlobalFrame, String> {
-                Err("no frames".into())
-            }
-            fn get_frame(&self, _frame_number: u64) -> Result<GlobalFrame, String> {
-                Err("no frames".into())
-            }
-        }
         let seen = Arc::new(AtomicUsize::new(0));
         let handler: quil_rpc::SubmitHandler = {
             let seen = seen.clone();
@@ -2853,6 +2945,24 @@ mod tests {
                 })
             })
         };
+        (archive_answering(handler).await, seen)
+    }
+
+    /// An archive's peer listener answering each submission with `handler`.
+    /// Returns its address.
+    async fn archive_answering(handler: quil_rpc::SubmitHandler) -> String {
+        use quil_types::proto::global::global_service_server::GlobalServiceServer;
+        use quil_types::proto::global::GlobalFrame;
+        use tokio::net::TcpListener;
+        struct NoFrames;
+        impl quil_rpc::FrameLookup for NoFrames {
+            fn get_latest_frame(&self) -> Result<GlobalFrame, String> {
+                Err("no frames".into())
+            }
+            fn get_frame(&self, _frame_number: u64) -> Result<GlobalFrame, String> {
+                Err("no frames".into())
+            }
+        }
         let server_key = quil_p2p::generate_falcon_signing_key();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -2882,7 +2992,7 @@ mod tests {
                 .add_service(service)
                 .serve_with_incoming(incoming),
         );
-        (address, seen)
+        address
     }
 
     /// A worker's next part for a seat the retry queue holds, sent while
@@ -4018,6 +4128,408 @@ mod tests {
             view(&[2; 32], &[7; 35], 1496),
             super::SlotState::default(),
             "another member's seat shows open"
+        );
+    }
+
+    /// A queued proof dropped for one seat this node's view shows sealed
+    /// names the seats it leaves owed and its window's end: the other seat
+    /// of such a proof was sent again a frame after its window, and no line
+    /// named it (devnet, 2026-11-22).
+    #[test]
+    fn a_proof_dropped_for_a_sealed_seat_names_the_seats_it_leaves_owed() {
+        let (settled, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let group = storage_proof_bundle(1, &[(7, 1495, true, false), (9, 1495, true, false)], 8);
+        let window_end = super::StorageProofSubmission::of(&group)
+            .expect("premise: a storage epoch proof")
+            .window_end;
+        queue.push(group);
+        settled.lock().unwrap().sealed.insert((9, 1497));
+        let logs = Logs::capture();
+        queue.drop_settled(FAST, &|| Some(5));
+        assert_eq!(queue.len(), 0, "premise: the proof was dropped");
+        let lines = logs.lines("holds a seat this node's view");
+        eprintln!("REACH seat-hold-owed-named lines={}", lines.len());
+        assert_eq!(lines.len(), 1, "premise: one line: {lines:?}");
+        let owed = lines[0]
+            .split("owed=[")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_default();
+        assert!(
+            owed.contains(&format!("{}@1495", hex::encode([7u8; 35])))
+                && !owed.contains(&hex::encode([9u8; 35]))
+                && lines[0].contains(&format!("window_end={window_end}")),
+            "OWED-UNNAMED: the line does not name the seat left owed and the window's end: {}",
+            lines[0]
+        );
+    }
+
+    /// Whether the transport gave up the proof `bundle` carries, `why`
+    /// ([`super::abandoned`]).
+    fn given_up(why: &str, bundle: &[u8]) -> bool {
+        let proof = StorageProofSubmission::of(bundle).expect("premise: a storage epoch proof");
+        super::abandoned_proofs()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(said, member, id)| *said == why && *member == proof.member && *id == proof.id)
+    }
+
+    /// A transport to `archive` (none: no archive), reading `view`.
+    async fn transport_to(
+        archive: Option<String>,
+        view: super::SettledSeat,
+    ) -> super::ProdProverMessageTransport {
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        if let Some(address) = archive {
+            pool.add(address).await;
+        }
+        super::ProdProverMessageTransport {
+            archive_pool: pool,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            p2p_handle: quil_p2p::node::P2PHandle::for_test(false),
+            falcon_signing_key: Some(quil_p2p::generate_falcon_signing_key()),
+            publish_to_blossomsub: false,
+            retry_queue: Arc::new(SubmitRetryQueue::reading_slots(view)),
+            join_header_check: Arc::new(|_: &quil_types::proto::global::GlobalFrame| true),
+        }
+    }
+
+    /// The transport names a proof as the node's batching does: its seats
+    /// (`storage_epoch_batch::named_proof_seats`) and its id
+    /// (`storage_epoch_batch::proof_id`), by which giving it up takes back
+    /// the stamps it set and no other proof's.
+    #[test]
+    fn a_proof_is_named_as_its_batching_names_it() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{SeatProof, StorageEpochProof};
+        let part = |shard: u8, epoch: u64, seals: bool, settles: bool| SeatProof {
+            shard_filter: vec![shard; 35],
+            epoch,
+            seals,
+            settles,
+            ..Default::default()
+        };
+        let parts = vec![
+            part(9, 1495, true, false),
+            part(3, 1496, false, true),
+            part(5, 1495, true, true),
+        ];
+        let proof = StorageEpochProof {
+            member: [1; 32],
+            seats: parts.clone(),
+            proof: vec![0x5a; 8],
+        };
+        let published = proof.to_canonical_bytes();
+        let bundle = crate::master_node::reward_proofs::prover_bundle(published.clone()).unwrap();
+        let submission =
+            StorageProofSubmission::of(&bundle).expect("premise: a storage epoch proof");
+        let mut named = submission.seats.clone();
+        named.sort_unstable();
+        let stamped = quil_engine::storage_epoch_batch::named_proof_seats(&parts);
+        eprintln!("REACH seat-hold-seats-named equal={}", named == stamped);
+        assert_eq!(
+            named, stamped,
+            "SEATS-MISNAMED: the transport names a proof's seats unlike its batching"
+        );
+        assert_eq!(
+            submission.id,
+            quil_engine::storage_epoch_batch::proof_id(&published),
+            "ID-MISNAMED: the transport names a proof's id unlike its batching's stamps"
+        );
+    }
+
+    /// A bundle of `proof`, the bytes a node's batching published, sent at
+    /// `timestamp`: copies of one proof differ only in it.
+    fn bundle_of(proof: &[u8], timestamp: i64) -> Vec<u8> {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(proof.to_vec()).unwrap())],
+            timestamp,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// The proof bytes `bundle` carries.
+    fn proof_in(bundle: &[u8]) -> Vec<u8> {
+        use quil_execution::message_envelope::CanonicalMessageBundle;
+        let bundle = CanonicalMessageBundle::from_canonical_bytes(bundle).unwrap();
+        bundle.requests[0].as_ref().unwrap().inner_bytes.clone()
+    }
+
+    /// A queued proof a later one supersedes as it is queued is given up:
+    /// its seats' retries go at once, as the later proof does not carry
+    /// them all (read, 2026-11-23).
+    #[test]
+    fn a_queued_proof_a_later_one_supersedes_is_given_up() {
+        let (_, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let earlier = storage_proof_bundle(1, &[(8, 1495, true, true)], 64);
+        let later = storage_proof_bundle(1, &[(8, 1495, false, true), (9, 1495, false, true)], 64);
+        queue.push(earlier.clone());
+        queue.push(later);
+        assert_eq!(
+            queue.len(),
+            1,
+            "premise: the later proof took the earlier one's place"
+        );
+        let given = given_up("superseded", &earlier);
+        eprintln!("REACH seat-hold-given-up-superseded given={given}");
+        assert!(
+            given,
+            "KEPT-SUPERSEDED: a queued proof a later one superseded was not given up"
+        );
+    }
+
+    /// A queued proof a delivered one supersedes is given up.
+    #[test]
+    fn a_queued_proof_a_delivered_one_supersedes_is_given_up() {
+        let (_, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let earlier = storage_proof_bundle(1, &[(8, 1495, true, true)], 64);
+        let delivered = storage_proof_bundle(1, &[(8, 1495, false, true)], 64);
+        queue.push(earlier.clone());
+        let delivered =
+            StorageProofSubmission::of(&delivered).expect("premise: a storage epoch proof");
+        assert_eq!(
+            queue.delivered(&delivered),
+            1,
+            "premise: the queued proof was dropped"
+        );
+        let given = given_up("superseded", &earlier);
+        eprintln!("REACH seat-hold-given-up-delivered-superseded given={given}");
+        assert!(
+            given,
+            "KEPT-DELIVERED-SUPERSEDED: a queued proof a delivered one superseded was not given up"
+        );
+    }
+
+    /// A queued proof one sent again from the queue supersedes once an
+    /// archive takes it is given up (read, 2026-11-23: the resend path had
+    /// its own copy of the supersede give-up).
+    #[tokio::test]
+    async fn a_queued_proof_a_resent_one_supersedes_is_given_up() {
+        let queue = Arc::new(SubmitRetryQueue::default());
+        let earlier = storage_proof_bundle(1, &[(13, 1495, true, true)], 8);
+        let seal_only = storage_proof_bundle(1, &[(13, 1495, true, false)], 8);
+        queue.push(earlier);
+        queue.push(seal_only.clone());
+        assert_eq!(
+            queue.len(),
+            2,
+            "premise: a seal alone does not supersede the earlier seal and settlement"
+        );
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counted = sends.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        assert_eq!(queue.len(), 0, "premise: the queue emptied");
+        assert_eq!(
+            sends.load(Ordering::Relaxed),
+            1,
+            "premise: the earlier proof went first and its delivery took the seal alone off the queue"
+        );
+        let given = given_up("superseded", &seal_only);
+        eprintln!("REACH seat-hold-given-up-resent-superseded given={given}");
+        assert!(
+            given,
+            "KEPT-RESENT-SUPERSEDED: a queued proof a resent one superseded was not given up"
+        );
+    }
+
+    /// A copy of the same proof bytes queued later takes the earlier copy's
+    /// place without giving it up: the proof goes on, and giving it up
+    /// would take back its stamps (read, 2026-11-23).
+    #[test]
+    fn a_copy_of_the_same_proof_queued_later_is_not_given_up() {
+        let (_, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let proof = proof_in(&storage_proof_bundle(1, &[(8, 1495, false, true)], 64));
+        let (first, copy) = (bundle_of(&proof, 1), bundle_of(&proof, 2));
+        queue.push(first.clone());
+        queue.push(copy);
+        assert_eq!(
+            queue.len(),
+            1,
+            "premise: the copy took the first one's place"
+        );
+        let given = given_up("superseded", &first);
+        eprintln!("REACH seat-hold-same-copy given={given}");
+        assert!(
+            !given,
+            "COPY-GIVEN-UP: a proof's earlier copy was given up as its later copy took its place"
+        );
+    }
+
+    /// A queued proof dropped for a seat this node's view shows sealed is
+    /// given up: its other seats' retries go at once.
+    #[test]
+    fn a_queued_proof_dropped_as_settled_is_given_up() {
+        let (settled, view) = settled_view();
+        let queue = SubmitRetryQueue::reading_slots(view);
+        let group = storage_proof_bundle(1, &[(7, 1495, true, false), (9, 1495, true, false)], 8);
+        queue.push(group.clone());
+        settled.lock().unwrap().sealed.insert((9, 1497));
+        queue.drop_settled(FAST, &|| Some(5));
+        assert_eq!(queue.len(), 0, "premise: the proof was dropped");
+        let given = given_up("settled", &group);
+        eprintln!("REACH seat-hold-given-up-dropped given={given}");
+        assert!(
+            given,
+            "KEPT-DROPPED: a queued proof dropped as settled was not given up"
+        );
+    }
+
+    /// A proof sent again from the queue, taken as one of its seats
+    /// settled, is given up: GLOBAL refuses it whole.
+    #[tokio::test]
+    async fn a_resent_proof_taken_as_its_seat_settled_is_given_up() {
+        let (settled, view) = settled_view();
+        let queue = Arc::new(SubmitRetryQueue::reading_slots(view));
+        let group = storage_proof_bundle(1, &[(10, 1495, true, true), (11, 1495, false, true)], 8);
+        queue.push(group.clone());
+        let flip = settled.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |_| {
+                flip.lock().unwrap().closed.insert((11, 1495));
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        assert_eq!(queue.len(), 0, "premise: an archive took it");
+        let given = given_up("settled", &group);
+        eprintln!("REACH seat-hold-given-up-resent-settled given={given}");
+        assert!(
+            given,
+            "KEPT-RESENT-SETTLED: a resent proof taken as its seat settled was not given up"
+        );
+    }
+
+    /// A proof sent again from the queue and refused for good by every
+    /// archive is given up.
+    #[tokio::test]
+    async fn a_resent_proof_every_archive_refuses_for_good_is_given_up() {
+        let queue = Arc::new(SubmitRetryQueue::default());
+        let proof = storage_proof_bundle(1, &[(12, 1495, false, true)], 8);
+        queue.push(proof.clone());
+        run_retries(
+            queue.clone(),
+            FAST,
+            |_| async { Delivery::default() },
+            || Some(1),
+        )
+        .await;
+        assert_eq!(queue.len(), 0, "premise: it was dropped");
+        let given = given_up("refused", &proof);
+        eprintln!("REACH seat-hold-given-up-resent-refused given={given}");
+        assert!(
+            given,
+            "KEPT-RESENT-REFUSED: a resent proof refused for good was not given up"
+        );
+    }
+
+    /// A proof a full retry queue drops is given up.
+    #[test]
+    fn a_proof_a_full_queue_drops_is_given_up() {
+        let queue = SubmitRetryQueue::default();
+        let bundles = overfull_queue(1);
+        let oldest = bundles[0].clone();
+        for bundle in bundles {
+            queue.push(bundle);
+        }
+        assert_eq!(queue.len(), super::RETRY_MAX_MESSAGES, "premise: full");
+        let given = given_up("evicted", &oldest);
+        eprintln!("REACH seat-hold-given-up-evicted given={given}");
+        assert!(
+            given,
+            "KEPT-EVICTED: a proof a full queue dropped was not given up"
+        );
+    }
+
+    /// A proof holding a seat this node's view shows settled, not sent, is
+    /// given up.
+    #[tokio::test]
+    async fn a_proof_not_sent_for_a_settled_seat_is_given_up() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        let (settled, view) = settled_view();
+        settled.lock().unwrap().closed.insert((9, 1495));
+        let transport = transport_to(None, view).await;
+        let group = storage_proof_bundle(1, &[(8, 1495, false, true), (9, 1495, false, true)], 64);
+        let _ = transport.publish_prover_bundle(group.clone()).await;
+        assert_eq!(transport.retry_queue.len(), 0, "premise: not queued");
+        let given = given_up("settled", &group);
+        eprintln!("REACH seat-hold-given-up-not-sent given={given}");
+        assert!(
+            given,
+            "KEPT-NOT-SENT: a proof not sent for a settled seat was not given up"
+        );
+    }
+
+    /// A proof an archive takes as one of its seats settles is given up:
+    /// GLOBAL refuses it whole.
+    #[tokio::test]
+    async fn a_proof_taken_as_its_seat_settled_is_given_up() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        let (settled, view) = settled_view();
+        let flip = settled.clone();
+        let handler: quil_rpc::SubmitHandler = Arc::new(move |_request| {
+            flip.lock().unwrap().closed.insert((9, 1495));
+            Box::pin(async { Ok(()) })
+        });
+        let transport = transport_to(Some(archive_answering(handler).await), view).await;
+        let group = storage_proof_bundle(1, &[(8, 1495, false, true), (9, 1495, false, true)], 64);
+        let _ = transport.publish_prover_bundle(group.clone()).await;
+        assert!(
+            settled.lock().unwrap().closed.contains(&(9, 1495)),
+            "premise: the archive took it"
+        );
+        let given = given_up("settled", &group);
+        eprintln!("REACH seat-hold-given-up-taken-settled given={given}");
+        assert!(
+            given,
+            "KEPT-TAKEN-SETTLED: a proof taken as its seat settled was not given up"
+        );
+    }
+
+    /// A proof every archive refuses for good is given up.
+    #[tokio::test]
+    async fn a_proof_every_archive_refuses_for_good_is_given_up() {
+        use quil_engine::prover_message_transport::ProverMessageTransport;
+        let handler: quil_rpc::SubmitHandler = Arc::new(|_request| {
+            Box::pin(async { Err(quil_rpc::SubmitRefusal::invalid("invalid proof")) })
+        });
+        let (_, view) = settled_view();
+        let transport = transport_to(Some(archive_answering(handler).await), view).await;
+        let proof = storage_proof_bundle(1, &[(13, 1495, false, true)], 64);
+        let _ = transport.publish_prover_bundle(proof.clone()).await;
+        assert_eq!(transport.retry_queue.len(), 0, "premise: not queued");
+        let given = given_up("refused", &proof);
+        eprintln!("REACH seat-hold-given-up-refused given={given}");
+        assert!(
+            given,
+            "KEPT-REFUSED: a proof every archive refused for good was not given up"
         );
     }
 }
