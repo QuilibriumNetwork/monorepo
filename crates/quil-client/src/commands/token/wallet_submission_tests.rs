@@ -6660,6 +6660,31 @@ async fn submit_checked(
         .unwrap();
 }
 
+/// GLOBAL holds `record` at its address `data` in `store`.
+#[cfg(feature = "native-proof")]
+fn record_global(store: &Arc<quil_store::RocksHypergraphStore>, data: [u8; 32], record: &[u8]) {
+    use quil_types::store::*;
+    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+    let shard = quil_hypergraph::addressing::shard_key_for_location(
+        &quil_hypergraph::addressing::Location {
+            app_address: global,
+            data_address: data,
+        },
+    );
+    let txn = HypergraphStore::new_transaction(store.as_ref(), false).unwrap();
+    HypergraphStore::save_vertex_underlying(
+        store.as_ref(),
+        txn.as_ref(),
+        "vertex",
+        "adds",
+        &shard,
+        &[global.as_slice(), data.as_slice()].concat(),
+        record,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+}
+
 /// GLOBAL records `marker` of `application` consumed by `operation`, in
 /// `store`.
 #[cfg(feature = "native-proof")]
@@ -6670,27 +6695,11 @@ fn record_consumed(
     operation: &[u8; 32],
 ) {
     use quil_execution::token_intrinsic::global_commit;
-    use quil_types::store::*;
-    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
-    let consumed = global_commit::consumed_address(application, marker).unwrap();
-    let shard = quil_hypergraph::addressing::shard_key_for_location(
-        &quil_hypergraph::addressing::Location {
-            app_address: global,
-            data_address: consumed,
-        },
-    );
-    let txn = HypergraphStore::new_transaction(store.as_ref(), false).unwrap();
-    HypergraphStore::save_vertex_underlying(
-        store.as_ref(),
-        txn.as_ref(),
-        "vertex",
-        "adds",
-        &shard,
-        &[global.as_slice(), consumed.as_slice()].concat(),
+    record_global(
+        store,
+        global_commit::consumed_address(application, marker).unwrap(),
         &global_commit::encode_consumed_record(operation).unwrap(),
-    )
-    .unwrap();
-    txn.commit().unwrap();
+    );
 }
 
 /// A settlement whose input another operation consumed after the node
@@ -6796,6 +6805,181 @@ async fn a_coin_this_wallet_just_spent_is_not_selected_again() {
         after.len(),
         before.len() - addresses.len(),
         "only the spent coins are held"
+    );
+    node.stop().await;
+}
+
+/// A settlement whose inputs' consumption records name the settlement
+/// itself committed: its wait goes on for the certificate and never tells
+/// the user it can never commit, which would invite paying twice.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_settlement_that_consumed_its_own_inputs_is_not_called_refused() {
+    use quil_execution::token_intrinsic::{global_commit, settlement_record, spent};
+    use quil_lattice_ct::confidential::settlement::Settlement;
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (wallet, tc, node) = served_loaded_wallet(directory.path()).await;
+    let (operations, _) = cited_root_operations(&wallet, &node).await;
+    let (name, settlement) = operations[2].clone();
+    assert_eq!(name, "settlement");
+    submit_checked(&wallet, &tc, &node, settlement.clone()).await;
+    let operation = global_commit::tx_id(&settlement);
+    let journal = std::fs::read_to_string(tc.config_dir.join("wallet-pending-spends.txt"))
+        .unwrap_or_default();
+    assert!(
+        journal.contains(&hex::encode(operation)),
+        "premise: the wallet journaled not the settlement it submitted:\n{journal}"
+    );
+    let statement = Settlement::decode(&settlement, &wallet.network, &wallet.application)
+        .unwrap()
+        .statement;
+    for image in &statement.funding.images {
+        let marker = spent::marker_address(&wallet.network, &wallet.application, image).unwrap();
+        record_consumed(
+            &node.fixture.store,
+            &wallet.application,
+            &marker,
+            &operation,
+        );
+    }
+    let error = settlement_claim(
+        &tc,
+        statement.destination,
+        settlement_record::receipt_address(&statement).unwrap(),
+        statement.settlement,
+        &ClaimBinding::Bundle(statement.context),
+        None,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .expect_err("a settlement no root certifies was claimed");
+    let message = format!("{error:#}");
+    eprintln!("REACH consumed-input own settlement wait ended: {message}");
+    assert!(
+        message.contains("not yet certified") && !message.contains("can never commit"),
+        "committed_as_spent: a settlement that consumed its own inputs was called refused: \
+         {message}"
+    );
+    node.stop().await;
+}
+
+/// A settle over operations the global commit never decides because
+/// another operation consumed one of their inputs (a shield's legacy
+/// source, a mint claim's receipt) ends each of those waits at once,
+/// naming the consumer, this wallet's own when it journaled it, and goes on
+/// to the next operation; a rejected one frees its journal entry.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_settle_ends_each_wait_whose_input_was_consumed_and_goes_on() {
+    use quil_execution::token_intrinsic::{
+        global_commit::{self, Decision},
+        spend_entries,
+    };
+    use quil_lattice_ct::confidential::{
+        memo::create_output,
+        mint_claim::MintClaim,
+        shield::{Shield, ShieldStatement},
+    };
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (wallet, tc, node) = served_loaded_wallet(directory.path()).await;
+    let (operations, _) = cited_root_operations(&wallet, &node).await;
+    let (name, transfer) = operations[0].clone();
+    assert_eq!(name, "transfer");
+    let output = |amount| {
+        create_output(&wallet.context, wallet.address(), amount)
+            .unwrap()
+            .output
+    };
+    let shield = Shield {
+        statement: ShieldStatement {
+            network: wallet.network,
+            application: wallet.application,
+            transparent_address: [0x81; 32],
+            owner_public_key: [7; 57],
+            amount: 12,
+            fee: 2,
+            outputs: vec![output(10)],
+        },
+        signature: [0; 114],
+        proof: placeholder_proof(),
+    }
+    .encode()
+    .unwrap();
+    let claim = MintClaim {
+        network: wallet.network,
+        application: wallet.application,
+        cited_global_frame: 3,
+        global_root: [5; 32],
+        receipt: [6; 32],
+        fee: 1,
+        outputs: vec![output(7)],
+        forest_proof: vec![1],
+    }
+    .encode()
+    .unwrap();
+    let mut submitted = Vec::new();
+    for bytes in [&shield, &claim, &transfer] {
+        submit_checked(&wallet, &tc, &node, bytes.clone()).await;
+        submitted.push(Submitted::of(&wallet.network, wallet.application, bytes).unwrap());
+    }
+    let consumed = |bytes: &[u8]| {
+        let kind = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+        spend_entries::commit_needs(&wallet.application, kind, bytes)
+            .unwrap()
+            .consumptions[0]
+    };
+    let (store, application) = (&node.fixture.store, &wallet.application);
+    let transfer_id = global_commit::tx_id(&transfer);
+    record_consumed(store, application, &consumed(&shield), &[0xee; 32]);
+    record_consumed(store, application, &consumed(&claim), &transfer_id);
+    record_global(
+        store,
+        global_commit::decision_address(application, &transfer_id).unwrap(),
+        &global_commit::encode_decision_record(&Decision::Rejected {
+            frame: 7,
+            reason: "a test rejection".into(),
+        })
+        .unwrap(),
+    );
+    let wait = std::time::Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    let error = inclusion::settle(
+        &tc,
+        &wallet,
+        "operation",
+        &submitted,
+        Follow { wait, max_pages: 4 },
+        started + wait,
+    )
+    .await
+    .expect_err("operations refused or rejected settled");
+    let message = format!("{error:#}");
+    eprintln!("REACH consumed-input settle ended: {message}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "decision_unchecked: the settle ran {:?} to its deadline: {message}",
+        started.elapsed()
+    );
+    assert!(
+        message.contains("a test rejection"),
+        "settle_continue: the settle stopped before the rejected transfer's decision: {message}"
+    );
+    assert!(
+        message.contains(&format!("by operation 0x{}", hex::encode([0xee; 32])))
+            && message.contains(&format!(
+                "by this wallet's earlier operation 0x{}",
+                hex::encode(transfer_id)
+            )),
+        "consumer_unnamed: the errors name not each consumer, this wallet's as its own: \
+         {message}"
+    );
+    let journal = std::fs::read_to_string(tc.config_dir.join("wallet-pending-spends.txt"))
+        .unwrap_or_default();
+    assert!(
+        !journal.contains(&hex::encode(transfer_id)),
+        "decided_release: the rejected transfer still holds its coins:\n{journal}"
     );
     node.stop().await;
 }

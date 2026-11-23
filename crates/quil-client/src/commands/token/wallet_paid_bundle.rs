@@ -191,7 +191,8 @@ fn unclaimed(error: anyhow::Error, tc: &TokenCtx, saved: &std::path::Path) -> an
     // never will: the saved bundle has nothing to resume.
     if error.is::<pending::InputSpent>() {
         return anyhow::anyhow!(
-            "{error:#}. The bundle saved at {} pays with that settlement, so it can never be              resumed; remove it and run custom-mint again",
+            "{error:#}. The bundle saved at {} pays with that settlement, so it can never be \
+             resumed; remove it and run custom-mint again",
             saved.display()
         );
     }

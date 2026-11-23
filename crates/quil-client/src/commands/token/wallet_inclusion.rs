@@ -297,7 +297,7 @@ async fn await_decision(
                 let read = read_decision(&client, application, operation).await;
                 #[cfg(feature = "native-proof")]
                 if matches!(read, Ok(None)) {
-                    inputs.poll(&client).await?;
+                    inputs.poll(&client, deadline).await?;
                 }
                 read
             }

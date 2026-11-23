@@ -1,6 +1,6 @@
-//! This wallet's recent spends, kept in its config directory: the spend
-//! markers each submitted operation consumes, the coins they belong to, and
-//! a settlement's receipt.
+//! This wallet's recent spends, kept in its config directory: the keys each
+//! submitted operation consumes (spend markers, shield sources' markers,
+//! receipts), the coins they belong to, and a settlement's receipt.
 //!
 //! A regular node answers GLOBAL reads from a view it pulls from an archive,
 //! which can trail GLOBAL by minutes, so a coin this wallet spent moments ago
@@ -14,6 +14,14 @@
 //! The journal is a hint: an unreadable one holds nothing, and two commands
 //! writing at once may lose one entry, never corrupt the file. It is bounded
 //! by [`MAX_SPENDS`] entries and [`KEEP`].
+//!
+//! Two older journals leave out coins for the same window
+//! ([`SUBMITTED_EXCLUSION_SECS`](super::super::legacy::SUBMITTED_EXCLUSION_SECS)):
+//! shield-all's, which lists legacy coin addresses for `token legacy` and the
+//! node manager too, and the batch merge's, written before delivery so a
+//! merge whose delivery result was lost stays out. This journal is written
+//! once a delivery succeeded and keyed by what the commit consumes, so a
+//! wait can read each input's consumer and a refusal can free its coins.
 use super::{RecipientWallet, TokenCtx};
 use quil_execution::token_intrinsic::global_commit;
 
@@ -21,10 +29,15 @@ type Client =
     quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>;
 
 /// How long selection leaves out a coin this wallet spent while the node
-/// still lists it unspent: the longest a wallet command waits for its own
-/// spend to settle (`SETTLEMENT_WAIT`), which also covers a view pull every
-/// few minutes. A spend the wait shows refused frees its coins at once.
-pub(super) const HOLD: std::time::Duration = std::time::Duration::from_secs(900);
+/// still lists it unspent: the window shield-all and the batch merge leave
+/// their submitted coins out for. A submitted operation commits with its
+/// shard's next frame, which mainnet has held back about 30 min (a batch
+/// shield committed 1,864 s after its submission;
+/// `shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS`), so a shorter hold
+/// could select a coin whose spend still commits. A spend a wait shows
+/// refused frees its coins at once, and a command naming a coin takes it.
+pub(super) const HOLD: std::time::Duration =
+    std::time::Duration::from_secs(super::super::legacy::SUBMITTED_EXCLUSION_SECS);
 
 /// How long an entry is kept: a resumed settlement wait finds its inputs
 /// within this.
@@ -39,8 +52,9 @@ const FILE: &str = "wallet-pending-spends.txt";
 /// One input of a submitted spend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SpentInput {
-    /// Its spend marker, whose GLOBAL consumption record names the
-    /// operation that consumed it.
+    /// The key the global commit consumes for it (a spend marker, a shield
+    /// source's marker, a receipt), whose GLOBAL consumption record names
+    /// the operation that consumed it.
     pub(super) marker: [u8; 32],
     /// The coin, when this run selected it.
     pub(super) coin: Option<[u8; 32]>,
@@ -60,9 +74,13 @@ pub(super) struct PendingSpend {
 }
 
 impl PendingSpend {
-    /// The spend `bytes` of `application` makes, whose inputs' coins `coins`
-    /// names by marker; `None` for an operation that spends no coin of a
-    /// wallet (a mint, a shield, an escrow claim).
+    /// The spend `bytes` of `application` makes: its inputs are what the
+    /// global commit consumes for it
+    /// ([`spend_entries::commit_needs`](quil_execution::token_intrinsic::spend_entries::commit_needs)):
+    /// a spend's markers, a shield's legacy sources, a mint claim's or a
+    /// custom mint's receipt. `coins` names an input's coin by marker. `None`
+    /// for an operation that consumes nothing: an escrow claim, which spends
+    /// its escrow record, and the QUIL reward mint, which GLOBAL executes.
     pub(super) fn of(
         network: &[u8; 32],
         application: &[u8; 32],
@@ -70,61 +88,38 @@ impl PendingSpend {
         coins: &std::collections::HashMap<[u8; 32], [u8; 32]>,
         at: u64,
     ) -> Option<Self> {
-        use quil_execution::token_intrinsic::constants::{
-            TYPE_LATTICE_PENDING, TYPE_LATTICE_SETTLEMENT, TYPE_LATTICE_TRANSACTION,
+        use quil_execution::token_intrinsic::{
+            constants::TYPE_LATTICE_SETTLEMENT, settlement_record, spend_entries,
         };
-        use quil_lattice_ct::confidential::{
-            pending_create::PendingCreate, settlement::Settlement, transfer::Transfer,
-        };
+        use quil_lattice_ct::confidential::settlement::Settlement;
         let kind = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
-        let (images, receipt) = match kind {
-            TYPE_LATTICE_TRANSACTION => (
-                Transfer::decode(bytes, network, application)
-                    .ok()?
-                    .statement
-                    .images,
-                None,
-            ),
-            TYPE_LATTICE_PENDING => (
-                PendingCreate::decode(bytes, network, application)
-                    .ok()?
-                    .statement
-                    .funding
-                    .images,
-                None,
-            ),
-            TYPE_LATTICE_SETTLEMENT => {
-                let statement = Settlement::decode(bytes, network, application)
-                    .ok()?
-                    .statement;
-                let receipt =
-                    quil_execution::token_intrinsic::settlement_record::receipt_address(&statement)
-                        .ok()?;
-                (statement.funding.images, Some(receipt))
-            }
-            _ => return None,
-        };
-        let inputs = images
-            .iter()
-            .map(|image| {
-                let marker = quil_execution::token_intrinsic::spent::marker_address(
-                    network,
-                    application,
-                    image,
+        let consumed = spend_entries::commit_needs(application, kind, bytes)?.consumptions;
+        if consumed.is_empty() {
+            return None;
+        }
+        let receipt = match kind {
+            TYPE_LATTICE_SETTLEMENT => Some(
+                settlement_record::receipt_address(
+                    &Settlement::decode(bytes, network, application)
+                        .ok()?
+                        .statement,
                 )
-                .ok()?;
-                Some(SpentInput {
-                    marker,
-                    coin: coins.get(&marker).copied(),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
+                .ok()?,
+            ),
+            _ => None,
+        };
         Some(Self {
             application: *application,
             operation: global_commit::tx_id(bytes),
             receipt,
             at,
-            inputs,
+            inputs: consumed
+                .into_iter()
+                .map(|marker| SpentInput {
+                    marker,
+                    coin: coins.get(&marker).copied(),
+                })
+                .collect(),
         })
     }
 
@@ -284,23 +279,36 @@ pub(super) struct InputSpent {
     pub(super) input: SpentInput,
     /// The operation that consumed it.
     pub(super) by: [u8; 32],
+    /// Whether that operation is one this wallet journaled.
+    pub(super) own: bool,
 }
 
 impl std::fmt::Display for InputSpent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let coin = match self.input.coin {
-            Some(coin) => format!("coin 0x{}", hex::encode(coin)),
+        let input = match self.input.coin {
+            Some(coin) => format!("input coin 0x{}", hex::encode(coin)),
             None => format!(
-                "coin with spend marker 0x{}",
+                "input with consumption key 0x{}",
                 hex::encode(self.input.marker)
             ),
         };
+        let (by, cause) = if self.own {
+            ("this wallet's earlier operation", "")
+        } else {
+            (
+                "operation",
+                ", or another copy of this wallet or a concurrent command spent it first",
+            )
+        };
+        let next = match self.input.coin {
+            Some(_) => "rerun to select other coins",
+            None => "check what that operation did before running this again",
+        };
         write!(
             f,
-            "the {} can never commit: its input {coin} was already consumed by operation 0x{}, \
-             so every node refuses it and none of its coins was spent. The node listed the coin \
-             unspent when it was selected because its GLOBAL view trailed GLOBAL; rerun to \
-             select other coins",
+            "the {} can never commit: its {input} was already consumed by {by} 0x{}, so every \
+             node refuses it and none of its inputs was spent. The node still listed the input \
+             unspent when this was built: its GLOBAL view may trail GLOBAL{cause}; {next}",
             self.what,
             hex::encode(self.by)
         )
@@ -357,6 +365,7 @@ pub(super) async fn check_inputs(client: &Client, spend: &PendingSpend, what: &s
                     what: what.to_string(),
                     input: input.clone(),
                     by,
+                    own: false,
                 })
             }
             Ok(None) | Err(_) => {}
@@ -411,20 +420,34 @@ impl InputWatch {
         self.spend = None;
     }
 
-    /// One poll: an error once another operation consumed an input, which
-    /// also frees the spend's other coins for selection. Once the spend
-    /// itself shows committed, later polls read nothing.
-    pub(super) async fn poll(&mut self, client: &Client) -> Result<(), InputSpent> {
+    /// One poll, its reads ended at the wait's `deadline`: an error once
+    /// another operation consumed an input, which also frees the spend's
+    /// other coins for selection. Once the spend itself shows committed,
+    /// later polls read nothing.
+    pub(super) async fn poll(
+        &mut self,
+        client: &Client,
+        deadline: std::time::Instant,
+    ) -> Result<(), InputSpent> {
         let Some(spend) = &self.spend else {
             return Ok(());
         };
-        match check_inputs(client, spend, &self.what).await {
+        let read = check_inputs(client, spend, &self.what);
+        // A read that hangs says nothing, as one that fails.
+        let inputs = tokio::time::timeout_at(deadline.into(), read)
+            .await
+            .unwrap_or(Inputs::Unspent);
+        match inputs {
             Inputs::Unspent => Ok(()),
             Inputs::Committed => {
                 self.spend = None;
                 Ok(())
             }
-            Inputs::Spent(spent) => {
+            Inputs::Spent(mut spent) => {
+                spent.own = self
+                    .spends
+                    .by_operation(&spend.application, &spent.by)
+                    .is_some();
                 self.spends.release(&spend.operation);
                 self.spend = None;
                 Err(spent)

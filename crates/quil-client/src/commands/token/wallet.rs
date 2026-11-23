@@ -6472,7 +6472,7 @@ pub(super) async fn settlement_claim(
             Err(status) => return Err(anyhow::anyhow!("settlement witness: {status}")),
         }
         if let Ok(client) = &connected {
-            inputs.poll(client).await?;
+            inputs.poll(client, deadline).await?;
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
