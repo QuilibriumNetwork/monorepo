@@ -2379,9 +2379,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     // node's Ed448 seed and thus authenticate as this same peer_id — may invoke
     // them. A remote machine handshakes as a different peer_id and is denied.
     .with_self_peer_id(peer_id.to_bytes())
-    // A standalone worker's resolver messages, delivered by this node to just
-    // the members they name (the worker's own connections cannot be
-    // attributed to its committee key).
+    // A standalone worker's shard consensus messages, delivered by this node
+    // to the members they name (the worker's own connections cannot be
+    // attributed to its committee key). Members not served directly get a
+    // topic copy sent from here, after the answer: the worker sends to the
+    // topic itself only when this node does not take the request (an
+    // earlier build answers "not delivered").
     .with_shard_direct_relay({
         let p2p = p2p_handle.clone();
         let peers = super::direct_delivery::CommitteePeers::new(peer_info_cache.clone());
@@ -2389,14 +2392,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             let (p2p, peers) = (p2p.clone(), peers.clone());
             Box::pin(async move {
                 let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
-                let payload = quil_engine::bitmasks::shard_cw_frame_for(channel, &data, &recipients);
-                let delivered =
-                    super::direct_delivery::deliver_direct(&p2p, &peers, &recipients, &topic, &payload).await;
-                if !delivered {
-                    // The worker sends it to the topic itself.
+                let undelivered =
+                    super::direct_delivery::deliver_direct(&p2p, &peers, channel, &data, &recipients, &topic).await;
+                if let Some(payload) = super::direct_delivery::fallback_payload(channel, &data, &undelivered) {
                     p2p.note_direct_fallback();
+                    tokio::spawn(async move {
+                        super::cw_publish::publish_shard_cw(&p2p, 0, &filter, topic, payload).await;
+                    });
                 }
-                delivered
+                true
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         }) as quil_rpc::global_service::ShardDirectRelay
     })

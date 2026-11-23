@@ -29,6 +29,11 @@ use crate::message_collector::MessageCollector;
 static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate =
     crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
 
+/// Votes, certificates and blocks being relayed to a shard's members at once.
+/// One that finds this full goes to the topic instead.
+static COMMITTEE_RELAY_TASKS: crate::spawn_gate::SpawnGate =
+    crate::spawn_gate::SpawnGate::new("committee-relay", 256);
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -964,17 +969,30 @@ impl WorkerOnlyNode {
                                             .await;
                                             continue;
                                         }
-                                        // A resolver message: through the master to just
-                                        // its recipients, else the topic. Off the pump,
-                                        // which also carries votes, since a relayed send
-                                        // can wait out the master's timeout.
-                                        // Either way it names its recipient, so other
-                                        // members drop it unread.
+                                        // Through the master to each recipient, else the
+                                        // topic. Off the pump, which also carries votes,
+                                        // since a relayed send can wait out the master's
+                                        // timeout. A copy for one member names it, so
+                                        // other members drop it unread.
                                         let worker = worker_for_pump.clone();
                                         let publish = publish.clone();
-                                        // A peer's resolver requests drive these; each can wait
-                                        // out the master's timeout. A dropped reply is re-asked.
-                                        let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
+                                        let permit = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+                                            // A peer's resolver requests drive these; each can wait
+                                            // out the master's timeout. A dropped reply is re-asked.
+                                            let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
+                                            permit
+                                        } else {
+                                            // Consensus waits on these: never dropped.
+                                            let Some(permit) = COMMITTEE_RELAY_TASKS.try_enter() else {
+                                                publish(
+                                                    crate::bitmasks::shard_cw_bitmask(&filter),
+                                                    crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients),
+                                                )
+                                                .await;
+                                                continue;
+                                            };
+                                            permit
+                                        };
                                         tokio::spawn(async move {
                                             let _permit = permit;
                                             let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);

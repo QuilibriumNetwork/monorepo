@@ -317,9 +317,9 @@ pub enum AppEngineEvent {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
-        /// The committee keys it is addressed to, for the resolver channel
-        /// only (empty otherwise): a node may deliver it to just those
-        /// members, falling back to the topic.
+        /// The committee keys it is addressed to, this member excluded: a
+        /// node delivers it to each of them, falling back to the topic. Empty
+        /// sends it to the topic.
         recipients: Vec<Vec<u8>>,
     },
 }
@@ -2779,11 +2779,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 /// `AppEngineEvent::CwOut` on the engine's event channel. The master publishes
 /// it on `shard_cw_bitmask` gossip (or the in-memory harness routes it to peers).
 /// `deliver` runs on the simplex thread → a plain channel send (no runtime
-/// needed). Votes, certificates and blocks go to the whole shard committee via
-/// gossip. Resolver messages keep their recipients (one member each): sent to
-/// the whole topic, every subscriber received every response, 163–171 Mbit/s
-/// on one regular node (2026-10-04). For a single-prover shard nothing is
-/// delivered anywhere (simplex handles its own messages internally).
+/// needed). Every message keeps its recipients, so the node can send each
+/// member its own copy: sent to the whole topic, every subscriber received
+/// every resolver response, 163–171 Mbit/s on one regular node (2026-10-04),
+/// and the mesh carried each vote and certificate to every subscriber several
+/// times over. For a single-prover shard nothing is delivered anywhere
+/// (simplex handles its own messages internally).
 struct EngineCwTransport {
     filter: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppEngineEvent>,
@@ -2793,6 +2794,9 @@ struct EngineCwTransport {
     /// lagging the session (a regular node's, after a split or reassignment)
     /// silently dropped a real committee's messages (2026-10-13).
     alone: bool,
+    /// This member's key, never a recipient: simplex addresses a broadcast
+    /// to the whole committee, this member included.
+    me: Vec<u8>,
     /// The votes this host hands to the node to publish
     /// ([`crate::own_votes`]). Counted here, before the master publishes
     /// them: the publish reports no outcome back to the engine (for a
@@ -2813,12 +2817,15 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
         if channel == crate::own_votes::VOTE_CHANNEL {
             self.sent.note();
         }
-        let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+        if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
             crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
-            recipients.iter().map(|key| key.as_ref().to_vec()).collect()
-        } else {
-            Vec::new()
-        };
+        }
+        let recipients = recipients
+            .iter()
+            .map(|key| key.as_ref())
+            .filter(|key| *key != self.me.as_slice())
+            .map(<[u8]>::to_vec)
+            .collect();
         let _ = self.event_tx.send(AppEngineEvent::CwOut {
             filter: self.filter.clone(),
             channel,
@@ -11286,6 +11293,7 @@ impl AppConsensusEngine {
                 filter: filter.clone(),
                 event_tx: self.event_tx.clone(),
                 alone: member_pubkeys.len() == 1,
+                me: my_pk.clone(),
                 sent: sent_votes.clone(),
             });
 
@@ -25266,37 +25274,38 @@ mod tests {
         );
     }
 
-    /// Resolver messages carry the members they are addressed to; votes,
-    /// certificates and blocks go to the whole topic.
+    /// Every message carries the members it is addressed to, this member
+    /// left out: votes, certificates and blocks as well as resolver messages.
     #[test]
-    fn only_resolver_messages_carry_their_recipients() {
+    fn every_message_carries_its_recipients_but_this_member() {
         use crate::cw_app_seams::AppConsensusTransport as _;
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let transport = EngineCwTransport {
             filter: vec![1; 32],
             event_tx,
             alone: false,
+            me: vec![6; 897],
             sent: Default::default(),
         };
-        let member =
-            quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
-        for (channel, expected) in [
-            (
-                crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL,
-                vec![vec![5u8; 897]],
-            ),
-            (0, Vec::new()),
-            (1, Vec::new()),
-            (crate::cw_app_seams::CW_APP_BLOCK_CHANNEL, Vec::new()),
+        let key =
+            |n: u8| quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[n; 897]).unwrap();
+        for channel in [
+            crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL,
+            0,
+            1,
+            crate::cw_app_seams::CW_APP_BLOCK_CHANNEL,
         ] {
-            transport.deliver(channel, vec![member.clone()], vec![channel as u8]);
+            transport.deliver(channel, vec![key(5), key(6), key(7)], vec![channel as u8]);
             match events.try_recv().unwrap() {
                 AppEngineEvent::CwOut {
                     channel: sent,
                     recipients,
                     ..
                 } => {
-                    assert_eq!((sent, recipients), (channel, expected));
+                    assert_eq!(
+                        (sent, recipients),
+                        (channel, vec![vec![5u8; 897], vec![7u8; 897]])
+                    );
                 }
                 _ => panic!("expected a CwOut"),
             }
@@ -25318,6 +25327,7 @@ mod tests {
             filter: vec![1; 32],
             event_tx,
             alone: true,
+            me: Vec::new(),
             sent: Default::default(),
         };
         let member =
