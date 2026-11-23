@@ -710,8 +710,15 @@ fn a_view_behind_global_holds_what_it_lacks_and_refuses_only_what_no_frame_lifts
         &transfer(9, 6, 7),
     );
     assert_eq!(fees, 2, "the transfer commits, spending image 6");
-    for lasting in [claim(32, 1, false, 300), transfer(3, 6, 8)] {
-        assert_eq!(outlook(lasting.clone()), CommitOutlook::Settled);
+    for (lasting, reason) in [
+        (claim(32, 1, false, 300), "claim does not match the escrow"),
+        (transfer(3, 6, 8), "already consumed"),
+    ] {
+        assert_eq!(
+            outlook(lasting.clone()),
+            CommitOutlook::Settled(reason),
+            "settled_reason: the outlook names another reason"
+        );
         assert_eq!(arrival(lasting), Err(ArrivalRefusal::Rejected));
     }
 }
@@ -739,7 +746,10 @@ fn a_shield_stands_as_execution_finds_it_before_its_proof() {
         ("another key's coin", shield(8, mine, 4, true)),
         ("another amount", shield(9, more, 5, true)),
     ] {
-        assert_eq!(outlook(refused.clone()), CommitOutlook::Settled, "{name}");
+        assert!(
+            matches!(outlook(refused.clone()), CommitOutlook::Settled(_)),
+            "{name}"
+        );
         assert_eq!(
             manager.arrival_operations(&global, &APPLICATION, &bundle(refused)),
             Err(ArrivalRefusal::Rejected),
