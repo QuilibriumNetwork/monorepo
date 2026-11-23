@@ -159,9 +159,23 @@ pub fn persistent_storage_warmup_at(current: u64) -> bool {
 }
 
 /// Whether GLOBAL in epoch `current` admits a capacity precommit for `epoch`:
-/// from the epoch itself up to [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] ahead.
+/// from [`PERSISTENT_STORAGE_WARMUP_EPOCHS`] ahead up to
+/// [`capacity_precommit_last_epoch`].
 pub fn capacity_precommit_window(current: u64, epoch: u64) -> bool {
-    epoch >= current && epoch <= current.saturating_add(PERSISTENT_STORAGE_WARMUP_EPOCHS)
+    current <= capacity_precommit_last_epoch(epoch)
+        && epoch <= current.saturating_add(PERSISTENT_STORAGE_WARMUP_EPOCHS)
+}
+
+/// The last epoch in which GLOBAL admits a capacity precommit for `epoch`
+/// ([`capacity_precommit_window`]): the epoch itself.
+pub fn capacity_precommit_last_epoch(epoch: u64) -> u64 {
+    epoch
+}
+
+/// The GLOBAL frame from which GLOBAL admits no capacity precommit for
+/// `epoch` ([`capacity_precommit_last_epoch`]).
+pub fn capacity_precommit_end(epoch: u64) -> u64 {
+    super::epoch_start_frame(capacity_precommit_last_epoch(epoch).saturating_add(1))
 }
 
 /// The most certified sectors a member holding `seats` may have.

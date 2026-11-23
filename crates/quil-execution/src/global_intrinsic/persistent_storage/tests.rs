@@ -1161,3 +1161,31 @@ fn mainnet_precommits_use_three_layers_within_the_coordinated_warmup() {
     .contains("not activated"));
     set_min_sector_nodes_for_thread(None);
 }
+
+/// [`CapacityMessage::refused_from`] is the first frame `check_capacity`
+/// refuses a message as late: a precommit's last fresh frame, a
+/// certificate's last epoch. The node's transport drops capacity messages
+/// from it.
+#[test]
+fn capacity_messages_are_refused_as_late_from_refused_from() {
+    gates(true);
+    let state = state();
+    let frame = first_frame();
+    let (member, _) = member_at(&state, 23, 1, 0);
+    let fresh = precommit_for(member, [3; 32], 32, frame);
+    let late = fresh.refused_from();
+    assert_eq!(late, frame + 11, "harness: freshness ends before the epoch");
+    precommit(&state, &fresh, late - 1).expect("refused_from: a fresh precommit refused");
+    let refused = precommit(&state, &fresh, late).unwrap_err().to_string();
+    assert!(refused.contains("freshness"), "refused_from: {refused}");
+    let message = pending_certification(&state, member, [4; 32], frame);
+    let late = message.refused_from();
+    eprintln!("REACH refused-from certificate={late}");
+    certify(&state, &message, late - 1).expect("refused_from: a certificate refused in time");
+    let refused = certify(&state, &message, late).unwrap_err().to_string();
+    assert!(
+        refused.contains("precommit expired"),
+        "refused_from: {refused}"
+    );
+    gates(false);
+}

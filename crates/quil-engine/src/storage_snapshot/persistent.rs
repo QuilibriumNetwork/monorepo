@@ -1871,9 +1871,25 @@ fn precommit_due(
 /// When a sector's certificate for `target` and `beacon_frame` was last
 /// sent, and how many times.
 fn certificate_sends(dir: &Path, target: u64, beacon_frame: u64) -> Option<(u64, u64)> {
+    let [sent_for, sent_beacon, at, sends] = certificate_sent_record(dir)?;
+    (sent_for == target && sent_beacon == beacon_frame).then_some((at, sends))
+}
+
+/// The epoch the sector in `dir` precommits for, as last written.
+fn stored_target(dir: &Path) -> Option<u64> {
+    fs::read(dir.join("capacity-target"))
+        .ok()
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(u64::from_be_bytes)
+}
+
+/// The sector's last certificate send ([`certificate_sent`]): its target,
+/// beacon frame, frame and count of sends.
+fn certificate_sent_record(dir: &Path) -> Option<[u64; 4]> {
     let bytes = <[u8; 32]>::try_from(fs::read(dir.join("certificate-sent")).ok()?).ok()?;
-    let at = |i: usize| u64::from_be_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-    (at(0) == target && at(1) == beacon_frame).then_some((at(2), at(3)))
+    Some(std::array::from_fn(|i| {
+        u64::from_be_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+    }))
 }
 
 /// Whether a sector's certificate is sent at `frame`: at once the first
@@ -2031,6 +2047,7 @@ fn slot_wait(
     target: u64,
     holder: &quil_execution::global_intrinsic::persistent_storage::PendingCertificate,
 ) {
+    use quil_execution::global_intrinsic::persistent_storage::CERTIFICATE_LATE_EPOCHS;
     let mut waits = SLOT_WAITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2041,7 +2058,7 @@ fn slot_wait(
         SlotWait {
             sector: sector.cert.sector,
             since: current,
-            term: holder.epoch.saturating_add(2),
+            term: holder.epoch.saturating_add(CERTIFICATE_LATE_EPOCHS),
             holder: held,
             warned: None,
             seen: frame,
@@ -2071,7 +2088,9 @@ fn slot_wait(
     }
     if begun || wait.holder != held {
         wait.holder = held;
-        wait.term = wait.term.max(holder.epoch.saturating_add(2));
+        wait.term = wait
+            .term
+            .max(holder.epoch.saturating_add(CERTIFICATE_LATE_EPOCHS));
         info!(frame, sector = %id, target, held_by = %held_by, held_for = holder.epoch,
             ends_by = wait.term.saturating_add(1).min(target),
             "a sector's precommit waits: another precommit of this member holds its GLOBAL \
@@ -2173,6 +2192,16 @@ pub(crate) fn poll_sector_certificates(
             if !sector.certified {
                 sector.certified = true;
                 sector.save()?;
+                // Sends of the certificate for the target on disk, not of an
+                // earlier one.
+                let target = stored_target(&sector.dir);
+                let sends = certificate_sent_record(&sector.dir)
+                    .filter(|[sent_for, ..]| Some(*sent_for) == target)
+                    .map(|[.., sends]| sends);
+                info!(frame, sector = %hex::encode(sector.cert.sector), nodes = sector.cert.n,
+                    sends = %sends.map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+                    "sector certificate committed: GLOBAL holds this sector's capacity \
+                     certificate; it is sent no more");
             }
             store
                 .for_profile(sector.cert.profile)
@@ -2199,10 +2228,7 @@ pub(crate) fn poll_sector_certificates(
             return Ok(());
         }
         let target_path = sector.dir.join("capacity-target");
-        let previous = fs::read(&target_path)
-            .ok()
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map(u64::from_be_bytes);
+        let previous = stored_target(&sector.dir);
         // A target is written as the next epoch, or the first, and kept
         // two epochs past it at most: one past both is damage.
         let next = first.max(current.saturating_add(1));
@@ -2212,7 +2238,9 @@ pub(crate) fn poll_sector_certificates(
                 "a sector's precommit target on disk is past the next epoch, as a damaged \
                  file leaves it; it precommits for the next epoch instead");
         }
-        let kept = previous.filter(|e| current <= e.saturating_add(2) && *e <= next);
+        let kept = previous.filter(|e| {
+            current <= e.saturating_add(protocol::CERTIFICATE_LATE_EPOCHS) && *e <= next
+        });
         // A target the epoch has reached keeps its window only with a
         // committed precommit, whose certificate GLOBAL takes until two
         // epochs past it. GLOBAL refuses an uncommitted one as soon as it
@@ -2239,7 +2267,9 @@ pub(crate) fn poll_sector_certificates(
         // certified (`persistent_storage::check_capacity`): a sector given
         // a new certificate, or another sharing its slot, waits rather than
         // sending one GLOBAL refuses at every frame.
-        if let Some(holder) = holder.filter(|h| h.epoch >= current.saturating_sub(2)) {
+        if let Some(holder) =
+            holder.filter(|h| h.epoch >= current.saturating_sub(protocol::CERTIFICATE_LATE_EPOCHS))
+        {
             let certified = protocol::committed_certificate(
                 snapshot.as_ref(),
                 member,
@@ -7667,12 +7697,9 @@ mod tests {
         }
         gates(false);
     }
-    /// A sector whose precommit GLOBAL committed keeps its target as the
-    /// epoch reaches and passes it, through the two epochs GLOBAL takes its
-    /// certificate in, and sends that certificate there, never a precommit
-    /// for another epoch.
-    #[test]
-    fn a_sector_with_a_committed_precommit_keeps_its_target_for_the_certificate() {
+    /// A pool whose sector's precommit for 1500 GLOBAL committed, with the
+    /// GLOBAL frame its certificate's beacon comes from.
+    fn committed_precommit_pool() -> Pool {
         use quil_execution::global_intrinsic::persistent_storage as protocol;
         use quil_execution::hypergraph_state::HypergraphState;
         let pool = Pool::new();
@@ -7702,6 +7729,17 @@ mod tests {
             )
             .unwrap();
         txn.commit().unwrap();
+        pool
+    }
+
+    /// A sector whose precommit GLOBAL committed keeps its target as the
+    /// epoch reaches and passes it, through the two epochs GLOBAL takes its
+    /// certificate in, and sends that certificate there, never a precommit
+    /// for another epoch.
+    #[test]
+    fn a_sector_with_a_committed_precommit_keeps_its_target_for_the_certificate() {
+        let pool = committed_precommit_pool();
+        let f = pool.frame;
         let length = quil_types::consensus::epoch_length_frames();
         for at in [
             f + 3,
@@ -7723,6 +7761,41 @@ mod tests {
                  committed sent {magics:?}, targeting {target:?}, not its certificate for 1500"
             );
         }
+        gates(false);
+    }
+    /// A sector's committed target ends where GLOBAL refuses its
+    /// certificate (`CapacityMessage::refused_from`): from that frame's
+    /// epoch on it sends no certificate and targets a later epoch.
+    #[test]
+    fn a_committed_targets_certificate_stops_where_global_refuses_it() {
+        use quil_execution::global_intrinsic::persistent_storage as protocol;
+        let pool = committed_precommit_pool();
+        let certificate = pool.poll(1500 * quil_types::consensus::epoch_length_frames() + 2);
+        let certificate = decoded(certificate.first().expect("premise: a certificate"));
+        assert!(!certificate.proof.is_empty(), "premise: a certificate");
+        let refused_from = protocol::CapacityMessage::decode(&certificate)
+            .unwrap()
+            .refused_from();
+        let late = quil_types::consensus::epoch_for_frame(refused_from);
+        let at = quil_types::consensus::epoch_start_frame(late) + 2;
+        let sent: Vec<(u64, bool)> = pool
+            .poll(at)
+            .iter()
+            .map(|bytes| {
+                let message = protocol::CapacityMessage::decode(&decoded(bytes)).unwrap();
+                (message.epoch, !message.proof.is_empty())
+            })
+            .collect();
+        let certificates = sent.iter().filter(|sent| **sent == (1500, true)).count();
+        let target = fs::read(pool.path.join("capacity-target")).unwrap();
+        eprintln!("REACH late-target epoch={late} sent={sent:?} target={target:?}");
+        assert!(
+            certificates == 0 && target != 1500u64.to_be_bytes(),
+            "LATE_TARGET: in epoch {late}, from whose start GLOBAL refuses a certificate for \
+             1500 ({} late epochs), the sector sent {certificates} certificates, targeting \
+             {target:?}",
+            protocol::CERTIFICATE_LATE_EPOCHS
+        );
         gates(false);
     }
     /// GLOBAL's refusal of a precommit for an epoch already passed names
