@@ -401,6 +401,28 @@ fn abandoned(proof: &StorageProofSubmission, why: &'static str) {
     quil_engine::storage_epoch_batch::note_proof_abandoned(&proof.member, &proof.id);
 }
 
+/// Remove from `pending` each storage epoch proof `by` supersedes
+/// ([`StorageProofSubmission::supersedes`]); returns those it gives up
+/// ([`StorageProofSubmission::gives_up`]), for the caller to pass to
+/// [`abandoned`] once it releases `pending`. The one supersede path for a
+/// proof queued, delivered or delivered when sent again.
+fn take_superseded(
+    pending: &mut VecDeque<Queued>,
+    by: &StorageProofSubmission,
+) -> Vec<StorageProofSubmission> {
+    let mut given_up = Vec::new();
+    pending.retain(|queued| {
+        let Some(old) = queued.proof.as_ref().filter(|old| by.supersedes(old)) else {
+            return true;
+        };
+        if by.gives_up(old) {
+            given_up.push(old.clone());
+        }
+        false
+    });
+    given_up
+}
+
 /// A proof given up ([`abandoned`]): why, its member and its id.
 #[cfg(test)]
 type AbandonedProof = (
@@ -523,32 +545,22 @@ impl SubmitRetryQueue {
         let proof = StorageProofSubmission::of(&bytes);
         let mut pending = self.pending.lock().unwrap();
         if !pending.iter().any(|queued| queued.bytes == bytes) {
-            let mut given_up = Vec::new();
-            if let Some(proof) = &proof {
-                let (mut replaced, mut replaced_bytes) = (0usize, 0usize);
-                pending.retain(|queued| {
-                    let gone = queued
-                        .proof
-                        .as_ref()
-                        .is_some_and(|old| proof.supersedes(old));
-                    if let Some(old) = queued
-                        .proof
-                        .as_ref()
-                        .filter(|old| gone && proof.gives_up(old))
-                    {
-                        given_up.push(old.clone());
-                    }
-                    replaced += usize::from(gone);
-                    replaced_bytes += if gone { queued.bytes.len() } else { 0 };
-                    !gone
-                });
+            let queued_bytes = |pending: &VecDeque<Queued>| -> usize {
+                pending.iter().map(|queued| queued.bytes.len()).sum()
+            };
+            let given_up = proof.as_ref().map_or_else(Vec::new, |proof| {
+                let (before, before_bytes) = (pending.len(), queued_bytes(&pending));
+                let given_up = take_superseded(&mut pending, proof);
+                let replaced = before - pending.len();
                 if replaced > 0 {
+                    let replaced_bytes = before_bytes - queued_bytes(&pending);
                     let (member, shards, epochs) = proof.fields();
                     info!(member, ?shards, ?epochs, bytes = bytes.len(), replaced, replaced_bytes,
                         "storage epoch proof queued in place of earlier proofs of the same settlements or seals: GLOBAL \
                          applies only the first of them to ride a frame, so the archives hold one copy");
                 }
-            }
+                given_up
+            });
             pending.push_back(Queued {
                 id: self.ids.fetch_add(1, Ordering::Relaxed),
                 bytes,
@@ -655,21 +667,7 @@ impl SubmitRetryQueue {
         }
         let mut pending = self.pending.lock().unwrap();
         let before = pending.len();
-        let mut given_up = Vec::new();
-        pending.retain(|queued| {
-            let gone = queued
-                .proof
-                .as_ref()
-                .is_some_and(|old| delivered.supersedes(old));
-            if let Some(old) = queued
-                .proof
-                .as_ref()
-                .filter(|old| gone && delivered.gives_up(old))
-            {
-                given_up.push(old.clone());
-            }
-            !gone
-        });
+        let given_up = take_superseded(&mut pending, delivered);
         let superseded = before - pending.len();
         drop(pending);
         for old in &given_up {
@@ -1013,28 +1011,15 @@ fn resent(
     // Holding a seat settled meanwhile, it seals and settles none.
     let settled = queue.settled_seats(proof);
     let before = pending.len();
-    let mut given_up = Vec::new();
-    if settled.is_empty() {
-        pending.retain(|other| {
-            let gone = other
-                .proof
-                .as_ref()
-                .is_some_and(|old| proof.supersedes(old));
-            if let Some(old) = other
-                .proof
-                .as_ref()
-                .filter(|old| gone && proof.gives_up(old))
-            {
-                given_up.push(old.clone());
-            }
-            !gone
-        });
+    let given_up = if settled.is_empty() {
+        take_superseded(&mut pending, proof)
     } else {
         abandoned(proof, "settled");
         let digest = proof_digest(&queued.bytes);
         let sent = (digest.as_str(), queued.bytes.len());
         queue.warn_settled(proof, sent, &settled, frame(), "taken by an archive");
-    }
+        Vec::new()
+    };
     let superseded = before - pending.len();
     drop(pending);
     for old in &given_up {
@@ -4317,6 +4302,52 @@ mod tests {
         assert!(
             given,
             "KEPT-DELIVERED-SUPERSEDED: a queued proof a delivered one superseded was not given up"
+        );
+    }
+
+    /// A queued proof one sent again from the queue supersedes once an
+    /// archive takes it is given up (read, 2026-11-23: the resend path had
+    /// its own copy of the supersede give-up).
+    #[tokio::test]
+    async fn a_queued_proof_a_resent_one_supersedes_is_given_up() {
+        let queue = Arc::new(SubmitRetryQueue::default());
+        let earlier = storage_proof_bundle(1, &[(13, 1495, true, true)], 8);
+        let seal_only = storage_proof_bundle(1, &[(13, 1495, true, false)], 8);
+        queue.push(earlier);
+        queue.push(seal_only.clone());
+        assert_eq!(
+            queue.len(),
+            2,
+            "premise: a seal alone does not supersede the earlier seal and settlement"
+        );
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counted = sends.clone();
+        run_retries(
+            queue.clone(),
+            FAST,
+            move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                async {
+                    Delivery {
+                        accepted: 1,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Some(1),
+        )
+        .await;
+        assert_eq!(queue.len(), 0, "premise: the queue emptied");
+        assert_eq!(
+            sends.load(Ordering::Relaxed),
+            1,
+            "premise: the earlier proof went first and its delivery took the seal alone off the queue"
+        );
+        let given = given_up("superseded", &seal_only);
+        eprintln!("REACH seat-hold-given-up-resent-superseded given={given}");
+        assert!(
+            given,
+            "KEPT-RESENT-SUPERSEDED: a queued proof a resent one superseded was not given up"
         );
     }
 
