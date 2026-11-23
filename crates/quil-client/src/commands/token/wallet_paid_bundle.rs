@@ -187,6 +187,14 @@ fn resume_command(program: &str, read_flags: &[String], saved: &std::path::Path)
 /// A claim wait's `error` once the settlement paying for the bundle saved at
 /// `saved` was sent: that payment stands, and only the saved bundle spends it.
 fn unclaimed(error: anyhow::Error, tc: &TokenCtx, saved: &std::path::Path) -> anyhow::Error {
+    // A settlement whose inputs another spend consumed paid nothing and
+    // never will: the saved bundle has nothing to resume.
+    if error.is::<pending::InputSpent>() {
+        return anyhow::anyhow!(
+            "{error:#}. The bundle saved at {} pays with that settlement, so it can never be              resumed; remove it and run custom-mint again",
+            saved.display()
+        );
+    }
     anyhow::anyhow!(
         "{error:#}. The settlement was submitted and pays only for the bundle saved at {}: do \
          not run custom-mint again, which pays a new settlement. Finish this mint without \
@@ -290,7 +298,7 @@ where
     // the payment is part of the settlement, chosen when it was paid.
     if payment.is_none() {
         if let Some(claim) = claim_prefunded(tc, wallet.application, &quote, wait).await? {
-            return send_claimed_bundle(
+            let submitted = send_claimed_bundle(
                 tc,
                 domain,
                 request,
@@ -299,7 +307,9 @@ where
                 quote.global_execution,
                 submitted,
             )
-            .await;
+            .await?;
+            wallet.note_submitted(&unpaid.operation);
+            return Ok(submitted);
         }
     }
     let unpaid = PaidBundle {
@@ -344,7 +354,7 @@ where
         Some(path) => unclaimed(error, tc, path),
         None => error,
     })?;
-    send_claimed_bundle(
+    let submitted = send_claimed_bundle(
         tc,
         domain,
         request,
@@ -353,7 +363,9 @@ where
         quote.global_execution,
         submitted,
     )
-    .await
+    .await?;
+    wallet.note_submitted(&unpaid.operation);
+    Ok(submitted)
 }
 
 /// Submit `claim` and then `request`, the operation, as the bundle stamped
@@ -475,5 +487,6 @@ pub(super) async fn resume(
         submitted,
     )
     .await?;
+    wallet.note_submitted(&paid.operation);
     Ok((wallet, submitted, paid.payment.is_some()))
 }

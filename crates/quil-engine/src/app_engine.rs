@@ -1848,7 +1848,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 .map(|(canon, outlook)| {
                     failures
                         .as_ref()
-                        .filter(|_| *outlook != CommitOutlook::Settled)
+                        .filter(|_| !matches!(outlook, CommitOutlook::Settled(_)))
                         .and_then(|failures| failures.of(canon))
                 })
                 .collect();
@@ -1874,7 +1874,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             }
             let done: Vec<bool> = outlooks
                 .iter()
-                .map(|outlook| *outlook == CommitOutlook::Settled)
+                .map(|outlook| matches!(outlook, CommitOutlook::Settled(_)))
                 .collect();
             let finished: Vec<Vec<u8>> = done
                 .iter()
@@ -13047,8 +13047,13 @@ impl AppConsensusEngine {
                 .clone()
                 .unwrap_or_else(|| exec.crdt());
             match exec.commit_outlook(&global, &self.app_address, &data) {
-                CommitOutlook::Settled => {
-                    self.settled_arrivals.note(&self.filter, data.len());
+                CommitOutlook::Settled(reason) => {
+                    self.settled_arrivals.note(
+                        &self.filter,
+                        data.len(),
+                        reason,
+                        &routing_key(&data),
+                    );
                     return;
                 }
                 CommitOutlook::Pending => self.pending_arrivals.note(&self.filter, data.len()),
@@ -15718,15 +15723,26 @@ impl MalformedArrivals {
 struct SettledArrivals {
     submissions: u64,
     bytes: u64,
+    /// Refusals by reason ([`CommitOutlook::Settled`]); bounded by the
+    /// commit's fixed set of reasons.
+    ///
+    /// [`CommitOutlook::Settled`]: quil_execution::manager::CommitOutlook::Settled
+    reasons: std::collections::BTreeMap<&'static str, u64>,
+    /// The last refused submission's bundle id: the first 4 bytes of the
+    /// SHA3-256 of its canonical bytes, which a wallet prints in full.
+    last_bundle: [u8; 4],
     logged: Option<std::time::Instant>,
 }
 
 impl SettledArrivals {
-    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// Count one of `bytes`, refused for `reason`, whose canonical bytes
+    /// hash to `bundle`; one line when the first arrives and then at most
     /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
-    fn note(&mut self, filter: &[u8], bytes: usize) {
+    fn note(&mut self, filter: &[u8], bytes: usize, reason: &'static str, bundle: &[u8; 32]) {
         self.submissions += 1;
         self.bytes = self.bytes.saturating_add(bytes as u64);
+        *self.reasons.entry(reason).or_default() += 1;
+        self.last_bundle.copy_from_slice(&bundle[..4]);
         self.report(filter);
     }
 
@@ -15744,10 +15760,18 @@ impl SettledArrivals {
             return;
         }
         self.logged = Some(now);
+        let reasons = self
+            .reasons
+            .iter()
+            .map(|(reason, count)| format!("{reason}: {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
             filter = %hex::encode(filter),
             submissions = self.submissions,
             bytes = self.bytes,
+            reasons = %reasons,
+            last_bundle = %hex::encode(self.last_bundle),
             scope = "a peer or wallet",
             action = "none here: a wallet seeing this for its own submission resent one \
                       already decided, or spends a coin or key image already spent",
@@ -15756,6 +15780,7 @@ impl SettledArrivals {
         );
         self.submissions = 0;
         self.bytes = 0;
+        self.reasons.clear();
     }
 }
 

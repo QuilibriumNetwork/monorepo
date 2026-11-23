@@ -5,40 +5,14 @@
 //! a claim would cite. Its witness says nothing about whether the claim was
 //! made: the global commit records that, keyed by the receipt, and names the
 //! operation that consumed it.
-use super::{RecipientWallet, TokenCtx};
-use quil_execution::token_intrinsic::global_commit;
+use super::pending::read_consumer;
+use super::TokenCtx;
 use quil_types::proto::node::{
-    GetMintAuthorizationStatusRequest, GetMintAuthorizationStatusResponse, GetVertexDataRequest,
-    MintAuthorizationState,
+    GetMintAuthorizationStatusRequest, GetMintAuthorizationStatusResponse, MintAuthorizationState,
 };
 
 type Client =
     quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>;
-
-/// The operation that consumed `receipt`, from its GLOBAL record; `None` while
-/// no claim has committed.
-async fn read_consumer(
-    client: &Client,
-    application: &[u8; 32],
-    receipt: &[u8; 32],
-) -> anyhow::Result<Option<[u8; 32]>> {
-    let mut address = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
-    address.extend_from_slice(&global_commit::consumed_address(application, receipt)?);
-    let response = client
-        .clone()
-        .max_decoding_message_size(66_560)
-        .get_vertex_data(GetVertexDataRequest {
-            address,
-            full_data: true,
-        })
-        .await?
-        .into_inner();
-    let (present, blob) = RecipientWallet::decode_global_record(response)?;
-    if !present {
-        return Ok(None);
-    }
-    Ok(Some(global_commit::parse_consumed_record(&blob)?))
-}
 
 /// The line a claim prints when the receipt it is about to claim was already
 /// consumed. The commit decides either way, so an unreadable record only says so.
@@ -190,8 +164,10 @@ pub(in crate::commands::token) async fn run_mint_status(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RecipientWallet;
     use super::*;
     use quil_crypto::sntrup761;
+    use quil_execution::token_intrinsic::global_commit;
     use quil_types::store::HypergraphStore;
     use std::path::Path;
     use std::sync::Arc;

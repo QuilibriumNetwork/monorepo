@@ -262,6 +262,9 @@ impl ProofFailures {
     }
 }
 
+/// [`CommitOutlook::Settled`]'s reason for a bundle the commit decided whole.
+pub const EVERY_REQUEST_DECIDED: &str = "every request already decided";
+
 /// What the global commit can make of a canonical bundle, read ahead of it
 /// from this node's GLOBAL view and shard store
 /// ([`ExecutionEngineManager::commit_outlook`]).
@@ -271,7 +274,11 @@ pub enum CommitOutlook {
     Open,
     /// Decided, or an operation can only be rejected (see
     /// [`ArrivalRefusal::Rejected`]): no shard needs to verify or propose it.
-    Settled,
+    /// Carries which: the reason the commit would record for the operation
+    /// it can only reject ([`Standing::reason`]), else [`EVERY_REQUEST_DECIDED`].
+    ///
+    /// [`Standing::reason`]: crate::token_intrinsic::global_commit::Standing::reason
+    Settled(&'static str),
     /// An operation names what this node does not hold yet (see
     /// [`ArrivalRefusal::Pending`]): verifying or proposing it waits until
     /// this node holds it; a later GLOBAL frame may settle it either way.
@@ -1380,13 +1387,15 @@ impl ExecutionEngineManager {
             let mut pending = false;
             for request in bundle.requests.iter().flatten() {
                 match Self::request_standing(&state, shard, &application, request) {
-                    Some(Standing::Lasting(_)) => return CommitOutlook::Settled,
+                    Some(lasting @ Standing::Lasting(_)) => {
+                        return CommitOutlook::Settled(lasting.reason())
+                    }
                     Some(Standing::Pending(_)) => pending = true,
                     None => {}
                 }
             }
             if Self::all_decided(&state, &application, &bundle) {
-                return CommitOutlook::Settled;
+                return CommitOutlook::Settled(EVERY_REQUEST_DECIDED);
             }
             if pending {
                 CommitOutlook::Pending

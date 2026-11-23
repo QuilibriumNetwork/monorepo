@@ -275,21 +275,40 @@ async fn head(tc: &TokenCtx) -> Option<u64> {
         .map(|info| info.into_inner().last_global_head_frame)
 }
 
-/// Poll the decision until it exists or `deadline` passes. Read failures
-/// retry until the deadline; the last one is returned with `None`.
+/// Poll the decision on `operation` (`what`) until it exists or `deadline`
+/// passes. Read failures retry until the deadline; the last one is returned
+/// with `None`. An operation this wallet submitted whose input another
+/// operation consumed is refused on arrival and never decided: once a poll
+/// reads that, the wait ends with the error ([`input_spent`]).
 async fn await_decision(
     tc: &TokenCtx,
+    what: &str,
     application: &[u8; 32],
     operation: &[u8; 32],
     deadline: std::time::Instant,
 ) -> anyhow::Result<(Option<Decision>, Option<String>)> {
+    #[cfg(feature = "native-proof")]
+    let mut inputs = super::pending::InputWatch::operation(tc, what, application, operation);
+    #[cfg(not(feature = "native-proof"))]
+    let _ = what;
     loop {
         let read = match tc.connect().await {
-            Ok(client) => read_decision(&client, application, operation).await,
+            Ok(client) => {
+                let read = read_decision(&client, application, operation).await;
+                #[cfg(feature = "native-proof")]
+                if matches!(read, Ok(None)) {
+                    inputs.poll(&client).await?;
+                }
+                read
+            }
             Err(error) => Err(error),
         };
         let failure = match read {
-            Ok(Some(decision)) => return Ok((Some(decision), None)),
+            Ok(Some(decision)) => {
+                #[cfg(feature = "native-proof")]
+                inputs.decided(&decision);
+                return Ok((Some(decision), None));
+            }
             Ok(None) => None,
             Err(error) if error.to_string().starts_with(UNDECODABLE) => return Err(error),
             Err(error) => Some(error.to_string()),
@@ -400,7 +419,14 @@ pub(in crate::commands::token) async fn settle(
     let mut committed = Vec::new();
     for s in submitted {
         let (decision, failure) =
-            await_decision(tc, &s.application, &s.operation, deadline).await?;
+            match await_decision(tc, what, &s.application, &s.operation, deadline).await {
+                Ok(read) => read,
+                Err(error) if input_spent(&error) => {
+                    failures.push(format!("{error:#}"));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         match decision {
             Some(decision) => match decision_outcome(what, &decision) {
                 Ok(line) => {
@@ -468,6 +494,17 @@ pub(in crate::commands::token) async fn settle(
     }
 }
 
+/// Whether `error` is a wait ended by an input another operation consumed.
+fn input_spent(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "native-proof")]
+    return error.is::<super::pending::InputSpent>();
+    #[cfg(not(feature = "native-proof"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// [`announce`] one submitted operation, then [`settle`] it with `--wait`.
 pub(in crate::commands::token) async fn follow(
     tc: &TokenCtx,
@@ -507,7 +544,8 @@ pub(in crate::commands::token) async fn run_inclusion(
     let application = super::identifier(application)?;
     let operation = super::identifier(operation)?;
     let deadline = std::time::Instant::now() + wait;
-    let (decision, failure) = await_decision(tc, &application, &operation, deadline).await?;
+    let (decision, failure) =
+        await_decision(tc, "operation", &application, &operation, deadline).await?;
     if let Some(decision) = decision {
         say!("{}", decision_outcome("operation", &decision)?);
         return Ok(());

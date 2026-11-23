@@ -6616,3 +6616,186 @@ async fn a_batch_merge_stops_when_its_first_merge_is_stale() {
     );
     node.stop().await;
 }
+
+/// A wallet loaded from a token context on a node serving nine of its
+/// coins, that context on that node, and the node; the wallet keeps its
+/// config in `directory`.
+#[cfg(feature = "native-proof")]
+async fn served_loaded_wallet(
+    directory: &std::path::Path,
+) -> (Arc<RecipientWallet>, TokenCtx, ServedCoins) {
+    let unserved = paid_mint_ctx(directory, "/ip4/127.0.0.1/tcp/1".into());
+    let wallet = Arc::new(
+        RecipientWallet::load(&unserved, &[31; 32], &quil_execution::domains::QUIL_TOKEN).unwrap(),
+    );
+    let node = ServedCoins::start(&wallet, recording_node(Ok(())).0).await;
+    let opts = crate::rpc::ConnectOpts {
+        listen_grpc_multiaddr: node.multiaddr.clone(),
+        ..Default::default()
+    };
+    let tc = TokenCtx {
+        connect_opts: opts.clone(),
+        submit_opts: opts,
+        ..unserved
+    };
+    (wallet, tc, node)
+}
+
+/// Submit `bytes` through the wallet's path: its cited root checked, sent
+/// to the node.
+#[cfg(feature = "native-proof")]
+async fn submit_checked(
+    wallet: &RecipientWallet,
+    tc: &TokenCtx,
+    node: &ServedCoins,
+    bytes: Vec<u8>,
+) {
+    let mut client = node.client.clone();
+    let checked = RootChecked::check(wallet, &client, bytes, RootLimit::Retained)
+        .await
+        .unwrap();
+    wallet
+        .submit(&mut client, &tc.submit_key_manager, checked)
+        .await
+        .unwrap();
+}
+
+/// GLOBAL records `marker` of `application` consumed by `operation`, in
+/// `store`.
+#[cfg(feature = "native-proof")]
+fn record_consumed(
+    store: &Arc<quil_store::RocksHypergraphStore>,
+    application: &[u8; 32],
+    marker: &[u8; 32],
+    operation: &[u8; 32],
+) {
+    use quil_execution::token_intrinsic::global_commit;
+    use quil_types::store::*;
+    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+    let consumed = global_commit::consumed_address(application, marker).unwrap();
+    let shard = quil_hypergraph::addressing::shard_key_for_location(
+        &quil_hypergraph::addressing::Location {
+            app_address: global,
+            data_address: consumed,
+        },
+    );
+    let txn = HypergraphStore::new_transaction(store.as_ref(), false).unwrap();
+    HypergraphStore::save_vertex_underlying(
+        store.as_ref(),
+        txn.as_ref(),
+        "vertex",
+        "adds",
+        &shard,
+        &[global.as_slice(), consumed.as_slice()].concat(),
+        &global_commit::encode_consumed_record(operation).unwrap(),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+}
+
+/// A settlement whose input another operation consumed after the node
+/// listed it unspent is refused by every node on arrival and never
+/// certified: the wait for it reads that from its inputs' consumption
+/// records and fails at once, naming the coin, instead of waiting out its
+/// deadline.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_settlement_whose_input_was_consumed_fails_its_wait_at_once() {
+    use quil_lattice_ct::confidential::settlement::Settlement;
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (wallet, tc, node) = served_loaded_wallet(directory.path()).await;
+    let (operations, addresses) = cited_root_operations(&wallet, &node).await;
+    let (name, settlement) = operations[2].clone();
+    assert_eq!(name, "settlement");
+    submit_checked(&wallet, &tc, &node, settlement.clone()).await;
+    let statement = Settlement::decode(&settlement, &wallet.network, &wallet.application)
+        .unwrap()
+        .statement;
+    let receipt =
+        quil_execution::token_intrinsic::settlement_record::receipt_address(&statement).unwrap();
+    let marker = quil_execution::token_intrinsic::spent::marker_address(
+        &wallet.network,
+        &wallet.application,
+        &statement.funding.images[0],
+    )
+    .unwrap();
+    record_consumed(
+        &node.fixture.store,
+        &wallet.application,
+        &marker,
+        &[0xee; 32],
+    );
+    let started = std::time::Instant::now();
+    let error = settlement_claim(
+        &tc,
+        statement.destination,
+        receipt,
+        statement.settlement,
+        &ClaimBinding::Bundle(statement.context),
+        None,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect_err("a settlement whose input another operation consumed was certified");
+    let message = format!("{error:#}");
+    eprintln!("REACH consumed-input settlement wait ended: {message}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "input_unchecked: the wait ran {:?} to its deadline: {message}",
+        started.elapsed()
+    );
+    assert!(
+        addresses
+            .iter()
+            .any(|address| message.contains(&hex::encode(address)))
+            && message.contains(&hex::encode([0xee; 32])),
+        "coin_unnamed: the error names not both the consumed coin and its consumer: {message}"
+    );
+    node.stop().await;
+}
+
+/// A coin this wallet just spent stays out of its next selection while the
+/// node, its GLOBAL view behind, still lists it unspent: the next spend
+/// does not take it again and fail.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_coin_this_wallet_just_spent_is_not_selected_again() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (wallet, tc, node) = served_loaded_wallet(directory.path()).await;
+    let (operations, addresses) = cited_root_operations(&wallet, &node).await;
+    let before = wallet
+        .clone()
+        .scan_spendable(&node.client, 64, 16)
+        .await
+        .unwrap();
+    assert!(
+        addresses
+            .iter()
+            .all(|address| before.iter().any(|coin| coin.address == *address)),
+        "the node lists the coins unspent"
+    );
+    submit_checked(&wallet, &tc, &node, operations[0].1.clone()).await;
+    let after = wallet
+        .clone()
+        .scan_spendable(&node.client, 64, 16)
+        .await
+        .unwrap();
+    eprintln!("REACH consumed-input selection after a spend");
+    let again: Vec<String> = after
+        .iter()
+        .filter(|coin| addresses.contains(&coin.address))
+        .map(|coin| hex::encode(coin.address))
+        .collect();
+    assert!(
+        again.is_empty(),
+        "spent_reselected: a just-spent coin was selected again: {again:?}"
+    );
+    assert_eq!(
+        after.len(),
+        before.len() - addresses.len(),
+        "only the spent coins are held"
+    );
+    node.stop().await;
+}

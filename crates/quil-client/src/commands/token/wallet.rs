@@ -34,6 +34,9 @@ pub(super) use mint_status::run_mint_status;
 #[path = "wallet_paid_bundle.rs"]
 mod paid_bundle;
 #[cfg(feature = "native-proof")]
+#[path = "wallet_pending.rs"]
+mod pending;
+#[cfg(feature = "native-proof")]
 pub(super) use paid_bundle::run_custom_mint_resume;
 #[path = "wallet_inclusion.rs"]
 pub(super) mod inclusion;
@@ -65,6 +68,14 @@ pub(super) struct RecipientWallet {
     /// ([`RecipientWallet::check_cited_root`]); a run loads its wallet once.
     #[cfg(feature = "native-proof")]
     root_age_unknown_said: std::sync::atomic::AtomicBool,
+    /// This wallet's recent spends ([`pending`]); none for a wallet built
+    /// from bare keys.
+    #[cfg(feature = "native-proof")]
+    spends: Option<pending::PendingSpends>,
+    /// The coins of the spends this run built, by spend marker, so a spend's
+    /// journal entry names them.
+    #[cfg(feature = "native-proof")]
+    input_coins: std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>,
 }
 
 #[cfg(test)]
@@ -1196,13 +1207,15 @@ impl RecipientWallet {
         key_manager: &quil_keys::FileKeyManager,
         operation: RootChecked,
     ) -> anyhow::Result<[u8; 32]> {
-        let (domain, request) = self.prepare_submission(operation.into_bytes())?;
+        let bytes = operation.into_bytes();
+        let (domain, request) = self.prepare_submission(bytes.clone())?;
         let bundle = quil_types::proto::global::MessageBundle {
             requests: vec![request],
             timestamp: crate::send::now_millis(),
         };
         let id = bundle_id(&bundle)?;
         crate::send::send_message_bundle(client, key_manager, domain, bundle).await?;
+        self.note_submitted(&bytes);
         Ok(id)
     }
 
@@ -2681,6 +2694,21 @@ impl RecipientWallet {
                     .map_err(|e| anyhow::anyhow!("input image: {e:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        #[cfg(feature = "native-proof")]
+        self.note_inputs(
+            coins
+                .iter()
+                .zip(&images)
+                .map(|((address, _), image)| {
+                    quil_execution::token_intrinsic::spent::marker_address(
+                        &self.network,
+                        &self.application,
+                        image,
+                    )
+                    .map(|marker| (marker, *address))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let mut refund_recovery = None;
         let created = recipients
             .iter()
@@ -2877,8 +2905,14 @@ impl RecipientWallet {
         max_pages: usize,
         max_owned: usize,
     ) -> anyhow::Result<Vec<OwnedCoin>> {
-        self.scan_spendable_with(client, max_pages, max_owned, &mut ScanReport::default())
-            .await
+        let coins = self
+            .clone()
+            .scan_spendable_with(client, max_pages, max_owned, &mut ScanReport::default())
+            .await?;
+        // A command naming its coins takes them as named.
+        #[cfg(feature = "native-proof")]
+        let coins = self.hold_pending(coins)?;
+        Ok(coins)
     }
 
     /// [`Self::scan_spendable`] for a command that names its coins: each
@@ -3496,7 +3530,13 @@ impl RecipientWallet {
             .key_manager
             .get_public_key_bytes_by_id(WALLET_KEY)
             .map_err(|e| anyhow::anyhow!("{WALLET_KEY} public in keystore {}: {e}", keystore()))?;
-        Self::from_keys(network, application, &public, secret)
+        #[cfg_attr(not(feature = "native-proof"), allow(unused_mut))] // spends is native-proof
+        let mut wallet = Self::from_keys(network, application, &public, secret)?;
+        #[cfg(feature = "native-proof")]
+        {
+            wallet.spends = Some(pending::PendingSpends::at(&tc.config_dir));
+        }
+        Ok(wallet)
     }
     fn from_keys(
         network: &[u8; 32],
@@ -3540,6 +3580,10 @@ impl RecipientWallet {
             opening: std::sync::OnceLock::new(),
             #[cfg(feature = "native-proof")]
             root_age_unknown_said: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "native-proof")]
+            spends: None,
+            #[cfg(feature = "native-proof")]
+            input_coins: Default::default(),
         })
     }
 
@@ -6356,12 +6400,17 @@ pub(super) async fn settlement_claim(
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let deadline = std::time::Instant::now() + wait;
+    // A settlement another operation's spend of its inputs beat is refused
+    // on arrival and never certified; the wait reads its inputs each poll.
+    let mut inputs = pending::InputWatch::settlement(tc, &receipt);
     loop {
         // The settlement is paid and the wait has its own deadline, so a
         // failed connection is as transient here as an unavailable node.
-        let response = match tc.connect().await {
-            Ok(mut client) => {
+        let connected = tc.connect().await;
+        let response = match &connected {
+            Ok(client) => {
                 client
+                    .clone()
                     .get_mint_authorization_witness(
                         quil_types::proto::node::GetMintAuthorizationWitnessRequest {
                             receipt: receipt.to_vec(),
@@ -6421,6 +6470,9 @@ pub(super) async fn settlement_claim(
             }
             Err(status) if crate::retry::transient(status.code()) => {}
             Err(status) => return Err(anyhow::anyhow!("settlement witness: {status}")),
+        }
+        if let Ok(client) = &connected {
+            inputs.poll(client).await?;
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
