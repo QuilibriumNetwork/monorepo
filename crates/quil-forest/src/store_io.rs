@@ -1065,6 +1065,73 @@ pub fn start_master(db: &CoordinatedDb) -> bool {
     )
 }
 
+/// What the reads this thread made while some work ran cost, from RocksDB's
+/// per-thread perf context: reads on other threads are not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadReads {
+    /// Blocks read from table files, missing the block cache.
+    pub block_reads: u64,
+    pub block_read_time: Duration,
+    pub block_cache_hits: u64,
+}
+
+thread_local! {
+    /// The perf level this thread runs at. RocksDB keeps one per thread,
+    /// starting at counts only, and has no getter; every change goes through
+    /// [`with_perf_level`], which records it here.
+    static PERF_LEVEL: std::cell::Cell<rocksdb::perf::PerfStatsLevel> =
+        const { std::cell::Cell::new(rocksdb::perf::PerfStatsLevel::EnableCount) };
+}
+
+/// Runs its closure when dropped, on return and on unwind alike: state a
+/// function sets on its thread for some work is restored even if the work
+/// panics and a caller catches it.
+pub(crate) struct RestoreOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> RestoreOnDrop<F> {
+    pub(crate) fn new(restore: F) -> Self {
+        Self(Some(restore))
+    }
+}
+
+impl<F: FnOnce()> Drop for RestoreOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
+        }
+    }
+}
+
+/// Run `work` at RocksDB perf `level` on this thread, then restore the level
+/// the thread had, also if `work` panics.
+pub fn with_perf_level<T>(level: rocksdb::perf::PerfStatsLevel, work: impl FnOnce() -> T) -> T {
+    use rocksdb::perf::set_perf_stats;
+    let prior = PERF_LEVEL.replace(level);
+    set_perf_stats(level);
+    let _restore = RestoreOnDrop::new(move || {
+        PERF_LEVEL.set(prior);
+        set_perf_stats(prior);
+    });
+    work()
+}
+
+/// Run `work` and count its reads on this thread. Timing each block read
+/// costs a clock read; use it where the work is measured anyway.
+pub fn count_thread_reads<T>(work: impl FnOnce() -> T) -> (T, ThreadReads) {
+    use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel};
+    with_perf_level(PerfStatsLevel::EnableTimeExceptForMutex, || {
+        let mut context = PerfContext::default();
+        context.reset();
+        let result = work();
+        let reads = ThreadReads {
+            block_reads: context.metric(PerfMetric::BlockReadCount),
+            block_read_time: Duration::from_nanos(context.metric(PerfMetric::BlockReadTime)),
+            block_cache_hits: context.metric(PerfMetric::BlockCacheHitCount),
+        };
+        (result, reads)
+    })
+}
+
 #[cfg(test)]
 #[path = "store_io_tests.rs"]
 mod tests;
