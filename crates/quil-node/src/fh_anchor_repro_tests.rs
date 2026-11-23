@@ -583,7 +583,7 @@ fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
     {
         Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {
             assert!(
-                held_unverified(&error),
+                held_unverified(&error, &header_bundle(rig.certified(anchor)), anchor),
                 "FH LIVENESS: a collector must hold a header anchored ahead of the window, \
                  not drop it: {error}"
             )
@@ -617,7 +617,7 @@ fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
     {
         Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {
             assert!(
-                !held_unverified(&error),
+                !held_unverified(&error, &header_bundle(rig.certified(anchor)), last + 1),
                 "FH LIVENESS: a collector must refuse a header behind the window, which rides \
                  no later frame, not hold it: {error}"
             )
@@ -632,18 +632,19 @@ fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
 }
 
 /// A window refusal names its direction at both edges, and only an anchor
-/// ahead of the window is one a later GLOBAL frame can carry.
+/// ahead of the window is one a later GLOBAL frame can carry; a collector
+/// holds one only within the leader's bound, never one far ahead.
 #[test]
 fn fh_fix_a_window_refusal_names_its_direction() {
     use quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window;
     let rig = Rig::new(2..HALT_FRAME);
     let (oldest, newest) = anchor_window(HALT_FRAME);
-    for (anchor, ahead) in [
-        (oldest - 1, false),
-        (1, false),
-        (newest + 1, true),
-        (1_000_000, true),
-        (u64::MAX, true),
+    for (anchor, ahead, held) in [
+        (oldest - 1, false, false),
+        (1, false, false),
+        (newest + 1, true, true),
+        (1_000_000, true, false),
+        (u64::MAX, true, false),
     ] {
         match rig
             .intrinsic
@@ -656,9 +657,9 @@ fn fh_fix_a_window_refusal_names_its_direction() {
                     "FH FIX: anchor {anchor}, GLOBAL frame {HALT_FRAME}: {error}"
                 );
                 assert_eq!(
-                    held_unverified(&error),
-                    ahead,
-                    "FH FIX: anchor {anchor}: only one ahead of the window is held"
+                    held_unverified(&error, &header_bundle(junk_header(anchor)), HALT_FRAME),
+                    held,
+                    "FH FIX: anchor {anchor}: only one shortly ahead of the window is held"
                 );
             }
             other => panic!("FH FIX: anchor {anchor} must be refused, got {other:?}"),

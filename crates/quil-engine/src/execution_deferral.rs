@@ -39,19 +39,25 @@ pub fn awaits_execution(error: &QuilError, anchor: u64, executed: u64) -> bool {
         && quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(error)
 }
 
-/// Whether a shard frame that verification for the GLOBAL frame after the
-/// head refused with `error` is held unverified, for the leader to verify
-/// when it packs one: the state verification needs is unavailable now, or the
-/// frame's anchor lies ahead of that GLOBAL frame's lockstep window
-/// ([`anchor_ahead_of_window`]). Such a frame rides a later GLOBAL frame once
-/// the head reaches its anchor, so it is held as it was while GLOBAL read the
-/// anchor first and found no such frame. One behind the window can ride no
-/// frame after the head: it is refused, and its sender hears so.
+/// Whether a shard frame in `bundle` that verification for GLOBAL frame
+/// `verified_for`, the one after the head, refused with `error` is held
+/// unverified, for the leader to verify when it packs one: the state
+/// verification needs is unavailable now, or the frame's anchor lies ahead of
+/// that GLOBAL frame's lockstep window ([`anchor_ahead_of_window`]) no further
+/// than the leader holds one ([`bundle_shard_frames_ahead`]). Such a frame
+/// rides a later GLOBAL frame once the head reaches its anchor, so it is held
+/// as it was while GLOBAL read the anchor first and found no such frame. One
+/// behind the window, or ahead past the leader's bound, can ride no frame
+/// after the head: it is refused, and its sender hears so. Held (until
+/// 2026-11-21), a header anchored up to `u64::MAX` stayed in an archive's
+/// mempool, its certificate unchecked, until a leader refused it.
 ///
 /// [`anchor_ahead_of_window`]: quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window
-pub fn held_unverified(error: &QuilError) -> bool {
+/// [`bundle_shard_frames_ahead`]: crate::message_collector::bundle_shard_frames_ahead
+pub fn held_unverified(error: &QuilError, bundle: &[u8], verified_for: u64) -> bool {
     error.is_execution_unavailable()
-        || quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window(error)
+        || (quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window(error)
+            && crate::message_collector::bundle_shard_frames_ahead(bundle, verified_for))
 }
 
 /// The verifier of the message collector that feeds an archive's GLOBAL
@@ -76,7 +82,7 @@ pub fn collector_verifier(
         let verified_for = current.effective().saturating_add(1);
         match manager.validate_message(verified_for, &[0xff; 32], bundle) {
             Ok(()) => ShardFrameVerdict::Valid,
-            Err(error) if held_unverified(&error) => {
+            Err(error) if held_unverified(&error, bundle, verified_for) => {
                 ShardFrameVerdict::Unavailable(error.to_string())
             }
             Err(error) => {
@@ -123,6 +129,9 @@ pub struct ShardClaim {
     pub frame: u64,
     pub anchor: u64,
     pub generation: Option<u64>,
+    /// It votes out of bounds at its anchor: fee vote fence evidence, which
+    /// GLOBAL takes as a fence rather than a frame of its shard.
+    pub evidence: bool,
 }
 
 /// Every shard frame header a canonical `MessageBundle` carries.
@@ -141,6 +150,10 @@ pub fn bundle_shard_claims(data: &[u8]) -> Vec<ShardClaim> {
         .filter(|header| !header.address.is_empty())
         .map(|header| ShardClaim {
             generation: claimed_generation(&header.public_key_signature_bls48581),
+            evidence: quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                header.global_frame_number,
+                header.fee_multiplier_vote as u64,
+            ),
             address: header.address,
             frame: header.frame_number,
             anchor: header.global_frame_number,
@@ -209,6 +222,8 @@ impl CollectorDeferrals {
     /// ([`awaits_execution`]), and a [`Provenance::Prover`] delivered it;
     /// [`ShardFrameVerdict::Full`] (refused, retryably) when such a frame came
     /// from any other sender or does not fit the caps; otherwise invalid.
+    /// Fee vote fence evidence it carries is judged so but never held here:
+    /// it takes no frame's place, and the collector refuses it only invalid.
     pub fn verdict_from(
         &self,
         error: &QuilError,
@@ -244,9 +259,11 @@ impl CollectorDeferrals {
             let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
             forget_reached(&mut held, executed);
             // Admit into copies of the touched shards, written back only if
-            // every claim fits.
+            // every claim fits. Fee vote fence evidence is no frame of its
+            // shard: counted here (until 2026-11-22), a header voting out of
+            // bounds took or evicted a held frame's place.
             let mut touched: HashMap<Vec<u8>, BTreeMap<u64, u64>> = HashMap::new();
-            for claim in &claims {
+            for claim in claims.iter().filter(|claim| !claim.evidence) {
                 let frames = touched
                     .entry(claim.address.clone())
                     .or_insert_with(|| held.get(&claim.address).cloned().unwrap_or_default());
@@ -280,7 +297,7 @@ impl CollectorDeferrals {
             held.extend(touched);
             held.len()
         };
-        for claim in &claims {
+        for claim in claims.iter().filter(|claim| !claim.evidence) {
             self.log.deferred(
                 &claim.address,
                 claim.frame,

@@ -338,7 +338,7 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
     );
     let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&parent.requests[0])
         .unwrap();
-    assert!(rig.collector.add_message(1, raw));
+    assert!(rig.collector.add_message(1, raw.clone()));
     assert!(rig.collector.add_message(1, vec![1, 2, 3]));
     let sequence = rig.db.inner().latest_sequence_number();
     {
@@ -408,9 +408,9 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
         0
     );
     assert_eq!(
-        rig.collector.total_pending(),
-        2,
-        "private proposal must not remove or age out public messages"
+        rig.collector.collect_for_rank(1),
+        vec![raw],
+        "a private proposal keeps its ancestor's input public and drops the bytes it refused"
     );
     assert_eq!(
         rig.source.hypergraph.global_commitments_checked().unwrap(),
@@ -419,48 +419,21 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
 }
 
 // After the split at 837360 each proposal for 837364 validated the same 36
-// refused messages again: proposals validate a private copy of the mempool,
-// and the public pool keeps what they refuse.
+// refused messages again: proposals validate a private copy of the mempool.
+// What one refuses leaves the public pool; a copy sent again is not
+// validated again on the same parent.
 #[test]
 fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
     let rig = Rig::new();
     let parent = rig.deploy();
     rig.put(&parent);
     let context = rig.context(&parent);
-    let confirm = quil_execution::global_intrinsic::ProverConfirm {
-        filter: Vec::new(),
-        // Signed far outside the inclusion epoch.
-        frame_number: 10_000_000,
-        public_key_signature_bls48581: Some(quil_execution::global_intrinsic::AddressedSignature {
-            signature: vec![
-                0;
-                quil_execution::global_intrinsic::AddressedSignature::SIG_LEN_SINGLE
-            ],
-            address: vec![9; 32],
-        }),
-        filters: vec![vec![1; 32]],
-        leaf_roots: Vec::new(),
-        release: None,
-    };
-    let bundle = quil_types::proto::global::MessageBundle {
-        requests: vec![quil_types::proto::global::MessageRequest {
-            request: Some(
-                quil_types::proto::global::message_request::Request::Confirm(
-                    quil_execution::global_intrinsic::conversions::prover_confirm_to_proto(
-                        &confirm,
-                    ),
-                ),
-            ),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let once = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle).unwrap();
-    let decoded = crate::consensus_wire::decode_message_bundle(&once).unwrap();
-    let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&decoded).unwrap();
-    assert_eq!(raw, once, "a canonical bundle reaches validation");
-    assert!(rig.collector.add_message(1, raw.clone()));
+    let raw = out_of_epoch_confirm();
     for proposal in 0..2 {
+        assert!(
+            rig.collector.add_message(1, raw.clone()),
+            "the public pool takes it again once refused"
+        );
         let lease = rig
             .executor
             .prepare(context, 1, &rig.blocks, &rig.verifier, true)
@@ -478,7 +451,583 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
             "validated only by the first proposal"
         );
     }
-    assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "refused, it leaves the public pool"
+    );
+}
+
+/// A storage epoch proof settling one seat, `tag` telling the proofs apart.
+fn seat_settlement(tag: u8) -> Vec<u8> {
+    use quil_execution::global_intrinsic::storage_epoch_proof::{
+        SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let proof = StorageEpochProof {
+        member: [7; 32],
+        seats: vec![SeatProof {
+            shard_filter: vec![9; 32],
+            epoch: 1500,
+            seals: false,
+            settles: true,
+            ..Default::default()
+        }],
+        proof: vec![tag; 1_000],
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+            inner_bytes: proof.to_canonical_bytes(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// Delivers `raw` to the rig's public mempool from one sender.
+fn send_seat_proof(rig: &Rig, raw: Vec<u8>) -> crate::message_collector::SubmitOutcome {
+    use crate::message_collector::Provenance;
+    rig.collector
+        .add_message_outcome_by(1, raw, Provenance::Prover, b"sender")
+}
+
+/// The GLOBAL engine dependencies an archive, the only GLOBAL proposer,
+/// installs; without them a storage epoch proof is not verifiable, and
+/// a proposal holds it rather than refusing it.
+fn install_archive_deps(rig: &Rig) {
+    rig.source
+        .execution_manager
+        .install_global_frame_header_deps(
+            rig.source.prover_registry.clone(),
+            Arc::new(crate::rewards::OptRewardIssuance),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_tries::ShaInclusionProver),
+            Arc::new(TestFrameProver),
+        )
+        .unwrap();
+}
+
+/// A storage epoch proof a private proposal refuses leaves the public
+/// mempool with its sender's seat, so the sender's next proof of the seat
+/// is held. Refused from the proposal's copy alone, the refused proof held
+/// the seat to its window's end and every later proof of it was refused.
+#[test]
+fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
+    use crate::message_collector::{Refusal, SubmitOutcome};
+    let rig = Rig::new();
+    install_archive_deps(&rig);
+    rig.collector.set_class_shares();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let send = |raw: Vec<u8>| send_seat_proof(&rig, raw);
+    let refused = seat_settlement(1);
+    assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
+    assert_eq!(
+        send(seat_settlement(2)),
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "the sender's seat is held before the proposal"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    let state = lease.prove(&[]).unwrap();
+    assert!(state.state.messages.is_empty());
+    assert!(
+        rig.leader.refused_message(&refused).is_some(),
+        "the proposal validated and refused the proof"
+    );
+    assert_eq!(
+        send(seat_settlement(3)),
+        SubmitOutcome::Accepted,
+        "SEAT-FREED: a proof the proposal refused still holds its sender's seat"
+    );
+}
+
+/// A message that is not a canonical bundle, which a private proposal
+/// discards, leaves the public mempool too: discarded from the proposal's
+/// copy alone, every later proposal copied and discarded it again.
+#[test]
+fn a_malformed_input_a_proposal_discards_leaves_the_public_pool() {
+    use crate::message_collector::SubmitOutcome;
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let mut malformed = seat_settlement(1);
+    malformed.push(0);
+    assert_eq!(
+        send_seat_proof(&rig, malformed),
+        SubmitOutcome::Accepted,
+        "the mempool holds a message it cannot decode"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "MALFORMED-KEPT: a malformed input the proposal discarded stayed public"
+    );
+}
+
+/// A bundle carrying a prover confirm signed far outside its inclusion
+/// epoch, which validation refuses at every frame.
+fn out_of_epoch_confirm() -> Vec<u8> {
+    let confirm = quil_execution::global_intrinsic::ProverConfirm {
+        filter: Vec::new(),
+        frame_number: 10_000_000,
+        public_key_signature_bls48581: Some(quil_execution::global_intrinsic::AddressedSignature {
+            signature: vec![
+                0;
+                quil_execution::global_intrinsic::AddressedSignature::SIG_LEN_SINGLE
+            ],
+            address: vec![9; 32],
+        }),
+        filters: vec![vec![1; 32]],
+        leaf_roots: Vec::new(),
+        release: None,
+    };
+    canonical_bundle(&quil_types::proto::global::MessageBundle {
+        requests: vec![quil_types::proto::global::MessageRequest {
+            request: Some(
+                quil_types::proto::global::message_request::Request::Confirm(
+                    quil_execution::global_intrinsic::conversions::prover_confirm_to_proto(
+                        &confirm,
+                    ),
+                ),
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+}
+
+/// `bundle`'s canonical bytes, which reach validation unchanged.
+fn canonical_bundle(bundle: &quil_types::proto::global::MessageBundle) -> Vec<u8> {
+    let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle).unwrap();
+    assert_eq!(
+        canonical_bytes(&raw),
+        raw,
+        "a canonical bundle reaches validation"
+    );
+    raw
+}
+
+/// `raw` decoded and encoded again, as a leader checks its inputs.
+fn canonical_bytes(raw: &[u8]) -> Vec<u8> {
+    let decoded = crate::consensus_wire::decode_message_bundle(raw).unwrap();
+    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&decoded).unwrap()
+}
+
+/// A paying rig's deploy, paid by its seeded settlement record.
+fn paid_request(rig: &Rig) -> Vec<u8> {
+    let genesis = rig.clock.get_global_clock_frame(0).unwrap();
+    let root: [u8; 32] = genesis
+        .header
+        .unwrap()
+        .prover_tree_commitment
+        .try_into()
+        .unwrap();
+    canonical_bundle(&PaidDeploy::new(&Rig::token_deploy()).bundle(&rig.source.hypergraph, root))
+}
+
+/// The bundles a proposal carries, as bytes.
+fn carried(messages: &[quil_types::proto::global::MessageBundle]) -> Vec<Vec<u8>> {
+    messages
+        .iter()
+        .map(|bundle| {
+            crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle).unwrap()
+        })
+        .collect()
+}
+
+/// What a private proposal on `parent` carries.
+fn propose_privately(rig: &Rig, parent: &GlobalFrame) -> Vec<Vec<u8>> {
+    let lease = rig
+        .executor
+        .prepare(rig.context(parent), 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    carried(&lease.prove(&[]).unwrap().state.messages)
+}
+
+/// What the rig's node leader proposes on its genesis, over the public
+/// mempool itself.
+fn propose_on_genesis(rig: &Rig) -> Vec<Vec<u8>> {
+    use quil_consensus::leader_provider::LeaderProvider as _;
+    let state = rig
+        .leader
+        .prove_next_state(1, &[], 0, &rig.genesis.as_ref().to_vec())
+        .unwrap();
+    carried(&state.state.messages)
+}
+
+/// A message a private proposal cannot judge (a header or store read
+/// this node lacks) stays in the public mempool, not remembered as
+/// refused, until a proposal can: refused then, it leaves. Refused at
+/// once, it left the public mempool for good.
+#[test]
+fn a_message_a_private_proposal_cannot_judge_stays_public_until_refused() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let raw = out_of_epoch_confirm();
+    assert!(rig.collector.add_message(1, raw.clone()));
+    rig.leader.hold_unverifiable(&raw, true);
+    assert!(propose_privately(&rig, &parent).is_empty());
+    assert_eq!(
+        rig.collector.collect_for_rank(1),
+        vec![raw.clone()],
+        "BRANCH-HELD-LEFT: a message the proposal could not judge left the public mempool"
+    );
+    assert_eq!(
+        rig.leader.refused_message(&raw),
+        None,
+        "BRANCH-HELD-LEFT: a message the proposal could not judge was remembered as refused"
+    );
+    rig.leader.hold_unverifiable(&raw, false);
+    assert!(propose_privately(&rig, &parent).is_empty());
+    let reason = rig
+        .leader
+        .refused_message(&raw)
+        .expect("judged, it is refused");
+    assert!(reason.contains("inclusion epoch"), "{reason}");
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "refused, it leaves the public mempool"
+    );
+}
+
+/// A message a private proposal cannot judge rides the next proposal
+/// that validates it.
+#[test]
+fn a_message_a_private_proposal_cannot_judge_rides_once_it_validates() {
+    let rig = Rig::paying();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let raw = paid_request(&rig);
+    assert!(rig.collector.add_message(1, raw.clone()));
+    rig.leader.hold_unverifiable(&raw, true);
+    assert!(propose_privately(&rig, &parent).is_empty());
+    rig.leader.hold_unverifiable(&raw, false);
+    assert_eq!(
+        propose_privately(&rig, &parent),
+        vec![raw],
+        "BRANCH-HELD-NEVER-RODE: a message the proposal could not judge never rode once valid"
+    );
+}
+
+/// [`a_message_a_private_proposal_cannot_judge_stays_public_until_refused`]
+/// for a leader over the public mempool itself.
+#[test]
+fn a_message_a_leader_cannot_judge_stays_public_until_refused() {
+    let rig = Rig::new();
+    let raw = out_of_epoch_confirm();
+    assert!(rig.collector.add_message(1, raw.clone()));
+    rig.leader.hold_unverifiable(&raw, true);
+    assert!(propose_on_genesis(&rig).is_empty());
+    assert_eq!(
+        rig.collector.collect_for_rank(1),
+        vec![raw.clone()],
+        "LEADER-HELD-LEFT: a message the leader could not judge left the mempool"
+    );
+    assert_eq!(
+        rig.leader.refused_message(&raw),
+        None,
+        "LEADER-HELD-LEFT: a message the leader could not judge was remembered as refused"
+    );
+    rig.leader.hold_unverifiable(&raw, false);
+    assert!(propose_on_genesis(&rig).is_empty());
+    let reason = rig
+        .leader
+        .refused_message(&raw)
+        .expect("judged, it is refused");
+    assert!(reason.contains("inclusion epoch"), "{reason}");
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "refused, it leaves the mempool"
+    );
+}
+
+/// [`a_message_a_private_proposal_cannot_judge_rides_once_it_validates`]
+/// for a leader over the public mempool itself.
+#[test]
+fn a_message_a_leader_cannot_judge_rides_once_it_validates() {
+    let rig = Rig::paying();
+    let raw = paid_request(&rig);
+    assert!(rig.collector.add_message(1, raw.clone()));
+    rig.leader.hold_unverifiable(&raw, true);
+    assert!(propose_on_genesis(&rig).is_empty());
+    rig.leader.hold_unverifiable(&raw, false);
+    assert_eq!(
+        propose_on_genesis(&rig),
+        vec![raw],
+        "LEADER-HELD-NEVER-RODE: a message the leader could not judge never rode once valid"
+    );
+}
+
+/// A shard proof anchored ahead of the proposed frame, up to the window's
+/// newest anchor plus `RETENTION_WINDOW`, stays in the mempool and rides
+/// the frame whose window reaches it. One no frame can carry before its
+/// rank ages out leaves it: naming no anchor once anchors are required,
+/// or anchored past that bound (`u64::MAX` included).
+#[test]
+fn a_shard_proof_anchored_ahead_of_the_frame_stays_and_one_behind_leaves() {
+    use crate::message_collector::bundle_shard_frames_in_lockstep as in_lockstep;
+    use crate::message_collector::RETENTION_WINDOW;
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let shard_proof = |address: u8, anchor: u64| {
+        let header = FrameHeader {
+            address: vec![address; 32],
+            frame_number: 3,
+            global_frame_number: anchor,
+            ..Default::default()
+        };
+        let raw = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header.to_canonical_bytes().unwrap(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        assert_eq!(
+            canonical_bytes(&raw),
+            raw,
+            "a canonical bundle reaches validation"
+        );
+        raw
+    };
+    let rig = Rig::new();
+    // Frame 1 carries anchors in 0..=0; frame 2 in 0..=1.
+    let ahead = shard_proof(0x11, 1);
+    let behind = shard_proof(0x22, 0);
+    let edge = shard_proof(0x33, RETENTION_WINDOW);
+    let past = shard_proof(0x44, RETENTION_WINDOW + 1);
+    let farthest = shard_proof(0x55, u64::MAX);
+    // Verified on admission, as an archive does: it rides unchecked.
+    assert!(rig.collector.add_verified_message(1, ahead.clone()));
+    for raw in [&behind, &edge, &past, &farthest] {
+        assert!(rig.collector.add_message(1, raw.clone()));
+    }
+    quil_types::consensus::set_required_anchor_epoch_for_thread(Some(0));
+    for raw in [&ahead, &behind, &edge, &past, &farthest] {
+        assert!(!in_lockstep(raw, 1));
+    }
+    let messages = propose_on_genesis(&rig);
+    quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+    assert!(messages.is_empty());
+    let pending = rig.collector.collect_for_rank(1);
+    assert!(
+        pending.contains(&ahead) && !pending.contains(&behind),
+        "AHEAD-LEFT: a shard proof anchored ahead of the frame left the mempool, or one behind stayed"
+    );
+    assert!(
+        pending.contains(&edge),
+        "AHEAD-EDGE: a shard proof anchored at the newest anchor plus the retention window left the mempool"
+    );
+    assert!(
+        !pending.contains(&past) && !pending.contains(&farthest),
+        "AHEAD-UNBOUNDED: a shard proof anchored past the newest anchor plus the retention window stayed"
+    );
+    assert_eq!(
+        pending.len(),
+        2,
+        "only the proofs a later frame can carry stay"
+    );
+    let parent = rig.deploy();
+    rig.put(&parent);
+    assert!(in_lockstep(&ahead, 2));
+    assert_eq!(
+        propose_privately(&rig, &parent),
+        vec![ahead],
+        "AHEAD-NEVER-RODE: a shard proof held ahead of its window never rode the frame whose window reached it"
+    );
+}
+
+/// A rig whose GLOBAL state settled a committee-handoff seal: its source
+/// was fenced after its closing timeout. Returns the rig and a bundle
+/// carrying a copy of that seal.
+fn settled_seal_rig() -> (Rig, Vec<u8>) {
+    use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
+    use quil_execution::global_intrinsic::handoff::{
+        self, CertificateSubmission, DesiredCommittee, SealSubmission, TYPE_COMMITTEE_HANDOFF,
+    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let mut members: Vec<_> = (0..2)
+        .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec())
+        .collect();
+    members.sort();
+    let filter = vec![0x61; 32];
+    let session = Session {
+        chain_id: [7; 32],
+        filter: filter.clone(),
+        generation: 1,
+        genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+        base_frame: 0,
+        authorization: [0; 32],
+        members: members.clone(),
+    };
+    let mut seal = None;
+    let signer = Arc::new(quil_crypto::FalconSigner::generate());
+    let fixture = Fixture::seeded(Some(signer.public_key()), |crdt| {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+        let commit = || {
+            state.commit().unwrap();
+            state.abort();
+            crdt.commit(0).unwrap();
+        };
+        handoff::initialize(&state, 1, &session).unwrap();
+        commit();
+        let request = handoff::schedule(
+            &state,
+            2,
+            vec![filter.clone()],
+            vec![DesiredCommittee {
+                filter: filter.clone(),
+                members,
+            }],
+        )
+        .unwrap();
+        commit();
+        let due = handoff::schedule::fence_due_frame(request.frame);
+        assert_eq!(
+            handoff::schedule::fence_stalled_sources(
+                &state,
+                due,
+                std::slice::from_ref(&filter),
+                None,
+            )
+            .unwrap(),
+            1,
+            "the closing source is fenced"
+        );
+        commit();
+        seal = Some(Seal {
+            request: request.id().unwrap(),
+            session: session.id().unwrap(),
+            view: 1,
+            checkpoint: Checkpoint {
+                frame: 0,
+                view: 0,
+                digest: [0; 32],
+                state_roots: [[0; 32]; 4],
+                history_root: [0; 32],
+            },
+        });
+    });
+    let submission = CertificateSubmission {
+        seal: seal.unwrap(),
+        certificate: vec![1; 40],
+    };
+    let raw = CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_COMMITTEE_HANDOFF,
+            inner_bytes: SealSubmission {
+                submission,
+                drain: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    (Rig::over(signer, fixture), raw)
+}
+
+/// A copy of a committee-handoff seal GLOBAL already settled, which a
+/// private proposal drops, leaves the public mempool too: dropped from the
+/// proposal's copy alone, every later proposal copied and dropped it again.
+#[test]
+fn a_settled_seal_copy_a_proposal_drops_leaves_the_public_pool() {
+    let (rig, raw) = settled_seal_rig();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let view =
+        quil_execution::global_intrinsic::handoff::CommittedView::capture(&rig.source.hypergraph)
+            .unwrap();
+    let copies = crate::leader_provider::order_handoff_copies(vec![raw.clone()], Some(&view));
+    assert_eq!(
+        copies.settled,
+        vec![raw.clone()],
+        "GLOBAL's committed view shows the seal settled: the test proves nothing"
+    );
+    assert!(
+        rig.collector.add_message(1, raw),
+        "the mempool holds the settled seal's copy"
+    );
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "SETTLED-KEPT: a settled seal copy the proposal dropped stayed public"
+    );
+}
+
+/// A refused seat proof delivered again under its sender's identity (a
+/// resend by its sender, or its signed gossip copy relayed intact once the
+/// receiver's duplicate cache forgets it) holds the seat again only until
+/// the next proposal. On the same parent, as here, that proposal drops it
+/// on the refusal it remembers without validating it again; on another it
+/// validates it again and drops it as refused.
+#[test]
+fn a_replayed_refused_seat_proof_holds_its_seat_until_the_next_proposal() {
+    use crate::message_collector::{Refusal, SubmitOutcome};
+    let rig = Rig::new();
+    install_archive_deps(&rig);
+    rig.collector.set_class_shares();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let send = |raw: Vec<u8>| send_seat_proof(&rig, raw);
+    let refused = seat_settlement(1);
+    let propose = || {
+        let lease = rig
+            .executor
+            .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+            .unwrap();
+        assert!(lease.prove(&[]).unwrap().state.messages.is_empty());
+    };
+    assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
+    propose();
+    assert!(rig.leader.refused_message(&refused).is_some());
+    assert_eq!(
+        send(refused.clone()),
+        SubmitOutcome::Accepted,
+        "a replayed copy of the refused proof is held again"
+    );
+    assert_eq!(
+        send(seat_settlement(2)),
+        SubmitOutcome::Filtered(Refusal::RankFull),
+        "the replayed copy holds the seat until a proposal"
+    );
+    propose();
+    assert_eq!(
+        rig.leader.refusals_reused(),
+        1,
+        "the next proposal drops the replayed copy on its remembered refusal"
+    );
+    assert_eq!(
+        send(seat_settlement(3)),
+        SubmitOutcome::Accepted,
+        "REPLAY-HELD: a replayed refused proof held its sender's seat past the next proposal"
+    );
 }
 
 #[test]
@@ -2390,6 +2939,7 @@ fn a_branch_leader_takes_a_proof_its_base_applied_from_the_mempool() {
         crdt.commit(0).unwrap();
     });
     let rig = Rig::over(signer, fixture);
+    install_archive_deps(&rig);
     let parent = rig.deploy();
     rig.put(&parent);
     rig.collector.note_finalized_frame(1);

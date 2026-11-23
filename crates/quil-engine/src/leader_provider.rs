@@ -88,10 +88,10 @@ type ValidationContext = (u64, Vec<u8>, u64);
 
 /// Messages validation refused under one [`ValidationContext`], shared by a
 /// node's leader and every execution-branch leader it makes. A proposal
-/// validates a private copy of the mempool and leaves the public pool as it
-/// is, so each proposal at one height validated the same refused messages
-/// again: after the split at 837360, 36 of them took most of every
-/// proposal's validation time.
+/// validates a private copy of the mempool and drops what it refuses from
+/// the public pool too, but a refused message sent again is copied again:
+/// after the split at 837360, 36 of them took most of every proposal's
+/// validation time at one height.
 #[derive(Default)]
 struct RejectedMessages {
     context: Option<ValidationContext>,
@@ -101,6 +101,10 @@ struct RejectedMessages {
     copies: std::collections::HashMap<[u8; 32], CopyRefusal>,
     #[cfg(test)]
     reused: usize,
+    /// Messages whose validation reports this node unable to judge them
+    /// ([`GlobalLeaderProvider::hold_unverifiable`]).
+    #[cfg(test)]
+    unverifiable: std::collections::HashSet<[u8; 32]>,
 }
 
 /// GLOBAL frames a seal copy's refusal stands while the sources of the seals
@@ -126,6 +130,12 @@ impl RejectedMessages {
             self.reasons.clear();
         }
         self.context = context;
+    }
+
+    /// A test made validation report this node unable to judge `hash`.
+    #[cfg(test)]
+    fn unverifiable(&self, hash: &[u8; 32]) -> bool {
+        self.unverifiable.contains(hash)
     }
 
     fn refused(&mut self, hash: &[u8; 32]) -> Option<String> {
@@ -715,33 +725,54 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     selection
 }
 
-/// Remove `invalid`, the messages a leader's validation dropped, from its
-/// `collector`. A branch leader's collector is its proposal's copy of the
-/// public `mempool`, with the frame its branch was executed over: of what
-/// it drops, only proofs of seat parts a frame at or below both that frame
-/// and the finalized one applied leave the mempool
-/// ([`MessageCollector::learn_committed`]). `applied_of` reads those parts
-/// from the state validation ran on, so they re-teach a mempool that
-/// restarted and never saw those frames applied. Returns how many messages
-/// left the mempool: all of `invalid` for a leader over the mempool itself
-/// (`mempool` `None`).
+/// `error` as a log bucket: digit runs become '#', so per-epoch and
+/// per-frame variants group together, cut to 90 characters.
+fn reason_bucket(error: &str) -> String {
+    error
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .take(90)
+        .collect()
+}
+
+/// Remove `invalid`, the messages a leader's validation refused, from its
+/// `collector` and the mempool; returns how many left the mempool. A
+/// branch leader's collector is its proposal's copy of the public
+/// `mempool`, with the frame its branch was executed over: the state
+/// validation ran on holds the frames executed above it, any of which may
+/// yet be abandoned. So a message whose seat parts `applied_of` reads all
+/// sit above both that frame and the finalized one stays in the mempool,
+/// until that frame finalizes ([`MessageCollector::learn_published`]) or
+/// is abandoned and the message validates. Every other message leaves it
+/// ([`MessageCollector::remove_refused`]), and the parts at or below both
+/// are learned ([`MessageCollector::learn_committed`]): they re-teach a
+/// mempool that restarted and never saw those frames applied. A leader
+/// over the mempool itself (`mempool` `None`) drops all of `invalid`.
 pub(crate) fn release_applied(
     collector: &MessageCollector,
     mempool: Option<(&MessageCollector, u64)>,
     invalid: &[Vec<u8>],
     applied_of: impl Fn(&[u8]) -> Vec<quil_types::execution::SeatPartChange>,
 ) -> usize {
-    let applied: Vec<quil_types::execution::SeatPartChange> =
-        invalid.iter().flat_map(|raw| applied_of(raw)).collect();
-    let left = match mempool {
-        Some((mempool, base)) => mempool.learn_committed(&applied, base),
-        None => {
-            collector.learn_committed(&applied, u64::MAX);
-            invalid.len()
+    let applied: Vec<Vec<quil_types::execution::SeatPartChange>> =
+        invalid.iter().map(|raw| applied_of(raw)).collect();
+    let parts: Vec<quil_types::execution::SeatPartChange> =
+        applied.iter().flatten().cloned().collect();
+    match mempool {
+        Some((mempool, base)) => {
+            collector.remove(invalid);
+            let leaving: Vec<Vec<u8>> = invalid
+                .iter()
+                .zip(&applied)
+                .filter(|(_, parts)| {
+                    parts.is_empty() || parts.iter().any(|part| mempool.is_committed(part, base))
+                })
+                .map(|(raw, _)| raw.clone())
+                .collect();
+            mempool.learn_committed(&parts, base) + mempool.remove_refused(&leaving)
         }
-    };
-    collector.remove(invalid);
-    left
+        None => collector.learn_committed(&parts, u64::MAX) + collector.remove_refused(invalid),
+    }
 }
 
 /// What a proposal's executed ancestors did
@@ -821,9 +852,10 @@ pub struct GlobalLeaderProvider {
     pool: Option<crate::proposal_pool::ProposalPool>,
     /// The public mempool an execution-branch leader's `message_collector`
     /// copied ([`Self::for_execution_branch`]), with its branch's executed
-    /// base: what its validation drops leaves only the copy, except a proof
-    /// a frame at or below that base and finalized applied
-    /// ([`MessageCollector::learn_committed`]). `None` for a leader over the
+    /// base. What its proposal refuses leaves both ([`Self::drop_messages`]),
+    /// save proofs refused only for seat parts applied above that base and
+    /// the finalized frame, which stay public; it learns parts applied at
+    /// or below both ([`release_applied`]). `None` for a leader over the
     /// mempool itself.
     mempool: Option<(Arc<MessageCollector>, u64)>,
 }
@@ -853,6 +885,19 @@ impl GlobalLeaderProvider {
             .reasons
             .get(&<[u8; 32]>::from(Sha256::digest(raw)))
             .cloned()
+    }
+
+    /// Make validation report this node unable to judge `raw` while
+    /// `unverifiable`, as a missing header or store read does.
+    #[cfg(test)]
+    pub(crate) fn hold_unverifiable(&self, raw: &[u8], unverifiable: bool) {
+        let hash = <[u8; 32]>::from(Sha256::digest(raw));
+        let mut rejected = self.rejected.lock().unwrap();
+        if unverifiable {
+            rejected.unverifiable.insert(hash);
+        } else {
+            rejected.unverifiable.remove(&hash);
+        }
     }
 
     /// How many messages were dropped on a remembered refusal.
@@ -912,6 +957,18 @@ impl GlobalLeaderProvider {
         leader.pool = self.message_collector.take_proposal_pool();
         leader.mempool = Some((self.message_collector.clone(), ancestors.base));
         Ok(leader)
+    }
+
+    /// Drop `raw` from the mempool: from an execution-branch leader's copy
+    /// and the public collector it copied. Dropped from the copy alone, a
+    /// message stayed held for every later proposal to copy and drop again,
+    /// a storage epoch proof with its sender's seat to its window's end.
+    /// Each collector remembers them as refused for its share-full line.
+    fn drop_messages(&self, raw: &[Vec<u8>]) {
+        self.message_collector.remove_refused(raw);
+        if let Some((mempool, _)) = &self.mempool {
+            mempool.remove_refused(raw);
+        }
     }
 
     pub fn new(
@@ -1636,7 +1693,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 rejected = malformed.len(),
                 "discarding non-canonical GLOBAL proposal inputs"
             );
-            self.message_collector.remove(&malformed);
+            self.drop_messages(&malformed);
         }
         // Committee-handoff seals: every member of a closing committee submits
         // the same seal and resubmits until its own view shows it recorded,
@@ -1659,7 +1716,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     settled = copies.settled.len(),
                     "dropping committee-handoff seals GLOBAL already recorded"
                 );
-                self.message_collector.remove(&copies.settled);
+                self.drop_messages(&copies.settled);
             }
             copies
         };
@@ -1699,10 +1756,19 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let (mut deferred, mut deferred_capacity) = (0usize, 0usize);
                 // Fee vote fence headers: one copy per shard frame rides, the
                 // first that validates in `fee_fence_copies_by_signers`'
-                // order, and the others wait in the mempool. One this node
-                // cannot judge now (an anchor or state it lacks) waits too.
+                // order, and the others wait in the mempool.
                 let mut fence_riding: std::collections::HashSet<(Vec<u8>, u64)> =
                     std::collections::HashSet::new();
+                // What this proposal leaves out without refusing it, by
+                // `"<msg_type> :: <reason>"`: messages this node cannot judge
+                // now (a header, anchor or store read it lacks: no evidence
+                // against them) and shard proofs anchored ahead of this frame.
+                // They are not remembered as refused and stay in the mempool
+                // until one validates, is refused or its window evicts it.
+                // Refused (until 2026-11-20), each left the public mempool
+                // for good and its sender had to send it again.
+                let mut held: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 let mut fence_unavailable = 0usize;
                 // Op kinds → (messages, total ms, slowest ms), logged when
                 // validation is slow, to tell one costly op from a slow store.
@@ -1727,6 +1793,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             frame_number,
                         ) {
                             in_lockstep_shard.push(raw);
+                        } else if crate::message_collector::bundle_shard_frames_ahead(
+                            &raw,
+                            frame_number,
+                        ) {
+                            // A later frame may carry it.
+                            *held
+                                .entry(format!(
+                                    "{} :: shard proof anchored ahead of this frame",
+                                    msg_type(&raw)
+                                ))
+                                .or_insert(0) += 1;
                         } else {
                             *drop_reasons
                                 .entry(format!("{} :: out-of-lockstep-shard-frame", msg_type(&raw)))
@@ -1786,7 +1863,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         continue;
                     }
                     let started = std::time::Instant::now();
-                    let outcome = validator.validate_message(frame_number, &global_addr, &raw);
+                    #[cfg(test)]
+                    let unverifiable = self.rejected.lock().unwrap().unverifiable(&hash);
+                    #[cfg(not(test))]
+                    let unverifiable = false;
+                    let outcome = if unverifiable {
+                        Err(QuilError::ExecutionUnavailable(
+                            "a test holds it unverifiable".into(),
+                        ))
+                    } else {
+                        validator.validate_message(frame_number, &global_addr, &raw)
+                    };
                     let ms = started.elapsed().as_millis() as u64;
                     let entry = validation_ms
                         .entry(message_kinds(&raw))
@@ -1798,28 +1885,33 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             fence_riding.extend(fence_keys);
                             valid.push((index, raw));
                         }
-                        // Fence evidence this node cannot judge now waits for
-                        // a later frame within its anchor window, as a shard
-                        // tip does: dropped, it would leave its session's
-                        // members waiting on a frame GLOBAL never fences.
-                        Err(e) if e.is_execution_unavailable() && !fence_keys.is_empty() => {
-                            fence_unavailable += 1;
+                        // A message this node cannot judge now waits for a
+                        // later frame, as a shard tip does: held, never
+                        // refused. Fence evidence dropped would leave its
+                        // session's members waiting on a frame GLOBAL never
+                        // fences.
+                        Err(e) if e.is_execution_unavailable() => {
+                            if !fence_keys.is_empty() {
+                                fence_unavailable += 1;
+                            }
+                            *held
+                                .entry(format!(
+                                    "{} :: {}",
+                                    msg_type(&raw),
+                                    reason_bucket(&e.to_string())
+                                ))
+                                .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
-                                "fee vote fence header not verifiable this frame; left for a later one",
+                                fence_header = !fence_keys.is_empty(),
+                                "GLOBAL message not verifiable this frame; left for a later one",
                             );
                         }
                         Err(e) => {
                             let error = e.to_string();
                             crate::storage_proof_refusal::note(frame_number, &raw, &error);
-                            // Normalize the reason (digit runs → '#') so per-epoch /
-                            // per-frame variants group into one bucket.
-                            let reason: String = error
-                                .chars()
-                                .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                                .take(90)
-                                .collect();
+                            let reason = reason_bucket(&error);
                             *drop_reasons
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
@@ -1905,12 +1997,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                 Ok(()) => TipCheck::Valid,
                                 Err(e) if e.is_execution_unavailable() => TipCheck::Unavailable,
                                 Err(e) => {
-                                    let reason: String = e
-                                        .to_string()
-                                        .chars()
-                                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                                        .take(90)
-                                        .collect();
+                                    let reason = reason_bucket(&e.to_string());
                                     rejected.lock().unwrap().remember(
                                         context,
                                         hash,
@@ -2003,19 +2090,25 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     );
                 }
                 if tips.deferred > 0 {
-                    tracing::info!(
-                        frame = frame_number,
-                        deferred = tips.deferred,
-                        "shard-frame proofs not verified this frame; left for a later one",
-                    );
+                    *held
+                        .entry("shard tip :: not verifiable this frame".to_string())
+                        .or_insert(0) += tips.deferred;
                 }
-                if fence_unavailable > 0 {
+                if !held.is_empty() {
+                    let mut breakdown: Vec<(String, usize)> = held.into_iter().collect();
+                    breakdown.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                     tracing::info!(
                         frame = frame_number,
-                        deferred = fence_unavailable,
+                        held = breakdown.iter().map(|(_, n)| n).sum::<usize>(),
+                        fence_headers = fence_unavailable,
+                        by_reason = %breakdown
+                            .iter()
+                            .map(|(k, n)| format!("{n}× {k}"))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
                         scope = "this node",
-                        until = "it holds the GLOBAL frame each header anchors to",
-                        "fee vote fence headers not verifiable this frame; left for a later one",
+                        until = "each validates, is refused, or its window evicts it",
+                        "GLOBAL messages left out of this proposal unrefused; they stay in the mempool",
                     );
                 }
                 if !invalid.is_empty() {
@@ -2041,7 +2134,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
-                        from = if self.mempool.is_some() { "proposal copy" } else { "global mempool" },
+                        from = if self.mempool.is_some() {
+                            "proposal copy and global mempool"
+                        } else {
+                            "global mempool"
+                        },
                         left_mempool,
                         by_reason = %by_reason,
                         "dropped protocol-invalid messages",

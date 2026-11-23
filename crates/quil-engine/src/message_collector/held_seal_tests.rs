@@ -44,6 +44,14 @@ fn field(line: &str, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A share-full line's detail naming no seat and no refused proof.
+fn no_detail() -> ShareFullDetail {
+    ShareFullDetail {
+        seat: String::new(),
+        refused_held: (0, 0),
+    }
+}
+
 /// `line` holds `name` with the text `value`.
 fn has(line: &str, name: &str, value: &str) -> bool {
     line.split_whitespace()
@@ -183,7 +191,7 @@ fn share_full_lines_count_every_refusal_once() {
         for turn in 0..turns {
             let now = t0 + Duration::from_secs(at + turn * 5);
             for _ in 0..each {
-                mc.note_share_full(now, state());
+                mc.note_share_full(now, state(), no_detail);
                 refused += 1;
             }
             mc.note_share_accepting(now + Duration::from_secs(1), 1);
@@ -213,6 +221,54 @@ fn share_full_lines_count_every_refusal_once() {
     );
     assert_eq!(ended.len(), 1, "share_full_end: {ended:?}");
     assert_eq!(field(&ended[0], "refused_total"), refused, "{}", ended[0]);
+}
+
+/// A share-full line names the refused proof's share and first seat, and
+/// the held proofs a GLOBAL proposal already refused that were sent again:
+/// on mainnet about half of a median proposal's held proofs were ones
+/// GLOBAL refuses, holding the seal share full (2026-11-19).
+#[test]
+fn a_share_full_line_names_the_seat_its_share_and_refused_held_bytes() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.install();
+    let mc = collector();
+    let refused = settling(1, 1);
+    assert_eq!(send(&mc, 1, &refused), SubmitOutcome::Accepted);
+    mc.remove_refused(std::slice::from_ref(&refused));
+    assert_eq!(
+        send(&mc, 1, &refused),
+        SubmitOutcome::Accepted,
+        "removed, its seat takes it again"
+    );
+    let mut next = 2;
+    fill_with_firsts(&mc, &mut next);
+    let last = next - 1;
+    let lines = logs.lines_with("refusing submits over their class share");
+    eprintln!("REACH share_full detail lines={}", lines.len());
+    let [line] = lines.as_slice() else {
+        panic!("share_full_line: one line expected, got {lines:?}");
+    };
+    let seat = format!(
+        "{}/{}/{EPOCH}/settle",
+        hex::encode(last.to_be_bytes()),
+        "00000000"
+    );
+    assert!(
+        has(line, "latest_share", "seals"),
+        "share_full_share: {line}"
+    );
+    assert!(
+        has(line, "latest_seat", &seat),
+        "share_full_seat {seat}: {line}"
+    );
+    assert_eq!(
+        (
+            field(line, "refused_held_pending"),
+            field(line, "refused_held_bytes")
+        ),
+        (1, refused.len() as u64),
+        "share_full_refused_held: {line}"
+    );
 }
 
 /// Proofs dropped without riding a frame are summarized in one line that
@@ -489,11 +545,11 @@ fn a_refusal_after_a_quiet_interval_begins_an_episode() {
     };
     let t0 = Instant::now();
     for _ in 0..3 {
-        mc.note_share_full(t0, state());
+        mc.note_share_full(t0, state(), no_detail);
     }
     let later = t0 + RANK_FULL_LOG_EVERY + Duration::from_secs(5);
     for _ in 0..2 {
-        mc.note_share_full(later, state());
+        mc.note_share_full(later, state(), no_detail);
     }
     mc.note_share_accepting(later + 2 * RANK_FULL_LOG_EVERY, 1);
     let refusing = logs.lines_with("refusing submits over their class share");
@@ -508,5 +564,36 @@ fn a_refusal_after_a_quiet_interval_begins_an_episode() {
     assert!(
         refusing.len() == 2 && field(&refusing[1], "for_secs") == 0,
         "quiet_episode_start: {refusing:?}"
+    );
+}
+
+/// The refused keys a share-full line reads are bounded: past
+/// [`REFUSED_KEYS_KEPT`] the oldest is forgotten first, a key noted again
+/// takes no second place, and the set and its order name the same keys.
+#[test]
+fn refused_keys_forget_the_oldest_past_their_bound() {
+    let key = |i: usize| -> [u8; 32] {
+        let mut key = [0; 32];
+        key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        key
+    };
+    let mut refused = RefusedKeys::default();
+    for i in 0..REFUSED_KEYS_KEPT {
+        refused.note(key(i));
+    }
+    refused.note(key(0));
+    assert_eq!(refused.order.len(), REFUSED_KEYS_KEPT, "a key noted again");
+    refused.note(key(REFUSED_KEYS_KEPT));
+    assert_eq!(
+        (refused.keys.len(), refused.order.len()),
+        (REFUSED_KEYS_KEPT, REFUSED_KEYS_KEPT),
+        "REFUSED-BOUND: the refused keys outgrew their bound"
+    );
+    assert!(!refused.keys.contains(&key(0)), "the oldest is forgotten");
+    assert!(refused.keys.contains(&key(1)) && refused.keys.contains(&key(REFUSED_KEYS_KEPT)));
+    assert_eq!(refused.order.front(), Some(&key(1)));
+    assert!(
+        refused.order.iter().all(|key| refused.keys.contains(key)),
+        "the set and its order name the same keys"
     );
 }
