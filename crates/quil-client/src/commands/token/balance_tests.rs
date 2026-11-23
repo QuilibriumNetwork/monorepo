@@ -289,3 +289,23 @@ fn quil_amounts_read_briefly() {
     assert_eq!(quil_brief(8), "0.000000001");
     assert_eq!(quil_brief(1), "0.000000000125");
 }
+
+/// A node's refusal is printed without the control characters it carries.
+#[test]
+fn a_nodes_refusal_is_printed_without_control_characters() {
+    let hostile =
+        tonic::Status::unavailable("\u{1b}[2J\u{1b}]52;c;cHduZWQ=\u{7}\nBalance: 1000 QUIL\r");
+    for error in [
+        anyhow::Error::new(hostile.clone()),
+        anyhow::Error::new(hostile).context("claimable rewards"),
+    ] {
+        let shown = reason(&error);
+        eprintln!("REACH balance-reason {}", shown.escape_debug());
+        assert!(
+            !shown.chars().any(char::is_control),
+            "REMOTE-TEXT-UNFILTERED: {}",
+            shown.escape_debug()
+        );
+        assert!(shown.contains("Balance: 1000 QUIL"), "{shown}");
+    }
+}

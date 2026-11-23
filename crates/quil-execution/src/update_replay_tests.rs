@@ -381,3 +381,184 @@ fn hypergraph_admission_takes_either_form_and_execution_only_the_bound_one() {
         "harness: rotated"
     );
 }
+
+/// Switch on, for this thread, the execution rules the metadata vertex tests
+/// expect from the frame they run at.
+fn strict_writes_from_genesis() {
+    quil_types::consensus::set_strict_validation_epoch_for_thread(Some(0));
+}
+
+/// The write key committed state resolves for `domain`, if any.
+fn resolved_write_key(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    domain: &[u8; 32],
+) -> Option<Vec<u8>> {
+    use crate::hypergraph_intrinsic::HypergraphConfigResolver;
+    crate::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone())
+        .write_public_key(domain)
+}
+
+/// A vertex write of one sealed field at `address` of `domain`, signed by
+/// `write` as a client signs it.
+fn signed_vertex_add(write: &FalconSigner, domain: &[u8; 32], address: &[u8; 32]) -> Vec<u8> {
+    let reader = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+    let field = crate::hypergraph_intrinsic::confidential::seal(
+        b"note",
+        &reader.public,
+        &[0x11; 32],
+        &[0x22; 12],
+    )
+    .unwrap();
+    let chunks = vec![crate::hypergraph_intrinsic::confidential::encode(&field)];
+    let message = [
+        crate::hypergraph_intrinsic::vertex_add_domain_separator(domain).unwrap(),
+        crate::hypergraph_intrinsic::vertex_add_signing_message(domain, address, &chunks).unwrap(),
+    ]
+    .concat();
+    crate::hypergraph_intrinsic::VertexAdd {
+        domain: domain.to_vec(),
+        data_address: address.to_vec(),
+        data: crate::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks(&chunks)
+            .unwrap(),
+        signature: write.sign_with_domain(&message, &[]).unwrap(),
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A vertex removal at `address` of `domain`, signed by `write`.
+fn signed_vertex_remove(write: &FalconSigner, domain: &[u8; 32], address: &[u8; 32]) -> Vec<u8> {
+    let message = [
+        crate::hypergraph_intrinsic::vertex_remove_domain_separator(domain).unwrap(),
+        crate::hypergraph_intrinsic::vertex_remove_signing_message(domain, address).unwrap(),
+    ]
+    .concat();
+    crate::hypergraph_intrinsic::VertexRemove {
+        domain: domain.to_vec(),
+        data_address: address.to_vec(),
+        signature: write.sign_with_domain(&message, &[]).unwrap(),
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A hypergraph's metadata vertex holds the configuration and schema its
+/// owner deployed. The write key signs data writes; a vertex write it signs
+/// at the metadata address must not replace that vertex.
+#[test]
+fn the_write_key_cannot_replace_the_metadata_vertex() {
+    strict_writes_from_genesis();
+    let (owner, write) = (FalconSigner::generate(), FalconSigner::generate());
+    let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+    apply(
+        &engine,
+        11,
+        &domain,
+        signed_vertex_add(&write, &domain, &[0xBB; 32]),
+    )
+    .expect("harness: a data write signed by the write key applies");
+
+    let metadata = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let rewrite = apply(
+        &engine,
+        12,
+        &domain,
+        signed_vertex_add(&write, &domain, &metadata),
+    );
+    eprintln!("REACH metadata vertex write: {rewrite:?}");
+    assert!(
+        resolved_write_key(&crdt, &domain) == Some(write.public_key().to_vec()),
+        "METADATA-VERTEX-WRITABLE: a vertex write at the metadata address applied \
+         ({rewrite:?}) and replaced the deployed configuration"
+    );
+}
+
+/// A vertex removal the write key signs at the metadata address must not
+/// erase the vertex: without it no write of the application verifies.
+#[test]
+fn the_write_key_cannot_remove_the_metadata_vertex() {
+    strict_writes_from_genesis();
+    let (owner, write) = (FalconSigner::generate(), FalconSigner::generate());
+    let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+    apply(
+        &engine,
+        11,
+        &domain,
+        signed_vertex_add(&write, &domain, &[0xBB; 32]),
+    )
+    .expect("harness: a data write signed by the write key applies");
+    apply(
+        &engine,
+        12,
+        &domain,
+        signed_vertex_remove(&write, &domain, &[0xBB; 32]),
+    )
+    .expect("harness: a data removal signed by the write key applies");
+
+    let metadata = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let removal = apply(
+        &engine,
+        13,
+        &domain,
+        signed_vertex_remove(&write, &domain, &metadata),
+    );
+    eprintln!("REACH metadata vertex removal: {removal:?}");
+    assert!(
+        resolved_write_key(&crdt, &domain) == Some(write.public_key().to_vec()),
+        "METADATA-VERTEX-WRITABLE: a vertex removal at the metadata address applied \
+         ({removal:?}) and erased the deployed configuration"
+    );
+}
+
+// ---- fix-only tests below ----
+
+/// Until the strict validation epoch a vertex write or removal at the
+/// metadata address applies as before, so every build executes a frame
+/// alike until then; an application frame is judged by its GLOBAL anchor,
+/// not its own number.
+#[test]
+fn metadata_vertex_ops_apply_as_before_until_the_strict_epoch() {
+    quil_types::consensus::set_strict_validation_epoch_for_thread(Some(10));
+    let first = 10 * quil_types::consensus::epoch_length_frames();
+    let metadata = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let at_anchor = |engine: &HypergraphExecutionEngine, domain: &[u8; 32], anchor, inner| {
+        let message = CanonicalMessageRequest::wrap(inner)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let context = quil_types::execution::FrameExecutionContext {
+            frame_number: first + 5,
+            finalized_global_frame: Some(anchor),
+            venue: None,
+            shard: quil_types::execution::ShardPath::WHOLE,
+        };
+        engine
+            .process_message_with_context(context, &num_bigint::BigInt::from(0), domain, &message)
+            .map(|_| ())
+    };
+    for remove in [false, true] {
+        let (owner, write) = (FalconSigner::generate(), FalconSigner::generate());
+        let op = |domain: &[u8; 32]| {
+            if remove {
+                signed_vertex_remove(&write, domain, &metadata)
+            } else {
+                signed_vertex_add(&write, domain, &metadata)
+            }
+        };
+        let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+        let before = at_anchor(&engine, &domain, first - 1, op(&domain));
+        assert!(
+            resolved_write_key(&crdt, &domain).is_none(),
+            "STRICT-GATE-EDGE: before the epoch the op (remove {remove}) applies as before: \
+             {before:?}"
+        );
+        let (engine, crdt, domain) = deployed_hypergraph(&owner, &write, None);
+        let from = at_anchor(&engine, &domain, first, op(&domain));
+        assert!(
+            from.is_err()
+                && resolved_write_key(&crdt, &domain) == Some(write.public_key().to_vec()),
+            "from the epoch the op (remove {remove}) is refused: {from:?}"
+        );
+    }
+    quil_types::consensus::set_strict_validation_epoch_for_thread(None);
+}

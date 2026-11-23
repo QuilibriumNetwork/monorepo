@@ -78,7 +78,12 @@ async fn observe(global: GlobalArgs) -> anyhow::Result<Observation> {
     let info = client
         .get_node_info(GetNodeInfoRequest {})
         .await
-        .map_err(|e| anyhow::anyhow!("ask this node for its reachability: {}", e.message()))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "ask this node for its reachability: {}",
+                crate::util::status_text(&e)
+            )
+        })?
         .into_inner();
     let report = info.node_reachability.ok_or_else(|| {
         anyhow::anyhow!(

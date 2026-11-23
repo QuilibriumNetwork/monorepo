@@ -116,10 +116,18 @@ const MAX_COIN_READ_WAITERS: usize = 128;
 const MAX_RETRO_SENIORITY_KEYS: usize = 32;
 /// Each key scans the four retro tables, so lookups run one at a time.
 static RETRO_SENIORITY_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static RETRO_SENIORITY_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// A status read walks up to a lookback of headers and several roots, each
 /// briefly under the commit lock, so they run one at a time.
 static MINT_STATUS_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static MINT_STATUS_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Requests waiting for a one-at-a-time worker (retro seniority, mint
+/// status) beyond which more are refused at once. Each pool counts its own
+/// waiters, so a burst on one never refuses another's callers.
+const MAX_SINGLE_WORKER_WAITERS: usize = 8;
 
 /// Coin reads since the last summary, by how they got a worker or why not.
 struct CoinReadCounts {
@@ -132,14 +140,35 @@ struct CoinReadCounts {
     peak_waiting: std::sync::atomic::AtomicUsize,
 }
 
-static COIN_READS: CoinReadCounts = CoinReadCounts {
-    at_once: AtomicU64::new(0),
-    after_wait: AtomicU64::new(0),
-    refused_queue_full: AtomicU64::new(0),
-    refused_after_wait: AtomicU64::new(0),
-    abandoned: AtomicU64::new(0),
-    peak_waiting: std::sync::atomic::AtomicUsize::new(0),
-};
+impl CoinReadCounts {
+    const fn new() -> Self {
+        Self {
+            at_once: AtomicU64::new(0),
+            after_wait: AtomicU64::new(0),
+            refused_queue_full: AtomicU64::new(0),
+            refused_after_wait: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            peak_waiting: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Reads served and refused since the last call; the rest restart.
+    fn take_served_refused(&self) -> (u64, u64) {
+        let take = |count: &AtomicU64| count.swap(0, Ordering::Relaxed);
+        take(&self.abandoned);
+        self.peak_waiting.store(0, Ordering::Relaxed);
+        (
+            take(&self.at_once) + take(&self.after_wait),
+            take(&self.refused_queue_full) + take(&self.refused_after_wait),
+        )
+    }
+}
+
+static COIN_READS: CoinReadCounts = CoinReadCounts::new();
+/// Mint status and retro seniority reads, each counted apart from the coin
+/// reads as they wait in their own queues.
+static MINT_STATUS_READS: CoinReadCounts = CoinReadCounts::new();
+static RETRO_SENIORITY_READS: CoinReadCounts = CoinReadCounts::new();
 
 /// A worker slot from `workers`, waiting briefly in a bounded queue when all
 /// are busy.
@@ -147,42 +176,58 @@ async fn coin_read_permit(
     workers: &'static tokio::sync::Semaphore,
     what: &str,
 ) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
+    queued_permit(
+        workers,
+        &COIN_READ_WAITERS,
+        MAX_COIN_READ_WAITERS,
+        &COIN_READS,
+        what,
+    )
+    .await
+}
+
+/// A slot from `workers`, waiting up to [`COIN_READ_WAIT`] when all are
+/// busy, as one of at most `max_waiters` callers counted in `waiters`; the
+/// rest are answered busy at once. A caller cancelled while it waits leaves
+/// the count. Each outcome counts into `counts`.
+async fn queued_permit(
+    workers: &'static tokio::sync::Semaphore,
+    waiters: &'static std::sync::atomic::AtomicUsize,
+    max_waiters: usize,
+    counts: &'static CoinReadCounts,
+    what: &str,
+) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
     if let Ok(permit) = workers.try_acquire() {
-        COIN_READS.at_once.fetch_add(1, Ordering::Relaxed);
+        counts.at_once.fetch_add(1, Ordering::Relaxed);
         return Ok(permit);
     }
     let busy = || Status::resource_exhausted(format!("{what} workers busy; retry later"));
     // A cancelled RPC drops this future mid-wait; the place still leaves.
-    let Some(place) =
-        crate::queue_place::QueuePlace::take(&COIN_READ_WAITERS, MAX_COIN_READ_WAITERS)
-    else {
-        COIN_READS
-            .refused_queue_full
-            .fetch_add(1, Ordering::Relaxed);
+    let Some(place) = crate::queue_place::QueuePlace::take(waiters, max_waiters) else {
+        counts.refused_queue_full.fetch_add(1, Ordering::Relaxed);
         return Err(busy());
     };
-    let place = place.abandoned_into(&COIN_READS.abandoned);
-    COIN_READS
+    let place = place.abandoned_into(&counts.abandoned);
+    counts
         .peak_waiting
         .fetch_max(place.queued(), Ordering::Relaxed);
     let acquired = tokio::time::timeout(COIN_READ_WAIT, workers.acquire()).await;
     place.leave();
     match acquired {
         Ok(Ok(permit)) => {
-            COIN_READS.after_wait.fetch_add(1, Ordering::Relaxed);
+            counts.after_wait.fetch_add(1, Ordering::Relaxed);
             Ok(permit)
         }
         _ => {
-            COIN_READS
-                .refused_after_wait
-                .fetch_add(1, Ordering::Relaxed);
+            counts.refused_after_wait.fetch_add(1, Ordering::Relaxed);
             Err(busy())
         }
     }
 }
 
-/// Coin reads (wallet scans, legacy pages, witnesses, mint status) a node
-/// served to wallets since the last call, and its slots and queue now.
+/// Coin reads (wallet scans, legacy pages, witnesses, mint status) and retro
+/// seniority lookups a node served to wallets since the last call, and its
+/// slots and queue now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CoinReadInterval {
     /// Slots held now, of `COIN_SCAN_SLOTS` scan, `COIN_WITNESS_SLOTS`
@@ -200,6 +245,12 @@ pub struct CoinReadInterval {
     /// Refused after waiting `COIN_READ_WAIT` for a slot.
     pub refused_after_wait: u64,
     pub abandoned: u64,
+    /// Mint status and retro seniority reads, each in its own queue of
+    /// `MAX_SINGLE_WORKER_WAITERS`: served, and refused busy either way.
+    pub mint_status_served: u64,
+    pub mint_status_refused: u64,
+    pub retro_seniority_served: u64,
+    pub retro_seniority_refused: u64,
 }
 
 impl CoinReadInterval {
@@ -210,6 +261,9 @@ impl CoinReadInterval {
             slots.saturating_sub(workers.available_permits())
         };
         let waiting = COIN_READ_WAITERS.load(Ordering::Relaxed);
+        let (mint_status_served, mint_status_refused) = MINT_STATUS_READS.take_served_refused();
+        let (retro_seniority_served, retro_seniority_refused) =
+            RETRO_SENIORITY_READS.take_served_refused();
         Self {
             scan_held: held(&COIN_SCAN_WORKERS, COIN_SCAN_SLOTS),
             witness_held: held(&COIN_WITNESS_WORKERS, COIN_WITNESS_SLOTS),
@@ -224,11 +278,18 @@ impl CoinReadInterval {
             refused_queue_full: take(&COIN_READS.refused_queue_full),
             refused_after_wait: take(&COIN_READS.refused_after_wait),
             abandoned: take(&COIN_READS.abandoned),
+            mint_status_served,
+            mint_status_refused,
+            retro_seniority_served,
+            retro_seniority_refused,
         }
     }
 
     fn refused(&self) -> u64 {
-        self.refused_queue_full + self.refused_after_wait
+        self.refused_queue_full
+            + self.refused_after_wait
+            + self.mint_status_refused
+            + self.retro_seniority_refused
     }
 
     /// The summary's level: none for an idle node, warn when it refused.
@@ -257,6 +318,10 @@ impl CoinReadInterval {
                     refused_queue_full = self.refused_queue_full,
                     refused_after_wait = self.refused_after_wait,
                     abandoned = self.abandoned,
+                    mint_status_served = self.mint_status_served,
+                    mint_status_refused = self.mint_status_refused,
+                    retro_seniority_served = self.retro_seniority_served,
+                    retro_seniority_refused = self.retro_seniority_refused,
                     $message
                 )
             };
@@ -1540,7 +1605,8 @@ impl NodeService for NodeRpcServer {
                         Status::internal(format!("mint authorization witness: {e}"))
                     }
                 })?;
-        if witness.forest_proof.len() > 32 * 1024
+        if witness.forest_proof.len()
+            > quil_execution::token_intrinsic::reward_witness::MAX_REWARD_PROOF_BYTES
             || (witness.found && witness.global_root.len() != 32)
         {
             return Err(Status::internal(
@@ -1570,7 +1636,14 @@ impl NodeService for NodeRpcServer {
             .as_ref()
             .ok_or_else(|| Status::unavailable("coin witness provider not available"))?
             .clone();
-        let permit = coin_read_permit(&MINT_STATUS_WORKER, "mint authorization status").await?;
+        let permit = queued_permit(
+            &MINT_STATUS_WORKER,
+            &MINT_STATUS_WAITERS,
+            MAX_SINGLE_WORKER_WAITERS,
+            &MINT_STATUS_READS,
+            "mint authorization status",
+        )
+        .await?;
         let status = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             provider.mint_authorization_status(&receipt)
@@ -1609,11 +1682,18 @@ impl NodeService for NodeRpcServer {
                 "at most {MAX_RETRO_SENIORITY_KEYS} keys per request"
             )));
         }
-        let _permit = RETRO_SENIORITY_WORKER
-            .acquire()
-            .await
-            .map_err(|_| Status::unavailable("retro seniority worker closed"))?;
+        // The scan keeps its slot until it ends, even when the call is
+        // cancelled, so a dropped and resent request never runs beside it.
+        let permit = queued_permit(
+            &RETRO_SENIORITY_WORKER,
+            &RETRO_SENIORITY_WAITERS,
+            MAX_SINGLE_WORKER_WAITERS,
+            &RETRO_SENIORITY_READS,
+            "retro seniority",
+        )
+        .await?;
         let parts = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             keys.iter()
                 .map(|key| {
                     quil_execution::global_intrinsic::seniority_succession::retro_parts(
@@ -2284,7 +2364,7 @@ mod coin_read_queue_tests {
     use tokio::sync::Semaphore;
 
     /// Yields until `count` reads `want`; the paused clock never moves.
-    async fn until_counted(count: &AtomicUsize, want: usize) {
+    pub(super) async fn until_counted(count: &AtomicUsize, want: usize) {
         for _ in 0..1_000_000 {
             if count.load(Ordering::Relaxed) == want {
                 return;
@@ -2478,7 +2558,8 @@ mod mint_authorization_witness_tests {
                 caller: std::thread::current().id(),
             }))
         };
-        let valid = server(32 * 1024, 32, false);
+        let limit = quil_execution::token_intrinsic::reward_witness::MAX_REWARD_PROOF_BYTES;
+        let valid = server(limit, 32, false);
         assert_eq!(
             valid
                 .get_mint_authorization_witness(request(31))
@@ -2495,8 +2576,8 @@ mod mint_authorization_witness_tests {
         assert!(response.found);
         assert_eq!(response.cited_frame, 19);
         assert_eq!(response.global_root, vec![2; 32]);
-        assert_eq!(response.forest_proof.len(), 32 * 1024);
-        for bad in [server(32 * 1024 + 1, 32, false), server(1, 31, false)] {
+        assert_eq!(response.forest_proof.len(), limit);
+        for bad in [server(limit + 1, 32, false), server(1, 31, false)] {
             assert_eq!(
                 bad.get_mint_authorization_witness(request(32))
                     .await
@@ -2526,6 +2607,7 @@ mod mint_authorization_witness_tests {
 
 #[cfg(test)]
 mod mint_authorization_status_tests {
+    use super::coin_read_queue_tests::until_counted;
     use super::*;
     use quil_types::store::*;
     struct Provider {
@@ -2564,6 +2646,136 @@ mod mint_authorization_status_tests {
     }
     fn server(fail: bool) -> NodeRpcServer {
         NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider { fail }))
+    }
+
+    /// A flood of status reads on a busy status worker leaves the coin
+    /// reads' own queue free: a scan waiting for a slot gets the next one.
+    #[tokio::test]
+    async fn a_status_flood_leaves_coin_reads_their_queue() {
+        let held_status = MINT_STATUS_WORKER.acquire().await.unwrap();
+        let mut held_scans = Vec::new();
+        while let Ok(permit) = COIN_SCAN_WORKERS.try_acquire() {
+            held_scans.push(permit);
+        }
+        let server = Arc::new(server(false));
+        let mut flood = tokio::task::JoinSet::new();
+        for _ in 0..MAX_COIN_READ_WAITERS + 16 {
+            let server = server.clone();
+            flood.spawn(async move {
+                server
+                    .get_mint_authorization_status(request(32))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        // Calls refused for a full queue show it full.
+        let mut refused = 0;
+        while refused < 16 {
+            let answered =
+                tokio::time::timeout(std::time::Duration::from_secs(60), flood.join_next())
+                    .await
+                    .expect("status calls past a full queue are refused at once")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(answered.unwrap_err().code(), tonic::Code::ResourceExhausted);
+            refused += 1;
+        }
+        let scan = tokio::spawn(coin_read_permit(&COIN_SCAN_WORKERS, "coin scan"));
+        for _ in 0..100 {
+            if scan.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        held_scans.pop();
+        let scanned = tokio::time::timeout(std::time::Duration::from_secs(60), scan)
+            .await
+            .expect("the scan is answered")
+            .unwrap();
+        eprintln!("REACH status-flood scan_ok={}", scanned.is_ok());
+        assert!(
+            scanned.is_ok(),
+            "STATUS-FLOOD-REFUSED-COIN-READ: {:?}",
+            scanned.err()
+        );
+        drop(held_status);
+    }
+
+    /// While the status worker is busy, a full queue of status reads waits
+    /// for it and the next is answered busy at once, counted as refused for
+    /// a full queue, rather than waiting behind them.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_read_past_a_full_queue_is_refused_at_once() {
+        let held_status = MINT_STATUS_WORKER.acquire().await.unwrap();
+        let server = Arc::new(server(false));
+        let mut queue = tokio::task::JoinSet::new();
+        for _ in 0..MAX_SINGLE_WORKER_WAITERS {
+            let server = server.clone();
+            queue.spawn(async move {
+                server
+                    .get_mint_authorization_status(request(32))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        until_counted(&MINT_STATUS_WAITERS, MAX_SINGLE_WORKER_WAITERS).await;
+        let started = tokio::time::Instant::now();
+        let answered = tokio::time::timeout(
+            COIN_READ_WAIT * 2,
+            server.get_mint_authorization_status(request(32)),
+        )
+        .await;
+        let waited = started.elapsed();
+        let code = answered.ok().and_then(|r| r.err()).map(|s| s.code());
+        let at_once = MINT_STATUS_READS.refused_queue_full.load(Ordering::Relaxed);
+        eprintln!("REACH status-queue-cap code={code:?} waited={waited:?} at_once={at_once}");
+        assert!(
+            code == Some(tonic::Code::ResourceExhausted)
+                && waited < std::time::Duration::from_secs(1)
+                && at_once == 1,
+            "STATUS-QUEUE-PAST-CAP: the read past {MAX_SINGLE_WORKER_WAITERS} waiting \
+             was answered {code:?} after {waited:?}, {at_once} refused at once"
+        );
+        queue.abort_all();
+        drop(held_status);
+    }
+
+    /// A status read refused for a full queue counts in the coin-read
+    /// summary as a mint status refusal, which warns.
+    #[tokio::test]
+    async fn a_refused_status_read_is_counted_and_warns() {
+        let held_status = MINT_STATUS_WORKER.acquire().await.unwrap();
+        CoinReadInterval::take();
+        let server = Arc::new(server(false));
+        let mut queue = tokio::task::JoinSet::new();
+        for _ in 0..MAX_SINGLE_WORKER_WAITERS + 1 {
+            let server = server.clone();
+            queue.spawn(async move {
+                server
+                    .get_mint_authorization_status(request(32))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), queue.join_next())
+            .await
+            .expect("the call past a full queue is refused at once")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        let interval = CoinReadInterval::take();
+        eprintln!("REACH status-refusal {interval:?}");
+        assert!(
+            interval.mint_status_refused >= 1 && interval.level() == Some(tracing::Level::WARN),
+            "STATUS-REFUSAL-UNCOUNTED: {interval:?}"
+        );
+        assert_eq!(
+            interval.refused(),
+            interval.mint_status_refused,
+            "counted as a mint status refusal only"
+        );
+        queue.abort_all();
+        drop(held_status);
     }
 
     #[tokio::test]
@@ -3948,6 +4160,7 @@ mod frame_cadence_rpc_tests {
 
 #[cfg(test)]
 mod retro_seniority_tests {
+    use super::coin_read_queue_tests::until_counted;
     use super::*;
     use node::node_service_server::NodeService;
 
@@ -3984,5 +4197,120 @@ mod retro_seniority_tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// While the lookup worker is busy, callers past a bounded queue are
+    /// answered busy at once rather than all waiting for it.
+    #[tokio::test]
+    async fn callers_past_the_queue_of_a_busy_lookup_are_refused() {
+        let held = RETRO_SENIORITY_WORKER.acquire().await.unwrap();
+        let server = Arc::new(NodeRpcServer::new());
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let server = server.clone();
+            calls.spawn(async move {
+                server
+                    .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                        public_keys: Vec::new(),
+                    }))
+                    .await
+                    .map(|_| ())
+            });
+        }
+        let first = tokio::time::timeout(std::time::Duration::from_secs(60), calls.join_next())
+            .await
+            .map(|joined| joined.unwrap().unwrap().err().map(|status| status.code()));
+        eprintln!("REACH retro-queue answered={}", first.is_ok());
+        let code = first
+            .expect("RETRO-QUEUE-UNBOUNDED: 64 callers waited 60 s on a busy lookup, none refused")
+            .expect("RETRO-QUEUE-UNBOUNDED: a call ran while the worker was held");
+        assert_eq!(
+            code,
+            tonic::Code::ResourceExhausted,
+            "RETRO-QUEUE-UNBOUNDED"
+        );
+        drop(held);
+    }
+
+    /// While the lookup worker is busy, a full queue of lookups waits for
+    /// it and the next is answered busy at once, counted as refused for a
+    /// full queue, rather than waiting behind them.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_past_a_full_queue_is_refused_at_once() {
+        let held = RETRO_SENIORITY_WORKER.acquire().await.unwrap();
+        let server = Arc::new(NodeRpcServer::new());
+        let lookup = || {
+            Request::new(node::GetRetroSeniorityRequest {
+                public_keys: Vec::new(),
+            })
+        };
+        let mut queue = tokio::task::JoinSet::new();
+        for _ in 0..MAX_SINGLE_WORKER_WAITERS {
+            let server = server.clone();
+            queue.spawn(async move { server.get_retro_seniority(lookup()).await.map(|_| ()) });
+        }
+        until_counted(&RETRO_SENIORITY_WAITERS, MAX_SINGLE_WORKER_WAITERS).await;
+        let started = tokio::time::Instant::now();
+        let answered =
+            tokio::time::timeout(COIN_READ_WAIT * 2, server.get_retro_seniority(lookup())).await;
+        let waited = started.elapsed();
+        let code = answered.ok().and_then(|r| r.err()).map(|s| s.code());
+        let at_once = RETRO_SENIORITY_READS
+            .refused_queue_full
+            .load(Ordering::Relaxed);
+        eprintln!("REACH retro-queue-cap code={code:?} waited={waited:?} at_once={at_once}");
+        assert!(
+            code == Some(tonic::Code::ResourceExhausted)
+                && waited < std::time::Duration::from_secs(1)
+                && at_once == 1,
+            "RETRO-QUEUE-PAST-CAP: the lookup past {MAX_SINGLE_WORKER_WAITERS} waiting \
+             was answered {code:?} after {waited:?}, {at_once} refused at once"
+        );
+        queue.abort_all();
+        drop(held);
+    }
+
+    /// A lookup whose call is cancelled keeps the worker until its scan
+    /// ends, so a dropped and resent request never runs beside it.
+    #[tokio::test]
+    async fn a_cancelled_lookup_keeps_the_worker_until_its_scan_ends() {
+        let server = Arc::new(NodeRpcServer::new());
+        // Distinct keys of the size a lookup reads: the first one parses
+        // the retro tables, which takes far longer than the steps below.
+        let keys: Vec<Vec<u8>> = (0..MAX_RETRO_SENIORITY_KEYS)
+            .map(|i| vec![i as u8; 57])
+            .collect();
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                        public_keys: keys,
+                    }))
+                    .await
+            })
+        };
+        while RETRO_SENIORITY_WORKER.available_permits() == 1 {
+            assert!(
+                !call.is_finished(),
+                "the lookup ended before it was seen holding the worker"
+            );
+            tokio::task::yield_now().await;
+        }
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        let free = RETRO_SENIORITY_WORKER.available_permits();
+        eprintln!("REACH retro-cancel free={free}");
+        assert_eq!(
+            free, 0,
+            "RETRO-SLOT-FREED-ON-CANCEL: the worker was free while the cancelled scan ran"
+        );
+        // Let the scan end before the runtime shuts down.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            RETRO_SENIORITY_WORKER.acquire(),
+        )
+        .await
+        .expect("the cancelled scan ends");
     }
 }

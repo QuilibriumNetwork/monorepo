@@ -137,7 +137,10 @@ pub fn restart_summary(r: &RestartReadiness) -> (String, bool) {
             "Restart: cost unknown; no GLOBAL frame seen yet".into(),
             false,
         ),
-        other => (format!("Restart: {other}"), false),
+        other => (
+            format!("Restart: {}", crate::util::remote_text(other)),
+            false,
+        ),
     }
 }
 pub fn detail(s: Option<&WorkerExecution>) -> String {

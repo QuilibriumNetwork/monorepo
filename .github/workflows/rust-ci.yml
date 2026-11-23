@@ -85,7 +85,7 @@ jobs:
 
       # Toolchain channel is read from rust-toolchain.toml at the repo
       # root. Update that file, not this workflow, to bump Rust.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
@@ -97,7 +97,7 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Check artifacts must not win the immutable test-cache key race.
           shared-key: rust-check-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
@@ -139,7 +139,7 @@ jobs:
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
@@ -148,7 +148,7 @@ jobs:
           components: clippy
 
       # Its own cache: the check job's RUSTFLAGS change every unit hash.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: rust-clippy-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
@@ -197,14 +197,14 @@ jobs:
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
           # The explicit cache below owns restore/save for this job.
           cache: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # The partitions build the same artifacts; one saves them.
@@ -299,7 +299,7 @@ jobs:
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
@@ -308,7 +308,7 @@ jobs:
 
       # The variables below are set per step, so the cache key matches
       # the test job's: restore its dependencies, never save.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           save-if: false
@@ -392,14 +392,14 @@ jobs:
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
           # The explicit cache below owns restore/save for this job.
           cache: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three

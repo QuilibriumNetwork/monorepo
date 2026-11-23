@@ -107,6 +107,27 @@ pub fn format_quil(amount_be: &[u8]) -> String {
     float_string_12(&amount, &conversion_factor())
 }
 
+/// Text another node sent (a gRPC status message, a reason, a verdict) as
+/// it may be printed: without control characters, so it cannot move the
+/// cursor, rewrite or add lines, or reach the terminal's clipboard.
+pub fn remote_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// A status message from another node, as [`remote_text`].
+pub fn status_text(status: &tonic::Status) -> String {
+    remote_text(status.message())
+}
+
+/// An error as qclient prints it on exit: its own lines kept, any other
+/// control character (one a node's text may carry) left out.
+pub fn error_text(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

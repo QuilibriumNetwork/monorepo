@@ -663,10 +663,17 @@ pub(in crate::commands::token) async fn await_claimable(
         let pending = match read {
             StatusRead::Answer(Ok(status)) => {
                 if status.state() == State::Claimable {
-                    say!("The mint authorization is claimable: {}.", status.reason);
+                    say!(
+                        "The mint authorization is claimable: {}.",
+                        crate::util::remote_text(&status.reason)
+                    );
                     return Ok(true);
                 }
-                format!("{}: {}", mint_state_label(status.state()), status.reason)
+                format!(
+                    "{}: {}",
+                    mint_state_label(status.state()),
+                    crate::util::remote_text(&status.reason)
+                )
             }
             StatusRead::Answer(Err(status))
                 if matches!(
@@ -677,7 +684,7 @@ pub(in crate::commands::token) async fn await_claimable(
                 say!(
                     "The node does not report mint authorization status ({}); the claim \
                      finds out.",
-                    status.message()
+                    crate::util::status_text(&status)
                 );
                 return Ok(false);
             }

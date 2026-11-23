@@ -391,6 +391,34 @@ fn repro_merge_whose_children_are_not_live_leaves_the_grid_whole() {
     );
 }
 
+/// Switch on, for this thread, the split rule the spine test expects at `F`.
+fn strict_splits_at_f() {
+    quil_types::consensus::set_strict_validation_epoch_for_thread(Some(EPOCH));
+}
+
+/// A deep split registers the regions it descends past as empty spine
+/// shards with no committee. Where an output address can fall in one, an
+/// output committed there is never delivered, so GLOBAL refuses the split
+/// however it was signed.
+#[test]
+fn repro_split_leaving_an_output_reachable_spine_is_refused() {
+    activate();
+    strict_splits_at_f();
+    let net = net(&[&[]]);
+    // Children 0010 and 0011 leave the spine 1, 01 and 000; 000 starts at
+    // address zero, below the bound of every output address.
+    let deep = net.split(F, &[], &[&[O, O, I, O], &[O, O, I, I]]);
+    let bytes = deep.to_canonical_bytes().unwrap();
+    let validated = net.accepted(F, &bytes);
+    let invoked = net.invoked(F, &bytes);
+    eprintln!("REACH output-reachable spine split: validate {validated}, invoke {invoked}");
+    assert!(
+        !validated && !invoked,
+        "SPINE-STRANDS-OUTPUTS: a split leaving the empty spine shard 000, which output \
+         addresses reach, was accepted (validate {validated}, invoke {invoked})"
+    );
+}
+
 // ---- fix-only tests below ----
 
 mod fixed {
@@ -770,5 +798,47 @@ mod fixed {
             }),
         };
         assert!(verify_shard_merge(&op, &net.tree, net.keys.as_ref(), F + 9).unwrap());
+    }
+
+    /// Before the strict validation epoch a split leaving an
+    /// output-reachable spine is taken as before; from it, a deep split
+    /// whose spine no output address reaches still is.
+    #[test]
+    fn spine_splits_are_refused_from_the_strict_epoch_only_where_outputs_reach() {
+        activate();
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(EPOCH + 1));
+        let before = net(&[&[]]);
+        let deep = before.split(F, &[], &[&[O, O, I, O], &[O, O, I, I]]);
+        assert_eq!(
+            crate::global_intrinsic::materialize::output_reachable_spine(
+                &deep.shard_address,
+                &deep.proposed_shards
+            ),
+            Some(vec![O, O, O])
+        );
+        let bytes = deep.to_canonical_bytes().unwrap();
+        assert!(
+            before.accepted(F, &bytes) && before.invoked(F, &bytes),
+            "STRICT-GATE-EDGE: before the epoch a split leaving a reachable spine is taken as \
+             before"
+        );
+
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(EPOCH));
+        let from = net(&[&[O], &[I]]);
+        // Spine 10 and 110: their lowest addresses start 0x80 and 0xC0.
+        let shallow = from.split(F, &[I], &[&[I, I, I, O], &[I, I, I, I]]);
+        assert_eq!(
+            crate::global_intrinsic::materialize::output_reachable_spine(
+                &shallow.shard_address,
+                &shallow.proposed_shards
+            ),
+            None
+        );
+        let bytes = shallow.to_canonical_bytes().unwrap();
+        assert!(
+            from.accepted(F, &bytes) && from.invoked(F, &bytes),
+            "from the epoch a split whose spine no output reaches is taken"
+        );
+        quil_types::consensus::set_strict_validation_epoch_for_thread(None);
     }
 }

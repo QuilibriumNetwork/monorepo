@@ -959,6 +959,13 @@ impl GlobalIntrinsic {
                         },
                     )?;
                 }
+                Self::refuse_output_reachable_spine(frame_number, &op).inspect_err(|e| {
+                    tracing::debug!(
+                        frame = frame_number,
+                        error = %e,
+                        "validate_message: ShardSplit refused"
+                    )
+                })?;
                 Ok(true)
             }
             TYPE_SHARD_MERGE => {
@@ -3011,6 +3018,7 @@ impl GlobalIntrinsic {
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         Self::refuse_anchor_outside_window(frame_number, op)?;
         Self::verify_anchored_output(clock_store, op)
     }
@@ -3029,6 +3037,7 @@ impl GlobalIntrinsic {
         op: &super::frame_header::FrameHeader,
     ) -> Result<HeaderAdmission> {
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         Self::refuse_anchor_outside_window(frame_number, op)?;
         Self::recompute_anchored_output(clock_store, op)?;
         if crate::fee_vote::fee_vote_out_of_bounds_at(
@@ -3060,6 +3069,29 @@ impl GlobalIntrinsic {
             )));
         }
         Ok(())
+    }
+
+    /// From the strict validation epoch GLOBAL frame `frame_number` refuses
+    /// a shard frame header whose fee total is neither empty nor 16 bytes:
+    /// any other length reads as zero, and the header's output binds only
+    /// that value, so the field of a certified header could be rewritten.
+    fn refuse_malformed_fee_total(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        let length = op.fee_total.len();
+        if length == 0
+            || length == 16
+            || !quil_types::consensus::strict_validation_active(frame_number)
+        {
+            return Ok(());
+        }
+        Err(QuilError::InvalidArgument(format!(
+            "FrameHeader: shard {} frame {} carries a {length}-byte fee total \
+             (empty or 16 bytes)",
+            hex::encode(&op.address),
+            op.frame_number
+        )))
     }
 
     /// GLOBAL frame `frame_number` refuses a shard frame header anchored
@@ -3358,27 +3390,19 @@ impl GlobalIntrinsic {
                 "seal drain: header is not certified by the sealed session".into(),
             ));
         }
-        self.verify_shard_frame_output(op)?;
-        super::prover_shard_update::verify_settlement_relay(op)?;
-        #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
-        #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(
-            frame_number,
-            op.frame_number,
-            &op.spends,
-        )?;
-        Ok(())
+        self.check_seal_certified_header(frame_number, op)
     }
 
     /// [`Self::check_drain_header`] for a header the seal certifies
     /// ([`Self::drain_certified_by_seal`]): everything but its own certificate.
+    /// Every drain header passes these checks, so they live only here.
     #[cfg_attr(not(feature = "confidential-tokens"), allow(unused_variables))]
     fn check_seal_certified_header(
         &self,
         frame_number: u64,
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
+        Self::refuse_malformed_fee_total(frame_number, op)?;
         self.verify_shard_frame_output(op)?;
         super::prover_shard_update::verify_settlement_relay(op)?;
         #[cfg(feature = "confidential-tokens")]
@@ -4393,6 +4417,37 @@ impl GlobalIntrinsic {
         .is_ok()
     }
 
+    /// From the strict validation epoch GLOBAL frame `frame_number` refuses
+    /// a bit-path split whose spine would hold an empty shard that output
+    /// addresses reach ([`materialize::output_reachable_spine`]): no
+    /// committee forms there, so an output committed to it would never be
+    /// delivered. Honest proposers never descend past such a region. The
+    /// caller logs the refusal: execution warns, validation only at debug,
+    /// since an older-build proposer sends the split again every frame.
+    fn refuse_output_reachable_spine(
+        frame_number: u64,
+        op: &super::prover_ops::ShardSplit,
+    ) -> Result<()> {
+        if !quil_types::consensus::strict_validation_active(frame_number)
+            || frame_number < super::materialize::unified_tree_cutover_frame()
+        {
+            return Ok(());
+        }
+        let Some(spine) =
+            materialize::output_reachable_spine(&op.shard_address, &op.proposed_shards)
+        else {
+            return Ok(());
+        };
+        let path: String = spine
+            .iter()
+            .map(|&bit| if bit { '1' } else { '0' })
+            .collect();
+        Err(QuilError::InvalidArgument(format!(
+            "shard split: spine shard {path} of {} is reachable by output addresses",
+            hex::encode(&op.shard_address)
+        )))
+    }
+
     /// ShardSplit invoke_step: register new sub-shard addresses.
     ///
     /// Go equivalent: `ShardSplitOp::Materialize` at
@@ -4470,6 +4525,14 @@ impl GlobalIntrinsic {
             &op.proposed_shards,
             bit_path_mode,
         )?;
+        Self::refuse_output_reachable_spine(frame_number, op).inspect_err(|e| {
+            tracing::warn!(
+                frame = frame_number,
+                error = %e,
+                "shard split refused: it leaves an empty spine shard that output addresses \
+                 reach; the proposer runs a build that descends past such regions"
+            )
+        })?;
 
         if let (Some(store), true) = (&self.shards_store, self.shard_metadata_writes_enabled) {
             let change = PendingShardChange {
@@ -7540,6 +7603,120 @@ mod tests {
         // The floor holds for a small shard.
         assert_eq!(classify_session_pass(4_900, 4_850, Some(100)), Info);
         assert_eq!(classify_session_pass(5_100, 5_050, Some(100)), Warn);
+    }
+
+    /// Switch on, for this thread, the header rule the fee total test expects
+    /// at the frame it checks.
+    fn strict_headers_from_genesis() {
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(0));
+    }
+
+    /// A shard frame header without an anchor whose output its fields
+    /// reproduce, carrying `fee_total` as given.
+    fn header_with_fee_total(
+        fee_total: Vec<u8>,
+    ) -> crate::global_intrinsic::frame_header::FrameHeader {
+        let mut op = crate::global_intrinsic::frame_header::FrameHeader {
+            address: vec![1; 32],
+            frame_number: 7,
+            fee_multiplier_vote: 100,
+            fee_total,
+            ..Default::default()
+        };
+        op.output = quil_crypto::porep::deterministic_app_frame_output(
+            &op.parent_selector,
+            &op.requests_root,
+            &op.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]),
+            op.frame_number,
+            op.rank,
+            &op.prover,
+            op.difficulty,
+            op.fee_multiplier_vote as u64,
+            op.timestamp,
+            &op.storage_attestation_root,
+            op.fee_total_value(),
+            &op.settlements,
+            &op.accumulator,
+            &op.spends,
+        );
+        op
+    }
+
+    /// A shard frame header's fee total is 16 big-endian bytes, or empty for
+    /// zero. Any other length reads as zero, which is all the output binds,
+    /// so a relayer could rewrite the field of a certified header at will;
+    /// GLOBAL refuses such a header in admission, execution and vouching.
+    #[test]
+    fn a_shard_header_with_a_malformed_fee_total_is_refused() {
+        strict_headers_from_genesis();
+        let frame = 100;
+        let fee = crate::global_intrinsic::frame_header::fee_total_field(5);
+        GlobalIntrinsic::check_anchor_and_output(None, frame, &header_with_fee_total(fee))
+            .expect("harness: a header with a 16-byte fee total passes");
+        for fee_total in [vec![0x01; 17], vec![0x05; 3]] {
+            let length = fee_total.len();
+            let op = header_with_fee_total(fee_total);
+            let checked = GlobalIntrinsic::check_anchor_and_output(None, frame, &op);
+            let admitted = GlobalIntrinsic::admit_anchor_and_output(None, frame, &op);
+            eprintln!("REACH fee total of {length} bytes: check {checked:?}, admit {admitted:?}");
+            assert!(
+                checked.is_err() && admitted.is_err(),
+                "FEE-TOTAL-MALFORMED-ACCEPTED: a header with a {length}-byte fee total was \
+                 accepted (check {checked:?}, admit {admitted:?})"
+            );
+        }
+    }
+
+    /// Before the strict validation epoch a malformed fee total passes as
+    /// before; from it, an empty and a 16-byte one (zero included) pass.
+    #[test]
+    fn a_malformed_fee_total_is_refused_only_from_the_strict_epoch() {
+        quil_types::consensus::set_strict_validation_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        let malformed = header_with_fee_total(vec![0x01; 17]);
+        GlobalIntrinsic::check_anchor_and_output(None, first - 1, &malformed)
+            .expect("STRICT-GATE-EDGE: before the epoch a malformed fee total passes as before");
+        let refused =
+            GlobalIntrinsic::check_anchor_and_output(None, first, &malformed).unwrap_err();
+        assert!(
+            refused.to_string().contains("17-byte fee total"),
+            "{refused}"
+        );
+        for fee_total in [Vec::new(), vec![0; 16], vec![0x07; 16]] {
+            let op = header_with_fee_total(fee_total);
+            GlobalIntrinsic::check_anchor_and_output(None, first, &op)
+                .expect("from the epoch an empty or 16-byte fee total passes");
+            assert_eq!(
+                GlobalIntrinsic::admit_anchor_and_output(None, first, &op).unwrap(),
+                HeaderAdmission::Frame
+            );
+        }
+        quil_types::consensus::set_strict_validation_epoch_for_thread(None);
+    }
+
+    /// A seal's drain headers, certified by their session or by the seal,
+    /// pass `check_seal_certified_header`; from the strict validation epoch
+    /// it refuses a malformed fee total before the output check, whose
+    /// binding of the fee total that length makes meaningless.
+    #[test]
+    fn a_seal_drain_header_with_a_malformed_fee_total_is_refused() {
+        strict_headers_from_genesis();
+        let gi = GlobalIntrinsic::new(std::sync::Arc::new(crate::testing::NoopKeyManager));
+        for fee_total in [vec![0x01; 17], vec![0x05; 3]] {
+            let length = fee_total.len();
+            let checked = gi.check_seal_certified_header(100, &header_with_fee_total(fee_total));
+            eprintln!("REACH drain fee total of {length} bytes: {checked:?}");
+            let refused = checked
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains(&format!("{length}-byte fee total")));
+            assert!(
+                refused,
+                "FEE-TOTAL-DRAIN-ACCEPTED: a drain header with a {length}-byte fee total was \
+                 not refused for it ({checked:?})"
+            );
+        }
+        quil_types::consensus::set_strict_validation_epoch_for_thread(None);
     }
 
     /// From the required-anchor epoch GLOBAL refuses a shard frame header

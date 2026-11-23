@@ -13,7 +13,7 @@ fn main() {
     // Errors are printed to stderr with a non-zero exit, matching Go's
     // `Execute()`.
     if let Err(e) = real_main() {
-        eprintln!("Error: {e:#}");
+        eprintln!("Error: {}", quil_client::util::error_text(&e));
         std::process::exit(1);
     }
 }

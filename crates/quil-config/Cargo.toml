@@ -11,5 +11,8 @@ serde_yaml = "0.9"
 hex = "0.4"
 thiserror = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

@@ -410,9 +410,12 @@ pub fn require_active(frame: u64) -> Result<()> {
 ///
 /// `anchor_output` returns a GLOBAL frame's output from this node's clock
 /// store. It is asked only for anchors already checked to be earlier frames
-/// of `frame`'s epoch, which every node materializing `frame` holds: a report
-/// must not make a node look up a frame it may lack, since a missing anchor
-/// stops materialization rather than refusing the report.
+/// of `frame`'s epoch, which every node materializing `frame` holds, and only
+/// for a header whose output is the preimage of the payload its verified
+/// votes sign: a report must not make a node look up a frame it may lack,
+/// since a missing anchor stops materialization rather than refusing the
+/// report, and a header not bound to its votes is refused by every node
+/// alike, without a lookup.
 pub fn verify(
     state: &impl Records,
     frame: u64,
@@ -531,17 +534,19 @@ pub fn verify(
                     ));
                 }
                 if !output_checked[index] {
+                    // The header is bound to the signed payload before its
+                    // anchor is read.
+                    if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)?
+                        != proposal.payload
+                    {
+                        return Err(invalid("payload is not the digest of the header output"));
+                    }
                     let output = anchor_output(proposal.header.global_frame_number)?;
                     crate::global_intrinsic::prover_shard_update::verify_app_frame_output(
                         &proposal.header,
                         &output,
                     )
                     .map_err(|_| invalid("header output does not match its fields and anchor"))?;
-                    if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)?
-                        != proposal.payload
-                    {
-                        return Err(invalid("payload is not the digest of the header output"));
-                    }
                     output_checked[index] = true;
                 }
             }

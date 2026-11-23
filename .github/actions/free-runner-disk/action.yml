@@ -42,7 +42,7 @@ runs:
       shell: bash
       run: |
         # Nothing here runs Docker, Python, Node or Go from the runner
-        # image: toolchains come from rustup, tools from install-action.
+        # image: toolchains come from rustup, tools from pinned release archives.
         sudo du -sh /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache 2>/dev/null || true
         if command -v docker >/dev/null; then sudo docker system df || true; fi
         sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/*

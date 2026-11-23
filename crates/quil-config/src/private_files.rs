@@ -37,9 +37,12 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// runs as. A user who may not give the replacement that owner gets a
 /// `PermissionDenied` error naming the file and its owner, and the file
 /// is left as it was. A symbolic link at `path` is followed, so its target
-/// is replaced and the link kept. On failure the temporary file is
-/// removed.
+/// is replaced and the link kept, when root, the user this runs as or the
+/// owner of what it names owns it; so is a link to a directory on the way
+/// (`check_links`). On failure the temporary file is removed.
 pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    check_links(path)?;
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -57,6 +60,51 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         return Err(e);
     }
     sync_parent_dir(&target);
+    Ok(())
+}
+
+/// Refuse `path` when a symbolic link on it, the file itself or a directory
+/// on the way, is owned by a user other than root, the user this runs as
+/// and the owner of what it names: a user who may write a directory could
+/// otherwise point a file that a root run replaces at any file of root's
+/// (the rule Linux applies to links in shared directories,
+/// `fs.protected_symlinks`). A link of the user this runs as only leads
+/// where that user may write.
+#[cfg(unix)]
+fn check_links(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        let link = match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => meta,
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // A link naming nothing is not followed to anything here; the write
+        // fails at it.
+        let named = match std::fs::metadata(&prefix) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if link.uid() != 0 && link.uid() != euid && link.uid() != named.uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is a link of uid {} to a file of uid {}, which is not followed: \
+                     replace the link with what it names, or have its owner own the \
+                     link; nothing was written",
+                    prefix.display(),
+                    link.uid(),
+                    named.uid()
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -192,6 +240,61 @@ pub fn restrict_private_file(path: &Path) -> io::Result<Option<u32>> {
     {
         let _ = path;
         Ok(None)
+    }
+}
+
+/// What [`open_private_create`] opens its file for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateCreate {
+    /// Appending records.
+    Append,
+    /// Holding a lock on it; nothing is written.
+    Lock,
+}
+
+/// Open the regular file at `path` for `how`, created owner-only (mode
+/// 0600 less the umask) when missing. The open follows no link in its
+/// place: a user who may write the directory and plants one there, also
+/// one naming nothing yet, gets a refusal, and nothing is created or
+/// opened where it points. A FIFO or other special file there is refused
+/// without waiting on it, and so is a file swapped in while it was
+/// opened. Links to the directory on the way are followed. The file
+/// closes on exec. Errors name no path; the caller names the file.
+pub fn open_private_create(path: &Path, how: PrivateCreate) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    match how {
+        PrivateCreate::Append => options.append(true),
+        PrivateCreate::Lock => options.write(true),
+    };
+    options.create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let file = options
+            .open(path)
+            .map_err(|e| match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a link stands in its place, which is not followed; nothing was created",
+                ),
+                _ => e,
+            })?;
+        let opened = file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !opened.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file, or replaced while it was opened",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
     }
 }
 
@@ -418,6 +521,123 @@ mod tests {
 
     const FOREIGN_OWNER: &str = "QUIL_CONFIG_TEST_FOREIGN_OWNER";
 
+    /// Run as root, a link is followed only when it is root's or belongs to
+    /// the owner of what it names: one another user planted to a file or a
+    /// directory not theirs is refused and what it names left whole.
+    #[test]
+    fn a_link_to_what_its_owner_does_not_own_is_refused() {
+        use std::os::unix::fs::{chown, lchown, symlink};
+        let dir = tempdir("planted");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can give a link another owner");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let roots = dir.join("roots.conf");
+        std::fs::write(&roots, b"root's").unwrap();
+        let link = dir.join("config.yml");
+        symlink(&roots, &link).unwrap();
+        lchown(&link, Some(NOBODY), Some(NOBODY)).unwrap();
+        let written = write_private_file(&link, b"replaced");
+        eprintln!("REACH planted-link written={}", written.is_ok());
+        assert_eq!(
+            std::fs::read(&roots).unwrap(),
+            b"root's",
+            "FOREIGN-LINK-FOLLOWED: the file a planted link names was replaced"
+        );
+        let err = written.expect_err("FOREIGN-LINK-FOLLOWED: the write went through");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keys.yml"), b"root's").unwrap();
+        let node = dir.join("node");
+        std::fs::create_dir(&node).unwrap();
+        chown(&node, Some(NOBODY), Some(NOBODY)).unwrap();
+        let configs = node.join("configs");
+        symlink(&elsewhere, &configs).unwrap();
+        lchown(&configs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let written = write_private_file(&configs.join("keys.yml"), b"replaced");
+        assert_eq!(
+            std::fs::read(elsewhere.join("keys.yml")).unwrap(),
+            b"root's",
+            "FOREIGN-LINK-FOLLOWED: a file under a planted directory link was replaced"
+        );
+        assert!(
+            written.is_err(),
+            "FOREIGN-LINK-FOLLOWED: the write went through"
+        );
+
+        // A link of the owner of what it names is followed.
+        let theirs = dir.join("theirs.yml");
+        std::fs::write(&theirs, b"old").unwrap();
+        chown(&theirs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let own = dir.join("own.yml");
+        symlink(&theirs, &own).unwrap();
+        lchown(&own, Some(NOBODY), Some(NOBODY)).unwrap();
+        write_private_file(&own, b"new").unwrap();
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"new");
+        assert_eq!(owner(&theirs), (NOBODY, NOBODY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link of the user this runs as is followed, also to a directory
+    /// another user owns: here `nobody`, through its own link, writes into
+    /// a directory of root's that it may write.
+    #[test]
+    fn a_users_own_link_is_followed() {
+        if let Ok(path) = std::env::var(OWN_LINK) {
+            // The child, run as `nobody`.
+            let written = write_private_file(Path::new(&path), b"theirs");
+            eprintln!("REACH own-link written={written:?}");
+            written.expect("OWN-LINK-REFUSED: nobody's own link was not followed");
+            return;
+        }
+        use std::os::unix::fs::{chown, lchown, symlink};
+        let dir = tempdir("own-link");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can run the test as another user");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        set_mode(&dir, 0o755);
+        let shared = dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        set_mode(&shared, 0o777);
+        let node = dir.join("node");
+        std::fs::create_dir(&node).unwrap();
+        chown(&node, Some(NOBODY), Some(NOBODY)).unwrap();
+        let configs = node.join("configs");
+        symlink(&shared, &configs).unwrap();
+        lchown(&configs, Some(NOBODY), Some(NOBODY)).unwrap();
+        let status = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("private_files::tests::a_users_own_link_is_followed")
+                .arg("--nocapture")
+                .env(OWN_LINK, configs.join("keys.yml"))
+                .uid(NOBODY)
+                .gid(NOBODY)
+                .status()
+                .expect("run the test as nobody")
+        };
+        let read = std::fs::read(shared.join("keys.yml"));
+        eprintln!(
+            "REACH own-link child_ok={} read={:?}",
+            status.success(),
+            read.as_deref().ok()
+        );
+        assert!(
+            status.success(),
+            "OWN-LINK-REFUSED: the write as nobody through its own link failed"
+        );
+        assert_eq!(read.unwrap(), b"theirs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const OWN_LINK: &str = "QUIL_CONFIG_TEST_OWN_LINK";
+
     /// New directories, parents included, are owner-only; an existing one
     /// keeps its mode.
     #[test]
@@ -458,6 +678,76 @@ mod tests {
         set_mode(&dir, 0o755);
         assert_eq!(restrict_private_file(&dir).unwrap(), None, "a directory");
         assert_eq!(mode(&dir), 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A private create makes a missing file 0600 and opens an existing
+    /// one in place, appending or for a lock, without truncating it.
+    #[test]
+    fn a_private_create_makes_the_file_owner_only_and_keeps_its_contents() {
+        use std::io::Write as _;
+        let dir = tempdir("create");
+        let path = dir.join("actions.jsonl");
+        open_private_create(&path, PrivateCreate::Append)
+            .unwrap()
+            .write_all(b"one\n")
+            .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        open_private_create(&path, PrivateCreate::Append)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
+        drop(open_private_create(&path, PrivateCreate::Lock).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        let lock = dir.join("batch.lock");
+        drop(open_private_create(&lock, PrivateCreate::Lock).unwrap());
+        assert_eq!(mode(&lock), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A private create follows no link in its place, one naming nothing
+    /// or a file, and waits on no FIFO: each is refused and nothing is
+    /// created or changed where it points.
+    #[test]
+    fn a_private_create_follows_no_link_and_waits_on_no_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let dir = tempdir("create-link");
+        for how in [PrivateCreate::Append, PrivateCreate::Lock] {
+            let target = dir.join("nologin");
+            let link = dir.join("dangling");
+            symlink(&target, &link).unwrap();
+            let error = open_private_create(&link, how).expect_err("a dangling link was followed");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert!(
+                std::fs::symlink_metadata(&target).is_err(),
+                "{how:?} created the file a dangling link names"
+            );
+            std::fs::remove_file(&link).unwrap();
+
+            let file = dir.join("roots");
+            std::fs::write(&file, b"root's").unwrap();
+            symlink(&file, &link).unwrap();
+            let error = open_private_create(&link, how).expect_err("a link to a file was followed");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert_eq!(std::fs::read(&file).unwrap(), b"root's");
+            std::fs::remove_file(&link).unwrap();
+        }
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // An open of a FIFO with no reader returns at once or never: the
+        // wait is a cap, not a pace.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_private_create(&path, PrivateCreate::Append).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the open waited on a FIFO");
+        assert!(refused, "a FIFO was opened");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

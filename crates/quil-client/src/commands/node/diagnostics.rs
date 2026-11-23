@@ -338,7 +338,10 @@ impl HealthSource {
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => Ok(None),
             Ok(Err(status)) => {
                 *slot = None;
-                Err(format!("health report: {}", status.message()))
+                Err(format!(
+                    "health report: {}",
+                    crate::util::status_text(&status)
+                ))
             }
             Err(_) => {
                 *slot = None;

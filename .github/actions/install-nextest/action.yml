@@ -1,45 +1,95 @@
 name: Install cargo-nextest
 description: |
-  Installs a pinned cargo-nextest into ~/.cargo/bin. The release binary
-  comes from GitHub release downloads (via taiki-e/install-action, which
-  checks it against its manifest's sha256); the binary is cached by
-  version, and when the release download fails on a cache miss it is
-  built from crates.io instead (checked against the crates.io index).
+  Installs a pinned cargo-nextest into ~/.cargo/bin on a Linux runner.
+  The release archive comes from the nextest GitHub release and is used
+  only when it matches its pinned sha256, also when it comes from the
+  cache: a cached file is checked on every use like a download. When the
+  release download fails it is built from crates.io instead (checked
+  against the crates.io index); a build is never cached.
   Run it after the Rust toolchain is installed.
 
 inputs:
   version:
     description: cargo-nextest version
-    # .nextest.toml requires at least 0.9.75.
+    # .nextest.toml requires at least 0.9.75. A new version needs the
+    # sha256 of each archive below (the release asset digests).
     default: "0.9.151"
 
 runs:
   using: composite
   steps:
-    - name: Cache cargo-nextest
-      id: cache-nextest
-      uses: actions/cache@v5
-      with:
-        path: ~/.cargo/bin/cargo-nextest
-        key: cargo-nextest-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
-
-    - name: Install cargo-nextest (release binary)
-      id: release
-      if: steps.cache-nextest.outputs.cache-hit != 'true'
-      continue-on-error: true
-      uses: taiki-e/install-action@v2
-      with:
-        tool: nextest@${{ inputs.version }}
-
-    - name: Install cargo-nextest (crates.io fallback)
-      if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.release.outcome != 'success'
+    - name: Pin cargo-nextest
+      id: nextest
       shell: bash
       env:
         NEXTEST_VERSION: ${{ inputs.version }}
+      run: |
+        case "$NEXTEST_VERSION/$RUNNER_ARCH" in
+          0.9.151/X64)
+            TARGET=x86_64-unknown-linux-gnu
+            ARCHIVE_SHA256=1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4
+            ;;
+          0.9.151/ARM64)
+            TARGET=aarch64-unknown-linux-gnu
+            ARCHIVE_SHA256=3e35e8f6913af92558ba09d7155f74e35dd1f0024ef3cd891637433ae4eacbdd
+            ;;
+          *)
+            echo "::error::no pinned cargo-nextest archive for $NEXTEST_VERSION on $RUNNER_ARCH"
+            exit 1
+            ;;
+        esac
+        {
+          echo "archive=cargo-nextest-$NEXTEST_VERSION-$TARGET.tar.gz"
+          echo "sha256=$ARCHIVE_SHA256"
+          echo "dir=$HOME/.cache/cargo-nextest-$NEXTEST_VERSION-$TARGET"
+          echo "key=cargo-nextest-$NEXTEST_VERSION-$TARGET-${ARCHIVE_SHA256:0:16}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache cargo-nextest download
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.nextest.outputs.dir }}
+        key: ${{ steps.nextest.outputs.key }}
+
+    - name: Install cargo-nextest
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+        ARCHIVE: ${{ steps.nextest.outputs.archive }}
+        ARCHIVE_SHA256: ${{ steps.nextest.outputs.sha256 }}
+        NEXTEST_DIR: ${{ steps.nextest.outputs.dir }}
+        NEXTEST_RELEASES: https://github.com/nextest-rs/nextest/releases/download
         RUSTFLAGS: ""
       run: |
-        echo "::warning::cargo-nextest $NEXTEST_VERSION release download failed; building it from crates.io"
-        cargo install cargo-nextest --locked --version "$NEXTEST_VERSION" --force
+        set -euo pipefail
+        mkdir -p "$NEXTEST_DIR" "$HOME/.cargo/bin"
+        # Succeeds only when the archive exists and matches its pin.
+        verified() { # <dir>
+          [[ -f "$1/$ARCHIVE" ]] &&
+            (cd "$1" && echo "$ARCHIVE_SHA256  $ARCHIVE" | sha256sum -c --quiet -)
+        }
+        if verified "$NEXTEST_DIR"; then
+          echo "cargo-nextest $NEXTEST_VERSION: cached release archive"
+        else
+          rm -f "$NEXTEST_DIR/$ARCHIVE"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
+              -o "$TMP/$ARCHIVE" \
+              "$NEXTEST_RELEASES/cargo-nextest-$NEXTEST_VERSION/$ARCHIVE" &&
+              verified "$TMP"; then
+            mv "$TMP/$ARCHIVE" "$NEXTEST_DIR/$ARCHIVE"
+            echo "cargo-nextest $NEXTEST_VERSION: release archive"
+          else
+            echo "::warning::cargo-nextest $NEXTEST_VERSION release archive missing or not matching its pinned sha256; building it from crates.io"
+          fi
+        fi
+        if verified "$NEXTEST_DIR"; then
+          tar -xzf "$NEXTEST_DIR/$ARCHIVE" -C "$HOME/.cargo/bin" cargo-nextest
+          chmod 0755 "$HOME/.cargo/bin/cargo-nextest"
+        else
+          cargo install cargo-nextest --locked --version "$NEXTEST_VERSION" --force
+        fi
 
     - name: Check cargo-nextest
       shell: bash

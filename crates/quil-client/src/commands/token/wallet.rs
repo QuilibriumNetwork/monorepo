@@ -296,7 +296,7 @@ where
         retries += 1;
         super::output::err_detail(format!(
             "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
-            status.message(),
+            crate::util::status_text(&status),
             SCAN_READ_RETRY_DELAY.as_secs()
         ));
         tokio::time::sleep(SCAN_READ_RETRY_DELAY).await;
@@ -768,8 +768,8 @@ fn scan_stopped(
 ) -> anyhow::Error {
     let outlived = outlived_snapshot(&error, elapsed);
     let reason = match error.downcast_ref::<tonic::Status>() {
-        Some(status) => status.message().to_string(),
-        None => format!("{error:#}"),
+        Some(status) => crate::util::status_text(status),
+        None => crate::util::remote_text(&format!("{error:#}")),
     };
     anyhow::Error::new(ScanStopped {
         what,
@@ -3321,7 +3321,7 @@ impl RecipientWallet {
             Err(status) => {
                 super::output::detail(format!(
                     "Escrows past their refund frame rank as pending: no GLOBAL head ({}).",
-                    status.message()
+                    crate::util::status_text(&status)
                 ));
                 0
             }
@@ -6548,15 +6548,12 @@ pub(crate) async fn run_merge(
 pub(super) const MERGE_BATCH_LOCK: &str = "token-merge-batch.lock";
 
 /// Hold [`MERGE_BATCH_LOCK`] for a batch run; refused while another run holds
-/// it. The lock ends with the returned file.
+/// it. The lock ends with the returned file. A link in its place is refused,
+/// so a root run creates no file where another user points it.
 #[cfg(feature = "native-proof")]
 pub(super) fn lock_merge_batch(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let path = dir.join(MERGE_BATCH_LOCK);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
+    let file = quil_config::open_private_create(&path, quil_config::PrivateCreate::Lock)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(file),
@@ -10671,5 +10668,32 @@ mod shield_all_cli_tests {
                 None,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_text_tests {
+    /// A scan a node stopped names the node's reason without the control
+    /// characters it carries.
+    #[test]
+    fn a_stopped_scan_names_the_reason_without_control_characters() {
+        let hostile =
+            tonic::Status::unavailable("\u{1b}[2J\u{1b}]52;c;cHduZWQ=\u{7}\nBalance: 1000 QUIL\r");
+        let stopped = super::scan_stopped(
+            "coins",
+            2,
+            10,
+            1,
+            anyhow::Error::new(hostile),
+            std::time::Duration::from_secs(3),
+        );
+        let shown = format!("{stopped:#}");
+        eprintln!("REACH scan-stopped {}", shown.escape_debug());
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "REMOTE-TEXT-UNFILTERED: {}",
+            shown.escape_debug()
+        );
+        assert!(shown.contains("Balance: 1000 QUIL"), "{shown}");
     }
 }

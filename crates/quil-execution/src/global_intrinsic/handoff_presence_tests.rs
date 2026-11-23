@@ -307,6 +307,39 @@ fn forged_presence_vote_is_refused_before_its_anchor_is_read() {
     refused_for(f.verify(&missing), "notarize of the proposal");
 }
 
+/// A header is bound to the payload its votes sign before its anchor is
+/// read: a genuine vote paired with a header whose output is not the
+/// payload's preimage is refused without a lookup, so a node that lacks the
+/// anchor named in such a header refuses it like every other node.
+#[test]
+fn a_header_not_bound_to_its_payload_is_refused_before_its_anchor_is_read() {
+    let f = fixture();
+    let mut report = f.report(vec![f.proposal(5, f.anchor, &[0, 1])]);
+    f.verify(&report).unwrap();
+    // Another earlier frame of the epoch, which this node does not hold.
+    report.proposals[0].header.global_frame_number = f.anchor - 1;
+    report.proposals[0].header.output = vec![0x5a; 516];
+    let lookups = std::cell::Cell::new(0u32);
+    let result =
+        crate::global_intrinsic::handoff::presence::verify(&f.state, f.frame, &report, |anchor| {
+            lookups.set(lookups.get() + 1);
+            Err(QuilError::ExecutionUnavailable(format!(
+                "anchored global frame {anchor} unavailable"
+            )))
+        });
+    eprintln!(
+        "REACH presence header check: lookups={} result={result:?}",
+        lookups.get()
+    );
+    assert_eq!(
+        lookups.get(),
+        0,
+        "PRESENCE-ANCHOR-READ-BEFORE-PAYLOAD: the anchor of a header not bound \
+         to its payload was read ({result:?})"
+    );
+    refused_for(result, "payload is not the digest of the header output");
+}
+
 #[test]
 fn presence_report_of_a_foreign_session_or_filter_is_refused() {
     let f = fixture();

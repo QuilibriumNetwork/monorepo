@@ -432,7 +432,12 @@ pub(crate) async fn local_peer_info(
     Ok(client
         .get_peer_info(quil_types::proto::node::GetPeerInfoRequest {})
         .await
-        .map_err(|e| anyhow::anyhow!("ask this node for its peer info: {}.", e.message()))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "ask this node for its peer info: {}.",
+                crate::util::status_text(&e)
+            )
+        })?
         .into_inner()
         .peer_info)
 }
