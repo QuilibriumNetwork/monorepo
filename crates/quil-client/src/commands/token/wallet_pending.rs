@@ -377,12 +377,19 @@ pub(super) async fn check_inputs(client: &Client, spend: &PendingSpend, what: &s
     Inputs::Unspent
 }
 
-/// Watches one wait's spend: its journal entry, read once, and whether its
-/// inputs still need reading.
+/// One read of a spend's inputs, still in flight.
+type Check = std::pin::Pin<Box<dyn std::future::Future<Output = Inputs> + Send>>;
+
+/// Watches one wait's spend: its journal entry, read once, whether its
+/// inputs still need reading, and the read of them still in flight.
 pub(super) struct InputWatch {
     spends: PendingSpends,
     spend: Option<PendingSpend>,
     what: String,
+    /// The reads a poll left unfinished, which the next poll drives on
+    /// from the input they reached, so a slow node's later inputs are
+    /// still read. Dropping the watch drops them.
+    check: Option<Check>,
 }
 
 impl InputWatch {
@@ -394,6 +401,7 @@ impl InputWatch {
             spends,
             spend,
             what: format!("settlement 0x{}", hex::encode(receipt)),
+            check: None,
         }
     }
 
@@ -411,6 +419,7 @@ impl InputWatch {
             spends,
             spend,
             what: format!("{what} 0x{}", hex::encode(operation)),
+            check: None,
         }
     }
 
@@ -421,25 +430,34 @@ impl InputWatch {
             self.spends.release(&spend.operation);
         }
         self.spend = None;
+        self.check = None;
     }
 
-    /// One poll, its reads ended at the wait's `deadline`: an error once
-    /// another operation consumed an input, which also frees the spend's
-    /// other coins for selection. Once the spend itself shows committed,
-    /// later polls read nothing.
+    /// One poll: it drives the reads of the spend's inputs for at most
+    /// `budget`, the caller's pause between its own progress reads, and
+    /// never past the wait's `deadline`; reads still unfinished go on at
+    /// the next poll. An error once another operation consumed an input,
+    /// which also frees the spend's other coins for selection. Once the
+    /// spend itself shows committed, later polls read nothing.
     pub(super) async fn poll(
         &mut self,
         client: &Client,
         deadline: std::time::Instant,
+        budget: std::time::Duration,
     ) -> Result<(), InputSpent> {
         let Some(spend) = &self.spend else {
             return Ok(());
         };
-        let read = check_inputs(client, spend, &self.what);
-        // A read that hangs says nothing, as one that fails.
-        let inputs = tokio::time::timeout_at(deadline.into(), read)
-            .await
-            .unwrap_or(Inputs::Unspent);
+        let check = self.check.get_or_insert_with(|| {
+            let (client, spend, what) = (client.clone(), spend.clone(), self.what.clone());
+            Box::pin(async move { check_inputs(&client, &spend, &what).await })
+        });
+        let until = deadline.min(std::time::Instant::now() + budget);
+        // A read that hangs says nothing yet, as one that fails.
+        let Ok(inputs) = tokio::time::timeout_at(until.into(), check).await else {
+            return Ok(());
+        };
+        self.check = None;
         match inputs {
             Inputs::Unspent => Ok(()),
             Inputs::Committed => {
@@ -548,13 +566,16 @@ impl RecipientWallet {
 mod tests {
     use super::*;
 
-    /// A node that accepts a connection and never answers holds a read
-    /// until the wait's deadline, not past it.
-    #[tokio::test]
-    async fn a_poll_whose_reads_hang_ends_at_the_wait_deadline() {
+    /// A client of a node that accepts connections and never answers, and
+    /// what tells each accepted connection; the task holding them.
+    async fn silent_node() -> (
+        Client,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (accepted, mut accepts) = tokio::sync::mpsc::unbounded_channel();
+        let (accepted, accepts) = tokio::sync::mpsc::unbounded_channel();
         let holding = tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
@@ -567,31 +588,80 @@ mod tests {
                 .unwrap()
                 .connect_lazy(),
         );
+        (client, accepts, holding)
+    }
+
+    /// One poll of a one-input spend on a silent node, its reads ending at
+    /// `deadline` or after `budget`, whichever comes first, run for at most
+    /// 2 s (`tag` names its overrun): how long it took.
+    async fn poll_silent(
+        deadline: std::time::Duration,
+        budget: std::time::Duration,
+        tag: &str,
+    ) -> std::time::Duration {
+        let (client, mut accepts, holding) = silent_node().await;
         let directory = tempfile::tempdir().unwrap();
         let mut watch = InputWatch {
             spends: PendingSpends::at(directory.path()),
             spend: Some(spend(2, RecipientWallet::unix_now(), &[3])),
             what: "transfer".to_string(),
+            check: None,
         };
         let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_millis(300);
-        let polled = tokio::time::timeout(
+        let Ok(polled) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            watch.poll(&client, deadline),
+            watch.poll(&client, started + deadline, budget),
         )
         .await
-        .expect("read_unbounded: a hung read held the poll past its deadline");
+        else {
+            panic!("{tag}: a hung read held the poll for 2 s");
+        };
+        let took = started.elapsed();
         assert!(polled.is_ok(), "a hung read says nothing");
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(250),
-            "the poll ended before its read reached the node"
-        );
         assert!(
             accepts.try_recv().is_ok(),
             "the read never reached the silent node"
         );
         assert!(watch.spend.is_some(), "a hung read keeps the watch");
+        assert!(
+            watch.check.is_some(),
+            "a hung read is kept for the next poll"
+        );
         holding.abort();
+        took
+    }
+
+    /// A node that accepts a connection and never answers holds a read
+    /// until the wait's deadline, not past it.
+    #[tokio::test]
+    async fn a_poll_whose_reads_hang_ends_at_the_wait_deadline() {
+        let took = poll_silent(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(60),
+            "read_unbounded",
+        )
+        .await;
+        assert!(
+            took >= std::time::Duration::from_millis(250),
+            "the poll ended after {took:?}, before its read reached the node"
+        );
+    }
+
+    /// A node that never answers holds a poll for its budget, the caller's
+    /// pause between its own progress reads, not until the wait's deadline:
+    /// the wait reads its progress meanwhile.
+    #[tokio::test]
+    async fn a_poll_whose_reads_hang_ends_after_its_budget() {
+        let took = poll_silent(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(300),
+            "budget_ignored",
+        )
+        .await;
+        assert!(
+            took >= std::time::Duration::from_millis(250),
+            "the poll ended after {took:?}, before its budget"
+        );
     }
 
     fn spend(operation: u8, at: u64, markers: &[u8]) -> PendingSpend {

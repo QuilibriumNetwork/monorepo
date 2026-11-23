@@ -6383,6 +6383,10 @@ pub(super) async fn run_settlement_claim(
     })
 }
 
+/// Pause between a settlement claim's witness reads while waiting.
+#[cfg(feature = "native-proof")]
+const WITNESS_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Build the claim spending settlement `receipt` in `destination`'s bundle,
 /// from a global membership witness. Waits up to `wait` for the settlement's
 /// GLOBAL record to reach a certified root this node retains.
@@ -6472,7 +6476,7 @@ pub(super) async fn settlement_claim(
             Err(status) => return Err(anyhow::anyhow!("settlement witness: {status}")),
         }
         if let Ok(client) = &connected {
-            inputs.poll(client, deadline).await?;
+            inputs.poll(client, deadline, WITNESS_POLL).await?;
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
@@ -6482,7 +6486,7 @@ pub(super) async fn settlement_claim(
             hex::encode(receipt),
             wait.as_secs()
         );
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(WITNESS_POLL).await;
     }
 }
 

@@ -6764,6 +6764,60 @@ async fn a_settlement_whose_input_was_consumed_fails_its_wait_at_once() {
     node.stop().await;
 }
 
+/// A poll whose budget ends before its reads do leaves them for the next
+/// poll, which goes on from the input they reached: polls with no budget
+/// at all still read a spend's second input, which another operation
+/// consumed, and end its wait.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn polls_with_no_budget_read_every_input_in_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let (wallet, tc, node) = served_loaded_wallet(directory.path()).await;
+    let (first, second) = ([0x41; 32], [0x42; 32]);
+    let operation = [0x43; 32];
+    super::pending::PendingSpends::at(&tc.config_dir).record(super::pending::PendingSpend {
+        application: wallet.application,
+        operation,
+        receipt: None,
+        at: RecipientWallet::unix_now(),
+        inputs: [first, second]
+            .map(|marker| super::pending::SpentInput { marker, coin: None })
+            .to_vec(),
+    });
+    record_consumed(
+        &node.fixture.store,
+        &wallet.application,
+        &second,
+        &[0xee; 32],
+    );
+    let mut watch =
+        super::pending::InputWatch::operation(&tc, "transfer", &wallet.application, &operation);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(60);
+    let mut polls = 0u32;
+    let spent = loop {
+        polls += 1;
+        match watch
+            .poll(&node.client, deadline, std::time::Duration::ZERO)
+            .await
+        {
+            Err(spent) => break spent,
+            Ok(()) => {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "reads_restarted: {polls} polls with no budget never read the second \
+                     input"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    };
+    eprintln!("REACH consumed-input second input read after {polls} polls");
+    assert_eq!(spent.input.marker, second, "the poll named another input");
+    assert_eq!(spent.by, [0xee; 32]);
+    node.stop().await;
+}
+
 /// A coin this wallet just spent stays out of its next selection while the
 /// node, its GLOBAL view behind, still lists it unspent: the next spend
 /// does not take it again and fail.
