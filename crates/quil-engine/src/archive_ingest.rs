@@ -97,6 +97,16 @@ pub struct ArchiveAppShardIngest {
     /// When a line last said frames wait for a GLOBAL frame, and how many
     /// GLOBAL frames were noted since without one.
     anchor_line: Option<(Instant, u64)>,
+    /// Shards whose next frame sequenced materialization lacks while
+    /// frames are buffered above it or a GLOBAL frame waits for it.
+    gap_lines: WaitLines,
+    /// Shards whose header a GLOBAL proposal held back, as this archive
+    /// lacks frame bodies below it ([`Self::holds_bodies_through`]). A
+    /// wait ends once the bodies are held, after [`WAIT_LINE_TTL`] with no
+    /// proposal holding its header back, or with a legacy history discard;
+    /// a pass that finds no proposal of the shard does not end it, as only
+    /// this node's own proposals fill the wanted set.
+    held_back_lines: WaitLines,
     /// The shards whose gossiped frames this archive ingests.
     tracked: TrackedShards,
     /// Frames received whose session generation executed GLOBAL state has not
@@ -173,6 +183,10 @@ pub struct ArchiveAppShardIngest {
     /// Frames [`Self::held_through`] stepped over, for tests of its cost.
     #[cfg(test)]
     held_walk_steps: u64,
+    /// GLOBAL committed views captured for held frames ([`CommittedOnce`]),
+    /// for tests of their cost.
+    #[cfg(test)]
+    committed_views: Arc<AtomicU64>,
 }
 
 const GAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -250,6 +264,24 @@ const AWAIT_ANCHOR_TTL: Duration = Duration::from_secs(10 * 60);
 /// The least time between two lines saying frames wait for a GLOBAL frame
 /// this archive has not stored.
 const AWAIT_ANCHOR_LINE_INTERVAL: Duration = Duration::from_secs(60);
+/// The least time between two lines about one shard's wait for frame
+/// bodies ([`WaitLines`]).
+const WAIT_LINE_INTERVAL: Duration = Duration::from_secs(60);
+/// Shards whose wait for frame bodies is tracked for its lines at once;
+/// past it a new wait goes unlogged until one ends.
+const MAX_WAIT_LINES: usize = 4096;
+/// How long a shard's wait for frame bodies lasts before it is logged: one
+/// retry interval ([`GAP_RETRY_INTERVAL`]). A wait that one pass opens and
+/// the next closes is the normal course of ingest, not worth two lines.
+const WAIT_LINE_AFTER: Duration = GAP_RETRY_INTERVAL;
+/// How long a shard's wait for frame bodies is followed with no pass
+/// looking at it: over ten retry passes, so only a wait no longer checked
+/// ages out ([`WaitLines`] says what that means for each wait).
+const WAIT_LINE_TTL: Duration = Duration::from_secs(10 * 60);
+/// The least time between two sweeps a full map of waits forces
+/// ([`WaitLines::due`]): waits that age out one at a time then cost one
+/// sweep of the map each this long, not one per new wait.
+const FORCED_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// The least time between two reads of the shards the prover registry holds
 /// allocations of, when a gossiped frame names a shard outside them
 /// ([`TrackedShards`]).
@@ -355,6 +387,166 @@ impl CommittedRange {
     fn served_whole(&self) -> bool {
         self.unserved.is_empty() && self.scanned_through >= self.tip
     }
+}
+
+/// One wait per shard for frame bodies, logged once it has lasted
+/// [`WAIT_LINE_AFTER`], at most every [`WAIT_LINE_INTERVAL`] while it
+/// lasts, and at its end if its start was logged. A wait no pass looked at
+/// for [`WAIT_LINE_TTL`] ends too, in one line for all of them per sweep.
+struct WaitLines {
+    /// Which wait, for the lines of waits that age out.
+    what: &'static str,
+    /// What a wait no pass looked at for `ttl_secs` means, for those lines.
+    aged_out: &'static str,
+    open: HashMap<Vec<u8>, Wait>,
+    /// When the waits were last swept for any no pass looked at
+    /// ([`Self::sweep`]).
+    swept: Instant,
+    /// When a full map is swept again for a new wait: no earlier than a
+    /// wait can age out, as of the last sweep (a wait's `seen` only moves
+    /// on and a new wait starts at now), and after a sweep a full map
+    /// forced, no earlier than [`FORCED_SWEEP_INTERVAL`] after it.
+    ages_out_from: Instant,
+}
+
+/// One shard's wait ([`WaitLines`]).
+struct Wait {
+    since: Instant,
+    /// When a pass last found it still waiting.
+    seen: Instant,
+    /// When it was last logged; `None` until it lasted [`WAIT_LINE_AFTER`].
+    logged: Option<Instant>,
+    /// The first frame it lacked when last logged, or first seen.
+    from: u64,
+}
+
+impl WaitLines {
+    fn new(what: &'static str, aged_out: &'static str) -> Self {
+        Self {
+            what,
+            aged_out,
+            open: HashMap::new(),
+            swept: Instant::now(),
+            ages_out_from: Instant::now(),
+        }
+    }
+
+    /// Whether a line is due for `address`, waiting from frame `from`: the
+    /// seconds it waited, first once it has lasted [`WAIT_LINE_AFTER`],
+    /// then at most every [`WAIT_LINE_INTERVAL`].
+    fn due(&mut self, address: &[u8], from: u64) -> Option<u64> {
+        self.due_at(Instant::now(), address, from)
+    }
+
+    /// [`Self::due`] at `now`.
+    fn due_at(&mut self, now: Instant, address: &[u8], from: u64) -> Option<u64> {
+        // A full map is swept for a new wait only once a wait can have aged
+        // out, and at most every [`FORCED_SWEEP_INTERVAL`], so a pass over
+        // every followed shard sweeps it at most once.
+        let new = !self.open.contains_key(address);
+        self.sweep(
+            now,
+            new && self.open.len() >= MAX_WAIT_LINES && now >= self.ages_out_from,
+        );
+        let full = self.open.len() >= MAX_WAIT_LINES;
+        let Some(wait) = self.open.get_mut(address) else {
+            if !full {
+                let wait = Wait {
+                    since: now,
+                    seen: now,
+                    logged: None,
+                    from,
+                };
+                self.open.insert(address.to_vec(), wait);
+            }
+            return None;
+        };
+        wait.seen = now;
+        let waited = now.saturating_duration_since(wait.since);
+        let due = match wait.logged {
+            Some(logged) => now.saturating_duration_since(logged) >= WAIT_LINE_INTERVAL,
+            None => waited >= WAIT_LINE_AFTER,
+        };
+        if !due {
+            return None;
+        }
+        wait.logged = Some(now);
+        wait.from = from;
+        Some(waited.as_secs().max(1))
+    }
+
+    /// End `address`'s wait: the seconds it lasted and the first frame it
+    /// lacked when last logged, if its start was logged.
+    fn end(&mut self, address: &[u8]) -> Option<(u64, u64)> {
+        self.sweep(Instant::now(), false);
+        let wait = self.open.remove(address)?;
+        wait.logged
+            .map(|_| (wait.since.elapsed().as_secs(), wait.from))
+    }
+
+    /// End every wait (the frames they waited for were discarded); returns
+    /// how many had their start logged.
+    fn clear(&mut self) -> usize {
+        let logged = self
+            .open
+            .values()
+            .filter(|wait| wait.logged.is_some())
+            .count();
+        self.open.clear();
+        logged
+    }
+
+    /// End the waits no pass looked at for [`WAIT_LINE_TTL`], at most every
+    /// [`WAIT_LINE_INTERVAL`] or, `now_too`, at once (a full map a wait can
+    /// have aged out of), in one line for those whose start was logged.
+    fn sweep(&mut self, now: Instant, now_too: bool) {
+        if !now_too && now.saturating_duration_since(self.swept) < WAIT_LINE_INTERVAL {
+            return;
+        }
+        self.swept = now;
+        let mut aged = Vec::new();
+        self.open.retain(|address, wait| {
+            let keep = now.saturating_duration_since(wait.seen) < WAIT_LINE_TTL;
+            if !keep && wait.logged.is_some() {
+                aged.push((
+                    hex::encode(address),
+                    wait.from,
+                    now.saturating_duration_since(wait.since).as_secs(),
+                ));
+            }
+            keep
+        });
+        let oldest = self.open.values().map(|wait| wait.seen).min();
+        let ages_out_from = oldest.unwrap_or(now) + WAIT_LINE_TTL;
+        // Waits that age out one at a time would otherwise force one sweep
+        // per new wait.
+        self.ages_out_from = if now_too {
+            ages_out_from.max(now + FORCED_SWEEP_INTERVAL)
+        } else {
+            ages_out_from
+        };
+        if aged.is_empty() {
+            return;
+        }
+        let ended = aged.len();
+        aged.truncate(4);
+        info!(wait = self.what, ended, first = ?aged, ttl_secs = WAIT_LINE_TTL.as_secs(),
+            "archive stopped following shards' waits for frame bodies: {}; first lists up to 4 as (address, \
+             missing_from, waited_secs)", self.aged_out);
+    }
+}
+
+/// Why the frames of a range were not asked for
+/// ([`ArchiveAppShardIngest::request_frames`]), for wait lines.
+#[derive(Debug, Default)]
+struct SkippedAsks {
+    /// Held without a certificate: they wait for a certified or committed
+    /// frame that links to them.
+    held_uncertified: usize,
+    /// Parked until their GLOBAL anchor is stored.
+    parked_anchor: usize,
+    /// Parked until GLOBAL execution reaches their anchor.
+    parked_execution: usize,
 }
 
 /// A frame of a committed range this archive does not serve: since when,
@@ -481,7 +673,46 @@ enum OwedOrigin {
 /// header. Every gap-fetch round in the meantime asks every member and archive.
 const EMPTY_FRAME_BODY_GRACE: Duration = Duration::from_secs(90);
 
+/// GLOBAL's committed view for one call that looks up several held frames
+/// ([`ArchiveAppShardIngest::committed_held`]): captured at the first lookup
+/// that finds a frame held at its height, then shared by the rest. A view is
+/// short-lived, so none outlives its call, nor one sequencing step. Until
+/// 2026-11-23 each lookup captured its own, up to 32 for one body check
+/// under the ingest.
+struct CommittedOnce {
+    global: Arc<quil_hypergraph::HypergraphCrdt>,
+    view: std::cell::OnceCell<Option<quil_execution::global_intrinsic::handoff::CommittedView>>,
+    #[cfg(test)]
+    captured: Arc<AtomicU64>,
+}
+
+impl CommittedOnce {
+    /// `read` of the view, `None` where GLOBAL's committed view is
+    /// unavailable.
+    fn read<T>(
+        &self,
+        read: impl FnOnce(&quil_execution::global_intrinsic::handoff::CommittedView) -> T,
+    ) -> Option<T> {
+        let capture = || {
+            #[cfg(test)]
+            self.captured.fetch_add(1, Ordering::Relaxed);
+            quil_execution::global_intrinsic::handoff::CommittedView::capture(&self.global).ok()
+        };
+        self.view.get_or_init(capture).as_ref().map(read)
+    }
+}
+
 impl ArchiveAppShardIngest {
+    /// A [`CommittedOnce`] for one call.
+    fn committed_once(&self) -> CommittedOnce {
+        CommittedOnce {
+            global: self.hypergraph.clone(),
+            view: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            captured: self.committed_views.clone(),
+        }
+    }
+
     pub fn new(
         prover_registry: Arc<dyn ProverRegistryTrait>,
         bls_constructor: Arc<dyn BlsConstructor>,
@@ -544,6 +775,15 @@ impl ArchiveAppShardIngest {
             awaiting_anchor: HashMap::new(),
             anchors_noted: std::collections::BTreeSet::new(),
             anchor_line: None,
+            gap_lines: WaitLines::new(
+                "frame gap",
+                "no pass looked at them for ttl_secs, so their shards stopped or are no longer \
+                 ingested",
+            ),
+            held_back_lines: WaitLines::new(
+                "held back",
+                "no GLOBAL proposal of ours held their shard headers back for ttl_secs",
+            ),
             awaiting_execution: HashMap::new(),
             execution_deferrals: crate::execution_deferral::DeferralLog::new("archive ingest"),
             sequenced: false,
@@ -555,6 +795,8 @@ impl ArchiveAppShardIngest {
             skip_header_authentication: false,
             #[cfg(test)]
             held_walk_steps: 0,
+            #[cfg(test)]
+            committed_views: Arc::default(),
         }
     }
 
@@ -634,6 +876,7 @@ impl ArchiveAppShardIngest {
         let Ok(cursor) = self.materialized_height(address) else {
             return bodies;
         };
+        let committed = self.committed_once();
         let mut next = cursor.saturating_add(1);
         while next <= through {
             let held = self
@@ -659,7 +902,7 @@ impl ArchiveAppShardIngest {
                     }
                     PlannedBody::Stored(next)
                 }
-                None => match self.committed_held(address, next) {
+                None => match self.committed_held(address, next, &committed) {
                     Some(frame) => {
                         if !budget.take(PlanBudget::bundle_bytes(&frame.requests)) {
                             break;
@@ -784,7 +1027,8 @@ impl ArchiveAppShardIngest {
     /// ([`HeldBodies::frames_held`]): publish what is held of each shard and
     /// ask for the first frame it lacks ([`Self::holds_bodies_through`]).
     pub fn look_into_wanted(&mut self) {
-        for (address, (through, empty)) in self.held_bodies.take_wanted() {
+        let wanted = self.held_bodies.take_wanted();
+        for (address, (through, empty)) in wanted {
             if let Err(error) = self.holds_bodies_through(&address, through, empty) {
                 debug!(%error, address = %hex::encode(&address),
                     "shard body check unavailable; its header is held back");
@@ -1052,10 +1296,13 @@ impl ArchiveAppShardIngest {
         self.requested.clear();
         self.owed_bodies.clear();
         self.committed_ranges.clear();
+        let waits_ended = self.gap_lines.clear() + self.held_back_lines.clear();
         crate::app_engine::forget_legacy_relay_boundaries();
         tracing::info!(
             global_frame,
-            "committee-handoff flag day: archive discarded its legacy app frame history"
+            waits_ended,
+            "committee-handoff flag day: archive discarded its legacy app frame history; waits_ended: logged \
+             shard waits for frame bodies it ends with it"
         );
         Ok(true)
     }
@@ -1235,25 +1482,44 @@ impl ArchiveAppShardIngest {
         }
         // Held ancestors this frame now authenticates, down the chain.
         let mut authenticated = vec![(number, frame)];
-        let mut child = header;
-        if let Some(held) = self.held.get_mut(address) {
-            while child.frame_number > 0 {
-                let below = child.frame_number - 1;
-                let parent = held
-                    .range((below, [0; 32])..=(below, [0xff; 32]))
-                    .find(|(_, parent)| {
-                        parent
-                            .header
-                            .as_ref()
-                            .is_some_and(|p| app_frame_links_to_child(p, &child))
-                    })
-                    .map(|(key, _)| *key);
-                let Some(key) = parent else { break };
-                let parent = held.remove(&key).expect("found above");
-                child = parent.header.clone().expect("held frames have headers");
-                authenticated.push((below, parent));
-            }
+        authenticated.extend(self.take_held_ancestors(address, header));
+        self.buffer_authenticated(address, authenticated);
+    }
+
+    /// Take out of `held` the frames `child` authenticates, down the chain:
+    /// its parent, that frame's parent, and so on, while each is held.
+    fn take_held_ancestors(
+        &mut self,
+        address: &[u8],
+        mut child: quil_types::proto::global::FrameHeader,
+    ) -> Vec<(u64, AppShardFrame)> {
+        use crate::frame_validator::app_frame_links_to_child;
+        let mut authenticated = Vec::new();
+        let Some(held) = self.held.get_mut(address) else {
+            return authenticated;
+        };
+        while child.frame_number > 0 {
+            let below = child.frame_number - 1;
+            let parent = held
+                .range((below, [0; 32])..=(below, [0xff; 32]))
+                .find(|(_, parent)| {
+                    parent
+                        .header
+                        .as_ref()
+                        .is_some_and(|p| app_frame_links_to_child(p, &child))
+                })
+                .map(|(key, _)| *key);
+            let Some(key) = parent else { break };
+            let parent = held.remove(&key).expect("found above");
+            child = parent.header.clone().expect("held frames have headers");
+            authenticated.push((below, parent));
         }
+        authenticated
+    }
+
+    /// Buffer `authenticated` frames of `address`: certified ones and the
+    /// held ancestors a certified or committed frame links to.
+    fn buffer_authenticated(&mut self, address: &[u8], authenticated: Vec<(u64, AppShardFrame)>) {
         let cursor = self.last_materialized.get(address).copied().unwrap_or(0);
         for (number, frame) in authenticated {
             if self.refuses_sibling(&frame) {
@@ -1380,14 +1646,15 @@ impl ArchiveAppShardIngest {
     /// Frame `number` of `address` may no longer be held: the next walk of
     /// [`Self::held_through`] starts below it, unless it still is.
     fn unhold(&mut self, address: &[u8], number: u64) {
-        if !self.holds_body(address, number) {
+        let holds = self.holds_body(address, number, &self.committed_once());
+        if !holds {
             self.held_bodies.forget_copy(address, number);
         }
-        if self
-            .held_run_end
-            .get(address)
-            .is_none_or(|&end| end < number)
-            || self.holds_body(address, number)
+        if holds
+            || self
+                .held_run_end
+                .get(address)
+                .is_none_or(|&end| end < number)
         {
             return;
         }
@@ -1431,10 +1698,10 @@ impl ArchiveAppShardIngest {
     /// proposals: buffered, stored with its digest remembered
     /// ([`Self::body_held`]), in a stored run ([`Self::stored_runs`]) or held
     /// as the frame GLOBAL committed at that height ([`Self::committed_held`]).
-    fn holds_body(&self, address: &[u8], number: u64) -> bool {
+    fn holds_body(&self, address: &[u8], number: u64, committed: &CommittedOnce) -> bool {
         self.body_held(address, number)
             || self.stored_run_end(address, number).is_some()
-            || self.committed_held(address, number).is_some()
+            || self.committed_held(address, number, committed).is_some()
     }
 
     /// The highest frame of `address` through which every body above
@@ -1444,7 +1711,7 @@ impl ArchiveAppShardIngest {
     /// last one ended ([`Self::held_run_end`]) and crosses a stored run at
     /// once: it ran from the cursor on every admit, about N²/2 lookups under
     /// the ingest while a shard N frames behind caught up.
-    fn held_through(&mut self, address: &[u8], cursor: u64) -> u64 {
+    fn held_through(&mut self, address: &[u8], cursor: u64, committed: &CommittedOnce) -> u64 {
         let mut through = self
             .held_run_end
             .get(address)
@@ -1460,7 +1727,7 @@ impl ArchiveAppShardIngest {
                 through = last;
             } else if self.body_held(address, next) {
                 through = next;
-            } else if let Some(frame) = self.committed_held(address, next) {
+            } else if let Some(frame) = self.committed_held(address, next, committed) {
                 // Sequenced ingest takes it without checking its identity.
                 self.held_bodies.note_copy(address, next, &frame, true);
                 through = next;
@@ -1472,12 +1739,25 @@ impl ArchiveAppShardIngest {
         through
     }
 
+    /// [`Self::held_through`], first buffering the held frames the frame
+    /// GLOBAL committed above them authenticates when the run stops at one
+    /// of them below `through` ([`Self::buffer_held_below_committed`]).
+    fn held_through_committed(&mut self, address: &[u8], cursor: u64, through: u64) -> u64 {
+        let committed = self.committed_once();
+        let held = self.held_through(address, cursor, &committed);
+        if through > held && self.buffer_held_below_committed(address, held + 1, &committed) > 0 {
+            self.held_through(address, cursor, &committed)
+        } else {
+            held
+        }
+    }
+
     /// Publish what this ingest holds of `address` ([`HeldBodies`]).
     fn publish_held(&mut self, address: &[u8]) {
         let Ok(cursor) = self.materialized_height(address) else {
             return;
         };
-        let through = self.held_through(address, cursor);
+        let through = self.held_through(address, cursor, &self.committed_once());
         self.held_bodies.publish(address, cursor, through);
     }
 
@@ -1494,7 +1774,10 @@ impl ArchiveAppShardIngest {
         let Some(held) = self.held.get(address) else {
             return;
         };
-        let Ok(Some(tip)) = crate::app_handoff::committed_tip(&self.hypergraph, address) else {
+        let committed = self.committed_once();
+        let Some(Ok(Some(tip))) =
+            committed.read(|view| crate::app_handoff::committed_tip_in(view, address))
+        else {
             return;
         };
         let at_tip = |identity: [u8; 32]| held.contains_key(&(tip, identity));
@@ -1514,11 +1797,9 @@ impl ArchiveAppShardIngest {
         if served.is_some_and(at_tip) {
             return;
         }
-        let Ok(Some(digest)) = crate::app_handoff::committed_frame_digest_looked_through(
-            &self.hypergraph,
-            address,
-            tip,
-        ) else {
+        let Some(Ok(Some(digest))) = committed.read(|view| {
+            crate::app_handoff::committed_frame_digest_looked_through_in(view, address, tip)
+        }) else {
             return;
         };
         let Some(frame) = held.get(&(tip, digest)) else {
@@ -2464,6 +2745,9 @@ impl ArchiveAppShardIngest {
             if broken.is_some_and(|broken| next < broken) && !carried.contains_key(&next) {
                 break false;
             }
+            // A parent held below the frame GLOBAL committed is taken first.
+            let committed = self.committed_once();
+            self.buffer_held_below_committed(address, next, &committed);
             // `rebuilt`: rebuilt from its header, and whether whole.
             let buffered = self
                 .buffered
@@ -2482,7 +2766,7 @@ impl ArchiveAppShardIngest {
             };
             let (frame, rebuilt) = match held {
                 Some(f) => (f, None),
-                None => match self.committed_held(address, next) {
+                None => match self.committed_held(address, next, &committed) {
                     Some(frame) => {
                         self.store_for_serving(&frame);
                         info!(address = %hex::encode(address), frame = next,
@@ -2645,14 +2929,26 @@ impl ArchiveAppShardIngest {
                 // Counted into the inclusion summary; a GLOBAL frame waiting on
                 // the gap has a warning of its own.
                 crate::inclusion_summary::note_gap(address, next_needed, requested);
-                debug!(
-                    address = %hex::encode(address),
-                    missing_from = next_needed,
-                    requested,
-                    buffered_ahead = ahead,
-                    "archive app-shard frame gap awaiting recovery"
-                );
             }
+            if let Some(waited_secs) = self.gap_lines.due(address, next_needed) {
+                let skipped = self.skipped_asks(address, next_needed..=upto);
+                info!(address = %hex::encode(address), missing_from = next_needed, asked_from = wanted, upto,
+                    requested, buffered_ahead = ahead, global_frame = global_frame.unwrap_or(0), waited_secs,
+                    held_uncertified = skipped.held_uncertified, parked_anchor = skipped.parked_anchor,
+                    parked_execution = skipped.parked_execution,
+                    "archive app-shard frame gap awaiting recovery: materialization lacks the shard's next \
+                     frame while frames above it are buffered or a GLOBAL frame (global_frame, 0: none) \
+                     waits for it; it asks the shard's members and archives (requested 0: asked within the \
+                     retry interval or skipped as counted); held_uncertified frames wait for a certified or \
+                     committed frame that links to them; logged once it lasts 30s, then each minute while it \
+                     lasts");
+            }
+        } else if let Some((waited_secs, from)) = self.gap_lines.end(address) {
+            info!(address = %hex::encode(address), missing_from = from, cursor = last, waited_secs,
+                next_held = !missing,
+                "archive app-shard frame gap closed: the shard's next frame is held or materialized \
+                 (next_held true), or it is still missing with no frame buffered above it and no GLOBAL \
+                 frame waiting for it (next_held false), so nothing needs it yet");
         }
         // Bound the buffer to frames still ahead of us. An outstanding request
         // stays: a GLOBAL frame can need a frame with nothing buffered past it,
@@ -2840,9 +3136,15 @@ impl ArchiveAppShardIngest {
         empty: bool,
     ) -> quil_types::error::Result<bool> {
         let last = self.materialized_height(address)?;
-        let held = self.held_through(address, last);
+        let held = self.held_through_committed(address, last, through);
         self.held_bodies.publish(address, last, held);
         if through <= held || (empty && through == held + 1) {
+            if let Some((waited_secs, from)) = self.held_back_lines.end(address) {
+                info!(address = %hex::encode(address), missing_from = from, cursor = last, through,
+                    waited_secs,
+                    "archive holds every application frame body below a shard header it held back from \
+                     GLOBAL proposals; the header can be proposed again");
+            }
             return Ok(true);
         }
         let number = held + 1;
@@ -2859,7 +3161,7 @@ impl ArchiveAppShardIngest {
                 .get(address)
                 .and_then(|runs| runs.range(number..).next())
                 .map_or(upto, |(&first, _)| upto.min(first.saturating_sub(1)));
-            self.request_frames(
+            let requested = self.request_frames(
                 address,
                 number..=upto,
                 false,
@@ -2867,8 +3169,35 @@ impl ArchiveAppShardIngest {
                 None,
                 GAP_RETRY_INTERVAL,
             );
+            if let Some(waited_secs) = self.held_back_lines.due(address, number) {
+                let skipped = self.skipped_asks(address, number..=upto);
+                info!(address = %hex::encode(address), missing_from = number, cursor = last, through,
+                    upto, requested, waited_secs, held_uncertified = skipped.held_uncertified,
+                    parked_anchor = skipped.parked_anchor, parked_execution = skipped.parked_execution,
+                    "archive holds a shard header back from GLOBAL proposals: it lacks application frame \
+                     bodies from missing_from, which it asks the shard's members and archives for \
+                     (requested 0: asked within the last 30s or skipped as counted); held_uncertified \
+                     frames wait for a certified or committed frame that links to them; logged once it \
+                     lasts 30s, then each minute while it lasts");
+            }
         }
         Ok(false)
+    }
+
+    /// Why frames of `frames` of `address` would not be asked for, for wait
+    /// lines ([`SkippedAsks`]).
+    fn skipped_asks(&self, address: &[u8], frames: RangeInclusive<u64>) -> SkippedAsks {
+        let parked = |waiting: Option<&BTreeMap<u64, (u64, Instant)>>| {
+            waiting.map_or(0, |waiting| waiting.range(frames.clone()).count())
+        };
+        SkippedAsks {
+            held_uncertified: frames
+                .clone()
+                .filter(|&number| self.is_held(address, number))
+                .count(),
+            parked_anchor: parked(self.awaiting_anchor.get(address)),
+            parked_execution: parked(self.awaiting_execution.get(address)),
+        }
     }
 
     /// Ask at once for the frames of `address` that materializing it through
@@ -2889,7 +3218,7 @@ impl ArchiveAppShardIngest {
         empty: bool,
     ) -> quil_types::error::Result<usize> {
         let last = self.materialized_height(address)?;
-        let held = self.held_through(address, last);
+        let held = self.held_through_committed(address, last, through);
         self.held_bodies.publish(address, last, held);
         if through <= held || (empty && through == held + 1) {
             return Ok(0);
@@ -3041,18 +3370,75 @@ impl ArchiveAppShardIngest {
     /// it, and the GLOBAL frame sequencing the successor waited on it forever
     /// (…091f80, frame 4693, GLOBAL frame 935144, 2026-10-25). Committed state
     /// is the same on every archive, so every archive takes the same frame.
-    fn committed_held(&self, address: &[u8], number: u64) -> Option<AppShardFrame> {
+    fn committed_held(
+        &self,
+        address: &[u8],
+        number: u64,
+        committed: &CommittedOnce,
+    ) -> Option<AppShardFrame> {
         let held = self.held.get(address)?;
         held.range((number, [0; 32])..=(number, [0xff; 32]))
             .next()?;
-        let digest = crate::app_handoff::committed_frame_digest_looked_through(
-            &self.hypergraph,
-            address,
-            number,
-        )
-        .ok()
-        .flatten()?;
+        let digest = committed
+            .read(|view| {
+                crate::app_handoff::committed_frame_digest_looked_through_in(view, address, number)
+            })?
+            .ok()
+            .flatten()?;
         held.get(&(number, digest)).cloned()
+    }
+
+    /// Buffer the frames of `address` held without a certificate that the
+    /// frame GLOBAL committed above them links down to
+    /// ([`Self::committed_held`]), when frame `next` is one of them; returns
+    /// how many. Committed state authenticates that frame as a certified
+    /// child would, and so each held parent it links down to. A sealed
+    /// session's last frame often has no certificate of its own, nor its
+    /// parent, final only through it. No certified frame follows them, so
+    /// the parent stayed held, every ask skipped it as held, and every
+    /// header above it was held back after archives restarted across the
+    /// seal (devnet, 2026-11-22).
+    fn buffer_held_below_committed(
+        &mut self,
+        address: &[u8],
+        next: u64,
+        committed: &CommittedOnce,
+    ) -> usize {
+        if !self.is_held(address, next) {
+            return 0;
+        }
+        let numbers: Vec<u64> = self
+            .held
+            .get(address)
+            .map(|held| held.keys().map(|&(number, _)| number).collect())
+            .unwrap_or_default();
+        let mut numbers: Vec<u64> = numbers.into_iter().filter(|&n| n > next).collect();
+        numbers.dedup();
+        for number in numbers.into_iter().rev() {
+            let Some(frame) = self.committed_held(address, number, committed) else {
+                continue;
+            };
+            let Some(header) = frame.header else {
+                continue;
+            };
+            let cursor = self.last_materialized.get(address).copied().unwrap_or(0);
+            let authenticated: Vec<_> = self
+                .take_held_ancestors(address, header)
+                .into_iter()
+                .filter(|(below, _)| *below > cursor)
+                .collect();
+            let Some(&(lowest, _)) = authenticated.last() else {
+                continue;
+            };
+            let frames = authenticated.len();
+            self.buffer_authenticated(address, authenticated);
+            info!(address = %hex::encode(address), committed_frame = number, lowest, frames, cursor,
+                "archive takes frames held without a certificate of their own below the frame GLOBAL \
+                 committed (a sealed session's last frame), which links down to them; headers above \
+                 them can be proposed again");
+            return frames;
+        }
+        0
     }
 
     /// Whether a frame `number` of `address` is held without a certificate.
@@ -6225,6 +6611,363 @@ pub(crate) mod tests {
             "sequenced ingest takes it too"
         );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// The chain of [`a_header_over_the_sealed_last_frame_global_committed_is_held`]
+    /// with the sealed last frame's parent also held without a certificate:
+    /// final only through the frame GLOBAL committed, which no certified
+    /// frame links to.
+    fn held_parent_below_sealed_last_frame(
+        filter: &[u8],
+    ) -> (ArchiveAppShardIngest, Vec<AppShardFrame>) {
+        let mut frames = chain(filter, 4);
+        frames[3].header.as_mut().unwrap().parent_selector = vec![0x5e; 32];
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(filter, 3, sealed), Some(clock)).sequenced();
+        ingest.admit(filter, frames[0].clone(), true);
+        ingest.admit(filter, frames[1].clone(), false);
+        ingest.admit(filter, frames[2].clone(), false);
+        ingest.admit(filter, frames[3].clone(), true);
+        assert!(
+            ingest.is_held(filter, 2),
+            "premise: no certified frame links to it"
+        );
+        assert!(
+            ingest.is_held(filter, 3),
+            "premise: no certified frame links to it"
+        );
+        (ingest, frames)
+    }
+
+    /// After an archive restart across a seal, the sealed last frame and
+    /// its parent arrived without certificates. The parent is final only
+    /// through the frame GLOBAL committed, yet stayed held: every ask
+    /// skipped it as held, and every header above it was held back from
+    /// GLOBAL proposals. The committed frame authenticates it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parent_held_below_the_sealed_last_frame_is_taken() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (mut ingest, frames) = held_parent_below_sealed_last_frame(&filter);
+        let holds = ingest.holds_bodies_through(&filter, 4, false).unwrap();
+        println!("REACH restart-gap body check answered {holds}");
+        assert!(
+            holds,
+            "held_below_committed: the header over the seal is held back"
+        );
+        assert!(!ingest.is_held(&filter, 2), "taken, not held");
+        let header = frames[3].header.clone().unwrap();
+        assert_eq!(
+            ingest
+                .held_bodies()
+                .held_for_vote(&header_need(&header, true)),
+            Some(4)
+        );
+        let vouched = HashMap::from([(4, header)]);
+        assert!(ingest
+            .materialize_through_vouched(&filter, 4, &vouched, 1)
+            .unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// Sequenced materialization takes the same parent when GLOBAL
+    /// sequences the header over the seal before any body check ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequenced_materialization_takes_a_parent_held_below_the_sealed_last_frame() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (mut ingest, frames) = held_parent_below_sealed_last_frame(&filter);
+        let vouched = HashMap::from([(4, frames[3].header.clone().unwrap())]);
+        let reached = ingest
+            .materialize_through_vouched(&filter, 4, &vouched, 1)
+            .unwrap();
+        println!("REACH restart-gap materialization reached {reached}");
+        assert!(
+            reached,
+            "held_below_committed: materialization stopped at the held parent"
+        );
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// A body check over a shard holding [`MAX_HELD_FRAMES_PER_SHARD`]
+    /// frames without certificates, none the frame GLOBAL committed, reads
+    /// GLOBAL's committed view once. Until 2026-11-23 each held frame's
+    /// lookup captured its own: 32 for one check, under the ingest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_check_over_held_frames_reads_one_committed_view() {
+        const CHECKS: u64 = 200;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let top = MAX_HELD_FRAMES_PER_SHARD as u64 + 1;
+        let frames = chain(&filter, top);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest =
+            fixture_over(sealed_global(&filter, 3, [0x77; 32]), Some(clock)).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        for frame in &frames[1..] {
+            ingest.admit(&filter, frame.clone(), false);
+        }
+        assert!(
+            (2..=top).all(|number| ingest.is_held(&filter, number)),
+            "premise: every frame above the first is held"
+        );
+        let before = ingest.committed_views.load(Ordering::Relaxed);
+        let started = Instant::now();
+        for _ in 0..CHECKS {
+            assert!(!ingest.holds_bodies_through(&filter, top, false).unwrap());
+        }
+        let micros = started.elapsed().as_micros() / u128::from(CHECKS);
+        let views = ingest.committed_views.load(Ordering::Relaxed) - before;
+        println!(
+            "REACH restart-gap committed views {views}/{CHECKS} body checks, {micros} us each"
+        );
+        assert!(
+            views <= CHECKS,
+            "view_once: {views} committed views for {CHECKS} body checks over {} held frames",
+            top - 1
+        );
+    }
+
+    /// A held frame the frame GLOBAL committed does not link down to stays
+    /// held: committed state authenticates only its own chain, so the body
+    /// check still holds the header above it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_frame_the_committed_frame_does_not_link_to_stays_held() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let mut frames = chain(&filter, 4);
+        frames[2].header.as_mut().unwrap().parent_selector = vec![0x5d; 32];
+        frames[3].header.as_mut().unwrap().parent_selector = vec![0x5e; 32];
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock)).sequenced();
+        for (frame, certified) in frames.iter().zip([true, false, false, true]) {
+            ingest.admit(&filter, frame.clone(), certified);
+        }
+        assert!(ingest.is_held(&filter, 2), "premise: held");
+        assert!(
+            ingest
+                .committed_held(&filter, 3, &ingest.committed_once())
+                .is_some(),
+            "premise: GLOBAL committed the held frame 3"
+        );
+        let holds = ingest.holds_bodies_through(&filter, 4, false).unwrap();
+        let held = ingest.is_held(&filter, 2);
+        println!("REACH restart-gap unlinked frame held {held} body check {holds}");
+        assert!(
+            held && !holds,
+            "held_unlinked: a frame the committed frame does not link to was taken"
+        );
+    }
+
+    /// The gap and held-back waits: a wait that ends within
+    /// [`WAIT_LINE_AFTER`] logs neither its start nor its end; one that
+    /// lasts logs its start once, repeats at most every
+    /// [`WAIT_LINE_INTERVAL`], and logs its end. Until 2026-11-23 every wait
+    /// logged its start and end at once, two lines for each one-pass gap.
+    #[test]
+    fn a_wait_line_starts_only_once_the_wait_lasted() {
+        let ago = |by: Duration| Instant::now().checked_sub(by).unwrap();
+        let mut lines = WaitLines::new("test", "test");
+        let first = lines.due(b"brief", 5);
+        let ended = lines.end(b"brief");
+        println!("REACH restart-gap brief wait start {first:?} end {ended:?}");
+        assert!(
+            first.is_none() && ended.is_none(),
+            "wait_after: a wait shorter than its threshold logged {first:?} and {ended:?}"
+        );
+        assert_eq!(lines.due(b"lasting", 5), None);
+        lines.open.get_mut(&b"lasting"[..]).unwrap().since = ago(WAIT_LINE_AFTER);
+        let start = lines.due(b"lasting", 6);
+        assert!(
+            start.is_some_and(|secs| secs >= WAIT_LINE_AFTER.as_secs()),
+            "wait_after: a lasting wait's start was not logged: {start:?}"
+        );
+        assert_eq!(lines.due(b"lasting", 7), None, "within the interval");
+        let wait = lines.open.get_mut(&b"lasting"[..]).unwrap();
+        wait.logged = wait.logged.map(|_| ago(WAIT_LINE_INTERVAL));
+        assert!(lines.due(b"lasting", 8).is_some(), "repeated after it");
+        let ended = lines.end(b"lasting");
+        assert!(
+            ended.is_some_and(|(_, from)| from == 8),
+            "wait_after: a logged wait's end was not logged: {ended:?}"
+        );
+    }
+
+    /// A held-back wait lasts across retry passes whose wanted set lacks
+    /// its shard: only this node's own proposals fill that set, so a
+    /// window in which it proposes nothing says nothing of the wait. Its
+    /// start is logged once it has lasted, and it ends only when the
+    /// bodies are held, by the TTL or by a discard. Until 2026-11-23 such a
+    /// pass ended the wait: a logged wait got a false "no longer holds a
+    /// header back" line, and one that never lasted two windows was never
+    /// logged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_back_wait_lasts_across_passes_that_do_not_want_its_shard() {
+        let (ingest, _) = fixture();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (prefetch_tx, _prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = ingest.with_prefetch(prefetch_tx).sequenced();
+        for number in [1, 3] {
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
+        }
+        let held = ingest.held_bodies();
+        let propose = |ingest: &mut ArchiveAppShardIngest| {
+            assert_eq!(
+                held.frames_held(&filter, 3, false),
+                None,
+                "premise: frame 2 is missing"
+            );
+            ingest.look_into_wanted();
+        };
+        propose(&mut ingest);
+        let since = Instant::now().checked_sub(WAIT_LINE_AFTER).unwrap();
+        let wait = ingest.held_back_lines.open.get_mut(&filter);
+        assert!(
+            wait.is_some(),
+            "premise: the proposal opened a held-back wait"
+        );
+        wait.unwrap().since = since;
+        ingest.look_into_wanted();
+        ingest.look_into_wanted();
+        propose(&mut ingest);
+        let wait = ingest.held_back_lines.open.get(&filter);
+        let (kept, logged) = (
+            wait.is_some_and(|wait| wait.since == since),
+            wait.is_some_and(|wait| wait.logged.is_some()),
+        );
+        println!("REACH restart-gap held-back wait kept {kept} start logged {logged}");
+        assert!(
+            kept && logged,
+            "wait_absent: passes without the shard ended its held-back wait (kept {kept}, logged {logged})"
+        );
+    }
+
+    /// At the cap of waits followed, waits no pass looked at for
+    /// [`WAIT_LINE_TTL`] end, so a new wait is still logged; while every
+    /// followed wait is live, a new one is not followed. Until 2026-11-23
+    /// a wait ended only with a gap-free pass of its own shard: a shard
+    /// that stopped kept its entry, and at the cap no new wait was logged
+    /// again.
+    #[test]
+    fn waits_no_pass_looks_at_age_out_so_new_waits_log_at_the_cap() {
+        let ago = |by: Duration| Instant::now().checked_sub(by).unwrap();
+        let mut lines = WaitLines::new("test", "test");
+        for shard in 0..MAX_WAIT_LINES as u32 {
+            lines.due(&shard.to_be_bytes(), 1);
+        }
+        assert_eq!(lines.open.len(), MAX_WAIT_LINES, "premise: at the cap");
+        lines.due(b"live cap", 1);
+        assert!(
+            !lines.open.contains_key(&b"live cap"[..]),
+            "live waits fill the cap"
+        );
+        // The TTL passes: every instant the waits hold moves back by it.
+        for wait in lines.open.values_mut() {
+            wait.seen = ago(WAIT_LINE_TTL);
+        }
+        lines.ages_out_from = lines.ages_out_from.checked_sub(WAIT_LINE_TTL).unwrap();
+        // Whether its start logs at once is another test's rule (wait_after).
+        let first = lines.due(b"new", 1);
+        let followed = lines.open.contains_key(&b"new"[..]);
+        if let Some(wait) = lines.open.get_mut(&b"new"[..]) {
+            wait.since = ago(WAIT_LINE_AFTER);
+        }
+        let start = first.or(lines.due(b"new", 2));
+        println!("REACH restart-gap cap followed {followed} start {start:?}");
+        assert!(
+            followed && start.is_some(),
+            "wait_age_out: at the cap of stale waits a new wait went unlogged"
+        );
+        assert_eq!(lines.open.len(), 1, "the stale waits ended");
+    }
+
+    /// A full map whose waits age out one at a time, each as a new wait
+    /// arrives, is swept at most every [`FORCED_SWEEP_INTERVAL`] and
+    /// [`WAIT_LINE_INTERVAL`], and once the floor passed: a longer floor
+    /// refuses new waits at the cap for longer. Until 2026-11-23 each new
+    /// wait forced a sweep of the whole map there, 4096 sweeps of 4096
+    /// waits per TTL.
+    #[test]
+    fn staggered_waits_aging_out_one_at_a_time_force_a_sweep_at_most_each_second() {
+        const STEP: Duration = Duration::from_millis(10);
+        let key = |n: usize| u32::try_from(n).unwrap().to_be_bytes();
+        let mut lines = WaitLines::new("test", "test");
+        let t0 = Instant::now();
+        for n in 0..MAX_WAIT_LINES {
+            lines.due_at(t0 + STEP * u32::try_from(n).unwrap(), &key(n), 1);
+        }
+        let first_arrival = t0 + WAIT_LINE_TTL;
+        let aged_at_first = lines
+            .open
+            .values()
+            .filter(|wait| first_arrival.saturating_duration_since(wait.seen) >= WAIT_LINE_TTL)
+            .count();
+        assert_eq!(lines.open.len(), MAX_WAIT_LINES, "premise: at the cap");
+        assert_eq!(aged_at_first, 1, "premise: one wait ages out per arrival");
+        let arrivals = u32::try_from(WAIT_LINE_TTL.as_millis() / STEP.as_millis()).unwrap();
+        let mut sweeps = 0u32;
+        for k in 0..arrivals {
+            let swept = lines.swept;
+            let n = MAX_WAIT_LINES + usize::try_from(k).unwrap();
+            lines.due_at(first_arrival + STEP * k, &key(n), 1);
+            sweeps += u32::from(lines.swept != swept);
+        }
+        let bound = WAIT_LINE_TTL.as_secs() / FORCED_SWEEP_INTERVAL.as_secs()
+            + WAIT_LINE_TTL.as_secs() / WAIT_LINE_INTERVAL.as_secs()
+            + 1;
+        // The first fill's waits age out one a step. Each sweep frees those
+        // aged since the last, so the map refills and is swept again once
+        // the floor passed: at least each second while they age. A longer
+        // floor refuses more new waits at the cap.
+        let aging = STEP * u32::try_from(MAX_WAIT_LINES).unwrap();
+        let floor = aging.as_secs() / FORCED_SWEEP_INTERVAL.as_secs();
+        println!("REACH restart-gap staggered sweeps {sweeps}/{arrivals} bounds {floor}..={bound}");
+        assert!(
+            u64::from(sweeps) <= bound,
+            "sweep_floor: {sweeps} sweeps of a full map in one TTL, bound {bound}"
+        );
+        assert!(
+            u64::from(sweeps) >= floor,
+            "sweep_floor_long: {sweeps} sweeps of a full map in one TTL, at least {floor}"
+        );
+    }
+
+    /// The flag day's discard of legacy history ends the gap and held-back
+    /// waits with the frames they waited for, as it clears the rest of
+    /// what ingest remembers of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_history_discard_ends_every_wait() {
+        use quil_types::consensus::{set_committee_handoff_policy, CommitteeHandoffPolicy};
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (mut ingest, _) = fixture_with_clock(Some(clock));
+        ingest.gap_lines.due(b"gap", 1);
+        ingest.held_back_lines.due(b"held back", 1);
+        set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 10,
+            chain_id: [0; 32],
+            legacy_history: quil_types::consensus::LegacyHistory::Discard,
+            membership_boundary_frame: 10,
+            first_session_boundary_frame: 10,
+        }));
+        let discarded = ingest.discard_legacy_history_at(10);
+        set_committee_handoff_policy(None);
+        assert!(discarded.unwrap(), "premise: the flag day discards");
+        let left = (
+            ingest.gap_lines.open.len(),
+            ingest.held_back_lines.open.len(),
+        );
+        println!("REACH restart-gap discard left waits {left:?}");
+        assert_eq!(
+            left,
+            (0, 0),
+            "wait_discard: the discard left waits followed"
+        );
     }
 
     /// A GLOBAL voter's body check answers as a leader's does and records

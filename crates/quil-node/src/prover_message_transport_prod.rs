@@ -639,16 +639,12 @@ impl SubmitRetryQueue {
                 // Its first failure was logged as it was queued.
                 logged: Instant::now(),
             });
-            let mut total: usize = pending.iter().map(|queued| queued.bytes.len()).sum();
-            let mut dropped = Vec::new();
-            while pending.len() > RETRY_MAX_MESSAGES || total > RETRY_MAX_BYTES {
-                let Some(oldest) = pending.pop_front() else {
-                    break;
-                };
-                total -= oldest.bytes.len();
-                dropped.push(oldest);
-            }
-            let queued = (pending.len(), total);
+            let for_proof = pending.back().is_some_and(|queued| queued.proof.is_some());
+            let dropped = self.make_room(&mut pending, for_proof);
+            let queued = (
+                pending.len(),
+                pending.iter().map(|queued| queued.bytes.len()).sum(),
+            );
             drop(pending);
             if !dropped.is_empty() {
                 self.dropped(&dropped, queued);
@@ -662,15 +658,61 @@ impl SubmitRetryQueue {
         !self.running.swap(true, Ordering::AcqRel)
     }
 
+    /// Bring a queue over its caps back within them, dropping in order:
+    /// what can no longer land ([`expire`]; a storage epoch proof only once
+    /// its longest window is over, as no frame is read here), the oldest
+    /// message other than a storage epoch proof, and, only to make room for
+    /// a proof just queued (`for_proof`), the oldest proof. Shard headers
+    /// and other messages give up within minutes, a proof's window lasts an
+    /// epoch and carries its seats' rewards, so a burst of refused headers
+    /// never pushes a proof out. Returns what it dropped beyond [`expire`].
+    fn make_room(&self, pending: &mut VecDeque<Queued>, for_proof: bool) -> Vec<Queued> {
+        let size = |pending: &VecDeque<Queued>| -> usize {
+            pending.iter().map(|queued| queued.bytes.len()).sum()
+        };
+        let over = |pending: &VecDeque<Queued>, total: usize| {
+            pending.len() > RETRY_MAX_MESSAGES || total > RETRY_MAX_BYTES
+        };
+        let mut dropped = Vec::new();
+        if !over(pending, size(pending)) {
+            return dropped;
+        }
+        for window_end in expire(pending, RETRY_TIMING, None) {
+            self.tally(window_end, |t| t.undelivered += 1);
+        }
+        let mut total = size(pending);
+        while over(pending, total) {
+            let at = pending
+                .iter()
+                .position(|queued| queued.proof.is_none())
+                .or_else(|| for_proof.then_some(0));
+            let Some(gone) = at.and_then(|at| pending.remove(at)) else {
+                break;
+            };
+            total -= gone.bytes.len();
+            dropped.push(gone);
+        }
+        dropped
+    }
+
     /// Count the messages a full queue `dropped` (the storage epoch proofs
-    /// among them in their window's tally) and log them
-    /// ([`Self::log_drops`]); `queued` is what the queue still holds, in
-    /// messages and bytes.
+    /// among them in their window's tally, each named in a line) and log
+    /// them ([`Self::log_drops`]); `queued` is what the queue still holds,
+    /// in messages and bytes.
     fn dropped(&self, dropped: &[Queued], queued: (usize, usize)) {
         let mut proofs = 0u64;
-        for proof in dropped.iter().filter_map(|queued| queued.proof.as_ref()) {
+        for gone in dropped {
+            let Some(proof) = &gone.proof else {
+                continue;
+            };
             proofs += 1;
             self.tally(proof.window_end, |t| t.dropped += 1);
+            let (member, shards, epochs) = proof.fields();
+            warn!(member, ?shards, ?epochs, digest = %proof_digest(&gone.bytes), bytes = gone.bytes.len(),
+                window_end = proof.window_end, attempts = gone.attempts + 1, secs = gone.queued.elapsed().as_secs(),
+                queued = queued.0, "storage epoch proof dropped from the full retry queue to make room for a later \
+                 proof: the queue held nothing else to drop. The archives refused or did not answer this node's \
+                 proofs for longer than the queue holds; a worker's later send of these seats may still deliver them");
         }
         let mut drops = self.drops.lock().unwrap();
         drops.messages += dropped.len() as u64;
@@ -702,8 +744,8 @@ impl SubmitRetryQueue {
         warn!(dropped = drops.messages, proofs = drops.proofs, bytes = drops.bytes,
             since_secs = %or_unknown(secs), queued, queued_bytes,
             max_messages = RETRY_MAX_MESSAGES, max_bytes = RETRY_MAX_BYTES,
-            "prover submission retry queue full: its oldest messages were dropped since the last such line \
-             (since_secs unknown: the first). The archives refused or did not answer this node's submissions \
+            "prover submission retry queue full: messages were dropped since the last such line (since_secs \
+             unknown: the first), the oldest other than storage epoch proofs first, a proof only for a later proof. The archives refused or did not answer this node's submissions \
              for longer than the queue holds: see the 'storage epoch proof still not delivered' lines for their \
              reasons. A dropped storage epoch proof counts as dropped, not undelivered, in its window's summary: \
              a worker's later send of its seats may still deliver them");
@@ -890,7 +932,8 @@ fn random_part(most: Duration) -> Duration {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Delivery {
     accepted: usize,
-    /// Refusals that ask for a retry.
+    /// Refusals that ask for a retry ([`asks_for_retry`]), refused
+    /// connections among them.
     retry: usize,
     /// Of those, refusals for room: a full rank or share of held proofs.
     room: usize,
@@ -967,11 +1010,33 @@ fn transient(error: &ArchiveClientError) -> bool {
     }
 }
 
+/// The archive refused the connection: nothing listened at its address (a
+/// restarting archive), so the message never reached it.
+fn refused_connection(error: &ArchiveClientError) -> bool {
+    let refused_io =
+        std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |cause| {
+            cause.source()
+        })
+        .any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+        });
+    refused_io
+        || matches!(error, ArchiveClientError::Rpc(status)
+            if status.code() == tonic::Code::Unavailable
+                && status.message().to_ascii_lowercase().contains("connection refused"))
+}
+
 /// Whether a submission `error` failed is sent again: a refusal asking for a
-/// retry, and for a storage epoch proof (`proof`), whose window lasts an
-/// epoch, any transient failure too.
+/// retry, a refused connection, and for a storage epoch proof (`proof`),
+/// whose window lasts an epoch, any transient failure too. A message the
+/// archive refused the connection for never reached it, so sending it again
+/// cannot apply it twice; dropped, a shard header submitted while every
+/// archive restarted reached none of them, and the archives' sequenced
+/// ingest waited for it.
 fn asks_for_retry(error: &ArchiveClientError, proof: bool) -> bool {
-    retryable(error) || (proof && transient(error))
+    retryable(error) || refused_connection(error) || (proof && transient(error))
 }
 
 /// Resend the queue until it empties. A round sends the storage epoch proofs
@@ -1603,9 +1668,10 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             if queued {
                 warn!(
                     archive_count,
-                    full = delivery.retry,
+                    refused_for_now = delivery.retry,
                     queued = self.retry_queue.len(),
-                    "no archive accepted submission yet — queued to retry"
+                    "no archive accepted submission yet — queued to retry (refused_for_now: archives that \
+                     refused it asking for a retry or refused the connection)"
                 );
             } else {
                 warn!(
@@ -2957,6 +3023,32 @@ mod tests {
         assert!(asks_for_retry(&full, false) && asks_for_retry(&full, true));
     }
 
+    /// A message any archive refused the connection for is sent again: it
+    /// never reached the archive. A timeout or a reset may have landed, so
+    /// a message other than a storage epoch proof is not.
+    #[test]
+    fn a_message_an_archive_refused_the_connection_for_is_sent_again() {
+        use quil_rpc::archive_client::ArchiveClientError;
+        let refused = ArchiveClientError::Rpc(tonic::Status::unavailable(
+            "Connection refused (os error 111)",
+        ));
+        let retry = asks_for_retry(&refused, false);
+        println!("REACH restart-gap refused connection retry {retry}");
+        assert!(
+            retry,
+            "refused_retry: a header refused at connect is dropped"
+        );
+        let mut beneath = tonic::Status::unavailable("transport error");
+        beneath.set_source(std::sync::Arc::new(Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "tcp connect error",
+        ))));
+        assert!(asks_for_retry(&ArchiveClientError::Rpc(beneath), false));
+        let reset = ArchiveClientError::Rpc(tonic::Status::unavailable("connection reset"));
+        let timeout = ArchiveClientError::Rpc(tonic::Status::cancelled("Timeout expired"));
+        assert!(!asks_for_retry(&reset, false) && !asks_for_retry(&timeout, false));
+    }
+
     #[derive(Debug)]
     struct Outer(std::io::Error);
     impl std::fmt::Display for Outer {
@@ -2989,7 +3081,8 @@ mod tests {
     }
 
     /// Over the real transport: an archive refusing connections leaves a
-    /// storage epoch proof queued to retry, and any other message not.
+    /// storage epoch proof queued to retry, and any other message too: it
+    /// never reached the archive.
     #[tokio::test]
     async fn an_unreachable_archive_queues_a_storage_proof_to_retry() {
         // A bound socket that never listens: a dial is refused, and no other
@@ -3019,7 +3112,12 @@ mod tests {
         )
         .unwrap();
         let (_, delivery) = submit_to_archives(&pool, Some(key), header).await;
-        assert_eq!((delivery.accepted, delivery.retry), (0, 0), "{delivery:?}");
+        println!("REACH restart-gap refused dial {delivery:?}");
+        assert_eq!(
+            (delivery.accepted, delivery.retry),
+            (0, 1),
+            "refused_retry: a header refused at connect is dropped: {delivery:?}"
+        );
     }
 
     /// A storage epoch proof no archive took is sent again until one takes
@@ -4134,6 +4232,131 @@ mod tests {
         assert!(
             drops.len() == 1 && drops[0].contains(" dropped=1 proofs=1 "),
             "retry-drop warn-once: not one line for the first of 3 drops within one interval: {drops:?}"
+        );
+    }
+
+    /// A shard header refused by every archive, with the frame number
+    /// `frame`.
+    fn refused_header(frame: u64) -> Vec<u8> {
+        let header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+            frame_number: frame,
+            ..Default::default()
+        };
+        crate::master_node::reward_proofs::prover_bundle(header.to_canonical_bytes().unwrap())
+            .unwrap()
+    }
+
+    /// A burst of refused shard headers never pushes a storage epoch proof
+    /// out of the full retry queue: the oldest headers go, and a header
+    /// meeting a queue of proofs goes itself. A proof is dropped only for
+    /// a later proof, in a line naming it. Until 2026-11-23 the oldest
+    /// message went whatever it was, so once refused headers were queued
+    /// too, 256 of them during an outage of every archive pushed out a
+    /// proof whose window and rewards lasted an epoch.
+    #[test]
+    fn refused_headers_never_push_a_storage_epoch_proof_out_of_the_retry_queue() {
+        let logs = Logs::capture();
+        let queue = SubmitRetryQueue::default();
+        let proof = storage_proof_bundle(1, &[(7, 1335, false, true)], 8);
+        queue.push(proof.clone());
+        // A bundle carries its time: each header is made once.
+        let headers: Vec<Vec<u8>> = (0..=super::RETRY_MAX_MESSAGES as u64)
+            .map(refused_header)
+            .collect();
+        for header in &headers {
+            queue.push(header.clone());
+        }
+        let held = |queue: &SubmitRetryQueue, bytes: &[u8]| {
+            queue
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|queued| queued.bytes == bytes)
+        };
+        let kept = held(&queue, &proof);
+        eprintln!(
+            "REACH restart-gap eviction proof kept {kept} queued {}",
+            queue.len()
+        );
+        assert!(
+            kept,
+            "proof_eviction: refused headers pushed the proof out of the full queue"
+        );
+        assert_eq!(queue.len(), super::RETRY_MAX_MESSAGES);
+        assert!(
+            !held(&queue, &headers[0]) && !held(&queue, &headers[1]),
+            "proof_eviction: the two oldest headers made the room"
+        );
+        assert!(headers[2..].iter().all(|header| held(&queue, header)));
+        let drops = logs.lines("retry queue full");
+        assert!(
+            drops.len() == 1 && drops[0].contains(" dropped=1 proofs=0 "),
+            "proof_eviction: one line for the first dropped header: {drops:?}"
+        );
+
+        // A queue of proofs drops a header pushed into it, and a proof only
+        // for a later proof, naming it.
+        let logs = Logs::capture();
+        let queue = SubmitRetryQueue::default();
+        let proofs = overfull_queue(0);
+        for bundle in &proofs {
+            queue.push(bundle.clone());
+        }
+        let header = refused_header(7);
+        queue.push(header.clone());
+        assert!(
+            !held(&queue, &header) && proofs.iter().all(|proof| held(&queue, proof)),
+            "proof_eviction: a header pushed a proof out of a queue of proofs"
+        );
+        queue.push(storage_proof_bundle(3, &[(7, 1335, false, true)], 8));
+        assert!(!held(&queue, &proofs[0]) && held(&queue, &proofs[1]));
+        let named = logs.lines("storage epoch proof dropped from the full retry queue");
+        assert!(
+            named.len() == 1 && named[0].contains("WARN") && named[0].contains("window_end="),
+            "proof_eviction: the dropped proof is named: {named:?}"
+        );
+    }
+
+    /// A full retry queue first drops what can no longer land: a header
+    /// refused for longer than a message is retried goes before the oldest
+    /// header still live, and is not counted as a drop of the full queue.
+    #[test]
+    fn a_full_retry_queue_drops_expired_messages_before_live_ones() {
+        let logs = Logs::capture();
+        let queue = SubmitRetryQueue::default();
+        let headers: Vec<Vec<u8>> = (0..=super::RETRY_MAX_MESSAGES as u64)
+            .map(refused_header)
+            .collect();
+        let (last, filling) = headers.split_last().unwrap();
+        for header in filling {
+            queue.push(header.clone());
+        }
+        assert_eq!(queue.len(), super::RETRY_MAX_MESSAGES, "premise: full");
+        // The second oldest has been refused for as long as one is retried.
+        queue.pending.lock().unwrap()[1].queued =
+            Instant::now().checked_sub(RETRY_TIMING.give_up).unwrap();
+        queue.push(last.clone());
+        let held = |bytes: &[u8]| {
+            queue
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|queued| queued.bytes == bytes)
+        };
+        let (oldest, expired) = (held(&headers[0]), held(&headers[1]));
+        eprintln!("REACH restart-gap expire-first oldest kept {oldest} expired kept {expired}");
+        assert!(
+            oldest && !expired && held(last),
+            "expire_first: the full queue dropped a live header before an expired one \
+             (oldest kept {oldest}, expired kept {expired})"
+        );
+        assert_eq!(queue.len(), super::RETRY_MAX_MESSAGES);
+        let drops = logs.lines("retry queue full");
+        assert!(
+            drops.is_empty(),
+            "expire_first: an expiry counted as a drop: {drops:?}"
         );
     }
 
