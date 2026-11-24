@@ -365,6 +365,27 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// older release computes (`Config::legacy_message_id`), since the last
     /// [`Behaviour::take_legacy_id_answers`]; at most [`MAX_LEGACY_ID_PEERS`] peers.
     legacy_id_answers: HashMap<PeerId, u64>,
+
+    /// QUILIBRIUM: announcements (IHAVE) dropped or not asked for, and fallback asks.
+    announce_stats: AnnounceStats,
+}
+
+/// QUILIBRIUM: what became of peers' announcements (IHAVE), counted since the behaviour was
+/// built. A dropped announcement of a lazily forwarded message (`Config::lazy_forward_threshold`)
+/// is a copy this node pulls from another announcer, or from heartbeat gossip, or not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnnounceStats {
+    /// IHAVEs dropped whole: over `max_ihave_messages` from one peer in a heartbeat, or after
+    /// the peer used up its `max_ihave_length` IWANT budget.
+    pub dropped_ihaves: u64,
+    /// The message ids in those IHAVEs.
+    pub dropped_ids: u64,
+    /// Ids of a kept IHAVE not asked for, over the peer's IWANT budget.
+    pub unasked_ids: u64,
+    /// The peer of the latest drop.
+    pub last_dropping_peer: Option<PeerId>,
+    /// IWANTs sent to a later announcer after every promise for the message broke.
+    pub fallback_asks: u64,
 }
 
 /// QUILIBRIUM: the most peers [`Behaviour::take_legacy_id_answers`] holds between two calls.
@@ -517,6 +538,7 @@ where
             rejected_rpcs: RejectedRpcStats::default(),
             unsent_rpcs: UnsentRpcStats::default(),
             legacy_id_answers: HashMap::new(),
+            announce_stats: AnnounceStats::default(),
         })
     }
 
@@ -597,6 +619,12 @@ where
     /// the previous call. Such a peer runs a release from before the change of id.
     pub fn take_legacy_id_answers(&mut self) -> HashMap<PeerId, u64> {
         std::mem::take(&mut self.legacy_id_answers)
+    }
+
+    /// QUILIBRIUM: announcements dropped or not asked for, and fallback asks, since the
+    /// behaviour was built ([`AnnounceStats`]).
+    pub fn announce_stats(&self) -> AnnounceStats {
+        self.announce_stats
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -1345,6 +1373,12 @@ where
         let peer_have = self.count_received_ihave.entry(*peer_id).or_insert(0);
         *peer_have += 1;
         if *peer_have > self.config.max_ihave_messages() {
+            self.announce_stats.dropped_ihaves += 1;
+            self.announce_stats.dropped_ids += ihave_msgs
+                .iter()
+                .map(|(_, ids)| ids.len() as u64)
+                .sum::<u64>();
+            self.announce_stats.last_dropping_peer = Some(*peer_id);
             tracing::debug!(
                 peer=%peer_id,
                 "IHAVE: peer has advertised too many times ({}) within this heartbeat \
@@ -1356,6 +1390,12 @@ where
 
         if let Some(iasked) = self.count_sent_iwant.get(peer_id) {
             if *iasked >= self.config.max_ihave_length() {
+                self.announce_stats.dropped_ihaves += 1;
+                self.announce_stats.dropped_ids += ihave_msgs
+                    .iter()
+                    .map(|(_, ids)| ids.len() as u64)
+                    .sum::<u64>();
+                self.announce_stats.last_dropping_peer = Some(*peer_id);
                 tracing::debug!(
                     peer=%peer_id,
                     "IHAVE: peer has already advertised too many messages ({}); ignoring",
@@ -1368,24 +1408,34 @@ where
         tracing::trace!(peer=%peer_id, "Handling IHAVE for peer");
 
         let mut iwant_ids = HashSet::new();
+        // QUILIBRIUM: ids a mesh peer announced: lazily forwarded, so large
+        // (`Config::lazy_followup_time`).
+        let mut lazy_ids = HashSet::new();
 
         for (topic, ids) in ihave_msgs {
             // only process the message if we are subscribed
-            if !self.mesh.contains_key(&topic) {
+            let Some(mesh) = self.mesh.get(&topic) else {
                 tracing::debug!(
                     %topic,
                     "IHAVE: Ignoring IHAVE - Not subscribed to topic"
                 );
                 continue;
-            }
+            };
+            let from_mesh = mesh.contains(peer_id);
 
-            for id in ids.into_iter().filter(|id| {
-                if self.duplicate_cache.contains(id) {
-                    return false;
+            for id in ids {
+                if self.duplicate_cache.contains(&id) {
+                    continue;
                 }
-
-                !self.gossip_promises.contains(id)
-            }) {
+                // QUILIBRIUM: already asked of another peer: keep this one to ask if that
+                // promise breaks.
+                if self.gossip_promises.contains(&id) {
+                    self.gossip_promises.add_fallback(&id, *peer_id);
+                    continue;
+                }
+                if from_mesh {
+                    lazy_ids.insert(id.clone());
+                }
                 // have not seen this message and are not currently requesting it
                 if iwant_ids.insert(id) {
                     // Register the IWANT metric
@@ -1402,6 +1452,8 @@ where
             let mut iask = iwant_ids.len();
             if *iasked + iask > self.config.max_ihave_length() {
                 iask = self.config.max_ihave_length().saturating_sub(*iasked);
+                self.announce_stats.unasked_ids += (iwant_ids.len() - iask) as u64;
+                self.announce_stats.last_dropping_peer = Some(*peer_id);
             }
 
             // Send the list of IWANT control messages
@@ -1420,14 +1472,20 @@ where
             iwant_ids_vec.truncate(iask);
             *iasked += iask;
 
-            let followup_time = Instant::now()
-                .checked_add(self.config.iwant_followup_time())
-                .unwrap_or_else(|| {
-                    tracing::error!("Invalid iwant_followup_time using Instant::now()");
-                    Instant::now()
-                });
-            self.gossip_promises
-                .add_promise(*peer_id, &iwant_ids_vec, followup_time);
+            let (lazy, gossiped): (Vec<MessageId>, Vec<MessageId>) = iwant_ids_vec
+                .iter()
+                .cloned()
+                .partition(|id| lazy_ids.contains(id));
+            self.gossip_promises.add_promise(
+                *peer_id,
+                &gossiped,
+                Self::followup_at(self.config.iwant_followup_time()),
+            );
+            self.gossip_promises.add_promise(
+                *peer_id,
+                &lazy,
+                Self::followup_at(self.config.lazy_followup_time()),
+            );
             tracing::trace!(
                 peer=%peer_id,
                 "IHAVE: Asking for the following messages from peer: {:?}",
@@ -2318,16 +2376,74 @@ where
         );
     }
 
+    /// The instant a promise made now for `followup` expires.
+    fn followup_at(followup: Duration) -> Instant {
+        Instant::now().checked_add(followup).unwrap_or_else(|| {
+            tracing::error!("Invalid iwant_followup_time using Instant::now()");
+            Instant::now()
+        })
+    }
+
     /// Applies penalties to peers that did not respond to our IWANT requests.
+    /// QUILIBRIUM: broken promises are dropped with scoring off too, so a later
+    /// announcer can be asked ([`Behaviour::ask_fallback_announcers`]).
     fn apply_iwant_penalties(&mut self) {
+        let broken = self.gossip_promises.get_broken_promises();
         if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
-            for (peer, count) in self.gossip_promises.get_broken_promises() {
+            for (peer, count) in broken {
                 peer_score.add_penalty(&peer, count);
                 #[cfg(feature = "metrics")]
                 if let Some(metrics) = self.metrics.as_mut() {
                     metrics.register_score_penalty(Penalty::BrokenPromise);
                 }
             }
+        }
+    }
+
+    /// QUILIBRIUM: for each message whose promises all broke, send an IWANT to the oldest
+    /// later announcer still connected, above the gossip threshold and within its IWANT
+    /// budget, under [`Config::lazy_followup_time`]: such announcers are mostly mesh peers
+    /// (heartbeat gossip goes once per heartbeat, while mesh peers announce once). The rest
+    /// stay for the next break.
+    fn ask_fallback_announcers(&mut self) {
+        for (msg_id, mut announcers) in self.gossip_promises.take_unserved_fallbacks() {
+            if self.duplicate_cache.contains(&msg_id) {
+                continue;
+            }
+            while let Some(peer_id) = announcers.pop_front() {
+                if !self.connected_peers.contains_key(&peer_id)
+                    || self
+                        .peer_score
+                        .below_threshold(&peer_id, |ts| ts.gossip_threshold)
+                        .0
+                {
+                    continue;
+                }
+                let iasked = self.count_sent_iwant.entry(peer_id).or_insert(0);
+                if *iasked >= self.config.max_ihave_length() {
+                    continue;
+                }
+                *iasked += 1;
+                self.gossip_promises.add_promise(
+                    peer_id,
+                    std::slice::from_ref(&msg_id),
+                    Self::followup_at(self.config.lazy_followup_time()),
+                );
+                self.announce_stats.fallback_asks += 1;
+                tracing::debug!(
+                    peer=%peer_id,
+                    message=%msg_id,
+                    "IWANT: asking a later announcer after the first broke its promise"
+                );
+                self.send_message(
+                    peer_id,
+                    RpcOut::IWant(IWant {
+                        message_ids: vec![msg_id.clone()],
+                    }),
+                );
+                break;
+            }
+            self.gossip_promises.keep_fallbacks(msg_id, announcers);
         }
     }
 
@@ -2362,6 +2478,7 @@ where
 
         // apply iwant penalties
         self.apply_iwant_penalties();
+        self.ask_fallback_announcers();
 
         // check connections to explicit peers
         if self.heartbeat_ticks % self.config.check_explicit_peers_ticks() == 0 {

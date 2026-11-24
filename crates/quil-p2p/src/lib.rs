@@ -105,9 +105,20 @@ pub mod params {
     /// pushed. A peer sends IDONTWANT only once a whole copy has arrived, so
     /// a multi-megabyte GLOBAL frame reaches a node from most of its mesh at
     /// once. At 256 KiB the transfer takes about a WAN round trip at
-    /// 50 Mbps, the cost of the pull; every other class of message is far
-    /// smaller.
+    /// 50 Mbps, the cost of the pull (about 1.5 round trips a hop). In a
+    /// 10-minute sample on one node (Nov 16) only GLOBAL frames were larger;
+    /// shard blocks and frames reached 128-256 KiB. A larger one is pulled
+    /// too.
     pub const LAZY_FORWARD_THRESHOLD: usize = 256 * 1024;
+    /// How long a mesh peer that announced a message has to deliver it
+    /// after our IWANT; then the next announcer is asked. Two bounds: a
+    /// relay answers IWANT from its cache for HISTORY_LENGTH heartbeats
+    /// (16.8 s), so the next announcer, asked one heartbeat after this,
+    /// must still hold the message; and the transfer of a GLOBAL frame
+    /// (1-8 MiB, up to 15 MiB) must fit: at 8 s a 4 MiB frame needs
+    /// 4.2 Mbit/s and a 15 MiB one 15.7 Mbit/s. A slower transfer breaks
+    /// the promise and pulls one more copy.
+    pub const LAZY_FOLLOWUP_TIME: Duration = Duration::from_secs(8);
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -135,6 +146,8 @@ pub struct BlossomsubParams {
     pub mcache_max_bytes: usize,
     /// See [`params::LAZY_FORWARD_THRESHOLD`].
     pub lazy_forward_threshold: usize,
+    /// See [`params::LAZY_FOLLOWUP_TIME`].
+    pub lazy_followup_time: std::time::Duration,
 }
 
 impl Default for BlossomsubParams {
@@ -153,6 +166,7 @@ impl Default for BlossomsubParams {
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
             lazy_forward_threshold: params::LAZY_FORWARD_THRESHOLD,
+            lazy_followup_time: params::LAZY_FOLLOWUP_TIME,
         }
     }
 }
@@ -201,6 +215,7 @@ impl BlossomsubParams {
             // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,
             lazy_forward_threshold: d.lazy_forward_threshold,
+            lazy_followup_time: d.lazy_followup_time,
         }
     }
 }

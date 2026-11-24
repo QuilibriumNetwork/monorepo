@@ -180,6 +180,8 @@ pub struct BlossomSubBehaviour {
     /// Operator log state for gossip RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcLog,
     unsent_rpcs: UnsentRpcLog,
+    /// Operator log of peers' announcements (IHAVE) dropped, and of fallback asks.
+    announces: AnnounceLog,
     /// Operator log of peers answering under the message ids of releases before strict shard
     /// gossip.
     legacy_ids: LegacyIdLog,
@@ -235,6 +237,7 @@ impl BlossomSubBehaviour {
             cache_pressure: CachePressure::default(),
             rejected_rpcs: RejectedRpcLog::default(),
             unsent_rpcs: UnsentRpcLog::default(),
+            announces: AnnounceLog::default(),
             legacy_ids: LegacyIdLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
@@ -289,6 +292,7 @@ impl BlossomSubBehaviour {
         self.cache_pressure = CachePressure::default();
         self.rejected_rpcs = RejectedRpcLog::default();
         self.unsent_rpcs = UnsentRpcLog::default();
+        self.announces = AnnounceLog::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -545,6 +549,7 @@ impl BlossomSubBehaviour {
         self.rejected_rpcs
             .observe(self.inner.rejected_rpc_stats(), now);
         self.unsent_rpcs.observe(self.inner.unsent_rpc_stats(), now);
+        self.announces.observe(self.inner.announce_stats(), now);
         self.legacy_ids.observe(
             crate::node::strict_shard_gossip(),
             self.inner.take_legacy_id_answers(),
@@ -802,6 +807,78 @@ impl RejectedRpcLog {
             }
         }
         Some(line)
+    }
+}
+
+/// Dropped announcements and fallback asks are summarized at most this often.
+const ANNOUNCE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one [`AnnounceLog`] line counts, since the previous line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AnnounceCounts {
+    dropped_ihaves: u64,
+    dropped_ids: u64,
+    unasked_ids: u64,
+    fallback_asks: u64,
+}
+
+/// Operator log of peers' announcements (IHAVE) this node dropped (over gossipsub's
+/// per-heartbeat IHAVE and IWANT limits) and of IWANTs sent to a later announcer after the
+/// first broke its promise: one info line per [`ANNOUNCE_LOG_INTERVAL`] while either
+/// continues, with the counts since the previous line. A relay announces a large message
+/// (a GLOBAL frame) instead of pushing it, so each dropped announcement of one is a copy
+/// this node must get from another announcer.
+#[derive(Debug, Default)]
+struct AnnounceLog {
+    /// Counters at the previous line.
+    logged: gossipsub::AnnounceStats,
+    last_log: Option<std::time::Instant>,
+}
+
+impl AnnounceLog {
+    /// Returns the counts since the previous line when one is due.
+    fn observe(
+        &mut self,
+        stats: gossipsub::AnnounceStats,
+        now: std::time::Instant,
+    ) -> Option<AnnounceCounts> {
+        let counts = AnnounceCounts {
+            dropped_ihaves: stats
+                .dropped_ihaves
+                .saturating_sub(self.logged.dropped_ihaves),
+            dropped_ids: stats.dropped_ids.saturating_sub(self.logged.dropped_ids),
+            unasked_ids: stats.unasked_ids.saturating_sub(self.logged.unasked_ids),
+            fallback_asks: stats
+                .fallback_asks
+                .saturating_sub(self.logged.fallback_asks),
+        };
+        if counts == AnnounceCounts::default() {
+            return None;
+        }
+        let since = self.last_log.map(|at| now.duration_since(at));
+        if since.is_some_and(|since| since < ANNOUNCE_LOG_INTERVAL) {
+            return None;
+        }
+        self.logged = stats;
+        self.last_log = Some(now);
+        let latest_dropping_peer = stats
+            .last_dropping_peer
+            .map(|peer| peer.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            dropped_ihaves = counts.dropped_ihaves,
+            dropped_ids = counts.dropped_ids,
+            unasked_ids = counts.unasked_ids,
+            fallback_asks = counts.fallback_asks,
+            %latest_dropping_peer,
+            since_secs = since.map_or(0, |since| since.as_secs()),
+            "gossip announcements dropped over the per-heartbeat IHAVE/IWANT limits, and \
+             messages asked of a later announcer after the first did not deliver in time; the \
+             counts are since the previous line. A dropped announcement of a large message is \
+             pulled from another announcer or heartbeat gossip; check the latest dropping peer \
+             if dropped_ids stays high for hours"
+        );
+        Some(counts)
     }
 }
 
@@ -1275,6 +1352,7 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
         .lazy_forward_threshold(params.lazy_forward_threshold)
+        .lazy_followup_time(params.lazy_followup_time)
         // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
         // `protocol.rs` and is the smallest that carries the largest message
         // the node gossips: a GLOBAL frame of up to 15 MiB
@@ -1512,6 +1590,33 @@ mod propagation_tests {
             );
         }
         crate::node::set_strict_shard_gossip(false);
+    }
+
+    #[test]
+    fn announce_drops_log_one_bounded_summary_per_interval() {
+        let stats = |dropped_ids, fallback_asks| gossipsub::AnnounceStats {
+            dropped_ihaves: dropped_ids,
+            dropped_ids,
+            fallback_asks,
+            ..Default::default()
+        };
+        let counts = |dropped_ids, fallback_asks| AnnounceCounts {
+            dropped_ihaves: dropped_ids,
+            dropped_ids,
+            fallback_asks,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = AnnounceLog::default();
+        let within = "at most one announce line per interval";
+        assert_eq!(log.observe(stats(0, 0), at(0)), None, "nothing to count");
+        assert_eq!(log.observe(stats(2, 0), at(1)), Some(counts(2, 0)));
+        assert_eq!(log.observe(stats(30, 1), at(2)), None, "{within}");
+        assert_eq!(log.observe(stats(40, 1), at(60)), None, "{within}");
+        assert_eq!(log.observe(stats(40, 1), at(61)), Some(counts(38, 1)));
+        assert_eq!(log.observe(stats(40, 1), at(200)), None, "nothing new");
+        assert_eq!(log.observe(stats(40, 2), at(201)), Some(counts(0, 1)));
     }
 
     #[test]

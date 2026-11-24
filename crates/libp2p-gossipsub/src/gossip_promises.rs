@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use libp2p_identity::PeerId;
 use web_time::Instant;
@@ -33,7 +33,18 @@ pub(crate) struct GossipPromises {
     /// If the peer didn't respond until then we consider the promise as broken and penalize the
     /// peer.
     promises: HashMap<MessageId, HashMap<PeerId, Instant>>,
+    /// QUILIBRIUM: for a message with an open promise, the peers that announced it after we
+    /// asked another, oldest first, at most [`MAX_FALLBACK_ANNOUNCERS`]. When every promise for
+    /// it breaks, the next is asked ([`GossipPromises::take_unserved_fallbacks`]): a mesh peer
+    /// announces a message once, so without this a message whose announcer never answers
+    /// would wait for a later IHAVE from heartbeat gossip, if one comes.
+    fallbacks: HashMap<MessageId, VecDeque<PeerId>>,
 }
+
+/// QUILIBRIUM: the most later announcers kept per message with an open promise; a mesh holds
+/// at most `mesh_n_high` (12) peers, and each kept one costs a peer id until the message
+/// arrives or its promises break.
+pub(crate) const MAX_FALLBACK_ANNOUNCERS: usize = 8;
 
 impl GossipPromises {
     /// Returns true if the message id exists in the promises.
@@ -68,12 +79,60 @@ impl GossipPromises {
         }
     }
 
+    /// QUILIBRIUM: keep `peer`, which announced `message` while a promise for it is open, to
+    /// ask if every open promise for it breaks. Returns whether it was kept: not when no
+    /// promise is open, when `peer` already promised it or is kept, or at
+    /// [`MAX_FALLBACK_ANNOUNCERS`].
+    pub(crate) fn add_fallback(&mut self, message: &MessageId, peer: PeerId) -> bool {
+        if self
+            .promises
+            .get(message)
+            .is_none_or(|peers| peers.contains_key(&peer))
+        {
+            return false;
+        }
+        let kept = self.fallbacks.entry(message.clone()).or_default();
+        if kept.len() >= MAX_FALLBACK_ANNOUNCERS || kept.contains(&peer) {
+            return false;
+        }
+        kept.push_back(peer);
+        true
+    }
+
+    /// QUILIBRIUM: the later announcers of each message whose promises have all broken
+    /// ([`GossipPromises::get_broken_promises`]), oldest first; the caller asks the first it
+    /// can and returns the rest with [`GossipPromises::keep_fallbacks`] once it has a new
+    /// promise for the message.
+    pub(crate) fn take_unserved_fallbacks(&mut self) -> Vec<(MessageId, VecDeque<PeerId>)> {
+        let unserved: Vec<MessageId> = self
+            .fallbacks
+            .keys()
+            .filter(|id| !self.promises.contains_key(*id))
+            .cloned()
+            .collect();
+        unserved
+            .into_iter()
+            .filter_map(|id| self.fallbacks.remove_entry(&id))
+            .collect()
+    }
+
+    /// QUILIBRIUM: return the announcers not yet asked for `message`, after the caller has
+    /// made a new promise for it (dropped otherwise).
+    pub(crate) fn keep_fallbacks(&mut self, message: MessageId, peers: VecDeque<PeerId>) {
+        if !peers.is_empty() && self.promises.contains_key(&message) {
+            self.fallbacks.insert(message, peers);
+        }
+    }
+
     pub(crate) fn message_delivered(&mut self, message_id: &MessageId) {
         // Someone delivered a message, we can stop tracking all promises for it.
         self.promises.remove(message_id);
+        self.fallbacks.remove(message_id);
     }
 
     pub(crate) fn reject_message(&mut self, message_id: &MessageId, reason: &RejectReason) {
+        // QUILIBRIUM: nobody is asked again for a rejected message.
+        self.fallbacks.remove(message_id);
         // A message got rejected, so we can stop tracking promises and let the score penalty apply
         // from invalid message delivery.
         // We do take exception and apply promise penalty regardless in the following cases, where

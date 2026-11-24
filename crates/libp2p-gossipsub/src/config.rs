@@ -143,6 +143,7 @@ pub struct Config {
     idontwant_message_size_threshold: usize,
     idontwant_on_publish: bool,
     lazy_forward_threshold: usize,
+    lazy_followup_time: Duration,
     topic_configuration: TopicConfigs,
     mcache_max_bytes: usize,
 }
@@ -517,6 +518,16 @@ impl Config {
     pub fn lazy_forward_threshold(&self) -> usize {
         self.lazy_forward_threshold
     }
+
+    /// QUILIBRIUM: how long a mesh peer that announced a message has to deliver it after our
+    /// IWANT, in place of [`Config::iwant_followup_time`]. A mesh peer announces only a message
+    /// over its `lazy_forward_threshold` (heartbeat gossip goes to peers outside the mesh), and
+    /// the IHAVE does not carry the size, so this bounds the transfer of the largest such
+    /// message. When it passes, the promise breaks and the next peer that announced the
+    /// message is asked. Default 3 s.
+    pub fn lazy_followup_time(&self) -> Duration {
+        self.lazy_followup_time
+    }
 }
 
 impl Default for Config {
@@ -589,6 +600,7 @@ impl Default for ConfigBuilder {
                 idontwant_message_size_threshold: 1000,
                 idontwant_on_publish: false,
                 lazy_forward_threshold: usize::MAX,
+                lazy_followup_time: Duration::from_secs(3),
                 topic_configuration: TopicConfigs::default(),
                 mcache_max_bytes: usize::MAX,
             },
@@ -1120,6 +1132,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// QUILIBRIUM: see [`Config::lazy_followup_time`].
+    pub fn lazy_followup_time(&mut self, followup: Duration) -> &mut Self {
+        self.config.lazy_followup_time = followup;
+        self
+    }
+
     /// The topic configuration sets mesh parameter sizes for a given topic. Notes on default
     /// below.
     ///
@@ -1252,6 +1270,7 @@ impl std::fmt::Debug for Config {
         );
         let _ = builder.field("idontwant_on_publish", &self.idontwant_on_publish);
         let _ = builder.field("lazy_forward_threshold", &self.lazy_forward_threshold);
+        let _ = builder.field("lazy_followup_time", &self.lazy_followup_time);
         builder.finish()
     }
 }

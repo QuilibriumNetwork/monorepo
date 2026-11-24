@@ -7405,13 +7405,30 @@ fn iwant_answers_under_a_legacy_id_are_counted() {
     );
 }
 
-/// QUILIBRIUM: a relayed message over `lazy_forward_threshold` goes to mesh
-/// peers as an IHAVE, never as the message, and an IWANT for it is answered
-/// from the cache; an explicit peer is still pushed the message.
+/// QUILIBRIUM: the encoded size of the 1024-byte relayed message the lazy
+/// forwarding tests send on "topic1"; every random peer id encodes to the
+/// same length.
+fn lazy_test_message_len() -> usize {
+    RawMessage {
+        source: Some(PeerId::random()),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: Topic::new("topic1").hash(),
+        signature: None,
+        key: None,
+        validated: true,
+    }
+    .raw_protobuf_len()
+}
+
+/// QUILIBRIUM: a relayed message one byte over `lazy_forward_threshold` goes
+/// to mesh peers as an IHAVE, never as the message, and an IWANT for it is
+/// answered from the cache; an explicit peer is still pushed the message.
 #[test]
 fn announces_a_large_relayed_message_to_mesh_peers() {
+    let threshold = lazy_test_message_len() - 1;
     let config = ConfigBuilder::default()
-        .lazy_forward_threshold(256)
+        .lazy_forward_threshold(threshold)
         .build()
         .unwrap();
     let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
@@ -7437,9 +7454,10 @@ fn announces_a_large_relayed_message_to_mesh_peers() {
         key: None,
         validated: true,
     };
-    assert!(
-        raw_message.raw_protobuf_len() > 256,
-        "premise: over the threshold"
+    assert_eq!(
+        raw_message.raw_protobuf_len(),
+        threshold + 1,
+        "premise: one byte over the threshold"
     );
     let message = gs
         .data_transform
@@ -7494,12 +7512,13 @@ fn announces_a_large_relayed_message_to_mesh_peers() {
     assert_eq!(gs.config.message_id(&served), msg_id);
 }
 
-/// QUILIBRIUM: a relayed message at or below `lazy_forward_threshold` is
+/// QUILIBRIUM: a relayed message exactly at `lazy_forward_threshold` is
 /// pushed to mesh peers as before, with no IHAVE.
 #[test]
 fn pushes_a_relayed_message_at_the_lazy_threshold() {
+    let threshold = lazy_test_message_len();
     let config = ConfigBuilder::default()
-        .lazy_forward_threshold(4096)
+        .lazy_forward_threshold(threshold)
         .build()
         .unwrap();
     let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
@@ -7518,9 +7537,10 @@ fn pushes_a_relayed_message_at_the_lazy_threshold() {
         key: None,
         validated: true,
     };
-    assert!(
-        raw_message.raw_protobuf_len() <= 4096,
-        "premise: at or below"
+    assert_eq!(
+        raw_message.raw_protobuf_len(),
+        threshold,
+        "premise: exactly at the threshold"
     );
     gs.handle_received_message(raw_message, &PeerId::random());
     let mut pushed = HashSet::new();
@@ -7535,4 +7555,287 @@ fn pushes_a_relayed_message_at_the_lazy_threshold() {
         "no IHAVE for a message at or below the threshold"
     );
     assert_eq!(pushed, HashSet::from([peers[1], peers[2], peers[3]]));
+}
+
+/// QUILIBRIUM: a relayed message over `lazy_forward_threshold` is still pushed
+/// to a floodsub peer, which has no mesh and never answers an IHAVE, while
+/// gossipsub mesh peers get the IHAVE.
+#[test]
+fn pushes_a_large_relayed_message_to_floodsub_peers() {
+    let threshold = lazy_test_message_len() - 1;
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(threshold)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (flood_peer, flood_receiver) = add_peer_with_addr_and_kind(
+        &mut gs,
+        &topic_hashes,
+        false,
+        false,
+        Multiaddr::empty(),
+        Some(PeerKind::Floodsub),
+    );
+    let mut receivers = receivers;
+    receivers.insert(flood_peer, flood_receiver);
+    assert!(
+        !gs.mesh[&topic_hashes[0]].contains(&flood_peer)
+            && gs.connected_peers[&flood_peer]
+                .topics
+                .contains(&topic_hashes[0]),
+        "premise: the floodsub peer is subscribed and outside the mesh"
+    );
+
+    let raw_message = RawMessage {
+        source: Some(PeerId::random()),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert!(
+        raw_message.raw_protobuf_len() > threshold,
+        "premise: over the threshold"
+    );
+    gs.handle_received_message(raw_message, &PeerId::random());
+
+    let mut announced = HashSet::new();
+    let mut pushed = HashSet::new();
+    count_control_msgs(receivers, |peer_id, rpc| {
+        match rpc {
+            RpcOut::IHave(_) => {
+                announced.insert(*peer_id);
+            }
+            RpcOut::Forward { .. } => {
+                pushed.insert(*peer_id);
+            }
+            _ => {}
+        }
+        false
+    });
+    assert_eq!(
+        pushed,
+        HashSet::from([flood_peer]),
+        "the floodsub peer is pushed the message"
+    );
+    assert_eq!(
+        announced,
+        peers.iter().copied().collect::<HashSet<_>>(),
+        "the gossipsub mesh peers get the IHAVE"
+    );
+}
+
+/// QUILIBRIUM: the message ids of the IWANTs queued for each peer since the
+/// last call, and the receivers back.
+fn iwants_by_peer(
+    receivers: HashMap<PeerId, Receiver>,
+) -> (HashMap<PeerId, Vec<MessageId>>, HashMap<PeerId, Receiver>) {
+    let mut iwants: HashMap<PeerId, Vec<MessageId>> = HashMap::new();
+    let (_, receivers) = count_control_msgs(receivers, |peer_id, rpc| {
+        if let RpcOut::IWant(IWant { message_ids }) = rpc {
+            iwants
+                .entry(*peer_id)
+                .or_default()
+                .extend(message_ids.iter().cloned());
+        }
+        false
+    });
+    (iwants, receivers)
+}
+
+/// QUILIBRIUM: a message announced by several mesh peers is asked of the
+/// first; when that one never answers, the next announcer is asked on the
+/// first heartbeat after the follow-up time, and the message arrives from it.
+/// No third announcer is asked once it has arrived.
+#[test]
+fn asks_the_next_announcer_when_the_first_never_answers() {
+    let config = ConfigBuilder::default()
+        .iwant_followup_time(Duration::from_millis(1))
+        .lazy_followup_time(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    assert!(
+        peers
+            .iter()
+            .all(|peer| gs.mesh[&topic_hashes[0]].contains(peer)),
+        "premise: every announcer is a mesh peer"
+    );
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "only the first announcer is asked at first"
+    );
+
+    // The first never answers.
+    sleep(Duration::from_millis(20));
+    gs.heartbeat();
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[1], vec![msg_id.clone()])]),
+        "the first heartbeat after the follow-up asks the second announcer, alone"
+    );
+    assert_eq!(gs.announce_stats().fallback_asks, 1);
+
+    gs.handle_received_message(raw_message, &peers[1]);
+    assert!(
+        gs.events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+        )),
+        "the message arrives from the second announcer"
+    );
+
+    sleep(Duration::from_millis(20));
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.values().all(|ids| !ids.contains(&msg_id)),
+        "nobody is asked again once the message arrived: {iwants:?}"
+    );
+}
+
+/// QUILIBRIUM: a promise from a mesh peer's announcement lasts
+/// `lazy_followup_time`, one from heartbeat gossip `iwant_followup_time`;
+/// only the second has broken, and only its message is asked of the next
+/// announcer.
+#[test]
+fn a_mesh_announcement_waits_the_lazy_followup_time() {
+    let config = ConfigBuilder::default()
+        .iwant_followup_time(Duration::from_millis(1))
+        .lazy_followup_time(Duration::from_secs(3600))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mut receivers = receivers;
+    let mut outside = Vec::new();
+    // Outside the mesh: peers that did not subscribe, as heartbeat gossip may
+    // come from (a subscribed one joins a mesh below mesh_n_low at once).
+    for _ in 0..2 {
+        let (peer, receiver) = add_peer(&mut gs, &[], false, false);
+        receivers.insert(peer, receiver);
+        outside.push(peer);
+    }
+    let mesh = &gs.mesh[&topic_hashes[0]];
+    assert!(
+        peers.iter().all(|peer| mesh.contains(peer))
+            && outside.iter().all(|peer| !mesh.contains(peer)),
+        "premise: two mesh peers and two outside the mesh"
+    );
+    let mut seq = 0;
+    let mut id_of = |gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        let raw = random_message(&mut seq, &topic_hashes);
+        let message = gs.data_transform.inbound_transform(raw).unwrap();
+        gs.config.message_id(&message)
+    };
+    let announced = id_of(&gs);
+    let gossiped = id_of(&gs);
+
+    for peer in &peers {
+        gs.handle_ihave(
+            peer,
+            vec![(topic_hashes[0].clone(), vec![announced.clone()])],
+        );
+    }
+    for peer in &outside {
+        gs.handle_ihave(
+            peer,
+            vec![(topic_hashes[0].clone(), vec![gossiped.clone()])],
+        );
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([
+            (peers[0], vec![announced.clone()]),
+            (outside[0], vec![gossiped.clone()]),
+        ]),
+        "premise: each message asked of its first announcer"
+    );
+
+    sleep(Duration::from_millis(20));
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(outside[1], vec![gossiped])]),
+        "only the gossiped message's promise broke; the mesh announcement still waits"
+    );
+}
+
+/// QUILIBRIUM: announcements dropped over the per-heartbeat IHAVE count, and
+/// ids not asked for over the IWANT budget, are counted for the operator log.
+#[test]
+fn counts_announcements_dropped_over_the_ihave_limits() {
+    let config = ConfigBuilder::default()
+        .max_ihave_messages(1)
+        .max_ihave_length(2)
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut seq = 0;
+    let mut ids = |n: usize, gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        (0..n)
+            .map(|_| {
+                let raw = random_message(&mut seq, &topic_hashes);
+                let message = gs.data_transform.inbound_transform(raw).unwrap();
+                gs.config.message_id(&message)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = ids(1, &gs);
+    let dropped = ids(2, &gs);
+    let over_budget = ids(3, &gs);
+
+    // One peer sends a second IHAVE in the heartbeat: dropped whole.
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), first)]);
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), dropped)]);
+    // Another announces three ids against a budget of two: one is not asked.
+    gs.handle_ihave(&peers[1], vec![(topic_hashes[0].clone(), over_budget)]);
+
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (stats.dropped_ihaves, stats.dropped_ids, stats.unasked_ids),
+        (1, 2, 1),
+        "one IHAVE of two ids dropped, one id over budget: {stats:?}"
+    );
+    assert_eq!(stats.last_dropping_peer, Some(peers[1]));
 }
