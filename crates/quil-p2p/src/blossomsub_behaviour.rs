@@ -818,16 +818,27 @@ const ANNOUNCE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 struct AnnounceCounts {
     dropped_ihaves: u64,
     dropped_ids: u64,
+    deferred_ids: u64,
     unasked_ids: u64,
     fallback_asks: u64,
+    deadline_asks: u64,
+    stale_announcers: u64,
+    evicted_iwants: u64,
+    large_first_from_source: u64,
+    large_first_pushed: u64,
+    large_first_pulled: u64,
 }
 
-/// Operator log of peers' announcements (IHAVE) this node dropped (over gossipsub's
-/// per-heartbeat IHAVE and IWANT limits) and of IWANTs sent to a later announcer after the
-/// first broke its promise: one info line per [`ANNOUNCE_LOG_INTERVAL`] while either
-/// continues, with the counts since the previous line. A relay announces a large message
-/// (a GLOBAL frame) instead of pushing it, so each dropped announcement of one is a copy
-/// this node must get from another announcer.
+/// Operator log of large gossip messages (a GLOBAL frame) by how their first copy came (from
+/// the source, pushed by a relay, pulled with IWANT), of peers' announcements (IHAVE) this
+/// node dropped or deferred to a later heartbeat (over gossipsub's per-heartbeat IHAVE and
+/// IWANT limits), of IWANTs sent to a kept announcer after the first broke its promise and of
+/// IWANTs it could not serve because
+/// its cache's byte budget evicted the message: one info line per [`ANNOUNCE_LOG_INTERVAL`]
+/// while any continues, with the counts since the previous line. A relay pushes a large
+/// message to a few mesh peers and announces it to the rest, which pull it unless a push
+/// arrives first, so a dropped announcement of one may be a copy this node must get from
+/// another announcer.
 #[derive(Debug, Default)]
 struct AnnounceLog {
     /// Counters at the previous line.
@@ -847,10 +858,29 @@ impl AnnounceLog {
                 .dropped_ihaves
                 .saturating_sub(self.logged.dropped_ihaves),
             dropped_ids: stats.dropped_ids.saturating_sub(self.logged.dropped_ids),
+            deferred_ids: stats.deferred_ids.saturating_sub(self.logged.deferred_ids),
             unasked_ids: stats.unasked_ids.saturating_sub(self.logged.unasked_ids),
             fallback_asks: stats
                 .fallback_asks
                 .saturating_sub(self.logged.fallback_asks),
+            deadline_asks: stats
+                .deadline_asks
+                .saturating_sub(self.logged.deadline_asks),
+            stale_announcers: stats
+                .stale_announcers
+                .saturating_sub(self.logged.stale_announcers),
+            evicted_iwants: stats
+                .evicted_iwants
+                .saturating_sub(self.logged.evicted_iwants),
+            large_first_from_source: stats
+                .large_first_from_source
+                .saturating_sub(self.logged.large_first_from_source),
+            large_first_pushed: stats
+                .large_first_pushed
+                .saturating_sub(self.logged.large_first_pushed),
+            large_first_pulled: stats
+                .large_first_pulled
+                .saturating_sub(self.logged.large_first_pulled),
         };
         if counts == AnnounceCounts::default() {
             return None;
@@ -868,15 +898,28 @@ impl AnnounceLog {
         tracing::info!(
             dropped_ihaves = counts.dropped_ihaves,
             dropped_ids = counts.dropped_ids,
+            deferred_ids = counts.deferred_ids,
             unasked_ids = counts.unasked_ids,
             fallback_asks = counts.fallback_asks,
+            deadline_asks = counts.deadline_asks,
+            stale_announcers = counts.stale_announcers,
+            evicted_iwants = counts.evicted_iwants,
+            large_first_from_source = counts.large_first_from_source,
+            large_first_pushed = counts.large_first_pushed,
+            large_first_pulled = counts.large_first_pulled,
             %latest_dropping_peer,
             since_secs = since.map_or(0, |since| since.as_secs()),
-            "gossip announcements dropped over the per-heartbeat IHAVE/IWANT limits, and \
-             messages asked of a later announcer after the first did not deliver in time; the \
-             counts are since the previous line. A dropped announcement of a large message is \
-             pulled from another announcer or heartbeat gossip; check the latest dropping peer \
-             if dropped_ids stays high for hours"
+            "large gossip messages by how their first copy came (from the source, pushed by a \
+             relay, pulled), announcements dropped or deferred to a later heartbeat over the \
+             per-heartbeat IHAVE/IWANT limits, messages asked of a kept announcer after the \
+             first did not deliver in time (fallback) or of a kept mesh announcer by its latest \
+             start while the first stalled (deadline) or not asked of one past its relay cache window, \
+             and asks this node could \
+             not serve because its cache's byte budget evicted the message; the counts are \
+             since the previous line. A dropped announcement of a large message is pulled from \
+             another announcer or heartbeat gossip; check the latest dropping peer if \
+             dropped_ids stays high for hours, and the cache budget warning if evicted_iwants \
+             grows"
         );
         Some(counts)
     }
@@ -1352,6 +1395,7 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
         .lazy_forward_threshold(params.lazy_forward_threshold)
+        .lazy_eager_peers(params.lazy_eager_peers)
         .lazy_followup_time(params.lazy_followup_time)
         // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
         // `protocol.rs` and is the smallest that carries the largest message
@@ -1617,6 +1661,20 @@ mod propagation_tests {
         assert_eq!(log.observe(stats(40, 1), at(61)), Some(counts(38, 1)));
         assert_eq!(log.observe(stats(40, 1), at(200)), None, "nothing new");
         assert_eq!(log.observe(stats(40, 2), at(201)), Some(counts(0, 1)));
+        let pulled = gossipsub::AnnounceStats {
+            large_first_pulled: 3,
+            evicted_iwants: 1,
+            ..stats(40, 2)
+        };
+        assert_eq!(
+            log.observe(pulled, at(300)),
+            Some(AnnounceCounts {
+                large_first_pulled: 3,
+                evicted_iwants: 1,
+                ..Default::default()
+            }),
+            "first copies and unserved asks alone make a line"
+        );
     }
 
     #[test]
@@ -1777,6 +1835,10 @@ mod propagation_tests {
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
+        build_swarm_with(crate::BlossomsubParams::default())
+    }
+
+    fn build_swarm_with(params: crate::BlossomsubParams) -> Swarm<BlossomSubBehaviour> {
         SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -1786,7 +1848,7 @@ mod propagation_tests {
             )
             .expect("tcp transport")
             .with_behaviour(|key| {
-                let mut b = BlossomSubBehaviour::new(0);
+                let mut b = BlossomSubBehaviour::with_params(0, params);
                 b.set_signing_identity(key.public().to_peer_id(), key.clone());
                 Ok(b)
             })
@@ -2073,18 +2135,21 @@ mod propagation_tests {
             .sum()
     }
 
-    /// A relay announces a message over the lazy-forward threshold to its
-    /// mesh, and a leaf that only the relay reaches pulls it with IWANT.
-    /// Chain hub - relay - leaf: the hub's flood publish reaches the relay
-    /// alone, so the leaf's copy comes from the relay, by IWANT (counted on
-    /// the leaf), not by a push.
+    /// A relay that pushes no mesh peer a message over the lazy-forward
+    /// threshold (lazy_eager_peers 0) announces it, and a leaf that only the
+    /// relay reaches pulls it with IWANT. Chain hub - relay - leaf: the
+    /// hub's flood publish reaches the relay alone, so the leaf's copy comes
+    /// from the relay, by IWANT (counted on the leaf), not by a push.
     #[tokio::test]
     async fn a_large_message_crosses_a_relay_by_announce_and_pull() {
         let bitmask = vec![0x80u8];
         let payload = vec![9u8; crate::params::LAZY_FORWARD_THRESHOLD + 1];
 
         let mut hub = build_swarm();
-        let mut relay = build_swarm();
+        let mut relay = build_swarm_with(crate::BlossomsubParams {
+            lazy_eager_peers: 0,
+            ..Default::default()
+        });
         let mut leaf = build_swarm();
         let (relay_id, leaf_id) = (*relay.local_peer_id(), *leaf.local_peer_id());
 
