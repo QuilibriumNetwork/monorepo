@@ -3582,6 +3582,55 @@ mod tests {
         assert_eq!(master.calls(), (0, 1), "nor was the master asked again");
     }
 
+    /// A master known to relay votes, with no channel to it made, holds no
+    /// vote while one is made: the vote goes to the topic at once, the
+    /// answer is forgotten, and the next vote sends a probe, which makes
+    /// the channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_vote_for_a_master_with_no_channel_goes_to_the_topic_and_a_probe_follows() {
+        let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let making = made.clone();
+        // A master not reached yet: its channel is never made.
+        let factory: MasterChannelFactory = Arc::new(move || {
+            making.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending::<
+                std::result::Result<
+                    tonic::transport::Channel,
+                    Box<dyn std::error::Error + Send + Sync>,
+                >,
+            >())
+        });
+        let relay = Arc::new(MasterRelay::new(Some(factory)));
+        relay
+            .relays_consensus
+            .lock()
+            .unwrap()
+            .answered(tokio::time::Instant::now(), true);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), vote(&relay, 1)).await,
+            Ok(false),
+            "the vote goes to the topic, not waiting for a channel"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the vote did not wait");
+        settle().await;
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the vote made no channel"
+        );
+        assert!(
+            !vote(&relay, 2).await,
+            "the next vote goes to the topic while the master is asked"
+        );
+        settle().await;
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a probe follows, making the channel"
+        );
+    }
+
     /// The master's answer is kept ten minutes, so votes do not each probe
     /// it; every relay answer replaces it, renewing it, or, from a master
     /// that no longer relays votes, sending the next to the topic at once.
