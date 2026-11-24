@@ -994,13 +994,13 @@ impl P2PNode {
             );
             traffic_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut traffic_logged = loop_gossip_traffic.snapshot();
-            // Direct delivery state: sends awaiting their outcome, peers that
-            // lack the protocol or answer only "queued" (until
-            // `UNSUPPORTED_RETRY_AFTER`), and the bitmasks this node takes
+            // Direct delivery state: sends awaiting their outcome, by bitmask;
+            // peers that lack the protocol or answer only "queued" on a bitmask
+            // (until `UNSUPPORTED_RETRY_AFTER`); and the bitmasks this node takes
             // direct messages on.
             let mut direct_pending: std::collections::HashMap<
                 libp2p::request_response::OutboundRequestId,
-                oneshot::Sender<crate::direct::DirectOutcome>,
+                (Vec<u8>, oneshot::Sender<crate::direct::DirectOutcome>),
             > = std::collections::HashMap::new();
             let mut direct_answers = crate::direct::DirectAnswers::default();
             let mut direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -1568,9 +1568,9 @@ impl P2PNode {
                                             }
                                         }
                                         Event::Message { peer, message: Message::Response { request_id, response }, .. } => {
-                                            if let Some(ack) = direct_pending.remove(&request_id) {
+                                            if let Some((bitmask, ack)) = direct_pending.remove(&request_id) {
                                                 let outcome = DirectOutcome::answered(response);
-                                                direct_answers.note(peer, outcome, std::time::Instant::now());
+                                                direct_answers.note(peer, &bitmask, outcome, std::time::Instant::now());
                                                 direct_stats.note(outcome);
                                                 let _ = ack.send(outcome);
                                             }
@@ -1578,7 +1578,8 @@ impl P2PNode {
                                         Event::OutboundFailure { peer, request_id, error, .. } => {
                                             let outcome = match error {
                                                 OutboundFailure::UnsupportedProtocols => {
-                                                    direct_answers.note(peer, DirectOutcome::Unsupported, std::time::Instant::now());
+                                                    // Kept per peer: the bitmask does not matter.
+                                                    direct_answers.note(peer, &[], DirectOutcome::Unsupported, std::time::Instant::now());
                                                     DirectOutcome::Unsupported
                                                 }
                                                 OutboundFailure::DialFailure => DirectOutcome::NotConnected,
@@ -1587,7 +1588,7 @@ impl P2PNode {
                                                     DirectOutcome::Failed
                                                 }
                                             };
-                                            if let Some(ack) = direct_pending.remove(&request_id) {
+                                            if let Some((_, ack)) = direct_pending.remove(&request_id) {
                                                 direct_stats.note(outcome);
                                                 let _ = ack.send(outcome);
                                             }
@@ -1711,7 +1712,7 @@ impl P2PNode {
                                 use crate::direct::DirectOutcome;
                                 // Only an existing connection: no dial, so a send
                                 // never waits on reaching a peer behind NAT.
-                                let refused = if let Some(skipped) = direct_answers.skip(&peer, needs_taken, std::time::Instant::now()) {
+                                let refused = if let Some(skipped) = direct_answers.skip(&peer, &bitmask, needs_taken, std::time::Instant::now()) {
                                     Some(skipped)
                                 } else if !swarm.is_connected(&peer) {
                                     Some(DirectOutcome::NotConnected)
@@ -1726,9 +1727,9 @@ impl P2PNode {
                                     None => {
                                         let id = swarm.behaviour_mut().direct.send_request(
                                             &peer,
-                                            crate::direct::DirectRequest { bitmask, data },
+                                            crate::direct::DirectRequest { bitmask: bitmask.clone(), data },
                                         );
-                                        direct_pending.insert(id, ack);
+                                        direct_pending.insert(id, (bitmask, ack));
                                     }
                                 }
                             }

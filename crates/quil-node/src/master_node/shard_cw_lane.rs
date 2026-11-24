@@ -133,6 +133,28 @@ pub(super) fn worker_answer(delivery: RemoteDelivery) -> DirectAnswer {
     }
 }
 
+/// Direct messages being handed to this node's standalone workers at once,
+/// each in its own task for up to the worker call's timeout.
+pub(super) static WORKER_FORWARDS: quil_engine::spawn_gate::SpawnGate =
+    quil_engine::spawn_gate::SpawnGate::new("shard-cw-forward", 256);
+
+/// A place in `places` for handing one direct message to a standalone
+/// worker, or, with every place taken, none and its sender answered
+/// "refused": the sender then serves its member by the topic, which the
+/// worker hears itself.
+pub(super) fn forward_place(
+    places: &'static quil_engine::spawn_gate::SpawnGate,
+    ack: &mut Option<DirectAck>,
+) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let place = places.try_enter();
+    if place.is_none() {
+        if let Some(ack) = ack.take() {
+            ack.answer(DirectAnswer::Refused);
+        }
+    }
+    place
+}
+
 /// Hand a shard CW message a committee member sent this node directly to
 /// the standalone worker running its shard, and answer the sender
 /// ([`worker_answer`]).
@@ -245,6 +267,40 @@ mod tests {
             assert_eq!(delivered, delivery);
             assert_eq!(answer_of(answered).await, answer, "{delivery:?}");
         }
+    }
+
+    /// Hand-offs to a standalone worker are bounded: with every place
+    /// taken, the next sender is answered "refused" at once and nothing is
+    /// handed on; a place freed takes the next.
+    #[tokio::test]
+    async fn a_hand_off_to_a_worker_with_every_place_taken_is_refused() {
+        static PLACES: quil_engine::spawn_gate::SpawnGate =
+            quil_engine::spawn_gate::SpawnGate::new("test-shard-cw-forward", 1);
+        let (first, mut first_answered) = direct();
+        let mut first_ack = first.ack;
+        let place = forward_place(&PLACES, &mut first_ack).expect("a free place");
+        assert!(
+            first_ack.is_some(),
+            "the handed-on sender is answered by its worker"
+        );
+        assert!(first_answered.try_recv().is_err(), "not answered yet");
+
+        let (second, second_answered) = direct();
+        let mut second_ack = second.ack;
+        assert!(
+            forward_place(&PLACES, &mut second_ack).is_none(),
+            "a hand-off with every place taken is refused"
+        );
+        assert!(second_ack.is_none());
+        assert_eq!(second_answered.await, Ok(DirectAnswer::Refused));
+
+        drop(place);
+        let (third, _answered) = direct();
+        let mut third_ack = third.ack;
+        assert!(
+            forward_place(&PLACES, &mut third_ack).is_some(),
+            "a freed place is taken"
+        );
     }
 
     fn message(bitmask: u8) -> ReceivedMessage {

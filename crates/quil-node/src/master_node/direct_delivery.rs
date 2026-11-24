@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quil_engine::cw_app_seams::CW_APP_RESOLVER_CHANNEL;
+use quil_p2p::direct::committee_send_timeout;
 use tracing::info;
 
 /// Most recipients a message is delivered to one by one; more go to the
@@ -27,25 +28,6 @@ pub(crate) const MAX_DIRECT_RECIPIENTS: usize = 64;
 /// six and members relay the rest, and the slowest copy would hold back the
 /// topic copy of every member not served.
 pub(crate) const MAX_DIRECT_BYTES: usize = 256 * 1024;
-
-/// How long one member's direct send of a small message may take before
-/// that member is served by the topic copy instead. Consensus waits on
-/// votes, so this is well under the direct protocol's own timeout; a send
-/// that lands later is a duplicate consensus ignores.
-pub(crate) const COMMITTEE_SEND_TIMEOUT: Duration = Duration::from_millis(1500);
-
-/// The upload rate, in bytes per second, a committee send is given time for
-/// on top of [`COMMITTEE_SEND_TIMEOUT`].
-const ASSUMED_UPLOAD_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
-
-/// How long each of `copies` direct sends of `bytes`, all sent at once, may
-/// take: [`COMMITTEE_SEND_TIMEOUT`] plus the time to upload every copy at
-/// [`ASSUMED_UPLOAD_BYTES_PER_SEC`], within the direct protocol's timeout.
-pub(crate) fn committee_send_timeout(copies: usize, bytes: usize) -> Duration {
-    let upload = (copies as u64).saturating_mul(bytes as u64);
-    let upload = Duration::from_millis(upload.saturating_mul(1000) / ASSUMED_UPLOAD_BYTES_PER_SEC);
-    (COMMITTEE_SEND_TIMEOUT + upload).min(quil_p2p::direct::DIRECT_REQUEST_TIMEOUT)
-}
 
 /// The direct side of a committee send.
 #[async_trait::async_trait]
@@ -476,6 +458,7 @@ pub(crate) async fn relay_for_worker<T: CommitteeTransport + Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_p2p::direct::COMMITTEE_SEND_TIMEOUT;
     use quil_p2p::DirectOutcome;
     use std::time::Duration;
 
@@ -531,18 +514,18 @@ mod tests {
         async fn send_direct(
             &self,
             peer: quil_p2p::PeerId,
-            _topic: Vec<u8>,
+            topic: Vec<u8>,
             data: Vec<u8>,
             needs_taken: bool,
         ) -> DirectOutcome {
             let now = std::time::Instant::now();
-            if let Some(skipped) = self.skipping.lock().skip(&peer, needs_taken, now) {
+            if let Some(skipped) = self.skipping.lock().skip(&peer, &topic, needs_taken, now) {
                 return skipped;
             }
             self.sent.lock().push((peer, data));
             let (delay, outcome) = self.answers[&peer];
             tokio::time::sleep(delay).await;
-            self.skipping.lock().note(peer, outcome, now);
+            self.skipping.lock().note(peer, &topic, outcome, now);
             outcome
         }
 
@@ -918,6 +901,36 @@ mod tests {
         assert!(sender.sent.lock().is_empty());
     }
 
+    /// The recipient bound's edge: [`MAX_DIRECT_RECIPIENTS`] members each get
+    /// their copy, and one member more sends none.
+    #[tokio::test]
+    async fn the_most_recipients_each_get_a_copy_and_one_more_get_none() {
+        let topic = quil_engine::bitmasks::shard_cw_bitmask(&[1; 32]);
+        let most = members(0, MAX_DIRECT_RECIPIENTS as u8);
+        let sender = Peers::answering(&most, Duration::ZERO, DirectOutcome::Delivered);
+        let left = deliver_direct(&sender, &mapped(&most), 1, b"x", &keys(&most), &topic).await;
+        assert!(left.is_empty(), "{} of the most members left", left.len());
+        assert_eq!(sender.sent.lock().len(), MAX_DIRECT_RECIPIENTS);
+
+        let one_more = members(0, MAX_DIRECT_RECIPIENTS as u8 + 1);
+        let sender = Peers::answering(&one_more, Duration::ZERO, DirectOutcome::Delivered);
+        let left = deliver_direct(
+            &sender,
+            &mapped(&one_more),
+            1,
+            b"x",
+            &keys(&one_more),
+            &topic,
+        )
+        .await;
+        assert_eq!(
+            left,
+            keys(&one_more),
+            "one member more: all left to the topic"
+        );
+        assert!(sender.sent.lock().is_empty());
+    }
+
     /// The topic copy: none when every member was served, one naming the
     /// member when one is left, one every member reads when more are.
     #[test]
@@ -1019,10 +1032,9 @@ mod tests {
     async fn pairing_this_master_with_this_worker() {
         let master = quil_rpc::global_service::shard_direct_relay_answer(true);
         assert!(
-            quil_engine::worker_node::relays_through_master(0, || async {
+            quil_engine::worker_node::relays_through_master(0, || {
                 quil_engine::worker_node::master_relays_consensus(&master)
-            })
-            .await,
+            }),
             "a vote is relayed through the master"
         );
         let answer = node_answers(quil_engine::worker_node::shard_consensus_answer(true)).await;
@@ -1081,10 +1093,9 @@ mod tests {
             quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL,
             CW_APP_RESOLVER_CHANNEL,
         ] {
-            let relayed = quil_engine::worker_node::relays_through_master(channel, || async {
+            let relayed = quil_engine::worker_node::relays_through_master(channel, || {
                 quil_engine::worker_node::master_relays_consensus(&earlier_master)
-            })
-            .await;
+            });
             assert_eq!(
                 relayed,
                 channel == CW_APP_RESOLVER_CHANNEL,

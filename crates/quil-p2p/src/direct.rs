@@ -47,6 +47,30 @@ pub const DIRECT_TAKE_WAIT: std::time::Duration = std::time::Duration::from_mill
 /// send that needs a take ([`DirectAnswers`]), is not asked again.
 pub const UNSUPPORTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long one member's direct send of a small committee message (a vote,
+/// certificate or block) may take before that member is served by the topic
+/// copy instead. Consensus waits on votes, so this is well under
+/// [`DIRECT_REQUEST_TIMEOUT`]; a send that lands later is a duplicate
+/// consensus ignores.
+pub const COMMITTEE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The upload rate, in bytes per second, a committee send is given time for
+/// on top of [`COMMITTEE_SEND_TIMEOUT`].
+const ASSUMED_UPLOAD_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// How long each of `copies` direct sends of `bytes`, all sent at once, may
+/// take: [`COMMITTEE_SEND_TIMEOUT`] plus the time to upload every copy at
+/// [`ASSUMED_UPLOAD_BYTES_PER_SEC`], within [`DIRECT_REQUEST_TIMEOUT`]. A
+/// standalone worker waits this long, plus a margin, for its master to relay
+/// a message.
+pub fn committee_send_timeout(copies: usize, bytes: usize) -> std::time::Duration {
+    let upload = (copies as u64).saturating_mul(bytes as u64);
+    let upload = std::time::Duration::from_millis(
+        upload.saturating_mul(1000) / ASSUMED_UPLOAD_BYTES_PER_SEC,
+    );
+    (COMMITTEE_SEND_TIMEOUT + upload).min(DIRECT_REQUEST_TIMEOUT)
+}
+
 /// Direct messages one peer may deliver per second, sustained.
 pub const DIRECT_PEER_RATE: f64 = 500.0;
 /// Direct messages one peer may deliver in a burst.
@@ -320,45 +344,55 @@ impl DirectStats {
 
 /// Peers a direct send skips for [`UNSUPPORTED_RETRY_AFTER`]: those that lack
 /// the protocol, and, for a send that needs its message taken, those that
-/// answered "queued" (an earlier build, or a node whose standalone worker is
-/// one). Such a send would cost a copy that serves nothing, and its sender
-/// sends the gossip copy anyway. An answer "taken" forgets the peer.
+/// answered "queued" on its bitmask (an earlier build, or a node whose
+/// standalone worker for that shard is one). Such a send would cost a copy
+/// that serves nothing, and its sender sends the gossip copy anyway. An
+/// answer "taken" on a bitmask forgets that bitmask's "queued": a node's
+/// workers for other shards may be later builds.
 #[derive(Debug, Default)]
 pub struct DirectAnswers {
-    since: HashMap<PeerId, (Instant, DirectOutcome)>,
+    /// Peers without the protocol, since when.
+    unsupported: HashMap<PeerId, Instant>,
+    /// Peers that answered "queued" on a bitmask, since when.
+    queued: HashMap<(PeerId, Vec<u8>), Instant>,
 }
 
 impl DirectAnswers {
-    /// Remember what `peer` answered at `now`.
-    pub fn note(&mut self, peer: PeerId, outcome: DirectOutcome, now: Instant) {
+    /// Remember what `peer` answered at `now` to a send on `bitmask`.
+    pub fn note(&mut self, peer: PeerId, bitmask: &[u8], outcome: DirectOutcome, now: Instant) {
         match outcome {
-            DirectOutcome::Unsupported | DirectOutcome::Queued => {
-                self.since.insert(peer, (now, outcome));
+            DirectOutcome::Unsupported => {
+                self.unsupported.insert(peer, now);
+            }
+            DirectOutcome::Queued => {
+                self.queued.insert((peer, bitmask.to_vec()), now);
             }
             DirectOutcome::Delivered => {
-                self.since.remove(&peer);
+                self.queued.remove(&(peer, bitmask.to_vec()));
             }
             _ => {}
         }
     }
 
-    /// The outcome a send to `peer` at `now` gets without being sent, if any:
-    /// [`DirectOutcome::Unsupported`] for a peer without the protocol, and
-    /// for one that answers only "queued" when the send `needs_taken`.
+    /// The outcome a send to `peer` on `bitmask` at `now` gets without being
+    /// sent, if any: [`DirectOutcome::Unsupported`] for a peer without the
+    /// protocol, and for one that answers only "queued" on `bitmask` when
+    /// the send `needs_taken`.
     pub fn skip(
         &mut self,
         peer: &PeerId,
+        bitmask: &[u8],
         needs_taken: bool,
         now: Instant,
     ) -> Option<DirectOutcome> {
-        self.since.retain(|_, (since, _)| {
-            now.saturating_duration_since(*since) < UNSUPPORTED_RETRY_AFTER
-        });
-        match self.since.get(peer) {
-            Some((_, DirectOutcome::Unsupported)) => Some(DirectOutcome::Unsupported),
-            Some((_, DirectOutcome::Queued)) if needs_taken => Some(DirectOutcome::Unsupported),
-            _ => None,
+        let fresh = |since: Instant| now.saturating_duration_since(since) < UNSUPPORTED_RETRY_AFTER;
+        self.unsupported.retain(|_, since| fresh(*since));
+        self.queued.retain(|_, since| fresh(*since));
+        if self.unsupported.contains_key(peer) {
+            return Some(DirectOutcome::Unsupported);
         }
+        (needs_taken && self.queued.contains_key(&(*peer, bitmask.to_vec())))
+            .then_some(DirectOutcome::Unsupported)
     }
 }
 
@@ -547,11 +581,12 @@ mod tests {
     fn a_peer_that_answers_queued_is_skipped_only_by_sends_that_need_a_take() {
         let mut peers = DirectAnswers::default();
         let start = Instant::now();
+        let shard = b"shard".as_slice();
         let (earlier, without, upgraded) = (PeerId::random(), PeerId::random(), PeerId::random());
-        peers.note(earlier, DirectOutcome::Queued, start);
-        peers.note(without, DirectOutcome::Unsupported, start);
-        peers.note(upgraded, DirectOutcome::Queued, start);
-        peers.note(upgraded, DirectOutcome::Delivered, start);
+        peers.note(earlier, shard, DirectOutcome::Queued, start);
+        peers.note(without, shard, DirectOutcome::Unsupported, start);
+        peers.note(upgraded, shard, DirectOutcome::Queued, start);
+        peers.note(upgraded, shard, DirectOutcome::Delivered, start);
         for (row, peer, needs_taken, skipped) in [
             (
                 "a queued peer, a vote",
@@ -574,12 +609,47 @@ mod tests {
             ),
             ("an upgraded peer, a vote", upgraded, true, None),
         ] {
-            assert_eq!(peers.skip(&peer, needs_taken, start), skipped, "{row}");
+            assert_eq!(
+                peers.skip(&peer, shard, needs_taken, start),
+                skipped,
+                "{row}"
+            );
         }
         let later = start + UNSUPPORTED_RETRY_AFTER;
-        assert_eq!(peers.skip(&earlier, true, later), None, "asked again");
-        assert_eq!(peers.skip(&without, false, later), None, "asked again");
-        assert!(peers.since.is_empty());
+        assert_eq!(
+            peers.skip(&earlier, shard, true, later),
+            None,
+            "asked again"
+        );
+        assert_eq!(
+            peers.skip(&without, shard, false, later),
+            None,
+            "asked again"
+        );
+        assert!(peers.unsupported.is_empty() && peers.queued.is_empty());
+    }
+
+    /// "Queued" is kept per shard: a node whose standalone worker for one
+    /// shard is an earlier build still gets votes directly for its other
+    /// shards, and a "taken" on another shard does not forget it.
+    #[test]
+    fn a_queued_answer_skips_only_the_shard_it_was_given_on() {
+        let mut peers = DirectAnswers::default();
+        let now = Instant::now();
+        let (earlier_worker, later_worker) = (b"shard a".as_slice(), b"shard b".as_slice());
+        let node = PeerId::random();
+        peers.note(node, earlier_worker, DirectOutcome::Queued, now);
+        peers.note(node, later_worker, DirectOutcome::Delivered, now);
+        assert_eq!(
+            peers.skip(&node, earlier_worker, true, now),
+            Some(DirectOutcome::Unsupported),
+            "a vote for the earlier worker's shard is skipped though another shard took one"
+        );
+        assert_eq!(
+            peers.skip(&node, later_worker, true, now),
+            None,
+            "a vote for the later worker's shard is still sent"
+        );
     }
 
     #[test]

@@ -2114,10 +2114,19 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     );
                     let data = cw_bytes.to_vec();
                     let topic = received.bitmask.clone();
-                    let ack = received.ack.take();
+                    let mut ack = received.ack.take();
+                    // Bounded like the other tasks remote input spawns: a
+                    // stalled worker would otherwise hold one per message.
+                    let Some(place) = super::shard_cw_lane::forward_place(
+                        &super::shard_cw_lane::WORKER_FORWARDS,
+                        &mut ack,
+                    ) else {
+                        return true;
+                    };
                     let (p2p, unsupported) = (p2p.clone(), unsupported.clone());
                     spawner.detach("shard-cw-forward", async move {
                         use quil_engine::remote_worker::RemoteDelivery;
+                        let _place = place;
                         let delivery = super::shard_cw_lane::forward_to_worker(
                             remote.as_ref(), &filter, channel, data, from_key, ack,
                         )
