@@ -356,8 +356,26 @@ macro_rules! impl_hypergraph_storage {
             }
         }
         impl HypergraphStore for $store {
+            fn invalidate_coin_changes(&self) -> Result<()> {
+                self.invalidate_coin_changes_backend()
+            }
+
+            fn invalidate_coin_changes_in_transaction(&self, txn: &dyn Transaction) -> Result<()> {
+                <$txn>::for_store(txn, &self.db)?;
+                txn.set(crate::coin_changes::RESET_REQUEST, b"1")
+            }
+
+            fn set_coin_changes_installing(&self, scope: &[u8], installing: bool) -> Result<()> {
+                self.set_coin_changes_installing_backend(scope, installing)
+            }
+
+            fn is_coin_changes_installing(&self, scope: &[u8]) -> Result<bool> {
+                self.is_coin_changes_installing_backend(scope)
+            }
+
             fn clear_shard_underlying(&self, shard: &ShardKey) -> Result<()> {
                 let txn = self.new_transaction_backend(false)?;
+                txn.set(crate::coin_changes::RESET_REQUEST, b"1")?;
                 for (set, phase) in [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")] {
                     for lower in [
                         crate::encoding::hypergraph_vertex_data_prefix(set, phase, shard),

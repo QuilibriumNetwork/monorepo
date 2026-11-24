@@ -945,6 +945,7 @@ service AppShardService {
   // snapshot-pinned, address-ordered, cursor-continued. A node that does not
   // serve the application refuses rather than returning an empty page.
   rpc ListShardCoins (ListShardCoinsRequest) returns (ListShardCoinsResponse);
+  rpc ListShardCoinChanges (ListShardCoinChangesRequest) returns (ListShardCoinChangesResponse);
   // Peer-to-peer legacy coin listing, answered only from the serving node's
   // own owner index (never forwarded again).
   rpc ListShardLegacyCoins (ListLegacyCoinsRequest) returns (ListLegacyCoinsResponse);
@@ -1048,6 +1049,20 @@ message ShardCoin {
   uint64 position = 6;
 }
 
+message ListShardCoinChangesRequest {
+  bytes domain = 1;
+  bytes cursor = 2;
+  uint32 max_coins = 3;
+}
+// Same arrival-order, empty-page and reset contract as node.pb ListCoinChangesResponse.
+message ListShardCoinChangesResponse {
+  bytes network = 1;
+  repeated ShardCoin coins = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+  bool reset = 5;
+}
+
 // Same contract as node.pb ListCoinsResponse, including its empty
 // root_record answer for an application without a coin root.
 message ListShardCoinsResponse {
@@ -1057,6 +1072,8 @@ message ListShardCoinsResponse {
   repeated ShardCoin coins = 4;
   bytes cursor = 5;
   bool has_more = 6;
+  // Same fixed bootstrap watermark and unsupported-empty contract as ListCoins.
+  bytes change_cursor = 7;
 }
 
 message SendMessage {

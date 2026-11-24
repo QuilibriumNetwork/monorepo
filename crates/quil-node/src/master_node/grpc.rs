@@ -372,6 +372,10 @@ struct CrdtCoinWitness {
     clock: Arc<dyn quil_types::store::ClockStore>,
     network: u8,
     #[cfg(feature = "confidential-tokens")]
+    coin_feed_issuer: [u8; 32],
+    #[cfg(feature = "confidential-tokens")]
+    archive_mode: bool,
+    #[cfg(feature = "confidential-tokens")]
     witness_index: Arc<crate::witness_index::NodeWitnessIndex>,
     /// QUIL's legacy coins by owner. Built only on an archive, which holds the
     /// whole application; other nodes ask an archive.
@@ -405,6 +409,8 @@ struct CompositeScan {
     /// `(filter, that store's scan identity)`, in address-range order.
     stores: Vec<(Vec<u8>, [u8; 32])>,
     root_record: Option<Vec<u8>>,
+    /// Bootstrap watermarks from these exact source snapshots (Coin scans only).
+    change_sources: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     /// When the scan started, against [`SCAN_MAX_AGE`].
     created: std::time::Instant,
     /// When a page of the scan was last read.
@@ -836,7 +842,7 @@ fn log_connection_refusals(
 }
 
 /// The shard path of a full filter, and the last address of its range.
-fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
+pub(super) fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
     let (_, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)?;
     if bits.len() > 256 {
         return None;
@@ -856,6 +862,56 @@ struct StorePage<T> {
     cursor: Option<[u8; 32]>,
     has_more: bool,
     root_record: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "confidential-tokens")]
+fn coin_store_page(
+    snapshot: &dyn quil_types::store::SnapshotReadable,
+    network: &[u8; 32],
+    domain: &[u8; 32],
+    after: Option<&[u8; 32]>,
+) -> quil_types::error::Result<StorePage<quil_execution::token_intrinsic::state::StoredCoin>> {
+    use quil_execution::token_intrinsic::scan::{
+        scan_wallet_page, unrooted_coins_error, WalletPage,
+    };
+    use quil_types::{error::QuilError, store::VertexPageLimits};
+    let limits = VertexPageLimits {
+        max_entries: 8,
+        max_bytes: 240 * 1024,
+    };
+    let page = match scan_wallet_page(snapshot, network, domain, after, limits) {
+        // `after` belongs to the entire application. A later, empty worker
+        // still has to be classified from the start of its retained view.
+        Err(error @ QuilError::NotFound(_)) if after.is_some() => {
+            match scan_wallet_page(snapshot, network, domain, None, limits) {
+                Ok(WalletPage::NoRoot) => WalletPage::NoRoot,
+                Ok(WalletPage::UnrootedCoins) => return Err(unrooted_coins_error()),
+                Ok(WalletPage::Page(_)) => return Err(error),
+                Err(error) => return Err(error),
+            }
+        }
+        result => result?,
+    };
+    match page {
+        WalletPage::NoRoot => Ok(StorePage {
+            entries: Vec::new(),
+            cursor: None,
+            has_more: false,
+            root_record: None,
+        }),
+        WalletPage::UnrootedCoins => Err(unrooted_coins_error()),
+        WalletPage::Page(page) => Ok(StorePage {
+            entries: page.coins,
+            cursor: page.cursor,
+            has_more: page.has_more,
+            root_record: Some(
+                page.root
+                    .encode()
+                    .map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?
+                    .to_vec(),
+            ),
+        }),
+    }
 }
 
 /// Serve one page of a scan over an application held in several local worker
@@ -902,13 +958,41 @@ fn composite_page<T>(
     Option<[u8; 32]>,
     bool,
 )> {
+    composite_page_with_coin_domain(
+        composite_scans,
+        &local,
+        snapshot_id,
+        after,
+        None,
+        scan_store,
+    )
+}
+
+fn composite_page_with_coin_domain<T>(
+    composite_scans: &parking_lot::Mutex<std::collections::HashMap<[u8; 32], CompositeScan>>,
+    local: &[(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)],
+    snapshot_id: Option<&[u8; 32]>,
+    after: Option<&[u8; 32]>,
+    coin_domain: Option<&[u8; 32]>,
+    scan_store: impl Fn(
+        &[u8],
+        &dyn quil_types::store::SnapshotReadable,
+        Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<StorePage<T>>,
+) -> quil_types::error::Result<(
+    [u8; 32],
+    Option<Vec<u8>>,
+    Vec<([u8; 32], T)>,
+    Option<[u8; 32]>,
+    bool,
+)> {
     {
         use quil_types::error::QuilError;
         use sha2::Digest as _;
         let mut ranged: Vec<_> = local
-            .into_iter()
+            .iter()
             .map(|(filter, crdt)| {
-                shard_range(&filter).map(|(path, last)| (last, path, filter, crdt))
+                shard_range(filter).map(|(path, last)| (last, path, filter.as_slice(), crdt))
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
@@ -934,14 +1018,31 @@ fn composite_page<T>(
                 let now = std::time::Instant::now();
                 let mut stores = Vec::with_capacity(ranged.len());
                 let mut hash = sha2::Sha256::new();
-                hash.update(b"quil/node/composite-coin-scan/v1");
+                hash.update(if coin_domain.is_some() {
+                    b"quil/node/composite-coin-scan/v3"
+                } else {
+                    b"quil/node/composite-coin-scan/v2"
+                });
+                let mut change_sources = coin_domain.map(|_| Vec::new());
                 for (_, _, filter, crdt) in &ranged {
-                    let generation = crdt
-                        .acquire_or_capture_scan_snapshot(None)?
-                        .ok_or_else(expired)?;
+                    let generation = match coin_domain {
+                        Some(domain) => crdt.acquire_or_capture_coin_scan_snapshot(None, domain)?,
+                        None => crdt.acquire_or_capture_scan_snapshot(None)?,
+                    }
+                    .ok_or_else(expired)?;
+                    if let (Some(domain), Some(cursors)) = (coin_domain, change_sources.as_mut()) {
+                        let snapshot = generation.db_snapshot.as_ref().ok_or_else(expired)?;
+                        let cursor =
+                            quil_store::coin_changes::snapshot_cursor(snapshot.as_ref(), domain)?;
+                        if ranged.len() <= quil_types::store::MAX_COIN_CHANGE_SOURCES {
+                            cursors.push((filter.to_vec(), cursor));
+                        }
+                    }
                     let scan_id = generation.scan_id.ok_or_else(expired)?;
+                    hash.update((filter.len() as u64).to_be_bytes());
+                    hash.update(filter);
                     hash.update(scan_id);
-                    stores.push((filter.clone(), scan_id));
+                    stores.push((filter.to_vec(), scan_id));
                 }
                 let id: [u8; 32] = hash.finalize().into();
                 // A scan started over the same store snapshots is the same
@@ -949,6 +1050,7 @@ fn composite_page<T>(
                 scans.entry(id).or_insert(CompositeScan {
                     stores,
                     root_record: None,
+                    change_sources,
                     created: now,
                     used: now,
                     pages: 0,
@@ -957,6 +1059,9 @@ fn composite_page<T>(
             }
         };
         let scan = scans.get_mut(&id).ok_or_else(expired)?;
+        if coin_domain.is_some() && scan.change_sources.is_none() {
+            return Err(expired());
+        }
         scan.used = std::time::Instant::now();
         scan.pages += 1;
         // Page the snapshots of the stores still ahead too: each store drops
@@ -969,7 +1074,7 @@ fn composite_page<T>(
             let store_scan = scan
                 .stores
                 .iter()
-                .find(|(f, _)| f == filter)
+                .find(|(f, _)| f.as_slice() == *filter)
                 .map(|(_, id)| *id)
                 .ok_or_else(expired)?;
             let generation = crdt.acquire_or_capture_scan_snapshot(Some(&store_scan))?;
@@ -984,7 +1089,7 @@ fn composite_page<T>(
             let store_scan = scan
                 .stores
                 .iter()
-                .find(|(f, _)| f == filter)
+                .find(|(f, _)| f.as_slice() == *filter)
                 .map(|(_, id)| *id)
                 // The node's shards changed under the scan.
                 .ok_or_else(expired)?;
@@ -1004,7 +1109,11 @@ fn composite_page<T>(
                 .filter(|(address, _)| path.covers(address))
                 .collect();
             let is_last = index + 1 == ranged.len();
-            if page.has_more {
+            // Split stores may retain higher-range rows. Their cursor must
+            // never skip outputs in the next Coin source's snapshot.
+            let range_finished =
+                coin_domain.is_some() && page.cursor.is_some_and(|cursor| cursor >= *last);
+            if page.has_more && !range_finished {
                 return Ok((id, scan.root_record.clone(), entries, page.cursor, true));
             }
             if is_last {
@@ -1027,6 +1136,96 @@ fn composite_page<T>(
 }
 
 impl CrdtCoinWitness {
+    #[cfg(feature = "confidential-tokens")]
+    fn coin_sources(
+        &self,
+        domain: &[u8; 32],
+    ) -> Vec<(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)> {
+        let local = self.worker_states(domain);
+        if local.is_empty() {
+            vec![(domain.to_vec(), self.crdt.clone())]
+        } else {
+            Self::local_crdts(local)
+        }
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn coin_scan_sources(
+        &self,
+        domain: &[u8; 32],
+    ) -> quil_types::error::Result<Vec<(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)>> {
+        use quil_types::error::QuilError;
+        // Validate the same handles used for the scan, after RPC admission.
+        // Worker assignment may have changed while the request was queued.
+        let local = self.worker_states(domain);
+        let covered = if local.is_empty() {
+            if self.archive_mode || domain == &[0xff; 32] {
+                true
+            } else if domain == &quil_execution::domains::QUIL_TOKEN {
+                false
+            } else {
+                let disc = quil_execution::hypergraph_state::vertex_adds_discriminator()?;
+                quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone())
+                    .get(
+                        domain,
+                        &quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS,
+                        &disc,
+                    )?
+                    .is_some_and(|blob| !blob.is_empty())
+            }
+        } else {
+            local
+                .iter()
+                .map(|(filter, _)| {
+                    quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits)
+                })
+                .collect::<Option<Vec<_>>>()
+                .is_some_and(|paths| shard_paths_cover_application(&paths))
+        };
+        if !covered {
+            return Err(QuilError::ExecutionUnavailable(
+                "Coin domain coverage changed or is incomplete; retry the scan".into(),
+            ));
+        }
+        Ok(if local.is_empty() {
+            vec![(domain.to_vec(), self.crdt.clone())]
+        } else {
+            Self::local_crdts(local)
+        })
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn composite_coin_snapshot_cursor(
+        &self,
+        domain: &[u8; 32],
+        snapshot_id: &[u8; 32],
+        sources: &[(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)],
+    ) -> quil_types::error::Result<Vec<u8>> {
+        use quil_types::error::QuilError;
+        let expired = || QuilError::NotFound("coin change snapshot expired; restart scan".into());
+        let cursors = {
+            let scans = self.composite_scans.lock();
+            let scan = scans.get(snapshot_id).ok_or_else(expired)?;
+            if sources.len() != scan.stores.len()
+                || sources
+                    .iter()
+                    .any(|(filter, _)| !scan.stores.iter().any(|(held, _)| held == filter))
+            {
+                return Err(expired());
+            }
+            if sources.len() > quil_types::store::MAX_COIN_CHANGE_SOURCES {
+                return Ok(Vec::new());
+            }
+            scan.change_sources.clone().ok_or_else(expired)?
+        };
+        super::coin_changes::bootstrap(
+            &quil_execution::token_intrinsic::state::network_identifier(self.network),
+            &self.coin_feed_issuer,
+            domain,
+            cursors,
+        )
+    }
+
     fn local_crdts(
         local: Vec<(Vec<u8>, super::worker_manager::WorkerAppState)>,
     ) -> Vec<(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)> {
@@ -1181,6 +1380,23 @@ impl CrdtCoinWitness {
 }
 
 impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
+    #[cfg(feature = "confidential-tokens")]
+    fn coin_changes(
+        &self,
+        domain: &[u8; 32],
+        cursor: &[u8],
+        max_coins: usize,
+    ) -> quil_types::error::Result<Option<quil_types::store::CoinChangesPageData>> {
+        super::coin_changes::page(
+            quil_execution::token_intrinsic::state::network_identifier(self.network),
+            &self.coin_feed_issuer,
+            domain,
+            self.coin_sources(domain),
+            cursor,
+            max_coins,
+        )
+    }
+
     #[cfg(feature = "confidential-tokens")]
     fn legacy_coins(
         &self,
@@ -1355,76 +1571,26 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
         }
         // An application split across several local worker stores is scanned
         // store by store in address order (see `CompositeScan`).
-        let local = self.worker_states(domain);
-        if local.len() > 1 {
+        let sources = self.coin_scan_sources(domain)?;
+        if sources.len() > 1 {
             let network = network_identifier(self.network);
-            // Whether a store without a root held a coin: the scan then cannot
-            // answer that the application has none.
-            let unrooted_coins = std::cell::Cell::new(false);
-            let (id, root, coins, cursor, has_more) = composite_page(
+            let (id, root, coins, cursor, has_more) = composite_page_with_coin_domain(
                 &self.composite_scans,
-                Self::local_crdts(local),
+                &sources,
                 snapshot_id,
                 after,
-                |_, snapshot, after| {
-                    let page = match scan_wallet_page(
-                        snapshot,
-                        &network,
-                        domain,
-                        after,
-                        VertexPageLimits {
-                            max_entries: 8,
-                            max_bytes: 240 * 1024,
-                        },
-                    ) {
-                        Ok(WalletPage::Page(page)) => page,
-                        // A store that has received no root (a sub-shard this node
-                        // only just joined) holds no coin the network recognizes:
-                        // it adds nothing to the scan rather than failing all of it.
-                        Ok(rootless) => {
-                            unrooted_coins.set(
-                                unrooted_coins.get()
-                                    || matches!(rootless, WalletPage::UnrootedCoins),
-                            );
-                            return Ok(StorePage {
-                                entries: Vec::new(),
-                                cursor: None,
-                                has_more: false,
-                                root_record: None,
-                            });
-                        }
-                        Err(QuilError::NotFound(_)) => {
-                            return Ok(StorePage {
-                                entries: Vec::new(),
-                                cursor: None,
-                                has_more: false,
-                                root_record: None,
-                            })
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let root_record = page
-                        .root
-                        .encode()
-                        .map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?
-                        .to_vec();
-                    Ok(StorePage {
-                        entries: page.coins,
-                        cursor: page.cursor,
-                        has_more: page.has_more,
-                        root_record: Some(root_record),
-                    })
-                },
+                Some(domain),
+                |_, snapshot, after| coin_store_page(snapshot, &network, domain, after),
             )?;
             let root_record = match root {
                 Some(root) => root,
-                None if unrooted_coins.get() => return Err(unrooted_coins_error()),
                 // No store has a root or a coin: the answer a single store
                 // gives for an application without confidential coins.
                 None if after.is_none() && coins.is_empty() && !has_more => Vec::new(),
                 None => return Err(QuilError::NotFound("coin scan: no root in snapshot".into())),
             };
             return Ok(Some(CoinPageData {
+                change_cursor: self.composite_coin_snapshot_cursor(domain, &id, &sources)?,
                 network,
                 snapshot_id: id,
                 root_record,
@@ -1443,17 +1609,27 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
                 has_more,
             }));
         }
-        let generation = self
-            .crdt_for(domain)
-            .acquire_or_capture_scan_snapshot(snapshot_id)?
-            .ok_or_else(|| {
-                QuilError::NotFound(
-                    "coin scan snapshot unavailable or expired; restart scan".into(),
-                )
-            })?;
+        let crdt = &sources[0].1;
+        let generation = match snapshot_id {
+            Some(id) => crdt.acquire_or_capture_scan_snapshot(Some(id))?,
+            None => crdt.acquire_or_capture_coin_scan_snapshot(None, domain)?,
+        }
+        .ok_or_else(|| {
+            QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into())
+        })?;
         let network = network_identifier(self.network);
+        let snapshot = generation.db_snapshot.as_ref().unwrap().as_ref();
+        let change_cursor = super::coin_changes::bootstrap(
+            &network,
+            &self.coin_feed_issuer,
+            domain,
+            vec![(
+                sources[0].0.clone(),
+                quil_store::coin_changes::snapshot_cursor(snapshot, domain)?,
+            )],
+        )?;
         let result = match scan_wallet_page(
-            generation.db_snapshot.as_ref().unwrap().as_ref(),
+            snapshot,
             &network,
             domain,
             after,
@@ -1467,6 +1643,7 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
             // final page without a root answers the scan.
             WalletPage::NoRoot => {
                 return Ok(Some(CoinPageData {
+                    change_cursor,
                     network,
                     snapshot_id: generation.scan_id.unwrap(),
                     root_record: Vec::new(),
@@ -1478,6 +1655,7 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
             WalletPage::UnrootedCoins => return Err(unrooted_coins_error()),
         };
         Ok(Some(CoinPageData {
+            change_cursor,
             network,
             snapshot_id: generation.scan_id.unwrap(),
             root_record: result
@@ -2595,6 +2773,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         clock: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         network,
         #[cfg(feature = "confidential-tokens")]
+        coin_feed_issuer: {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(peer_id.to_string().as_bytes()).into()
+        },
+        #[cfg(feature = "confidential-tokens")]
+        archive_mode,
+        #[cfg(feature = "confidential-tokens")]
         witness_index: crate::witness_index::NodeWitnessIndex::start(
             db_arc.clone(),
             crdt.clone(),
@@ -2738,12 +2923,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             falcon,
             network,
         )
-        .with_prover_registry(registry);
+        .with_prover_registry(registry)
+        .with_coin_feed_routes(db_arc.inner(), peer_id.to_string().into_bytes())?;
         let reader = Arc::new(reader);
         tracing::info!(
             "state reads for uncovered applications will be forwarded to covering nodes"
         );
         node_rpc_builder = node_rpc_builder
+            .with_remote_coin_changes({
+                let reader = reader.clone();
+                Arc::new(move |domain, cursor, max_coins| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.coin_changes(domain, cursor, max_coins).await })
+                })
+            })
             .with_remote_coin_page({
                 let reader = reader.clone();
                 Arc::new(move |domain, snapshot, after, max_coins| {
@@ -5721,6 +5914,404 @@ mod coverage_tests {
 #[cfg(test)]
 mod composite_scan_tests {
     use super::*;
+
+    #[cfg(feature = "confidential-tokens")]
+    fn wallet_worker() -> super::super::worker_manager::WorkerAppState {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let hg = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        super::super::worker_manager::WorkerAppState {
+            db,
+            hg_store: hg,
+            crdt,
+            witness_index: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn wallet_provider(
+        workers: Vec<(Vec<u8>, super::super::worker_manager::WorkerAppState)>,
+        archive_mode: bool,
+    ) -> (quil_lifecycle::Supervisor<anyhow::Error>, CrdtCoinWitness) {
+        let own = wallet_worker();
+        let supervisor = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+        let spawner = supervisor.detached_spawner();
+        let provider = CrdtCoinWitness {
+            crdt: own.crdt.clone(),
+            clock: Arc::new(quil_store::RocksClockStore::new(own.db.inner())),
+            network: 0,
+            coin_feed_issuer: [2; 32],
+            archive_mode,
+            witness_index: Arc::new(crate::witness_index::NodeWitnessIndex::new(
+                own.db.clone(),
+                own.crdt.clone(),
+                0,
+                spawner.clone(),
+            )),
+            legacy_index: None,
+            shard_anchor: Arc::new(|| None),
+            spawner,
+            worker_app_states: Arc::new(parking_lot::RwLock::new(workers.into_iter().collect())),
+            composite_scans: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        };
+        (supervisor, provider)
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn wallet_coin(
+        worker: &super::super::worker_manager::WorkerAppState,
+        domain: &[u8; 32],
+    ) -> [u8; 32] {
+        use quil_lattice_ct::confidential::{
+            relation::membership::IDENTITY_BYTES,
+            transfer::{parameter_context, Output},
+            AmountOpening, CommitmentKey,
+        };
+        let network = quil_execution::token_intrinsic::state::network_identifier(0);
+        let context = parameter_context(&network, domain);
+        let output = Output {
+            owner: [3; IDENTITY_BYTES],
+            memo: [4; 1115],
+            commitment: CommitmentKey::derive(&context)
+                .commit(5, &AmountOpening::from_seed(&context, &[6; 32])),
+        };
+        let (address, tree) =
+            quil_execution::token_intrinsic::state::create_coin(&context, 7, &output, 0).unwrap();
+        let shard = quil_hypergraph::addressing::shard_key_for_location(
+            &quil_hypergraph::addressing::Location {
+                app_address: *domain,
+                data_address: address,
+            },
+        );
+        let txn = worker.hg_store.new_transaction(false).unwrap();
+        worker
+            .hg_store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &[domain.as_slice(), address.as_slice()].concat(),
+                &quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                7,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        address
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    #[tokio::test]
+    async fn a_coin_bootstrap_rejects_sources_lost_after_the_coverage_check() {
+        use quil_types::proto::node::{self, node_service_server::NodeService};
+        let domain = [3; 32];
+        let cases = [
+            (vec![vec![false], vec![true]], vec![0]),
+            (vec![vec![false], vec![true]], vec![0, 1]),
+            (
+                vec![
+                    vec![false, false],
+                    vec![false, true],
+                    vec![true, false],
+                    vec![true, true],
+                ],
+                vec![0, 2],
+            ),
+        ];
+        for (paths, removed) in cases {
+            let workers: Vec<_> = paths
+                .iter()
+                .map(|bits| {
+                    (
+                        quil_forest::encode_shard_bit_path(&domain, bits),
+                        wallet_worker(),
+                    )
+                })
+                .collect();
+            let missing_coin = wallet_coin(&workers[0].1, &domain);
+            assert!(shard_range(&workers[0].0).unwrap().0.covers(&missing_coin));
+            let (_supervisor, provider) = wallet_provider(workers.clone(), false);
+            let states = provider.worker_app_states.clone();
+            let filters: Vec<_> = removed.iter().map(|i| workers[*i].0.clone()).collect();
+            let server = quil_rpc::NodeRpcServer::new()
+                .with_coin_witness_provider(Arc::new(provider))
+                .with_application_coverage(Arc::new(move |_| {
+                    let paths = states
+                        .read()
+                        .keys()
+                        .map(|filter| {
+                            quil_forest::decode_shard_filter_or_root(filter, 32)
+                                .unwrap()
+                                .1
+                        })
+                        .collect::<Vec<_>>();
+                    let covered = shard_paths_cover_application(&paths);
+                    // A worker can exit after admission and before the queued read runs.
+                    for filter in &filters {
+                        states.write().remove(filter);
+                    }
+                    covered
+                }));
+            let result = NodeService::list_coins(
+                &server,
+                tonic::Request::new(node::ListCoinsRequest {
+                    domain: domain.to_vec(),
+                    snapshot_id: Vec::new(),
+                    after: Vec::new(),
+                    max_coins: 8,
+                }),
+            )
+            .await;
+            assert_eq!(
+                result
+                    .expect_err("a partial domain cannot issue a successful bootstrap")
+                    .code(),
+                tonic::Code::Unavailable
+            );
+        }
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn a_coin_bootstrap_keeps_the_existing_master_store_fallbacks() {
+        use quil_types::store::CoinWitnessProvider;
+        for (domain, archive, metadata) in [
+            ([3; 32], true, false),
+            ([0xff; 32], false, false),
+            ([4; 32], false, true),
+        ] {
+            let (_supervisor, provider) = wallet_provider(Vec::new(), archive);
+            if metadata {
+                let state =
+                    quil_execution::hypergraph_state::HypergraphState::new(provider.crdt.clone());
+                let disc = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
+                state
+                    .set(
+                        &domain,
+                        &quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS,
+                        &disc,
+                        0,
+                        vec![1],
+                    )
+                    .unwrap();
+                state.commit().unwrap();
+                state.abort();
+                provider.crdt.commit(1).unwrap();
+            }
+            let page = provider.coin_page(&domain, None, None).unwrap().unwrap();
+            assert!(page.coins.is_empty() && !page.has_more);
+            assert!(!page.change_cursor.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_coin_scan_never_passes_an_out_of_range_cursor_to_the_next_worker() {
+        let domain = [3; 32];
+        let paths = [
+            vec![false, false, false],
+            vec![false, false, true],
+            vec![false, true],
+            vec![true],
+        ];
+        let sources: Vec<_> = paths
+            .iter()
+            .map(|bits| (quil_forest::encode_shard_bit_path(&domain, bits), store()))
+            .collect();
+        let low = sources[0].0.clone();
+        let high = sources[1].0.clone();
+        let read = |filter: &[u8],
+                    _: &dyn quil_types::store::SnapshotReadable,
+                    after: Option<&[u8; 32]>| {
+            // The first worker retains copies of nine rows from before a split.
+            // Eight-row paging can therefore stop beyond its owned range.
+            let rows = if filter == low.as_slice() {
+                std::iter::once(address(1, 1))
+                    .chain((1..=9).map(|i| address(0x20, i)))
+                    .collect()
+            } else if filter == high.as_slice() {
+                vec![address(0x20, 2)]
+            } else {
+                Vec::new()
+            };
+            let remaining: Vec<_> = rows
+                .into_iter()
+                .filter(|a| after.is_none_or(|after| a > after))
+                .collect();
+            let entries: Vec<_> = remaining.iter().take(8).map(|a| (*a, ())).collect();
+            Ok(StorePage {
+                cursor: entries.last().map(|(a, _)| *a),
+                entries,
+                has_more: remaining.len() > 8,
+                root_record: Some(vec![1]),
+            })
+        };
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let (id, _, entries, cursor, more) =
+            composite_page_with_coin_domain(&scans, &sources, None, None, Some(&domain), &read)
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(more);
+        assert_eq!(
+            cursor,
+            Some(shard_range(&low).unwrap().1),
+            "a source cursor cannot skip another source's rows"
+        );
+        let (_, _, entries, _, _) = composite_page_with_coin_domain(
+            &scans,
+            &sources,
+            Some(&id),
+            cursor.as_ref(),
+            Some(&domain),
+            &read,
+        )
+        .unwrap();
+        assert_eq!(entries, vec![(address(0x20, 2), ())]);
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    #[tokio::test]
+    async fn a_composite_bootstrap_keeps_late_coins_after_a_finished_sources_snapshot_expires() {
+        use quil_types::store::CoinWitnessProvider;
+        let domain = [3; 32];
+        let (low, high) = (wallet_worker(), wallet_worker());
+        let (_supervisor, provider) = wallet_provider(
+            vec![
+                (
+                    quil_forest::encode_shard_bit_path(&domain, &[false]),
+                    low.clone(),
+                ),
+                (quil_forest::encode_shard_bit_path(&domain, &[true]), high),
+            ],
+            false,
+        );
+        let first = provider.coin_page(&domain, None, None).unwrap().unwrap();
+        assert!(first.coins.is_empty() && !first.has_more);
+        assert!(!first.change_cursor.is_empty());
+
+        let address = wallet_coin(&low, &domain);
+        low.crdt.close_snapshots();
+        let cursor = provider
+            .composite_coin_snapshot_cursor(
+                &domain,
+                &first.snapshot_id,
+                &provider.coin_scan_sources(&domain).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor, first.change_cursor,
+            "bootstrap must not advance to the live tail"
+        );
+        let changes = provider.coin_changes(&domain, &cursor, 8).unwrap().unwrap();
+        assert!(!changes.reset);
+        assert_eq!(changes.coins.len(), 1);
+        assert_eq!(
+            (changes.coins[0].address, changes.coins[0].frame_number),
+            (address, 7)
+        );
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn an_empty_rootless_worker_finishes_a_coin_continuation() {
+        let domain = [3; 32];
+        let network = quil_execution::token_intrinsic::state::network_identifier(0);
+        let low = quil_forest::encode_shard_bit_path(&domain, &[false]);
+        let high = quil_forest::encode_shard_bit_path(&domain, &[true]);
+        let sources = vec![(low.clone(), store()), (high, store())];
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let read = |filter: &[u8],
+                    snapshot: &dyn quil_types::store::SnapshotReadable,
+                    after: Option<&[u8; 32]>| {
+            if filter == low.as_slice() {
+                return Ok(StorePage {
+                    entries: vec![([1; 32], ())],
+                    cursor: Some([1; 32]),
+                    has_more: false,
+                    root_record: Some(vec![1]),
+                });
+            }
+            let page = coin_store_page(snapshot, &network, &domain, after)?;
+            Ok(StorePage {
+                entries: page.entries.into_iter().map(|(a, _)| (a, ())).collect(),
+                cursor: page.cursor,
+                has_more: page.has_more,
+                root_record: page.root_record,
+            })
+        };
+        let (id, _, entries, cursor, more) =
+            composite_page(&scans, sources.clone(), None, None, &read).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(more);
+        let (_, _, entries, _, more) =
+            composite_page(&scans, sources, Some(&id), cursor.as_ref(), &read).unwrap();
+        assert!(entries.is_empty() && !more);
+    }
+
+    #[test]
+    fn a_generic_composite_scan_does_not_apply_the_coin_sync_gate() {
+        let domain = [3; 32];
+        let left = store();
+        let right = store();
+        let mut key = b"quil/forest-sync/incomplete/v1/".to_vec();
+        key.extend_from_slice(&32u16.to_be_bytes());
+        key.extend_from_slice(&domain);
+        left.forest_store().unwrap().put(key, [0, 0, 0]).unwrap();
+        let local = vec![
+            (quil_forest::encode_shard_bit_path(&domain, &[false]), left),
+            (quil_forest::encode_shard_bit_path(&domain, &[true]), right),
+        ];
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let result = composite_page(&scans, local, None, None, |_, _, _| {
+            Ok(StorePage::<u8> {
+                entries: Vec::new(),
+                cursor: None,
+                has_more: false,
+                root_record: None,
+            })
+        });
+        assert!(
+            result.is_ok(),
+            "the shared escrow path must not inherit a Coin-only gate"
+        );
+    }
+
+    #[test]
+    fn composite_snapshot_identity_binds_the_application_and_filter_layout() {
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let left = store();
+        let right = store();
+        let mut ids = Vec::new();
+        for domain in [[1; 32], [2; 32]] {
+            let local = vec![
+                (
+                    quil_forest::encode_shard_bit_path(&domain, &[false]),
+                    left.clone(),
+                ),
+                (
+                    quil_forest::encode_shard_bit_path(&domain, &[true]),
+                    right.clone(),
+                ),
+            ];
+            let (id, _, _, _, _) = composite_page(&scans, local, None, None, |_, _, _| {
+                Ok(StorePage::<u8> {
+                    entries: Vec::new(),
+                    cursor: None,
+                    has_more: false,
+                    root_record: None,
+                })
+            })
+            .expect("each application has an independent composite snapshot");
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1]);
+    }
 
     fn store() -> Arc<quil_hypergraph::HypergraphCrdt> {
         let db: &'static quil_store::RocksDb =

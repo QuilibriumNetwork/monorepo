@@ -1512,6 +1512,24 @@ impl ArchiveClient {
             .into_inner())
     }
 
+    /// Public encrypted output changes from this peer's durable local journal.
+    pub async fn list_shard_coin_changes(
+        &mut self,
+        domain: Vec<u8>,
+        cursor: Vec<u8>,
+        max_coins: u32,
+    ) -> Result<quil_types::proto::global::ListShardCoinChangesResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .list_shard_coin_changes(quil_types::proto::global::ListShardCoinChangesRequest {
+                domain,
+                cursor,
+                max_coins,
+            })
+            .await?
+            .into_inner())
+    }
+
     pub async fn list_shard_legacy_coins(
         &mut self,
         domain: Vec<u8>,

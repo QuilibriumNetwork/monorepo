@@ -14,6 +14,8 @@ use quil_lifecycle::{ShutdownReason, Supervisor};
 
 pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod archive_sync;
+#[cfg(feature = "confidential-tokens")]
+mod coin_changes;
 mod committee_builds;
 mod committee_peer_policy;
 pub(crate) mod consensus_intake;

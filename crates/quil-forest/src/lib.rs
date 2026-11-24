@@ -61,8 +61,12 @@ pub use database::{
     take_all_stores_write_times, thread_store_write_time, CoordinatedDb, DatabaseCommitError,
     DatabaseWriteGuard, DisjointBatch, ExitHold, KeyPrefixSet, WeakCoordinatedDb, WriteTimesSample,
 };
+mod local_projection;
 pub use jmt::storage::TreeReader;
 pub use jmt::KeyHash;
+pub use local_projection::{
+    local_projection_invalid_key, LocalBatchProjection, LocalProjectionBatch, LocalProjectionRead,
+};
 pub use membership_proof::{
     verify_vertex_membership, verify_vertex_membership_with, MembershipProof, ShardAggregation,
     VertexMembershipProof,

@@ -173,15 +173,13 @@ pub fn unrooted_coins_error() -> QuilError {
     )
 }
 
-/// A wallet scan's page. An application with no coin root at all, neither
-/// the canonical root GLOBAL folds from shard reports (a shard holding no
-/// confidential coin reports nothing) nor a local record (written with the
-/// first coin a node commits), is one in which no confidential coin exists
-/// yet, such as QUIL before its first shield or mint. Its scan is complete
-/// and empty, [`WalletPage::NoRoot`], rather than failed.
+/// A wallet scan's page. A rootless application returns [`WalletPage::NoRoot`]
+/// only when bounded enumeration proves this snapshot contains no Coin.
+/// Root publication can lag delivered records, so an empty first page alone
+/// cannot establish that the application is empty.
 ///
 /// Only a fresh scan gets that answer. A continuation without a root is an
-/// error, and a first page that already holds a coin is
+/// error, and a rootless scan that finds a coin is
 /// [`WalletPage::UnrootedCoins`]: a store whose root has not arrived, not an
 /// empty application.
 pub fn scan_wallet_page(
@@ -198,12 +196,24 @@ pub fn scan_wallet_page(
     if after.is_some() {
         return Err(no_root());
     }
-    let (coins, _, _) = scan_coins(snapshot, network, application, None, limits)?;
-    Ok(if coins.is_empty() {
-        WalletPage::NoRoot
-    } else {
-        WalletPage::UnrootedCoins
-    })
+    // Large rows also include escrows. An empty bounded page proves nothing
+    // about later rows, especially when a wallet uses this snapshot's tail
+    // as its starting point for incremental discovery.
+    let mut probe_after = None;
+    for _ in 0..8 {
+        let (coins, cursor, has_more) =
+            scan_coins(snapshot, network, application, probe_after.as_ref(), limits)?;
+        if !coins.is_empty() {
+            return Ok(WalletPage::UnrootedCoins);
+        }
+        if !has_more {
+            return Ok(WalletPage::NoRoot);
+        }
+        probe_after = cursor;
+    }
+    Err(QuilError::ExecutionUnavailable(
+        "coin scan: no root and emptiness is not established within the probe budget; retry after root publication".into(),
+    ))
 }
 
 /// Internal index scan. Wallet pages continue to advertise the canonical root.
@@ -501,6 +511,161 @@ mod tests {
     use quil_lattice_ct::confidential::{transfer::Output, AmountOpening, CommitmentKey};
     use quil_types::crypto::NoopInclusionProver;
     use std::sync::Arc;
+
+    #[test]
+    fn a_rootless_scan_cannot_skip_a_coin_after_a_non_coin_page() {
+        use super::super::escrow::StoredEscrow;
+        use quil_lattice_ct::confidential::{
+            memo::EscrowRecoveryMemo, pending_claim::EscrowPolicy,
+        };
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let (network, application) = ([1; 32], [2; 32]);
+        let context = parameter_context(&network, &application);
+        let limits = VertexPageLimits {
+            max_entries: 8,
+            max_bytes: 240 * 1024,
+        };
+        let snapshot_limits = SnapshotLimits {
+            max_coins: 8,
+            max_depth: 32,
+            max_nodes: 1 << 12,
+        };
+        let output = Output {
+            owner: [3; IDENTITY_BYTES],
+            commitment: CommitmentKey::derive(&context)
+                .commit(5, &AmountOpening::from_seed(&context, &[4; 32])),
+            memo: [0; 1115],
+        };
+        let (coin, tree) = roots::stage_coin(
+            &state,
+            &network,
+            &application,
+            &context,
+            7,
+            &output,
+            &mut std::collections::BTreeMap::new(),
+            snapshot_limits,
+        )
+        .unwrap();
+        let disc = vertex_adds_discriminator().unwrap();
+        let mut escrow = StoredEscrow {
+            frame_number: 73,
+            output,
+            policy: EscrowPolicy {
+                recipient: [6; 897],
+                refund: [7; 897],
+                refund_after_global_frame: 100,
+            },
+            refund_recovery: EscrowRecoveryMemo {
+                owner: [8; IDENTITY_BYTES],
+                ciphertext: [9; 1115],
+            },
+        };
+        let mut preceding = 0;
+        for frame in 100..10_100 {
+            escrow.policy.refund_after_global_frame = frame;
+            let (address, blob) = escrow.encode(&context).unwrap();
+            if address < coin {
+                state.set(&application, &address, &disc, 0, blob).unwrap();
+                preceding += 1;
+                if preceding == limits.max_entries {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            preceding, limits.max_entries,
+            "fixture needs a full escrow prefix"
+        );
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(1).unwrap();
+        let empty_of_coins = store.capture_snapshot().unwrap();
+        assert!(
+            matches!(
+                scan_wallet_page(
+                    empty_of_coins.as_ref(),
+                    &network,
+                    &application,
+                    None,
+                    limits
+                ),
+                Ok(WalletPage::NoRoot)
+            ),
+            "escrows alone do not require a coin root"
+        );
+
+        state
+            .set(
+                &application,
+                &coin,
+                &disc,
+                0,
+                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(2).unwrap();
+        let unrooted = store.capture_snapshot().unwrap();
+        assert!(
+            matches!(
+                scan_wallet_page(unrooted.as_ref(), &network, &application, None, limits),
+                Ok(WalletPage::UnrootedCoins)
+            ),
+            "a bounded non-coin prefix cannot prove the application empty"
+        );
+        assert!(
+            matches!(
+                scan_wallet_page(
+                    unrooted.as_ref(),
+                    &network,
+                    &application,
+                    None,
+                    VertexPageLimits {
+                        max_entries: 1,
+                        ..limits
+                    }
+                ),
+                Err(QuilError::ExecutionUnavailable(_))
+            ),
+            "an exhausted rootless probe must not issue an empty bootstrap"
+        );
+
+        // Root publication alone must make the existing coin discoverable;
+        // it must not require rewriting the coin into a newer journal event.
+        roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(3).unwrap();
+        let rooted = store.capture_snapshot().unwrap();
+        let mut after = None;
+        let mut found = Vec::new();
+        for _ in 0..4 {
+            let WalletPage::Page(page) = scan_wallet_page(
+                rooted.as_ref(),
+                &network,
+                &application,
+                after.as_ref(),
+                limits,
+            )
+            .unwrap() else {
+                panic!("root has been published");
+            };
+            found.extend(page.coins);
+            after = page.cursor;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].0, found[0].1.frame_number), (coin, 7));
+    }
 
     #[test]
     fn escrow_scan_retains_snapshot_and_advances_over_metadata_without_coin_root() {

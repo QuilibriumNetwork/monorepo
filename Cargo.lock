@@ -6830,6 +6830,7 @@ dependencies = [
 name = "quil-store"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.15",
  "hex 0.4.3",
  "libc",
  "num-bigint 0.4.6",

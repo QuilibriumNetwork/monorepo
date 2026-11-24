@@ -110,6 +110,7 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
                 .partition_point(|(address, _, _)| after.is_some_and(|old| address <= old));
             let next = self.coins.get(index);
             Ok(Some(CoinPageData {
+                change_cursor: Vec::new(),
                 network: self.network,
                 snapshot_id: [33; 32],
                 root_record: self.root.clone(),
@@ -515,6 +516,7 @@ impl quil_types::store::CoinWitnessProvider for Listed {
             .partition_point(|(address, ..)| after.is_some_and(|after| address <= after));
         if let Some((cursor, has_more)) = self.tail_page(after, start == self.coins.len()) {
             return Ok(Some(CoinPageData {
+                change_cursor: Vec::new(),
                 network: self.network,
                 snapshot_id: [33; 32],
                 root_record: self.root.clone(),
@@ -525,6 +527,7 @@ impl quil_types::store::CoinWitnessProvider for Listed {
         }
         let page = &self.coins[start..self.coins.len().min(start + 8)];
         Ok(Some(CoinPageData {
+            change_cursor: Vec::new(),
             network: self.network,
             snapshot_id: [33; 32],
             root_record: self.root.clone(),
@@ -2823,6 +2826,7 @@ async fn a_default_wallet_scan_finds_its_coin_behind_the_old_page_budget() {
                 .partition_point(|(address, ..)| after.is_some_and(|after| address <= after));
             let page = &self.coins[start..self.coins.len().min(start + 8)];
             Ok(Some(CoinPageData {
+                change_cursor: Vec::new(),
                 network: self.network,
                 snapshot_id: [33; 32],
                 root_record: self.root.clone(),
@@ -3758,6 +3762,7 @@ impl quil_types::store::CoinWitnessProvider for RecordingCoins {
             .partition_point(|(address, ..)| after.is_some_and(|old| address <= old));
         let page = &self.coins[start..(start + 2).min(self.coins.len())];
         Ok(Some(quil_types::store::CoinPageData {
+            change_cursor: Vec::new(),
             network: self.network,
             snapshot_id: [44; 32],
             root_record: self.root.clone(),

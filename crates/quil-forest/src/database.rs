@@ -23,6 +23,8 @@ use rocksdb::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseCommitError {
+    #[error("a local batch projection is already registered or has an empty namespace")]
+    InvalidProjection,
     #[error("database write barrier is poisoned")]
     Poisoned,
     #[error(
@@ -304,6 +306,7 @@ pub fn take_all_stores_write_times() -> WriteTimesSample {
 /// declared prefixes is recorded per prefix; every other write is
 /// general. Execution publication compares these against its own footprint.
 struct WriteLedger {
+    projection: Option<Arc<dyn crate::LocalBatchProjection>>,
     general: WriteStamp,
     disjoint: BTreeMap<&'static [u8], WriteStamp>,
     /// Sequence after the last write that may have written a watched key.
@@ -547,6 +550,29 @@ impl WeakCoordinatedDb {
 }
 
 impl CoordinatedDb {
+    /// Install before the store serves snapshots. The callback runs under the
+    /// final write barrier and must never acquire an owner lock or write again.
+    pub fn register_local_projection(
+        &self,
+        projection: Arc<dyn crate::LocalBatchProjection>,
+    ) -> Result<(), DatabaseCommitError> {
+        let mut guard = self.lock_writes()?;
+        if projection.namespace().is_empty() || guard.ledger.projection.is_some() {
+            return Err(DatabaseCommitError::InvalidProjection);
+        }
+        guard.ledger.projection = Some(projection);
+        Ok(())
+    }
+
+    pub fn has_local_projection(&self, namespace: &[u8]) -> Result<bool, DatabaseCommitError> {
+        Ok(self
+            .lock_writes()?
+            .ledger
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.namespace() == namespace))
+    }
+
     pub fn new(db: DB) -> Self {
         Self::open(db, None)
     }
@@ -566,6 +592,7 @@ impl CoordinatedDb {
         let inner = Arc::new(DatabaseInner {
             db: ManuallyDrop::new(db),
             writes: Mutex::new(WriteLedger {
+                projection: None,
                 general: WriteStamp::at(general),
                 disjoint: BTreeMap::new(),
                 // Nothing written before the watch is known to be unwatched.
@@ -939,11 +966,27 @@ impl Drop for DatabaseWriteGuard<'_> {
 impl DatabaseWriteGuard<'_> {
     fn write_raw(
         &mut self,
-        batch: WriteBatch,
+        mut batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<(), DatabaseCommitError> {
         if self.database.0.state.is_latched() {
             return Err(self.database.refuse_write());
+        }
+        if let Some(projection) = self.ledger.projection.clone() {
+            let namespace = projection.namespace();
+            let mut output = crate::LocalProjectionBatch::new(namespace);
+            let projected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                projection.project(
+                    &crate::LocalProjectionRead(&self.database.0.db),
+                    batch.data(),
+                    &mut output,
+                )
+            }));
+            if !matches!(projected, Ok(Ok(()))) || !output.append(&mut batch) {
+                // Never commit a state change with an apparently usable feed
+                // cursor when projecting its event failed or panicked.
+                batch.put(crate::local_projection_invalid_key(namespace), b"1");
+            }
         }
         // Keys are listed only for a journal someone reads.
         let list = self.ledger.journal.is_some();

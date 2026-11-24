@@ -245,6 +245,7 @@ impl CoinWitnessProvider for SnapshotWitnessProvider {
             .map(|(address, _, _)| *address)
             .or(after.copied());
         Ok(Some(CoinPageData {
+            change_cursor: Vec::new(),
             network: self.network,
             snapshot_id: [64; 32],
             root_record: self
@@ -321,6 +322,7 @@ impl CoinWitnessProvider for WitnessProvider {
         coins.truncate(8);
         let cursor = coins.last().map(|(address, _)| *address).or(after.copied());
         Ok(Some(CoinPageData {
+            change_cursor: Vec::new(),
             network: self.network,
             snapshot_id: [64; 32],
             root_record: self

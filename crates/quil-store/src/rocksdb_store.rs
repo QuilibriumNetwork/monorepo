@@ -379,7 +379,7 @@ impl RocksDb {
         crate::migration::run_migrations(&db, &migrations)?;
 
         Ok(Self {
-            db: Self::coordinated(db),
+            db: Self::coordinated(db)?,
             shared_block_cache: shared,
         })
     }
@@ -399,7 +399,7 @@ impl RocksDb {
         let db = rocksdb::DB::open(opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
         Ok(Self {
-            db: Self::coordinated(db),
+            db: Self::coordinated(db)?,
             shared_block_cache: false,
         })
     }
@@ -540,23 +540,26 @@ impl RocksDb {
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
         Ok(Self {
-            db: Self::coordinated(db),
+            db: Self::coordinated(db)?,
             shared_block_cache: false,
         })
     }
 
     /// A writable store watches the prover registry's keys, so execution
     /// branches can reuse a registry scan no write has changed.
-    fn coordinated(db: rocksdb::DB) -> quil_forest::CoordinatedDb {
+    fn coordinated(db: rocksdb::DB) -> Result<quil_forest::CoordinatedDb> {
         let db = quil_forest::CoordinatedDb::with_watched_prefixes(
             db,
             crate::encoding::prover_registry_key_prefixes(),
         );
+        // Initialize before exposing the DB so the first wallet snapshot has
+        // a journal generation, including stores populated later by sync.
+        crate::coin_changes::enable(&db)?;
         open_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(db.downgrade());
-        db
+        Ok(db)
     }
 
     /// Share the database and its write barrier across store implementations.

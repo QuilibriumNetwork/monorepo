@@ -138,6 +138,9 @@ impl Transaction for MemTxn {
 /// Minimal in-memory `HypergraphStore` for tests. Stores node and root
 /// data in hash maps; all other operations are no-ops.
 pub struct MemStore {
+    coin_change_resets: Mutex<usize>,
+    coin_change_installing: Mutex<std::collections::HashSet<Vec<u8>>>,
+    phase_root_clear_failure: Mutex<bool>,
     read_failure_phase: Mutex<Option<String>>,
     commit_setup_failures: Mutex<(bool, bool)>,
     nodes: Mutex<HashMap<String, Vec<u8>>>,
@@ -173,6 +176,9 @@ impl quil_types::store::SnapshotReadable for MemSnapshot {
 impl MemStore {
     pub fn new() -> Self {
         Self {
+            coin_change_resets: Mutex::new(0),
+            coin_change_installing: Mutex::new(std::collections::HashSet::new()),
+            phase_root_clear_failure: Mutex::new(false),
             snapshots: Mutex::new(None),
             read_failure_phase: Mutex::new(None),
             commit_setup_failures: Mutex::new((false, false)),
@@ -181,6 +187,18 @@ impl MemStore {
             per_vertex: Mutex::new(HashMap::new()),
             kv: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn coin_change_resets(&self) -> usize {
+        *self.coin_change_resets.lock().unwrap()
+    }
+
+    pub fn coin_change_installing(&self) -> bool {
+        !self.coin_change_installing.lock().unwrap().is_empty()
+    }
+
+    pub fn fail_phase_root_clear(&self, fail: bool) {
+        *self.phase_root_clear_failure.lock().unwrap() = fail;
     }
 
     /// Capture committed snapshots of the kv map; test utility only (a plain
@@ -228,6 +246,37 @@ impl MemStore {
 }
 
 impl HypergraphStore for MemStore {
+    fn clear_phase_root_versions(&self, _: &str, _: &str, _: &[u8]) -> Result<usize> {
+        if *self.phase_root_clear_failure.lock().unwrap() {
+            return Err(QuilError::Store(
+                "injected phase index clear failure".into(),
+            ));
+        }
+        Ok(0)
+    }
+
+    fn invalidate_coin_changes(&self) -> Result<()> {
+        *self.coin_change_resets.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    fn set_coin_changes_installing(&self, scope: &[u8], installing: bool) -> Result<()> {
+        let mut scopes = self.coin_change_installing.lock().unwrap();
+        let changed = if installing {
+            scopes.insert(scope.to_vec())
+        } else {
+            scopes.remove(scope)
+        };
+        if changed {
+            self.invalidate_coin_changes()?;
+        }
+        Ok(())
+    }
+
+    fn is_coin_changes_installing(&self, scope: &[u8]) -> Result<bool> {
+        Ok(self.coin_change_installing.lock().unwrap().contains(scope))
+    }
+
     fn capture_tree_snapshot(
         &self,
     ) -> Result<Option<Arc<dyn quil_types::store::SnapshotReadable>>> {
