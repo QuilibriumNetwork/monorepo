@@ -311,12 +311,29 @@ enum Answer {
 /// What became of a shard consensus message handed to a standalone worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteDelivery {
+    /// Its engine took it.
     Accepted,
-    /// The worker no longer runs that shard's engine.
+    /// An earlier worker accepted it; whether its engine's queue dropped it
+    /// is unknown.
+    Queued,
+    /// The worker no longer runs that shard's engine, or its engine's queue
+    /// is full.
     Refused,
     /// The worker's build lacks `DeliverShardConsensus`.
     Unsupported,
     Failed,
+}
+
+impl RemoteDelivery {
+    /// A worker's answer, read by whether it says "taken"
+    /// ([`quil_p2p::direct::ANSWERS_TAKEN`]); an earlier worker does not.
+    pub fn answered(response: &quil_types::proto::node::DeliverShardConsensusResponse) -> Self {
+        match quil_p2p::direct::DirectAnswer::of(response.accepted, response.taken) {
+            quil_p2p::direct::DirectAnswer::Taken => Self::Accepted,
+            quil_p2p::direct::DirectAnswer::Queued => Self::Queued,
+            quil_p2p::direct::DirectAnswer::Refused => Self::Refused,
+        }
+    }
 }
 
 /// Events from remote workers to the master.
@@ -1187,8 +1204,7 @@ impl RemoteWorkerManager {
         )
         .await
         {
-            Ok(Ok(response)) if response.get_ref().accepted => RemoteDelivery::Accepted,
-            Ok(Ok(_)) => RemoteDelivery::Refused,
+            Ok(Ok(response)) => RemoteDelivery::answered(response.get_ref()),
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
                 RemoteDelivery::Unsupported
             }

@@ -431,10 +431,10 @@ impl From<&str> for SubmitRefusal {
 pub type ConsensusDeliveryHandler =
     Arc<dyn Fn(Request<global::SubmitGlobalConsensusRequest>) -> Result<(), String> + Send + Sync>;
 
-/// Delivers a standalone worker's shard resolver message to the committee
-/// members it names, directly over this node's peer connections:
-/// `(filter, channel, data, recipient committee keys)` → every recipient
-/// accepted it.
+/// Delivers a standalone worker's shard CW message to the committee members
+/// it names, directly over this node's peer connections:
+/// `(filter, channel, data, recipient committee keys)` → taken: each member
+/// took it, or gets a topic copy sent by this node.
 pub type ShardDirectRelay = Arc<
     dyn Fn(
             Vec<u8>,
@@ -445,6 +445,16 @@ pub type ShardDirectRelay = Arc<
         + Send
         + Sync,
 >;
+
+/// This node's answer to its worker's relay request: `delivered` ([`ShardDirectRelay`]),
+/// and that it relays votes, certificates and blocks
+/// ([`quil_p2p::direct::ANSWERS_TAKEN`]).
+pub fn shard_direct_relay_answer(delivered: bool) -> global::SendShardConsensusDirectResponse {
+    global::SendShardConsensusDirectResponse {
+        delivered,
+        relays_consensus: quil_p2p::direct::ANSWERS_TAKEN,
+    }
+}
 
 /// Sends one of a standalone worker's GLOBAL requests (a certified shard
 /// `FrameHeader` or a committee-handoff submission) on through this node's
@@ -1722,13 +1732,16 @@ impl GlobalService for GlobalRpcServer {
             ));
         }
         let req = request.into_inner();
-        let delivered = match &self.shard_direct_relay {
-            Some(relay) => relay(req.filter, req.channel, req.data, req.recipients).await,
-            None => false,
+        let Some(relay) = &self.shard_direct_relay else {
+            return Ok(Response::new(
+                global::SendShardConsensusDirectResponse::default(),
+            ));
         };
-        Ok(Response::new(global::SendShardConsensusDirectResponse {
-            delivered,
-        }))
+        // A request naming no recipient asks only whether this node relays
+        // votes, certificates and blocks.
+        let delivered = req.recipients.is_empty()
+            || relay(req.filter, req.channel, req.data, req.recipients).await;
+        Ok(Response::new(shard_direct_relay_answer(delivered)))
     }
 
     async fn get_historical_committees(
@@ -2475,6 +2488,14 @@ mod identity_gate_tests {
             .await
             .unwrap();
         assert!(response.get_ref().delivered);
+        assert!(
+            response.get_ref().relays_consensus,
+            "its workers relay votes, certificates and blocks through it"
+        );
+        let mut probe = request(Some(me));
+        probe.get_mut().recipients.clear();
+        let probed = server.send_shard_consensus_direct(probe).await.unwrap();
+        assert!(probed.get_ref().relays_consensus && probed.get_ref().delivered);
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             &[(vec![1; 32], 2, b"response".to_vec(), vec![vec![5; 897]])]

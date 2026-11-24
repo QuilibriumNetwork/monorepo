@@ -2118,23 +2118,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     let (p2p, unsupported) = (p2p.clone(), unsupported.clone());
                     spawner.detach("shard-cw-forward", async move {
                         use quil_engine::remote_worker::RemoteDelivery;
-                        match remote.deliver_shard_consensus(&filter, channel, data, from_key).await {
-                            RemoteDelivery::Accepted => {
-                                if let Some(ack) = ack {
-                                    ack.taken();
-                                }
-                            }
-                            RemoteDelivery::Unsupported => {
-                                // Senders fall back to the topic, which the
-                                // worker hears itself.
-                                warn!(filter = %hex::encode(&filter),
-                                    "standalone worker lacks direct shard delivery; refusing direct messages for its shard");
-                                unsupported.lock().insert(topic.clone());
-                                p2p.revoke_direct(topic).await;
-                            }
-                            // Answered "not delivered" as `ack` drops: the
-                            // sender sends its topic copy.
-                            RemoteDelivery::Refused | RemoteDelivery::Failed => {}
+                        let delivery = super::shard_cw_lane::forward_to_worker(
+                            remote.as_ref(), &filter, channel, data, from_key, ack,
+                        )
+                        .await;
+                        if delivery == RemoteDelivery::Unsupported {
+                            // Senders fall back to the topic, which the
+                            // worker hears itself.
+                            warn!(filter = %hex::encode(&filter),
+                                "standalone worker lacks direct shard delivery; refusing direct messages for its shard");
+                            unsupported.lock().insert(topic.clone());
+                            p2p.revoke_direct(topic).await;
                         }
                         Ok(())
                     });
@@ -2163,15 +2157,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     tracing::debug!(filter = %hex::encode(&filter), channel,
                         sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                         "routing shard CW message to its engine");
-                    // A direct sender is told "delivered" only if the engine
-                    // took it.
-                    if handle.try_deliver(quil_engine::app_engine::AppEngineMessage::CwIn {
+                    super::shard_cw_lane::deliver_in_process(
+                        received,
+                        |message| handle.try_deliver(message),
                         channel,
-                        from: from_key,
-                        data: cw_bytes.to_vec(),
-                    }) {
-                        received.taken();
-                    }
+                        from_key,
+                        cw_bytes.to_vec(),
+                    );
                 }
                 true
             })
@@ -4022,13 +4014,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             tracing::debug!(filter = %hex::encode(filter), channel,
                                                 sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                                                 "routing shard CW message to its engine");
-                                            if handle.try_deliver(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                            super::shard_cw_lane::deliver_in_process(
+                                                &received,
+                                                |message| handle.try_deliver(message),
                                                 channel,
-                                                from: from_key,
-                                                data: cw_bytes.to_vec(),
-                                            }) {
-                                                received.taken();
-                                            }
+                                                from_key,
+                                                cw_bytes.to_vec(),
+                                            );
                                         }
                                         routed = true;
                                         break;

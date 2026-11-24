@@ -47,24 +47,33 @@ async fn reproduces_direct_messages_filling_the_receive_queue() {
     let allowed = vec![1, 7, 7];
     receiver.allow_direct(allowed.clone()).await;
     let deadline = tokio::time::Instant::now() + CONNECT_WAIT;
-    loop {
+    let (outcome, took) = loop {
+        let started = tokio::time::Instant::now();
         let outcome = sender
             .send_direct(receiver_id, allowed.clone(), vec![0])
             .await;
         if outcome != DirectOutcome::NotConnected {
-            break;
+            break (outcome, started.elapsed());
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "the sender never reached the receiver: {outcome:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     assert_eq!(
         receiver.direct_stats().received,
         1,
         "the first one was queued"
     );
+    // Never read, it is not taken: its sender is answered "refused" once
+    // the receiver's take wait ends, and the receiver counts it.
+    assert_eq!(outcome, DirectOutcome::Refused);
+    assert!(
+        took >= quil_p2p::direct::DIRECT_TAKE_WAIT,
+        "answered after {took:?}"
+    );
+    assert_eq!(receiver.direct_stats().received_untaken, 1);
 
     let sent = RECEIVE_QUEUE * 3 / 4 + 256;
     futures::stream::iter(1..sent)

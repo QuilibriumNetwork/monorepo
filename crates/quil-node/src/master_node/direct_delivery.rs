@@ -50,11 +50,14 @@ pub(crate) fn committee_send_timeout(copies: usize, bytes: usize) -> Duration {
 /// The direct side of a committee send.
 #[async_trait::async_trait]
 pub(crate) trait DirectSend: Send + Sync {
+    /// One copy to `peer`; one that `needs_taken` skips a peer that answers
+    /// only "queued" (`quil_p2p::direct::DirectAnswers`).
     async fn send_direct(
         &self,
         peer: quil_p2p::PeerId,
         topic: Vec<u8>,
         data: Vec<u8>,
+        needs_taken: bool,
     ) -> quil_p2p::DirectOutcome;
 
     /// Where its sends are counted.
@@ -70,8 +73,13 @@ impl DirectSend for quil_p2p::node::P2PHandle {
         peer: quil_p2p::PeerId,
         topic: Vec<u8>,
         data: Vec<u8>,
+        needs_taken: bool,
     ) -> quil_p2p::DirectOutcome {
-        quil_p2p::node::P2PHandle::send_direct(self, peer, topic, data).await
+        if needs_taken {
+            quil_p2p::node::P2PHandle::send_direct_taken(self, peer, topic, data).await
+        } else {
+            quil_p2p::node::P2PHandle::send_direct(self, peer, topic, data).await
+        }
     }
 }
 
@@ -332,7 +340,9 @@ impl CommitteePeers {
 /// protocol, refusing it, on an earlier build, or slower than
 /// [`committee_send_timeout`]), in request order: all of them when there are
 /// more than [`MAX_DIRECT_RECIPIENTS`] or the message is larger than
-/// [`MAX_DIRECT_BYTES`].
+/// [`MAX_DIRECT_BYTES`]. A member whose node answered "queued" (an earlier
+/// build, or an earlier standalone worker behind it) is sent no vote,
+/// certificate or block for a while: only its topic copy serves it.
 pub(crate) async fn deliver_direct<S: DirectSend + ?Sized>(
     sender: &S,
     peers: &CommitteePeers,
@@ -352,18 +362,25 @@ pub(crate) async fn deliver_direct<S: DirectSend + ?Sized>(
     // still be dropped: enough for a resolver reply, which is asked again,
     // not for consensus.
     let queued_serves = channel == CW_APP_RESOLVER_CHANNEL;
+    let needs_taken = !queued_serves;
     let sends = recipients.iter().map(|key| async move {
         let Some(peer) = peers.peer(key) else {
             return Served::Unmapped;
         };
         let payload =
             quil_engine::bitmasks::shard_cw_frame_for(channel, bytes, std::slice::from_ref(key));
-        let sent =
-            tokio::time::timeout(timeout, sender.send_direct(peer, topic.to_vec(), payload)).await;
+        let sent = tokio::time::timeout(
+            timeout,
+            sender.send_direct(peer, topic.to_vec(), payload, needs_taken),
+        )
+        .await;
         match sent {
             Ok(quil_p2p::DirectOutcome::Delivered) => Served::Yes,
             Ok(quil_p2p::DirectOutcome::Queued) if queued_serves => Served::Yes,
-            Ok(quil_p2p::DirectOutcome::Queued) => Served::Earlier,
+            // An earlier build: its key maps to the right peer.
+            Ok(quil_p2p::DirectOutcome::Queued | quil_p2p::DirectOutcome::Unsupported) => {
+                Served::Earlier
+            }
             _ => {
                 peers.forget(key);
                 Served::No
@@ -483,10 +500,12 @@ mod tests {
     type Published = (Vec<u8>, Vec<u8>);
 
     /// Answers each peer after its delay with its outcome; records each send
-    /// and topic copy, and counts its own committee sends.
+    /// and topic copy, and counts its own committee sends. Peers it would
+    /// skip are skipped as the network task does ([`quil_p2p::direct::DirectAnswers`]).
     #[derive(Default, Clone)]
     struct Peers {
         answers: HashMap<quil_p2p::PeerId, (Duration, DirectOutcome)>,
+        skipping: Arc<parking_lot::Mutex<quil_p2p::direct::DirectAnswers>>,
         sent: Arc<parking_lot::Mutex<Vec<Sent>>>,
         published: Arc<parking_lot::Mutex<Vec<Published>>>,
         fallbacks: Arc<AtomicU64>,
@@ -514,10 +533,16 @@ mod tests {
             peer: quil_p2p::PeerId,
             _topic: Vec<u8>,
             data: Vec<u8>,
+            needs_taken: bool,
         ) -> DirectOutcome {
+            let now = std::time::Instant::now();
+            if let Some(skipped) = self.skipping.lock().skip(&peer, needs_taken, now) {
+                return skipped;
+            }
             self.sent.lock().push((peer, data));
             let (delay, outcome) = self.answers[&peer];
             tokio::time::sleep(delay).await;
+            self.skipping.lock().note(peer, outcome, now);
             outcome
         }
 
@@ -663,6 +688,31 @@ mod tests {
         assert_eq!(sender.sends.counts()[3].kept, 14);
     }
 
+    /// The size limit's edge: a message of exactly [`MAX_DIRECT_BYTES`] goes
+    /// to each member, one byte more to the topic.
+    #[tokio::test]
+    async fn a_message_at_the_size_limit_goes_direct_and_one_byte_more_does_not() {
+        let committee = members(1, 14);
+        let sender = Peers::answering(&committee, Duration::ZERO, DirectOutcome::Delivered);
+        let peers = mapped(&committee);
+        let topic = quil_engine::bitmasks::shard_cw_bitmask(&[1; 32]);
+        let recipients = keys(&committee);
+        let at_limit = vec![9u8; MAX_DIRECT_BYTES];
+        assert_eq!(
+            deliver_direct(&sender, &peers, 3, &at_limit, &recipients, &topic).await,
+            Vec::<Vec<u8>>::new(),
+            "a message of exactly the limit goes direct"
+        );
+        assert_eq!(sender.sent.lock().len(), 14);
+        let over = vec![9u8; MAX_DIRECT_BYTES + 1];
+        assert_eq!(
+            deliver_direct(&sender, &peers, 3, &over, &recipients, &topic).await,
+            recipients
+        );
+        assert_eq!(sender.sent.lock().len(), 14, "nothing more sent directly");
+        assert_eq!(sender.sends.counts()[3].kept, 14);
+    }
+
     /// A message up to the direct size limit, sent to every other member of
     /// a committee of 15 at once, is given time to upload every copy.
     #[tokio::test(start_paused = true)]
@@ -700,8 +750,9 @@ mod tests {
 
     /// An earlier build answers once a message is queued, where it can
     /// still be dropped: that serves a resolver reply, asked again if lost,
-    /// but a vote, certificate or block still gets its topic copy. The peer
-    /// stays known.
+    /// but a vote, certificate or block still gets its topic copy, and the
+    /// member is sent no more of those directly, which would serve nothing.
+    /// The peer stays known.
     #[tokio::test]
     async fn a_queued_answer_serves_only_a_resolver_reply() {
         let committee = members(1, 2);
@@ -716,6 +767,11 @@ mod tests {
                 "channel {channel}"
             );
             assert_eq!(sender.sends.counts()[channel as usize].earlier, 2);
+            assert_eq!(
+                sender.sent.lock().len(),
+                2,
+                "channel {channel}: a member that answered queued is sent no more consensus"
+            );
         }
         assert_eq!(
             deliver_direct(
@@ -729,6 +785,7 @@ mod tests {
             .await,
             Vec::<Vec<u8>>::new()
         );
+        assert_eq!(sender.sent.lock().len(), 4, "a resolver reply still goes");
         assert!(peers.known.lock().get(&recipients[0]).is_some(), "kept");
     }
 
@@ -877,6 +934,174 @@ mod tests {
         assert_eq!(
             quil_engine::bitmasks::shard_cw_split_payload(&both),
             Some((1, b"cert".as_slice()))
+        );
+    }
+
+    // Pairings of builds on the three hops of a direct send: sender to the
+    // member's node (peer to peer), that node to its standalone worker, and
+    // a standalone worker to its master's relay. In each, a vote reaches a
+    // member taken, or the member gets its topic copy, and no hop spends a
+    // direct copy that serves nothing. Earlier builds are stubs giving their
+    // answers: a worker without `taken`, a master without
+    // `relays_consensus`, a receiver on the earlier protocol ("queued").
+
+    /// A node of this build relaying to its standalone worker.
+    struct WorkerAnswering(quil_types::proto::node::DeliverShardConsensusResponse);
+
+    #[async_trait::async_trait]
+    impl super::super::shard_cw_lane::ShardWorkers for WorkerAnswering {
+        async fn deliver_shard_consensus(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: Vec<u8>,
+            _: Vec<u8>,
+        ) -> quil_engine::remote_worker::RemoteDelivery {
+            quil_engine::remote_worker::RemoteDelivery::answered(&self.0)
+        }
+    }
+
+    /// What a member's node of this build answers a vote's sender, its
+    /// standalone worker having answered `worker`.
+    async fn node_answers(
+        worker: quil_types::proto::node::DeliverShardConsensusResponse,
+    ) -> DirectOutcome {
+        let (ack, answered) = quil_p2p::direct::DirectAck::new();
+        super::super::shard_cw_lane::forward_to_worker(
+            &WorkerAnswering(worker),
+            &[1; 32],
+            0,
+            b"vote".to_vec(),
+            vec![5; 897],
+            Some(ack),
+        )
+        .await;
+        DirectOutcome::answered(
+            answered
+                .await
+                .unwrap_or(quil_p2p::direct::DirectAnswer::Refused),
+        )
+    }
+
+    /// Two votes and a resolver reply to members whose nodes answer
+    /// `outcome`: the members served by the first vote, its topic copies,
+    /// and the direct copies the second vote and the reply cost.
+    async fn votes_to(outcome: DirectOutcome) -> (u64, usize, usize, usize) {
+        let committee = members(1, 2);
+        let sender = Peers::answering(&committee, Duration::ZERO, outcome);
+        let peers = mapped(&committee);
+        let filter = [1u8; 32];
+        let recipients = keys(&committee);
+        send_committee(&sender, &peers, 0, &filter, 0, b"vote", &recipients).await;
+        let served = sender.sends.counts()[0].served;
+        let copies = sender.published.lock().len();
+        let sent = sender.sent.lock().len();
+        send_committee(&sender, &peers, 0, &filter, 0, b"vote 2", &recipients).await;
+        let second = sender.sent.lock().len() - sent;
+        send_committee(
+            &sender,
+            &peers,
+            0,
+            &filter,
+            CW_APP_RESOLVER_CHANNEL,
+            b"reply",
+            &recipients,
+        )
+        .await;
+        let reply = sender.sent.lock().len() - sent - second;
+        (served, copies, second, reply)
+    }
+
+    /// This build everywhere: the worker relays votes through its master,
+    /// the member's worker takes them, its node says so, and the vote costs
+    /// one direct copy per member and no topic copy.
+    #[tokio::test]
+    async fn pairing_this_master_with_this_worker() {
+        let master = quil_rpc::global_service::shard_direct_relay_answer(true);
+        assert!(
+            quil_engine::worker_node::relays_through_master(0, || async {
+                quil_engine::worker_node::master_relays_consensus(&master)
+            })
+            .await,
+            "a vote is relayed through the master"
+        );
+        let answer = node_answers(quil_engine::worker_node::shard_consensus_answer(true)).await;
+        assert_eq!(
+            answer,
+            DirectOutcome::Delivered,
+            "the worker's take reaches the sender"
+        );
+        assert_eq!(
+            node_answers(quil_engine::worker_node::shard_consensus_answer(false)).await,
+            DirectOutcome::Refused,
+            "an engine queue that dropped it"
+        );
+        assert_eq!(
+            votes_to(answer).await,
+            (2, 0, 2, 2),
+            "served, topic copies, direct votes after a queued answer, direct replies"
+        );
+    }
+
+    /// This build's node, its standalone worker an earlier build: the
+    /// worker's "accepted" does not say its engine took the vote, so the
+    /// sender is told "queued", sends the topic copy (which the worker reads
+    /// itself) and sends that member no more votes directly.
+    #[tokio::test]
+    async fn pairing_this_master_with_an_earlier_worker() {
+        let earlier_worker = quil_types::proto::node::DeliverShardConsensusResponse {
+            accepted: true,
+            ..Default::default()
+        };
+        let answer = node_answers(earlier_worker).await;
+        assert_eq!(
+            answer,
+            DirectOutcome::Queued,
+            "an earlier worker's acceptance reads as queued"
+        );
+        assert_eq!(
+            votes_to(answer).await,
+            (0, 1, 0, 2),
+            "served, topic copies, direct votes after a queued answer, direct replies"
+        );
+    }
+
+    /// An earlier master, this build's worker: the master's answer lacks
+    /// `relays_consensus`, so the worker sends votes, certificates and
+    /// blocks to the topic itself and relays only resolver messages.
+    #[tokio::test]
+    async fn pairing_an_earlier_master_with_this_worker() {
+        let earlier_master = quil_types::proto::global::SendShardConsensusDirectResponse {
+            delivered: true,
+            ..Default::default()
+        };
+        for channel in [
+            0,
+            1,
+            quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL,
+            CW_APP_RESOLVER_CHANNEL,
+        ] {
+            let relayed = quil_engine::worker_node::relays_through_master(channel, || async {
+                quil_engine::worker_node::master_relays_consensus(&earlier_master)
+            })
+            .await;
+            assert_eq!(
+                relayed,
+                channel == CW_APP_RESOLVER_CHANNEL,
+                "channel {channel}"
+            );
+        }
+    }
+
+    /// A member's node on the earlier protocol answers "queued": its first
+    /// vote also gets the topic copy, later votes go only there, and
+    /// resolver replies (which "queued" serves) still go directly.
+    #[tokio::test]
+    async fn pairing_this_sender_with_an_earlier_receiver() {
+        assert_eq!(
+            votes_to(DirectOutcome::Queued).await,
+            (0, 1, 0, 2),
+            "served, topic copies, direct votes after a queued answer, direct replies"
         );
     }
 }

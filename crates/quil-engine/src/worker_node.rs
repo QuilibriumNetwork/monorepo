@@ -58,6 +58,40 @@ fn cw_relay(
     committee.try_enter().map_or(CwRelay::Topic, CwRelay::Relay)
 }
 
+/// Whether a master's relay answer says it relays votes, certificates and
+/// blocks, not only resolver messages ([`quil_p2p::direct::ANSWERS_TAKEN`]):
+/// an earlier master's answer does not.
+pub fn master_relays_consensus(
+    response: &quil_types::proto::global::SendShardConsensusDirectResponse,
+) -> bool {
+    quil_p2p::direct::DirectAnswer::of(true, response.relays_consensus)
+        == quil_p2p::direct::DirectAnswer::Taken
+}
+
+/// A worker's answer to its master for a shard consensus message the engine
+/// took (`accepted`) or not: "taken" says that acceptance was the engine's
+/// ([`quil_p2p::direct::ANSWERS_TAKEN`]).
+pub fn shard_consensus_answer(
+    accepted: bool,
+) -> quil_types::proto::node::DeliverShardConsensusResponse {
+    quil_types::proto::node::DeliverShardConsensusResponse {
+        accepted,
+        taken: accepted && quil_p2p::direct::ANSWERS_TAKEN,
+    }
+}
+
+/// Whether a CW message on `channel` goes to the master's relay: a resolver
+/// message to any master with the relay, a vote, certificate or block only
+/// to one that `relays_consensus` (asked only then). Otherwise the worker
+/// sends it to the topic itself, as before the relay took them.
+pub async fn relays_through_master<F, R>(channel: u64, relays_consensus: F) -> bool
+where
+    F: FnOnce() -> R,
+    R: std::future::Future<Output = bool>,
+{
+    channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL || relays_consensus().await
+}
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -285,6 +319,9 @@ pub(crate) struct MasterRelay {
     /// When the master last answered that it lacks the direct relay (an older
     /// build): resolver messages go to the topic for a while.
     direct_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Whether the master relays votes, certificates and blocks, and since
+    /// when that is known ([`master_relays_consensus`]).
+    relays_consensus: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
     /// When the master last answered that it cannot take GLOBAL submissions.
     submit_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
     /// When a reward proof was last lost, for a warning at most once a minute.
@@ -311,6 +348,7 @@ impl MasterRelay {
             factory,
             client: tokio::sync::Mutex::new(None),
             direct_unsupported: std::sync::Mutex::new(None),
+            relays_consensus: tokio::sync::Mutex::new(None),
             submit_unsupported: std::sync::Mutex::new(None),
             proof_lost_warned: std::sync::Mutex::new(None),
         }
@@ -340,10 +378,49 @@ impl MasterRelay {
         *self.client.lock().await = None;
     }
 
-    /// Have the master deliver a resolver message directly to the committee
+    /// Whether the master relays votes, certificates and blocks. Asked with
+    /// a request naming no recipient, which sends nothing, then kept for
+    /// [`MASTER_RELAY_RETRY_AFTER`] and refreshed by every relay answer. No
+    /// while unknown (no channel, a failure).
+    async fn relays_consensus(&self) -> bool {
+        let mut known = self.relays_consensus.lock().await;
+        if let Some((since, relays)) = *known {
+            if since.elapsed() < MASTER_RELAY_RETRY_AFTER {
+                return relays;
+            }
+        }
+        let Some(mut client) = self.client().await else {
+            return false;
+        };
+        let probe = quil_types::proto::global::SendShardConsensusDirectRequest::default();
+        match tokio::time::timeout(
+            MASTER_RELAY_TIMEOUT,
+            client.send_shard_consensus_direct(probe),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let relays = master_relays_consensus(response.get_ref());
+                *known = Some((std::time::Instant::now(), relays));
+                relays
+            }
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                *self.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
+                false
+            }
+            _ => {
+                drop(known);
+                self.reconnect().await;
+                false
+            }
+        }
+    }
+
+    /// Have the master deliver a shard CW message directly to the committee
     /// members it names. False: send it to the topic (no master channel, a
-    /// master without the relay, a failure, or a recipient the master could
-    /// not reach).
+    /// master without the relay, a vote, certificate or block for a master
+    /// that relays only resolver messages, a failure, or a recipient the
+    /// master could not reach).
     async fn relay_direct(
         &self,
         filter: Vec<u8>,
@@ -352,6 +429,9 @@ impl MasterRelay {
         recipients: Vec<Vec<u8>>,
     ) -> bool {
         if Self::recently(&self.direct_unsupported) {
+            return false;
+        }
+        if !relays_through_master(channel, || self.relays_consensus()).await {
             return false;
         }
         let Some(mut client) = self.client().await else {
@@ -369,7 +449,14 @@ impl MasterRelay {
         )
         .await
         {
-            Ok(Ok(response)) => response.into_inner().delivered,
+            Ok(Ok(response)) => {
+                let response = response.into_inner();
+                *self.relays_consensus.lock().await = Some((
+                    std::time::Instant::now(),
+                    master_relays_consensus(&response),
+                ));
+                response.delivered
+            }
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
                 *self.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
                 false
@@ -2346,9 +2433,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService for DataIp
             .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
             .clone();
         let accepted = deliver_to_engine(handle, request.into_inner());
-        Ok(tonic::Response::new(
-            quil_types::proto::node::DeliverShardConsensusResponse { accepted },
-        ))
+        Ok(tonic::Response::new(shard_consensus_answer(accepted)))
     }
 
     /// The engine this worker runs and its latest execution report, for the
