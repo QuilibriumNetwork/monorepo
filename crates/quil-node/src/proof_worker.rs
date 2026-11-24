@@ -406,6 +406,9 @@ pub(crate) fn build_node_worker_as(
     let Some(worker) = build_worker(proof, slots)? else {
         return Ok(None);
     };
+    let automatic = automatic_slots(proof, archive, slots, || {
+        (process_cpus(), memory_for_verifiers(archive))
+    });
     #[cfg(target_os = "macos")]
     let worker = worker.with_memory_admission(std::sync::Arc::new(|deadline, frame| {
         // The measured depth-32 child peak is 2.73 GB; reserve 3 GiB from
@@ -424,12 +427,53 @@ pub(crate) fn build_node_worker_as(
         PathBuf::from(&config.db.path)
     };
     std::fs::create_dir_all(&base)?;
-    quil_engine::admission_verify::use_worker_slots(worker.concurrency());
+    quil_engine::admission_verify::use_worker_slots(worker_slots(
+        &slots,
+        &automatic,
+        worker.concurrency(),
+    ));
     let lock = std::fs::canonicalize(base)?.join(".proof-worker-admission.lock");
     worker
         .with_shared_admission(lock.clone())
         .map(Some)
         .map_err(|e| anyhow::anyhow!("proof worker admission file {}: {e:?}", lock.display()))
+}
+
+/// The count this process would size itself to with `maxConcurrent`
+/// unset, for the proof wait warnings: `slots` when `maxConcurrent` did not
+/// choose them, else the slots `machine` (this process's CPUs and the
+/// memory it sizes slots from, [`memory_for_verifiers`]) gives without it.
+fn automatic_slots(
+    proof: &ProofWorkerConfig,
+    archive: bool,
+    slots: VerifierSlots,
+    machine: impl FnOnce() -> (Option<usize>, Option<u64>),
+) -> VerifierSlots {
+    if slots.source != SlotSource::Configured {
+        return slots;
+    }
+    let unset = ProofWorkerConfig {
+        max_concurrent: None,
+        ..proof.clone()
+    };
+    let (cpus, available_memory) = machine();
+    verifier_slots(&unset, archive, cpus, available_memory)
+}
+
+/// What the proof wait warnings say of a worker admitting `concurrency`
+/// verifications, chosen as `chosen` says; `automatic`: the count this
+/// process would size itself to with `maxConcurrent` unset, known only when
+/// it counted its CPUs.
+fn worker_slots(
+    chosen: &VerifierSlots,
+    automatic: &VerifierSlots,
+    concurrency: usize,
+) -> quil_engine::admission_verify::WorkerSlots {
+    quil_engine::admission_verify::WorkerSlots {
+        slots: concurrency,
+        configured: chosen.source == SlotSource::Configured,
+        automatic: (automatic.source == SlotSource::Machine).then_some(automatic.slots),
+    }
 }
 
 /// Install the network policy and a clone of the shared worker on a manager.
@@ -516,6 +560,74 @@ mod tests {
                 (configured, SlotSource::Configured)
             );
         }
+    }
+
+    /// The proof wait warnings learn whether `maxConcurrent` set the slot
+    /// count and the count this process would size itself to with
+    /// `maxConcurrent` unset: a regular node configured to 2 on 128 CPUs
+    /// with ample memory would take 16.
+    /// Without a CPU count no automatic value is claimed.
+    #[test]
+    fn the_proof_wait_warnings_learn_the_configured_and_automatic_slots() {
+        const GIB: u64 = 1 << 30;
+        let unset = ProofWorkerConfig::default();
+        let explicit = ProofWorkerConfig {
+            max_concurrent: Some(2),
+            ..ProofWorkerConfig::default()
+        };
+        let machine = |config| verifier_slots(config, false, Some(128), Some(320 * GIB));
+        let automatic = machine(&unset);
+        assert_eq!(
+            worker_slots(&machine(&explicit), &automatic, 2),
+            quil_engine::admission_verify::WorkerSlots {
+                slots: 2,
+                configured: true,
+                automatic: Some(16),
+            },
+            "configured_slots_unlearned"
+        );
+        assert_eq!(
+            worker_slots(&automatic, &automatic, 16),
+            quil_engine::admission_verify::WorkerSlots {
+                slots: 16,
+                configured: false,
+                automatic: Some(16),
+            }
+        );
+        let unknown = verifier_slots(&unset, false, None, Some(320 * GIB));
+        assert_eq!(
+            worker_slots(&unknown, &unknown, 2).automatic,
+            None,
+            "an unknown machine claims no automatic count"
+        );
+    }
+
+    /// A configured slot count asks the machine again without
+    /// `maxConcurrent` (the node built it without asking): 2 configured on
+    /// 128 CPUs with ample memory gives this process's 16. Unset, the
+    /// machine's own slots are kept and it is not asked again.
+    #[test]
+    fn a_configured_slot_count_learns_what_the_machine_sizes_itself_to() {
+        const GIB: u64 = 1 << 30;
+        let explicit = ProofWorkerConfig {
+            max_concurrent: Some(2),
+            ..ProofWorkerConfig::default()
+        };
+        let configured = verifier_slots(&explicit, false, None, None);
+        let automatic = automatic_slots(&explicit, false, configured, || {
+            (Some(128), Some(320 * GIB))
+        });
+        assert_eq!(
+            (automatic.slots, automatic.source),
+            (16, SlotSource::Machine),
+            "automatic_not_recomputed"
+        );
+        let unset = ProofWorkerConfig::default();
+        let machine = verifier_slots(&unset, false, Some(128), Some(320 * GIB));
+        assert_eq!(
+            automatic_slots(&unset, false, machine, || unreachable!("asked again")),
+            machine
+        );
     }
 
     /// An explicit `maxConcurrent` above what available memory admits under
