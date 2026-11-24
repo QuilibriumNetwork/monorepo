@@ -514,8 +514,18 @@ struct RestartSummary {
     layers_done: u32,
     layers: u32,
     cost_minutes: u32,
-    minutes_to_grace: u32,
+    /// The least time a running encode has to the grace frame; `None` while
+    /// no pending seat encodes.
+    minutes_to_grace: Option<u32>,
     encoding: bool,
+}
+
+/// [`RestartSummary::minutes_to_grace`] as logged: "unknown" while no
+/// pending seat encodes.
+fn minutes_to_grace_shown(summary: &RestartSummary) -> String {
+    summary
+        .minutes_to_grace
+        .map_or_else(|| "unknown".to_string(), |m| m.to_string())
 }
 
 impl Default for RestartSummary {
@@ -528,7 +538,7 @@ impl Default for RestartSummary {
             layers_done: 0,
             layers: 0,
             cost_minutes: 0,
-            minutes_to_grace: 0,
+            minutes_to_grace: None,
             encoding: false,
         }
     }
@@ -555,11 +565,10 @@ impl RestartSummary {
                 seat.layers_done
             };
             self.layers = self.layers.max(seat.layers);
-            self.minutes_to_grace = if self.encoding {
-                self.minutes_to_grace.min(seat.minutes_to_grace)
-            } else {
-                seat.minutes_to_grace
-            };
+            self.minutes_to_grace = Some(
+                self.minutes_to_grace
+                    .map_or(seat.minutes_to_grace, |m| m.min(seat.minutes_to_grace)),
+            );
             self.encoding = true;
         }
     }
@@ -636,12 +645,14 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
                 frames_to_grace = grace_frame.saturating_sub(frame_number),
                 labels_kept = restart.labels_kept, layers_done = restart.layers_done,
                 layers = restart.layers, restart_cost_minutes = restart.cost_minutes,
-                minutes_to_grace = restart.minutes_to_grace, restart_costs_share = restart.costs_share,
+                minutes_to_grace = %minutes_to_grace_shown(&restart), restart_costs_share = restart.costs_share,
                 restart_stops_shard = restart.stops_shard, restart = restart.worst.text(),
                 pending_filters = %listed,
                 more_pending = filters.len().saturating_sub(LISTED), scope = "local",
                 "confirmation submits the seats whose storage snapshot is encoded and retries the pending \
-                 ones each cycle: an expected wait while their snapshots encode; a seat still pending at the \
+                 ones each cycle: an expected wait while their snapshots encode; a seat not started waits on \
+                 what its \"storage job waits\" line names, and its minutes to grace are unknown until it \
+                 encodes; a seat still pending at the \
                  grace frame renews without a storage registration, so its frames carry no storage attestation \
                  that epoch");
         }
@@ -4889,9 +4900,35 @@ mod tests {
                 summary.cost_minutes,
                 summary.minutes_to_grace
             ),
-            (1, 35, 30)
+            (1, 35, Some(30))
         );
         assert!(!summary.labels_kept, "one seat's labels are not kept");
+    }
+
+    /// While no pending seat encodes, the time an encode needs to the grace
+    /// frame is unknown: the line says so, not 0 minutes.
+    #[test]
+    fn the_restart_summary_knows_no_minutes_to_grace_while_none_encodes() {
+        use crate::restart_readiness::Verdict;
+        use quil_types::proto::node::RestartReadiness;
+        let waiting = (
+            RestartReadiness {
+                verdict: Verdict::Ok.name().into(),
+                encoding: false,
+                labels_kept: false,
+                layers_done: 0,
+                layers: 11,
+                restart_cost_minutes: 0,
+                minutes_to_grace: 0,
+                committee_margin: None,
+            },
+            Verdict::Ok,
+        );
+        let mut summary = super::RestartSummary::default();
+        summary.add(waiting.clone());
+        summary.add(waiting);
+        assert_eq!(summary.minutes_to_grace, None);
+        assert_eq!(super::minutes_to_grace_shown(&summary), "unknown");
     }
 
     /// After a restart, the seats noted encoding for the epoch a renewal now
