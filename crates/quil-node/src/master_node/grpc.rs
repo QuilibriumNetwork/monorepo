@@ -839,10 +839,11 @@ const CAPACITY_FULL_NOTE: &str = "rank_full refusals of capacity messages over t
                                   over their class share";
 const SHARE_FULL_NOTE: &str = "share_full counts storage epoch proofs over their share of this \
                                node's mempool: active provers' proofs, other senders' proofs or \
-                               one sender's proofs (latest_reason names the last); they fill it \
-                               as each epoch boundary's proofs arrive, senders resend, and \
-                               frames free the room within about 25 minutes: nothing to fix on \
-                               this node for these";
+                               one sender's proofs (latest_reason, the last refusal of any kind, \
+                               names its share when it is one of these); they fill it as each \
+                               epoch boundary's proofs arrive, senders resend, and frames free \
+                               the room within about 25 minutes: nothing to fix on this node for \
+                               these";
 
 /// The open file limit of this process, as raised at startup.
 fn open_file_limit() -> u64 {

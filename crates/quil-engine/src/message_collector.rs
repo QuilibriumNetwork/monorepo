@@ -29,6 +29,8 @@ mod seal_wait_end_tests;
 mod seal_waiting;
 #[cfg(test)]
 mod seat_density_tests;
+#[cfg(test)]
+mod share_meaning_tests;
 pub(crate) use cert_union::order_copies_by_signers;
 pub use cert_union::{session_committees, Committee, CommitteeSource};
 use window_seats::SeatEvent;
@@ -1322,6 +1324,18 @@ impl Share {
             Share::Unreserved | Share::Seals | Share::OtherSeals | Share::Sender => false,
         }
     }
+
+    /// A storage epoch proof refused over this share may wait for the room
+    /// frames free in it ([`seal_waiting::SealWaiting::refused`]): the
+    /// active provers' and other senders' shares keep that room for it. A
+    /// sender's share frees room only as that sender's own proofs go, and
+    /// the other shares hold no storage epoch proofs.
+    pub(crate) fn waits(self) -> bool {
+        match self {
+            Share::Seals | Share::OtherSeals => true,
+            Share::Unreserved | Share::Capacity | Share::Member | Share::Sender => false,
+        }
+    }
 }
 
 /// What a rank buffer holds of each class with a share, as (messages, bytes).
@@ -1497,7 +1511,7 @@ impl SenderSeals {
             Share::Sender => "its sender holds other proofs",
             Share::Seals => "the active provers' share is full",
             Share::OtherSeals => "other senders' share is full",
-            _ => "its rank's share is full",
+            Share::Unreserved | Share::Capacity | Share::Member => "its rank's share is full",
         }
     }
 }
@@ -4307,7 +4321,7 @@ impl MessageCollector {
                 self.note_oversize_seal(Instant::now(), false, sender, bytes, rank, reason);
             }
             self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
-            if matches!(share, Share::Seals | Share::OtherSeals) {
+            if share.waits() {
                 self.seal_refused(&buffers, &message, seal_frame);
             }
             return SubmitOutcome::Filtered(Refusal::ShareFull(share));
@@ -5304,7 +5318,7 @@ impl MessageCollector {
             // A prover's copy refused waits as a plain submit's does: its
             // sender resends it, and another sender's copy held here does
             // not end its wait ([`seal_waiting::Found::ends`]).
-            if matches!(share, Share::Seals | Share::OtherSeals) {
+            if share.waits() {
                 self.seal_refused(buffers, message, frame);
             }
             return SubmitOutcome::Filtered(Refusal::ShareFull(share));
