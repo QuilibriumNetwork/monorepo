@@ -5917,7 +5917,7 @@ mod composite_scan_tests {
 
     #[cfg(feature = "confidential-tokens")]
     fn wallet_worker() -> super::super::worker_manager::WorkerAppState {
-        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let db = Arc::new(quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap());
         let hg = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             hg.clone(),
@@ -6314,8 +6314,9 @@ mod composite_scan_tests {
     }
 
     fn store() -> Arc<quil_hypergraph::HypergraphCrdt> {
-        let db: &'static quil_store::RocksDb =
-            Box::leak(Box::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let db: &'static quil_store::RocksDb = Box::leak(Box::new(
+            quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap(),
+        ));
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_tries::ShaInclusionProver),

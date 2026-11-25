@@ -1404,14 +1404,20 @@ pub trait HypergraphStore: Send + Sync {
         self.invalidate_coin_changes()
     }
 
-    /// Fence snapshots while a multi-batch replacement is incomplete. A
-    /// failed replacement keeps the fence until a later successful repair.
+    /// Suspend incremental discovery during a multi-batch replacement.
+    /// Keep the fence after failure until the same scope is repaired.
     fn set_coin_changes_installing(&self, _scope: &[u8], _installing: bool) -> Result<()> {
         self.invalidate_coin_changes()
     }
 
-    /// Whether this exact replacement scope remains unfinished. Stores
-    /// with durable fences must report uncertain recovery state as an error.
+    /// Retain the intended roots so a completed rewind can be recognized
+    /// after a crash without replaying or changing canonical state.
+    fn begin_coin_changes_rewind(&self, scope: &[u8], _roots: &[[u8; 32]; 4]) -> Result<()> {
+        self.set_coin_changes_installing(scope, true)
+    }
+
+    /// Check this replacement scope. Durable backends return an error for
+    /// unknown recovery state.
     fn is_coin_changes_installing(&self, _scope: &[u8]) -> Result<bool> {
         Ok(false)
     }

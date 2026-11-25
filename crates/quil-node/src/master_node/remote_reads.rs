@@ -1400,13 +1400,20 @@ impl PeerCoinReader {
         } else {
             Some(page.cursor.try_into().map_err(|_| malformed())?)
         };
-        let change_cursor = self
+        let change_cursor = match self
             .wrap_coin_feed_cursor(domain, endpoint, &page.change_cursor)
             .await
-            .map_err(|reason| Decline {
-                reason,
-                transfer: false,
-            })?;
+        {
+            Ok(cursor) => cursor,
+            Err(reason) => {
+                tracing::warn!(
+                    application = %hex::encode(domain),
+                    reason = %bounded_reason(&reason),
+                    "forwarded Coin snapshot has no resumable change cursor"
+                );
+                Vec::new()
+            }
+        };
         Ok(CoinPageData {
             change_cursor,
             network,
@@ -1920,6 +1927,37 @@ mod tests {
                 async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint.addr).await },
             )
         })
+    }
+
+    #[tokio::test]
+    async fn a_route_write_failure_preserves_the_forwarded_coin_snapshot() {
+        let (endpoint, _) = serve_peer(1).await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(endpoint).await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(plaintext_dial())
+            .with_read_retry(Duration::ZERO, Duration::from_millis(1));
+        db.inner()
+            .refuse_writes("injected route persistence failure");
+
+        let page = reader.coin_page([3; 32], None, None, 8).await.unwrap();
+
+        assert_eq!(page.snapshot_id, [7; 32]);
+        assert_eq!(page.coins.len(), 2);
+        assert_eq!(page.coins[0].address, [0; 32]);
+        assert_eq!(page.coins[1].address, [1; 32]);
+        assert!(page.change_cursor.is_empty());
+        assert!(reader
+            .coin_feed_routes
+            .unwrap()
+            .table
+            .lock()
+            .routes
+            .is_empty());
     }
 
     #[tokio::test]

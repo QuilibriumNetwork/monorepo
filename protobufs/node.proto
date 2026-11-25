@@ -1066,7 +1066,7 @@ message ListCoinChangesResponse {
 // An empty root_record answers a fresh scan of an application that has no
 // coin root: no confidential coin exists in it yet. Such a page has no
 // coins, no address cursor and has_more false; every other page carries the
-// root. A change_cursor can still begin watching the empty application.
+// root. An empty application can still return a change_cursor.
 message ListCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;
@@ -1074,12 +1074,11 @@ message ListCoinsResponse {
   repeated ConfidentialCoin coins = 4;
   bytes cursor = 5;
   bool has_more = 6;
-  // Fixed at the first page's snapshot, including an empty application.
-  // History is bounded: follow/stash ListCoinChanges from the first page
-  // while pagination runs if the snapshot can outlast retained history.
-  // Deduplicate outputs by address; save a feed cursor only after processing
-  // its page. A reset requires a new snapshot.
-  // Empty when incremental discovery is unavailable; use ListCoins again.
+  // Watermark of the first page's snapshot, including an empty application.
+  // History is bounded; read or buffer ListCoinChanges while paging.
+  // Deduplicate outputs by address and save each cursor after processing its page.
+  // On reset, restart ListCoins.
+  // Empty when incremental discovery is unavailable; continue using ListCoins.
   bytes change_cursor = 7;
 }
 

@@ -3,7 +3,9 @@ use quil_store::{coin_changes, encoding, RocksDb, RocksHypergraphSnapshot};
 use quil_types::store::{HypergraphStore, ShardKey};
 
 fn memory_store() -> CoordinatedDb {
-    RocksDb::open_in_memory().unwrap().inner()
+    RocksDb::open_in_memory_with_coin_changes(true)
+        .unwrap()
+        .inner()
 }
 
 fn overlay_limits() -> OverlayLimits {
@@ -33,9 +35,43 @@ fn cursor(db: &quil_forest::CoordinatedDb, domain: u8) -> Vec<u8> {
     let cursor = coin_changes::snapshot_cursor(&snapshot, &[domain; 32]).unwrap();
     assert!(
         !cursor.is_empty(),
-        "writable stores initialize the journal before snapshots"
+        "enabled stores initialize the journal before snapshots"
     );
     cursor
+}
+
+#[test]
+fn unavailable_journal_omits_the_cursor_without_failing_the_snapshot() {
+    for (key, value) in [
+        (
+            b"quil/local/coin-changes/v1/invalid".as_slice(),
+            b"1".to_vec(),
+        ),
+        (
+            b"quil/local/coin-changes/v1/install-overflow".as_slice(),
+            b"1".to_vec(),
+        ),
+        (
+            b"quil/local/coin-changes/v1/installing".as_slice(),
+            1u64.to_be_bytes().to_vec(),
+        ),
+    ] {
+        let db = memory_store();
+        db.put(b"test/canonical", b"retained").unwrap();
+        db.put(key, value).unwrap();
+        let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+        assert!(
+            coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+                .unwrap()
+                .is_empty(),
+            "{} must disable incremental discovery without refusing the snapshot",
+            String::from_utf8_lossy(key)
+        );
+        assert_eq!(
+            db.get(b"test/canonical").unwrap().as_deref(),
+            Some(b"retained".as_slice())
+        );
+    }
 }
 
 #[test]
@@ -103,7 +139,9 @@ fn unchanged_installation_metadata_is_not_rewritten() {
     assert_eq!(db.get(meta_key).unwrap(), installing_meta);
     assert_eq!(db.latest_sequence_number() - before, 1);
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
 
     coin_changes::finish_install(&db, b"retry").unwrap();
     let resumed = cursor(&db, 1);
@@ -163,7 +201,7 @@ fn a_transactional_reset_is_discarded_on_abort_and_published_with_state() {
     txn.abort().unwrap();
     assert_eq!(cursor(&db, 1), start);
 
-    let foreign = RocksDb::open_in_memory().unwrap();
+    let foreign = RocksDb::open_in_memory_with_coin_changes(true).unwrap();
     let foreign_store = quil_store::RocksHypergraphStore::new(foreign.inner());
     let foreign_txn = foreign_store.new_transaction(false).unwrap();
     assert!(hypergraph
@@ -218,7 +256,7 @@ fn a_private_transactional_reset_waits_for_overlay_publication() {
 #[test]
 fn journal_tracks_arrival_order_and_resumes_after_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let start = cursor(&db, 1);
     db.put(row(1, 9, 900), vec![9; 4096]).unwrap();
@@ -231,7 +269,7 @@ fn journal_tracks_arrival_order_and_resumes_after_reopen() {
     let continued = first.cursor;
     drop(db);
     drop(store);
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let page = coin_changes::read_page(&store.inner(), &[1; 32], &continued, 8, 100_000).unwrap();
     assert!(!page.reset);
     assert_eq!(page.records.len(), 1);
@@ -361,6 +399,10 @@ fn a_page_bounds_work_even_when_every_record_belongs_to_another_domain() {
     let start = cursor(&db, 1);
     let mut batch = rocksdb::WriteBatch::default();
     for version in 0..1025 {
+        if version > 0 && version % 32 == 0 {
+            db.write(batch).unwrap();
+            batch = rocksdb::WriteBatch::default();
+        }
         batch.put(row(2, 3, version), vec![3; 4096]);
     }
     batch.put(row(1, 4, 1), vec![4; 4096]);
@@ -384,7 +426,7 @@ fn a_page_bounds_work_even_when_every_record_belongs_to_another_domain() {
 #[test]
 fn snapshot_import_resets_and_excludes_another_nodes_local_continuity() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let old = cursor(&db, 1);
     let source = rocksdb::DB::open_default(directory.path().join("snapshot")).unwrap();
@@ -417,6 +459,134 @@ fn snapshot_import_resets_and_excludes_another_nodes_local_continuity() {
 }
 
 #[test]
+fn snapshot_install_markers_share_the_required_import_batches() {
+    for enabled in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("snapshot");
+        let store = RocksDb::open_with_coin_changes(directory.path(), enabled).unwrap();
+        let db = store.inner();
+        let source = rocksdb::DB::open_default(&staging).unwrap();
+        source.put(row(1, 4, 1), vec![4; 4096]).unwrap();
+        drop(source);
+        let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+        db.take_write_times();
+
+        hypergraph
+            .apply_snapshot(directory.path().to_str().unwrap())
+            .unwrap();
+
+        assert_eq!(db.take_write_times().writes, 2, "enabled={enabled}");
+        assert_eq!(db.get(row(1, 4, 1)).unwrap(), Some(vec![4; 4096]));
+        assert_eq!(
+            db.get(coin_changes::SNAPSHOT_INSTALL_STATE)
+                .unwrap()
+                .as_deref(),
+            Some(b"0".as_slice())
+        );
+        let mut events = db.raw_iterator();
+        events.seek(b"quil/local/coin-changes/v1/events/");
+        assert!(!events
+            .key()
+            .is_some_and(|key| key.starts_with(b"quil/local/coin-changes/v1/events/")));
+        events.status().unwrap();
+        assert!(!staging.exists());
+    }
+}
+
+#[test]
+fn optional_hooks_do_not_consume_the_overlay_read_budget() {
+    for mode in ["off", "on", "off-after-on"] {
+        let directory = tempfile::tempdir().unwrap();
+        if mode == "off-after-on" {
+            drop(RocksDb::open_with_coin_changes(directory.path(), true).unwrap());
+        }
+        let store = RocksDb::open_with_coin_changes(directory.path(), mode == "on").unwrap();
+        let db = store.inner();
+        let branch = std::sync::Arc::new(
+            ExecutionOverlay::capture(
+                db.clone(),
+                OverlayLimits {
+                    max_read_operations: 0,
+                    max_delta_entries: 1,
+                    max_delta_bytes: b"test/canonical".len() + b"state".len(),
+                    max_record_bytes: b"test/canonical".len() + b"state".len(),
+                    ..overlay_limits()
+                },
+            )
+            .unwrap(),
+        );
+        let tentative = quil_store::OverlayHypergraphStore::new(branch.clone());
+        let before = db.latest_sequence_number();
+        tentative
+            .set_coin_changes_installing(b"test-scope", true)
+            .unwrap();
+        tentative
+            .set_coin_changes_installing(b"test-scope", false)
+            .unwrap();
+        tentative
+            .begin_coin_changes_rewind(b"rewind/test-scope", &[[0; 32]; 4])
+            .unwrap();
+        assert!(!tentative.is_coin_changes_installing(b"test-scope").unwrap());
+        let txn = tentative.new_transaction(false).unwrap();
+        txn.set(b"test/canonical", b"state").unwrap();
+        tentative
+            .invalidate_coin_changes_in_transaction(txn.as_ref())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(branch.stats().delta_entries, 1, "mode={mode}");
+        assert_eq!(
+            branch.stats().delta_bytes,
+            b"test/canonical".len() + b"state".len(),
+            "mode={mode}"
+        );
+        assert_eq!(branch.stats().read_operations, 0, "mode={mode}");
+        assert_eq!(branch.stats().read_bytes, 0, "mode={mode}");
+        assert!(branch.execution_healthy());
+        assert!(db.get(b"test/canonical").unwrap().is_none());
+
+        branch.prepare_commit().unwrap().commit(&db).unwrap();
+
+        assert_eq!(
+            db.get(b"test/canonical").unwrap().as_deref(),
+            Some(b"state".as_slice())
+        );
+        if mode != "on" {
+            assert_eq!(db.latest_sequence_number() - before, 1);
+        }
+    }
+}
+
+#[test]
+fn optional_hooks_reject_closed_and_expired_overlays() {
+    for mode in ["closed", "expired", "released"] {
+        let store = RocksDb::open_in_memory().unwrap();
+        let admission = quil_forest::ExecutionViewAdmission::new(
+            4,
+            if mode == "closed" {
+                std::time::Duration::from_secs(60)
+            } else {
+                std::time::Duration::ZERO
+            },
+        );
+        let branch = std::sync::Arc::new(
+            ExecutionOverlay::capture_admitted(store.inner(), overlay_limits(), &admission)
+                .unwrap(),
+        );
+        if mode == "closed" {
+            branch.close();
+        } else if mode == "released" {
+            assert_eq!(admission.release_expired(), 1);
+        }
+        let tentative = quil_store::OverlayHypergraphStore::new(branch.clone());
+        assert!(tentative
+            .set_coin_changes_installing(b"test-scope", true)
+            .is_err());
+        assert!(!branch.execution_healthy());
+        assert!(branch.prepare_commit().is_err());
+    }
+}
+
+#[test]
 fn tiny_response_budget_cannot_advance_past_a_matching_record() {
     let db = memory_store();
     let start = cursor(&db, 1);
@@ -434,7 +604,7 @@ fn tiny_response_budget_cannot_advance_past_a_matching_record() {
 #[test]
 fn scoped_installation_stays_unavailable_until_every_started_scope_finishes() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let old = cursor(&db, 1);
     coin_changes::begin_install(&db, b"rewind/one").unwrap();
@@ -443,14 +613,18 @@ fn scoped_installation_stays_unavailable_until_every_started_scope_finishes() {
     coin_changes::finish_install(&db, b"rewind/one").unwrap();
     coin_changes::finish_install(&db, b"rewind/one").unwrap();
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
     drop(snapshot);
     drop(db);
     drop(store);
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
     assert!(
         coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
             .unwrap()
@@ -481,7 +655,7 @@ fn completing_an_inactive_scope_preserves_an_existing_cursor() {
 #[test]
 fn installation_scope_query_is_precise_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
     assert!(!hypergraph.is_coin_changes_installing(b"one").unwrap());
@@ -491,7 +665,7 @@ fn installation_scope_query_is_precise_and_survives_reopen() {
     drop(hypergraph);
     drop(db);
     drop(store);
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
     assert!(hypergraph.is_coin_changes_installing(b"one").unwrap());
@@ -583,7 +757,7 @@ fn installation_scope_query_refuses_malformed_fence_state() {
 #[test]
 fn snapshot_import_missing_staging_is_an_error_while_its_scope_is_active() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
     // A repeated call without any started import remains a harmless no-op.
@@ -604,7 +778,7 @@ fn snapshot_import_missing_staging_is_an_error_while_its_scope_is_active() {
 #[test]
 fn snapshot_import_missing_staging_does_not_finish_another_scope() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     coin_changes::begin_install(&db, b"unrelated-maintenance").unwrap();
     let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
@@ -612,7 +786,9 @@ fn snapshot_import_missing_staging_does_not_finish_another_scope() {
         .apply_snapshot(directory.path().to_str().unwrap())
         .unwrap();
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
     coin_changes::finish_install(&db, b"unrelated-maintenance").unwrap();
     assert!(!cursor(&db, 1).is_empty());
 }
@@ -622,7 +798,7 @@ fn snapshot_import_missing_staging_does_not_finish_another_scope() {
 fn snapshot_import_failed_final_write_retains_staging_and_retries_after_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let staging = directory.path().join("snapshot");
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let old = cursor(&db, 1);
     let source = rocksdb::DB::open_default(&staging).unwrap();
@@ -647,7 +823,7 @@ fn snapshot_import_failed_final_write_retains_staging_and_retries_after_reopen()
     drop(db);
     drop(store);
 
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
     assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
@@ -665,25 +841,26 @@ fn snapshot_import_failed_final_write_retains_staging_and_retries_after_reopen()
 }
 
 #[test]
-fn snapshot_import_unfinished_projection_retains_staging_and_reports_failure() {
+fn snapshot_import_completion_is_independent_of_its_optional_projection() {
     let directory = tempfile::tempdir().unwrap();
     let staging = directory.path().join("snapshot");
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let source = rocksdb::DB::open_default(&staging).unwrap();
     source.put(row(1, 4, 1), vec![4; 4096]).unwrap();
     drop(source);
-    // The original import writes can succeed while their local projection
-    // fails. Completing that write alone must not discard the retry source.
+    // Inject a projection failure without rejecting the canonical writes.
     db.put(b"quil/local/coin-changes/v1/installing", b"bad-count")
         .unwrap();
     let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
-    assert!(hypergraph
+    hypergraph
         .apply_snapshot(directory.path().to_str().unwrap())
-        .is_err());
-    assert!(staging.is_dir());
+        .unwrap();
+    assert!(!staging.exists());
     let snapshot = RocksHypergraphSnapshot::capture(db).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -715,6 +892,11 @@ fn one_batch_over_the_journal_capacity_resets_without_losing_canonical_rows() {
             .unwrap()
             .reset
     );
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    db.put(b"test/canonical", b"recover").unwrap();
     assert!(!cursor(&db, 1).is_empty());
 }
 
@@ -766,8 +948,7 @@ fn cursor_head_checks_epoch_domain_future_and_unfinished_installation_without_sc
 #[test]
 fn failed_projection_replays_a_durable_begin_before_another_scope_finishes() {
     let db = memory_store();
-    // Corrupt count bytes make the projector fail after the original scope
-    // request is staged. The original request and invalid marker must survive.
+    // A bad count leaves the begin request and INVALID durable.
     db.put(b"quil/local/coin-changes/v1/installing", b"bad-count")
         .unwrap();
     coin_changes::begin_install(&db, b"still-running").unwrap();
@@ -779,7 +960,9 @@ fn failed_projection_replays_a_durable_begin_before_another_scope_finishes() {
         .unwrap();
     coin_changes::finish_install(&db, b"unrelated").unwrap();
     let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
-    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
     coin_changes::finish_install(&db, b"still-running").unwrap();
     assert!(!cursor(&db, 1).is_empty());
 }
@@ -788,17 +971,21 @@ fn failed_projection_replays_a_durable_begin_before_another_scope_finishes() {
 fn journal_retention_expires_old_cursors_but_keeps_recent_continuations() {
     let db = memory_store();
     let old = cursor(&db, 1);
-    let mut first = rocksdb::WriteBatch::default();
-    for version in 0..900 {
-        first.put(row(1, 2, version), vec![4; 65_536]);
+    for start in (0..900).step_by(4) {
+        let mut batch = rocksdb::WriteBatch::default();
+        for version in start..(start + 4).min(900) {
+            batch.put(row(1, 2, version), vec![4; 65_536]);
+        }
+        db.write(batch).unwrap();
     }
-    db.write(first).unwrap();
     let recent = cursor(&db, 1);
-    let mut second = rocksdb::WriteBatch::default();
-    for version in 900..1100 {
-        second.put(row(1, 2, version), vec![5; 65_536]);
+    for start in (900..1100).step_by(4) {
+        let mut batch = rocksdb::WriteBatch::default();
+        for version in start..(start + 4).min(1100) {
+            batch.put(row(1, 2, version), vec![5; 65_536]);
+        }
+        db.write(batch).unwrap();
     }
-    db.write(second).unwrap();
     assert!(coin_changes::cursor_head(&db, &[1; 32], &old)
         .unwrap()
         .is_none());
@@ -848,7 +1035,7 @@ fn concurrent_writers_share_one_durable_arrival_sequence() {
 #[test]
 fn refused_state_write_cannot_advance_the_durable_feed() {
     let directory = tempfile::tempdir().unwrap();
-    let store = RocksDb::open(directory.path()).unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let db = store.inner();
     let before = cursor(&db, 1);
     db.refuse_writes("injected storage failure");
@@ -857,7 +1044,7 @@ fn refused_state_write_cannot_advance_the_durable_feed() {
     assert_eq!(cursor(&db, 1), before);
     drop(db);
     drop(store);
-    let reopened = RocksDb::open(directory.path()).unwrap();
+    let reopened = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
     let page = coin_changes::read_page(&reopened.inner(), &[1; 32], &before, 8, 100_000).unwrap();
     assert!(page.records.is_empty());
     assert_eq!(page.cursor, before);
@@ -906,4 +1093,729 @@ fn unrelated_large_raw_payload_and_go_tree_do_not_reset_coin_continuity() {
     );
     assert!(page.records.is_empty());
     assert_eq!(page.cursor, start);
+}
+
+#[test]
+fn stores_leave_the_projector_off_unless_explicitly_enabled() {
+    let store = RocksDb::open_in_memory().unwrap();
+    let db = store.inner();
+    assert!(!db.has_local_projection(coin_changes::NAMESPACE).unwrap());
+    let before = db.latest_sequence_number();
+    db.put(row(1, 4, 1), vec![4; 4096]).unwrap();
+    assert_eq!(db.latest_sequence_number() - before, 1);
+    let snapshot = RocksHypergraphSnapshot::capture(db).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn scope_overflow_recovers_after_all_recorded_requests_finish() {
+    let db = memory_store();
+    let old = cursor(&db, 1);
+    for index in 0..129 {
+        coin_changes::begin_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+    }
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    for index in 0..128 {
+        coin_changes::finish_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+    }
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    coin_changes::finish_install(&db, b"scope/128").unwrap();
+    assert!(!cursor(&db, 1).is_empty());
+    assert!(
+        coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
+            .unwrap()
+            .reset
+    );
+}
+
+#[test]
+fn disabling_then_reenabling_resets_old_cursors_but_retains_canonical_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let old = cursor(&store.inner(), 1);
+    store.inner().put(row(1, 1, 1), vec![1; 4096]).unwrap();
+    drop(store);
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    assert!(coin_changes::cursor_head(&store.inner(), &[1; 32], &old)
+        .unwrap()
+        .is_some());
+    drop(store);
+    let store = RocksDb::open(directory.path()).unwrap();
+    let db = store.inner();
+    assert!(!db.has_local_projection(coin_changes::NAMESPACE).unwrap());
+    db.put(row(1, 2, 2), vec![2; 4096]).unwrap();
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    let before = db.latest_sequence_number();
+    let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+    hypergraph
+        .set_coin_changes_installing(b"unrelated", true)
+        .unwrap();
+    assert_eq!(db.latest_sequence_number(), before);
+    drop(hypergraph);
+    drop(snapshot);
+    drop(db);
+    drop(store);
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let db = store.inner();
+    assert!(db.get(row(1, 1, 1)).unwrap().is_some());
+    assert!(db.get(row(1, 2, 2)).unwrap().is_some());
+    assert!(!cursor(&db, 1).is_empty());
+    assert!(
+        coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
+            .unwrap()
+            .reset
+    );
+}
+
+#[test]
+fn verified_completed_maintenance_is_recovered_at_open() {
+    for kind in ["wipe", "reset", "rewind"] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        let db = store.inner();
+        let old = cursor(&db, 1);
+        let mut scope = format!("{kind}/").into_bytes();
+        scope.extend([7; 32]);
+        if kind == "wipe" {
+            scope.push(0);
+        }
+        if kind == "rewind" {
+            let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+            hypergraph
+                .begin_coin_changes_rewind(&scope, &[[0; 32]; 4])
+                .unwrap();
+        } else {
+            coin_changes::begin_install(&db, &scope).unwrap();
+        }
+        drop(db);
+        drop(store);
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        let db = store.inner();
+        let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+        assert!(
+            !hypergraph.is_coin_changes_installing(&scope).unwrap(),
+            "{kind}"
+        );
+        assert!(!cursor(&db, 1).is_empty(), "{kind}");
+        assert!(
+            coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
+                .unwrap()
+                .reset
+        );
+    }
+}
+
+#[test]
+fn a_partial_import_stays_unavailable_with_the_feed_disabled() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = directory.path().join("snapshot");
+    let store = RocksDb::open(directory.path()).unwrap();
+    let source = rocksdb::DB::open_default(&staging).unwrap();
+    for version in 0..101 {
+        source.put(row(1, 4, version), vec![4; 4096]).unwrap();
+    }
+    drop(source);
+    let hypergraph = quil_store::RocksHypergraphStore::new(store.inner());
+    hypergraph.fail_commit_for_test(true);
+    assert!(hypergraph
+        .apply_snapshot(directory.path().to_str().unwrap())
+        .is_err());
+    assert!(store.inner().get(row(1, 4, 0)).unwrap().is_some());
+    assert!(store.inner().get(row(1, 4, 100)).unwrap().is_none());
+    drop(hypergraph);
+    drop(store);
+    let store = RocksDb::open(directory.path()).unwrap();
+    let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_err());
+    drop(snapshot);
+    let hypergraph = quil_store::RocksHypergraphStore::new(store.inner());
+    hypergraph
+        .apply_snapshot(directory.path().to_str().unwrap())
+        .unwrap();
+    let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    assert!(!staging.exists());
+    for version in 0..101 {
+        assert_eq!(
+            store.inner().get(row(1, 4, version)).unwrap(),
+            Some(vec![4; 4096])
+        );
+    }
+}
+
+#[test]
+fn completed_import_does_not_become_pending_again_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = directory.path().join("snapshot");
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let source = rocksdb::DB::open_default(&staging).unwrap();
+    source.put(b"test/canonical", b"imported").unwrap();
+    drop(source);
+    store
+        .inner()
+        .put(b"quil/local/coin-changes/v1/installing", b"bad-count")
+        .unwrap();
+    let hypergraph = quil_store::RocksHypergraphStore::new(store.inner());
+    hypergraph
+        .apply_snapshot(directory.path().to_str().unwrap())
+        .unwrap();
+    store.inner().put(b"test/canonical", b"newer").unwrap();
+    drop(hypergraph);
+    drop(store);
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_ok());
+    let hypergraph = quil_store::RocksHypergraphStore::new(store.inner());
+    hypergraph
+        .apply_snapshot(directory.path().to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        store.inner().get(b"test/canonical").unwrap().as_deref(),
+        Some(b"newer".as_slice())
+    );
+}
+
+#[test]
+fn a_completed_import_allows_a_new_explicit_snapshot_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = directory.path().join("snapshot");
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let hypergraph = quil_store::RocksHypergraphStore::new(store.inner());
+    for value in [b"first".as_slice(), b"replacement".as_slice()] {
+        let source = rocksdb::DB::open_default(&staging).unwrap();
+        source.put(b"test/canonical", value).unwrap();
+        drop(source);
+        hypergraph
+            .apply_snapshot(directory.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            store.inner().get(b"test/canonical").unwrap().as_deref(),
+            Some(value)
+        );
+        assert!(!staging.exists());
+        let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+        assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32]).is_ok());
+    }
+}
+
+#[test]
+fn deferred_scope_overflow_recovers_across_a_bounded_startup_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let old = cursor(&store.inner(), 1);
+    for index in 0..257 {
+        coin_changes::begin_install(&store.inner(), format!("scope/{index:03}").as_bytes())
+            .unwrap();
+    }
+    drop(store);
+    let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+    let db = store.inner();
+    for index in 0..257 {
+        coin_changes::finish_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+    }
+    assert!(db
+        .get(b"quil/local/coin-changes/v1/install-overflow")
+        .unwrap()
+        .is_none());
+    assert!(!cursor(&db, 1).is_empty());
+    assert!(
+        coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
+            .unwrap()
+            .reset
+    );
+}
+
+#[test]
+fn ordinary_writes_during_scope_overflow_do_not_rotate_the_journal() {
+    let db = memory_store();
+    for index in 0..129 {
+        coin_changes::begin_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+    }
+    let before = db.latest_sequence_number();
+    db.put(b"test/canonical", b"ordinary").unwrap();
+    assert_eq!(db.latest_sequence_number() - before, 1);
+}
+
+#[test]
+fn completed_resets_drain_deferred_requests_after_reopen() {
+    for count in [257u64, 1025] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        for index in 0..count {
+            let mut app = [7; 32];
+            app[..8].copy_from_slice(&index.to_be_bytes());
+            let scope = [b"reset/".as_slice(), app.as_slice()].concat();
+            // The reset trees are already physically empty; only finish was lost.
+            coin_changes::begin_install(&store.inner(), &scope).unwrap();
+        }
+        drop(store);
+        let mut recovered = false;
+        for attempt in 0..4 {
+            let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+            let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+            let cursor = coin_changes::snapshot_cursor(&snapshot, &[1; 32]).unwrap();
+            if count == 257 && attempt == 0 {
+                assert!(
+                    !cursor.is_empty(),
+                    "257 completed scopes fit one recovery open"
+                );
+            }
+            if !cursor.is_empty() {
+                assert!(store
+                    .inner()
+                    .get(b"quil/local/coin-changes/v1/install-overflow")
+                    .unwrap()
+                    .is_none());
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "{count} completed reset scopes must make progress"
+        );
+    }
+}
+
+#[test]
+fn one_batch_of_deferred_begins_writes_overflow_only_once() {
+    let db = memory_store();
+    for index in 0..128 {
+        coin_changes::begin_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+    }
+    let mut batch = rocksdb::WriteBatch::default();
+    for index in 128..256 {
+        let key = format!("quil/local/coin-changes/v1/install-requests/scope/{index:03}");
+        batch.put(key, [1]);
+    }
+    let before = db.latest_sequence_number();
+    db.write(batch).unwrap();
+    // 128 original requests and one auxiliary overflow marker.
+    assert_eq!(db.latest_sequence_number() - before, 129);
+    for index in 128..256 {
+        let key = format!("quil/local/coin-changes/v1/install-requests/scope/{index:03}");
+        assert_eq!(db.get(key).unwrap().as_deref(), Some([1].as_slice()));
+    }
+}
+
+#[test]
+fn an_unreadable_journal_does_not_duplicate_coin_blobs_while_fenced() {
+    for tracked in [false, true] {
+        let db = memory_store();
+        let old = cursor(&db, 1);
+        if tracked {
+            for index in 0..257 {
+                coin_changes::begin_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+            }
+            for index in 0..128 {
+                coin_changes::finish_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+            }
+        } else {
+            db.put(b"quil/local/coin-changes/v1/install-overflow", b"1")
+                .unwrap();
+        }
+        assert!(db
+            .get(b"quil/local/coin-changes/v1/installing")
+            .unwrap()
+            .is_none());
+        let before = db.latest_sequence_number();
+        db.put(row(1, 4, 1), vec![4; 4096]).unwrap();
+        assert_eq!(db.latest_sequence_number() - before, 1);
+        assert_eq!(db.get(row(1, 4, 1)).unwrap(), Some(vec![4; 4096]));
+        let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+        assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+            .unwrap()
+            .is_empty());
+        if tracked {
+            for index in 128..257 {
+                coin_changes::finish_install(&db, format!("scope/{index:03}").as_bytes()).unwrap();
+            }
+            assert!(
+                coin_changes::read_page(&db, &[1; 32], &old, 8, 100_000)
+                    .unwrap()
+                    .reset
+            );
+            let resumed = cursor(&db, 1);
+            db.put(row(1, 5, 1), vec![5; 4096]).unwrap();
+            let page = coin_changes::read_page(&db, &[1; 32], &resumed, 8, 100_000).unwrap();
+            assert!(!page.reset);
+            assert_eq!(page.records.len(), 1);
+            assert_eq!(page.records[0].key[32..], [5; 32]);
+        }
+    }
+}
+
+#[test]
+fn malformed_optional_snapshot_scope_does_not_become_a_canonical_import() {
+    for enabled in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        store.inner().put(row(1, 4, 1), vec![4; 4096]).unwrap();
+        store
+            .inner()
+            .put(
+                b"quil/local/coin-changes/v1/install-scopes/snapshot-install",
+                b"malformed",
+            )
+            .unwrap();
+        drop(store);
+        let store = RocksDb::open_with_coin_changes(directory.path(), enabled).unwrap();
+        assert!(store
+            .inner()
+            .get(coin_changes::SNAPSHOT_INSTALL_STATE)
+            .unwrap()
+            .is_none());
+        let snapshot = RocksHypergraphSnapshot::capture(store.inner()).unwrap();
+        assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inner().get(row(1, 4, 1)).unwrap(),
+            Some(vec![4; 4096])
+        );
+    }
+}
+
+#[test]
+fn startup_verifies_recorded_rewind_roots_without_changing_the_tree() {
+    for case in ["matching", "different", "headless"] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        let db = store.inner();
+        let app = [7; 32];
+        let phase = quil_forest::Phase::VertexAdds;
+        let forest = quil_forest::Forest::with_namespace(db.clone(), quil_store::FOREST_NAMESPACE);
+        let staged = forest
+            .stage_synced_phase(
+                &app,
+                phase,
+                0,
+                [(quil_forest::KeyHash([1; 32]), Some(vec![9]))],
+                &[],
+                None,
+            )
+            .unwrap();
+        let root = staged.root();
+        let mut batch = rocksdb::WriteBatch::default();
+        for (key, value) in staged.puts() {
+            batch.put(key, value);
+        }
+        if case != "headless" {
+            let (key, value) = forest.head_version_put(&app, phase, 0).unwrap();
+            batch.put(key, value);
+        }
+        db.write(batch).unwrap();
+        staged.publish_memory().unwrap();
+        let scope = [b"rewind/".as_slice(), app.as_slice()].concat();
+        let mut targets = [root, [0; 32], [0; 32], [0; 32]];
+        if case == "different" {
+            targets[0] = [99; 32];
+        }
+        let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+        hypergraph
+            .begin_coin_changes_rewind(&scope, &targets)
+            .unwrap();
+        drop(hypergraph);
+        drop(forest);
+        drop(db);
+        drop(store);
+        let store = RocksDb::open_with_coin_changes(directory.path(), true).unwrap();
+        let db = store.inner();
+        let hypergraph = quil_store::RocksHypergraphStore::new(db.clone());
+        assert_eq!(
+            hypergraph.is_coin_changes_installing(&scope).unwrap(),
+            case != "matching"
+        );
+        let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+        assert_eq!(
+            coin_changes::snapshot_cursor(&snapshot, &[7; 32])
+                .unwrap()
+                .is_empty(),
+            case != "matching"
+        );
+        let forest = quil_forest::Forest::with_namespace(db, quil_store::FOREST_NAMESPACE);
+        assert_eq!(
+            forest.shard_phase_root(&app, phase, 0).unwrap(),
+            Some(root),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn private_reset_hints_follow_transaction_abort_and_fork_ownership() {
+    for (publish_hint, finish, use_earlier_child) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let db = memory_store();
+        let start = cursor(&db, 1);
+        let parent =
+            std::sync::Arc::new(ExecutionOverlay::capture(db.clone(), overlay_limits()).unwrap());
+        let branch = quil_store::OverlayHypergraphStore::new(parent.clone());
+        let clean_child = parent.fork(overlay_limits()).unwrap();
+        let txn = branch.new_transaction(false).unwrap();
+        branch
+            .invalidate_coin_changes_in_transaction(txn.as_ref())
+            .unwrap();
+        txn.abort().unwrap();
+        if publish_hint {
+            branch
+                .set_coin_changes_installing(b"private-reset", true)
+                .unwrap();
+        }
+        if finish {
+            branch
+                .set_coin_changes_installing(b"private-reset", false)
+                .unwrap();
+        }
+        let child = parent.fork(overlay_limits()).unwrap();
+        assert_eq!(parent.stats().delta_entries, 0);
+        assert_eq!(parent.stats().delta_bytes, 0);
+        assert_eq!(cursor(&db, 1), start);
+        // A child captured before its parent's hint must remain independent.
+        parent.close();
+        if use_earlier_child {
+            clean_child.prepare_commit().unwrap().commit(&db).unwrap();
+        } else {
+            child.prepare_commit().unwrap().commit(&db).unwrap();
+        }
+        assert_eq!(
+            coin_changes::read_page(&db, &[1; 32], &start, 8, 100_000)
+                .unwrap()
+                .reset,
+            publish_hint && !use_earlier_child
+        );
+    }
+}
+
+#[test]
+fn private_maintenance_keeps_prior_durable_scope_visible_without_read_budget() {
+    let db = memory_store();
+    coin_changes::begin_install(&db, b"prior-wipe").unwrap();
+    db.put(
+        b"quil/local/coin-changes/v1/install-scopes/oversized",
+        vec![0; 256 << 10],
+    )
+    .unwrap();
+    let parent = std::sync::Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            OverlayLimits {
+                max_read_operations: 0,
+                ..overlay_limits()
+            },
+        )
+        .unwrap(),
+    );
+    let branch = quil_store::OverlayHypergraphStore::new(parent.clone());
+    assert!(branch.is_coin_changes_installing(b"prior-wipe").unwrap());
+    assert!(branch.is_coin_changes_installing(b"oversized").is_err());
+    assert!(parent.execution_healthy());
+
+    branch
+        .set_coin_changes_installing(b"private-reset", true)
+        .unwrap();
+    branch
+        .set_coin_changes_installing(b"private-reset", false)
+        .unwrap();
+    assert!(branch.is_coin_changes_installing(b"prior-wipe").unwrap());
+    assert_eq!(parent.stats().read_operations, 0);
+    parent.prepare_commit().unwrap().commit(&db).unwrap();
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.get(b"quil/local/coin-changes/v1/installing")
+            .unwrap()
+            .unwrap(),
+        1u64.to_be_bytes()
+    );
+}
+
+#[test]
+fn projection_work_limits_preserve_canonical_rows_and_force_rescan() {
+    for large_input in [false, true] {
+        let db = memory_store();
+        let start = cursor(&db, 1);
+        let mut batch = rocksdb::WriteBatch::default();
+        let expected = if large_input {
+            let value = vec![6; 9 << 20];
+            batch.put(b"test/canonical-large", &value);
+            vec![(b"test/canonical-large".to_vec(), value)]
+        } else {
+            (0..40)
+                .map(|index| {
+                    let key = row(1, index, 1);
+                    let value = vec![6; 32 << 10];
+                    batch.put(&key, &value);
+                    (key, value)
+                })
+                .collect::<Vec<_>>()
+        };
+        db.write(batch).unwrap();
+        for (key, value) in expected {
+            assert_eq!(db.get(key).unwrap(), Some(value));
+        }
+        assert!(!db.write_failed());
+        assert!(db
+            .get(b"quil/local/coin-changes/v1/invalid")
+            .unwrap()
+            .is_some());
+        assert!(
+            coin_changes::read_page(&db, &[1; 32], &start, 8, 100_000)
+                .unwrap()
+                .reset
+        );
+        // Recovery rotates the epoch; subsequent small arrivals remain discoverable.
+        db.put(b"test/canonical", b"recovery").unwrap();
+        let resumed = cursor(&db, 1);
+        db.put(row(1, 99, 1), vec![7; 4096]).unwrap();
+        let page = coin_changes::read_page(&db, &[1; 32], &resumed, 8, 100_000).unwrap();
+        assert!(!page.reset);
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].key[32..], [99; 32]);
+    }
+}
+
+#[test]
+fn private_shard_clear_uses_only_the_eight_canonical_range_entries() {
+    let db = memory_store();
+    let parent = std::sync::Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            OverlayLimits {
+                max_delta_entries: 8,
+                ..overlay_limits()
+            },
+        )
+        .unwrap(),
+    );
+    let branch = quil_store::OverlayHypergraphStore::new(parent.clone());
+    branch
+        .clear_shard_underlying(&ShardKey {
+            l1: [7; 3],
+            l2: [1; 32],
+        })
+        .unwrap();
+    assert!(parent.execution_healthy());
+    assert_eq!(parent.stats().delta_entries, 8);
+    parent.prepare_commit().unwrap().commit(&db).unwrap();
+}
+
+#[test]
+fn private_recovery_can_finish_a_prior_durable_scope() {
+    for cancel in [false, true] {
+        let db = memory_store();
+        let start = cursor(&db, 1);
+        coin_changes::begin_install(&db, b"prior-wipe").unwrap();
+        let parent = std::sync::Arc::new(
+            ExecutionOverlay::capture(
+                db.clone(),
+                OverlayLimits {
+                    max_read_operations: 0,
+                    max_delta_entries: 0,
+                    ..overlay_limits()
+                },
+            )
+            .unwrap(),
+        );
+        let branch = quil_store::OverlayHypergraphStore::new(parent.clone());
+        assert!(branch.is_coin_changes_installing(b"prior-wipe").unwrap());
+        branch
+            .set_coin_changes_installing(b"prior-wipe", false)
+            .unwrap();
+        if cancel {
+            branch
+                .set_coin_changes_installing(b"prior-wipe", true)
+                .unwrap();
+        }
+        assert!(db
+            .get(b"quil/local/coin-changes/v1/installing")
+            .unwrap()
+            .is_some());
+        parent.prepare_commit().unwrap().commit(&db).unwrap();
+        assert_eq!(
+            db.get(b"quil/local/coin-changes/v1/installing")
+                .unwrap()
+                .is_some(),
+            cancel
+        );
+        let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+        assert_eq!(
+            coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+                .unwrap()
+                .is_empty(),
+            cancel
+        );
+        assert!(
+            coin_changes::read_page(&db, &[1; 32], &start, 8, 100_000)
+                .unwrap()
+                .reset
+        );
+    }
+}
+
+#[test]
+fn a_new_private_overflow_fence_survives_recovery_of_old_tracked_overflow() {
+    let db = memory_store();
+    let start = cursor(&db, 1);
+    db.put(b"quil/local/coin-changes/v1/install-overflow", b"2")
+        .unwrap();
+    let parent = ExecutionOverlay::capture(db.clone(), overlay_limits()).unwrap();
+    parent
+        .stage_local_projection_records(
+            coin_changes::NAMESPACE,
+            b"quil/local/coin-changes/v1/reset-request",
+            b"quil/local/coin-changes/v1/install-overflow",
+            &[(
+                b"quil/local/coin-changes/v1/install-requests/untracked",
+                &vec![1; 513],
+            )],
+        )
+        .unwrap();
+    parent
+        .apply(&[OverlayMutation::Put(
+            b"test/canonical".to_vec(),
+            b"state".to_vec(),
+        )])
+        .unwrap();
+    assert!(parent.execution_healthy());
+    assert_eq!(parent.stats().delta_entries, 1);
+    parent.prepare_commit().unwrap().commit(&db).unwrap();
+    assert_eq!(
+        db.get(b"test/canonical").unwrap().as_deref(),
+        Some(b"state".as_slice())
+    );
+    assert_eq!(
+        db.get(b"quil/local/coin-changes/v1/install-overflow")
+            .unwrap()
+            .as_deref(),
+        Some(b"1".as_slice())
+    );
+    let snapshot = RocksHypergraphSnapshot::capture(db.clone()).unwrap();
+    assert!(coin_changes::snapshot_cursor(&snapshot, &[1; 32])
+        .unwrap()
+        .is_empty());
+    assert!(
+        coin_changes::read_page(&db, &[1; 32], &start, 8, 100_000)
+            .unwrap()
+            .reset
+    );
 }

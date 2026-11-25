@@ -173,10 +173,8 @@ pub fn unrooted_coins_error() -> QuilError {
     )
 }
 
-/// A wallet scan's page. A rootless application returns [`WalletPage::NoRoot`]
-/// only when bounded enumeration proves this snapshot contains no Coin.
-/// Root publication can lag delivered records, so an empty first page alone
-/// cannot establish that the application is empty.
+/// A rootless scan returns [`WalletPage::NoRoot`] after exhausting its
+/// candidate rows without finding a Coin. Coin rows can arrive before a root.
 ///
 /// Only a fresh scan gets that answer. A continuation without a root is an
 /// error, and a rootless scan that finds a coin is
@@ -196,9 +194,8 @@ pub fn scan_wallet_page(
     if after.is_some() {
         return Err(no_root());
     }
-    // Large rows also include escrows. An empty bounded page proves nothing
-    // about later rows, especially when a wallet uses this snapshot's tail
-    // as its starting point for incremental discovery.
+    // Pages can contain only escrows. Check later rows before issuing an
+    // empty bootstrap.
     let mut probe_after = None;
     for _ in 0..8 {
         let (coins, cursor, has_more) =
@@ -637,8 +634,7 @@ mod tests {
             "an exhausted rootless probe must not issue an empty bootstrap"
         );
 
-        // Root publication alone must make the existing coin discoverable;
-        // it must not require rewriting the coin into a newer journal event.
+        // Publishing the root exposes the existing Coin without rewriting it.
         roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap();
         state.commit().unwrap();
         state.abort();

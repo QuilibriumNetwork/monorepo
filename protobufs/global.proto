@@ -1072,7 +1072,7 @@ message ListShardCoinsResponse {
   repeated ShardCoin coins = 4;
   bytes cursor = 5;
   bool has_more = 6;
-  // Same fixed bootstrap watermark and unsupported-empty contract as ListCoins.
+  // Same snapshot watermark as ListCoins; empty if incremental discovery is unavailable.
   bytes change_cursor = 7;
 }
 

@@ -984,6 +984,7 @@ pub(crate) fn init(
         let worker_db_base = config.db.path.clone();
         let worker_paths_cfg = config.db.worker_paths.clone();
         let worker_path_prefix_cfg = config.db.worker_path_prefix.clone();
+        let coin_changes_enabled = config.db.coin_changes_enabled;
         // For the per-worker step-4 app-shard catch-up syncer: the shared
         // archive pool + this node's Falcon key (the :8340 mTLS identity).
         let archive_pool_for_builder = archive_pool.clone();
@@ -1015,9 +1016,10 @@ pub(crate) fn init(
             );
             std::fs::create_dir_all(&path)
                 .map_err(|e| format!("worker {} mkdir {}: {e}", core_id, path.display()))?;
-            let db = quil_store::RocksDb::open_counted(
+            let db = quil_store::RocksDb::open_counted_with_coin_changes(
                 &path,
                 quil_store::write_stats::StoreClass::Workers,
+                coin_changes_enabled,
             )
             .map_err(|e| format!("worker {} open db {}: {e}", core_id, path.display()))?;
             let db_arc = Arc::new(db);

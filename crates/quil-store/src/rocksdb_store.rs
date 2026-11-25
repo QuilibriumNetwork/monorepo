@@ -339,19 +339,19 @@ impl RocksDb {
     /// unless `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives each store its own of that
     /// size, as before the shared cache.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, None, None)
+        Self::open_with_block_cache(path, None, None, false)
     }
 
     /// [`Self::open`] for an archive's store, with its own block cache sized
     /// from memory ([`archive_block_cache_bytes`]).
     pub fn open_archive(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), None)
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), None, false)
     }
 
     /// [`Self::open`] for one of the node's stores, its disk writes counted
     /// under `class` ([`crate::write_stats`]).
     pub fn open_counted(path: &Path, class: crate::write_stats::StoreClass) -> Result<Self> {
-        Self::open_with_block_cache(path, None, Some(class))
+        Self::open_with_block_cache(path, None, Some(class), false)
     }
 
     /// [`Self::open_archive`], its disk writes counted under `class`.
@@ -359,7 +359,33 @@ impl RocksDb {
         path: &Path,
         class: crate::write_stats::StoreClass,
     ) -> Result<Self> {
-        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), Some(class))
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), Some(class), false)
+    }
+
+    /// Open a store with optional durable Coin discovery. Disabled by default.
+    pub fn open_with_coin_changes(path: &Path, enabled: bool) -> Result<Self> {
+        Self::open_with_block_cache(path, None, None, enabled)
+    }
+
+    pub fn open_counted_with_coin_changes(
+        path: &Path,
+        class: crate::write_stats::StoreClass,
+        enabled: bool,
+    ) -> Result<Self> {
+        Self::open_with_block_cache(path, None, Some(class), enabled)
+    }
+
+    pub fn open_archive_counted_with_coin_changes(
+        path: &Path,
+        class: crate::write_stats::StoreClass,
+        enabled: bool,
+    ) -> Result<Self> {
+        Self::open_with_block_cache(
+            path,
+            Some(archive_block_cache_bytes()),
+            Some(class),
+            enabled,
+        )
     }
 
     /// A store with its own block cache of `block_cache_bytes`, or the
@@ -369,6 +395,7 @@ impl RocksDb {
         path: &Path,
         block_cache_bytes: Option<usize>,
         class: Option<crate::write_stats::StoreClass>,
+        coin_changes_enabled: bool,
     ) -> Result<Self> {
         let (opts, shared) = Self::store_options_for(block_cache_bytes, class);
         let db = rocksdb::DB::open(&opts, path)
@@ -379,7 +406,7 @@ impl RocksDb {
         crate::migration::run_migrations(&db, &migrations)?;
 
         Ok(Self {
-            db: Self::coordinated(db)?,
+            db: Self::coordinated(db, coin_changes_enabled, Some(path))?,
             shared_block_cache: shared,
         })
     }
@@ -399,7 +426,7 @@ impl RocksDb {
         let db = rocksdb::DB::open(opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
         Ok(Self {
-            db: Self::coordinated(db)?,
+            db: Self::coordinated(db, false, None)?,
             shared_block_cache: false,
         })
     }
@@ -530,6 +557,10 @@ impl RocksDb {
 
     /// Open an in-memory RocksDB instance (for testing).
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_coin_changes(false)
+    }
+
+    pub fn open_in_memory_with_coin_changes(coin_changes_enabled: bool) -> Result<Self> {
         let tmp = tempfile::TempDir::new()
             .map_err(|e| QuilError::Store(format!("failed to create temp dir: {}", e)))?;
         let mut opts = rocksdb::Options::default();
@@ -540,21 +571,23 @@ impl RocksDb {
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
         Ok(Self {
-            db: Self::coordinated(db)?,
+            db: Self::coordinated(db, coin_changes_enabled, None)?,
             shared_block_cache: false,
         })
     }
 
     /// A writable store watches the prover registry's keys, so execution
     /// branches can reuse a registry scan no write has changed.
-    fn coordinated(db: rocksdb::DB) -> Result<quil_forest::CoordinatedDb> {
+    fn coordinated(
+        db: rocksdb::DB,
+        coin_changes_enabled: bool,
+        path: Option<&Path>,
+    ) -> Result<quil_forest::CoordinatedDb> {
         let db = quil_forest::CoordinatedDb::with_watched_prefixes(
             db,
             crate::encoding::prover_registry_key_prefixes(),
         );
-        // Initialize before exposing the DB so the first wallet snapshot has
-        // a journal generation, including stores populated later by sync.
-        crate::coin_changes::enable(&db)?;
+        crate::coin_changes::configure(&db, coin_changes_enabled, path)?;
         open_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

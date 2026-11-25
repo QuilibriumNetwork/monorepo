@@ -1,7 +1,7 @@
 //! Durable arrival order for wallet discovery.
 //!
-//! Events join the source rows' final RocksDB batch and contain public vertex
-//! blobs. Authoritative Coin decoding stays in quil-node.
+//! Events and source rows commit in the same RocksDB batch.
+//! Stored blobs are public; quil-node decodes Coins.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,18 +13,25 @@ use quil_types::store::SnapshotReadable;
 pub const NAMESPACE: &[u8] = b"quil/local/coin-changes/v1/";
 const META: &[u8] = b"quil/local/coin-changes/v1/meta";
 const INVALID: &[u8] = b"quil/local/coin-changes/v1/invalid";
+pub(crate) const DISABLED: &[u8] = b"quil/local/coin-changes/v1/disabled";
+pub(crate) const INSTALL_TARGETS: &[u8] = b"quil/local/coin-changes/v1/install-targets/";
+/// Canonical import readiness is independent of the optional Coin journal.
+pub const SNAPSHOT_INSTALL_STATE: &[u8] = b"quil/local/canonical-snapshot/installing/v1";
 pub(crate) const RESET_REQUEST: &[u8] = b"quil/local/coin-changes/v1/reset-request";
 pub(crate) const INSTALLING: &[u8] = b"quil/local/coin-changes/v1/installing";
-const INSTALL_OVERFLOW: &[u8] = b"quil/local/coin-changes/v1/install-overflow";
+pub(crate) const INSTALL_OVERFLOW: &[u8] = b"quil/local/coin-changes/v1/install-overflow";
 const INSTALL_REQUESTS: &[u8] = b"quil/local/coin-changes/v1/install-requests/";
 const INSTALL_SCOPES: &[u8] = b"quil/local/coin-changes/v1/install-scopes/";
 const MAX_INSTALL_SCOPES: u64 = 128;
+const MAX_RECOVERY_BYTES: usize = 64 << 10;
 const EVENTS: &[u8] = b"quil/local/coin-changes/v1/events/";
 const EVENTS_END: &[u8] = b"quil/local/coin-changes/v1/events0";
 const MAX_LOG_BYTES: usize = 64 << 20;
 const MAX_RECORD_BYTES: usize = 64 << 10;
 const MAX_EXAMINED: usize = 1024;
-const MAX_RECLAIMED: usize = 1024;
+const MAX_RECLAIMED: usize = 64;
+const MAX_BATCH_EVENT_BYTES: usize = 512 << 10;
+const MAX_BATCH_EVENTS: usize = 128;
 
 #[derive(Debug)]
 pub struct RawCoinChange {
@@ -114,17 +121,228 @@ fn event_bytes(blob_len: usize) -> usize {
     EVENTS.len() + 8 + 64 + blob_len
 }
 
-/// Enable once, before any wallet snapshot is captured. Old stores bootstrap
-/// their existing rows by snapshot; only subsequent arrivals enter the log.
-pub(crate) fn enable(db: &CoordinatedDb) -> Result<()> {
+/// Configure the journal before exposing the store. A clean restart keeps
+/// the existing cursor epoch.
+pub(crate) fn configure(
+    db: &CoordinatedDb,
+    enabled: bool,
+    path: Option<&std::path::Path>,
+) -> Result<()> {
+    if db.get(SNAPSHOT_INSTALL_STATE).map_err(error)?.is_none() {
+        let snapshot_request = [INSTALL_REQUESTS, b"snapshot-install"].concat();
+        let snapshot_scope = [INSTALL_SCOPES, b"snapshot-install"].concat();
+        let request = db.get(&snapshot_request).map_err(error)?;
+        let scope = db.get(&snapshot_scope).map_err(error)?;
+        let legacy_import = legacy_snapshot_import_pending(request.as_deref(), scope.as_deref());
+        let uncertain_import = path.is_some_and(|path| path.join("snapshot").is_dir())
+            && (db.get(INSTALLING).map_err(error)?.is_some()
+                || db.get(INSTALL_OVERFLOW).map_err(error)?.is_some()
+                || db.get(INVALID).map_err(error)?.is_some());
+        if legacy_import || uncertain_import {
+            db.put(SNAPSHOT_INSTALL_STATE, b"1").map_err(error)?;
+        }
+    }
+    let stored = db.get(META).map_err(error)?;
+    if !enabled {
+        if stored.is_some() && db.get(DISABLED).map_err(error)?.is_none() {
+            db.put(DISABLED, b"1").map_err(error)?;
+        }
+        return Ok(());
+    }
+
+    let scopes = recovery_page(db, INSTALL_SCOPES, MAX_RECOVERY_BYTES)?;
+    let scopes = scopes.complete.then_some(scopes.entries);
+    let requests = recovery_page(db, INSTALL_REQUESTS, MAX_RECOVERY_BYTES)?;
+    let requests_complete = requests.complete;
+    let requests_empty = requests.entries.is_empty();
+    let remaining = MAX_RECOVERY_BYTES.saturating_sub(requests.bytes);
+    let installing = db.get(INSTALLING).map_err(error)?;
+    let invalid = db.get(INVALID).map_err(error)?.is_some();
+    let was_disabled = db.get(DISABLED).map_err(error)?.is_some();
+    let overflow = db.get(INSTALL_OVERFLOW).map_err(error)?;
+    if overflow.as_deref() == Some(b"1") {
+        tracing::warn!("Coin journal has untracked legacy maintenance; keeping incremental discovery unavailable until canonical recovery is verified");
+    }
+    let fresh = stored.as_deref().and_then(Meta::decode).is_none();
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut repair = rocksdb::WriteBatch::default();
+    let uncertain = scopes.is_none() || !requests_complete;
+    let mut untracked = scopes.is_none();
+    if let Some(scopes) = &scopes {
+        let count = scopes.len() as u64;
+        let encoded = count.to_be_bytes();
+        let expected = (count > 0).then_some(encoded.as_slice());
+        if installing.as_deref() != expected {
+            if count == 0 {
+                repair.delete(INSTALLING);
+                if installing.is_some() && requests_complete && requests_empty {
+                    untracked = true;
+                }
+            } else {
+                repair.put(INSTALLING, encoded);
+            }
+        }
+        for (key, value) in scopes {
+            let scope = &key[INSTALL_SCOPES.len()..];
+            if value.as_slice() != b"1" {
+                untracked = true;
+            }
+            let request = [INSTALL_REQUESTS, scope].concat();
+            // Verify each scope once, through its pending request when present.
+            if requests
+                .entries
+                .binary_search_by(|(key, _)| key.cmp(&request))
+                .is_err()
+                && completed_installation(db, scope)?
+            {
+                batch.put(request, [0]);
+            }
+        }
+    }
+    for (key, value) in requests.entries {
+        let scope = &key[INSTALL_REQUESTS.len()..];
+        if scope.is_empty() || scope.len() > 256 || !matches!(value.as_slice(), [0] | [1]) {
+            untracked = true;
+            continue;
+        }
+        if value == [0] || completed_installation(db, scope)? {
+            batch.put(key, [0]);
+        } else {
+            batch.put(key, value);
+        }
+    }
+    if uncertain || untracked {
+        let value = if !untracked && overflow.as_deref() == Some(b"2") {
+            tracing::info!("Coin journal has deferred requests; verifying bounded recovery pages");
+            b"2".as_slice()
+        } else {
+            tracing::warn!("Coin journal recovery cannot verify all maintenance identities; incremental discovery remains unavailable");
+            b"1".as_slice()
+        };
+        if overflow.as_deref() != Some(value) {
+            repair.put(INSTALL_OVERFLOW, value);
+        }
+    }
+    if repair.len() > 0 {
+        db.write(repair).map_err(error)?;
+    }
     db.register_local_projection(Arc::new(CoinProjection))
         .map_err(error)?;
-    let meta = db.get(META).map_err(error)?;
-    if meta.as_deref().and_then(Meta::decode).is_none() || db.get(INVALID).map_err(error)?.is_some()
+    if fresh
+        || invalid
+        || was_disabled
+        || installing.is_some()
+        || overflow.is_some()
+        || batch.len() > 0
     {
-        reset(db)?;
+        batch.delete(DISABLED);
+        batch.put(RESET_REQUEST, b"1");
+        db.write(batch).map_err(error)?;
+    }
+    if !requests_complete && !untracked && overflow.as_deref() == Some(b"2") {
+        recover_deferred_requests(db, remaining)?;
     }
     Ok(())
+}
+
+struct RecoveryPage {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    complete: bool,
+    bytes: usize,
+}
+
+fn recovery_page(db: &CoordinatedDb, prefix: &[u8], max_bytes: usize) -> Result<RecoveryPage> {
+    let mut options = rocksdb::ReadOptions::default();
+    options.fill_cache(false);
+    let mut iterator = db.raw_iterator_opt(options);
+    iterator.seek(prefix);
+    let mut entries = Vec::new();
+    let mut bytes = 0usize;
+    while let Some((key, value)) = iterator.key().zip(iterator.value()) {
+        if !key.starts_with(prefix) {
+            break;
+        }
+        bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        if entries.len() == MAX_INSTALL_SCOPES as usize || bytes > max_bytes {
+            iterator.status().map_err(error)?;
+            return Ok(RecoveryPage {
+                entries,
+                complete: false,
+                bytes,
+            });
+        }
+        entries.push((key.to_vec(), value.to_vec()));
+        iterator.next();
+    }
+    iterator.status().map_err(error)?;
+    Ok(RecoveryPage {
+        entries,
+        complete: true,
+        bytes,
+    })
+}
+
+// The byte budget covers request enumeration here. Projection validation
+// and forest point reads have separate bounds.
+fn recover_deferred_requests(db: &CoordinatedDb, mut remaining: usize) -> Result<()> {
+    while remaining > 0 {
+        let page = recovery_page(db, INSTALL_REQUESTS, remaining)?;
+        remaining = remaining.saturating_sub(page.bytes);
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut finished = Vec::new();
+        for (key, value) in page.entries {
+            let scope = &key[INSTALL_REQUESTS.len()..];
+            if !scope.is_empty()
+                && scope.len() <= 256
+                && matches!(value.as_slice(), [0] | [1])
+                && (value == [0] || completed_installation(db, scope)?)
+            {
+                batch.put(&key, [0]);
+                finished.push(key);
+            }
+        }
+        if finished.is_empty() {
+            if !page.complete {
+                tracing::warn!("Coin journal deferred recovery has no completed request in its bounded page; keeping its fence");
+            }
+            return Ok(());
+        }
+        db.write(batch).map_err(error)?;
+        // The write may commit despite projection failure; request removal proves progress.
+        let mut progressed = false;
+        for key in finished {
+            if db.get(key).map_err(error)?.is_none() {
+                progressed = true;
+                break;
+            }
+        }
+        if !progressed {
+            tracing::warn!(
+                "Coin journal deferred recovery could not consume a request; keeping its fence"
+            );
+            return Ok(());
+        }
+        if page.complete {
+            return Ok(());
+        }
+    }
+    tracing::warn!("Coin journal deferred recovery exhausted its startup metadata budget; remaining requests are retained for the next open");
+    Ok(())
+}
+
+pub(crate) fn rewind_target(scope: &[u8], roots: &[[u8; 32]; 4]) -> (Vec<u8>, Vec<u8>) {
+    (
+        [INSTALL_TARGETS, scope].concat(),
+        roots.iter().flatten().copied().collect(),
+    )
+}
+
+pub(crate) fn completed_snapshot_import(value: &[u8]) -> bool {
+    value == b"0"
+}
+
+fn legacy_snapshot_import_pending(request: Option<&[u8]>, scope: Option<&[u8]>) -> bool {
+    request == Some(&[1]) || (request != Some(&[0]) && scope == Some(b"1"))
 }
 
 /// A semantic state replacement invalidates all cursors of this local store.
@@ -160,9 +378,8 @@ pub(crate) fn installation_request(scope: &[u8], installing: bool) -> Result<(Ve
     Ok(([INSTALL_REQUESTS, scope].concat(), [u8::from(installing)]))
 }
 
-/// The reader must retain one snapshot for every point read. Pending requests
-/// matter because a failed projection commits the request without its marker;
-/// overlay branches also expose the request before publication projects it.
+/// Pending requests can survive projection failures before their markers exist.
+/// Read flags and requests from one snapshot, including in overlays.
 pub(crate) fn is_installing(
     scope: &[u8],
     mut read: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>>,
@@ -195,30 +412,55 @@ pub(crate) fn is_installing(
     Ok(false)
 }
 
-/// Read the watermark from the very same retained snapshot as ListCoins.
-/// Never replace a missing snapshot watermark with the current live tail.
+/// Return the watermark from the snapshot used by ListCoins.
+/// A missing watermark leaves incremental discovery unavailable.
 pub fn snapshot_cursor(snapshot: &dyn SnapshotReadable, domain: &[u8; 32]) -> Result<Vec<u8>> {
-    if snapshot.read_record(INSTALLING)?.is_some()
+    let import_state = snapshot.read_record(SNAPSHOT_INSTALL_STATE)?;
+    let completed = import_state
+        .as_deref()
+        .is_some_and(completed_snapshot_import);
+    let legacy_import = if completed {
+        false
+    } else {
+        let request = snapshot.read_record(&[INSTALL_REQUESTS, b"snapshot-install"].concat())?;
+        let scope = snapshot.read_record(&[INSTALL_SCOPES, b"snapshot-install"].concat())?;
+        legacy_snapshot_import_pending(request.as_deref(), scope.as_deref())
+    };
+    if import_state
+        .as_deref()
+        .is_some_and(|value| !completed_snapshot_import(value))
+        || legacy_import
+    {
+        return Err(QuilError::ExecutionUnavailable(
+            "Coin scan snapshot contains an incomplete snapshot import".into(),
+        ));
+    }
+    if snapshot.read_record(DISABLED)?.is_some()
+        || snapshot.read_record(INSTALLING)?.is_some()
         || snapshot.read_record(INSTALL_OVERFLOW)?.is_some()
         || snapshot.read_record(INVALID)?.is_some()
     {
-        return Err(QuilError::ExecutionUnavailable(
-            "coin changes: state installation or journal recovery is incomplete".into(),
-        ));
+        return Ok(Vec::new());
     }
     match snapshot.read_record(META)? {
         None => Ok(Vec::new()),
         Some(bytes) => {
-            let meta = Meta::decode(&bytes).ok_or_else(|| error("malformed snapshot metadata"))?;
-            Ok(meta.cursor(domain, meta.tail))
+            Ok(Meta::decode(&bytes).map_or_else(Vec::new, |meta| meta.cursor(domain, meta.tail)))
         }
     }
 }
 
-// Read flags and metadata from one snapshot; a mixed view could accept a
-// generation whose history has already been replaced.
+// Flags and epoch must come from one snapshot.
 fn readable_meta(snapshot: &rocksdb::Snapshot<'_>) -> Result<Option<Meta>> {
-    for key in [INVALID, INSTALLING, INSTALL_OVERFLOW] {
+    if snapshot
+        .get(SNAPSHOT_INSTALL_STATE)
+        .map_err(error)?
+        .as_deref()
+        .is_some_and(|value| !completed_snapshot_import(value))
+    {
+        return Ok(None);
+    }
+    for key in [DISABLED, INVALID, INSTALLING, INSTALL_OVERFLOW] {
         if snapshot.get(key).map_err(error)?.is_some() {
             return Ok(None);
         }
@@ -235,9 +477,7 @@ pub fn cursor_head(
     cursor: &[u8],
 ) -> Result<Option<Vec<u8>>> {
     if !db.has_local_projection(NAMESPACE).map_err(error)? {
-        return Err(QuilError::ExecutionUnavailable(
-            "coin changes: store has no writable journal".into(),
-        ));
+        return Ok(None);
     }
     if cursor.is_empty() {
         return Ok(None);
@@ -268,9 +508,7 @@ pub fn read_page(
     max_bytes: usize,
 ) -> Result<RawCoinChangesPage> {
     if !db.has_local_projection(NAMESPACE).map_err(error)? {
-        return Err(QuilError::ExecutionUnavailable(
-            "coin changes: store has no writable journal".into(),
-        ));
+        return Ok(RawCoinChangesPage::reset());
     }
     if max_entries == 0 || max_bytes < 64 {
         return Err(QuilError::InvalidArgument(
@@ -371,18 +609,26 @@ impl LocalBatchProjection for CoinProjection {
         let mut candidates = BTreeMap::<Vec<u8>, Candidate<'_>>::new();
         let mut reset = false;
         let mut overflow = false;
+        let mut work_limit = false;
         let mut bytes = 0usize;
         let mut order = 0u32;
         let mut install_requests = BTreeMap::<Vec<u8>, bool>::new();
         let mut install_overrun = false;
+        let mut unknown_installation = false;
+        let mut pending_left = false;
+        let stored_overflow = view.get(INSTALL_OVERFLOW).map_err(|e| e.to_string())?;
+        let tracked_overflow = stored_overflow.as_deref() == Some(b"2");
         let invalid = view.get(INVALID).map_err(|e| e.to_string())?.is_some();
-        if invalid {
-            // Failed projections leave requests durable without scope/count
-            // updates. Replay them before clearing INVALID so another scope's
-            // finish cannot release an unfinished installation.
-            reset = true;
+        if invalid || tracked_overflow {
+            // Failed projections leave requests without scope/count updates.
+            // Replay them before clearing INVALID.
+            reset = invalid;
             match view
-                .prefix_entries(INSTALL_REQUESTS, MAX_INSTALL_SCOPES as usize, 64 << 10)
+                .prefix_entries(
+                    INSTALL_REQUESTS,
+                    MAX_INSTALL_SCOPES as usize,
+                    MAX_RECOVERY_BYTES,
+                )
                 .map_err(|e| e.to_string())?
             {
                 Some(entries) => {
@@ -393,12 +639,17 @@ impl LocalBatchProjection for CoinProjection {
                             || !matches!(value.as_slice(), [0] | [1])
                         {
                             install_overrun = true;
+                            unknown_installation = true;
                         } else {
                             install_requests.insert(scope.to_vec(), value == [1]);
                         }
                     }
                 }
-                None => install_overrun = true,
+                None => {
+                    install_overrun = true;
+                    pending_left = true;
+                    unknown_installation = !tracked_overflow;
+                }
             }
         }
         let parsed = visit_batch(batch, |mutation| {
@@ -408,15 +659,25 @@ impl LocalBatchProjection for CoinProjection {
                     if key == RESET_REQUEST {
                         reset = true;
                     }
+                    if key == INSTALL_OVERFLOW && value == b"1" {
+                        // A private branch may have dropped untrackable hints.
+                        // Its new fence must survive completion of older scopes.
+                        unknown_installation = true;
+                        install_overrun = true;
+                        overflow = true;
+                    }
                     if let Some(scope) = key.strip_prefix(INSTALL_REQUESTS) {
-                        if scope.is_empty()
-                            || scope.len() > 256
-                            || !matches!(value, [0] | [1])
-                            || (install_requests.len() >= MAX_INSTALL_SCOPES as usize
-                                && !install_requests.contains_key(scope))
-                        {
+                        if scope.is_empty() || scope.len() > 256 || !matches!(value, [0] | [1]) {
                             overflow = true;
                             install_overrun = true;
+                            unknown_installation = true;
+                        } else if install_requests.len() >= MAX_INSTALL_SCOPES as usize
+                            && !install_requests.contains_key(scope)
+                        {
+                            // Leave deferred requests durable for a later pass.
+                            overflow = true;
+                            install_overrun = true;
+                            pending_left = true;
                         } else {
                             install_requests.insert(scope.to_vec(), value == [1]);
                         }
@@ -445,7 +706,8 @@ impl LocalBatchProjection for CoinProjection {
                             return;
                         }
                         bytes = bytes.saturating_add(event_bytes(value.len()));
-                        if bytes > MAX_LOG_BYTES {
+                        if bytes > MAX_BATCH_EVENT_BYTES || candidates.len() >= MAX_BATCH_EVENTS {
+                            work_limit = true;
                             overflow = true;
                             candidates.clear();
                             return;
@@ -468,29 +730,38 @@ impl LocalBatchProjection for CoinProjection {
                 BatchMutation::DeleteRange(lower, upper) => {
                     if range_touches_rows(lower, upper) {
                         reset = true;
+                        candidates.retain(|key, candidate| {
+                            let keep = key.as_slice() < lower || key.as_slice() >= upper;
+                            if !keep {
+                                bytes -= event_bytes(candidate.blob.len());
+                            }
+                            keep
+                        });
                     }
-                    candidates.retain(|key, candidate| {
-                        let keep = key.as_slice() < lower || key.as_slice() >= upper;
-                        if !keep {
-                            bytes -= event_bytes(candidate.blob.len());
-                        }
-                        keep
-                    });
                 }
             }
         });
+        if work_limit {
+            return Err("coin journal per-write event limit".into());
+        }
         if !parsed {
-            // The unparsed suffix may contain a maintenance request. Keep
-            // the original request and durable invalid marker so recovery
-            // replays it; a mere epoch rotation could lose that active scope.
+            // The unread suffix may contain a begin request. Retain the input
+            // and invalidate the journal so recovery can replay it.
             return Err("unlistable coin journal input".into());
         }
-        if candidates.is_empty() && install_requests.is_empty() && !reset && !overflow {
+        if candidates.is_empty()
+            && install_requests.is_empty()
+            && !reset
+            && !overflow
+            && !tracked_overflow
+        {
             return Ok(());
         }
-        if install_overrun {
-            output.put(INSTALL_OVERFLOW, b"1")?;
-        }
+        let overflow_value = if unknown_installation || stored_overflow.as_deref() == Some(b"1") {
+            b"1".as_slice()
+        } else {
+            b"2".as_slice()
+        };
         let installed_count = view.get(INSTALLING).map_err(|e| e.to_string())?;
         let had_installed_count = installed_count.is_some();
         let mut installing = match installed_count {
@@ -506,23 +777,33 @@ impl LocalBatchProjection for CoinProjection {
         for (scope, active) in install_requests {
             let marker = [INSTALL_SCOPES, &scope].concat();
             let existed = view.get(&marker).map_err(|e| e.to_string())?.is_some();
-            // A duplicate begin/finish changes no state. In particular a
-            // caller finishing an unstarted scope must keep valid cursors.
-            reset |= active != existed;
+            // A duplicate begin or finish does not change this scope.
             if active && !existed {
                 if installing >= MAX_INSTALL_SCOPES {
-                    // A bounded fail-closed latch: an untracked unfinished
-                    // replacement can never be cleared by another scope.
-                    output.put(INSTALL_OVERFLOW, b"1")?;
+                    // Keep the request while all tracked scope slots are occupied.
+                    install_overrun = true;
+                    pending_left = true;
+                    continue;
                 } else {
+                    reset = true;
                     installing += 1;
                     output.put(&marker, b"1")?;
                 }
             } else if !active && existed {
+                reset = true;
                 installing = installing
                     .checked_sub(1)
                     .ok_or_else(|| "coin journal installation count underflow".to_string())?;
                 output.delete(&marker)?;
+            }
+            let target = [INSTALL_TARGETS, &scope].concat();
+            if !active
+                && view
+                    .get(&target)
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+            {
+                output.delete(target)?;
             }
             output.delete([INSTALL_REQUESTS, &scope].concat())?;
         }
@@ -532,6 +813,17 @@ impl LocalBatchProjection for CoinProjection {
             } else {
                 output.put(INSTALLING, installing.to_be_bytes())?;
             }
+        }
+        if install_overrun && stored_overflow.as_deref() != Some(overflow_value) {
+            output.put(INSTALL_OVERFLOW, overflow_value)?;
+        }
+        if (tracked_overflow || (install_overrun && overflow_value == b"2"))
+            && !unknown_installation
+            && !pending_left
+            && installing == 0
+        {
+            output.delete(INSTALL_OVERFLOW)?;
+            reset = true;
         }
         let stored = view.get(META).map_err(|e| e.to_string())?;
         let mut meta = stored.as_deref().and_then(Meta::decode);
@@ -543,9 +835,8 @@ impl LocalBatchProjection for CoinProjection {
             output.delete(RESET_REQUEST)?;
         }
         let mut meta = meta.unwrap();
-        // While an external replacement is unfinished no bootstrap is valid;
-        // finishing rotates once more and starts at the complete snapshot.
-        if overflow || installing > 0 {
+        // These arrivals are covered by the snapshot after the epoch reset.
+        if overflow || installing > 0 || previous_installing > 0 || stored_overflow.is_some() {
             candidates.clear();
             bytes = 0;
         }
@@ -592,6 +883,111 @@ impl LocalBatchProjection for CoinProjection {
     }
 }
 
+fn completed_installation(db: &CoordinatedDb, scope: &[u8]) -> Result<bool> {
+    if scope == b"snapshot-install" {
+        return Ok(db
+            .get(SNAPSHOT_INSTALL_STATE)
+            .map_err(error)?
+            .as_deref()
+            .is_some_and(completed_snapshot_import));
+    }
+    let forest = quil_forest::Forest::with_namespace(db.clone(), crate::FOREST_NAMESPACE);
+    let root_versions_absent = |app: &[u8; 32], phase_idx: usize| -> Result<bool> {
+        let (set, kind) = [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ][phase_idx];
+        let mut prefix = crate::encoding::hypergraph_root_version_key(set, kind, app, &[0; 32]);
+        prefix.truncate(prefix.len() - 32);
+        let mut options = rocksdb::ReadOptions::default();
+        options.fill_cache(false);
+        let mut iterator = db.raw_iterator_opt(options);
+        iterator.seek(&prefix);
+        iterator.status().map_err(error)?;
+        Ok(!iterator.key().is_some_and(|key| key.starts_with(&prefix)))
+    };
+    let empty_phase = |app: &[u8; 32], phase_idx: usize| -> Result<bool> {
+        Ok(forest
+            .shard_phase_is_physically_empty(app, quil_forest::PHASES[phase_idx])
+            .map_err(error)?
+            && root_versions_absent(app, phase_idx)?)
+    };
+
+    if let Some(descriptor) = scope.strip_prefix(b"wipe/") {
+        if descriptor.len() != 33 || descriptor[32] >= 4 {
+            return Ok(false);
+        }
+        let app: &[u8; 32] = descriptor[..32].try_into().unwrap();
+        return empty_phase(app, usize::from(descriptor[32]));
+    }
+    if let Some(descriptor) = scope.strip_prefix(b"reset/") {
+        let Ok(app) = <&[u8; 32]>::try_from(descriptor) else {
+            return Ok(false);
+        };
+        for phase_idx in 0..4 {
+            if !empty_phase(app, phase_idx)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(filter) = scope.strip_prefix(b"rewind/") {
+        if !(32..=128).contains(&filter.len()) {
+            return Ok(false);
+        }
+        let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else {
+            return Ok(false);
+        };
+        let Some(targets) = db.get([INSTALL_TARGETS, scope].concat()).map_err(error)? else {
+            return Ok(false);
+        };
+        if targets.len() != 128 {
+            return Ok(false);
+        }
+        let app: &[u8; 32] = app.as_slice().try_into().unwrap();
+        for (phase_idx, phase) in quil_forest::PHASES.into_iter().enumerate() {
+            let expected: [u8; 32] = targets[phase_idx * 32..(phase_idx + 1) * 32]
+                .try_into()
+                .unwrap();
+            let empty = quil_forest::subtree_proof::same_root(&expected, &[0; 32]);
+            match forest.read_head_version(app, phase).map_err(error)? {
+                Some(head) => {
+                    if forest
+                        .shard_phase_root(app, phase, head)
+                        .map_err(error)?
+                        .is_none()
+                    {
+                        return Ok(false);
+                    }
+                    let actual = forest
+                        .app_subtree_root(app, phase, head, &bits)
+                        .map_err(error)?;
+                    if !quil_forest::subtree_proof::same_root(&actual, &expected) {
+                        return Ok(false);
+                    }
+                }
+                None => {
+                    if !empty
+                        || !forest
+                            .shard_phase_is_physically_empty(app, phase)
+                            .map_err(error)?
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            // A whole-app zero target resets this phase and clears its index.
+            if bits.is_empty() && expected == [0; 32] && !empty_phase(app, phase_idx)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn range_touches_rows(lower: &[u8], upper: &[u8]) -> bool {
     [[0x30, 0, 0], [0x31, 0, 0]].iter().any(|prefix| {
         lower < upper
@@ -612,8 +1008,8 @@ fn is_proven_non_coin(blob: &[u8]) -> bool {
     if may_contain_coin_owner(blob) {
         return false;
     }
-    // Preserve decoder errors and marked but malformed Coins. Only a parsed
-    // tree without a possible 32-byte Coin type marker is safe to discard.
+    // Keep malformed encodings for the node's Coin decoder. Exclude only
+    // parsed trees with no possible 32-byte Coin type marker.
     let Ok(root) = quil_tries::deserialize_go_tree(blob) else {
         return false;
     };
@@ -622,9 +1018,7 @@ fn is_proven_non_coin(blob: &[u8]) -> bool {
         .is_none_or(|marker| marker.len() != 32)
 }
 
-/// Mirrors token_intrinsic::state; integration tests enforce parity.
-/// Reserved root histories must not rotate the journal. Other oversized
-/// rows remain uncertain because the decoder accepts trailing padding.
+/// Reserved token metadata and root-history addresses, matching token_intrinsic::state.
 pub fn is_reserved_coin_record(address: &[u8; 32]) -> bool {
     if address[..31].iter().all(|byte| *byte == 0xff) && matches!(address[31], 0xf9..=0xfe) {
         return true;

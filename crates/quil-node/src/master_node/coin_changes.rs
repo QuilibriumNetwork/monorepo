@@ -131,7 +131,7 @@ pub(super) fn bootstrap(
     domain: &[u8; 32],
     sources: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<Vec<u8>> {
-    // An older provider's snapshot cannot be given a live-store watermark.
+    // Older providers have no snapshot-bound watermark.
     if sources.len() > MAX_SOURCES || sources.iter().any(|(_, cursor)| cursor.is_empty()) {
         return Ok(Vec::new());
     }
@@ -183,16 +183,14 @@ pub(super) fn page(
         let Some(db) = crdt.forest_store() else {
             return Ok(None);
         };
-        // Validate every source before returning any output: bootstrap reads
-        // refuse incomplete state, whereas an existing feed must reset.
+        // Validate every source cursor before returning records.
         let Some(head) = quil_store::coin_changes::cursor_head(&db, domain, &source.cursor)? else {
             return Ok(Some(reset(network)));
         };
         databases.push(db);
         heads.push(head);
     }
-    // Start after the last served store, rather than repeatedly draining a
-    // hot first worker while later workers accumulate unseen outputs.
+    // Round-robin sources so a busy worker cannot starve the others.
     let index = (0..local.len())
         .map(|offset| (cursor.next + offset) % local.len())
         .find(|&index| cursor.sources[index].cursor != heads[index]);
@@ -307,7 +305,7 @@ mod tests {
     }
 
     fn store() -> (quil_store::RocksDb, Arc<HypergraphCrdt>) {
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let crdt = Arc::new(HypergraphCrdt::new(
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_tries::ShaInclusionProver),
@@ -347,8 +345,7 @@ mod tests {
             let (address, tree) =
                 quil_execution::token_intrinsic::state::create_coin(&context, frame, &output, 0)
                     .unwrap();
-            // BN254 addresses have two leading zero bits. Partition on the
-            // next bit, which can actually vary for real Coin identities.
+            // BN254 addresses have two leading zero bits; split on the next bit.
             if high.is_some_and(|high| (address[0] & 0x20 != 0) != high) {
                 continue;
             }

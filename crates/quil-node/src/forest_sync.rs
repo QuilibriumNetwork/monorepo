@@ -936,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn empty_source_retry_cleans_interrupted_wipe_root_index() {
         use quil_types::store::HypergraphStore;
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let stale = [0x7b; 32];
         let txn = store.new_transaction(false).unwrap();
@@ -985,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_source_without_its_wipe_scope_does_not_write_or_release_other_scopes() {
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let scope = [b"wipe/".as_slice(), PROVER_SHARD.as_slice(), &[2]].concat();
         quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
@@ -1006,14 +1006,18 @@ mod tests {
         );
         assert_eq!(db.inner().latest_sequence_number(), sequence);
         let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
-        assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_err());
+        assert!(
+            quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn empty_source_with_unknown_coin_recovery_keeps_canonical_sync_read_only() {
         use quil_types::store::HypergraphStore;
         for invalid in [false, true] {
-            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
             if invalid {
                 db.inner()
                     .put(b"quil/local/coin-changes/v1/installing", b"bad-count")
@@ -1047,14 +1051,18 @@ mod tests {
             crdt.rewind_app_shard(&PROVER_SHARD, &[[0; 32]; 4]).unwrap();
             assert_eq!(db.inner().latest_sequence_number(), sequence);
             let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
-            assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_err());
+            assert!(
+                quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32])
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
     #[tokio::test]
     async fn empty_source_resumes_a_placeholder_wipe_only_when_its_scope_is_active() {
         use quil_types::store::HypergraphStore;
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let forest = quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE);
         let phase = quil_forest::Phase::VertexRemoves;
@@ -1115,7 +1123,7 @@ mod tests {
     #[test]
     fn unchanged_rewind_retry_cleans_interrupted_phase_root_index() {
         use quil_types::store::HypergraphStore;
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let stale = [0x7b; 32];
         let txn = store.new_transaction(false).unwrap();
@@ -1151,7 +1159,7 @@ mod tests {
     #[test]
     fn partial_rewind_retry_cleans_an_already_reset_phases_root_index() {
         use quil_types::store::HypergraphStore;
-        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let forest = quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE);
         let stale = [0x7b; 32];

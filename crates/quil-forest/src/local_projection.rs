@@ -5,7 +5,10 @@
 
 use rocksdb::{WriteBatch, DB};
 
-const MAX_OUTPUT_BYTES: usize = 65 << 20;
+// These bound optional work per publication, independently of retained history.
+pub(crate) const MAX_INPUT_BYTES: usize = 8 << 20;
+const MAX_OUTPUT_BYTES: usize = 1 << 20;
+const MAX_READ_RECORD_BYTES: usize = 128 << 10;
 
 pub trait LocalBatchProjection: Send + Sync {
     fn namespace(&self) -> &'static [u8];
@@ -22,8 +25,15 @@ pub trait LocalBatchProjection: Send + Sync {
 pub struct LocalProjectionRead<'a>(pub(crate) &'a DB);
 
 impl LocalProjectionRead<'_> {
-    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, rocksdb::Error> {
-        self.0.get(key)
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, String> {
+        let value = self.0.get_pinned(key).map_err(|error| error.to_string())?;
+        if value
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_READ_RECORD_BYTES)
+        {
+            return Err("local projection read record limit".into());
+        }
+        Ok(value.map(|value| value.to_vec()))
     }
 
     /// Recover bounded pending local operations after a failed projection.

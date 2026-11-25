@@ -361,8 +361,11 @@ macro_rules! impl_hypergraph_storage {
             }
 
             fn invalidate_coin_changes_in_transaction(&self, txn: &dyn Transaction) -> Result<()> {
-                <$txn>::for_store(txn, &self.db)?;
-                txn.set(crate::coin_changes::RESET_REQUEST, b"1")
+                self.invalidate_coin_changes_in_transaction_backend(txn)
+            }
+
+            fn begin_coin_changes_rewind(&self, scope: &[u8], roots: &[[u8; 32]; 4]) -> Result<()> {
+                self.begin_coin_changes_rewind_backend(scope, roots)
             }
 
             fn set_coin_changes_installing(&self, scope: &[u8], installing: bool) -> Result<()> {
@@ -375,7 +378,7 @@ macro_rules! impl_hypergraph_storage {
 
             fn clear_shard_underlying(&self, shard: &ShardKey) -> Result<()> {
                 let txn = self.new_transaction_backend(false)?;
-                txn.set(crate::coin_changes::RESET_REQUEST, b"1")?;
+                self.invalidate_coin_changes_in_transaction_backend(txn.as_ref())?;
                 for (set, phase) in [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")] {
                     for lower in [
                         crate::encoding::hypergraph_vertex_data_prefix(set, phase, shard),

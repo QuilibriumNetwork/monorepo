@@ -5103,30 +5103,38 @@ impl HypergraphCrdt {
         }
         let mut unverified = false;
         for phase_idx in without_head {
-            // A missing head may be an interrupted reset, or a migrated tree
-            // which still has nodes. Physical absence proves an empty prefix
-            // too, but only a whole-phase rewind may clear its root index.
-            let verified_absent = empty(&roots[phase_idx])
-                && matches!(
-                    self.read_shard_phase_root_checked(&forest, &app, phase_idx),
-                    Ok(root) if root == [0; 32]
-                );
+            // A headless phase may still contain migrated nodes. Only physical
+            // absence proves it empty. Clear root indices only for whole-phase
+            // rewinds.
+            let verified_absent = if empty(&roots[phase_idx]) {
+                match self.read_shard_phase_root_checked(&forest, &app, phase_idx) {
+                    Ok(root) => root == [0; 32],
+                    Err(error) if unchanged => {
+                        txn.abort()?;
+                        return Err(error);
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             if verified_absent {
                 if bits.is_empty() {
                     wiped.push(phase_idx);
                 }
             } else if unchanged {
                 txn.abort()?;
-                return Err(QuilError::ExecutionUnavailable(format!(
-                    "cannot verify interrupted rewind phase {phase_idx}; its Coin feed fence remains active"
-                )));
+                tracing::warn!(
+                    filter = %hex::encode(filter),
+                    phase_idx,
+                    "cannot verify optional Coin rewind recovery; keeping canonical state and its feed fence unchanged"
+                );
+                return Ok(());
             } else {
                 unverified = true;
             }
         }
-        // Query optional feed metadata only when needed to recover an old
-        // scope. An unreadable fence must not fail a substantive canonical
-        // rewind; keep Coin unavailable until that scope can be verified.
+        // Unverified recovery keeps the feed fenced without failing this rewind.
         let finish_scope = if !unchanged && unverified {
             match self.store.is_coin_changes_installing(&coin_scope) {
                 Ok(false) => true,
@@ -5145,7 +5153,7 @@ impl HypergraphCrdt {
         if unchanged {
             txn.abort()?;
         } else {
-            self.store.set_coin_changes_installing(&coin_scope, true)?;
+            self.store.begin_coin_changes_rewind(&coin_scope, roots)?;
             txn.commit()?;
             self.invalidate_local_observer_after_sync(&app, 0);
             for (phase_idx, version, phase) in staged {
@@ -5188,9 +5196,8 @@ impl HypergraphCrdt {
         self.wipe_shard_phase_inner(shard_id, phase_idx, expected, false)
     }
 
-    /// Finish this empty phase's interrupted wipe, if its exact durable scope
-    /// is still active. Ordinary empty-source checks stay read-only, including
-    /// committed placeholder trees which must keep their canonical root.
+    /// Resume an empty phase wipe only while its durable scope is active.
+    /// Unfenced empty and placeholder phases remain unchanged.
     pub fn resume_empty_shard_phase_wipe(
         &self,
         shard_id: &[u8],
@@ -7858,9 +7865,8 @@ impl HypergraphCrdt {
         })
     }
 
-    /// Capture Coin bootstrap only after forest maintenance has released its
-    /// barrier. The cursor is then read from this same retained snapshot;
-    /// its store also rejects a durable, unfinished installation fence.
+    /// Capture a Coin scan snapshot under the forest maintenance lock.
+    /// Reject snapshots with an incomplete sync for this domain.
     pub fn acquire_or_capture_coin_scan_snapshot(
         &self,
         id: Option<&[u8; 32]>,
@@ -8941,7 +8947,7 @@ mod phase_wipe_tests {
     }
 
     #[test]
-    fn a_prefix_rewind_retry_cannot_finish_an_unverified_nonempty_phase() {
+    fn an_unchanged_prefix_rewind_keeps_an_unverified_phase_and_its_optional_fence() {
         let store = Arc::new(MemStore::new());
         let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
         hg.set_unified_tree(true);
@@ -8966,7 +8972,7 @@ mod phase_wipe_tests {
         let filter = [app.as_slice(), &[1]].concat();
         let scope = [b"rewind/".as_slice(), filter.as_slice()].concat();
         store.set_coin_changes_installing(&scope, true).unwrap();
-        assert!(hg.rewind_app_shard(&filter, &[[0; 32]; 4]).is_err());
+        hg.rewind_app_shard(&filter, &[[0; 32]; 4]).unwrap();
         assert!(store.coin_change_installing());
         assert_eq!(hg.current_forest_phase_root(&app, 0).unwrap(), root);
     }

@@ -976,6 +976,9 @@ impl DatabaseWriteGuard<'_> {
             let namespace = projection.namespace();
             let mut output = crate::LocalProjectionBatch::new(namespace);
             let projected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if batch.data().len() > crate::local_projection::MAX_INPUT_BYTES {
+                    return Err("local projection input byte limit".into());
+                }
                 projection.project(
                     &crate::LocalProjectionRead(&self.database.0.db),
                     batch.data(),
