@@ -12988,7 +12988,7 @@ impl AppConsensusEngine {
         self.malformed_arrivals.report(&self.filter);
         self.settled_arrivals.report(&self.filter);
         self.pending_arrivals.report(&self.filter);
-        self.message_collector.report_refused_shields();
+        self.message_collector.report_counts_left();
     }
 
     /// Add an application message to this shard's mempool for inclusion in

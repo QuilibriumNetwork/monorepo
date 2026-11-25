@@ -227,7 +227,7 @@ fn a_proof_past_its_window_rides_no_frame() {
 }
 
 /// A proof whose window ends by the next frame to finalize takes no room
-/// from held proofs.
+/// from held proofs: it is refused for good.
 #[test]
 fn a_proof_past_its_window_makes_no_room() {
     let end = settlement_window(EPOCH).1;
@@ -243,10 +243,274 @@ fn a_proof_past_its_window_makes_no_room() {
     eprintln!("REACH seal-deadline closed-room outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
+        SubmitOutcome::Filtered(Refusal::WindowEnded),
         "seal-deadline closed-room: a settlement past its window took room"
     );
     assert_eq!(mc.pending_count(1), held);
+}
+
+/// A proof arriving after its window ended, the next frame to finalize
+/// being the frame it ends at, is refused for good, from any sender: it is
+/// never held, so it never counts toward a share, never takes room, and no
+/// finalization drops it as closed. Its line counts it.
+#[test]
+fn a_proof_past_its_window_is_refused_for_good() {
+    let end = settlement_window(EPOCH).1;
+    let mc = knowing(end - 1);
+    let (own, relayed) = (soon(1), soon(2));
+    let outcomes = [
+        mc.add_message_outcome(1, own.clone()),
+        mc.add_message_outcome_by(1, relayed.clone(), Provenance::Prover, b"relay"),
+    ];
+    eprintln!("REACH window-ended refused outcomes={outcomes:?}");
+    for outcome in outcomes {
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Filtered(Refusal::WindowEnded),
+            "window-ended: a proof whose window ended at the next frame to finalize was not refused for good"
+        );
+    }
+    assert!(!Refusal::WindowEnded.retryable());
+    assert!(
+        !holds(&mc, &own) && !holds(&mc, &relayed),
+        "window-ended: a refused proof is held"
+    );
+    assert_eq!(
+        Seals::held(&mc.buffers.read().unwrap()),
+        Seals::default(),
+        "window-ended: a refused proof counts toward a share"
+    );
+    let mut late = mc.late_seals.lock().unwrap();
+    assert_eq!(
+        (late.refused, late.provers),
+        (1, 1),
+        "window-ended: the first refusal is logged at once and the second counted for the next line"
+    );
+    assert_eq!(
+        late.report(Instant::now() + LATE_SEAL_LINE_EVERY),
+        Some((1, 1))
+    );
+}
+
+/// A proof whose window ends one frame after the next frame to finalize
+/// still rides that frame: it is held, in the provers' share.
+#[test]
+fn a_proof_due_one_frame_after_the_next_is_held() {
+    let end = settlement_window(EPOCH).1;
+    let mc = knowing(end - 2);
+    let outcome = mc.add_message_outcome(50, soon(1));
+    eprintln!("REACH window-ended boundary outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "window-ended boundary: a proof the next frame to finalize can carry was refused"
+    );
+    assert!(holds(&mc, &soon(1)));
+    assert_eq!(
+        Seals::held(&mc.buffers.read().unwrap()).prover,
+        (1, soon(1).len())
+    );
+    let taken = mc
+        .snapshot_for_proposal(50, SEAL_BYTES_PER_PROPOSAL, 10_000, Some(end - 1), &[])
+        .unwrap();
+    assert_eq!(
+        taken.len(),
+        1,
+        "window-ended boundary: the next frame does not carry it"
+    );
+}
+
+/// The line for proofs refused past their window: the first at once, then
+/// at most one a minute, each counting those since the one before, and the
+/// last count once they stop.
+#[test]
+fn proofs_refused_past_their_window_log_a_bounded_count() {
+    let late = |frame| LateSeal {
+        member: None,
+        sender: "local".into(),
+        window_end: frame,
+        frame,
+    };
+    let start = Instant::now();
+    let mut seals = LateSeals::default();
+    seals.note(start, true, late(1));
+    assert_eq!(
+        (seals.refused, seals.logged),
+        (0, Some(start)),
+        "the first at once"
+    );
+    seals.note(start + Duration::from_secs(1), false, late(2));
+    seals.note(start + Duration::from_secs(59), true, late(3));
+    let quiet = seals.report(start + Duration::from_secs(59));
+    let end = seals.report(start + LATE_SEAL_LINE_EVERY);
+    eprintln!("REACH window-ended line quiet={quiet:?} end={end:?}");
+    assert_eq!(quiet, None, "window-ended line: two lines within a minute");
+    assert_eq!(
+        end,
+        Some((2, 1)),
+        "window-ended line: the last count is not logged once they stop"
+    );
+    assert_eq!(
+        seals.report(start + 3 * LATE_SEAL_LINE_EVERY),
+        None,
+        "nothing to log"
+    );
+}
+
+/// A frame finalized while a proof is filed, after its window was first
+/// judged, ends its window: judged again under the buffers' lock, it is
+/// refused for good, never held for that finalization to drop as closed.
+#[test]
+fn a_proof_whose_window_ends_while_it_is_filed_is_refused() {
+    let end = settlement_window(EPOCH).1;
+    let mc = std::sync::Arc::new(knowing(end - 2));
+    let racer = mc.clone();
+    set_file_gap_hook(Box::new(move || racer.note_finalized_frame(end - 1)));
+    let outcome = mc.add_message_outcome(50, soon(1));
+    eprintln!("REACH window-ended race outcome={outcome:?}");
+    assert_eq!(mc.next_seal_frame(), end, "the hook finalized no frame");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::WindowEnded),
+        "window-ended race: a proof whose window ended while it was filed was held"
+    );
+    assert!(!holds(&mc, &soon(1)));
+}
+
+/// A persistent-sector capacity message for `epoch` from member `member`,
+/// carrying a certificate.
+fn capacity(member: u8, epoch: u64) -> Vec<u8> {
+    use quil_crypto::persistent_storage::{Certificate, Profile};
+    use quil_execution::global_intrinsic::persistent_storage::CapacityMessage;
+    let message = CapacityMessage {
+        member: [member; 32],
+        epoch,
+        certificate: Certificate {
+            profile: Profile::Eleven,
+            sector: [member; 32],
+            n: 32,
+            columns: [0; 32],
+            labels: [0; 32],
+        },
+        signed_at: 0,
+        signature: Vec::new(),
+        proof: vec![member; 1_000],
+    };
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+            inner_bytes: message.envelope().to_canonical_bytes(),
+        })],
+        timestamp: 0,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// A capacity message is no held storage epoch proof: the seal window its
+/// envelope names refuses nothing, as GLOBAL takes a certificate for an
+/// epoch until three epochs later. One whose envelope's window ended by
+/// the next frame to finalize is held.
+#[test]
+fn a_capacity_message_is_not_refused_by_its_envelopes_window() {
+    let bytes = capacity(9, EPOCH + 2);
+    let message = CollectedMessage::new(bytes.clone());
+    let end = message
+        .window_end
+        .expect("a capacity message's envelope names a window end");
+    let mc = knowing(end);
+    assert!(!message.held_seal());
+    assert!(window_ended(end, mc.next_seal_frame()));
+    let outcome = mc.add_message_outcome(1, bytes.clone());
+    eprintln!("REACH window-ended capacity outcome={outcome:?}");
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Accepted,
+        "window-ended capacity: a capacity message was refused by its envelope's window"
+    );
+    assert!(holds(&mc, &bytes));
+}
+
+/// The line for proofs refused past their window names the member a proof
+/// names only for a proof that may wait: this node's own proof, or one its
+/// member sent. Another sender's late proof names its sender alone.
+#[test]
+fn a_late_proofs_line_names_its_member_only_from_that_member() {
+    let end = settlement_window(EPOCH).1;
+    let mc = knowing(end - 1);
+    let mut member = [0u8; 32];
+    member[..4].copy_from_slice(&1u32.to_be_bytes());
+    mc.set_sender_member(move |peer| (peer == b"m").then_some(member));
+    // Within a minute of a line: the latest stays to be read.
+    mc.late_seals.lock().unwrap().logged = Some(Instant::now());
+    let latest = |peer: &[u8]| {
+        assert_eq!(
+            mc.add_message_outcome_by(1, soon(1), Provenance::Prover, peer),
+            SubmitOutcome::Filtered(Refusal::WindowEnded)
+        );
+        let seals = mc.late_seals.lock().unwrap();
+        let latest = seals.latest.as_ref().expect("a refusal is the latest");
+        (latest.member, latest.sender.clone())
+    };
+    let (own, _) = latest(b"m");
+    let (relayed, sender) = latest(b"r");
+    assert_eq!(
+        mc.add_message_outcome(1, soon(1)),
+        SubmitOutcome::Filtered(Refusal::WindowEnded)
+    );
+    let (local, local_sender) = {
+        let seals = mc.late_seals.lock().unwrap();
+        let latest = seals.latest.as_ref().expect("a refusal is the latest");
+        (latest.member, latest.sender.clone())
+    };
+    eprintln!("REACH window-ended member own={own:?} relayed={relayed:?} local={local:?}");
+    assert_eq!(
+        own,
+        Some(member),
+        "a member's own late proof does not name it"
+    );
+    assert_eq!(
+        (local, local_sender),
+        (Some(member), sender_label(Sender::Local)),
+        "window-ended member local: this node's own late proof does not name its member"
+    );
+    assert_eq!(
+        relayed, None,
+        "window-ended member: another sender's late proof names the member it claims"
+    );
+    assert_eq!(sender, sender_label(Sender::Peer(b"r")));
+}
+
+/// A late proof's count left within a minute of the last line is logged by
+/// the node's timer ([`MessageCollector::report_counts_left`]) once that
+/// minute has passed, though no frame finalizes: a GLOBAL stall keeps it.
+#[test]
+fn a_late_proofs_count_is_logged_by_the_timer_through_a_global_stall() {
+    let end = settlement_window(EPOCH).1;
+    let mc = knowing(end - 1);
+    let frame = mc.next_seal_frame();
+    for peer in [&b"a"[..], b"b"] {
+        assert_eq!(
+            mc.add_message_outcome_by(1, soon(1), Provenance::Prover, peer),
+            SubmitOutcome::Filtered(Refusal::WindowEnded)
+        );
+    }
+    let pending = mc.late_seals.lock().unwrap().refused;
+    assert_eq!(
+        pending, 1,
+        "the first is logged at once, the second pending"
+    );
+    let quiet = mc.report_counts_left_at(Instant::now() + LATE_SEAL_LINE_EVERY / 2);
+    let logged =
+        mc.report_counts_left_at(Instant::now() + LATE_SEAL_LINE_EVERY + Duration::from_secs(1));
+    eprintln!("REACH window-ended drain quiet={quiet:?} logged={logged:?}");
+    assert_eq!(mc.next_seal_frame(), frame, "a frame finalized");
+    assert_eq!(quiet, None, "window-ended drain: two lines within a minute");
+    assert_eq!(
+        logged,
+        Some((1, 1)),
+        "window-ended drain: a count pending over a minute is not logged without a finalization"
+    );
 }
 
 /// Until the collector knows the current frame (none proposed or
@@ -283,7 +547,7 @@ fn a_finalized_frame_tells_the_collector_the_current_frame() {
     eprintln!("REACH seal-deadline finalized-closed outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
+        SubmitOutcome::Filtered(Refusal::WindowEnded),
         "seal-deadline finalized-closed: a settlement due by the next frame to finalize took room"
     );
     assert_eq!(mc.pending_count(1), held);
