@@ -1,21 +1,15 @@
 //! A share's waiting proof stops keeping room however it comes to be held
 //! or carried: an active prover's copy promoting another sender's, refused
-//! first; a prover's copy held beside another sender's wait; a frame
-//! another archive led; a carried proposal's re-file. Until 2026-11-25 only
-//! a plain submit's hold in its own share ended a wait, and the others kept
-//! room for up to `SEAL_WAIT_STALE`, refusing proofs due with it.
+//! first; a frame another archive led; a carried proposal's re-file. Until
+//! 2026-11-25 only a plain submit's hold in its own share ended a wait, and
+//! the others kept room for up to `SEAL_WAIT_STALE`, refusing proofs due
+//! with it.
 
 use super::seal_starvation_tests::{archive, fill, settlement};
 use super::*;
 
 const LARGE: usize = 4_000_000;
 const SMALL: usize = 1_000_000;
-
-/// Settlement `id`, `len` bytes, delivered by another sender, its own peer.
-fn from_other(mc: &MessageCollector, id: u32, len: usize) -> SubmitOutcome {
-    let peer = id.to_be_bytes();
-    mc.add_message_outcome_by(1, settlement(id, len), Provenance::Other, &peer)
-}
 
 /// The proof waiting in the `prover` share, as (bytes, keeping room).
 fn waiting(mc: &MessageCollector, prover: bool) -> Option<(usize, bool)> {
@@ -113,49 +107,6 @@ fn a_waiting_proof_promoted_from_another_senders_copy_frees_its_room() {
         "SEAL-END-PROMOTED: a promoted proof kept its room"
     );
     assert_eq!(waiting(&mc, true), None);
-}
-
-/// Another sender's waiting proof stops keeping room once an active
-/// prover's copy of it is held.
-#[test]
-fn another_senders_waiting_proof_ends_once_a_provers_copy_is_held() {
-    let mc = archive();
-    let mut held = Vec::new();
-    for id in 1..=20u32 {
-        match from_other(&mc, id, SMALL) {
-            SubmitOutcome::Accepted => held.push(settlement(id, SMALL)),
-            SubmitOutcome::Filtered(_) => break,
-            other => panic!("settlement {id}: {other:?}"),
-        }
-    }
-    assert!(held.len() >= 8, "premise: other senders fill their share");
-    let large = settlement(1000, LARGE);
-    for _ in 0..2 {
-        assert_eq!(
-            from_other(&mc, 1000, LARGE),
-            SubmitOutcome::Filtered(Refusal::ShareFull(Share::OtherSeals)),
-            "premise: the other senders' share refuses the large proof"
-        );
-    }
-    assert_eq!(
-        waiting(&mc, false),
-        Some((large.len(), true)),
-        "premise: the large proof waits"
-    );
-    assert_eq!(
-        mc.add_message_outcome(1, large.clone()),
-        SubmitOutcome::Accepted,
-        "premise: an active prover's copy is held"
-    );
-    mc.mark_finalized(&held[..4]);
-    let outcome = from_other(&mc, 2000, SMALL);
-    let waits = waiting(&mc, false);
-    eprintln!("REACH seal-wait-end prover-copy outcome={outcome:?} waiting={waits:?}");
-    assert_eq!(
-        (outcome, waits),
-        (SubmitOutcome::Accepted, None),
-        "SEAL-END-PROVER-COPY: another sender's wait kept room for a proof held as a prover's"
-    );
 }
 
 /// A waiting proof a frame carried, led by another archive, stops keeping

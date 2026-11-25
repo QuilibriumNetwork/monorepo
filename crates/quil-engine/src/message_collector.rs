@@ -26,6 +26,8 @@ mod seal_share_tests;
 mod seal_starvation_tests;
 #[cfg(test)]
 mod seal_wait_end_tests;
+#[cfg(test)]
+mod seal_wait_sender_tests;
 mod seal_waiting;
 #[cfg(test)]
 mod seat_density_tests;
@@ -246,6 +248,15 @@ impl CollectedMessage {
     fn density_member(&self) -> Option<[u8; 32]> {
         self.member
             .filter(|_| self.own && self.data.len() >= SEAT_DENSITY_MIN_BYTES)
+    }
+
+    /// A held storage epoch proof of this node's provers: its own
+    /// ([`Self::sender`] none) or one its member delivered as an active
+    /// prover ([`Self::own`]). Only such a proof waits for room
+    /// ([`seal_waiting::SealWaiting::refused`]) or makes passed-over proofs
+    /// due with it yield ([`evict_later_seals`]).
+    fn may_wait(&self) -> bool {
+        self.held_seal() && (self.sender.is_none() || self.own)
     }
 
     /// A held storage epoch proof no member sends: larger than a proposal's
@@ -1068,7 +1079,8 @@ const SEAL_PASSES_TO_YIELD: u32 = 12;
 /// `message` counts toward, with `keep` bytes left free
 /// ([`seal_waiting::SealWaiting::keep`]), by dropping proofs of that share
 /// whose window has ended by `frame` (those first) or ends later than its
-/// own, latest first, then those due with it that at least
+/// own, latest first, then, for a proof of this node's provers
+/// ([`CollectedMessage::may_wait`]), those due with it that at least
 /// [`SEAL_PASSES_TO_YIELD`] proposals passed over, newest first; `frame` is
 /// the next GLOBAL frame to finalize
 /// ([`MessageCollector::next_seal_frame`]). A proof due sooner rides first
@@ -1114,6 +1126,7 @@ fn evict_later_seals(
     if need == 0 {
         return evicted;
     }
+    let yields = message.may_wait();
     let mut victims = Vec::new();
     let mut freed = 0usize;
     {
@@ -1126,10 +1139,11 @@ fn evict_later_seals(
                     .victims(message.prover, frame, end)
                     .filter(move |&(_, victim_end, arrival)| {
                         victim_end != end
-                            || buffer.messages.get(&arrival).is_some_and(|m| {
-                                m.passed
-                                    .is_some_and(|p| p.proposals >= SEAL_PASSES_TO_YIELD)
-                            })
+                            || (yields
+                                && buffer.messages.get(&arrival).is_some_and(|m| {
+                                    m.passed
+                                        .is_some_and(|p| p.proposals >= SEAL_PASSES_TO_YIELD)
+                                }))
                     });
                 (rank, buffer, victims.peekable())
             })
@@ -1327,9 +1341,11 @@ impl Share {
 
     /// A storage epoch proof refused over this share may wait for the room
     /// frames free in it ([`seal_waiting::SealWaiting::refused`]): the
-    /// active provers' and other senders' shares keep that room for it. A
-    /// sender's share frees room only as that sender's own proofs go, and
-    /// the other shares hold no storage epoch proofs.
+    /// active provers' and other senders' shares keep that room for a proof
+    /// that may wait ([`CollectedMessage::may_wait`]),
+    /// which only the active provers' share holds. A sender's share frees
+    /// room only as that sender's own proofs go, and the other shares hold
+    /// no storage epoch proofs.
     pub(crate) fn waits(self) -> bool {
         match self {
             Share::Seals | Share::OtherSeals => true,
@@ -4934,7 +4950,7 @@ impl MessageCollector {
             .collect();
         drop(finalized);
         drop(buffers);
-        if let (Some(frame), false) = (frame, passed.is_empty()) {
+        if let Some(frame) = frame {
             // A poisoned lock leaves the order as it was; the copy stands. A
             // proof that rode, aged or moved since is not marked.
             if let Ok(mut buffers) = self.buffers.write() {
@@ -4943,6 +4959,14 @@ impl MessageCollector {
                         buffer.mark_passed(&key, frame, skip);
                     }
                 }
+                // This proposal passed over each waiting proof not held.
+                let seal_frame = self.next_seal_frame();
+                let finalized = self.finalized.read().unwrap();
+                let found = |hash: &[u8; 32]| seal_found(&buffers, &finalized, hash);
+                self.seal_waiting
+                    .lock()
+                    .unwrap()
+                    .passed(frame, seal_frame, Instant::now(), found);
             }
         }
         Ok(taken)

@@ -15,6 +15,16 @@ pub(super) const SEAL_WAIT_STALE: Duration = Duration::from_secs(180);
 /// shows its sender still resends it.
 const SEAL_WAIT_REFUSALS: u32 = 2;
 
+/// This node's proposals, each of its own frame, that pass over a waiting
+/// proof not yet held before its wait ends ([`SealWaiting::passed`]): as
+/// many as pass over a held proof before it yields its room
+/// ([`super::SEAL_PASSES_TO_YIELD`]), about 29 minutes. A held proof rides
+/// only this node's proposals, so the room a wait gathers frees as their
+/// frames finalize: one pass would end a wait at the proposal whose frame
+/// frees its room, before its sender sends it again, and a few would when
+/// this node leads consecutive frames.
+const SEAL_WAIT_PASSES: u32 = super::SEAL_PASSES_TO_YIELD;
+
 /// A refused proof the next room freed goes to.
 #[derive(Clone, Copy, Debug)]
 struct Waiting {
@@ -23,6 +33,10 @@ struct Waiting {
     end: u64,
     len: usize,
     refusals: u32,
+    /// This node's proposals that passed over it, each frame's once, and
+    /// the last one's frame.
+    passes: u32,
+    passed: u64,
     first: Instant,
     last: Instant,
 }
@@ -67,6 +81,8 @@ enum Ended {
     Held,
     /// Its sender did not send it again within [`SEAL_WAIT_STALE`].
     Stale,
+    /// [`SEAL_WAIT_PASSES`] of this node's proposals passed over it.
+    PassedOver,
     /// Its window ended.
     Closed,
     /// A refused proof due sooner, or a larger one due with it, waits
@@ -79,6 +95,7 @@ impl Ended {
         match self {
             Ended::Held => "held",
             Ended::Stale => "stale",
+            Ended::PassedOver => "passed_over",
             Ended::Closed => "window_ended",
             Ended::Superseded => "superseded",
         }
@@ -86,7 +103,9 @@ impl Ended {
 }
 
 /// For each share of held storage epoch proofs, the refused proof whose
-/// window ends soonest: once its sender sends it again, the share keeps its
+/// window ends soonest, of those that may wait
+/// ([`CollectedMessage::may_wait`]) and that are due within an epoch
+/// ([`within_reach`]): once its sender sends it again, the share keeps its
 /// bytes free of every proof due no sooner, so the room frames free gathers
 /// for it. Without it, proofs of about 1 MB took each megabyte a frame
 /// freed, and a 4 MB proof due with them was refused on all 22 sends over
@@ -101,6 +120,11 @@ impl Ended {
 /// plain submit's hold in its own share ended it, and a proof promoted,
 /// carried by another archive's frame or re-filed kept its room for up to
 /// [`SEAL_WAIT_STALE`].
+///
+/// A wait also ends once [`SEAL_WAIT_PASSES`] of this node's proposals
+/// passed over its proof while it was not held, however often it is sent
+/// again. Any other sender's proof neither starts nor refreshes a wait: it
+/// is held or refused as the room left allows.
 #[derive(Default)]
 pub(super) struct SealWaiting {
     prover: Option<Waiting>,
@@ -143,9 +167,10 @@ impl SealWaiting {
         }
     }
 
-    /// `message` was refused for its full share: it waits if its window
-    /// ends sooner than the waiting proof's, or with it and it is larger,
-    /// or none waits.
+    /// `message` was refused for its full share: if it may wait
+    /// ([`CollectedMessage::may_wait`]) and is due within reach of
+    /// `frame` ([`within_reach`]), it waits if its window ends sooner than
+    /// the waiting proof's, or with it and it is larger, or none waits.
     pub(super) fn refused(
         &mut self,
         message: &CollectedMessage,
@@ -155,7 +180,7 @@ impl SealWaiting {
     ) {
         let Some(end) = message
             .window_end
-            .filter(|end| message.held_seal() && (frame == 0 || *end > frame))
+            .filter(|&end| message.may_wait() && within_reach(end, frame))
         else {
             return;
         };
@@ -192,6 +217,8 @@ impl SealWaiting {
                     end,
                     len: message.data.len(),
                     refusals: 1,
+                    passes: 0,
+                    passed: 0,
                     first: now,
                     last: now,
                 });
@@ -209,6 +236,35 @@ impl SealWaiting {
         }
     }
 
+    /// A proposal of this node for frame `proposal` was taken: each wait
+    /// still not over ([`Self::settle`]) counts it, a frame's proposals
+    /// once, and ends at [`SEAL_WAIT_PASSES`]. Under the buffers' lock.
+    pub(super) fn passed(
+        &mut self,
+        proposal: u64,
+        frame: u64,
+        now: Instant,
+        found: impl Fn(&[u8; 32]) -> Found,
+    ) {
+        self.settle(frame, now, &found);
+        for prover in [true, false] {
+            let slot = self.slot(prover);
+            let Some(waiting) = slot.as_mut() else {
+                continue;
+            };
+            if waiting.passes > 0 && waiting.passed == proposal {
+                continue;
+            }
+            waiting.passes = waiting.passes.saturating_add(1);
+            waiting.passed = proposal;
+            if waiting.passes >= SEAL_WAIT_PASSES {
+                let waiting = *waiting;
+                *slot = None;
+                end_line(waiting, prover, Ended::PassedOver, now);
+            }
+        }
+    }
+
     /// The proof waiting in the `prover` share, as (bytes, window end, keeping
     /// room for it), for tests.
     #[cfg(test)]
@@ -216,6 +272,16 @@ impl SealWaiting {
         let slot = if prover { &self.prover } else { &self.other };
         slot.map(|waiting| (waiting.len, waiting.end, waiting.active()))
     }
+}
+
+/// A wait may keep room for a proof due at `end` while `frame` is the next
+/// GLOBAL frame to finalize: after it, and at most an epoch past it. Every
+/// window ends at an epoch boundary, its proofs sent within it
+/// (`settlement_window`; a seal's ends with its settlement's), so a proof
+/// due further off has no need to wait yet. While `frame` is unknown (0)
+/// none waits.
+fn within_reach(end: u64, frame: u64) -> bool {
+    frame != 0 && end > frame && end - frame <= quil_types::consensus::epoch_length_frames()
 }
 
 /// The share of held proofs `prover` names.
@@ -265,8 +331,9 @@ fn end_line(waiting: Waiting, prover: bool, why: Ended, now: Instant) {
         bytes = waiting.len,
         window_end = waiting.end,
         refusals = waiting.refusals,
+        passes = waiting.passes,
         waited_secs = now.saturating_duration_since(waiting.first).as_secs(),
-        "message collector: stopped keeping room for a refused storage epoch proof; held: it was held here or a finalized frame carried it, by waited_secs after its first refusal; window_ended or stale: its window ended or its sender sent it no more, and the room is free again; superseded: a refused proof due sooner, or a larger one due with it, waits instead"
+        "message collector: stopped keeping room for a refused storage epoch proof; held: it was held here or a finalized frame carried it, by waited_secs after its first refusal; window_ended or stale: its window ended or its sender sent it no more, and the room is free again; passed_over: passes of this node's proposals passed over it while it was not held, and the room is free again; superseded: a refused proof due sooner, or a larger one due with it, waits instead"
     );
 }
 
