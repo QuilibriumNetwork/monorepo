@@ -107,7 +107,7 @@ fn fill(
         };
         match outcome {
             SubmitOutcome::Accepted => {}
-            SubmitOutcome::Filtered(Refusal::RankFull) => return (id - first) as usize,
+            SubmitOutcome::Filtered(Refusal::ShareFull(_)) => return (id - first) as usize,
             other => panic!("proof {id}: {other:?}"),
         }
     }
@@ -164,7 +164,7 @@ fn a_full_share_makes_room_for_a_proof_due_sooner() {
         of.insert(sha256(&bytes), id);
         match mc.add_message_outcome(1, bytes) {
             SubmitOutcome::Accepted => held = id,
-            SubmitOutcome::Filtered(Refusal::RankFull) => break,
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)) => break,
             other => panic!("seal {id}: {other:?}"),
         }
     }
@@ -175,7 +175,7 @@ fn a_full_share_makes_room_for_a_proof_due_sooner() {
     );
     assert_eq!(
         mc.add_message_outcome(1, late(1000)),
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
         "seal-deadline equal: a proof due with the held ones takes no room"
     );
     let bytes = soon(101);
@@ -243,7 +243,7 @@ fn a_proof_past_its_window_makes_no_room() {
     eprintln!("REACH seal-deadline closed-room outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
         "seal-deadline closed-room: a settlement past its window took room"
     );
     assert_eq!(mc.pending_count(1), held);
@@ -260,7 +260,7 @@ fn a_full_share_makes_no_room_before_the_frame_is_known() {
     eprintln!("REACH seal-deadline unknown-frame outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
         "seal-deadline unknown-frame: a proof of epoch 0 took room before the frame was known"
     );
     assert_eq!(
@@ -283,7 +283,7 @@ fn a_finalized_frame_tells_the_collector_the_current_frame() {
     eprintln!("REACH seal-deadline finalized-closed outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
         "seal-deadline finalized-closed: a settlement due by the next frame to finalize took room"
     );
     assert_eq!(mc.pending_count(1), held);
@@ -366,7 +366,12 @@ fn a_full_share_takes_no_room_from_the_other_share() {
         let held = fill(&mc, 1, own, 1, soon) + fill(&mc, 1, other, 100, late);
         let outcome = mc.add_message_outcome_from(1, soon(200), own);
         eprintln!("REACH seal-deadline shares-apart {own:?} outcome={outcome:?}");
-        assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+        let share = if own == Provenance::Prover {
+            Share::Seals
+        } else {
+            Share::OtherSeals
+        };
+        assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::ShareFull(share)));
         assert_eq!(
             mc.pending_count(1),
             held,
@@ -388,7 +393,10 @@ fn a_share_that_cannot_make_room_drops_nothing() {
     );
     let outcome = mc.add_message_outcome(1, soon(101));
     eprintln!("REACH seal-deadline short outcome={outcome:?}");
-    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals))
+    );
     assert_eq!(
         mc.pending_count(1),
         held + 1,
@@ -412,7 +420,7 @@ fn an_abandoned_proposal_ends_no_window() {
     eprintln!("REACH seal-deadline abandoned outcome={outcome:?}");
     assert_eq!(
         outcome,
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)),
         "seal-deadline abandoned: a seal took the room of settlements an abandoned proposal passed"
     );
     for rank in 1..=RETENTION_WINDOW + 1 {
@@ -524,7 +532,10 @@ fn a_sender_over_its_share_makes_no_room() {
         (1..8).contains(&made_room),
         "the sender's proofs within its share make room"
     );
-    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Sender))
+    );
     let late_held = (1..=held as u32)
         .filter(|&id| holds(&mc, &late(id)))
         .count();
@@ -556,7 +567,8 @@ fn a_promotion_over_its_senders_share_makes_no_room() {
         own += 1;
     };
     assert!(
-        (1..8).contains(&own) && refused == SubmitOutcome::Filtered(Refusal::RankFull),
+        (1..8).contains(&own)
+            && refused == SubmitOutcome::Filtered(Refusal::ShareFull(Share::Sender)),
         "the prover holds its share of proofs due later"
     );
     let filled = fill(&mc, 1, Provenance::Prover, 100, late);
@@ -574,7 +586,10 @@ fn a_promotion_over_its_senders_share_makes_no_room() {
     );
     let outcome = mc.add_message_outcome_by(1, promoted.clone(), Provenance::Prover, prover);
     eprintln!("REACH seal-deadline promote-sender outcome={outcome:?}");
-    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert_eq!(
+        outcome,
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Sender))
+    );
     assert_eq!(
         late_held(),
         before,
@@ -622,14 +637,20 @@ fn a_full_rank_makes_no_room() {
             addr += 1;
             match mc.add_message_outcome(2, header(addr, len)) {
                 SubmitOutcome::Accepted => {}
-                SubmitOutcome::Filtered(Refusal::RankFull) => break,
+                SubmitOutcome::Filtered(Refusal::RankFull | Refusal::ShareFull(_)) => break,
                 other => panic!("header {addr}: {other:?}"),
             }
         }
     }
     let outcome = mc.add_message_outcome(2, soon(101));
     eprintln!("REACH seal-deadline rank-room outcome={outcome:?}");
-    assert_eq!(outcome, SubmitOutcome::Filtered(Refusal::RankFull));
+    assert!(
+        matches!(
+            outcome,
+            SubmitOutcome::Filtered(Refusal::RankFull | Refusal::ShareFull(_))
+        ),
+        "{outcome:?}"
+    );
     assert_eq!(
         mc.pending_count(1),
         held,
@@ -704,7 +725,7 @@ fn settlements_ride_before_their_window_ends_under_110_percent_demand() {
                 submits += 1;
                 match archive.add_message_outcome_from(frame, p.bytes.clone(), Provenance::Prover) {
                     SubmitOutcome::Accepted | SubmitOutcome::Duplicate => p.taken_at = Some(frame),
-                    SubmitOutcome::Filtered(Refusal::RankFull) => {
+                    SubmitOutcome::Filtered(Refusal::RankFull | Refusal::ShareFull(_)) => {
                         refused.insert((a, p.settles));
                     }
                     other => panic!("proof {}: {other:?}", p.id),

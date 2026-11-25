@@ -636,7 +636,9 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
     match refusal {
         Refusal::ProverOnly => 0,
         Refusal::UnknownShard => 1,
-        Refusal::RankFull => 2,
+        // A share's refusal counts as a full rank, as senders read it; its
+        // reason names the share.
+        Refusal::RankFull | Refusal::ShareFull(_) => 2,
         Refusal::InvalidShardFrame => 3,
         Refusal::AwaitingExecution => 4,
         Refusal::NoProposer => 5,

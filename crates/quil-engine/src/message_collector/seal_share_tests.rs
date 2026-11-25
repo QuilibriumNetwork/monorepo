@@ -119,6 +119,35 @@ fn a_global_proposal_carries_eight_mib_of_storage_epoch_proofs_beside_shard_proo
     );
 }
 
+/// The proposal line counts the storage epoch proofs a GLOBAL proposal
+/// carries and their bytes (`pool_seals`, `pool_seal_bytes`), so archives
+/// can be compared by what the frames they lead carry.
+#[test]
+fn a_global_proposal_counts_the_storage_epoch_proofs_it_carries() {
+    let mc = MessageCollector::new();
+    let seals: Vec<Vec<u8>> = (1..=3).map(seal).collect();
+    for message in &seals {
+        assert!(mc.add_message(1, message.clone()));
+    }
+    let taken = mc
+        .snapshot_for_proposal(1, PROPOSAL, 100_000, Some(FRAME), &[])
+        .unwrap();
+    let pool = mc.take_proposal_pool().unwrap();
+    eprintln!(
+        "REACH seal-count taken={} seals={} bytes={}",
+        taken.len(),
+        pool.seals,
+        pool.seal_bytes
+    );
+    let bytes: usize = seals.iter().map(Vec::len).sum();
+    assert_eq!(taken.len(), 3, "premise: the proposal carried every proof");
+    assert_eq!(
+        (pool.seals, pool.seal_bytes),
+        (3, bytes),
+        "SEAL-COUNT: the proposal line's storage epoch proofs and bytes"
+    );
+}
+
 /// Storage epoch proofs past their share ride in the room every other
 /// message leaves, in the same proposal.
 #[test]
@@ -176,7 +205,7 @@ fn an_archive_holds_two_proposals_share_of_storage_epoch_proofs() {
         let len = proof.len();
         match mc.add_message_outcome(1, proof) {
             SubmitOutcome::Accepted => held += len,
-            SubmitOutcome::Filtered(Refusal::RankFull) => break,
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)) => break,
             other => panic!("seal {id}: {other:?}"),
         }
     }
@@ -202,7 +231,7 @@ fn an_archive_holds_one_proposals_share_of_other_senders_storage_epoch_proofs() 
         // Each sender is a peer of its own, within its share.
         match mc.add_message_outcome_by(1, proof, Provenance::Other, &id.to_be_bytes()) {
             SubmitOutcome::Accepted => held += len,
-            SubmitOutcome::Filtered(Refusal::RankFull) => break,
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::OtherSeals)) => break,
             other => panic!("seal {id}: {other:?}"),
         }
     }

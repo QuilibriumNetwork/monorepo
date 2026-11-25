@@ -515,7 +515,7 @@ fn install_archive_deps(rig: &Rig) {
 /// the seat to its window's end and every later proof of it was refused.
 #[test]
 fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
-    use crate::message_collector::{Refusal, SubmitOutcome};
+    use crate::message_collector::{Refusal, Share, SubmitOutcome};
     let rig = Rig::new();
     install_archive_deps(&rig);
     rig.collector.set_class_shares();
@@ -527,7 +527,7 @@ fn a_seat_proof_a_proposal_refuses_frees_its_senders_seat() {
     assert_eq!(send(refused.clone()), SubmitOutcome::Accepted);
     assert_eq!(
         send(seat_settlement(2)),
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Sender)),
         "the sender's seat is held before the proposal"
     );
     let lease = rig
@@ -988,7 +988,7 @@ fn a_settled_seal_copy_a_proposal_drops_leaves_the_public_pool() {
 /// validates it again and drops it as refused.
 #[test]
 fn a_replayed_refused_seat_proof_holds_its_seat_until_the_next_proposal() {
-    use crate::message_collector::{Refusal, SubmitOutcome};
+    use crate::message_collector::{Refusal, Share, SubmitOutcome};
     let rig = Rig::new();
     install_archive_deps(&rig);
     rig.collector.set_class_shares();
@@ -1014,7 +1014,7 @@ fn a_replayed_refused_seat_proof_holds_its_seat_until_the_next_proposal() {
     );
     assert_eq!(
         send(seat_settlement(2)),
-        SubmitOutcome::Filtered(Refusal::RankFull),
+        SubmitOutcome::Filtered(Refusal::ShareFull(Share::Sender)),
         "the replayed copy holds the seat until a proposal"
     );
     propose();
