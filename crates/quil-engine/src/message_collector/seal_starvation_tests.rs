@@ -20,7 +20,7 @@ const EPOCH: u64 = 1478;
 const PASSES: u64 = 12;
 
 /// Member `id`'s settlement of one seat of [`EPOCH`], with `len` proof bytes.
-fn settlement(id: u32, len: usize) -> Vec<u8> {
+pub(super) fn settlement(id: u32, len: usize) -> Vec<u8> {
     let mut member = [0u8; 32];
     member[..4].copy_from_slice(&id.to_be_bytes());
     let mut bytes = vec![0u8; len];
@@ -48,7 +48,7 @@ fn settlement(id: u32, len: usize) -> Vec<u8> {
 
 /// A GLOBAL collector that saw a frame of epoch `EPOCH + 1` finalized,
 /// before the settlements' window ends.
-fn archive() -> MessageCollector {
+pub(super) fn archive() -> MessageCollector {
     let mc = MessageCollector::new();
     mc.set_class_shares();
     mc.note_finalized_frame(settlement_window(EPOCH).0);
@@ -57,7 +57,7 @@ fn archive() -> MessageCollector {
 
 /// Fill the provers' share with this node's settlements of `len` bytes,
 /// ids from `first` on: those held, and the first refused.
-fn fill(mc: &MessageCollector, first: u32, len: usize) -> (Vec<Vec<u8>>, Vec<u8>) {
+pub(super) fn fill(mc: &MessageCollector, first: u32, len: usize) -> (Vec<Vec<u8>>, Vec<u8>) {
     let mut held = Vec::new();
     for id in first..first + 100 {
         let proof = settlement(id, len);

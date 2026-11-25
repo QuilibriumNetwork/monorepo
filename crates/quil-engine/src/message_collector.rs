@@ -24,6 +24,8 @@ mod seal_deadline_tests;
 mod seal_share_tests;
 #[cfg(test)]
 mod seal_starvation_tests;
+#[cfg(test)]
+mod seal_wait_end_tests;
 mod seal_waiting;
 #[cfg(test)]
 mod seat_density_tests;
@@ -741,6 +743,28 @@ fn seal_sender(sender: Sender<'_>) -> Option<[u8; 32]> {
         }
     }
     Some(h.finalize().into())
+}
+
+/// Where the storage epoch proof with `hash` stands for a share's waiting
+/// proof ([`seal_waiting::Found`]): carried by a finalized frame, or held at
+/// any rank, in the provers' share if any copy is. Read under the buffers'
+/// lock, the finalized set's taken after it as a collection takes it.
+fn seal_found(
+    buffers: &HashMap<u64, RankBuffer>,
+    finalized: &FinalizedSet,
+    hash: &[u8; 32],
+) -> seal_waiting::Found {
+    if finalized.contains(hash) {
+        return seal_waiting::Found::Included;
+    }
+    let mut found = seal_waiting::Found::Absent;
+    for prover in buffers.values().filter_map(|b| b.held_prover(hash)) {
+        found = seal_waiting::Found::Held { prover };
+        if prover {
+            break;
+        }
+    }
+    found
 }
 
 /// How a share-full line names `sender`.
@@ -1796,6 +1820,15 @@ impl RankBuffer {
             .get(key)
             .and_then(|arrival| self.messages.get(arrival))
             .is_some_and(|message| message.held_seal() && !message.prover)
+    }
+
+    /// The held message with `key` counts toward the active provers' share
+    /// ([`CollectedMessage::prover`]), if held.
+    fn held_prover(&self, key: &[u8; 32]) -> Option<bool> {
+        self.seen
+            .get(key)
+            .and_then(|arrival| self.messages.get(arrival))
+            .map(|message| message.prover)
     }
 
     /// Drop the held storage epoch proofs whose window ends at or before
@@ -4202,10 +4235,12 @@ impl MessageCollector {
             0
         };
         let keep = if shared && held_seal {
+            let finalized = self.finalized.read().unwrap();
+            let found = |hash: &[u8; 32]| seal_found(&buffers, &finalized, hash);
             self.seal_waiting
                 .lock()
                 .unwrap()
-                .keep(&message, seal_frame, Instant::now())
+                .keep(&message, seal_frame, Instant::now(), found)
         } else {
             0
         };
@@ -4253,21 +4288,14 @@ impl MessageCollector {
             }
             self.note_window_seats(SeatEvent::Refused, seats_prover, &seats);
             if matches!(share, Share::Seals | Share::OtherSeals) {
-                self.seal_waiting
-                    .lock()
-                    .unwrap()
-                    .refused(&message, seal_frame, Instant::now());
+                self.seal_refused(&buffers, &message, seal_frame);
             }
             return SubmitOutcome::Filtered(Refusal::ShareFull(share));
         }
-        let held_prover = message.prover;
         match buffer.add(message) {
             AddOutcome::Added => {
                 if shared && held_seal {
-                    self.seal_waiting
-                        .lock()
-                        .unwrap()
-                        .held(held_prover, &hash, Instant::now());
+                    self.settle_seal_waits(&buffers, seal_frame);
                 }
                 if let Some(bytes) = oversize {
                     let reason = "held alone: no other proof over a frame's seal budget is held in its share";
@@ -5208,11 +5236,14 @@ impl MessageCollector {
         };
         // A copy over its sender's share takes no held proof's room.
         let frame = self.next_seal_frame();
-        let keep = self
-            .seal_waiting
-            .lock()
-            .unwrap()
-            .keep(message, frame, Instant::now());
+        let keep = {
+            let finalized = self.finalized.read().unwrap();
+            let found = |hash: &[u8; 32]| seal_found(buffers, &finalized, hash);
+            self.seal_waiting
+                .lock()
+                .unwrap()
+                .keep(message, frame, Instant::now(), found)
+        };
         if over_sender.is_none() && seals.over(message, keep).is_some() {
             let mut dropped = Vec::new();
             let evicted = evict_later_seals(buffers, message, seals, frame, keep, &mut dropped);
@@ -5250,6 +5281,12 @@ impl MessageCollector {
             if let Some(seats) = buffer.held_seats(&message.hash) {
                 self.note_window_seats(SeatEvent::Refused, true, seats);
             }
+            // A prover's copy refused waits as a plain submit's does: its
+            // sender resends it, and another sender's copy held here does
+            // not end its wait ([`seal_waiting::Found::ends`]).
+            if matches!(share, Share::Seals | Share::OtherSeals) {
+                self.seal_refused(buffers, message, frame);
+            }
             return SubmitOutcome::Filtered(Refusal::ShareFull(share));
         }
         buffer.promote_seal(&message.hash, message.sender, message.own);
@@ -5257,7 +5294,37 @@ impl MessageCollector {
         if let Some(seats) = buffer.held_seats(&message.hash) {
             self.note_window_seats(SeatEvent::Admitted, true, seats);
         }
+        self.settle_seal_waits(buffers, frame);
         SubmitOutcome::Duplicate
+    }
+
+    /// `message`, a storage epoch proof, was refused for its full share:
+    /// it may wait for room ([`seal_waiting::SealWaiting::refused`]). Under
+    /// the buffers' lock.
+    fn seal_refused(
+        &self,
+        buffers: &HashMap<u64, RankBuffer>,
+        message: &CollectedMessage,
+        frame: u64,
+    ) {
+        let finalized = self.finalized.read().unwrap();
+        let found = |hash: &[u8; 32]| seal_found(buffers, &finalized, hash);
+        self.seal_waiting
+            .lock()
+            .unwrap()
+            .refused(message, frame, Instant::now(), found);
+    }
+
+    /// End the waits a hold just ended, so their lines time them; any other
+    /// hold or carry ends them on the share's next consult. Under the
+    /// buffers' lock.
+    fn settle_seal_waits(&self, buffers: &HashMap<u64, RankBuffer>, frame: u64) {
+        let finalized = self.finalized.read().unwrap();
+        let found = |hash: &[u8; 32]| seal_found(buffers, &finalized, hash);
+        self.seal_waiting
+            .lock()
+            .unwrap()
+            .settle(frame, Instant::now(), found);
     }
 
     /// Mark `raw_msgs` as included in a finalized frame: remove them from

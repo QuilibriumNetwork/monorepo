@@ -34,10 +34,36 @@ impl Waiting {
     }
 }
 
+/// Where a waiting proof stands outside its wait, read under the buffers'
+/// lock when its share is next consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Found {
+    /// Neither held here nor carried by a finalized frame.
+    Absent,
+    /// Held here at some rank, in the active provers' share if `prover`.
+    Held { prover: bool },
+    /// A finalized frame carried it: no frame carries it again.
+    Included,
+}
+
+impl Found {
+    /// The proof waiting in the `prover` share needs no more room. A copy
+    /// in the provers' share ends either wait; another sender's copy ends
+    /// only the other senders' wait, as an active prover's copy still
+    /// needs room in the provers' share to promote it.
+    fn ends(self, prover: bool) -> bool {
+        match self {
+            Found::Absent => false,
+            Found::Held { prover: held } => held || !prover,
+            Found::Included => true,
+        }
+    }
+}
+
 /// Why a proof stopped waiting, for its line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ended {
-    /// It was held.
+    /// It was held here, or a finalized frame carried it ([`Found::ends`]).
     Held,
     /// Its sender did not send it again within [`SEAL_WAIT_STALE`].
     Stale,
@@ -68,6 +94,13 @@ impl Ended {
 /// (2026-11-25). Of two proofs due together the larger waits: room for it
 /// fits the smaller, and a proof as small as the room a frame frees needs no
 /// wait. Taken under the buffers' lock only.
+///
+/// A wait ends however its proof is held or carried: each consult reads
+/// where both shares' waiting proofs stand ([`Found`]) before it keeps any
+/// room, so no hold or carry path has to report it. Until 2026-11-25 only a
+/// plain submit's hold in its own share ended it, and a proof promoted,
+/// carried by another archive's frame or re-filed kept its room for up to
+/// [`SEAL_WAIT_STALE`].
 #[derive(Default)]
 pub(super) struct SealWaiting {
     prover: Option<Waiting>,
@@ -85,14 +118,20 @@ impl SealWaiting {
 
     /// The bytes `message`, a submitted proof, must leave free in its share
     /// held with it: the waiting proof's, unless `message` is that proof or
-    /// due sooner. `frame` is the next GLOBAL frame to finalize, 0 unknown.
-    pub(super) fn keep(&mut self, message: &CollectedMessage, frame: u64, now: Instant) -> usize {
+    /// due sooner. `frame` is the next GLOBAL frame to finalize, 0 unknown;
+    /// `found` tells where a proof with a given hash stands.
+    pub(super) fn keep(
+        &mut self,
+        message: &CollectedMessage,
+        frame: u64,
+        now: Instant,
+        found: impl Fn(&[u8; 32]) -> Found,
+    ) -> usize {
         if !message.held_seal() {
             return 0;
         }
-        let slot = self.slot(message.prover);
-        expire(slot, message.prover, frame, now);
-        match slot {
+        self.settle(frame, now, found);
+        match self.slot(message.prover) {
             Some(waiting)
                 if waiting.active()
                     && waiting.hash != message.hash
@@ -107,16 +146,22 @@ impl SealWaiting {
     /// `message` was refused for its full share: it waits if its window
     /// ends sooner than the waiting proof's, or with it and it is larger,
     /// or none waits.
-    pub(super) fn refused(&mut self, message: &CollectedMessage, frame: u64, now: Instant) {
+    pub(super) fn refused(
+        &mut self,
+        message: &CollectedMessage,
+        frame: u64,
+        now: Instant,
+        found: impl Fn(&[u8; 32]) -> Found,
+    ) {
         let Some(end) = message
             .window_end
             .filter(|end| message.held_seal() && (frame == 0 || *end > frame))
         else {
             return;
         };
+        self.settle(frame, now, found);
         let prover = message.prover;
         let slot = self.slot(prover);
-        expire(slot, prover, frame, now);
         match slot {
             Some(waiting) if waiting.hash == message.hash => {
                 waiting.refusals = waiting.refusals.saturating_add(1);
@@ -154,13 +199,13 @@ impl SealWaiting {
         }
     }
 
-    /// The proof with `hash`, of the `prover` share, was held.
-    pub(super) fn held(&mut self, prover: bool, hash: &[u8; 32], now: Instant) {
-        let slot = self.slot(prover);
-        if slot.is_some_and(|waiting| waiting.hash == *hash) {
-            if let Some(waiting) = slot.take() {
-                end_line(waiting, prover, Ended::Held, now);
-            }
+    /// End each share's wait that is over: its proof held or carried
+    /// ([`Found::ends`]), its window ended at `frame`, or its sender
+    /// stopped. Called on every consult, and right after a hold so its line
+    /// times the wait.
+    pub(super) fn settle(&mut self, frame: u64, now: Instant, found: impl Fn(&[u8; 32]) -> Found) {
+        for prover in [true, false] {
+            expire(self.slot(prover), prover, frame, now, &found);
         }
     }
 
@@ -182,13 +227,22 @@ fn share(prover: bool) -> Share {
     }
 }
 
-/// End the proof waiting in `slot` if its window has ended at `frame` or its
-/// sender stopped sending it.
-fn expire(slot: &mut Option<Waiting>, prover: bool, frame: u64, now: Instant) {
+/// End the proof waiting in `slot`, of the `prover` share, if `found` finds
+/// it held or carried, its window has ended at `frame`, or its sender
+/// stopped sending it.
+fn expire(
+    slot: &mut Option<Waiting>,
+    prover: bool,
+    frame: u64,
+    now: Instant,
+    found: &impl Fn(&[u8; 32]) -> Found,
+) {
     let Some(waiting) = *slot else {
         return;
     };
-    let why = if frame != 0 && waiting.end <= frame {
+    let why = if found(&waiting.hash).ends(prover) {
+        Ended::Held
+    } else if frame != 0 && waiting.end <= frame {
         Ended::Closed
     } else if now.saturating_duration_since(waiting.last) > SEAL_WAIT_STALE {
         Ended::Stale
@@ -212,7 +266,7 @@ fn end_line(waiting: Waiting, prover: bool, why: Ended, now: Instant) {
         window_end = waiting.end,
         refusals = waiting.refusals,
         waited_secs = now.saturating_duration_since(waiting.first).as_secs(),
-        "message collector: stopped keeping room for a refused storage epoch proof; held: it was admitted waited_secs after its first refusal; window_ended or stale: its window ended or its sender sent it no more, and the room is free again; superseded: a refused proof due sooner, or a larger one due with it, waits instead"
+        "message collector: stopped keeping room for a refused storage epoch proof; held: it was held here or a finalized frame carried it, by waited_secs after its first refusal; window_ended or stale: its window ended or its sender sent it no more, and the room is free again; superseded: a refused proof due sooner, or a larger one due with it, waits instead"
     );
 }
 
@@ -229,6 +283,20 @@ mod tests {
         message
     }
 
+    fn absent(_: &[u8; 32]) -> Found {
+        Found::Absent
+    }
+
+    /// Where `hash` stands if `copy` is held, in the provers' share if
+    /// `prover`.
+    fn held(hash: &[u8; 32], copy: &CollectedMessage, prover: bool) -> Found {
+        if *hash == copy.hash {
+            Found::Held { prover }
+        } else {
+            Found::Absent
+        }
+    }
+
     /// A waiting proof keeps room only once sent again, for proofs due no
     /// sooner than it, and frees it once held, past its window, or no
     /// longer sent.
@@ -239,54 +307,66 @@ mod tests {
         let small = proof(2, 100, 1_000_000);
         let sooner = proof(3, 90, 1_000_000);
         let mut waiting = SealWaiting::default();
-        waiting.refused(&big, 10, now);
+        waiting.refused(&big, 10, now, absent);
         assert_eq!(
-            waiting.keep(&small, 10, now),
+            waiting.keep(&small, 10, now, absent),
             0,
             "one refusal keeps no room"
         );
-        waiting.refused(&big, 10, now);
-        let kept = waiting.keep(&small, 10, now);
+        waiting.refused(&big, 10, now, absent);
+        let kept = waiting.keep(&small, 10, now, absent);
         eprintln!("REACH seal-waiting kept={kept}");
         assert_eq!(
             kept, 4_000_000,
             "SEAL-WAITING: a waiting proof kept no room"
         );
-        assert_eq!(waiting.keep(&big, 10, now), 0, "nothing kept from itself");
         assert_eq!(
-            waiting.keep(&sooner, 10, now),
+            waiting.keep(&big, 10, now, absent),
+            0,
+            "nothing kept from itself"
+        );
+        assert_eq!(
+            waiting.keep(&sooner, 10, now, absent),
             0,
             "a proof due sooner rides first"
         );
-        waiting.refused(&small, 10, now);
+        waiting.refused(&small, 10, now, absent);
         assert_eq!(
             waiting.waiting(true),
             Some((4_000_000, 100, true)),
             "a smaller one waits after"
         );
 
-        waiting.held(true, &big.hash, now);
+        waiting.settle(10, now, |hash| held(hash, &big, true));
         assert_eq!(waiting.waiting(true), None);
 
-        waiting.refused(&big, 10, now);
-        waiting.refused(&big, 10, now);
-        assert_eq!(waiting.keep(&small, 100, now), 0, "its window ended");
+        waiting.refused(&big, 10, now, absent);
+        waiting.refused(&big, 10, now, absent);
+        assert_eq!(
+            waiting.keep(&small, 100, now, absent),
+            0,
+            "its window ended"
+        );
         assert_eq!(waiting.waiting(true), None);
 
-        waiting.refused(&big, 10, now);
-        waiting.refused(&big, 10, now);
+        waiting.refused(&big, 10, now, absent);
+        waiting.refused(&big, 10, now, absent);
         let later = now + SEAL_WAIT_STALE + Duration::from_secs(1);
-        assert_eq!(waiting.keep(&small, 10, later), 0, "its sender stopped");
+        assert_eq!(
+            waiting.keep(&small, 10, later, absent),
+            0,
+            "its sender stopped"
+        );
         assert_eq!(waiting.waiting(true), None);
 
-        waiting.refused(&small, 10, now);
-        waiting.refused(&big, 10, now);
+        waiting.refused(&small, 10, now, absent);
+        waiting.refused(&big, 10, now, absent);
         assert_eq!(
             waiting.waiting(true),
             Some((4_000_000, 100, false)),
             "a larger one waits"
         );
-        waiting.refused(&sooner, 10, now);
+        waiting.refused(&sooner, 10, now, absent);
         assert_eq!(
             waiting.waiting(true),
             Some((1_000_000, 90, false)),
@@ -297,9 +377,97 @@ mod tests {
             ..proof(4, 100, 1_000_000)
         };
         assert_eq!(
-            waiting.keep(&other, 10, now),
+            waiting.keep(&other, 10, now, absent),
             0,
             "the other share keeps its own"
         );
+    }
+
+    /// A waiting proof keeps its room until more than [`SEAL_WAIT_STALE`]
+    /// passed since its last refusal: a resend at exactly that much keeps
+    /// it waiting.
+    #[test]
+    fn a_waiting_proof_keeps_room_at_exactly_its_stale_time() {
+        let now = Instant::now();
+        let big = proof(1, 100, 4_000_000);
+        let small = proof(2, 100, 1_000_000);
+        let mut waiting = SealWaiting::default();
+        waiting.refused(&big, 10, now, absent);
+        waiting.refused(&big, 10, now, absent);
+        let kept = waiting.keep(&small, 10, now + SEAL_WAIT_STALE, absent);
+        eprintln!("REACH seal-stale kept={kept}");
+        assert_eq!(
+            kept,
+            4_000_000,
+            "SEAL-STALE-EDGE: a proof refused exactly {}s ago kept no room",
+            SEAL_WAIT_STALE.as_secs()
+        );
+        let later = now + SEAL_WAIT_STALE + Duration::from_millis(1);
+        assert_eq!(waiting.keep(&small, 10, later, absent), 0);
+    }
+
+    /// A wait ends once its proof is held in its own share or the provers',
+    /// or carried by a finalized frame, read on the share's next consult; an
+    /// active prover's proof whose other sender's copy is held still waits.
+    #[test]
+    fn a_wait_ends_once_its_proof_is_held_or_carried() {
+        let now = Instant::now();
+        let big = proof(1, 100, 4_000_000);
+        let other_big = CollectedMessage {
+            prover: false,
+            ..proof(1, 100, 4_000_000)
+        };
+        let small = proof(2, 100, 1_000_000);
+        let other_small = CollectedMessage {
+            prover: false,
+            ..proof(2, 100, 1_000_000)
+        };
+        let wait = |message: &CollectedMessage| {
+            let mut waiting = SealWaiting::default();
+            waiting.refused(message, 10, now, absent);
+            waiting.refused(message, 10, now, absent);
+            waiting
+        };
+
+        let mut waiting = wait(&big);
+        let kept = waiting.keep(&small, 10, now, |hash| held(hash, &big, false));
+        eprintln!("REACH seal-wait-end other-copy kept={kept}");
+        assert_eq!(
+            kept, 4_000_000,
+            "SEAL-END-SHARE: another sender's copy held ended a prover's wait"
+        );
+
+        let mut waiting = wait(&other_big);
+        let kept = waiting.keep(&small, 10, now, |hash| held(hash, &big, true));
+        assert_eq!(
+            waiting.waiting(false),
+            None,
+            "SEAL-END-PROVER: a prover's copy held left the other senders' wait"
+        );
+        assert_eq!(kept, 0);
+        assert_eq!(
+            waiting.keep(&other_small, 10, now, absent),
+            0,
+            "SEAL-END-PROVER: room kept after the prover's copy was held"
+        );
+
+        for prover in [true, false] {
+            let waiter = if prover { &big } else { &other_big };
+            let consult = if prover { &small } else { &other_small };
+            let mut waiting = wait(waiter);
+            let kept = waiting.keep(consult, 10, now, |hash| {
+                if *hash == big.hash {
+                    Found::Included
+                } else {
+                    Found::Absent
+                }
+            });
+            eprintln!("REACH seal-wait-end included prover={prover} kept={kept}");
+            assert_eq!(
+                (kept, waiting.waiting(prover)),
+                (0, None),
+                "SEAL-END-INCLUDED: a proof a frame carried kept its wait (prover share {prover})"
+            );
+        }
     }
 }

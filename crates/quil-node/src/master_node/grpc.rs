@@ -618,7 +618,7 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 10] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 11] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
@@ -629,6 +629,7 @@ const SUBMIT_REFUSAL_NAMES: [&str; 10] = [
     "shield_claimed",
     "unsendable_seal",
     "applied_seat_part",
+    "share_full",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -636,9 +637,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
     match refusal {
         Refusal::ProverOnly => 0,
         Refusal::UnknownShard => 1,
-        // A share's refusal counts as a full rank, as senders read it; its
-        // reason names the share.
-        Refusal::RankFull | Refusal::ShareFull(_) => 2,
+        Refusal::RankFull => 2,
         Refusal::InvalidShardFrame => 3,
         Refusal::AwaitingExecution => 4,
         Refusal::NoProposer => 5,
@@ -646,6 +645,9 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::ShieldClaimed => 7,
         Refusal::UnsendableSeal => 8,
         Refusal::AppliedSeatPart => 9,
+        // Senders read it as a full rank; this node's line does not: a full
+        // share is no sign of a lagging node.
+        Refusal::ShareFull(_) => 10,
     }
 }
 
@@ -761,17 +763,14 @@ fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64)
             "gRPC submits refused since {window}: {counts}; a peer sends GLOBAL messages to this \
              node as if it were an archive, and this node proposes no GLOBAL frames"
         );
-    } else if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull)]
-        > 0
-    {
+    } else if let Some(full) = full_refusals_note(&summary.counts) {
         warn!(
             executed,
             head,
             %latest_peer,
             latest_reason,
-            "gRPC submits refused by the message collector since {window}: {counts}; rank_full \
-             means this node's mempool is at its cap, which a node whose GLOBAL execution trails \
-             its head reaches first; submitters are told why and retry"
+            "gRPC submits refused by the message collector since {window}: {counts}; {full}; \
+             submitters are told why and retry"
         );
     } else {
         info!(
@@ -785,6 +784,31 @@ fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64)
         );
     }
 }
+
+/// What the full-mempool refusals among `counts` mean, if any: whose
+/// problem each is and how long it lasts.
+fn full_refusals_note(counts: &[u64; SUBMIT_REFUSAL_NAMES.len()]) -> Option<&'static str> {
+    use quil_engine::message_collector::{Refusal, Share};
+    let rank_full = counts[submit_refusal_slot(Refusal::RankFull)] > 0;
+    let share_full = counts[submit_refusal_slot(Refusal::ShareFull(Share::Seals))] > 0;
+    match (rank_full, share_full) {
+        (false, false) => None,
+        (true, false) => Some(RANK_FULL_NOTE),
+        (false, true) => Some(SHARE_FULL_NOTE),
+        (true, true) => Some(BOTH_FULL_NOTE),
+    }
+}
+
+const RANK_FULL_NOTE: &str = "rank_full means this node's mempool is at its cap, which a node \
+                              whose GLOBAL execution trails its head reaches first";
+const SHARE_FULL_NOTE: &str = "share_full means one class of messages filled its share of this \
+                               node's mempool (latest_reason names it); nothing to fix on this \
+                               node: storage epoch proofs fill theirs as each epoch boundary's \
+                               proofs arrive, and frames free the room within about 25 minutes";
+const BOTH_FULL_NOTE: &str = "rank_full means this node's mempool is at its cap, which a node \
+                              whose GLOBAL execution trails its head reaches first; share_full \
+                              means one class of messages filled its share, which storage epoch \
+                              proofs do for about 25 minutes after each epoch boundary";
 
 /// The open file limit of this process, as raised at startup.
 fn open_file_limit() -> u64 {
@@ -6970,10 +6994,10 @@ mod submit_sender_tests {
 #[cfg(test)]
 mod rpc_bound_tests {
     use super::{
-        node_service_bind, submit_refusal_reason, NodeServiceBind, SubmitRefusalSummary,
-        SubmitRefusals, SUBMIT_REFUSAL_REPORT_INTERVAL,
+        full_refusals_note, node_service_bind, submit_refusal_reason, NodeServiceBind,
+        SubmitRefusalSummary, SubmitRefusals, SUBMIT_REFUSAL_NAMES, SUBMIT_REFUSAL_REPORT_INTERVAL,
     };
-    use quil_engine::message_collector::Refusal;
+    use quil_engine::message_collector::{Refusal, Share};
     use std::time::{Duration, Instant};
 
     /// NodeService authenticates no caller: a non-loopback address is served
@@ -7032,7 +7056,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -7052,12 +7076,44 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0, 0],
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),
             })
         );
+    }
+
+    /// A full share's refusals are counted apart from a full rank's, and
+    /// their line says a full share is normal at an epoch boundary, not that
+    /// this node's execution trails.
+    #[test]
+    fn a_full_share_is_counted_and_explained_apart_from_a_full_rank() {
+        let mut refusals = SubmitRefusals::new();
+        let summary = refusals
+            .record(Refusal::ShareFull(Share::Seals), "a".into(), Instant::now())
+            .expect("the first refusal is logged");
+        let counted: Vec<(&str, u64)> = SUBMIT_REFUSAL_NAMES
+            .iter()
+            .copied()
+            .zip(summary.counts)
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let note = full_refusals_note(&summary.counts).unwrap_or_default();
+        eprintln!("REACH share-full counted={counted:?} note={note:?}");
+        assert_eq!(
+            counted,
+            [("share_full", 1)],
+            "SHARE-FULL-SLOT: a full share was counted as {counted:?}"
+        );
+        assert!(
+            note.contains("epoch boundary") && !note.contains("trails"),
+            "SHARE-FULL-SLOT: a full share read as {note:?}"
+        );
+        let mut rank = [0; SUBMIT_REFUSAL_NAMES.len()];
+        rank[super::submit_refusal_slot(Refusal::RankFull)] = 1;
+        assert!(full_refusals_note(&rank).is_some_and(|note| note.contains("trails")));
+        assert_eq!(full_refusals_note(&[0; SUBMIT_REFUSAL_NAMES.len()]), None);
     }
 }
 
