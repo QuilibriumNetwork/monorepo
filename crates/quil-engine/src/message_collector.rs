@@ -1301,6 +1301,29 @@ pub enum Share {
     Sender,
 }
 
+impl Share {
+    /// Refusals over this share are expected: storage epoch proofs fill
+    /// their shares as each epoch boundary's proofs arrive, senders resend,
+    /// and frames free the room. Refusals over any other share are a duty
+    /// failing ([`Self::capacity`] names whose).
+    pub fn expected(self) -> bool {
+        match self {
+            Share::Seals | Share::OtherSeals | Share::Sender => true,
+            Share::Unreserved | Share::Capacity | Share::Member => false,
+        }
+    }
+
+    /// A share of capacity messages: refused for long, members send them
+    /// faster than GLOBAL carries them, not because this node's execution
+    /// trails its head.
+    pub fn capacity(self) -> bool {
+        match self {
+            Share::Capacity | Share::Member => true,
+            Share::Unreserved | Share::Seals | Share::OtherSeals | Share::Sender => false,
+        }
+    }
+}
+
 /// What a rank buffer holds of each class with a share, as (messages, bytes).
 #[derive(Default)]
 struct Shares {
@@ -3273,10 +3296,7 @@ impl MessageCollector {
             Share::OtherSeals => log.other_seals += 1,
             Share::Sender => log.sender += 1,
         }
-        if !matches!(
-            state.share,
-            Share::Seals | Share::OtherSeals | Share::Sender
-        ) {
+        if !state.share.expected() {
             log.not_only_seals = true;
         }
         log.refusing = true;
