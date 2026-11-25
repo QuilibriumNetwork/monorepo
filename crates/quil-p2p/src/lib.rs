@@ -122,11 +122,12 @@ pub mod params {
     /// one per mesh peer. Pulls are a regular path, not only recovery.
     pub const LAZY_EAGER_PEERS: usize = 2;
     /// How long a mesh peer that announced a message has to deliver it
-    /// after our IWANT; then the announcer with the freshest IHAVE that
-    /// still serves it is asked: a mesh peer for HISTORY_LENGTH - 1
-    /// heartbeats (16.1 s) after its announcement, a peer outside the mesh
-    /// for HISTORY_LENGTH - 1 - HISTORY_GOSSIP (4.9 s) after its latest
-    /// heartbeat gossip of it. A relay answers IWANT from its cache on
+    /// after our IWANT; then the announcer with the latest first IHAVE that
+    /// still serves it is asked. Serving counts from an announcer's first
+    /// IHAVE, a repeat changes nothing: HISTORY_LENGTH - 1 heartbeats
+    /// (16.1 s) for a mesh peer, HISTORY_LENGTH - 1 - HISTORY_GOSSIP
+    /// (4.9 s) for one outside the mesh (libp2p-gossipsub PATCHES.md has
+    /// the rule). A relay answers IWANT from its cache on
     /// arrival for at least that long (less if MCACHE_MAX_BYTES evicts it),
     /// so this time does not shorten that window.
     /// The transfer of a GLOBAL frame (1-8 MiB, up to 15 MiB) must fit: at

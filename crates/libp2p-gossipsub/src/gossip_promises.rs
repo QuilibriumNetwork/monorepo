@@ -477,8 +477,9 @@ mod tests {
 
     /// QUILIBRIUM: a kept mesh announcer whose latest start comes before the next heartbeat is
     /// due by deadline, with or without an open promise; the others, also one outside the mesh
-    /// past its latest start, are due only while no promise is open, latest first IHAVE first; those past their serve-until are dropped and
-    /// counted; delivery and rejection drop the record.
+    /// past its latest start, are due only while no promise is open, latest first IHAVE
+    /// first; those past their serve-until are dropped and counted; delivery and rejection
+    /// drop the record.
     #[test]
     fn hands_out_kept_announcers_by_deadline_and_while_no_promise_is_open() {
         let mut promises = GossipPromises::default();

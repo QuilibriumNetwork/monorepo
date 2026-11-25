@@ -534,11 +534,11 @@ impl Config {
     /// over its `lazy_forward_threshold` (heartbeat gossip goes to peers outside the mesh), and
     /// the IHAVE does not carry the size, so this bounds the transfer of the largest such
     /// message. When it passes, the promise breaks and, at the next heartbeat, the kept
-    /// announcer with the freshest IHAVE that still serves the message is asked: a mesh peer
-    /// for `history_length - 1` heartbeats after its announcement, another peer for
-    /// `history_length - 1 - history_gossip` after its latest heartbeat gossip of it (a relay
+    /// announcer with the latest first IHAVE that still serves the message is asked. Serving
+    /// counts from an announcer's first IHAVE and a repeat changes nothing: `history_length - 1`
+    /// heartbeats for a mesh peer, `history_length - 1 - history_gossip` for another (a relay
     /// serves IWANT from its cache when it arrives, unless its byte budget evicted the
-    /// message). Default 3 s.
+    /// message; PATCHES.md of this crate has the rule). Default 3 s.
     pub fn lazy_followup_time(&self) -> Duration {
         self.lazy_followup_time
     }

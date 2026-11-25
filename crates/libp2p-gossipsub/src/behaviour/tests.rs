@@ -7688,7 +7688,7 @@ fn heartbeat_after(
 }
 
 /// QUILIBRIUM: a message announced by several mesh peers is asked of the
-/// first; when that one never answers, the announcer with the freshest IHAVE
+/// first; when that one never answers, the announcer with the latest first IHAVE
 /// is asked on the first heartbeat after the follow-up time, and the message
 /// arrives from it. Nobody else is asked once it has arrived. The cache of ten
 /// heartbeats puts the others' latest start (5 s on) past that break (3 s).
@@ -8119,7 +8119,7 @@ fn a_withholding_announcer_delays_the_next_ask_to_its_latest_start() {
 
 /// QUILIBRIUM: when the first announcer breaks its promise, the kept ones
 /// that left or fell below the gossip threshold are forgotten, one that used
-/// up its IWANT budget stays kept, and the freshest that can be asked is.
+/// up its IWANT budget stays kept, and the latest first IHAVE that can be asked is.
 #[test]
 fn skips_later_announcers_that_cannot_be_asked() {
     let config = ConfigBuilder::default()
@@ -8140,7 +8140,7 @@ fn skips_later_announcers_that_cannot_be_asked() {
             PeerScoreThresholds::default(),
         )))
         .create_network();
-    // Announced in this order, so the freshest first is left, low, spent.
+    // Announced in this order, so the latest first IHAVE is left, low, spent.
     let (first, next, spent, low, left) = (peers[0], peers[1], peers[2], peers[3], peers[4]);
     let mut seq = 0;
     let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
@@ -8333,9 +8333,9 @@ fn caps_mesh_announcements_at_the_iwant_budget_per_heartbeat() {
 }
 
 /// QUILIBRIUM: a mesh announcer serves an IWANT for `history_length - 1`
-/// heartbeats after its IHAVE, the least time a message stays in its cache
-/// (16.1 s with the node's 24 x 700 ms); a gossip announcer for
-/// `history_gossip` heartbeats less after its latest IHAVE (4.9 s), whatever
+/// heartbeats after its first IHAVE, the least time a message stays in its
+/// cache (16.1 s with the node's 24 x 700 ms); a gossip announcer for
+/// `history_gossip` heartbeats less after its first IHAVE (4.9 s), whatever
 /// `lazy_followup_time`: the relay serves the IWANT from its cache when it
 /// arrives.
 #[test]
@@ -8496,7 +8496,7 @@ fn does_not_ask_an_announcer_past_the_relay_cache_window() {
 
 /// QUILIBRIUM: asks of a message have no cap: with the most announcers kept
 /// and one more mesh announcer past that, the first announcer and each kept
-/// one are asked in turn, the freshest first, as each promise breaks, then
+/// one are asked in turn, the latest first IHAVE first, as each promise breaks, then
 /// nobody (all kept are mesh announcers, so the one past the cap was not
 /// kept), and the next heartbeat gossip of the message is asked and delivers
 /// it.

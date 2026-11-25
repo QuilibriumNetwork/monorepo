@@ -417,8 +417,8 @@ pub struct AnnounceStats {
     /// Announcers outside the mesh are never asked so, only as `fallback_asks`.
     pub deadline_asks: u64,
     /// Kept announcers dropped unasked once their serve-until passed: `history_length - 1`
-    /// heartbeats after a mesh announcement, `history_length - 1 - history_gossip` after a
-    /// peer's latest heartbeat gossip of the message.
+    /// heartbeats after a mesh announcer's first IHAVE, `history_length - 1 - history_gossip`
+    /// after another peer's first IHAVE; a repeat changes nothing (see PATCHES.md).
     pub stale_announcers: u64,
     /// IWANTs this node could not serve because its cache's byte budget
     /// (`Config::mcache_max_bytes`) evicted the message within its history window: each is
