@@ -2,7 +2,6 @@
 //! ([`SealWaiting`]).
 
 use super::{share_label, CollectedMessage, Share};
-use sha3::{Digest, Sha3_256};
 use std::time::{Duration, Instant};
 
 /// How long a waiting proof keeps its room after its last refusal: its
@@ -31,8 +30,6 @@ const SEAL_WAIT_PASSES: u32 = super::SEAL_PASSES_TO_YIELD;
 #[derive(Clone, Copy, Debug)]
 struct Waiting {
     hash: [u8; 32],
-    /// What identifies it ([`proof_key`]).
-    key: [u8; 32],
     /// Its window end ([`CollectedMessage::window_end`]).
     end: u64,
     len: usize,
@@ -97,13 +94,19 @@ enum Ended {
 
 impl Ended {
     /// Every way a wait ends, as both its lines list them ([`ends_text`]).
-    const ALL: [Ended; 5] = [
-        Ended::Held,
-        Ended::Closed,
-        Ended::Stale,
-        Ended::PassedOver,
-        Ended::Superseded,
-    ];
+    /// A new variant fails to compile in this match until it is listed.
+    const ALL: [Ended; 5] = {
+        match Ended::Held {
+            Ended::Held | Ended::Closed | Ended::Stale | Ended::PassedOver | Ended::Superseded => {}
+        }
+        [
+            Ended::Held,
+            Ended::Closed,
+            Ended::Stale,
+            Ended::PassedOver,
+            Ended::Superseded,
+        ]
+    };
 
     fn as_str(self) -> &'static str {
         match self {
@@ -169,10 +172,12 @@ fn ends_text() -> &'static str {
 #[derive(Default)]
 pub(super) struct SealWaiting {
     waiting: Option<Waiting>,
-    /// The proofs whose wait [`SEAL_WAIT_PASSES`] ended, by [`proof_key`],
-    /// with their window ends: none waits again before its window ends, when
-    /// it leaves. One joins each [`SEAL_WAIT_PASSES`] proposals of this node
-    /// at most, and each leaves within an epoch ([`within_reach`]).
+    /// The proofs whose wait [`SEAL_WAIT_PASSES`] ended, by hash, with
+    /// their window ends: none waits again before its window ends, when it
+    /// leaves. One joins each [`SEAL_WAIT_PASSES`] proposals of this node at
+    /// most, and each leaves within an epoch ([`within_reach`]). A sender
+    /// sends the same bytes again; a copy encoded again is a new proof, which
+    /// may wait once more, until its window ends at the latest.
     passed_over: Vec<([u8; 32], u64)>,
 }
 
@@ -224,8 +229,11 @@ impl SealWaiting {
             return;
         };
         self.settle(frame, now, found);
-        let key = proof_key(message);
-        if self.passed_over.iter().any(|&(passed, _)| passed == key) {
+        if self
+            .passed_over
+            .iter()
+            .any(|&(passed, _)| passed == message.hash)
+        {
             return;
         }
         match &mut self.waiting {
@@ -257,7 +265,6 @@ impl SealWaiting {
                 }
                 *slot = Some(Waiting {
                     hash: message.hash,
-                    key,
                     end,
                     len: message.data.len(),
                     refusals: 1,
@@ -318,7 +325,7 @@ impl SealWaiting {
         if waiting.passes >= SEAL_WAIT_PASSES {
             let waiting = *waiting;
             self.waiting = None;
-            self.passed_over.push((waiting.key, waiting.end));
+            self.passed_over.push((waiting.hash, waiting.end));
             end_line(waiting, Ended::PassedOver, now);
         }
     }
@@ -346,24 +353,6 @@ impl SealWaiting {
 /// none waits.
 fn within_reach(end: u64, frame: u64) -> bool {
     frame != 0 && end > frame && end - frame <= quil_types::consensus::epoch_length_frames()
-}
-
-/// What identifies a storage epoch proof for its wait: the seat parts it
-/// proves ([`CollectedMessage::seat_keys`]), in any order, so a copy encoded
-/// again is the same proof; its hash if it names none.
-fn proof_key(message: &CollectedMessage) -> [u8; 32] {
-    if message.seat_keys.is_empty() {
-        return message.hash;
-    }
-    let mut seats = message.seat_keys.clone();
-    seats.sort_unstable();
-    seats.dedup();
-    let mut h = Sha3_256::new();
-    h.update(b"quil/collector/seal-wait-proof/v1");
-    for seat in &seats {
-        h.update(seat);
-    }
-    h.finalize().into()
 }
 
 /// Log the end of `waiting`'s wait, if its share kept room for it.
@@ -688,8 +677,10 @@ mod tests {
     }
 
     /// A proof whose wait this node's proposals ended by passing over it
-    /// waits no more, sent again or encoded again with the same seats,
-    /// until its window ends; another proof still may.
+    /// waits no more when its sender sends the same bytes again, until its
+    /// window ends. A copy encoded again, proving the same seats in other
+    /// bytes, is a new proof: it waits once more, and that wait ends at its
+    /// window end.
     #[test]
     fn a_proof_passed_over_waits_no_more_before_its_window_ends() {
         let now = Instant::now();
@@ -714,7 +705,7 @@ mod tests {
         let again = waiting.waiting();
         let encoded = CollectedMessage {
             seat_keys: vec![[8; 32], [7; 32]],
-            ..proof(9, 100, 4_000_000)
+            ..proof(9, 100, 3_000_000)
         };
         waiting.refused(&encoded, 10, now, absent);
         waiting.refused(&encoded, 10, now, absent);
@@ -725,23 +716,12 @@ mod tests {
             "SEAL-PASSED-REARM: a passed-over proof sent again waited"
         );
         assert_eq!(
-            re_encoded, None,
-            "SEAL-PASSED-KEY: a passed-over proof encoded again waited"
+            re_encoded,
+            Some((3_000_000, 100, true)),
+            "SEAL-PASSED-NEW: a copy of a passed-over proof encoded again did not wait"
         );
 
-        let other = CollectedMessage {
-            seat_keys: vec![[5; 32]],
-            ..proof(2, 100, 4_000_000)
-        };
-        waiting.refused(&other, 10, now, absent);
-        waiting.refused(&other, 10, now, absent);
-        assert_eq!(
-            waiting.waiting(),
-            Some((4_000_000, 100, true)),
-            "premise: another proof still waits"
-        );
-
-        waiting.settle(99, now, |hash| held(hash, &other, true));
+        waiting.settle(99, now, absent);
         assert_eq!(
             waiting.passed_over_count(),
             1,
@@ -751,15 +731,90 @@ mod tests {
         waiting.refused(&big, 99, now, absent);
         assert_eq!(
             waiting.waiting(),
-            None,
+            Some((3_000_000, 100, true)),
             "SEAL-PASSED-KEPT: a passed-over proof waited a frame before its window ended"
         );
-        waiting.settle(100, now, absent);
+        let text = lines(|| waiting.settle(100, now, absent));
+        let closed = waiting.waiting().is_none()
+            && ["outcome=window_ended", "outcome=\"window_ended\""]
+                .iter()
+                .any(|outcome| text.contains(outcome));
         let left = waiting.passed_over_count();
-        eprintln!("REACH seal-waiting passed-over left={left}");
+        eprintln!("REACH seal-waiting passed-over closed={closed} left={left}");
+        assert!(
+            closed,
+            "SEAL-PASSED-CLOSED: a re-encoded copy's wait did not end at its window end: {text:?}"
+        );
         assert_eq!(
             left, 0,
             "SEAL-PASSED-END: a passed-over proof was kept past its window end"
+        );
+    }
+
+    /// A copy encoded again (the same seats in other bytes), smaller and due
+    /// with the waiting proof, is
+    /// refused for the room kept for the older encoding until that wait goes
+    /// stale: at exactly [`SEAL_WAIT_STALE`] after its last refusal it is
+    /// still refused, and just after it is held.
+    #[test]
+    fn a_smaller_copy_encoded_again_is_held_once_the_old_wait_goes_stale() {
+        let now = Instant::now();
+        let big = CollectedMessage {
+            seat_keys: vec![[7; 32], [8; 32]],
+            ..proof(1, 100, 4_000_000)
+        };
+        let smaller = CollectedMessage {
+            seat_keys: big.seat_keys.clone(),
+            ..proof(9, 100, 1_000_000)
+        };
+        let mut waiting = SealWaiting::default();
+        waiting.refused(&big, 10, now, absent);
+        waiting.refused(&big, 10, now, absent);
+        waiting.refused(&smaller, 10, now, absent);
+        assert_eq!(
+            waiting.waiting(),
+            Some((4_000_000, 100, true)),
+            "premise: the older encoding still waits"
+        );
+        let edge = waiting.keep(&smaller, 10, now + SEAL_WAIT_STALE, absent);
+        let later = now + SEAL_WAIT_STALE + Duration::from_millis(1);
+        let after = waiting.keep(&smaller, 10, later, absent);
+        eprintln!("REACH seal-waiting re-encoded edge={edge} after={after}");
+        assert_eq!(
+            edge, 4_000_000,
+            "SEAL-STALE-EDGE-REENCODED: the older encoding's room freed at exactly its stale time"
+        );
+        assert_eq!(
+            (after, waiting.waiting()),
+            (0, None),
+            "SEAL-REENCODED-STALE: the older encoding kept its room once stale"
+        );
+    }
+
+    /// While no GLOBAL frame was seen finalized (frame 0, as after a
+    /// restart) no proof waits; once one was, the next to finalize is 1 or
+    /// more, and a proof due within an epoch of it waits.
+    #[test]
+    fn no_proof_waits_until_a_frame_is_seen_finalized() {
+        let now = Instant::now();
+        let big = proof(1, 100, 4_000_000);
+        let wait = |frame: u64| {
+            let mut waiting = SealWaiting::default();
+            waiting.refused(&big, frame, now, absent);
+            waiting.refused(&big, frame, now, absent);
+            waiting.waiting()
+        };
+        let unknown = wait(0);
+        let first = wait(1);
+        eprintln!("REACH seal-waiting frame unknown={unknown:?} first={first:?}");
+        assert_eq!(
+            unknown, None,
+            "SEAL-FRAME-UNKNOWN: a proof waited while no frame was seen finalized"
+        );
+        assert_eq!(
+            first,
+            Some((4_000_000, 100, true)),
+            "premise: a proof waits once a frame is seen finalized"
         );
     }
 }
