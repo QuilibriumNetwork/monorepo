@@ -16584,6 +16584,12 @@ pub(crate) fn materialize_app_shard_requests(
 
     // The GLOBAL frame this frame is anchored at; none without an anchor.
     let anchor = (global_frame_number != 0).then_some(global_frame_number);
+    // What an application's creation floor is a quarter of, at this frame's
+    // pricing snapshot.
+    let pomw_basis = Some(quil_execution::pricing::frame_pomw_basis(
+        difficulty as u64,
+        world_size,
+    )?);
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
     // What execution refuses before the proof at the frame's anchor is not
@@ -16731,6 +16737,7 @@ pub(crate) fn materialize_app_shard_requests(
                 // Workers and archives replay app-shard frames alike: always
                 // in the application venue, never committing inline.
                 venue: Some(quil_types::execution::Venue::Application),
+                pomw_basis,
             },
             &fee,
             addr,
@@ -31464,6 +31471,97 @@ mod tests {
              {} exists)",
             hex::encode(created)
         );
+    }
+
+    /// An app-shard frame executes its bundles with the PoMW basis of the
+    /// frame's difficulty and world size: what an application's creation
+    /// floor is a quarter of. Without it, every deploy after the floor frame
+    /// is refused.
+    #[test]
+    fn app_shard_execution_carries_the_frame_pomw_basis() {
+        use quil_execution::hypergraph_intrinsic::confidential;
+        use quil_execution::hypergraph_intrinsic::vertex_ops::{
+            vertex_add_domain_separator, vertex_add_signing_message,
+        };
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+        use quil_types::proto::hypergraph::VertexAdd;
+        use std::sync::Arc;
+
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let mgr = quil_execution::ExecutionEngineManager::new(
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+            Arc::new(crate::test_support::AcceptAllKeyManager),
+            crdt,
+            crypto.circuit_compiler.clone(),
+            crypto.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            false, // application mode
+        );
+        let seen = mgr.record_contexts_for_test("hypergraph");
+        let domain = quil_execution::hypergraph_intrinsic::hypergraph_base_domain().to_vec();
+        // A signed confidential vertex add, as in the fee-vote test above.
+        let signer = quil_crypto::FalconSigner::generate();
+        let field = confidential::ConfidentialField {
+            commitment: [7u8; 32],
+            kem_ct: vec![0u8; confidential::KEM_CT_LEN],
+            nonce: [0u8; confidential::NONCE_LEN],
+            aead_ct: vec![0u8; confidential::SALT_LEN + confidential::TAG_LEN],
+        };
+        let chunks: Vec<Vec<u8>> = vec![confidential::encode(&field)];
+        let data_address = vec![0x22u8; 32];
+        let mut signed = vertex_add_domain_separator(&domain).unwrap();
+        signed.extend_from_slice(
+            &vertex_add_signing_message(&domain, &data_address, &chunks).unwrap(),
+        );
+        let bundle = MessageBundle {
+            requests: vec![MessageRequest {
+                timestamp: 1,
+                request: Some(Request::VertexAdd(VertexAdd {
+                    domain: domain.clone(),
+                    data_address,
+                    data:
+                        quil_execution::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks(
+                            &chunks,
+                        )
+                        .unwrap(),
+                    signature: signer.sign_with_domain(&signed, &[]).unwrap(),
+                })),
+            }],
+            timestamp: 1,
+        };
+        let (difficulty, world_size) = (50_000u32, 1u64 << 30);
+        let basis =
+            quil_execution::pricing::frame_pomw_basis(u64::from(difficulty), world_size).unwrap();
+        materialize_app_shard_requests(
+            &mgr,
+            std::slice::from_ref(&bundle),
+            1,
+            difficulty,
+            world_size,
+            0,
+            &domain,
+            0,
+        )
+        .unwrap();
+        println!("REACH creation-floor basis");
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.is_empty(),
+            "harness: the bundle reached the hypergraph engine"
+        );
+        for context in seen.iter() {
+            assert_eq!(
+                context.pomw_basis,
+                Some(basis),
+                "app_basis_unwired: frame {} executed without its PoMW basis",
+                context.frame_number
+            );
+        }
     }
 
     #[test]

@@ -519,6 +519,7 @@ mod tests {
             finalized_global_frame: Some(frame.saturating_sub(1)),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         }
     }
 

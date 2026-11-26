@@ -8,7 +8,9 @@
 //! record at a canonical global root no later than the executing frame's
 //! finalized global anchor; the record's destination must be the bundle's
 //! application and its context the SHA3-256 of the rest of the bundle; its
-//! amount must cover `multiplier × Σ cost`. The destination tree then records a
+//! amount must cover `multiplier × Σ cost`, and from
+//! [`app_creation_floor_frame`] on at least a quarter of the PoMW basis per
+//! application the bundle creates. The destination tree then records a
 //! consumption marker, so a record funds exactly one bundle.
 use super::settlement_record::{self, SettlementEntry};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
@@ -329,6 +331,120 @@ pub fn message_cost(message: &[u8]) -> Result<u64> {
     }
 }
 
+/// The first GLOBAL frame from which a bundle that creates an application
+/// pays at least [`app_creation_floor`] per application it creates. Its
+/// growth alone priced a new application at a few QUIL units, though every
+/// application shard it opens is funded by issuance for as long as it holds
+/// state. Consensus-affecting for GLOBAL, where deploys execute: every
+/// archive and prover must run a build with it before the frame (an older
+/// one still admits an underpriced deploy). Mainnet: not yet set.
+/// `QUIL_APP_CREATION_FLOOR_FRAME` elsewhere, never by default.
+pub const MAINNET_APP_CREATION_FLOOR_FRAME: Option<u64> = None;
+
+/// The setting naming the frame on a test network.
+pub const APP_CREATION_FLOOR_FRAME_SETTING: &str = "QUIL_APP_CREATION_FLOOR_FRAME";
+
+static APP_CREATION_FLOOR_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "testing-stubs"))]
+thread_local! {
+    static APP_CREATION_FLOOR_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn app_creation_floor_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == crate::pricing::MAINNET_NETWORK {
+        return MAINNET_APP_CREATION_FLOOR_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's application creation floor frame from its network, and
+/// return it. Called at startup before any frame is processed, and by the
+/// client before it prices a deploy; the first call decides.
+pub fn init_app_creation_floor_frame(network: u8) -> u64 {
+    *APP_CREATION_FLOOR_FRAME.get_or_init(|| {
+        app_creation_floor_frame_for(
+            network,
+            std::env::var(APP_CREATION_FLOOR_FRAME_SETTING)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_app_creation_floor_frame`]; the mainnet frame in
+/// a process that never called it. `u64::MAX`: never.
+pub fn app_creation_floor_frame() -> u64 {
+    #[cfg(any(test, feature = "testing-stubs"))]
+    if let Some(frame) = APP_CREATION_FLOOR_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    APP_CREATION_FLOOR_FRAME
+        .get()
+        .copied()
+        .unwrap_or_else(|| app_creation_floor_frame_for(crate::pricing::MAINNET_NETWORK, None))
+}
+
+/// Set the application creation floor frame for the calling thread only
+/// (tests). `None` restores the process setting.
+#[cfg(any(test, feature = "testing-stubs"))]
+pub fn set_app_creation_floor_frame_for_thread(frame: Option<u64>) {
+    APP_CREATION_FLOOR_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Whether a bundle judged at GLOBAL frame `global_frame` that creates an
+/// application pays the floor.
+pub fn app_creation_floor_at(global_frame: u64) -> bool {
+    let from = app_creation_floor_frame();
+    from != u64::MAX && global_frame >= from
+}
+
+/// The applications `bundle` creates: its token, hypergraph and compute
+/// deploys. Updates change an existing application and create none.
+pub fn application_creations(bundle: &CanonicalMessageBundle) -> u64 {
+    bundle
+        .requests
+        .iter()
+        .flatten()
+        .filter(|r| {
+            matches!(
+                r.inner_type_prefix,
+                crate::token_intrinsic::TYPE_TOKEN_DEPLOY
+                    | crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_DEPLOYMENT
+                    | crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY
+            )
+        })
+        .count() as u64
+}
+
+/// The least the creation of one application pays from the floor frame on: a
+/// quarter of the PoMW basis it is priced at (`pricing::pomw_basis`), about a
+/// month of four allocations' issuance.
+pub fn app_creation_floor(basis: &BigInt) -> BigInt {
+    basis / 4
+}
+
+/// The settlement a bundle of `cost` bytes of growth at `multiplier` must
+/// carry: the growth, raised to [`app_creation_floor`] per application it
+/// creates when `floor_basis` is given (the floor applies). The admitting
+/// engine and the paying wallet both price through this.
+pub fn required_settlement(
+    multiplier: &BigInt,
+    cost: u64,
+    creations: u64,
+    floor_basis: Option<&BigInt>,
+) -> BigInt {
+    let growth = multiplier * BigInt::from(cost);
+    match floor_basis {
+        Some(basis) if creations > 0 => {
+            growth.max(app_creation_floor(basis) * BigInt::from(creations))
+        }
+        _ => growth,
+    }
+}
+
 /// Everything needed to admit a paid consumer message.
 pub struct PaymentContext<'a> {
     pub state: Option<&'a HypergraphState>,
@@ -342,6 +458,11 @@ pub struct PaymentContext<'a> {
     pub frame_number: u64,
     /// Per-unit price of this message (`pricing::fee_multiplier_for_cost`).
     pub multiplier: &'a BigInt,
+    /// The PoMW basis the message is priced at
+    /// ([`quil_types::execution::FrameExecutionContext::pomw_basis`]), which an
+    /// application's creation pays a quarter of once [`app_creation_floor_at`]
+    /// the frame's GLOBAL anchor. `None` where the caller prices nothing.
+    pub basis: Option<u128>,
     /// The shard executing the message; a claim runs only on the shard that
     /// holds its consumption marker.
     pub shard: quil_types::execution::ShardPath,
@@ -424,7 +545,20 @@ pub fn admit_bundle(
     if payment.multiplier.sign() == num_bigint::Sign::Minus {
         return Err(invalid("negative fee multiplier"));
     }
-    let required = payment.multiplier * BigInt::from(cost);
+    // Judged like the configuration replay guard: an application shard's frame
+    // by its GLOBAL anchor, a GLOBAL frame by its own anchor (frame - 1).
+    let creations = application_creations(bundle);
+    let floor_basis = if creations > 0
+        && app_creation_floor_at(payment.global_bound.unwrap_or(payment.frame_number))
+    {
+        let basis = payment.basis.ok_or_else(|| {
+            invalid("an application's creation is priced without the frame's PoMW basis")
+        })?;
+        Some(BigInt::from(basis))
+    } else {
+        None
+    };
+    let required = required_settlement(payment.multiplier, cost, creations, floor_basis.as_ref());
     let Some(claim_request) = claim_at.first().and_then(|_| bundle.requests[0].as_ref()) else {
         if required.sign() == num_bigint::Sign::NoSign {
             return Ok(None);
@@ -450,6 +584,9 @@ pub fn admit_bundle(
     }
     claim.check_binding(&bundle_context(bundle)?)?;
     if BigInt::from(claim.settlement) < required {
+        if required > payment.multiplier * BigInt::from(cost) {
+            return Err(invalid("settlement below the application creation floor"));
+        }
         return Err(invalid("settlement below the bundle's dynamic cost"));
     }
     // A record funds exactly one bundle, which is true only if consuming it is
@@ -812,6 +949,7 @@ mod tests {
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier,
+                    basis: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
                 },
                 &[2; 32],
@@ -836,6 +974,7 @@ mod tests {
                 global_bound: Some(10),
                 frame_number: 11,
                 multiplier: &BigInt::from(0),
+                basis: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
             },
             &[2; 32],
@@ -871,6 +1010,7 @@ mod tests {
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier: &BigInt::from(2),
+                    basis: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
                 },
                 address,
@@ -955,6 +1095,7 @@ mod tests {
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier: &BigInt::from(2),
+                    basis: None,
                     shard: quil_types::execution::ShardPath::from_bits(&[bit]),
                 },
                 &[2; 32],
@@ -979,6 +1120,7 @@ mod tests {
                 global_bound: Some(10),
                 frame_number: 11,
                 multiplier: &BigInt::from(2),
+                basis: None,
                 shard: quil_types::execution::ShardPath::UNKNOWN,
             },
             &[2; 32],
@@ -986,5 +1128,204 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("another shard"), "{error}");
+    }
+
+    /// A PoMW basis whose floor (1,000,000 units) dwarfs the growth charge of
+    /// the bundles below (2 units per byte, a few hundred bytes).
+    const BASIS: u128 = 4_000_000;
+    const FLOOR: u128 = BASIS / 4;
+    /// The floor frame the tests below set for their thread.
+    const FLOOR_FRAME: u64 = 10;
+
+    /// Admit `rest` (its first request empty) with a claim of `settlement`,
+    /// judged at GLOBAL anchor `anchor` with `basis`. The claim binds the
+    /// bundle, so the amount check decides: `Ok` when the amount passed (the
+    /// missing state then refuses it), else the refusal's text.
+    fn admit_priced(
+        rest: &CanonicalMessageBundle,
+        settlement: u128,
+        anchor: u64,
+        basis: Option<u128>,
+    ) -> std::result::Result<(), String> {
+        set_app_creation_floor_frame_for_thread(Some(FLOOR_FRAME));
+        let mut bundle = rest.clone();
+        bundle.requests[0] = Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_SETTLEMENT_CLAIM,
+            inner_bytes: SettlementClaim {
+                settlement,
+                context: bundle_context(rest).unwrap(),
+                ..claim()
+            }
+            .encode()
+            .unwrap(),
+        });
+        let error = admit_bundle(
+            &PaymentContext {
+                state: None,
+                clock: None,
+                network: &[1; 32],
+                global_bound: Some(anchor),
+                frame_number: anchor + 1,
+                multiplier: &BigInt::from(2),
+                basis,
+                shard: quil_types::execution::ShardPath::WHOLE,
+            },
+            &[2; 32],
+            &bundle,
+            0,
+        )
+        .unwrap_err();
+        println!("REACH creation-floor admit");
+        if error.is_execution_unavailable() && error.to_string().contains("record consumption") {
+            Ok(())
+        } else {
+            Err(error.to_string())
+        }
+    }
+
+    fn rest_of(requests: Vec<Option<CanonicalMessageRequest>>) -> CanonicalMessageBundle {
+        let mut all = vec![None];
+        all.extend(requests);
+        CanonicalMessageBundle {
+            requests: all,
+            timestamp: 5,
+        }
+    }
+
+    /// The growth charge of `rest` at the multiplier of 2 `admit_priced` uses.
+    fn growth_of(rest: &CanonicalMessageBundle) -> u128 {
+        let cost = rest
+            .requests
+            .iter()
+            .flatten()
+            .map(|r| request_cost(r).unwrap())
+            .sum::<u64>();
+        2 * (u128::from(cost) + marker_record().unwrap().len() as u128)
+    }
+
+    #[test]
+    fn a_deploy_below_the_creation_floor_is_refused_after_activation() {
+        let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
+        let hypergraph = crate::hypergraph_intrinsic::canonical::TYPE_HYPERGRAPH_DEPLOYMENT;
+        for deploy in [compute, hypergraph] {
+            let rest = rest_of(vec![request(deploy, 100)]);
+            assert!(growth_of(&rest) < FLOOR);
+            for settlement in [growth_of(&rest), FLOOR - 1] {
+                let refused = admit_priced(&rest, settlement, FLOOR_FRAME, Some(BASIS));
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|e| e.contains("creation floor")),
+                    "below_floor_admitted: {deploy:#x} at {settlement}: {refused:?}"
+                );
+            }
+        }
+        // Each application a bundle creates pays the floor.
+        let two = rest_of(vec![request(compute, 100), request(compute, 120)]);
+        let refused = admit_priced(&two, FLOOR, FLOOR_FRAME + 5, Some(BASIS));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("creation floor")),
+            "second_creation_unpaid: {refused:?}"
+        );
+        assert_eq!(
+            admit_priced(&two, 2 * FLOOR, FLOOR_FRAME + 5, Some(BASIS)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_deploy_at_the_creation_floor_is_admitted() {
+        let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
+        let rest = rest_of(vec![request(compute, 100)]);
+        let admitted = admit_priced(&rest, FLOOR, FLOOR_FRAME, Some(BASIS));
+        assert_eq!(admitted, Ok(()), "at_floor_refused");
+        // A deploy whose growth exceeds the floor pays its growth.
+        let large = rest_of(vec![request(compute, FLOOR as usize)]);
+        let growth = growth_of(&large);
+        assert!(growth > FLOOR);
+        assert_eq!(
+            admit_priced(&large, growth, FLOOR_FRAME, Some(BASIS)),
+            Ok(()),
+            "at_floor_refused"
+        );
+        let refused = admit_priced(&large, growth - 1, FLOOR_FRAME, Some(BASIS));
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("dynamic cost")),
+            "growth_underpaid: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_deploy_before_the_floor_frame_pays_its_growth_alone() {
+        let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
+        let rest = rest_of(vec![request(compute, 100)]);
+        let growth = growth_of(&rest);
+        for basis in [Some(BASIS), None] {
+            let admitted = admit_priced(&rest, growth, FLOOR_FRAME - 1, basis);
+            assert_eq!(admitted, Ok(()), "floored_before_activation: {basis:?}");
+            let refused = admit_priced(&rest, growth - 1, FLOOR_FRAME - 1, basis);
+            assert!(
+                refused.as_ref().is_err_and(|e| e.contains("dynamic cost")),
+                "floored_before_activation: {refused:?}"
+            );
+        }
+        // Never on a network that sets no frame.
+        set_app_creation_floor_frame_for_thread(None);
+        assert!(
+            !app_creation_floor_at(u64::MAX - 1),
+            "floored_before_activation"
+        );
+        assert_eq!(app_creation_floor_frame_for(0, Some("5")), u64::MAX);
+        assert_eq!(app_creation_floor_frame_for(1, None), u64::MAX);
+        assert_eq!(app_creation_floor_frame_for(1, Some("bad")), u64::MAX);
+        assert_eq!(app_creation_floor_frame_for(1, Some("5")), 5);
+    }
+
+    #[test]
+    fn an_update_pays_its_growth_alone_after_activation() {
+        use crate::compute_intrinsic::config::{TYPE_COMPUTE_DEPLOY, TYPE_COMPUTE_UPDATE};
+        use crate::hypergraph_intrinsic::canonical::{
+            TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
+        };
+        use crate::token_intrinsic::{TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE};
+        for update in [TYPE_COMPUTE_UPDATE, TYPE_HYPERGRAPH_UPDATE] {
+            let rest = rest_of(vec![request(update, 100)]);
+            let growth = growth_of(&rest);
+            let admitted = admit_priced(&rest, growth, FLOOR_FRAME, Some(BASIS));
+            assert_eq!(admitted, Ok(()), "update_floored: {update:#x}");
+        }
+        let creations = |tps: &[u32]| {
+            application_creations(&rest_of(tps.iter().map(|&tp| request(tp, 8)).collect()))
+        };
+        assert_eq!(
+            creations(&[
+                TYPE_TOKEN_UPDATE,
+                TYPE_HYPERGRAPH_UPDATE,
+                TYPE_COMPUTE_UPDATE
+            ]),
+            0,
+            "update_floored"
+        );
+        assert_eq!(
+            creations(&[
+                TYPE_TOKEN_DEPLOY,
+                TYPE_HYPERGRAPH_DEPLOYMENT,
+                TYPE_COMPUTE_DEPLOY
+            ]),
+            3
+        );
+    }
+
+    #[test]
+    fn a_deploy_priced_without_a_basis_is_refused_after_activation() {
+        let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
+        let rest = rest_of(vec![request(compute, 100)]);
+        let refused = admit_priced(&rest, u128::from(u64::MAX), FLOOR_FRAME, None);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("PoMW basis")),
+            "unpriced_creation_admitted: {refused:?}"
+        );
     }
 }

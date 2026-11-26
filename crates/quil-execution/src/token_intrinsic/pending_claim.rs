@@ -326,6 +326,7 @@ mod tests {
                     finalized_global_frame: Some(100),
                     venue: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
+                    pomw_basis: None,
                 };
                 engine
                     .validate_message(frame, &application, &message)
@@ -340,6 +341,7 @@ mod tests {
                             finalized_global_frame: Some(999),
                             venue: None,
                             shard: quil_types::execution::ShardPath::WHOLE,
+                            pomw_basis: None,
                         }
                     } else {
                         FrameExecutionContext {
@@ -691,6 +693,7 @@ mod tests {
                 finalized_global_frame: Some(100),
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             };
             // A refund commits only at or after the escrow's refund frame, and
             // the frame that decides it is the global one, not the app height.

@@ -577,6 +577,7 @@ mod tests {
                     finalized_global_frame: Some(9),
                     venue: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
+                    pomw_basis: None,
                 },
                 &num_bigint::BigInt::from(0),
                 &app,
@@ -683,6 +684,7 @@ mod tests {
                     finalized_global_frame: Some(9),
                     venue: None,
                     shard: quil_types::execution::ShardPath::WHOLE,
+                    pomw_basis: None,
                 },
                 &num_bigint::BigInt::from(multiplier),
                 &app,
@@ -1242,6 +1244,7 @@ mod tests {
             finalized_global_frame: frame.checked_sub(1),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         };
         for frame in [0, 5] {
             // Custom issuance never takes the reward mint's global path.
@@ -1583,6 +1586,7 @@ mod tests {
             finalized_global_frame: Some(frame - 1),
             shard: quil_types::execution::ShardPath::WHOLE,
             venue: None,
+            pomw_basis: None,
         };
         policy
             .dispatch_for_commit(

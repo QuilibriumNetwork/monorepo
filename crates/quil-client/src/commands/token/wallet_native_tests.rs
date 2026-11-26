@@ -650,6 +650,7 @@ async fn wallet_pending_flow(fund_escrow: bool, disk: bool) {
             finalized_global_frame: Some(100),
             venue: None,
             shard: quil_types::execution::ShardPath::WHOLE,
+            pomw_basis: None,
         };
         let next_frame = Arc::new(std::sync::atomic::AtomicU64::new(execution.frame_number));
         let server = quil_rpc::node_service::NodeRpcServer::new().with_hypergraph_store(store)

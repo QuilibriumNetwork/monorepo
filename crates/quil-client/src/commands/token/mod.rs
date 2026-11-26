@@ -163,9 +163,12 @@ pub struct TokenCommonArgs {
 }
 
 /// Default limit on an automatic fee or bundle settlement: 0.1 QUIL. A QUIL
-/// operation's quoted fee is orders of magnitude lower; a settlement reaches it
-/// only for a bundle near the 1 MiB quote bound at several times the default
-/// application fee vote.
+/// operation's quoted fee is orders of magnitude lower; a settlement priced by
+/// its growth reaches it only for a bundle near the 1 MiB quote bound at
+/// several times the default application fee vote. A deploy from the
+/// application creation floor's frame pays at least a quarter of the PoMW
+/// basis per application it creates, tens of QUIL at mainnet's world size,
+/// so it needs a higher --max-fee; the quote prints the value.
 pub const DEFAULT_MAX_AUTOMATIC_FEE: u128 = 800_000_000;
 
 /// Environment variable behind `--max-fee`, also read by paid deploy and

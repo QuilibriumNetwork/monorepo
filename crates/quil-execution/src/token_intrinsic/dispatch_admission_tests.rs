@@ -134,6 +134,7 @@ fn the_executing_shard_refuses_a_noncanonical_owner_from_its_frame() {
                 finalized_global_frame: Some(1_000),
                 shard: quil_types::execution::ShardPath::WHOLE,
                 venue: None,
+                pomw_basis: None,
             },
             stubs.clock_store.as_ref(),
             &application,
