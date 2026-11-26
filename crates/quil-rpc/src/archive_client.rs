@@ -883,13 +883,13 @@ impl ArchiveClient {
             // the default silently failed those RPCs. Matches the hypersync
             // client limits in `hypergraph_sync_probe`.
             inner: GlobalServiceClient::new(channel.clone())
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE),
             frames: tonic::client::Grpc::new(channel.clone())
                 .max_decoding_message_size(MAX_FETCHED_FRAME_BYTES),
             app_shard: AppShardServiceClient::new(channel)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE),
             endpoint: addr.to_string(),
             _open: None,
         })
@@ -1153,13 +1153,13 @@ impl ArchiveClient {
             // the default silently failed those RPCs. Matches the hypersync
             // client limits in `hypergraph_sync_probe`.
             inner: GlobalServiceClient::new(channel.clone())
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE),
             frames: tonic::client::Grpc::new(channel.clone())
                 .max_decoding_message_size(MAX_FETCHED_FRAME_BYTES),
             app_shard: AppShardServiceClient::new(channel)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE),
             endpoint: addr.to_string(),
             _open: Some(open),
         })

@@ -402,6 +402,16 @@ impl ConsensusRelayKnown {
     }
 }
 
+/// A worker's client of its master's GlobalService, with the master's
+/// limits ([`quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE`]). Tonic's default
+/// 4 MiB refused a larger GLOBAL_* message the master streamed and broke
+/// the stream.
+pub fn master_global_client(channel: tonic::transport::Channel) -> MasterClient {
+    MasterClient::new(channel)
+        .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+}
+
 /// A standalone worker's channel to its master's `GlobalService` calls that
 /// act as the node. The worker connects under a synthetic identity: members
 /// cannot attribute its connections to its committee key, and it has no
@@ -486,7 +496,7 @@ impl MasterRelay {
         let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await else {
             return None;
         };
-        let client = MasterClient::new(channel);
+        let client = master_global_client(channel);
         *self.client.lock().unwrap() = Some(client.clone());
         Some(client)
     }
@@ -2334,6 +2344,21 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     line
 }
 
+/// `worker`'s DataIPC service with the limits the master and its workers
+/// share ([`quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE`]): the master hands
+/// it shard consensus messages up to
+/// [`quil_p2p::protocol::MAX_MESSAGE_SIZE`]; tonic's default 4 MiB refused
+/// a larger one.
+fn data_ipc_service(
+    worker: Arc<WorkerOnlyNode>,
+) -> quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer<DataIpcServiceImpl> {
+    quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
+        DataIpcServiceImpl { worker },
+    )
+    .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+    .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+}
+
 /// Serve the DataIPC service on `listen_addr` until `cancel`. A listener
 /// that cannot bind, or a server that stops on an error, is bound again
 /// with backoff rather than leaving the worker unreachable for good.
@@ -2371,13 +2396,7 @@ async fn serve_data_ipc(
             }
         }
         let served = builder
-            .add_service(
-                quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
-                    DataIpcServiceImpl {
-                        worker: worker.clone(),
-                    },
-                ),
-            )
+            .add_service(data_ipc_service(worker.clone()))
             .serve_with_incoming_shutdown(incoming, cancel.cancelled())
             .await;
         let Err(e) = served else { return };
@@ -2945,6 +2964,46 @@ fn encode_worker_storage_confirm(
 // Master message streaming — worker connects to master
 // =====================================================================
 
+/// The size of a message a gRPC limit refused, from tonic's status text
+/// (`... message length too large: found N bytes, the limit is: L bytes`).
+pub fn refused_message_bytes(status: &tonic::Status) -> Option<u64> {
+    if status.code() != tonic::Code::OutOfRange {
+        return None;
+    }
+    let text = status.message();
+    let rest = &text[text.find("length too large: found ")? + 24..];
+    rest[..rest.find(' ')?].parse().ok()
+}
+
+/// This worker's master-stream failures since it started. Each one loses
+/// the GLOBAL_* messages the master fans out until the stream reconnects.
+#[derive(Default)]
+struct MasterStreamFailures {
+    failures: u64,
+    oversized: u64,
+}
+
+impl MasterStreamFailures {
+    /// Count `error` and log it; the stream reconnects after `reconnect`.
+    fn log(&mut self, error: &tonic::Status, reconnect: Duration) {
+        self.failures += 1;
+        let message_bytes = refused_message_bytes(error);
+        let check = match message_bytes {
+            None => "check that the master runs and is reachable",
+            Some(_) if error.message().contains("decoded") => {
+                "a message over this worker's limit: run the master's build on this worker"
+            }
+            Some(_) => "the master refused a message over the shared limit; report this line",
+        };
+        if message_bytes.is_some() {
+            self.oversized += 1;
+        }
+        warn!(error = %error, message_bytes, limit_bytes = quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE,
+            failures = self.failures, oversized = self.oversized, reconnect_secs = reconnect.as_secs(),
+            check, "master stream failed; reconnecting, GLOBAL_* messages the master sends meanwhile are lost");
+    }
+}
+
 async fn stream_global_messages_from_master(
     master_endpoint: &str,
     channel_factory: MasterChannelFactory,
@@ -2953,6 +3012,7 @@ async fn stream_global_messages_from_master(
 ) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
+    let mut failures = MasterStreamFailures::default();
 
     loop {
         if cancel.is_cancelled() {
@@ -2969,10 +3029,7 @@ async fn stream_global_messages_from_master(
                 info!("connected to master, starting message stream");
                 backoff = Duration::from_secs(1); // reset backoff
 
-                let mut client =
-                    quil_types::proto::global::global_service_client::GlobalServiceClient::new(
-                        channel,
-                    );
+                let mut client = master_global_client(channel);
                 let request =
                     tonic::Request::new(quil_types::proto::global::StreamGlobalMessagesRequest {});
 
@@ -3003,7 +3060,7 @@ async fn stream_global_messages_from_master(
                                             break;
                                         }
                                         Err(e) => {
-                                            warn!(error = %e, "master stream error");
+                                            failures.log(&e, backoff);
                                             break;
                                         }
                                     }
@@ -4368,6 +4425,47 @@ mod respawn_queue_tests {
         );
     }
 
+    /// A shard consensus message over tonic's default 4 MiB, which the
+    /// master hands its worker directly (up to the gossip limit), reaches
+    /// the worker's DataIPC service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_accepts_a_shard_consensus_delivery_over_4_mib() {
+        let worker = idle_worker();
+        worker.respawns.state.lock().unwrap().ready = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            Server::builder()
+                .add_service(data_ipc_service(worker))
+                .serve_with_incoming(incoming),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let request = quil_types::proto::node::DeliverShardConsensusRequest {
+            filter: vec![7; 32],
+            channel: 0,
+            data: vec![0x5a; 4_887_812],
+            from: vec![9; 57],
+        };
+        let answer = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::remote_worker::shard_consensus_client(channel).deliver_shard_consensus(request),
+        )
+        .await
+        .expect("no answer within 60 s");
+        println!("REACH grpc-limit delivery answered");
+        match answer {
+            // Decoded and handed on: this worker runs no engine for it.
+            Ok(answer) => assert!(!answer.into_inner().accepted),
+            Err(status) => panic!("shard consensus delivery over 4 MiB refused: {status}"),
+        }
+    }
+
     /// The filter `service`'s worker reports running.
     async fn reported_filter(service: &DataIpcServiceImpl) -> Vec<u8> {
         use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
@@ -4727,5 +4825,52 @@ mod prover_tree_sync_log_tests {
         assert!(keys.len() <= MAX_PEER_KEYS);
         assert!(keys.contains_key(&id(0)), "a used key survives pruning");
         assert!(keys.contains_key(&id(MAX_PEER_KEYS as u32)));
+    }
+}
+
+#[cfg(test)]
+mod master_stream_failure_tests {
+    use super::*;
+    use crate::outage::test_logs::CapturedLogs;
+
+    /// Each master-stream failure warns with its running count and that the
+    /// stream reconnects; one over a gRPC limit names its size, the shared
+    /// limit and which side refused it.
+    #[test]
+    fn master_stream_failures_are_counted_and_name_the_refused_size() {
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let mut failures = MasterStreamFailures::default();
+        let oversized = tonic::Status::out_of_range(
+            "Error, decoded message length too large: found 4887812 bytes, the limit is: 4194304 bytes",
+        );
+        failures.log(&oversized, Duration::from_secs(1));
+        failures.log(
+            &tonic::Status::unavailable("connection reset"),
+            Duration::from_secs(2),
+        );
+        let warns = logs.lines_with("master stream failed; reconnecting");
+        println!("REACH grpc-limit failures logged");
+        assert_eq!(warns.len(), 2, "{warns:?}");
+        let limit = format!("limit_bytes={}", quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE);
+        assert!(
+            warns[0].contains("message_bytes=4887812")
+                && warns[0].contains(&limit)
+                && warns[0].contains("failures=1")
+                && warns[0].contains("oversized=1")
+                && warns[0].contains("reconnect_secs=1")
+                && warns[0].contains("this worker's limit"),
+            "oversized line: {}",
+            warns[0]
+        );
+        assert!(
+            !warns[1].contains("message_bytes=")
+                && warns[1].contains("failures=2")
+                && warns[1].contains("oversized=1")
+                && warns[1].contains("reconnect_secs=2")
+                && warns[1].contains("check that the master runs"),
+            "counted repeat: {}",
+            warns[1]
+        );
     }
 }

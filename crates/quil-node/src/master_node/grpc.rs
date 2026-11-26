@@ -1924,6 +1924,21 @@ async fn deliver_shard_submission<H>(
     Ok(())
 }
 
+/// The master's GlobalService with the limits its workers and archive
+/// clients share ([`quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE`]; tonic
+/// defaults to 4 MiB). Inbound submits are small, but the GLOBAL_* messages
+/// it streams to workers and the full global-frame / app-shard responses it
+/// encodes can exceed 4 MiB; the default truncated them, surfacing as `h2
+/// protocol error: error reading a body` on the client.
+pub(crate) fn master_global_service(
+    server: quil_rpc::GlobalRpcServer,
+) -> quil_types::proto::global::global_service_server::GlobalServiceServer<quil_rpc::GlobalRpcServer>
+{
+    quil_types::proto::global::global_service_server::GlobalServiceServer::new(server)
+        .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+}
+
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> anyhow::Result<()> {
     let GrpcArgs {
         frame_observations_path,
@@ -4081,14 +4096,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     if let Ok(addr) = stream_addr.parse::<std::net::SocketAddr>() {
         let stream_plan = crate::util::stream_listener::bind_plan(addr, &config.p2p);
         let global_service = tonic::service::interceptor::InterceptedService::new(
-            // 64 MiB decode/encode (tonic defaults to 4 MiB). Inbound
-            // submits are small, but full global-frame / app-shard
-            // responses this server encodes can exceed 4 MiB; the default
-            // truncated them, surfacing as `h2 protocol error: error
-            // reading a body` on the client. Mirrors the client limits.
-            quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+            master_global_service(grpc_server),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
@@ -4416,7 +4424,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 proxy_srv = proxy_srv.with_signer(signer).with_pubkey(pubkey_getter);
             }
             Some(tonic::service::interceptor::InterceptedService::new(
-                quil_types::proto::proxy::pub_sub_proxy_server::PubSubProxyServer::new(proxy_srv),
+                proxy_srv.into_service(),
                 quil_rpc::peer_auth_middleware::peer_auth_interceptor,
             ))
         } else {
@@ -7641,5 +7649,107 @@ mod shard_submission_tests {
         assert_eq!(gossiped.bitmask, topic);
         let text = logged.text();
         assert!(text.contains("reach peers again"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod worker_stream_limit_tests {
+    use super::*;
+    use quil_types::proto::global::StreamGlobalMessagesResponse;
+
+    struct NoFrames;
+    impl quil_rpc::global_service::FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<quil_types::proto::global::GlobalFrame, String> {
+            Err("no frames".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
+            Err("no frames".into())
+        }
+    }
+
+    /// The master's GlobalService on a local port, streaming what the
+    /// returned sender fans out to a worker client subscribed to it.
+    async fn subscribed_worker() -> (
+        tokio::sync::broadcast::Sender<StreamGlobalMessagesResponse>,
+        tonic::Streaming<StreamGlobalMessagesResponse>,
+    ) {
+        let (fan_out, _) = tokio::sync::broadcast::channel(4);
+        let server = quil_rpc::GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_message_broadcast(fan_out.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(master_global_service(server))
+                .serve_with_incoming(incoming),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = quil_engine::worker_node::master_global_client(channel);
+        let stream = client
+            .stream_global_messages(quil_types::proto::global::StreamGlobalMessagesRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        // The handler subscribed before it answered.
+        assert_eq!(fan_out.receiver_count(), 1, "the worker is subscribed");
+        (fan_out, stream)
+    }
+
+    fn message(bytes: usize) -> StreamGlobalMessagesResponse {
+        StreamGlobalMessagesResponse {
+            data: vec![0x5a; bytes],
+            bitmask: quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
+        }
+    }
+
+    /// A GLOBAL_* message over tonic's default 4 MiB (the size a devnet's
+    /// workers refused, breaking their stream) reaches the worker whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_receives_a_master_stream_message_over_4_mib() {
+        let (fan_out, mut stream) = subscribed_worker().await;
+        let size = 4_887_812;
+        fan_out.send(message(size)).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(60), stream.message())
+            .await
+            .expect("no message within 60 s");
+        println!("REACH grpc-limit stream answered");
+        let got = match got {
+            Ok(Some(got)) => got,
+            other => panic!("stream message over 4 MiB refused: {other:?}"),
+        };
+        assert_eq!(got.data.len(), size);
+        assert_eq!(got.bitmask, quil_engine::bitmasks::GLOBAL_FRAME);
+    }
+
+    /// A message over the shared limit is refused, never truncated, and the
+    /// worker's error names its size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_master_stream_message_over_the_shared_limit_is_refused_with_its_size() {
+        let (fan_out, mut stream) = subscribed_worker().await;
+        let limit = quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE;
+        fan_out.send(message(limit + 1)).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(60), stream.message())
+            .await
+            .expect("no answer within 60 s");
+        println!("REACH grpc-limit stream answered");
+        let status = match got {
+            Err(status) => status,
+            Ok(other) => panic!(
+                "over-limit message not refused: {:?}",
+                other.map(|m| m.data.len())
+            ),
+        };
+        assert_eq!(status.code(), tonic::Code::OutOfRange, "{status}");
+        let sized = quil_engine::worker_node::refused_message_bytes(&status);
+        assert!(
+            sized.is_some_and(|bytes| bytes > limit as u64),
+            "refused size unnamed: {sized:?} from {status}"
+        );
     }
 }
