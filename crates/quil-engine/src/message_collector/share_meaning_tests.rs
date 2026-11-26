@@ -6,6 +6,7 @@
 //! cannot fall into another's meaning unseen.
 
 use super::seal_starvation_tests::{archive, settlement};
+use super::seal_wait_sender_tests::largest;
 use super::*;
 
 /// The reason an oversize proof refused over `share` gives.
@@ -76,12 +77,36 @@ fn a_full_seals_share_keeps_its_proof_waiting() {
     );
 }
 
-/// A proof refused over other senders' share waits for its room.
+/// A proof refused over other senders' share keeps no room: that share
+/// holds no proof that may wait ([`CollectedMessage::may_wait`]), so
+/// a proof due with it is held in the room left.
 #[test]
-fn a_full_other_seals_share_keeps_its_proof_waiting() {
+fn a_full_other_seals_share_keeps_no_proof_waiting() {
+    let mc = archive();
+    assert_eq!(
+        mc.add_message_outcome_by(1, settlement(1, 1_000_000), Provenance::Other, b"o"),
+        SubmitOutcome::Accepted,
+        "premise: another sender's proof is held"
+    );
+    let big = largest(2);
+    for _ in 0..2 {
+        assert_eq!(
+            mc.add_message_outcome_by(1, big.clone(), Provenance::Other, b"f"),
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::OtherSeals)),
+            "premise: other senders' share refuses the large proof"
+        );
+    }
+    let waiting = mc.seal_waiting.lock().unwrap().waiting();
+    let outcome = mc.add_message_outcome_by(1, settlement(3, 1_000_000), Provenance::Other, b"g");
+    eprintln!("REACH share-meaning other-seals waiting={waiting:?} outcome={outcome:?}");
+    assert_eq!(
+        (waiting, outcome),
+        (None, SubmitOutcome::Accepted),
+        "SHARE-WAITS-OTHER-SEALS: a proof refused over other senders' share kept room"
+    );
     assert!(
-        Share::OtherSeals.waits(),
-        "SHARE-WAITS-OTHER-SEALS: a proof refused over other senders' share does not wait"
+        !Share::OtherSeals.waits(),
+        "SHARE-WAITS-OTHER-SEALS: a proof refused over other senders' share waits"
     );
     assert_eq!(
         oversize_reason(Share::OtherSeals),
@@ -109,14 +134,10 @@ fn a_full_sender_share_keeps_no_proof_waiting() {
             "premise: the sender's share refuses its second proof"
         );
     }
-    let waiting = {
-        let waiting = mc.seal_waiting.lock().unwrap();
-        (waiting.waiting(true), waiting.waiting(false))
-    };
+    let waiting = mc.seal_waiting.lock().unwrap().waiting();
     eprintln!("REACH share-meaning sender waiting={waiting:?}");
     assert_eq!(
-        waiting,
-        (None, None),
+        waiting, None,
         "SHARE-WAITS-SENDER: a proof refused over its sender's share keeps room"
     );
     assert!(

@@ -3,7 +3,7 @@
 //! active prover. Any other sender's proof is held or refused as the room
 //! left allows. A wait keeps room only for a proof due within an epoch, and
 //! ends once this node's proposals passed over it as many times as a held
-//! proof yields after.
+//! proof yields after; that proof waits no more before its window ends.
 
 use super::seal_starvation_tests::{archive, fill, settlement};
 use super::*;
@@ -62,7 +62,7 @@ fn settlement_of(id: u32, epoch: u64, len: usize, frames: usize) -> Vec<u8> {
 
 /// Member `id`'s settlement of [`EPOCH`] as large as a proposal's seal
 /// share, the largest proof an archive holds, and one it reads.
-fn largest(id: u32) -> Vec<u8> {
+pub(super) fn largest(id: u32) -> Vec<u8> {
     let with = |frames| settlement_of(id, EPOCH, MAX_PROOF_LEN as usize, frames);
     let base = with(0).len();
     let frame = with(1).len() - base;
@@ -80,9 +80,9 @@ fn largest(id: u32) -> Vec<u8> {
     proof
 }
 
-/// The proof waiting in the `prover` share, as (bytes, keeping room).
-fn waiting(mc: &MessageCollector, prover: bool) -> Option<(usize, bool)> {
-    let waiting = mc.seal_waiting.lock().unwrap().waiting(prover);
+/// The waiting proof, as (bytes, keeping room).
+fn waiting(mc: &MessageCollector) -> Option<(usize, bool)> {
+    let waiting = mc.seal_waiting.lock().unwrap().waiting();
     waiting.map(|(len, _, active)| (len, active))
 }
 
@@ -101,7 +101,7 @@ fn large_waits(mc: &MessageCollector) -> (Vec<Vec<u8>>, Vec<u8>) {
         );
     }
     assert_eq!(
-        waiting(mc, true),
+        waiting(mc),
         Some((large.len(), true)),
         "premise: the large proof waits"
     );
@@ -119,7 +119,7 @@ fn fill_quietly(mc: &MessageCollector) -> Vec<Vec<u8>> {
             "premise: the provers' share holds fourteen 1 MB proofs"
         );
     }
-    assert_eq!(waiting(mc, true), None, "premise: no proof waits");
+    assert_eq!(waiting(mc), None, "premise: no proof waits");
     held
 }
 
@@ -148,7 +148,7 @@ fn other_senders_proofs_keep_no_room_for_themselves() {
         );
     }
     let outcome = mc.add_message_outcome_by(1, settlement(3, SMALL), Provenance::Other, b"g");
-    let waits = waiting(&mc, false);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-sender other outcome={outcome:?} waiting={waits:?}");
     assert_eq!(
         outcome,
@@ -175,7 +175,7 @@ fn a_proof_its_member_did_not_send_supersedes_no_waiting_proof() {
     mc.mark_finalized(&held[..4]);
     let small = mc.add_message_outcome(1, settlement(2001, SMALL));
     let outcome = mc.add_message_outcome(1, large.clone());
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!(
         "REACH seal-wait-sender supersede small={small:?} outcome={outcome:?} waiting={waits:?}"
     );
@@ -228,7 +228,7 @@ fn a_proof_its_member_sends_as_an_active_prover_waits() {
         matches!(by(b"x"), SubmitOutcome::Filtered(_)),
         "premise: the provers' share refuses another active prover's copy"
     );
-    let first = waiting(&mc, true);
+    let first = waiting(&mc);
     eprintln!("REACH seal-wait-sender member first={first:?}");
     assert_eq!(
         first, None,
@@ -242,12 +242,12 @@ fn a_proof_its_member_sends_as_an_active_prover_waits() {
         matches!(by(b"x"), SubmitOutcome::Filtered(_)),
         "premise: the provers' share refuses another active prover's copy"
     );
-    let relayed = waiting(&mc, true);
+    let relayed = waiting(&mc);
     assert!(
         matches!(by(b"m"), SubmitOutcome::Filtered(_)),
         "premise: the provers' share refuses the member's proof again"
     );
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-sender member relayed={relayed:?} waiting={waits:?}");
     assert_eq!(
         (relayed, waits),
@@ -284,7 +284,7 @@ fn a_proof_due_over_an_epoch_away_keeps_no_room() {
             "premise: the provers' share refuses the proof"
         );
     }
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-sender far waiting={waits:?}");
     assert_eq!(
         waits,
@@ -313,7 +313,7 @@ fn a_wait_ends_once_this_nodes_proposals_pass_over_it() {
             "premise: the provers' share refuses the large proof"
         );
     }
-    let early = waiting(&mc, true);
+    let early = waiting(&mc);
     eprintln!("REACH seal-wait-sender passes early={early:?}");
     assert_eq!(
         early,
@@ -322,10 +322,49 @@ fn a_wait_ends_once_this_nodes_proposals_pass_over_it() {
         PASSES - 1
     );
     pass(&mc, start + PASSES - 1);
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-sender passes waiting={waits:?}");
     assert_eq!(
         waits, None,
         "SEAL-WAIT-PASSES: a wait outlived {PASSES} proposals passing over it"
+    );
+}
+
+/// A proof whose wait this node's proposals ended by passing over it does
+/// not wait again when its sender sends it twice more before its window
+/// ends, into a share refilled with proofs no proposal passed over: it is
+/// refused as the room left allows, and leaves the proof refused once there
+/// as it was.
+#[test]
+fn a_proof_passed_over_waits_no_more_when_sent_again() {
+    let mc = archive();
+    let (held, large) = large_waits(&mc);
+    let start = settlement_window(EPOCH).0 + 1;
+    for frame in start..start + PASSES {
+        pass(&mc, frame);
+    }
+    assert_eq!(waiting(&mc), None, "premise: the passes ended its wait");
+    mc.mark_finalized(&held);
+    let (refilled, refused) = fill(&mc, 100, SMALL);
+    assert_eq!(
+        refilled.len(),
+        held.len(),
+        "premise: the share is full again"
+    );
+    for _ in 0..2 {
+        assert!(
+            matches!(
+                mc.add_message_outcome(1, large.clone()),
+                SubmitOutcome::Filtered(_)
+            ),
+            "premise: the provers' share refuses the large proof"
+        );
+    }
+    let waits = waiting(&mc);
+    eprintln!("REACH seal-wait-sender passed-over waiting={waits:?}");
+    assert_eq!(
+        waits,
+        Some((refused.len(), false)),
+        "SEAL-PASSED-REARM: a passed-over proof sent twice more waited again"
     );
 }

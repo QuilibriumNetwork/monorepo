@@ -250,13 +250,14 @@ impl CollectedMessage {
             .filter(|_| self.own && self.data.len() >= SEAT_DENSITY_MIN_BYTES)
     }
 
-    /// A held storage epoch proof of this node's provers: its own
-    /// ([`Self::sender`] none) or one its member delivered as an active
-    /// prover ([`Self::own`]). Only such a proof waits for room
+    /// A held storage epoch proof of this node's provers, in the active
+    /// provers' share ([`Self::prover`]): its own ([`Self::sender`] none)
+    /// or one its member delivered as an active prover ([`Self::own`]).
+    /// Only such a proof waits for room
     /// ([`seal_waiting::SealWaiting::refused`]) or makes passed-over proofs
     /// due with it yield ([`evict_later_seals`]).
     fn may_wait(&self) -> bool {
-        self.held_seal() && (self.sender.is_none() || self.own)
+        self.held_seal() && self.prover && (self.sender.is_none() || self.own)
     }
 
     /// A held storage epoch proof no member sends: larger than a proposal's
@@ -758,8 +759,8 @@ fn seal_sender(sender: Sender<'_>) -> Option<[u8; 32]> {
     Some(h.finalize().into())
 }
 
-/// Where the storage epoch proof with `hash` stands for a share's waiting
-/// proof ([`seal_waiting::Found`]): carried by a finalized frame, or held at
+/// Where the storage epoch proof with `hash` stands for the waiting proof
+/// ([`seal_waiting::Found`]): carried by a finalized frame, or held at
 /// any rank, in the provers' share if any copy is. Read under the buffers'
 /// lock, the finalized set's taken after it as a collection takes it.
 fn seal_found(
@@ -1340,16 +1341,19 @@ impl Share {
     }
 
     /// A storage epoch proof refused over this share may wait for the room
-    /// frames free in it ([`seal_waiting::SealWaiting::refused`]): the
-    /// active provers' and other senders' shares keep that room for a proof
-    /// that may wait ([`CollectedMessage::may_wait`]),
-    /// which only the active provers' share holds. A sender's share frees
-    /// room only as that sender's own proofs go, and the other shares hold
-    /// no storage epoch proofs.
+    /// frames free in it ([`seal_waiting::SealWaiting::refused`]): only the
+    /// active provers' share, the one share that holds proofs that may wait
+    /// ([`CollectedMessage::may_wait`]). Other senders' share holds
+    /// none of them, a sender's share frees room only as that sender's own
+    /// proofs go, and the other shares hold no storage epoch proofs.
     pub(crate) fn waits(self) -> bool {
         match self {
-            Share::Seals | Share::OtherSeals => true,
-            Share::Unreserved | Share::Capacity | Share::Member | Share::Sender => false,
+            Share::Seals => true,
+            Share::OtherSeals
+            | Share::Unreserved
+            | Share::Capacity
+            | Share::Member
+            | Share::Sender => false,
         }
     }
 }

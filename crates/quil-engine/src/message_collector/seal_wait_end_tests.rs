@@ -11,9 +11,9 @@ use super::*;
 const LARGE: usize = 4_000_000;
 const SMALL: usize = 1_000_000;
 
-/// The proof waiting in the `prover` share, as (bytes, keeping room).
-fn waiting(mc: &MessageCollector, prover: bool) -> Option<(usize, bool)> {
-    let waiting = mc.seal_waiting.lock().unwrap().waiting(prover);
+/// The waiting proof, as (bytes, keeping room).
+fn waiting(mc: &MessageCollector) -> Option<(usize, bool)> {
+    let waiting = mc.seal_waiting.lock().unwrap().waiting();
     waiting.map(|(len, _, active)| (len, active))
 }
 
@@ -32,7 +32,7 @@ fn large_waits(mc: &MessageCollector) -> (Vec<Vec<u8>>, Vec<u8>) {
         );
     }
     assert_eq!(
-        waiting(mc, true),
+        waiting(mc),
         Some((large.len(), true)),
         "premise: the large proof waits"
     );
@@ -60,7 +60,7 @@ fn a_prover_copy_refused_beside_another_senders_waits() {
             "premise: the provers' share refuses the prover's copy"
         );
     }
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-end promote-refused waiting={waits:?}");
     assert_eq!(
         waits,
@@ -89,7 +89,7 @@ fn a_waiting_proof_promoted_from_another_senders_copy_frees_its_room() {
         "premise: another sender's copy is held"
     );
     assert_eq!(
-        waiting(&mc, true),
+        waiting(&mc),
         Some((large.len(), true)),
         "premise: another sender's copy leaves the prover's wait"
     );
@@ -106,7 +106,7 @@ fn a_waiting_proof_promoted_from_another_senders_copy_frees_its_room() {
         SubmitOutcome::Accepted,
         "SEAL-END-PROMOTED: a promoted proof kept its room"
     );
-    assert_eq!(waiting(&mc, true), None);
+    assert_eq!(waiting(&mc), None);
 }
 
 /// A waiting proof a frame carried, led by another archive, stops keeping
@@ -131,7 +131,7 @@ fn a_waiting_proof_a_frame_carried_frees_its_room() {
         SubmitOutcome::Accepted,
         "SEAL-END-CARRIED: a proof a frame carried kept its room"
     );
-    assert_eq!(waiting(&mc, true), None);
+    assert_eq!(waiting(&mc), None);
 }
 
 /// A waiting proof a carried proposal re-files is held, and stops keeping
@@ -151,7 +151,7 @@ fn a_waiting_proof_re_filed_by_a_carried_proposal_ends_its_wait() {
         "premise: the carried proof is held"
     );
     let _ = mc.add_message_outcome(1, settlement(2000, SMALL));
-    let waits = waiting(&mc, true);
+    let waits = waiting(&mc);
     eprintln!("REACH seal-wait-end re-filed waiting={waits:?}");
     assert!(
         waits.is_none_or(|(len, _)| len != large.len()),
