@@ -859,13 +859,13 @@ mod tests {
         first: u32,
         epoch: u64,
     ) -> (Vec<Vec<u8>>, Vec<u8>) {
-        use super::super::{Refusal, SubmitOutcome};
+        use super::super::{Refusal, Share, SubmitOutcome};
         let mut held = Vec::new();
         loop {
             let bytes = settlement(first + held.len() as u32, epoch);
             match mc.add_message_outcome(1, bytes.clone()) {
                 SubmitOutcome::Accepted => held.push(bytes),
-                SubmitOutcome::Filtered(Refusal::RankFull) => return (held, bytes),
+                SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals)) => return (held, bytes),
                 other => panic!("{other:?}"),
             }
             assert!(held.len() < 40, "40 proofs did not fill the share");
@@ -895,7 +895,7 @@ mod tests {
     /// window's end, and nothing counted the seats lost).
     #[test]
     fn the_global_collector_logs_each_windows_seats_once_it_ends() {
-        use super::super::{Provenance, Refusal, SubmitOutcome};
+        use super::super::{Provenance, Refusal, Share, SubmitOutcome};
         use quil_execution::global_intrinsic::storage_seat::settlement_window;
         let (from, end) = settlement_window(EPOCH);
         let mc = collector(from);
@@ -907,13 +907,13 @@ mod tests {
         // Sent again and refused again: one seat.
         assert_eq!(
             mc.add_message_outcome(1, refused),
-            SubmitOutcome::Filtered(Refusal::RankFull)
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals))
         );
         // Refused here, and carried by a frame another archive proposed.
         let carried = settlement(held.len() as u32 + 2, EPOCH);
         assert_eq!(
             mc.add_message_outcome(1, carried.clone()),
-            SubmitOutcome::Filtered(Refusal::RankFull)
+            SubmitOutcome::Filtered(Refusal::ShareFull(Share::Seals))
         );
         mc.mark_finalized(&[held[0].clone(), carried]);
         end_window(&mc, end);
@@ -1093,7 +1093,8 @@ mod tests {
             assert!(
                 matches!(
                     outcome,
-                    SubmitOutcome::Accepted | SubmitOutcome::Filtered(Refusal::RankFull)
+                    SubmitOutcome::Accepted
+                        | SubmitOutcome::Filtered(Refusal::RankFull | Refusal::ShareFull(_))
                 ),
                 "{outcome:?}"
             );

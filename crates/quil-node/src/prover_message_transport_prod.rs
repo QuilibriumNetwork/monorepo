@@ -1878,7 +1878,8 @@ where
             Ok(Err((addr, reason, retry))) => {
                 if retry {
                     delivery.retry += 1;
-                    // The collector's refusal for room (`Refusal::RankFull`).
+                    // The collector's refusals for room (`Refusal::RankFull` and
+                    // `Refusal::ShareFull`, whose reasons keep its text).
                     if reason.contains("rank buffer full") {
                         delivery.room += 1;
                         if let Some(resting) = resting {

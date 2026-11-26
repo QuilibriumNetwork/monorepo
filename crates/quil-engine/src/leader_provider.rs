@@ -2162,6 +2162,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 pool_anchored_earlier = pool.anchored_earlier,
                 pool_out_of_window = pool.out_of_window,
                 pool_applied_skipped = pool.applied_skipped,
+                pool_seals = pool.seals,
+                pool_seal_bytes = pool.seal_bytes,
                 pool_verified = pool.verified,
                 pool_unverified = pool.unverified,
                 verifying = pool.verifying,
