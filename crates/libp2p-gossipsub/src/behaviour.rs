@@ -58,7 +58,7 @@ use crate::rpc_proto::proto;
 use crate::{
     backoff::BackoffStorage,
     config::{Config, ValidationMode},
-    gossip_promises::GossipPromises,
+    gossip_promises::{Announcer, GossipPromises},
     handler::{Handler, HandlerEvent, HandlerIn},
     mcache::{MessageCache, MessageCacheStats},
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
@@ -324,6 +324,15 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// Counts the number of `IHAVE` received from each peer since the last heartbeat.
     count_received_ihave: HashMap<PeerId, usize>,
 
+    /// QUILIBRIUM: counts the mesh announcements (single-id `IHAVE` from a mesh peer) received
+    /// from each peer since the last heartbeat, apart from `count_received_ihave`.
+    count_received_announcements: HashMap<PeerId, usize>,
+
+    /// QUILIBRIUM: counts the messages each peer's IHAVEs added to the kept announcers since
+    /// the last heartbeat without an ask ([`Behaviour::keep_unasked`]), at most
+    /// `max_ihave_length`, as the IWANT budget bounds the messages asked of a peer.
+    count_deferred: HashMap<PeerId, usize>,
+
     /// Counts the number of `IWANT` that we sent the each peer since the last heartbeat.
     count_sent_iwant: HashMap<PeerId, usize>,
 
@@ -365,6 +374,63 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// older release computes (`Config::legacy_message_id`), since the last
     /// [`Behaviour::take_legacy_id_answers`]; at most [`MAX_LEGACY_ID_PEERS`] peers.
     legacy_id_answers: HashMap<PeerId, u64>,
+
+    /// QUILIBRIUM: announcements (IHAVE) dropped or not asked for, and fallback asks.
+    announce_stats: AnnounceStats,
+}
+
+/// QUILIBRIUM: what became of one ask of a kept announcer ([`Behaviour::ask_kept`]).
+enum KeptAsk {
+    Asked,
+    /// Over its IWANT budget in this heartbeat: still kept.
+    Deferred,
+    /// It left or fell below the gossip threshold: no longer kept.
+    Dropped,
+}
+
+/// QUILIBRIUM: what became of peers' announcements (IHAVE), counted since the behaviour was
+/// built. A dropped announcement of a lazily forwarded message (`Config::lazy_forward_threshold`)
+/// is a copy this node pulls from another announcer, or from heartbeat gossip, or not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnnounceStats {
+    /// IHAVEs dropped whole: over `max_ihave_messages` from one peer in a heartbeat (mesh
+    /// announcements are counted apart and deferred, `deferred_ids`).
+    pub dropped_ihaves: u64,
+    /// The message ids in those IHAVEs.
+    pub dropped_ids: u64,
+    /// Message ids whose announcer was kept to be asked at a later heartbeat instead of now:
+    /// a mesh announcement over `max_ihave_length` in a heartbeat, an id over the peer's
+    /// IWANT budget, or a kept announcer's ask over that budget.
+    pub deferred_ids: u64,
+    /// Ids neither asked for nor kept: over the IWANT budget and over the peer's
+    /// `max_ihave_length` deferred ids in the heartbeat.
+    pub unasked_ids: u64,
+    /// The peer of the latest drop or deferral.
+    pub last_dropping_peer: Option<PeerId>,
+    /// IWANTs sent to a kept announcer at a heartbeat with no promise for the message open:
+    /// after every promise for it broke, or after a deferral.
+    pub fallback_asks: u64,
+    /// IWANTs sent to a kept mesh announcer at a heartbeat because its latest start came
+    /// before the next one, whether or not another promise for the message was open: the
+    /// asks before it stalled. Each answered ask is a full copy of the message. At most 8
+    /// announcers of a message are kept at once; one asked frees its place for another.
+    /// Announcers outside the mesh are never asked so, only as `fallback_asks`.
+    pub deadline_asks: u64,
+    /// Kept announcers dropped unasked once their serve-until passed: `history_length - 1`
+    /// heartbeats after a mesh announcer's first IHAVE, `history_length - 1 - history_gossip`
+    /// after another peer's first IHAVE; a repeat changes nothing (see PATCHES.md).
+    pub stale_announcers: u64,
+    /// IWANTs this node could not serve because its cache's byte budget
+    /// (`Config::mcache_max_bytes`) evicted the message within its history window: each is
+    /// a promise that breaks at the asking peer.
+    pub evicted_iwants: u64,
+    /// First copies of messages over `lazy_forward_threshold` sent by their source itself
+    /// (its publish).
+    pub large_first_from_source: u64,
+    /// First copies of such messages pushed by a relay.
+    pub large_first_pushed: u64,
+    /// First copies of such messages sent by a peer answering this node's IWANT.
+    pub large_first_pulled: u64,
 }
 
 /// QUILIBRIUM: the most peers [`Behaviour::take_legacy_id_answers`] holds between two calls.
@@ -505,6 +571,8 @@ where
             px_peers: HashSet::new(),
             peer_score: PeerScoreState::Disabled,
             count_received_ihave: HashMap::new(),
+            count_received_announcements: HashMap::new(),
+            count_deferred: HashMap::new(),
             count_sent_iwant: HashMap::new(),
             connected_peers: HashMap::new(),
             published_message_ids: DuplicateCache::new(config.published_message_ids_cache_time()),
@@ -517,6 +585,7 @@ where
             rejected_rpcs: RejectedRpcStats::default(),
             unsent_rpcs: UnsentRpcStats::default(),
             legacy_id_answers: HashMap::new(),
+            announce_stats: AnnounceStats::default(),
         })
     }
 
@@ -597,6 +666,12 @@ where
     /// the previous call. Such a peer runs a release from before the change of id.
     pub fn take_legacy_id_answers(&mut self) -> HashMap<PeerId, u64> {
         std::mem::take(&mut self.legacy_id_answers)
+    }
+
+    /// QUILIBRIUM: announcements dropped or not asked for, and fallback asks, since the
+    /// behaviour was built ([`AnnounceStats`]).
+    pub fn announce_stats(&self) -> AnnounceStats {
+        self.announce_stats
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -1342,9 +1417,39 @@ where
         }
 
         // IHAVE flood protection
-        let peer_have = self.count_received_ihave.entry(*peer_id).or_insert(0);
+        // QUILIBRIUM: a mesh peer's IHAVE of a single id is its announcement of a message over
+        // its `lazy_forward_threshold` (heartbeat gossip goes to peers outside its mesh, one
+        // IHAVE per topic). It is counted apart from `max_ihave_messages`, which heartbeat
+        // gossip of more topics than that fills, against `max_ihave_length` per heartbeat: one
+        // id each, the bound the IWANT budget puts on ids asked. A mesh peer announces a
+        // message once, so one over that count is not dropped: its announcer is kept and asked
+        // at the next heartbeat.
+        let announcement = matches!(
+            ihave_msgs.as_slice(),
+            [(topic, ids)] if ids.len() == 1
+                && self.mesh.get(topic).is_some_and(|mesh| mesh.contains(peer_id))
+        );
+        let (received, limit) = if announcement {
+            (
+                &mut self.count_received_announcements,
+                self.config.max_ihave_length(),
+            )
+        } else {
+            (
+                &mut self.count_received_ihave,
+                self.config.max_ihave_messages(),
+            )
+        };
+        let peer_have = received.entry(*peer_id).or_insert(0);
         *peer_have += 1;
-        if *peer_have > self.config.max_ihave_messages() {
+        let over_count = *peer_have > limit;
+        if over_count && !announcement {
+            self.announce_stats.dropped_ihaves += 1;
+            self.announce_stats.dropped_ids += ihave_msgs
+                .iter()
+                .map(|(_, ids)| ids.len() as u64)
+                .sum::<u64>();
+            self.announce_stats.last_dropping_peer = Some(*peer_id);
             tracing::debug!(
                 peer=%peer_id,
                 "IHAVE: peer has advertised too many times ({}) within this heartbeat \
@@ -1353,41 +1458,58 @@ where
             );
             return;
         }
-
-        if let Some(iasked) = self.count_sent_iwant.get(peer_id) {
-            if *iasked >= self.config.max_ihave_length() {
-                tracing::debug!(
-                    peer=%peer_id,
-                    "IHAVE: peer has already advertised too many messages ({}); ignoring",
-                    *iasked
-                );
-                return;
-            }
-        }
+        // QUILIBRIUM: the IWANTs this peer may still be sent in this heartbeat; ids past them
+        // are kept with their announcer for a later heartbeat (`Behaviour::keep_unasked`),
+        // never dropped while the peer still serves them.
+        let budget = if over_count {
+            0
+        } else {
+            self.config.max_ihave_length().saturating_sub(
+                self.count_sent_iwant
+                    .get(peer_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        };
 
         tracing::trace!(peer=%peer_id, "Handling IHAVE for peer");
 
-        let mut iwant_ids = HashSet::new();
+        // QUILIBRIUM: each id to ask for, with this peer as its announcer: a mesh peer
+        // announces a message lazily forwarded, so large (`Config::lazy_followup_time`).
+        let now = Instant::now();
+        let mut iwant_ids: HashMap<MessageId, Announcer> = HashMap::new();
 
         for (topic, ids) in ihave_msgs {
             // only process the message if we are subscribed
-            if !self.mesh.contains_key(&topic) {
+            let Some(mesh) = self.mesh.get(&topic) else {
                 tracing::debug!(
                     %topic,
                     "IHAVE: Ignoring IHAVE - Not subscribed to topic"
                 );
                 continue;
-            }
+            };
+            let from_mesh = mesh.contains(peer_id);
+            let announcer = self.announcer(*peer_id, now, from_mesh);
 
-            for id in ids.into_iter().filter(|id| {
-                if self.duplicate_cache.contains(id) {
-                    return false;
+            for id in ids {
+                if self.duplicate_cache.contains(&id) {
+                    continue;
                 }
-
-                !self.gossip_promises.contains(id)
-            }) {
+                // QUILIBRIUM: already asked of another peer: keep this announcer while it still
+                // serves the message, a mesh peer to ask by its latest start, any kept one once
+                // no promise for the message is open.
+                if self.gossip_promises.contains(&id) {
+                    self.gossip_promises.keep_announcer(&id, announcer);
+                    continue;
+                }
+                // QUILIBRIUM: a peer asked for this message before did not deliver it; it is
+                // not asked again.
+                if self.gossip_promises.was_asked(&id, peer_id) {
+                    continue;
+                }
                 // have not seen this message and are not currently requesting it
-                if iwant_ids.insert(id) {
+                if let std::collections::hash_map::Entry::Vacant(vacant) = iwant_ids.entry(id) {
+                    vacant.insert(announcer);
                     // Register the IWANT metric
                     #[cfg(feature = "metrics")]
                     if let Some(metrics) = self.metrics.as_mut() {
@@ -1397,51 +1519,86 @@ where
             }
         }
 
-        if !iwant_ids.is_empty() {
-            let iasked = self.count_sent_iwant.entry(*peer_id).or_insert(0);
-            let mut iask = iwant_ids.len();
-            if *iasked + iask > self.config.max_ihave_length() {
-                iask = self.config.max_ihave_length().saturating_sub(*iasked);
-            }
-
-            // Send the list of IWANT control messages
-            tracing::debug!(
-                peer=%peer_id,
-                "IHAVE: Asking for {} out of {} messages from peer",
-                iask,
-                iwant_ids.len()
-            );
-
-            // Ask in random order
-            let mut iwant_ids_vec: Vec<_> = iwant_ids.into_iter().collect();
-            let mut rng = thread_rng();
-            iwant_ids_vec.partial_shuffle(&mut rng, iask);
-
-            iwant_ids_vec.truncate(iask);
-            *iasked += iask;
-
-            let followup_time = Instant::now()
-                .checked_add(self.config.iwant_followup_time())
-                .unwrap_or_else(|| {
-                    tracing::error!("Invalid iwant_followup_time using Instant::now()");
-                    Instant::now()
-                });
-            self.gossip_promises
-                .add_promise(*peer_id, &iwant_ids_vec, followup_time);
-            tracing::trace!(
-                peer=%peer_id,
-                "IHAVE: Asking for the following messages from peer: {:?}",
-                iwant_ids_vec
-            );
-
-            self.send_message(
-                *peer_id,
-                RpcOut::IWant(IWant {
-                    message_ids: iwant_ids_vec,
-                }),
-            );
+        if iwant_ids.is_empty() {
+            tracing::trace!(peer=%peer_id, "Completed IHAVE handling for peer");
+            return;
         }
+        let iask = iwant_ids.len().min(budget);
+        tracing::debug!(
+            peer=%peer_id,
+            "IHAVE: Asking for {} out of {} messages from peer",
+            iask,
+            iwant_ids.len()
+        );
+
+        // Ask in random order
+        let mut iwant_ids_vec: Vec<_> = iwant_ids.keys().cloned().collect();
+        let mut rng = thread_rng();
+        let (asked, unasked) = iwant_ids_vec.partial_shuffle(&mut rng, iask);
+        let (asked, unasked) = (asked.to_vec(), unasked.to_vec());
+        self.keep_unasked(
+            peer_id,
+            unasked.into_iter().map(|id| {
+                let announcer = iwant_ids[&id];
+                (id, announcer)
+            }),
+        );
+        if asked.is_empty() {
+            tracing::trace!(peer=%peer_id, "Completed IHAVE handling for peer");
+            return;
+        }
+        *self.count_sent_iwant.entry(*peer_id).or_insert(0) += asked.len();
+
+        let (lazy, gossiped): (Vec<MessageId>, Vec<MessageId>) =
+            asked.iter().cloned().partition(|id| iwant_ids[id].lazy);
+        self.gossip_promises.ask(
+            *peer_id,
+            &gossiped,
+            Self::followup_at(self.config.iwant_followup_time()),
+        );
+        self.gossip_promises.ask(
+            *peer_id,
+            &lazy,
+            Self::followup_at(self.config.lazy_followup_time()),
+        );
+        tracing::trace!(
+            peer=%peer_id,
+            "IHAVE: Asking for the following messages from peer: {:?}",
+            asked
+        );
+
+        self.send_message(*peer_id, RpcOut::IWant(IWant { message_ids: asked }));
         tracing::trace!(peer=%peer_id, "Completed IHAVE handling for peer");
+    }
+
+    /// QUILIBRIUM: keeps the announcer of each id this peer's IHAVE did not get asked for
+    /// (over the IWANT budget, or an announcement over its count), to ask at a later
+    /// heartbeat ([`Behaviour::ask_kept_announcers`]). An id already tracked costs no record;
+    /// a new one counts against the peer's `max_ihave_length` deferred ids per heartbeat, and
+    /// past them it is dropped and counted ([`AnnounceStats::unasked_ids`]).
+    fn keep_unasked(
+        &mut self,
+        peer_id: &PeerId,
+        unasked: impl IntoIterator<Item = (MessageId, Announcer)>,
+    ) {
+        let limit = self.config.max_ihave_length();
+        for (id, announcer) in unasked {
+            let deferred = self.count_deferred.entry(*peer_id).or_insert(0);
+            let kept = if self.gossip_promises.tracks(&id) {
+                self.gossip_promises.keep_announcer(&id, announcer)
+            } else if *deferred < limit {
+                *deferred += 1;
+                self.gossip_promises.keep_announcer(&id, announcer)
+            } else {
+                false
+            };
+            if kept {
+                self.announce_stats.deferred_ids += 1;
+            } else {
+                self.announce_stats.unasked_ids += 1;
+            }
+            self.announce_stats.last_dropping_peer = Some(*peer_id);
+        }
     }
 
     /// Handles an IWANT control message. Checks our cache of messages. If the message exists it is
@@ -1493,6 +1650,9 @@ where
                         },
                     );
                 }
+            } else if self.mcache.byte_evicted(&id) {
+                // QUILIBRIUM: a promise that breaks at the asking peer.
+                self.announce_stats.evicted_iwants += 1;
             }
         }
         tracing::debug!(peer=%peer_id, "Completed IWANT handling for peer");
@@ -2052,6 +2212,22 @@ where
             );
         }
 
+        // QUILIBRIUM: how the first copy of a large message came: from its source, pushed by
+        // a relay, or pulled (an answer to this node's IWANT).
+        if raw_protobuf_len > self.config.lazy_forward_threshold() {
+            let stats = &mut self.announce_stats;
+            if message.source.as_ref() == Some(propagation_source) {
+                stats.large_first_from_source += 1;
+            } else if self
+                .gossip_promises
+                .promised_by(&msg_id, propagation_source)
+            {
+                stats.large_first_pulled += 1;
+            } else {
+                stats.large_first_pushed += 1;
+            }
+        }
+
         // Tells score that message arrived (but is maybe not fully validated yet).
         // Consider the message as delivered for gossip promises.
         self.gossip_promises.message_delivered(&msg_id);
@@ -2318,10 +2494,21 @@ where
         );
     }
 
+    /// The instant a promise made now for `followup` expires.
+    fn followup_at(followup: Duration) -> Instant {
+        Instant::now().checked_add(followup).unwrap_or_else(|| {
+            tracing::error!("Invalid iwant_followup_time using Instant::now()");
+            Instant::now()
+        })
+    }
+
     /// Applies penalties to peers that did not respond to our IWANT requests.
+    /// QUILIBRIUM: broken promises are dropped with scoring off too, so a kept
+    /// announcer can be asked ([`Behaviour::ask_kept_announcers`]).
     fn apply_iwant_penalties(&mut self) {
+        let broken = self.gossip_promises.get_broken_promises();
         if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
-            for (peer, count) in self.gossip_promises.get_broken_promises() {
+            for (peer, count) in broken {
                 peer_score.add_penalty(&peer, count);
                 #[cfg(feature = "metrics")]
                 if let Some(metrics) = self.metrics.as_mut() {
@@ -2329,6 +2516,163 @@ where
                 }
             }
         }
+    }
+
+    /// QUILIBRIUM: how long after its IHAVE an announcer still serves an IWANT from its cache.
+    /// A mesh peer announces when it caches the message, which then stays in its cache for
+    /// between `history_length - 1` and `history_length` heartbeats (fewer if its byte budget
+    /// evicts it). Heartbeat gossip names a message for `history_gossip` heartbeats after the
+    /// peer cached it, so the latest such IHAVE leaves `history_length - 1 - history_gossip`.
+    /// The peer serves an IWANT from its cache when the IWANT arrives, so the transfer time
+    /// does not count against the cache. A relay caches a message when it receives it and
+    /// announces it to its mesh once validated, so a mesh announcer's cache ends up to its
+    /// validation time plus the IHAVE's transit before this window does. An ask goes out by
+    /// the window's end less its promise time ([`Behaviour::announcer`]), so it reaches the
+    /// cache in time while validation plus both transits stay under the promise time:
+    /// `lazy_followup_time` for a mesh announcer (8 s at the node). An ask that misses the
+    /// cache edge breaks its promise, counted as a broken promise here (and as
+    /// [`AnnounceStats::evicted_iwants`] on the peer when its byte budget evicted the
+    /// message).
+    fn serve_window(&self, from_mesh: bool) -> Duration {
+        let cached = self.config.history_length().saturating_sub(1);
+        let left = if from_mesh {
+            cached
+        } else {
+            cached.saturating_sub(self.config.history_gossip())
+        };
+        self.config
+            .heartbeat_interval()
+            .saturating_mul(u32::try_from(left).unwrap_or(u32::MAX))
+    }
+
+    /// QUILIBRIUM: `peer` as an announcer whose first IHAVE arrived at `announced`: it serves
+    /// the message for [`Behaviour::serve_window`], and its latest start is that less its
+    /// promise time (`lazy_followup_time` from the mesh, `iwant_followup_time` from outside)
+    /// and one heartbeat, the latest an ask over its IWANT budget is put off. Where the window
+    /// is shorter, its latest start is its IHAVE: a mesh announcer is asked at the next
+    /// heartbeat. Only a mesh announcer is asked by its latest start.
+    fn announcer(&self, peer: PeerId, announced: Instant, from_mesh: bool) -> Announcer {
+        let window = self.serve_window(from_mesh);
+        let ask_within = window
+            .saturating_sub(self.followup(from_mesh))
+            .saturating_sub(self.config.heartbeat_interval());
+        Announcer {
+            peer,
+            serve_until: announced.checked_add(window).unwrap_or(announced),
+            latest_start: announced.checked_add(ask_within).unwrap_or(announced),
+            lazy: from_mesh,
+        }
+    }
+
+    /// QUILIBRIUM: how long a promise lasts on an ask of a mesh announcer (`lazy`) or another.
+    fn followup(&self, lazy: bool) -> Duration {
+        if lazy {
+            self.config.lazy_followup_time()
+        } else {
+            self.config.iwant_followup_time()
+        }
+    }
+
+    /// QUILIBRIUM: asks the kept announcers due at this heartbeat
+    /// ([`GossipPromises::due_announcers`]). Each mesh announcer whose latest start comes
+    /// before the next heartbeat is asked now, whether or not another promise for the message
+    /// is open ([`AnnounceStats::deadline_asks`]): an adversary that announces first,
+    /// re-announces or withholds cannot hold off a mesh announcer past its serve window,
+    /// whatever the order. With no promise open and no such ask, the announcer with the latest
+    /// first IHAVE that can be asked is ([`AnnounceStats::fallback_asks`]): one outside the
+    /// mesh is asked only so, one at a time as upstream. An announcer that left or fell below
+    /// the gossip threshold is dropped; one over its IWANT budget stays kept and is asked at
+    /// the next heartbeat. A peer is asked for a message once while its record lasts; each
+    /// ask ends when its promise breaks or the message arrives. Each peer gets one IWANT for
+    /// all its asks.
+    fn ask_kept_announcers(&mut self) {
+        let now = Instant::now();
+        let (due, stale) = self
+            .gossip_promises
+            .due_announcers(now, self.config.heartbeat_interval());
+        self.announce_stats.stale_announcers += stale as u64;
+        let mut asks: HashMap<PeerId, Vec<MessageId>> = HashMap::new();
+        for (msg_id, due) in due {
+            if self.duplicate_cache.contains(&msg_id) {
+                self.gossip_promises.message_delivered(&msg_id);
+                continue;
+            }
+            let mut asked_by_deadline = false;
+            for announcer in due.deadline {
+                match self.ask_kept(&msg_id, announcer, &mut asks) {
+                    KeptAsk::Asked => {
+                        asked_by_deadline = true;
+                        self.announce_stats.deadline_asks += 1;
+                        tracing::debug!(
+                            peer=%announcer.peer,
+                            message=%msg_id,
+                            "IWANT: asking a kept announcer at its latest start"
+                        );
+                    }
+                    KeptAsk::Deferred => self.announce_stats.deferred_ids += 1,
+                    KeptAsk::Dropped => {}
+                }
+            }
+            if asked_by_deadline {
+                continue;
+            }
+            let mut deferred = false;
+            for announcer in due.serial {
+                match self.ask_kept(&msg_id, announcer, &mut asks) {
+                    KeptAsk::Asked => {
+                        deferred = false;
+                        self.announce_stats.fallback_asks += 1;
+                        tracing::debug!(
+                            peer=%announcer.peer,
+                            message=%msg_id,
+                            "IWANT: asking a kept announcer: no promise for the message is open"
+                        );
+                        break;
+                    }
+                    KeptAsk::Deferred => deferred = true,
+                    KeptAsk::Dropped => {}
+                }
+            }
+            if deferred {
+                self.announce_stats.deferred_ids += 1;
+            }
+        }
+        for (peer_id, message_ids) in asks {
+            self.send_message(peer_id, RpcOut::IWant(IWant { message_ids }));
+        }
+    }
+
+    /// QUILIBRIUM: asks `announcer` for `msg_id` in this heartbeat's IWANT to it (`asks`),
+    /// unless it left or fell below the gossip threshold (it is no longer kept) or used up
+    /// its IWANT budget (it stays kept).
+    fn ask_kept(
+        &mut self,
+        msg_id: &MessageId,
+        announcer: Announcer,
+        asks: &mut HashMap<PeerId, Vec<MessageId>>,
+    ) -> KeptAsk {
+        let peer_id = announcer.peer;
+        if !self.connected_peers.contains_key(&peer_id)
+            || self
+                .peer_score
+                .below_threshold(&peer_id, |ts| ts.gossip_threshold)
+                .0
+        {
+            self.gossip_promises.forget_announcer(msg_id, &peer_id);
+            return KeptAsk::Dropped;
+        }
+        let iasked = self.count_sent_iwant.entry(peer_id).or_insert(0);
+        if *iasked >= self.config.max_ihave_length() {
+            return KeptAsk::Deferred;
+        }
+        *iasked += 1;
+        self.gossip_promises.ask(
+            peer_id,
+            std::slice::from_ref(msg_id),
+            Self::followup_at(self.followup(announcer.lazy)),
+        );
+        asks.entry(peer_id).or_default().push(msg_id.clone());
+        KeptAsk::Asked
     }
 
     /// Heartbeat function which shifts the memcache and updates the mesh.
@@ -2359,9 +2703,12 @@ where
         // clean up ihave counters
         self.count_sent_iwant.clear();
         self.count_received_ihave.clear();
+        self.count_received_announcements.clear();
+        self.count_deferred.clear();
 
         // apply iwant penalties
         self.apply_iwant_penalties();
+        self.ask_kept_announcers();
 
         // check connections to explicit peers
         if self.heartbeat_ticks % self.config.check_explicit_peers_ticks() == 0 {
@@ -3025,15 +3372,41 @@ where
 
         // forward the message to peers
         // QUILIBRIUM: the last recipient takes `message` itself, not a copy.
+        // A message over `lazy_forward_threshold` is pushed to
+        // `lazy_eager_peers` random gossipsub mesh peers and announced to the
+        // rest (`Config::lazy_forward_threshold`): one the pushes miss asks
+        // an announcer with IWANT, served from the cache.
+        let lazy = message.raw_protobuf_len() > self.config.lazy_forward_threshold();
         let mut targets = Vec::with_capacity(recipient_peers.len());
+        let mut announce_to = Vec::new();
         for peer_id in recipient_peers.iter() {
             if let Some(peer) = self.connected_peers.get_mut(peer_id) {
                 if peer.dont_send.contains_key(msg_id) {
                     tracing::debug!(%peer_id, message_id=%msg_id, "Peer doesn't want message");
                     continue;
                 }
+                if lazy && peer.kind != PeerKind::Floodsub && !self.explicit_peers.contains(peer_id)
+                {
+                    announce_to.push(*peer_id);
+                    continue;
+                }
                 targets.push(*peer_id);
             }
+        }
+        if !announce_to.is_empty() {
+            let eager = self.config.lazy_eager_peers().min(announce_to.len());
+            announce_to.shuffle(&mut thread_rng());
+            targets.extend(announce_to.drain(..eager));
+        }
+        for peer_id in announce_to {
+            tracing::debug!(%peer_id, message_id=%msg_id, "Announcing message to peer");
+            self.send_message(
+                peer_id,
+                RpcOut::IHave(IHave {
+                    topic_hash: message.topic.clone(),
+                    message_ids: vec![msg_id.clone()],
+                }),
+            );
         }
         let mut message = Some(message);
         let last = targets.len().saturating_sub(1);
