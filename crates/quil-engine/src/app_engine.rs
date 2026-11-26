@@ -4606,6 +4606,43 @@ impl StorageEpochCheck {
 }
 
 impl AppConsensusEngine {
+    /// Warn that `frame_number`, whose `operations` worker verifications
+    /// were estimated at `estimate_secs`, has waited `waited` for them on a
+    /// background thread, with this process's proof queue (`queued_ahead`
+    /// submissions ahead of the frame's) and slot count
+    /// ([`crate::admission_verify::ProofQueueWait`]).
+    fn warn_proof_deferral_overrun(
+        &self,
+        frame_number: u64,
+        operations: usize,
+        waited: Duration,
+        estimate_secs: f64,
+        queued_ahead: usize,
+    ) {
+        // The consensus path defers only proofs verifying on the queue.
+        let proof_queue = crate::admission_verify::proof_queue_wait(queued_ahead, false);
+        warn!(
+            core_id = self.core_id,
+            filter = %hex::encode(&self.filter),
+            frame = frame_number,
+            operations,
+            waited_secs = waited.as_secs(),
+            memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
+            estimate_secs = estimate_secs.round() as u64,
+            queued_ahead,
+            queue_verifying = proof_queue.verifying,
+            queue_threads = proof_queue.threads,
+            queued = proof_queue.queued,
+            proof_slots = %proof_queue.slots_text(),
+            proof_slots_source = proof_queue.slots_source(),
+            proof_slots_automatic = %proof_queue.automatic_text(),
+            check = proof_queue.check().map(tracing::field::display),
+            scope = "this process's proof worker",
+            action = PROOF_WAIT_ACTION,
+            "app-shard frame materialization still waits for its proof verification on a background thread"
+        );
+    }
+
     /// Put this frame's materialization off while its confidential proofs
     /// verify on a background thread (`admission_verify`), so the engine
     /// keeps serving consensus, storage proofs and confirmations instead of
@@ -4644,8 +4681,6 @@ impl AppConsensusEngine {
         let mut unverified: Vec<quil_execution::manager::OperationEstimate> = Vec::new();
         let mut verifying = true;
         let mut restarted = false;
-        // Submissions queued ahead of this frame's last one.
-        let mut queued_ahead = 0usize;
         // The bundles this frame waits on, with their arrival here.
         let mut waiting = Vec::new();
         for bundle in requests {
@@ -4670,8 +4705,9 @@ impl AppConsensusEngine {
                 &canon,
                 anchor,
             ) || proof_prewarm_running(&canon);
-            queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
+        // Submissions queued ahead of this frame's last one.
+        let queued_ahead = queue.queued_ahead_of_any(&waiting);
         // This frame finalized and asked for its own submissions above
         // (moving them to the frames' lane): warm-ups of the proposals that
         // lost this frame or an earlier one are no longer needed.
@@ -4722,22 +4758,12 @@ impl AppConsensusEngine {
                 overrun,
             } => {
                 if let Some(waited) = overrun {
-                    warn!(
-                        core_id = self.core_id,
-                        filter = %hex::encode(&self.filter),
-                        frame = frame_number,
-                        operations = unverified.len(),
-                        waited_secs = waited.as_secs(),
-                        memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
-                        estimate_secs = estimate_secs.round() as u64,
+                    self.warn_proof_deferral_overrun(
+                        frame_number,
+                        unverified.len(),
+                        waited,
+                        estimate_secs,
                         queued_ahead,
-                        scope = "this node's proof worker",
-                        action = "the frame keeps waiting and materializes once its proofs verify; \
-                                  memory_starved_secs above 0 says its checks wait for memory or a slot (see \
-                                  the line on proof checks starved); else this node verifies confidential \
-                                  proofs slower than its shards' frames carry them: check its CPU and \
-                                  proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 at once)",
-                        "app-shard frame materialization still waits for its proof verification on a background thread"
                     );
                 }
                 Some(QuilError::ExecutionUnavailable(
@@ -6225,14 +6251,37 @@ impl AppConsensusEngine {
                 idle_secs = self.behind_shard.idle(now).as_secs(),
                 recovery = %recovery_wait(self.execution.snapshot().recovery.as_ref(),
                     crate::worker_execution::now_ms()),
+                proof_wait = %self.behind_on_proof_wait(cursor, now),
                 scope = "this node's worker",
                 action = "run `qclient node diagnostics health --self` and compare this worker's \
                           LOCAL with COMMITTEE and its RECOVERY failures; if every worker is behind, \
                           check this node's archive connections ('archive connection still \
                           failing'); if only this one stays behind, report this line with its shard \
-                          to the maintainer",
+                          to the maintainer; proof_wait, unless none, is this worker's next frame \
+                          waiting for its proof verification in this process, with that process's \
+                          proof queue and slots (see the line 'still waits for its proof \
+                          verification')",
                 "this worker is still behind its shard"),
         }
+    }
+
+    /// The behind-shard warning's `proof_wait`: the frame after `cursor`
+    /// waiting for its proof verification in this process at `now`, with
+    /// this process's proof queue and slot count
+    /// ([`crate::admission_verify::ProofQueueWait`]), or `none` (mainnet,
+    /// 2026-11-22: 682 behind warnings of one node whose frames waited
+    /// behind its proof queue named only its recovery).
+    fn behind_on_proof_wait(&self, cursor: u64, now: std::time::Instant) -> String {
+        let Some(wait) = self.proof_wait.filter(|wait| wait.frame == cursor + 1) else {
+            return "none".to_string();
+        };
+        format!(
+            "frame {} waited {}s ({}); {}",
+            wait.frame,
+            now.saturating_duration_since(wait.since).as_secs(),
+            wait.cause(),
+            self.proof_wait_queue(&wait),
+        )
     }
 
     /// The frame-gap check (`gap`) or the deferral check ended at `now`
@@ -6715,6 +6764,31 @@ impl AppConsensusEngine {
         Some(wait.frame)
     }
 
+    /// This process's proof queue and slot count as `wait`'s frame sees
+    /// them, and whether the proof worker refused it busy.
+    fn proof_wait_queue(&self, wait: &ProofWait) -> crate::admission_verify::ProofQueueWait {
+        crate::admission_verify::proof_queue_wait(
+            self.proof_wait_queued_ahead(wait.frame),
+            wait.busy,
+        )
+    }
+
+    /// Submissions queued in this process's proof queue ahead of the latest
+    /// of `frame`'s (0 when none of them is queued: verifying, or not
+    /// pending).
+    fn proof_wait_queued_ahead(&self, frame: u64) -> usize {
+        let Some(frame) = self.received_full_frames.get(&frame) else {
+            return 0;
+        };
+        let digests: Vec<[u8; 32]> = frame
+            .requests
+            .iter()
+            .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
+            .map(|canon| crate::admission_verify::digest(&canon))
+            .collect();
+        crate::admission_verify::global().queued_ahead_of_any(&digests)
+    }
+
     /// Log [`Self::proof_wait`] for an archive recovery: when it starts,
     /// then every [`PROOF_WAIT_REPEAT`] with the time waited; the frame's
     /// materialization logs its end.
@@ -6748,21 +6822,27 @@ impl AppConsensusEngine {
         };
         let waited = now.saturating_duration_since(wait.since);
         if proof_wait_overruns(waited) {
+            let proof_queue = self.proof_wait_queue(&wait);
+            let action = format!("{PROOF_WAIT_ACTION}; {REPLAY_PROOF_WAIT_RECOVERY}");
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
                 waited_secs = waited.as_secs(),
                 memory_starved_secs = crate::storage_jobs::verifier_starved_secs(),
+                queued_ahead = proof_queue.queued_ahead, queue_verifying = proof_queue.verifying,
+                queue_threads = proof_queue.threads, queued = proof_queue.queued,
+                proof_slots = %proof_queue.slots_text(),
+                proof_slots_source = proof_queue.slots_source(),
+                proof_slots_automatic = %proof_queue.automatic_text(),
+                check = proof_queue.check().map(tracing::field::display),
+                refusal = proof_queue.refusal(),
                 cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
-                scope = "this node's proof worker",
-                action = "the frame is committed and materializes once its proofs verify; its recovery \
-                    defers meanwhile; memory_starved_secs above 0 says this node's proof checks wait for \
-                    memory or a slot (see the line on proof checks starved), else check this node's CPU \
-                    and proofWorker settings",
+                scope = "this process's proof worker",
+                action = action.as_str(),
                 "archive replay frame still waits for its proof verification");
         } else {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
                 waited_secs = waited.as_secs(),
                 cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
-                scope = "this node's proof worker",
+                scope = "this process's proof worker",
                 action = "an expected wait: the frame is authenticated and committed, and materializes once its \
                     proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
                     failure; if it lasts hours, check this node's CPU and proofWorker settings",
@@ -20094,6 +20174,36 @@ impl UnrewindableFenceBlock {
 /// warns ([`proof_wait_overruns`]).
 const PROOF_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
 
+/// The action of the warnings of a frame still waiting for its proof
+/// verification. It states what each field is and infers no cause: the
+/// slots are shared by the node's processes and a busy refusal has several
+/// sources. `memory_starved_secs` counts only proof checks waiting in the
+/// memory admission, which only macOS nodes ask: it never counts a wait for
+/// a proof worker slot (mainnet, 2026-11-22: 1086 of 1086 lines said 0
+/// while frames waited behind the proof queue). Both warnings share it, so
+/// it claims nothing that holds on one path only: a worker replaying
+/// archive frames is behind and may abstain
+/// ([`AppConsensusEngine::publish_lagging_voter`]), and only the replay
+/// warning logs from a recovery's retry or replay, so only it says that
+/// recovery defers ([`REPLAY_PROOF_WAIT_RECOVERY`]).
+const PROOF_WAIT_ACTION: &str = "the frame is kept and materializes once its proofs verify; \
+    proof_slots is this process's count of the node's shared proof worker slots (a process takes \
+    at most its own count; the node's processes together run at most the largest), \
+    proof_slots_source says what set it and \
+    proof_slots_automatic is the count this process would size itself to with maxConcurrent \
+    unset; queue_verifying, queue_threads (proof_slots less one, at least one), queued and \
+    queued_ahead (ahead of this frame's) are this process's proof queue; check, when present, \
+    names a setting to change; memory_starved_secs is this process's time of proof checks \
+    starved in its memory admission across frames, never a wait for a proof worker slot";
+
+/// What the archive replay frame's proof-wait warning adds to
+/// [`PROOF_WAIT_ACTION`]: the shard recovery asks the engine to retry the
+/// frame first (`retry_proof_wait`) and, finding it still waiting, defers
+/// without fetching it again; the warning logs from that retry or from the
+/// replay that kept the frame.
+const REPLAY_PROOF_WAIT_RECOVERY: &str =
+    "an archive recovery finding this frame still waiting defers without fetching it again";
+
 /// Whether an archive replay frame waiting `waited` for this node's proof
 /// verification warns: from [`PROOF_WAIT_REPEAT`], its second line on.
 fn proof_wait_overruns(waited: Duration) -> bool {
@@ -22364,6 +22474,395 @@ mod tests {
             proof_wait_overruns(PROOF_WAIT_REPEAT),
             "proof_wait_warned_late: a wait of {PROOF_WAIT_REPEAT:?} did not warn"
         );
+    }
+
+    /// A replay frame still waiting for its proof verification names this
+    /// process's proof queue and slot count (where it came from, the queue
+    /// ahead of the frame), and no longer reads a positive
+    /// memory_starved_secs as a wait for a slot: it counts no proof worker
+    /// slot. A node with two configured slots on 128 CPUs warned 846 times
+    /// naming only memory, which was plentiful (mainnet, 2026-11-22). A
+    /// frame the proof worker refused busy names every source of the
+    /// refusal and claims none; neither line infers a cause, and with no
+    /// setting to change (no worker here) it has no check.
+    #[test]
+    fn a_replay_frames_proof_wait_warning_names_the_proof_queue() {
+        let warnings = capture_warnings();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let since = std::time::Instant::now();
+        let warn_at = |engine: &mut AppConsensusEngine, busy| {
+            warnings.lock().unwrap().clear();
+            engine.proof_wait = Some(ProofWait {
+                frame: 1,
+                since,
+                busy,
+                logged: None,
+            });
+            engine.log_proof_wait(since + PROOF_WAIT_REPEAT + Duration::from_secs(60));
+            let text = String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+            text.lines()
+                .find(|line| {
+                    line.contains("archive replay frame still waits for its proof verification")
+                })
+                .unwrap_or_else(|| panic!("proof_wait_not_warned: {text}"))
+                .to_string()
+        };
+        let line = warn_at(&mut engine, false);
+        for field in [
+            "queued_ahead=",
+            "queue_verifying=",
+            "queue_threads=",
+            "queued=",
+            "proof_slots=",
+            "proof_slots_source=",
+            "proof_slots_automatic=",
+            "memory_starved_secs=",
+        ] {
+            assert!(
+                line.contains(field),
+                "proof_wait_queue_unnamed: no {field} in {line}"
+            );
+        }
+        assert!(
+            !line.contains("memory or a slot"),
+            "proof_wait_blames_a_memory_slot: {line}"
+        );
+        assert!(
+            !line.contains("check=") && !line.contains("refusal="),
+            "check_without_a_setting: {line}"
+        );
+        let busy = warn_at(&mut engine, true);
+        assert!(
+            busy.contains(
+                "refusal=\"the proof worker refused admission: no slot came free in the wait, \
+                 the slot waiter list was full, or memory admission refused\""
+            ),
+            "busy_refusal_misnamed: {busy}"
+        );
+        for line in [&line, &busy] {
+            for claim in [
+                "slot is taken",
+                "no free slot",
+                "is the wait",
+                "none queued ahead",
+            ] {
+                assert!(!line.contains(claim), "proof_wait_infers_a_cause: {line}");
+            }
+            assert_action_names_its_fields(line);
+        }
+    }
+
+    /// Every field-like word (snake_case) in `line`'s action is a field of
+    /// `line`: an action shared by several warnings names only the fields
+    /// each carries.
+    fn assert_action_names_its_fields(line: &str) {
+        for word in action_of(line)
+            .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            .filter(|word| word.contains('_'))
+        {
+            assert!(
+                line.contains(&format!(" {word}=")),
+                "action_names_absent_fields: {word} in {line}"
+            );
+        }
+    }
+
+    /// The `action` field of a captured warning `line`.
+    fn action_of(line: &str) -> &str {
+        line.split("action=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no action in {line}"))
+    }
+
+    /// Neither proof-wait warning's action claims what does not hold on its
+    /// path: a worker replaying archive frames is behind and may abstain
+    /// (an 11-seat committee stood one vote short for 12 hours), so neither
+    /// says the worker keeps voting; only the replay warning logs from a
+    /// recovery's retry or replay, so only it says that recovery defers.
+    #[test]
+    fn neither_proof_wait_action_claims_what_its_path_does_not_hold() {
+        let warnings = capture_warnings();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let since = std::time::Instant::now();
+        engine.proof_wait = Some(ProofWait {
+            frame: 1,
+            since,
+            busy: false,
+            logged: None,
+        });
+        engine.log_proof_wait(since + PROOF_WAIT_REPEAT + Duration::from_secs(60));
+        engine.warn_proof_deferral_overrun(
+            1,
+            2,
+            PROOF_DEFERRAL_OVERRUN + Duration::from_secs(60),
+            90.0,
+            3,
+        );
+        let text = String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+        for (message, claims, recovery) in [
+            (
+                "archive replay frame still waits for its proof verification",
+                &["voting", "votes"][..],
+                true,
+            ),
+            (
+                "app-shard frame materialization still waits for its proof verification on a \
+                 background thread",
+                &["voting", "votes", "recovery"][..],
+                false,
+            ),
+        ] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("proof_wait_not_warned: {message}: {text}"));
+            let action = action_of(line);
+            for claim in claims {
+                assert!(
+                    !action.contains(claim),
+                    "action_claims_off_its_path: {claim:?} in {line}"
+                );
+            }
+            assert_eq!(
+                action.contains(REPLAY_PROOF_WAIT_RECOVERY),
+                recovery,
+                "replay_recovery_misplaced: {line}"
+            );
+        }
+    }
+
+    /// A worker behind its shard whose next frame waits for its proof
+    /// verification says so in its warning, with this process's proof
+    /// queue and slot count, and names every source of a busy refusal; a
+    /// wait for no frame, or for another frame than the next, is `none`.
+    /// One node's 682 behind warnings named only its recovery while its
+    /// frames waited behind its proof queue (mainnet, 2026-11-22).
+    #[test]
+    fn a_worker_behind_on_a_proof_wait_names_the_proof_queue() {
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let since = std::time::Instant::now();
+        let now = since + Duration::from_secs(120);
+        assert_eq!(engine.behind_on_proof_wait(0, now), "none");
+        engine.proof_wait = Some(ProofWait {
+            frame: 1,
+            since,
+            busy: false,
+            logged: None,
+        });
+        let named = engine.behind_on_proof_wait(0, now);
+        assert!(
+            named.starts_with("frame 1 waited 120s") && named.contains("proof_slots"),
+            "behind_proof_wait_unnamed: {named}"
+        );
+        assert!(!named.contains("refused"), "refusal_without_busy: {named}");
+        engine.proof_wait = Some(ProofWait {
+            frame: 1,
+            since,
+            busy: true,
+            logged: None,
+        });
+        let busy = engine.behind_on_proof_wait(0, now);
+        assert!(
+            busy.ends_with(crate::admission_verify::PROOF_WORKER_REFUSAL),
+            "busy_refusal_misnamed: {busy}"
+        );
+        assert_eq!(
+            engine.behind_on_proof_wait(5, now),
+            "none",
+            "a wait for a frame other than the next"
+        );
+    }
+
+    /// A frame whose materialization still waits for its proof
+    /// verification on a background thread, at each
+    /// [`PROOF_DEFERRAL_OVERRUN`] it passes, warns with this process's
+    /// proof queue and slot count (where it came from, the queue ahead of
+    /// the frame), names only fields it carries in its action, and no
+    /// longer reads a positive memory_starved_secs as a wait for a slot.
+    #[test]
+    fn a_frames_proof_deferral_overrun_names_the_proof_queue() {
+        let warnings = capture_warnings();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (engine, _handle, _events) = test_engine(registry);
+        let start = std::time::Instant::now();
+        let mut deferrals = ProofDeferrals::default();
+        let mut decide = |after: u64| {
+            deferrals.decide(
+                &engine.filter,
+                1,
+                2,
+                true,
+                false,
+                start + Duration::from_secs(after),
+            )
+        };
+        assert_eq!(
+            decide(0),
+            Deferral::Wait {
+                first: true,
+                overrun: None
+            }
+        );
+        assert_eq!(
+            decide(1000),
+            Deferral::Wait {
+                first: false,
+                overrun: None
+            }
+        );
+        let overrun = PROOF_DEFERRAL_OVERRUN.as_secs() + 60;
+        let Deferral::Wait {
+            first: false,
+            overrun: Some(waited),
+        } = decide(overrun)
+        else {
+            panic!("a wait past {PROOF_DEFERRAL_OVERRUN:?} overran");
+        };
+        engine.warn_proof_deferral_overrun(1, 2, waited, 90.0, 3);
+        let text = String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| {
+                line.contains(
+                    "app-shard frame materialization still waits for its proof verification \
+                     on a background thread",
+                )
+            })
+            .unwrap_or_else(|| panic!("consensus_wait_not_warned: {text}"));
+        for field in [
+            format!("waited_secs={overrun}"),
+            "queued_ahead=3".to_string(),
+            "queue_verifying=".to_string(),
+            "queue_threads=".to_string(),
+            "queued=".to_string(),
+            "proof_slots=".to_string(),
+            "proof_slots_source=".to_string(),
+            "proof_slots_automatic=".to_string(),
+            "memory_starved_secs=".to_string(),
+        ] {
+            assert!(
+                line.contains(&field),
+                "consensus_wait_queue_unnamed: no {field} in {line}"
+            );
+        }
+        assert!(
+            !line.contains("memory or a slot"),
+            "consensus_wait_blames_a_memory_slot: {line}"
+        );
+        assert_action_names_its_fields(line);
+    }
+
+    /// With `proofWorker.maxConcurrent` 2 below the 16 this process would
+    /// size itself to with `maxConcurrent` unset, both proof-wait warnings
+    /// (the archive replay frame's and the consensus deferral overrun's)
+    /// carry the check naming that setting. It sets this process's slot
+    /// count, which nextest keeps to this test's own process.
+    #[test]
+    fn both_proof_wait_warnings_check_a_configured_slot_count_below_the_processs() {
+        crate::admission_verify::use_worker_slots(crate::admission_verify::WorkerSlots {
+            slots: 2,
+            configured: true,
+            automatic: Some(16),
+        });
+        let warnings = capture_warnings();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let since = std::time::Instant::now();
+        engine.proof_wait = Some(ProofWait {
+            frame: 1,
+            since,
+            busy: false,
+            logged: None,
+        });
+        engine.log_proof_wait(since + PROOF_WAIT_REPEAT + Duration::from_secs(60));
+        engine.warn_proof_deferral_overrun(
+            1,
+            2,
+            PROOF_DEFERRAL_OVERRUN + Duration::from_secs(60),
+            90.0,
+            3,
+        );
+        let text = String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+        let check = "check=proofWorker.maxConcurrent=2 is below the 16 this process would \
+                     size itself to with maxConcurrent unset; this process uses up to 2 of the \
+                     node's shared slots;";
+        for message in [
+            "archive replay frame still waits for its proof verification",
+            "app-shard frame materialization still waits for its proof verification on a \
+             background thread",
+        ] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("proof_wait_not_warned: {message}: {text}"));
+            assert!(
+                line.contains(check),
+                "proof_wait_check_unnamed: no {check} in {line}"
+            );
+            assert!(
+                line.contains("proof_slots=2 ")
+                    && line.contains("proof_slots_source=\"proofWorker.maxConcurrent\"")
+                    && line.contains("proof_slots_automatic=16 "),
+                "proof_wait_slots_unnamed: {line}"
+            );
+        }
+    }
+
+    /// A worker behind its shard warns with its recovery and archive
+    /// guidance whether or not its next frame waits for its proof
+    /// verification, and its action names only fields the line carries
+    /// (it has no queue fields of its own: `proof_wait` holds them).
+    #[test]
+    fn a_behind_shard_warning_keeps_its_recovery_and_archive_guidance() {
+        let warnings = capture_warnings();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let start = std::time::Instant::now();
+        engine.proof_wait = Some(ProofWait {
+            frame: 1,
+            since: start,
+            busy: true,
+            logged: None,
+        });
+        engine.log_behind(true, 1, 5, start);
+        engine.log_behind(
+            true,
+            1,
+            5,
+            start + BEHIND_WARN_AFTER + Duration::from_secs(60),
+        );
+        let text = String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("this worker is still behind its shard"))
+            .unwrap_or_else(|| panic!("behind_not_warned: {text}"));
+        assert!(
+            line.contains("proof_wait=frame 1 waited"),
+            "behind_proof_wait_unnamed: {line}"
+        );
+        for guidance in [
+            "run `qclient node diagnostics health --self`",
+            "RECOVERY failures",
+            "'archive connection still failing'",
+            "report this line with its shard to the maintainer",
+        ] {
+            assert!(
+                line.contains(guidance),
+                "behind_guidance_dropped: no {guidance:?} in {line}"
+            );
+        }
+        for claim in [
+            "slot is taken",
+            "not for its shard",
+            "proof queue it waits on",
+        ] {
+            assert!(!line.contains(claim), "behind_infers_a_cause: {line}");
+        }
+        assert_action_names_its_fields(line);
     }
 
     /// A successor whose start waits on its predecessor's state takes the
