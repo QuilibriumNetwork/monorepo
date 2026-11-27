@@ -227,6 +227,12 @@ impl CollectedMessage {
         self.seal && !self.proof && self.capacity.is_none()
     }
 
+    /// A held storage epoch proof whose window ended by `frame`, the next
+    /// GLOBAL frame to finalize ([`window_ended`]).
+    fn window_ended(&self, frame: u64) -> bool {
+        self.held_seal() && self.window_end.is_some_and(|end| window_ended(end, frame))
+    }
+
     /// GLOBAL refuses every request it carries: each is a storage epoch
     /// proof carrying a seat part a frame applied (`applied`), refused
     /// whole. GLOBAL runs a bundle's requests one by one, so a bundle with
@@ -347,6 +353,17 @@ struct StorageKinds {
     seat_parts: Vec<Vec<([u8; 32], u64)>>,
     /// They prove more seats than that; the rest are not in `seat_keys`.
     too_many_seats: bool,
+}
+
+/// A window ending at `end` has ended by `frame`, the next GLOBAL frame to
+/// finalize: no frame from it on can carry a proof due then, as GLOBAL
+/// refuses a proof whole from the frame its earliest seat's window ends at
+/// ([`storage_window_end`]). False while `frame` is unknown (0). Every check
+/// of a held proof's or a seat's window against the next frame goes
+/// through it. The memory of applied seat parts forgets a part by the last
+/// frame finalized instead ([`AppliedParts::prune`]), so a frame later.
+fn window_ended(end: u64, frame: u64) -> bool {
+    frame > 0 && end <= frame
 }
 
 /// The GLOBAL frame from which execution refuses `proof`: the end of its
@@ -790,6 +807,94 @@ fn sender_label(sender: Sender<'_>) -> String {
     }
 }
 
+/// Least time between two lines about storage epoch proofs refused past
+/// their window ([`LateSeals`]).
+const LATE_SEAL_LINE_EVERY: Duration = Duration::from_secs(60);
+
+/// A storage epoch proof refused past its window, for the line.
+struct LateSeal {
+    /// The member its proofs name, if they all name one and the proof may
+    /// wait ([`CollectedMessage::may_wait`]): this node's own proof or
+    /// that member's.
+    member: Option<[u8; 32]>,
+    /// Who delivered it ([`sender_label`]).
+    sender: String,
+    /// The end of its window ([`CollectedMessage::window_end`]).
+    window_end: u64,
+    /// The next GLOBAL frame to finalize as it arrived.
+    frame: u64,
+}
+
+/// Storage epoch proofs refused past their window ([`Refusal::WindowEnded`])
+/// since the last line, and when that line was logged.
+#[derive(Default)]
+struct LateSeals {
+    refused: u64,
+    /// Of `refused`, those from this node or active provers.
+    provers: u64,
+    latest: Option<LateSeal>,
+    logged: Option<Instant>,
+}
+
+impl LateSeals {
+    /// Count one refusal at `now`, `prover` if from this node or an active
+    /// prover.
+    fn note(&mut self, now: Instant, prover: bool, late: LateSeal) {
+        self.refused += 1;
+        self.provers += u64::from(prover);
+        self.latest = Some(late);
+        self.report(now);
+    }
+
+    /// The line for the proofs refused since the last one, if one is due:
+    /// the first at once, then at most one per [`LATE_SEAL_LINE_EVERY`]. The
+    /// node's timers call this ([`MessageCollector::report_counts_left`]),
+    /// so the last count is logged after they stop, finalizations or not.
+    /// Returns the counts logged, as (refused, provers).
+    fn report(&mut self, now: Instant) -> Option<(u64, u64)> {
+        if self.refused == 0
+            || self
+                .logged
+                .is_some_and(|at| now.saturating_duration_since(at) < LATE_SEAL_LINE_EVERY)
+        {
+            return None;
+        }
+        let since_secs = self
+            .logged
+            .replace(now)
+            .map(|at| now.saturating_duration_since(at).as_secs());
+        let latest = self.latest.take();
+        let (refused, provers) = (
+            std::mem::take(&mut self.refused),
+            std::mem::take(&mut self.provers),
+        );
+        let latest = latest.as_ref();
+        tracing::info!(
+            refused,
+            provers,
+            since_secs,
+            latest_member = latest
+                .and_then(|l| l.member)
+                .map(hex::encode)
+                .unwrap_or_default(),
+            latest_sender = latest.map(|l| l.sender.as_str()).unwrap_or_default(),
+            latest_window_end = latest.map_or(0, |l| l.window_end),
+            latest_frame = latest.map_or(0, |l| l.frame),
+            scope = "the sender",
+            action = "none on this node: GLOBAL refuses these proofs, so their senders are told \
+                      so and not to send them again; a member named here sent its own proofs \
+                      too late; with no member named, latest_sender delivered them late",
+            "message collector: refused storage epoch proofs that arrived after their window \
+             ended; refused counts those since the previous line (since_secs, empty at the \
+             first), provers those of them from active provers, at most one line a minute; the \
+             latest came from latest_sender, latest_member when that member or this node \
+             sent its own proof (empty otherwise), and its window ended at frame \
+             latest_window_end, by latest_frame, the next frame to finalize"
+        );
+        Some((refused, provers))
+    }
+}
+
 /// Who delivered a message, for the share of a rank its capacity message is
 /// charged to ([`capacity_share`]).
 #[derive(Clone, Copy)]
@@ -1111,7 +1216,7 @@ fn evict_later_seals(
     if frame == 0 {
         return evicted;
     }
-    let Some(end) = message.window_end.filter(|end| *end > frame) else {
+    let Some(end) = message.window_end.filter(|&end| !window_ended(end, frame)) else {
         return evicted;
     };
     let (share, cap) = if message.prover {
@@ -1188,7 +1293,7 @@ fn evict_later_seals(
                 DropReason::Evicted
             };
             evicted.record(why, rank, &message);
-            let event = if message.window_end.is_some_and(|end| end <= frame) {
+            let event = if message.window_ended(frame) {
                 window_seats::SeatEvent::Closed
             } else {
                 window_seats::SeatEvent::Evicted
@@ -1402,6 +1507,14 @@ impl SealEnds {
         }
     }
 
+    /// The keys of `prover`'s share whose window ended by `frame`
+    /// ([`window_ended`]), due soonest first.
+    fn ended(&self, prover: bool, frame: u64) -> impl DoubleEndedIterator<Item = &(u64, u64)> + '_ {
+        self.of(prover)
+            .range(..=(frame, u64::MAX))
+            .filter(move |&&(end, _)| window_ended(end, frame))
+    }
+
     /// Index `message`, held at `arrival`, if it is a held storage epoch
     /// proof.
     fn add(&mut self, arrival: u64, message: &CollectedMessage) {
@@ -1437,7 +1550,7 @@ impl SealEnds {
         end: u64,
     ) -> impl Iterator<Item = (bool, u64, u64)> + '_ {
         let ends = self.of(prover);
-        let closed = ends.range(..=(frame, u64::MAX)).rev();
+        let closed = self.ended(prover, frame).rev();
         let later = ends
             .range((
                 std::ops::Bound::Excluded((end, u64::MAX)),
@@ -1900,7 +2013,7 @@ impl RankBuffer {
     ) {
         let keys: Vec<[u8; 32]> = [true, false]
             .into_iter()
-            .flat_map(|prover| self.shares.seal_ends.of(prover).range(..=(frame, u64::MAX)))
+            .flat_map(|prover| self.shares.seal_ends.ended(prover, frame))
             .filter_map(|(_, arrival)| self.messages.get(arrival).map(|m| m.hash))
             .collect();
         for key in keys {
@@ -2050,6 +2163,9 @@ pub enum Refusal {
     /// A storage epoch proof carrying a seal or settlement a finalized GLOBAL
     /// frame applied: GLOBAL refuses it whole ([`MessageCollector::mark_applied`]).
     AppliedSeatPart,
+    /// A storage epoch proof whose window ended by the next GLOBAL frame to
+    /// finalize: GLOBAL refuses it whole ([`CollectedMessage::window_ended`]).
+    WindowEnded,
 }
 
 impl Refusal {
@@ -2081,6 +2197,7 @@ impl Refusal {
             Self::ShieldClaimed => "another shield of this coin signed by the same key is pending here or awaits its GLOBAL decision",
             Self::UnsendableSeal => "storage epoch proof larger than a GLOBAL proposal's seal share, or proving more seats than one proof covers",
             Self::AppliedSeatPart => "storage epoch proof seals or settles a seat part a finalized GLOBAL frame already applied, so GLOBAL refuses it whole",
+            Self::WindowEnded => "storage epoch proof whose window ended by the next GLOBAL frame to finalize, so GLOBAL refuses it whole",
         }
     }
 
@@ -2695,6 +2812,8 @@ pub struct MessageCollector {
     union: cert_union::UnionState,
     /// The coins pending and recently carried shields claim.
     shield_claims: std::sync::Mutex<ShieldClaims>,
+    /// Storage epoch proofs refused past their window, for their line.
+    late_seals: std::sync::Mutex<LateSeals>,
     /// Whether a held message's proofs failed to verify here, for the
     /// shield claims ([`Self::set_rejected_proofs`]).
     rejected_proofs: RwLock<Option<RejectedProofs>>,
@@ -3509,6 +3628,7 @@ impl MessageCollector {
             last_pool: std::sync::Mutex::new(None),
             union: Default::default(),
             shield_claims: std::sync::Mutex::new(ShieldClaims::default()),
+            late_seals: Default::default(),
             rejected_proofs: RwLock::new(None),
             sender_member: std::sync::OnceLock::new(),
         }
@@ -3942,6 +4062,15 @@ impl MessageCollector {
         if self.finalized.read().unwrap().contains(&message.hash) {
             return SubmitOutcome::Duplicate;
         }
+        // A proof past its window is refused for good: held, it took room
+        // until the next finalization dropped it as closed, after its
+        // sender was told it was accepted (2026-11-25). No fault of the
+        // sender's: a relay may deliver an honest proof late. Judged again
+        // under the buffers' lock.
+        let frame = self.next_seal_frame();
+        if message.window_ended(frame) {
+            return self.refuse_late_seal(&message, sender, frame);
+        }
 
         let carried = carried_headers(&message.data);
         // A shard frame header decodes with bytes appended or a field in a
@@ -4216,6 +4345,21 @@ impl MessageCollector {
         if !message.seat_parts.is_empty() && self.applied.lock().unwrap().refuses(&message) {
             return SubmitOutcome::Filtered(Refusal::AppliedSeatPart);
         }
+        // The next GLOBAL frame to finalize, for held storage epoch proofs'
+        // windows and the room their share keeps for a refused one. Read
+        // under the buffers' lock, which a finalization takes to drop the
+        // proofs past their window after moving it
+        // ([`Self::prune_after_finalization`]): a proof whose window a frame
+        // finalized since the check above ended is refused here, never held
+        // for that finalization to drop as closed.
+        let seal_frame = if message.held_seal() {
+            self.next_seal_frame()
+        } else {
+            0
+        };
+        if message.window_ended(seal_frame) {
+            return self.refuse_late_seal(&message, sender, seal_frame);
+        }
         // Another copy of a storage epoch proof held since the check above,
         // at any rank: a prover's copy promotes another sender's, as there.
         if message.held_seal()
@@ -4280,13 +4424,6 @@ impl MessageCollector {
                 .or_else(|| from_sender.over(&message))
         } else {
             None
-        };
-        // The next GLOBAL frame to finalize, for held storage epoch proofs'
-        // windows, and the room their share keeps for a refused one.
-        let seal_frame = if shared && held_seal {
-            self.next_seal_frame()
-        } else {
-            0
         };
         let keep = if shared && held_seal {
             let finalized = self.finalized.read().unwrap();
@@ -4655,9 +4792,7 @@ impl MessageCollector {
                     capacity.push((rank, arrival, m));
                 } else if m.held_seal() {
                     // Past its window, execution refuses it.
-                    let closed = frame
-                        .zip(m.window_end)
-                        .is_some_and(|(frame, end)| end <= frame);
+                    let closed = frame.is_some_and(|frame| m.window_ended(frame));
                     if !closed {
                         seals.push((rank, arrival, m));
                     }
@@ -5061,6 +5196,29 @@ impl MessageCollector {
         if next > 0 && self.class_shares() {
             self.window_seats.lock().unwrap().begin(next);
         }
+    }
+
+    /// Refuse `message`, a storage epoch proof whose window ended by
+    /// `frame`, for good, counting it for its line ([`LateSeals`]). The
+    /// line names the member a proof names only for a proof that may wait
+    /// ([`CollectedMessage::may_wait`]), else its sender alone.
+    fn refuse_late_seal(
+        &self,
+        message: &CollectedMessage,
+        sender: Sender<'_>,
+        frame: u64,
+    ) -> SubmitOutcome {
+        let late = LateSeal {
+            member: message.member.filter(|_| message.may_wait()),
+            sender: sender_label(sender),
+            window_end: message.window_end.unwrap_or_default(),
+            frame,
+        };
+        self.late_seals
+            .lock()
+            .unwrap()
+            .note(Instant::now(), message.prover, late);
+        SubmitOutcome::Filtered(Refusal::WindowEnded)
     }
 
     /// The next GLOBAL frame to finalize, the first that can still carry a
@@ -5469,11 +5627,22 @@ impl MessageCollector {
         }
     }
 
-    /// Log the shields refused since the last line, if a line is due: the
-    /// engine's cleanup timer calls this, so the last count is logged when
-    /// they stop.
-    pub fn report_refused_shields(&self) {
-        self.shield_claims.lock().unwrap().report(Instant::now());
+    /// Log what the bounded refusal lines still count, if a line is due:
+    /// shields refused ([`ShieldClaims`]) and storage epoch proofs refused
+    /// past their window ([`LateSeals`]). Nothing else would once refusals
+    /// stop: a shard engine's cleanup timer calls this for its collector,
+    /// and the master's counts-left timer, at its own clock
+    /// ([`Self::report_counts_left_at`]), for the GLOBAL one, so a GLOBAL
+    /// stall, with no finalization, still logs the last count.
+    pub fn report_counts_left(&self) {
+        self.report_counts_left_at(Instant::now());
+    }
+
+    /// [`Self::report_counts_left`] at `now`. Returns the late proofs'
+    /// counts logged, as [`LateSeals::report`] does.
+    pub fn report_counts_left_at(&self, now: Instant) -> Option<(u64, u64)> {
+        self.shield_claims.lock().unwrap().report(now);
+        self.late_seals.lock().unwrap().report(now)
     }
 
     /// Consume `raw_msgs`, bundles a finalized frame carried that its

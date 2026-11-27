@@ -1124,3 +1124,100 @@ fn an_unresolved_store_device_is_absent() {
     assert_eq!(store_device(&missing), None);
     assert_eq!(disk_counters(None), None);
 }
+
+/// A cold read counts the blocks it reads; reading it again hits the cache.
+#[test]
+fn thread_reads_count_block_reads_and_cache_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = rocksdb::DB::open_default(dir.path()).unwrap();
+        for n in 0u32..1000 {
+            db.put(n.to_be_bytes(), [7u8; 100]).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let db = rocksdb::DB::open_default(dir.path()).unwrap();
+    let key = 500u32.to_be_bytes();
+    let (value, cold) = count_thread_reads(|| db.get(key).unwrap());
+    assert_eq!(value, Some(vec![7u8; 100]));
+    assert!(
+        cold.block_reads >= 1,
+        "cold read counted no block: {cold:?}"
+    );
+    assert!(!cold.block_read_time.is_zero(), "{cold:?}");
+    let (_, warm) = count_thread_reads(|| db.get(key).unwrap());
+    assert_eq!(warm.block_reads, 0, "{warm:?}");
+    assert!(warm.block_cache_hits >= 1, "{warm:?}");
+    let (_, unmeasured) = count_thread_reads(|| ());
+    assert_eq!(unmeasured, ThreadReads::default());
+}
+
+/// Counting a thread's reads leaves the thread at the perf level it found:
+/// RocksDB's default, which counts blocks, or an enclosing one.
+#[test]
+fn thread_reads_restore_the_prior_perf_level() {
+    use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel};
+    let dir = tempfile::tempdir().unwrap();
+    let db = rocksdb::DB::open_default(dir.path()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.flush().unwrap();
+    let blocks = || {
+        let mut context = PerfContext::default();
+        context.reset();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+        context.metric(PerfMetric::BlockCacheHitCount) + context.metric(PerfMetric::BlockReadCount)
+    };
+    // A fresh thread runs at RocksDB's default level.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                assert!(blocks() >= 1, "the default level counts blocks");
+                count_thread_reads(|| ());
+                assert!(blocks() >= 1, "the default level is restored");
+                with_perf_level(PerfStatsLevel::Disable, || {
+                    assert_eq!(blocks(), 0);
+                    count_thread_reads(|| ());
+                    assert_eq!(blocks(), 0, "an enclosing level is restored");
+                });
+                assert!(blocks() >= 1);
+            })
+            .join()
+            .unwrap()
+    });
+}
+
+/// A panic inside `with_perf_level` restores the thread's level, both
+/// RocksDB's and the recorded one a later restore returns to.
+#[test]
+fn a_panic_inside_a_perf_level_restores_the_prior_one() {
+    use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let dir = tempfile::tempdir().unwrap();
+    let db = rocksdb::DB::open_default(dir.path()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.flush().unwrap();
+    let blocks = || {
+        let mut context = PerfContext::default();
+        context.reset();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+        context.metric(PerfMetric::BlockCacheHitCount) + context.metric(PerfMetric::BlockReadCount)
+    };
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                assert!(blocks() >= 1, "the default level counts blocks");
+                let caught = catch_unwind(AssertUnwindSafe(|| {
+                    with_perf_level(PerfStatsLevel::Disable, || {
+                        assert_eq!(blocks(), 0);
+                        panic!("planted panic at a perf level");
+                    })
+                }));
+                assert!(caught.is_err());
+                assert!(blocks() >= 1, "the default level is restored on unwind");
+                count_thread_reads(|| ());
+                assert!(blocks() >= 1, "a later restore returns to the default");
+            })
+            .join()
+            .unwrap()
+    });
+}

@@ -624,7 +624,7 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 11] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 12] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
@@ -636,6 +636,7 @@ const SUBMIT_REFUSAL_NAMES: [&str; 11] = [
     "unsendable_seal",
     "applied_seat_part",
     "share_full",
+    "window_ended",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -657,6 +658,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         // a failing duty.
         Refusal::ShareFull(share) if share.expected() => 10,
         Refusal::ShareFull(_) => 2,
+        Refusal::WindowEnded => 11,
     }
 }
 
@@ -7685,7 +7687,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
                 capacity_full: 0,
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
@@ -7706,7 +7708,7 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 capacity_full: 0,
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),

@@ -1839,6 +1839,16 @@ pub(crate) struct RegistryUpdateTiming {
     pub decode: std::cell::Cell<std::time::Duration>,
     pub copy: std::cell::Cell<std::time::Duration>,
     pub rebuild: std::cell::Cell<std::time::Duration>,
+    /// Rows the branch's version batches answered without a store read, and
+    /// rows they looked up in the store.
+    pub rows_unread: u64,
+    pub rows_sought: u64,
+    /// Bytes the branch's newest-key record held after the update, and the
+    /// reads it refused to keep at its cap since its view was captured.
+    pub memo_bytes: usize,
+    pub memo_refused: u64,
+    /// The update's reads on the publishing thread.
+    pub reads: quil_forest::store_io::ThreadReads,
 }
 
 fn measure<T>(time: Option<&std::cell::Cell<std::time::Duration>>, work: impl FnOnce() -> T) -> T {

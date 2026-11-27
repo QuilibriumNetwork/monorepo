@@ -6149,4 +6149,173 @@ mod tests {
         );
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
+
+    /// Of the GLOBAL rows a frame of shard headers writes, rewards, activity
+    /// and sealed seats, how many its execution read first: a publication's
+    /// version batch answers those without reading the store. The frame runs
+    /// on an execution overlay over a store holding the previous frame.
+    #[test]
+    fn a_reward_frame_reads_every_row_it_publishes() {
+        use quil_types::store::HypergraphStore;
+        const SHARDS: u8 = 12;
+        const PER_SHARD: u8 = 16;
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let va = vertex_adds_discriminator().unwrap();
+        let shards: Vec<(Vec<u8>, Vec<ProverInfo>)> = (0..SHARDS)
+            .map(|s| {
+                let filter = vec![0x80 + s; 32];
+                let provers = (0..PER_SHARD)
+                    .map(|p| fake_prover(1 + s * PER_SHARD + p, 1, 0, &filter))
+                    .collect();
+                (filter, provers)
+            })
+            .collect();
+        let reward: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8000)));
+        let frame = |state: &HypergraphState, number: u64| {
+            for (filter, provers) in &shards {
+                let mut header = fake_header(filter.clone(), number);
+                header.global_frame_number = boundary;
+                header.prover = provers[0].address.clone();
+                let participants: Vec<usize> = (0..provers.len()).collect();
+                materialize_prover_shard_update_with_fees(
+                    &header,
+                    boundary,
+                    state,
+                    &noop_registry(),
+                    &noop_frame_prover(),
+                    &reward,
+                    4096,
+                    provers.clone(),
+                    &participants,
+                    ShardMetadata {
+                        state_size: 1024,
+                        shard_count: u64::from(SHARDS),
+                    },
+                    0,
+                    None,
+                    Some(&mut StorageFrame {
+                        epoch: 1393,
+                        ..Default::default()
+                    }),
+                    HeaderIssuance::claimed(&header),
+                )
+                .unwrap();
+            }
+        };
+        // The rows the previous frame left, newest value per row.
+        let rows = |state: &HypergraphState| {
+            let mut rows = std::collections::BTreeMap::new();
+            for (domain, address, discriminator, value) in state.state_changes() {
+                assert_eq!(domain, GLOBAL_INTRINSIC_ADDRESS.to_vec());
+                if discriminator == va {
+                    rows.insert(<[u8; 32]>::try_from(address).unwrap(), value);
+                }
+            }
+            rows
+        };
+        let previous = make_state();
+        for (filter, provers) in &shards {
+            for prover in provers {
+                seed_alloc_blob(&previous, prover, filter);
+                give_seat(&previous, prover, filter, 1393, true);
+            }
+        }
+        frame(&previous, 10);
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap().inner();
+        let shard = quil_store::encoding::prover_registry_shard();
+        let stage = |store: &dyn HypergraphStore,
+                     rows: &std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+                     version| {
+            let txn = store.new_transaction(false).unwrap();
+            for (address, value) in rows {
+                let vertex = [GLOBAL_INTRINSIC_ADDRESS.as_slice(), address].concat();
+                store
+                    .save_vertex_underlying_versioned(
+                        txn.as_ref(),
+                        "vertex",
+                        "adds",
+                        &shard,
+                        &vertex,
+                        value,
+                        version,
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        stage(
+            &quil_store::RocksHypergraphStore::new(db.clone()),
+            &rows(&previous),
+            10,
+        );
+        let overlay = Arc::new(
+            quil_forest::ExecutionOverlay::capture(
+                db,
+                quil_forest::OverlayLimits {
+                    max_delta_bytes: 64 << 20,
+                    max_delta_entries: 1_000_000,
+                    max_record_bytes: 2 << 20,
+                    max_read_bytes: 1 << 30,
+                    max_read_operations: 20_000_000,
+                    max_cursors: 128,
+                },
+            )
+            .unwrap(),
+        );
+        let store = Arc::new(quil_store::OverlayHypergraphStore::new(overlay));
+        let state = HypergraphState::new(Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(StubProver),
+        )));
+        frame(&state, 11);
+        let written = rows(&state);
+        stage(store.as_ref(), &written, 11);
+        let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+        let addresses: Vec<[u8; 32]> = written.keys().copied().collect();
+        let ((), quil_forest::BatchRows { unread, sought }) = quil_forest::count_batch_rows(|| {
+            for chunk in addresses.chunks(quil_types::store::VERTEX_READ_BATCH) {
+                let read = snapshot
+                    .vertex_batch(
+                        "adds",
+                        &shard,
+                        &GLOBAL_INTRINSIC_ADDRESS,
+                        chunk,
+                        quil_types::store::VertexBatchRead::Registry { max_bytes: 1 << 20 },
+                    )
+                    .unwrap();
+                let staged: Vec<_> = chunk.iter().map(|a| Some(written[a].clone())).collect();
+                assert_eq!(read, staged);
+            }
+        });
+        eprintln!(
+            "reward frame: {} shards x {} provers, {} rows published, {unread} without a \
+             store read, {sought} sought",
+            SHARDS,
+            PER_SHARD,
+            written.len()
+        );
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+        // Each prover's seat, which holds the frame's issuance, and its
+        // allocation's activity.
+        let (mut seats, mut allocations) = (0, 0);
+        for (filter, provers) in &shards {
+            for prover in provers {
+                let member = &prover.address;
+                let seat = super::super::storage_seat::seat_address(member, filter).unwrap();
+                seats += usize::from(written.contains_key(&seat));
+                let allocation = allocation_address(&prover.public_key, filter).unwrap();
+                allocations += usize::from(written.contains_key(&allocation));
+            }
+        }
+        let provers = usize::from(SHARDS) * usize::from(PER_SHARD);
+        assert_eq!((seats, allocations), (provers, provers));
+        assert_eq!(written.len(), 2 * provers);
+        assert_eq!(
+            (unread, sought),
+            (written.len() as u64, 0),
+            "publication sought rows execution had read"
+        );
+    }
 }

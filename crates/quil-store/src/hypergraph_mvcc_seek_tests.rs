@@ -5,7 +5,7 @@
 
 use super::*;
 use quil_forest::{ExecutionOverlay, OverlayLimits};
-use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel};
 
 /// Records the eviction deletes; enough to separate a walk over them from
 /// a bounded read by orders of magnitude.
@@ -269,15 +269,15 @@ impl Readers {
 /// as a range-deleted one is, counts in no skip counter of RocksDB's perf
 /// context; the blocks holding it do.
 fn visited_blocks<T>(read: impl FnOnce() -> T) -> (T, u64, String) {
-    set_perf_stats(PerfStatsLevel::EnableCount);
-    let mut context = PerfContext::default();
-    context.reset();
-    let out = read();
-    let blocks =
-        context.metric(PerfMetric::BlockCacheHitCount) + context.metric(PerfMetric::BlockReadCount);
-    let report = context.report(true);
-    set_perf_stats(PerfStatsLevel::Disable);
-    (out, blocks, report)
+    quil_forest::store_io::with_perf_level(PerfStatsLevel::EnableCount, || {
+        let mut context = PerfContext::default();
+        context.reset();
+        let out = read();
+        let blocks = context.metric(PerfMetric::BlockCacheHitCount)
+            + context.metric(PerfMetric::BlockReadCount);
+        let report = context.report(true);
+        (out, blocks, report)
+    })
 }
 
 /// Runs each read, checks its answer, and fails naming every read that
@@ -539,4 +539,133 @@ fn a_bounded_vertex_read_returns_the_newest_version_at_or_below() {
             assert_eq!(run(), expected, "{name}");
         }
     }
+}
+
+/// A publication's version batch answers each row its execution read
+/// without reading the store again, unless the read showed a stored
+/// version newer than the staged one, and returns what a batch on a branch
+/// that read nothing returns: for a delta-only vertex just above the
+/// evicted range, a vertex whose stored versions the delta deletes, point
+/// or range, a staged delete, a stored version newer than the staged one,
+/// one only a read at an older version saw, and rows execution never read.
+#[test]
+fn a_publication_batch_after_execution_reads_returns_what_a_cold_one_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(directory.path());
+    let shard = read_shard();
+    // Below every stored vertex of the read shard: the first address is its
+    // lowest key, just above the evicted range.
+    let domain = [0x01; 32];
+    let address = |n: u8| [n; 32];
+    let key = |n: u8, version: u64| v2(&shard, "removes", &[domain, address(n)].concat(), version);
+    let value = |n: u8, version: u64| format!("{n:02x}-{version}").into_bytes();
+    let (delta_only, staged_newer, base_newer, point_deleted) = (0x00, 0x10, 0x20, 0x30);
+    let (range_deleted, read_older, not_read, staged_delete, same_version) =
+        (0x40, 0x50, 0x60, 0x70, 0x80);
+    let mut stored = records();
+    for (n, version) in [
+        (staged_newer, 1),
+        (staged_newer, 2),
+        (base_newer, 1),
+        (base_newer, 5),
+        (point_deleted, 1),
+        (range_deleted, 1),
+        (range_deleted, 2),
+        (read_older, 1),
+        (read_older, 5),
+        (not_read, 1),
+        (staged_delete, 1),
+        (same_version, 3),
+    ] {
+        stored.push((key(n, version), value(n, version)));
+    }
+    let _pin = evict_under_pin(&db, &stored);
+    let writes = || {
+        vec![
+            Write::Put(key(delta_only, 2), b"staged".to_vec()),
+            Write::Put(key(staged_newer, 3), b"staged".to_vec()),
+            Write::Put(key(base_newer, 3), b"staged".to_vec()),
+            Write::Delete(key(point_deleted, 1)),
+            Write::Put(key(point_deleted, 2), b"staged".to_vec()),
+            Write::Range(key(range_deleted, 1), key(range_deleted, 3)),
+            Write::Put(key(range_deleted, 4), b"staged".to_vec()),
+            Write::Put(key(read_older, 4), b"staged".to_vec()),
+            Write::Put(key(not_read, 2), b"staged".to_vec()),
+            Write::Delete(key(staged_delete, 1)),
+            Write::Put(key(same_version, 3), b"staged".to_vec()),
+        ]
+    };
+    let published = [
+        (delta_only, Some(b"staged".to_vec())),
+        (staged_newer, Some(b"staged".to_vec())),
+        (base_newer, Some(value(base_newer, 5))),
+        (point_deleted, Some(b"staged".to_vec())),
+        (range_deleted, Some(b"staged".to_vec())),
+        (read_older, Some(value(read_older, 5))),
+        (not_read, Some(b"staged".to_vec())),
+        (staged_delete, None),
+        (same_version, Some(b"staged".to_vec())),
+    ];
+    let addresses: Vec<[u8; 32]> = published.iter().map(|(n, _)| address(*n)).collect();
+    let expected: Vec<Option<Vec<u8>>> = published.iter().map(|(_, v)| v.clone()).collect();
+    // Each branch publishes twice, to show what a batch's own seeks record.
+    let publish = |executed: bool| {
+        let store = OverlayHypergraphStore::new(Arc::new(
+            ExecutionOverlay::capture(db.clone(), limits()).unwrap(),
+        ));
+        if executed {
+            for (n, _) in &published {
+                let vertex = [domain, address(*n)].concat();
+                let row = if *n == read_older {
+                    store.load_vertex_underlying_at("vertex", "removes", &shard, &vertex, 3)
+                } else if *n == not_read {
+                    continue;
+                } else {
+                    HypergraphStore::load_vertex_underlying_raw(
+                        &store, "vertex", "removes", &shard, &vertex,
+                    )
+                };
+                row.unwrap();
+            }
+        }
+        write_delta(&store, &writes());
+        let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+        let batch = || {
+            let ((rows, blocks, report), counted) = quil_forest::count_batch_rows(|| {
+                visited_blocks(|| {
+                    snapshot
+                        .vertex_batch(
+                            "removes",
+                            &shard,
+                            &domain,
+                            &addresses,
+                            quil_types::store::VertexBatchRead::Registry { max_bytes: 1 << 20 },
+                        )
+                        .unwrap()
+                })
+            });
+            let bound = MAX_BLOCKS * addresses.len() as u64;
+            assert!(blocks < bound, "{blocks} blocks; {report}");
+            (rows, (counted.unread, counted.sought))
+        };
+        let (first, first_rows) = batch();
+        let (second, second_rows) = batch();
+        ([first, second], first_rows, second_rows)
+    };
+    let (cold, cold_first, cold_second) = publish(false);
+    let (warm, warm_first, warm_second) = publish(true);
+    for rows in cold.iter().chain(&warm) {
+        assert_eq!(rows, &expected, "published rows differ from a cold read");
+    }
+    // Seven rows reach the batch's lookup; the range-deleted and the
+    // staged-delete rows resolve without it.
+    assert_eq!(cold_first, (0, 7), "cold branch, first batch");
+    // Rows execution read with nothing stored above the staged version:
+    // the delta-only, staged-newer, point-deleted and same-version rows.
+    assert_eq!(warm_first, (4, 3), "executed branch, first batch");
+    // A batch's seek past a staged version learns only that nothing lies
+    // above it; the stored versions newer than the staged ones it found
+    // still need reading.
+    assert_eq!(cold_second, (0, 7), "cold branch, second batch");
+    assert_eq!(warm_second, (4, 3), "executed branch, second batch");
 }

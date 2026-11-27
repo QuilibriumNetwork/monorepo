@@ -72,9 +72,9 @@ pub use membership_proof::{
     VertexMembershipProof,
 };
 pub use overlay::{
-    seek_latest_in_range, ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits,
-    OverlayMutation, OverlayReadView, OverlayStats, PreparedOverlayCommit, VersionedValue,
-    DEFAULT_EXECUTION_VIEW_MAX_AGE,
+    count_batch_rows, seek_latest_in_range, BatchRows, ExecutionOverlay, ExecutionViewAdmission,
+    OverlayCursor, OverlayLimits, OverlayMutation, OverlayReadView, OverlayStats,
+    PreparedOverlayCommit, VersionedValue, DEFAULT_EXECUTION_VIEW_MAX_AGE,
 };
 pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
 

@@ -378,9 +378,27 @@ impl ExecutionPublicationGuard<'_> {
         // if the branch's once-per-epoch maintenance refresh preceded it. Only
         // the records the branch's registry rows feed are re-read.
         let refreshed = branch.overlay().delta_generation();
-        branch
-            .registry
-            .update_written_rows_timed(branch.store.as_ref(), timing.registry.as_mut())?;
+        if let Some(registry_timing) = timing.registry.as_mut() {
+            let ((updated, reads), rows) = quil_forest::count_batch_rows(|| {
+                quil_forest::store_io::count_thread_reads(|| {
+                    branch.registry.update_written_rows_timed(
+                        branch.store.as_ref(),
+                        Some(&mut *registry_timing),
+                    )
+                })
+            });
+            let held = branch.overlay().stats();
+            registry_timing.rows_unread = rows.unread;
+            registry_timing.rows_sought = rows.sought;
+            registry_timing.memo_bytes = held.newest_bytes;
+            registry_timing.memo_refused = held.newest_refused;
+            registry_timing.reads = reads;
+            updated?;
+        } else {
+            branch
+                .registry
+                .update_written_rows_timed(branch.store.as_ref(), None)?;
+        }
         timing.mark("update registry");
         let branch_engines = branch.manager.engines.try_read().map_err(|_| {
             QuilError::ExecutionUnavailable("private execution engines are busy or poisoned".into())
@@ -532,6 +550,13 @@ impl Drop for PublicationSteps {
                 registry_copied = self.registry.as_ref().and_then(|t| t.copied),
                 registry_copy_ms = self.registry.as_ref().map(|t| t.copy.get().as_millis() as u64),
                 registry_index_ms = self.registry.as_ref().map(|t| t.rebuild.get().as_millis() as u64),
+                registry_rows_unread = self.registry.as_ref().map(|t| t.rows_unread),
+                registry_rows_sought = self.registry.as_ref().map(|t| t.rows_sought),
+                registry_memo_bytes = self.registry.as_ref().map(|t| t.memo_bytes),
+                registry_memo_refused = self.registry.as_ref().map(|t| t.memo_refused),
+                registry_block_reads = self.registry.as_ref().map(|t| t.reads.block_reads),
+                registry_block_read_ms = self.registry.as_ref().map(|t| t.reads.block_read_time.as_millis() as u64),
+                registry_block_cache_hits = self.registry.as_ref().map(|t| t.reads.block_cache_hits),
                 after_last_step_ms = self.last.elapsed().as_millis() as u64,
                 "slow execution publication"
             );

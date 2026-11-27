@@ -283,15 +283,14 @@ impl SealWaiting {
     /// Called on every consult, and right after a hold so its line times
     /// the wait.
     pub(super) fn settle(&mut self, frame: u64, now: Instant, found: impl Fn(&[u8; 32]) -> Found) {
-        if frame != 0 {
-            self.passed_over.retain(|&(_, end)| end > frame);
-        }
+        self.passed_over
+            .retain(|&(_, end)| !super::window_ended(end, frame));
         let Some(waiting) = self.waiting else {
             return;
         };
         let why = if found(&waiting.hash).ends() {
             Ended::Held
-        } else if frame != 0 && waiting.end <= frame {
+        } else if super::window_ended(waiting.end, frame) {
             Ended::Closed
         } else if now.saturating_duration_since(waiting.last) > SEAL_WAIT_STALE {
             Ended::Stale
@@ -352,7 +351,9 @@ impl SealWaiting {
 /// due further off has no need to wait yet. While `frame` is unknown (0)
 /// none waits.
 fn within_reach(end: u64, frame: u64) -> bool {
-    frame != 0 && end > frame && end - frame <= quil_types::consensus::epoch_length_frames()
+    frame != 0
+        && !super::window_ended(end, frame)
+        && end - frame <= quil_types::consensus::epoch_length_frames()
 }
 
 /// Log the end of `waiting`'s wait, if its share kept room for it.
