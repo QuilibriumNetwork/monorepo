@@ -13,13 +13,16 @@
 //! Inputs and JMT batch construction belong to the execution owner's frame
 //! budget; this layer bounds the retained delta and returned read records.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Result};
+
+use crate::store_io::RestoreOnDrop;
 
 #[cfg(test)]
 #[path = "overlay_publication_tests.rs"]
@@ -59,6 +62,53 @@ pub struct OverlayStats {
     /// branches whose handles/read views have not yet been dropped.
     pub descendant_branches: usize,
     pub closed: bool,
+    /// Bytes the snapshot family's newest-key record holds (see
+    /// [`OverlayReadView::latest_version_batch`]), and the reads it has
+    /// refused to keep at its cap, since the captured view was last released.
+    pub newest_bytes: usize,
+    pub newest_refused: u64,
+}
+
+/// Rows the version batches run on one thread answered without reading the
+/// captured database, as an earlier read showed it holds no newer version
+/// (see [`OverlayReadView::latest_version_batch`]), and rows they looked up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchRows {
+    pub unread: u64,
+    pub sought: u64,
+}
+
+thread_local! {
+    static BATCH_ROWS: Cell<BatchRows> = const { Cell::new(BatchRows { unread: 0, sought: 0 }) };
+}
+
+fn count_batch_row(unread: bool) {
+    BATCH_ROWS.with(|rows| {
+        let mut counted = rows.get();
+        if unread {
+            counted.unread += 1;
+        } else {
+            counted.sought += 1;
+        }
+        rows.set(counted);
+    });
+}
+
+/// Run `work` and count the rows its version batches on this thread
+/// answered or looked up. Batches on other threads, a sibling branch's
+/// among them, are not counted, and closing a branch loses no count.
+pub fn count_batch_rows<T>(work: impl FnOnce() -> T) -> (T, BatchRows) {
+    let outer = BATCH_ROWS.replace(BatchRows::default());
+    // An enclosing count includes this one's rows, also if `work` panics.
+    let _restore = RestoreOnDrop::new(move || {
+        let rows = BATCH_ROWS.get();
+        BATCH_ROWS.set(BatchRows {
+            unread: outer.unread + rows.unread,
+            sought: outer.sought + rows.sought,
+        });
+    });
+    let result = work();
+    (result, BATCH_ROWS.get())
 }
 
 #[derive(Clone, Debug)]
@@ -190,8 +240,64 @@ struct PinnedSnapshot {
     sequence: u64,
     /// The database's last watched write at `sequence`, if it watches keys.
     watched: Option<u64>,
+    newest: Mutex<NewestStored>,
     #[cfg(test)]
     iterators_created: AtomicUsize,
+}
+
+/// The newest stored key in `[lower, last]`, for the ranges a read of one
+/// record's versions has resolved. The captured view never changes, so an
+/// answer holds for its life, in every branch of its family. A publication
+/// reads again each row its execution wrote, to learn whether the view
+/// holds a version newer than the staged one; for a row execution read
+/// first, this answers without the seek, whose blocks have often left the
+/// cache by then.
+#[derive(Default)]
+struct NewestStored {
+    ranges: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    bytes: usize,
+    /// Reads not kept as the cap would be passed: their rows are sought.
+    refused: u64,
+}
+
+/// Bytes the newest-key record may hold per captured view. A registry row's
+/// entry takes about 0.3 KiB, and a GLOBAL frame publishes a few thousand.
+const MAX_NEWEST_STORED_BYTES: usize = 8 << 20;
+
+/// Per-entry bytes beyond the keys: the map's slot and the two allocations.
+const NEWEST_STORED_ENTRY_OVERHEAD: usize = 64;
+
+impl NewestStored {
+    fn range(lower: &[u8], last: &[u8]) -> Vec<u8> {
+        let mut range = Vec::with_capacity(4 + lower.len() + last.len());
+        range.extend_from_slice(&(lower.len() as u32).to_be_bytes());
+        range.extend_from_slice(lower);
+        range.extend_from_slice(last);
+        range
+    }
+
+    /// Keep what a read found; once full, keep what it holds.
+    fn record(&mut self, lower: &[u8], last: &[u8], newest: Option<&[u8]>) {
+        let range = Self::range(lower, last);
+        let cost = range.len() + newest.map_or(0, <[u8]>::len) + NEWEST_STORED_ENTRY_OVERHEAD;
+        if self.ranges.contains_key(&range) {
+            return;
+        }
+        if self.bytes + cost > MAX_NEWEST_STORED_BYTES {
+            self.refused += 1;
+            return;
+        }
+        self.bytes += cost;
+        self.ranges.insert(range, newest.map(<[u8]>::to_vec));
+    }
+
+    /// Whether `[lower, last]` is known to hold no stored key above `key`
+    /// (none at all when `key` is `None`).
+    fn none_above(&self, lower: &[u8], last: &[u8], key: Option<&[u8]>) -> bool {
+        self.ranges
+            .get(&Self::range(lower, last))
+            .is_some_and(|newest| newest.as_deref() <= key)
+    }
 }
 
 type HeldView<'a> = MutexGuard<'a, Option<rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>>>;
@@ -246,6 +352,7 @@ impl PinnedSnapshot {
             _db: db,
             sequence,
             watched,
+            newest: Mutex::default(),
             #[cfg(test)]
             iterators_created: AtomicUsize::new(0),
         });
@@ -255,6 +362,28 @@ impl PinnedSnapshot {
             .unwrap_or_else(|p| p.into_inner())
             .push(Arc::downgrade(&view));
         Ok(view)
+    }
+
+    /// Record the newest stored key in `[lower, last]` a read found.
+    fn record_newest(&self, lower: &[u8], last: &[u8], newest: Option<&[u8]>) {
+        self.newest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(lower, last, newest);
+    }
+
+    /// The newest-key record's bytes and refusals.
+    fn newest_held(&self) -> (usize, u64) {
+        let newest = self.newest.lock().unwrap_or_else(|p| p.into_inner());
+        (newest.bytes, newest.refused)
+    }
+
+    /// See [`NewestStored::none_above`].
+    fn none_stored_above(&self, lower: &[u8], last: &[u8], key: Option<&[u8]>) -> bool {
+        self.newest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .none_above(lower, last, key)
     }
 
     /// The pinned view for one read, released first if it outlived its age.
@@ -361,6 +490,7 @@ impl PinnedSnapshot {
                 .clear();
             snapshot.take()
         };
+        *self.newest.lock().unwrap_or_else(|p| p.into_inner()) = NewestStored::default();
         let held = released.is_some();
         drop(released);
         if held {
@@ -801,6 +931,10 @@ impl ExecutionOverlay {
 
     pub fn stats(&self) -> OverlayStats {
         let inner = self.lock_cleanup();
+        let (newest_bytes, newest_refused) = inner
+            .base
+            .as_ref()
+            .map_or((0, 0), |base| base.newest_held());
         OverlayStats {
             delta_bytes: inner.delta.bytes,
             delta_entries: inner.delta.entries(),
@@ -814,6 +948,8 @@ impl ExecutionOverlay {
                     .unwrap_or_else(|p| p.into_inner())
                     .is_none()
             }),
+            newest_bytes,
+            newest_refused,
         }
     }
 
@@ -1197,8 +1333,7 @@ impl OverlayReadView {
             lower.len().saturating_add(upper.len()) <= limits.max_record_bytes,
             "overlay cursor bound byte limit"
         );
-        let mut parked = base.take_iterator(&view, &lower, &upper)?;
-        let iter = &mut parked.iterator;
+        let mut parked: Option<ParkedIterator> = None;
         let mut values = Vec::with_capacity(addresses.len());
         for address in addresses {
             let start = [prefix, address].concat();
@@ -1240,10 +1375,31 @@ impl OverlayReadView {
             } else {
                 &start
             };
-            let found = if seek_latest_in_range(iter, seek, &last, || reads.operation(limits))? {
-                iter.key().zip(iter.value())
-            } else {
+            // A seek finding nothing above the staged version reads the same
+            // as this answer, and charges only the operation above.
+            let found = if base.none_stored_above(&start, &last, candidate.map(|(key, _)| key)) {
+                count_batch_row(true);
                 candidate
+            } else {
+                count_batch_row(false);
+                let iter = match &mut parked {
+                    Some(parked) => &mut parked.iterator,
+                    None => {
+                        &mut parked
+                            .insert(base.take_iterator(&view, &lower, &upper)?)
+                            .iterator
+                    }
+                };
+                if seek_latest_in_range(iter, seek, &last, || reads.operation(limits))? {
+                    // The newest in (staged, last] is the newest in the range.
+                    base.record_newest(&start, &last, iter.key());
+                    iter.key().zip(iter.value())
+                } else {
+                    if candidate.is_none() {
+                        base.record_newest(&start, &last, None);
+                    }
+                    candidate
+                }
             };
             let value = match found {
                 Some((key, blob)) if key.len() == last.len() => {
@@ -1476,6 +1632,14 @@ impl OverlayCursor<'_> {
         let mut exhausted = false;
         if reverse {
             exhausted = !step_back(it, key, inclusive, &self.lower, floor.as_ref());
+            // A floor-guarded cursor reads one record's versions; keep the
+            // newest it found for a later version batch. A failed step's
+            // position is no answer. A read from at or above `upper`, which
+            // the iterator does not see, arrives here as an exclusive step
+            // from `upper` (see above) and records nothing.
+            if self.floor_guard && inclusive && it.status().is_ok() {
+                base.record_newest(&self.lower, key, it.key().filter(|_| !exhausted));
+            }
         } else {
             if it.key() != Some(key) {
                 it.seek(key);
@@ -1893,6 +2057,347 @@ mod tests {
             .latest_version_batch(b"rows", &addresses, usize::MAX)
             .is_err());
         assert!(!capped.execution_healthy());
+    }
+
+    /// The newest-key record keeps reads up to its byte cap and refuses the
+    /// rest, counting each. A refused range is sought again; a kept one still
+    /// answers, and recording it again costs nothing.
+    #[test]
+    fn the_newest_key_record_stops_at_its_byte_cap() {
+        let row = |n: u32| {
+            let lower = [b"rows".as_slice(), &[0; 28], &n.to_be_bytes()].concat();
+            let last = [lower.as_slice(), &[0xff; 8]].concat();
+            let key = [lower.as_slice(), &1u64.to_be_bytes()].concat();
+            (lower, last, key)
+        };
+        let (lower, last, key) = row(0);
+        let cost =
+            NewestStored::range(&lower, &last).len() + key.len() + NEWEST_STORED_ENTRY_OVERHEAD;
+        let fits = MAX_NEWEST_STORED_BYTES / cost;
+        let mut newest = NewestStored::default();
+        for n in 0..fits as u32 + 2 {
+            let (lower, last, key) = row(n);
+            newest.record(&lower, &last, Some(&key));
+        }
+        assert_eq!(newest.refused, 2, "reads refused at the cap");
+        assert_eq!(newest.ranges.len(), fits);
+        assert_eq!(newest.bytes, fits * cost);
+        let (lower, last, key) = row(fits as u32);
+        assert!(!newest.none_above(&lower, &last, Some(&key)));
+        let (lower, last, key) = row(0);
+        assert!(newest.none_above(&lower, &last, Some(&key)));
+        newest.record(&lower, &last, Some(&key));
+        assert_eq!((newest.bytes, newest.refused), (fits * cost, 2));
+    }
+
+    /// A batch's seek past a staged version shows only that nothing newer is
+    /// stored, not that the row is absent: a view from before the version was
+    /// staged, and a sibling branch without it, still read the stored one.
+    #[test]
+    fn a_seek_past_a_staged_version_answers_no_branch_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let address = [7u8; 32];
+        let version = |v: u64| [b"rows".as_slice(), &address, &v.to_be_bytes()].concat();
+        db.put(version(1), [1]).unwrap();
+        db.put(version(2), [2]).unwrap();
+        let staged = Arc::new(ExecutionOverlay::capture(db, limits()).unwrap());
+        let sibling = Arc::new(staged.fork(limits()).unwrap());
+        let older = staged.read_view().unwrap();
+        staged
+            .apply(&[OverlayMutation::Put(version(3), vec![3])])
+            .unwrap();
+        let batch = |view: &OverlayReadView| {
+            let (values, rows) = count_batch_rows(|| {
+                view.latest_version_batch(b"rows", &[address], usize::MAX)
+                    .unwrap()
+            });
+            let value = match values.as_slice() {
+                [VersionedValue::Present(blob)] => Some(blob.clone()),
+                [VersionedValue::Missing] => None,
+                _ => panic!("row not resolved"),
+            };
+            (value, rows)
+        };
+        let sought = BatchRows {
+            unread: 0,
+            sought: 1,
+        };
+        assert_eq!(batch(&staged.read_view().unwrap()), (Some(vec![3]), sought));
+        assert_eq!(
+            batch(&older),
+            (Some(vec![2]), sought),
+            "a view from before the staged version"
+        );
+        assert_eq!(
+            batch(&sibling.read_view().unwrap()),
+            (Some(vec![2]), sought),
+            "a sibling branch"
+        );
+        assert!(staged.stats().newest_bytes > 0);
+        assert_eq!(staged.stats().newest_refused, 0);
+    }
+
+    /// A count covers the batches run on its own thread: a sibling branch's
+    /// batch on another thread is not in it, closing the branch midway loses
+    /// nothing, and an enclosing count includes a nested one.
+    #[test]
+    fn batch_rows_count_only_this_threads_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let addresses: Vec<_> = (0..4).map(|n| [n; 32]).collect();
+        let version =
+            |address: &[u8; 32], v: u64| [b"rows".as_slice(), address, &v.to_be_bytes()].concat();
+        for address in &addresses {
+            db.put(version(address, 1), [1]).unwrap();
+        }
+        let branch = Arc::new(ExecutionOverlay::capture(db, limits()).unwrap());
+        let sibling = Arc::new(branch.fork(limits()).unwrap());
+        // Execution reads the first row, then stages versions of two rows.
+        {
+            let view = branch.read_view().unwrap();
+            let lower = [b"rows".as_slice(), &addresses[0]].concat();
+            let last = version(&addresses[0], u64::MAX);
+            let upper = [last.as_slice(), &[0]].concat();
+            let mut cursor = view.floor_guarded_cursor(&lower, &upper).unwrap();
+            cursor.seek_for_prev(&last).unwrap();
+            assert_eq!(cursor.value(), Some([1].as_slice()));
+        }
+        branch
+            .apply(&[
+                OverlayMutation::Put(version(&addresses[0], 2), vec![2]),
+                OverlayMutation::Put(version(&addresses[1], 2), vec![2]),
+            ])
+            .unwrap();
+        let view = branch.read_view().unwrap();
+        let sibling_batch = || {
+            sibling
+                .read_view()
+                .unwrap()
+                .latest_version_batch(b"rows", &addresses, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        let (_, rows) = count_batch_rows(|| {
+            view.latest_version_batch(b"rows", &addresses[..2], usize::MAX)
+                .unwrap();
+            std::thread::scope(|scope| scope.spawn(sibling_batch).join().unwrap());
+            branch.close();
+        });
+        assert_eq!(
+            rows,
+            BatchRows {
+                unread: 1,
+                sought: 1
+            },
+            "the branch's batch alone"
+        );
+        let ((read, nested), enclosing) = count_batch_rows(|| count_batch_rows(sibling_batch));
+        assert_eq!(read, 4);
+        assert_eq!(nested, enclosing);
+        assert_eq!(
+            enclosing,
+            BatchRows {
+                unread: 0,
+                sought: 4
+            }
+        );
+    }
+
+    /// A count whose work panics still adds the rows it saw to the
+    /// enclosing count, which keeps its own.
+    #[test]
+    fn a_panicking_count_keeps_its_rows_in_the_enclosing_count() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let addresses: Vec<_> = (0..4).map(|n| [n; 32]).collect();
+        for address in &addresses {
+            db.put(
+                [b"rows".as_slice(), address, &1u64.to_be_bytes()].concat(),
+                [1],
+            )
+            .unwrap();
+        }
+        let overlay = Arc::new(ExecutionOverlay::capture(db, limits()).unwrap());
+        let view = overlay.read_view().unwrap();
+        let batch = |addresses: &[[u8; 32]]| {
+            view.latest_version_batch(b"rows", addresses, usize::MAX)
+                .unwrap()
+        };
+        let ((), enclosing) = count_batch_rows(|| {
+            batch(&addresses[..2]);
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                count_batch_rows(|| {
+                    batch(&addresses[2..]);
+                    panic!("planted panic after a batch");
+                })
+            }));
+            assert!(caught.is_err());
+        });
+        assert_eq!(
+            enclosing,
+            BatchRows {
+                unread: 0,
+                sought: 4
+            },
+            "both batches, the panicking count's among them"
+        );
+        let ((), after) = count_batch_rows(|| ());
+        assert_eq!(after, BatchRows::default(), "a later count starts empty");
+    }
+
+    /// A floor-guarded read past its cursor's upper bound saw only the keys
+    /// below the bound, so it records no answer for its range: a later batch
+    /// still finds a version stored between the bound and the read's key.
+    #[test]
+    fn a_read_past_its_cursor_bound_records_no_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let address = [7u8; 32];
+        let version = |v: u64| [b"rows".as_slice(), &address, &v.to_be_bytes()].concat();
+        db.put(version(1), [1]).unwrap();
+        db.put(version(5), [5]).unwrap();
+        let overlay = Arc::new(ExecutionOverlay::capture(db, limits()).unwrap());
+        {
+            let view = overlay.read_view().unwrap();
+            let lower = [b"rows".as_slice(), &address].concat();
+            let mut cursor = view.floor_guarded_cursor(&lower, &version(3)).unwrap();
+            cursor.seek_for_prev(&version(u64::MAX)).unwrap();
+            assert_eq!(
+                cursor.value(),
+                Some([1].as_slice()),
+                "the bound hides version 5"
+            );
+        }
+        assert_eq!(overlay.stats().newest_bytes, 0, "the read recorded nothing");
+        overlay
+            .apply(&[OverlayMutation::Put(version(2), vec![2])])
+            .unwrap();
+        let (values, rows) = count_batch_rows(|| {
+            overlay
+                .read_view()
+                .unwrap()
+                .latest_version_batch(b"rows", &[address], usize::MAX)
+                .unwrap()
+        });
+        assert!(
+            matches!(values.as_slice(), [VersionedValue::Present(blob)] if blob == &[5]),
+            "the batch returns the stored version above the staged one"
+        );
+        assert_eq!(
+            rows,
+            BatchRows {
+                unread: 0,
+                sought: 1
+            }
+        );
+    }
+
+    /// Releasing a captured view drops the newest-key record with it.
+    #[test]
+    fn release_clears_the_newest_key_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let address = [7u8; 32];
+        let version = |v: u64| [b"rows".as_slice(), &address, &v.to_be_bytes()].concat();
+        db.put(version(1), [1]).unwrap();
+        let overlay = Arc::new(ExecutionOverlay::capture(db, limits()).unwrap());
+        let view = overlay.read_view().unwrap();
+        {
+            let lower = [b"rows".as_slice(), &address].concat();
+            let last = version(u64::MAX);
+            let upper = [last.as_slice(), &[0]].concat();
+            let mut cursor = view.floor_guarded_cursor(&lower, &upper).unwrap();
+            cursor.seek_for_prev(&last).unwrap();
+            assert_eq!(cursor.value(), Some([1].as_slice()));
+        }
+        assert!(overlay.stats().newest_bytes > 0, "the read was recorded");
+        let base = overlay.lock_inner().unwrap().base.clone().unwrap();
+        assert!(base.release());
+        let stats = overlay.stats();
+        assert_eq!(
+            (stats.newest_bytes, stats.newest_refused),
+            (0, 0),
+            "release clears the record"
+        );
+        assert!(view
+            .latest_version_batch(b"rows", &[address], usize::MAX)
+            .is_err());
+    }
+
+    /// A row the newest-key record answers is charged what the seek it
+    /// replaces is charged: the record answers only where that seek finds
+    /// no key in its range, which takes no step past the first. A branch's
+    /// read charges, and its read budget's verdict, do not depend on what
+    /// its family recorded first.
+    #[test]
+    fn a_recorded_answer_charges_what_its_seek_charges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        let (stored, empty, newer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let version =
+            |address: &[u8; 32], v: u64| [b"rows".as_slice(), address, &v.to_be_bytes()].concat();
+        for v in 1..=2 {
+            db.put(version(&stored, v), [v as u8]).unwrap();
+        }
+        db.put(version(&newer, 5), [5]).unwrap();
+        let addresses = [stored, empty, newer];
+        let publish = |read_first: bool| {
+            let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+            if read_first {
+                let view = overlay.read_view().unwrap();
+                for address in &addresses {
+                    let lower = [b"rows".as_slice(), address].concat();
+                    let last = version(address, u64::MAX);
+                    let upper = [last.as_slice(), &[0]].concat();
+                    let mut cursor = view.floor_guarded_cursor(&lower, &upper).unwrap();
+                    cursor.seek_for_prev(&last).unwrap();
+                }
+            }
+            overlay
+                .apply(&[
+                    OverlayMutation::Put(version(&stored, 3), vec![3]),
+                    OverlayMutation::Put(version(&newer, 4), vec![4]),
+                ])
+                .unwrap();
+            let before = overlay.stats().read_operations;
+            let (values, rows) = count_batch_rows(|| {
+                overlay
+                    .read_view()
+                    .unwrap()
+                    .latest_version_batch(b"rows", &addresses, usize::MAX)
+                    .unwrap()
+            });
+            let values: Vec<_> = values
+                .into_iter()
+                .map(|value| match value {
+                    VersionedValue::Present(blob) => Some(blob),
+                    VersionedValue::Missing => None,
+                    _ => panic!("row not resolved"),
+                })
+                .collect();
+            (values, rows, overlay.stats().read_operations - before)
+        };
+        let (cold, cold_rows, cold_charged) = publish(false);
+        let (warm, warm_rows, warm_charged) = publish(true);
+        assert_eq!(cold, vec![Some(vec![3]), None, Some(vec![5])]);
+        assert_eq!(warm, cold);
+        assert_eq!(
+            (cold_rows, warm_rows),
+            (
+                BatchRows {
+                    unread: 0,
+                    sought: 3
+                },
+                BatchRows {
+                    unread: 2,
+                    sought: 1
+                }
+            ),
+            "two rows answered from the record"
+        );
+        assert_eq!(cold_charged, warm_charged, "read operations charged");
     }
 
     fn database(path: &std::path::Path) -> crate::CoordinatedDb {
