@@ -319,7 +319,7 @@ impl WindowSeats {
             if !self.windows.contains_key(&end) {
                 if frame == 0
                     || self.since == 0
-                    || end <= frame
+                    || super::window_ended(end, frame)
                     || end - frame > horizon()
                     || end <= self.since.saturating_add(horizon())
                 {
@@ -338,7 +338,7 @@ impl WindowSeats {
             let Some(tally) = self.windows.get_mut(&end) else {
                 continue;
             };
-            let event = if event == SeatEvent::Closed && end > frame {
+            let event = if event == SeatEvent::Closed && !super::window_ended(end, frame) {
                 SeatEvent::AgedOut
             } else {
                 event

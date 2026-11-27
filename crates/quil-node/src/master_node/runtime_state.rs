@@ -34,6 +34,26 @@ fn global_message_collector(
     collector
 }
 
+/// How often the GLOBAL collector logs the refusal counts left since its
+/// last lines ([`drain_counts_left`]).
+const COUNTS_LEFT_EVERY: Duration = Duration::from_secs(30);
+
+/// Every [`COUNTS_LEFT_EVERY`], log the refusal counts `collector` holds
+/// since its last lines, if a line is due
+/// (`MessageCollector::report_counts_left_at`, at tokio's clock): only a
+/// finalization logs them otherwise, and a GLOBAL stall finalizes nothing.
+/// Runs until cancelled.
+async fn drain_counts_left(
+    collector: Arc<quil_engine::message_collector::MessageCollector>,
+) -> anyhow::Result<()> {
+    let mut every = tokio::time::interval(COUNTS_LEFT_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        every.tick().await;
+        collector.report_counts_left_at(tokio::time::Instant::now().into_std());
+    }
+}
+
 /// The wait after the first failed startup load of the prover registry;
 /// it doubles after each failure up to [`REGISTRY_RETRY_MAX`].
 const REGISTRY_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -396,6 +416,11 @@ pub(crate) fn init(
         }
     });
 
+    let mc_counts_left = message_collector.clone();
+    sup.run_until_cancelled("global-counts-left", move |_token| {
+        drain_counts_left(mc_counts_left)
+    });
+
     RuntimeState {
         message_collector,
         prover_registry,
@@ -540,6 +565,85 @@ mod tests {
                 "class-share global-shares: the GLOBAL collector (participant: {participant}) keeps no room for shard headers and storage epoch proofs"
             );
         }
+    }
+
+    /// A GLOBAL storage epoch proof `bytes` long settling a seat of
+    /// `epoch`, which must be settled as epoch `epoch + 2` begins.
+    fn settlement(epoch: u64, bytes: usize) -> Vec<u8> {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            SeatProof, StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let member = [1u8; 32];
+        let proof = StorageEpochProof {
+            member,
+            seats: vec![SeatProof {
+                shard_filter: member.to_vec(),
+                epoch,
+                settles: true,
+                ..Default::default()
+            }],
+            proof: vec![1; bytes],
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: proof.to_canonical_bytes(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Through a GLOBAL stall, the count of proofs refused past their
+    /// window within a minute of the last line stayed unlogged: only a
+    /// finalization logged it. The counts-left timer logs it once that
+    /// minute has passed, though no frame finalizes.
+    #[tokio::test(start_paused = true)]
+    async fn the_global_collector_logs_a_late_count_left_through_a_stall() {
+        use quil_engine::message_collector::Provenance;
+        use quil_execution::global_intrinsic::storage_seat::settlement_window;
+        const LINE: &str = "refused storage epoch proofs that arrived after their window";
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let collector = global_message_collector(true);
+        let epoch = 1478;
+        collector.note_finalized_frame(settlement_window(epoch).1 - 1);
+        for peer in [&b"a"[..], b"b"] {
+            assert_eq!(
+                collector.add_message_outcome_by(
+                    1,
+                    settlement(epoch, 64),
+                    Provenance::Prover,
+                    peer
+                ),
+                SubmitOutcome::Filtered(Refusal::WindowEnded),
+                "a proof past its window was not refused"
+            );
+        }
+        assert_eq!(
+            capture.lines_with(LINE).len(),
+            1,
+            "the first refusal is logged at once, the second left"
+        );
+        let drain = tokio::spawn(drain_counts_left(collector.clone()));
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        let quiet = capture.lines_with(LINE).len();
+        tokio::time::sleep(Duration::from_secs(41)).await;
+        let lines = capture.lines_with(LINE);
+        drain.abort();
+        eprintln!(
+            "REACH window-ended timer quiet={quiet} lines={}",
+            lines.len()
+        );
+        assert_eq!(quiet, 1, "window-ended timer: two lines within a minute");
+        assert_eq!(
+            lines.len(),
+            2,
+            "window-ended timer: a count left over a minute is not logged through a GLOBAL stall"
+        );
+        assert!(lines[1].contains("refused=1"), "{}", lines[1]);
     }
 
     #[test]
