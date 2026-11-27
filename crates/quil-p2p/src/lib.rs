@@ -100,6 +100,40 @@ pub mod params {
     /// bytes; this does. 512 MiB is far more than gossip recovery needs
     /// while keeping the cache from driving OOM.
     pub const MCACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+    /// Encoded size above which a relayed message is pushed to only
+    /// LAZY_EAGER_PEERS mesh peers and announced (IHAVE) to the rest, which
+    /// pull it (IWANT) if no push reaches them. A peer sends IDONTWANT only
+    /// once a whole copy has arrived, so a multi-megabyte GLOBAL frame
+    /// pushed to every mesh peer reaches a node from most of its mesh at
+    /// once. At 256 KiB the transfer takes about a WAN round trip at
+    /// 50 Mbps, the cost of the pull (about 1.5 round trips a hop). In a
+    /// 10-minute sample on one node (Nov 16) only GLOBAL frames were larger;
+    /// shard blocks and frames reached 128-256 KiB. A larger one is pulled
+    /// too.
+    pub const LAZY_FORWARD_THRESHOLD: usize = 256 * 1024;
+    /// Random mesh peers that are still pushed a message over
+    /// LAZY_FORWARD_THRESHOLD. With a mesh of D peers (5 to 12) each pushing
+    /// to 2 at random, a node gets no push about (1 - 2/D)^D of the time
+    /// (a model: a relay picks among its peers other than the source): 7.8%
+    /// to 11.2%, at most e^-2 = 13.5%, more while expired IDONTWANTs (3 s)
+    /// return peers to the pool. The first IHAVE usually lands before a push
+    /// completes, so a node also pulls one copy unless a push came first:
+    /// about k + 1 - k/(D - 1) copies for k peers (2.6 at k = 2, D = 6), not
+    /// one per mesh peer. Pulls are a regular path, not only recovery.
+    pub const LAZY_EAGER_PEERS: usize = 2;
+    /// How long a mesh peer that announced a message has to deliver it
+    /// after our IWANT; then the announcer with the latest first IHAVE that
+    /// still serves it is asked. Serving counts from an announcer's first
+    /// IHAVE, a repeat changes nothing: HISTORY_LENGTH - 1 heartbeats
+    /// (16.1 s) for a mesh peer, HISTORY_LENGTH - 1 - HISTORY_GOSSIP
+    /// (4.9 s) for one outside the mesh (libp2p-gossipsub PATCHES.md has
+    /// the rule). A relay answers IWANT from its cache on
+    /// arrival for at least that long (less if MCACHE_MAX_BYTES evicts it),
+    /// so this time does not shorten that window.
+    /// The transfer of a GLOBAL frame (1-8 MiB, up to 15 MiB) must fit: at
+    /// 8 s a 4 MiB frame needs 4.2 Mbit/s and a 15 MiB one 15.7 Mbit/s. A
+    /// slower transfer breaks the promise and pulls one more copy.
+    pub const LAZY_FOLLOWUP_TIME: Duration = Duration::from_secs(8);
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -125,6 +159,12 @@ pub struct BlossomsubParams {
     /// [`params::MCACHE_MAX_BYTES`]. Bounds memory under catch-up floods
     /// that window-count history alone cannot.
     pub mcache_max_bytes: usize,
+    /// See [`params::LAZY_FORWARD_THRESHOLD`].
+    pub lazy_forward_threshold: usize,
+    /// See [`params::LAZY_EAGER_PEERS`].
+    pub lazy_eager_peers: usize,
+    /// See [`params::LAZY_FOLLOWUP_TIME`].
+    pub lazy_followup_time: std::time::Duration,
 }
 
 impl Default for BlossomsubParams {
@@ -142,6 +182,9 @@ impl Default for BlossomsubParams {
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
+            lazy_forward_threshold: params::LAZY_FORWARD_THRESHOLD,
+            lazy_eager_peers: params::LAZY_EAGER_PEERS,
+            lazy_followup_time: params::LAZY_FOLLOWUP_TIME,
         }
     }
 }
@@ -189,6 +232,9 @@ impl BlossomsubParams {
             // No P2PConfig field yet: a 512 MiB ceiling, enforced by
             // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,
+            lazy_forward_threshold: d.lazy_forward_threshold,
+            lazy_eager_peers: d.lazy_eager_peers,
+            lazy_followup_time: d.lazy_followup_time,
         }
     }
 }

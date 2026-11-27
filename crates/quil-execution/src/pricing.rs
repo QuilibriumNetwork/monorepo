@@ -94,6 +94,21 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
     mul >> POMW_SCALE_BITS
 }
 
+/// The PoMW basis in QUIL units of a frame priced at `difficulty` and
+/// `world_state_bytes`, as frame execution carries it
+/// (`FrameExecutionContext::pomw_basis`): the application creation floor is a
+/// quarter of it. At most `POMW_NUMERATOR * QUIL_TOKEN_UNITS`, so it always
+/// fits.
+pub fn frame_pomw_basis(difficulty: u64, world_state_bytes: u64) -> Result<u128> {
+    pomw_basis(difficulty, world_state_bytes, QUIL_TOKEN_UNITS)
+        .to_u128()
+        .ok_or_else(|| {
+            quil_types::error::QuilError::InvalidArgument(
+                "PoMW basis outside the u128 range".into(),
+            )
+        })
+}
+
 /// PoMW reward for one allocation's ring, before dividing among its eight
 /// prover slots. This is the issuance arithmetic: retain 53 fractional bits
 /// for sqrt(data_shards), fuse divisions, and truncate only at the end.

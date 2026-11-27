@@ -960,7 +960,8 @@ fn frame_alone_allowed(
     }
 }
 
-/// Seconds proof checks have been starved for memory or a slot in this
+/// Seconds proof checks have been starved in this memory admission (for
+/// memory or one of its job slots; never a proof worker slot) in this
 /// process now, a frame's however far apart its checks are asked
 /// ([`Starved::frames_for`]): 0 when none is ([`VERIFIER_STARVED_WARN`]).
 pub fn verifier_starved_secs() -> u64 {

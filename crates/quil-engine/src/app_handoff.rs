@@ -1760,7 +1760,16 @@ pub fn committed_frame_digest_looked_through(
     filter: &[u8],
     number: u64,
 ) -> Result<Option<[u8; 32]>> {
-    committed_frame_digest_in(&CommittedView::capture(global)?, filter, number, true)
+    committed_frame_digest_looked_through_in(&CommittedView::capture(global)?, filter, number)
+}
+
+/// [`committed_frame_digest_looked_through`] read from a captured `view`.
+pub fn committed_frame_digest_looked_through_in(
+    view: &CommittedView,
+    filter: &[u8],
+    number: u64,
+) -> Result<Option<[u8; 32]>> {
+    committed_frame_digest_in(view, filter, number, true)
 }
 
 fn committed_frame_digest_in(

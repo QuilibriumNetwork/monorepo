@@ -624,7 +624,7 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 10] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 11] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
@@ -635,6 +635,7 @@ const SUBMIT_REFUSAL_NAMES: [&str; 10] = [
     "shield_claimed",
     "unsendable_seal",
     "applied_seat_part",
+    "share_full",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -650,6 +651,12 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::ShieldClaimed => 7,
         Refusal::UnsendableSeal => 8,
         Refusal::AppliedSeatPart => 9,
+        // Senders read every full share as a full rank. This node's line
+        // counts apart the shares the collector expects to fill
+        // (`Share::expected`): a full storage epoch proof share is no sign of
+        // a failing duty.
+        Refusal::ShareFull(share) if share.expected() => 10,
+        Refusal::ShareFull(_) => 2,
     }
 }
 
@@ -658,6 +665,9 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
 /// [`SUBMIT_REFUSAL_REPORT_INTERVAL`], with the next refusal after it.
 struct SubmitRefusals {
     counts: [u64; SUBMIT_REFUSAL_NAMES.len()],
+    /// Of the `rank_full` count, the refusals over a capacity messages' share
+    /// ([`Share::capacity`](quil_engine::message_collector::Share::capacity)).
+    capacity_full: u64,
     latest_peer: String,
     latest_reason: &'static str,
     logged_at: Option<std::time::Instant>,
@@ -666,6 +676,7 @@ struct SubmitRefusals {
 #[derive(Debug, PartialEq, Eq)]
 struct SubmitRefusalSummary {
     counts: [u64; SUBMIT_REFUSAL_NAMES.len()],
+    capacity_full: u64,
     latest_peer: String,
     latest_reason: &'static str,
     since_previous: Option<std::time::Duration>,
@@ -675,6 +686,7 @@ impl SubmitRefusals {
     const fn new() -> Self {
         Self {
             counts: [0; SUBMIT_REFUSAL_NAMES.len()],
+            capacity_full: 0,
             latest_peer: String::new(),
             latest_reason: "",
             logged_at: None,
@@ -687,7 +699,14 @@ impl SubmitRefusals {
         peer: String,
         now: std::time::Instant,
     ) -> Option<SubmitRefusalSummary> {
-        self.counts[submit_refusal_slot(refusal)] += 1;
+        let slot = submit_refusal_slot(refusal);
+        self.counts[slot] += 1;
+        if let quil_engine::message_collector::Refusal::ShareFull(share) = refusal {
+            let rank_full = submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull);
+            if slot == rank_full && share.capacity() {
+                self.capacity_full += 1;
+            }
+        }
         self.latest_peer = peer;
         self.latest_reason = refusal.reason();
         let since_previous = self.logged_at.map(|at| now.saturating_duration_since(at));
@@ -697,6 +716,7 @@ impl SubmitRefusals {
         self.logged_at = Some(now);
         Some(SubmitRefusalSummary {
             counts: std::mem::take(&mut self.counts),
+            capacity_full: std::mem::take(&mut self.capacity_full),
             latest_peer: std::mem::take(&mut self.latest_peer),
             latest_reason: self.latest_reason,
             since_previous,
@@ -765,18 +785,24 @@ fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64)
             "gRPC submits refused since {window}: {counts}; a peer sends GLOBAL messages to this \
              node as if it were an archive, and this node proposes no GLOBAL frames"
         );
-    } else if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull)]
-        > 0
-    {
-        warn!(
-            executed,
-            head,
-            %latest_peer,
-            latest_reason,
-            "gRPC submits refused by the message collector since {window}: {counts}; rank_full \
-             means this node's mempool is at its cap, which a node whose GLOBAL execution trails \
-             its head reaches first; submitters are told why and retry"
-        );
+    } else if let Some((duty_failing, full)) = full_refusals_note(summary) {
+        macro_rules! full_line {
+            ($level:ident) => {
+                $level!(
+                    executed,
+                    head,
+                    %latest_peer,
+                    latest_reason,
+                    "gRPC submits refused by the message collector since {window}: {counts}; \
+                     {full}; submitters are told why and retry"
+                )
+            };
+        }
+        if duty_failing {
+            full_line!(warn);
+        } else {
+            full_line!(info);
+        }
     } else {
         info!(
             executed,
@@ -789,6 +815,41 @@ fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64)
         );
     }
 }
+
+/// What the full-mempool refusals of `summary` mean, if any: whose problem
+/// each is and how long it lasts, and whether a duty fails (the line warns)
+/// or only storage epoch proofs filled their share (`share_full`, at info).
+fn full_refusals_note(summary: &SubmitRefusalSummary) -> Option<(bool, String)> {
+    use quil_engine::message_collector::{Refusal, Share};
+    let rank_full = summary.counts[submit_refusal_slot(Refusal::RankFull)];
+    let capacity = summary.capacity_full > 0;
+    let mempool = rank_full > summary.capacity_full;
+    let share_full = summary.counts[submit_refusal_slot(Refusal::ShareFull(Share::Seals))] > 0;
+    let notes: Vec<&str> = [
+        (mempool, RANK_FULL_NOTE),
+        (capacity, CAPACITY_FULL_NOTE),
+        (share_full, SHARE_FULL_NOTE),
+    ]
+    .into_iter()
+    .filter_map(|(counted, note)| counted.then_some(note))
+    .collect();
+    (!notes.is_empty()).then(|| (mempool || capacity, notes.join("; ")))
+}
+
+const RANK_FULL_NOTE: &str = "rank_full means this node's mempool is at its cap, which a node \
+                              whose GLOBAL execution trails its head reaches first";
+const CAPACITY_FULL_NOTE: &str = "rank_full refusals of capacity messages over their share or \
+                                  one member's, if they last, mean members send capacity \
+                                  messages faster than GLOBAL carries them: check the release of \
+                                  latest_member in the message collector's line refusing submits \
+                                  over their class share";
+const SHARE_FULL_NOTE: &str = "share_full counts storage epoch proofs over their share of this \
+                               node's mempool: active provers' proofs, other senders' proofs or \
+                               one sender's proofs (latest_reason, the last refusal of any kind, \
+                               names its share when it is one of these); they fill it as each \
+                               epoch boundary's proofs arrive, senders resend, and frames free \
+                               the room within about 25 minutes: nothing to fix on this node for \
+                               these";
 
 /// The open file limit of this process, as raised at startup.
 fn open_file_limit() -> u64 {
@@ -7560,10 +7621,12 @@ mod submit_sender_tests {
 #[cfg(test)]
 mod rpc_bound_tests {
     use super::{
-        node_service_bind, submit_refusal_reason, NodeServiceBind, SubmitRefusalSummary,
-        SubmitRefusals, SUBMIT_REFUSAL_REPORT_INTERVAL,
+        full_refusals_note, log_submit_refusals, node_service_bind, submit_refusal_reason,
+        submit_refusal_slot, NodeServiceBind, SubmitRefusalSummary, SubmitRefusals,
+        SUBMIT_REFUSAL_NAMES, SUBMIT_REFUSAL_REPORT_INTERVAL,
     };
-    use quil_engine::message_collector::Refusal;
+    use crate::util::log_capture::Capture;
+    use quil_engine::message_collector::{Refusal, Share};
     use std::time::{Duration, Instant};
 
     /// NodeService authenticates no caller: a non-loopback address is served
@@ -7622,7 +7685,8 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                capacity_full: 0,
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -7642,12 +7706,180 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                capacity_full: 0,
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),
             })
         );
+    }
+
+    /// What one refusal over `share` comes to: the slot it is counted in, and
+    /// the level and text of the line `log_submit_refusals` writes for it.
+    fn share_line(share: Share) -> (&'static str, &'static str, String) {
+        let refusal = Refusal::ShareFull(share);
+        let summary = SubmitRefusals::new()
+            .record(refusal, "a".into(), Instant::now())
+            .expect("the first refusal is logged");
+        let counted: Vec<&str> = SUBMIT_REFUSAL_NAMES
+            .iter()
+            .copied()
+            .zip(summary.counts)
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            counted,
+            [SUBMIT_REFUSAL_NAMES[submit_refusal_slot(refusal)]],
+            "one refusal, one slot"
+        );
+        let logs = Capture::default();
+        {
+            let _guard = logs.install();
+            log_submit_refusals(&summary, 7, 9);
+        }
+        let lines = logs.lines_with("gRPC submits refused");
+        assert_eq!(lines.len(), 1, "one line: {lines:?}");
+        let line = lines[0].clone();
+        let level = if line.contains(" WARN ") {
+            "warn"
+        } else if line.contains(" INFO ") {
+            "info"
+        } else {
+            "other"
+        };
+        eprintln!(
+            "REACH share-full share={share:?} slot={} level={level} line={line:?}",
+            counted[0]
+        );
+        (counted[0], level, line)
+    }
+
+    /// A storage epoch proof share full: counted as `share_full`, logged at
+    /// info, with nothing to fix on this node.
+    fn assert_expected(share: Share, tag: &str, names: &str) {
+        let (slot, level, line) = share_line(share);
+        assert_eq!(
+            (slot, level),
+            ("share_full", "info"),
+            "{tag}: {share:?} counted as {slot} at {level}: {line}"
+        );
+        assert!(
+            line.contains("share_full counts storage epoch proofs")
+                && line.contains(names)
+                && line.contains("nothing to fix on this node")
+                && line.contains(Refusal::ShareFull(share).reason())
+                && !line.contains("trails")
+                && !line.contains("capacity messages"),
+            "{tag}: {share:?} explained as {line}"
+        );
+    }
+
+    /// A capacity messages' share full: counted as `rank_full` as on tip,
+    /// at warn, naming capacity senders and not this node's execution.
+    fn assert_capacity(share: Share, tag: &str) {
+        let (slot, level, line) = share_line(share);
+        assert_eq!(
+            (slot, level),
+            ("rank_full", "warn"),
+            "{tag}: {share:?} counted as {slot} at {level}: {line}"
+        );
+        assert!(
+            line.contains("members send capacity messages faster than GLOBAL carries them")
+                && line.contains("latest_member")
+                && !line.contains("trails")
+                && !line.contains("nothing to fix"),
+            "{tag}: {share:?} explained as {line}"
+        );
+    }
+
+    /// The room outside the reserve full: a full mempool, as on tip.
+    #[test]
+    fn a_full_unreserved_share_warns_as_a_full_rank() {
+        let (slot, level, line) = share_line(Share::Unreserved);
+        assert_eq!(
+            (slot, level),
+            ("rank_full", "warn"),
+            "SHARE-LINE-UNRESERVED: counted as {slot} at {level}: {line}"
+        );
+        assert!(
+            line.contains("trails its head")
+                && !line.contains("capacity messages")
+                && !line.contains("nothing to fix"),
+            "SHARE-LINE-UNRESERVED: explained as {line}"
+        );
+    }
+
+    #[test]
+    fn a_full_capacity_share_warns_of_capacity_senders() {
+        assert_capacity(Share::Capacity, "SHARE-LINE-CAPACITY");
+    }
+
+    #[test]
+    fn a_full_member_share_warns_of_capacity_senders() {
+        assert_capacity(Share::Member, "SHARE-LINE-MEMBER");
+    }
+
+    #[test]
+    fn a_full_seal_share_is_expected_at_info() {
+        assert_expected(Share::Seals, "SHARE-LINE-SEALS", "active provers' proofs");
+    }
+
+    #[test]
+    fn a_full_other_seal_share_is_expected_at_info() {
+        assert_expected(
+            Share::OtherSeals,
+            "SHARE-LINE-OTHER-SEALS",
+            "other senders' proofs",
+        );
+    }
+
+    #[test]
+    fn a_full_sender_seal_share_is_expected_at_info() {
+        assert_expected(Share::Sender, "SHARE-LINE-SENDER", "one sender's proofs");
+    }
+
+    /// Full refusals of every kind in one interval: the line warns and
+    /// explains each kind once; an interval without one has no note.
+    #[test]
+    fn mixed_full_refusals_warn_and_explain_each_kind() {
+        let mut refusals = SubmitRefusals::new();
+        let start = Instant::now();
+        refusals.record(Refusal::InvalidShardFrame, "a".into(), start);
+        for refusal in [
+            Refusal::RankFull,
+            Refusal::ShareFull(Share::Capacity),
+            Refusal::ShareFull(Share::Seals),
+        ] {
+            assert_eq!(refusals.record(refusal, "b".into(), start), None);
+        }
+        let summary = refusals
+            .record(
+                Refusal::ShareFull(Share::Member),
+                "c".into(),
+                start + SUBMIT_REFUSAL_REPORT_INTERVAL,
+            )
+            .expect("the interval's line is due");
+        let (warns, note) = full_refusals_note(&summary).unwrap_or_default();
+        eprintln!(
+            "REACH share-full mixed counts={:?} note={note:?}",
+            summary.counts
+        );
+        assert!(
+            warns
+                && note.contains("trails its head")
+                && note.contains("members send capacity messages")
+                && note.contains("share_full counts storage epoch proofs")
+                && note.matches("rank_full").count() == 2,
+            "SHARE-LINE-MIXED: {:?} explained as {note:?} (warns {warns})",
+            summary.counts
+        );
+        assert_eq!(summary.capacity_full, 2, "SHARE-LINE-MIXED: {summary:?}");
+        let quiet = SubmitRefusals::new()
+            .record(Refusal::InvalidShardFrame, "a".into(), start)
+            .expect("the first refusal is logged");
+        assert_eq!(full_refusals_note(&quiet), None);
     }
 }
 

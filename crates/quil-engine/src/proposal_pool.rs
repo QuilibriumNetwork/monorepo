@@ -159,6 +159,9 @@ pub(crate) struct ProposalPool {
     /// Held messages left out as GLOBAL refuses them for seat parts the
     /// proposal's executed ancestors applied.
     pub applied_skipped: usize,
+    /// Storage epoch proofs the proposal carries, and their bytes.
+    pub seals: usize,
+    pub seal_bytes: usize,
 }
 
 /// `Some(ms)` as the number, `None` as -1, for a log field.

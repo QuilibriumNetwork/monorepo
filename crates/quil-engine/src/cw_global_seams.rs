@@ -569,7 +569,10 @@ impl GlobalSeamProposer {
     /// not authenticate a claimed height. Only validated or recovered frames
     /// may populate `block_meta`. A block is held as its sending member's
     /// ([`BlockStore::put_from`]), so one member's bodies under a digest
-    /// cannot crowd out another's. `name` labels a sender in logs.
+    /// cannot crowd out another's. `name` labels a sender in logs. A body
+    /// carrying more bundles and requests than a GLOBAL frame may
+    /// ([`crate::frame_bound::MAX_GLOBAL_FRAME_ITEMS`]) cannot finalize and
+    /// is refused before it is decoded.
     fn peer_ingress(
         self: &Arc<Self>,
         store: BlockStore,
@@ -577,6 +580,12 @@ impl GlobalSeamProposer {
     ) -> Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync> {
         let finalizer = self.finalizer.clone();
         Arc::new(move |from: &FalconPublicKey, bytes: Vec<u8>| {
+            if crate::frame_bound::admit_global_block("committee block", &bytes, || name(from))
+                .is_err()
+            {
+                tracing::debug!("cw block ingress: body refused before decoding, dropping");
+                return;
+            }
             let Ok(frame) = decode_global_frame(&bytes) else {
                 tracing::debug!("cw block ingress: undecodable frame, dropping");
                 return;
@@ -2330,5 +2339,99 @@ mod ingress_tests {
             "{}",
             summary.senders
         );
+    }
+
+    /// Bundles and requests a GLOBAL frame may carry: the selected-parent
+    /// executor refuses a frame past them (`max_frame_items`).
+    const FRAME_ITEMS: usize = crate::frame_bound::MAX_GLOBAL_FRAME_ITEMS;
+
+    /// A GLOBAL frame whose header `frame_digest` names, with one bundle
+    /// of `requests` zero-length requests: four wire bytes a request.
+    fn member_body_of(requests: usize) -> (Digest, Vec<u8>) {
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 7,
+                output: vec![3; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
+        let mut bytes = encode_global_frame(&frame).unwrap();
+        // The encoding ends with its bundle count, zero here.
+        bytes.truncate(bytes.len() - 4);
+        let mut bundle = quil_execution::message_envelope::TYPE_MESSAGE_BUNDLE
+            .to_be_bytes()
+            .to_vec();
+        bundle.extend_from_slice(&(requests as u32).to_be_bytes());
+        bundle.resize(bundle.len() + 4 * requests, 0);
+        bundle.extend_from_slice(&1i64.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&(bundle.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&bundle);
+        (digest, bytes)
+    }
+
+    /// A committee member's block of zero-length requests decodes into one
+    /// `MessageRequest` per four wire bytes, on the thread that delivers
+    /// it. Peer ingress refuses a body carrying more bundles and requests
+    /// than a GLOBAL frame may before decoding it, and holds one within
+    /// that (one bundle and 99,999 requests), so the heap a member's block
+    /// costs here stays bounded by the frame limit, not its bytes.
+    #[test]
+    fn a_member_block_past_the_frame_items_is_refused_before_decoding() {
+        let proposer = Arc::new(GlobalSeamProposer::new(
+            Arc::new(NoProposal),
+            Arc::new(GlobalFrameVerifier::new(Arc::new(
+                quil_crypto::WesolowskiFrameProver::new(2048),
+            ))),
+            vec![],
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            None,
+        ));
+        let member = FalconPublicKey::from_bytes(&[8; 897]).unwrap();
+        let mut largest = 0.0f64;
+        let mut outcomes = Vec::new();
+        // One bundle each: at the limit (1 + 99,999 items) and one past it.
+        for requests in [1 << 16, FRAME_ITEMS - 1, FRAME_ITEMS, 1 << 17, 1 << 18] {
+            let store = BlockStore::new();
+            let ingress = proposer.peer_ingress(store.clone(), |_| "…member".into());
+            let (digest, bytes) = member_body_of(requests);
+            let wire = bytes.len();
+            let started = std::time::Instant::now();
+            let ((), heap) = crate::test_alloc::peak_by(|| ingress(&member, bytes));
+            let ingress_ms = started.elapsed().as_millis();
+            let held = !store.candidates(&digest).is_empty();
+            let ratio = heap as f64 / wire as f64;
+            largest = largest.max(ratio);
+            eprintln!(
+                "MEMBER-INGRESS-MEASURE requests={requests} wire_bytes={wire} peak_heap={heap} \
+                 per_wire_byte={ratio:.1} ingress_ms={ingress_ms} held={held}"
+            );
+            outcomes.push((requests, wire, heap, held));
+        }
+        let ceiling = crate::frame_materializer::MAX_GLOBAL_FRAME_BYTES;
+        eprintln!(
+            "MEMBER-INGRESS-MEASURE a {ceiling}-byte member block at {largest:.1} heap bytes a \
+             wire byte: {:.0} MiB decoded on the delivering thread",
+            largest * ceiling as f64 / f64::from(1 << 20)
+        );
+        for (requests, wire, heap, held) in outcomes {
+            // One bundle and `requests` requests: within when at most the limit.
+            if requests < FRAME_ITEMS {
+                assert!(
+                    held,
+                    "MEMBER-BLOCK-WITHIN-ITEMS: peer ingress dropped a member's body of one \
+                     bundle and {requests} requests, within the {FRAME_ITEMS} frame items"
+                );
+            } else {
+                assert!(
+                    !held && heap < 1 << 20,
+                    "MEMBER-BLOCK-PAST-ITEMS: peer ingress decoded a member's body of one bundle \
+                     and {requests} requests (frame items {FRAME_ITEMS}) from {wire} wire bytes \
+                     into {heap} heap bytes, held={held}"
+                );
+            }
+        }
     }
 }

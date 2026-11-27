@@ -611,6 +611,59 @@ fn tentative_deployment_matches_durable_application_state_and_continues_in_child
     assert_eq!(fixture.db.inner().latest_sequence_number(), sequence);
 }
 
+/// The GLOBAL materializer executes a frame's deploys with the PoMW basis
+/// of the frame's header: what an application's creation floor is a
+/// quarter of. Without it, every deploy after the floor frame is refused.
+#[test]
+fn global_execution_carries_the_frame_pomw_basis() {
+    let config = quil_execution::token_intrinsic::config::TokenConfiguration {
+        behavior: quil_execution::token_intrinsic::constants::DIVISIBLE as u32,
+        name: b"materializer basis token".to_vec(),
+        owner_public_key: vec![1; 32],
+        ..Default::default()
+    };
+    let deploy = quil_execution::token_intrinsic::TokenDeploy {
+        config: config.to_canonical_bytes().unwrap(),
+        rdf_schema: Vec::new(),
+    };
+    let paid = PaidDeploy::new(&deploy);
+    let (fixture, genesis) = Fixture::paying(None, &paid);
+    let seen = fixture
+        .source
+        .execution_manager
+        .record_contexts_for_test("token");
+    let root = fixture
+        .source
+        .capture_execution_branch(limits())
+        .unwrap()
+        .prover_root()
+        .unwrap();
+    let mut input = frame(1, root);
+    let header = input.header.as_mut().unwrap();
+    header.world_state_size = 1 << 30;
+    let basis = quil_execution::pricing::frame_pomw_basis(
+        header.difficulty as u64,
+        header.world_state_size,
+    )
+    .unwrap();
+    input.requests[0] = paid.bundle(&fixture.source.hypergraph, genesis);
+    fixture.source.materialize(&input).unwrap();
+    println!("REACH creation-floor basis");
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "harness: the deploy reached the token engine"
+    );
+    for context in seen.iter() {
+        assert_eq!(
+            context.pomw_basis,
+            Some(basis),
+            "global_basis_unwired: frame {} executed without its PoMW basis",
+            context.frame_number
+        );
+    }
+}
+
 #[test]
 fn capture_rejects_busy_opaque_foreign_and_inconsistent_sources() {
     let mut fixture = Fixture::new(None);

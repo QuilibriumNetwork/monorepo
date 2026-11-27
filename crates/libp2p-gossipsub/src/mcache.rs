@@ -79,6 +79,10 @@ pub(crate) struct MessageCache {
     evicted_messages: u64,
     evicted_bytes: u64,
     evicted_unvalidated: u64,
+    /// QUILIBRIUM: messages the byte budget evicted, each with the shifts left until its
+    /// history window would have dropped it ([`MessageCache::byte_evicted`]); at most the
+    /// messages put within one history.
+    byte_evicted: HashMap<MessageId, usize>,
 }
 
 /// QUILIBRIUM: the bytes a cached message is accounted for: its payload, signature, key and
@@ -117,7 +121,14 @@ impl MessageCache {
             evicted_messages: 0,
             evicted_bytes: 0,
             evicted_unvalidated: 0,
+            byte_evicted: HashMap::default(),
         }
+    }
+
+    /// QUILIBRIUM: whether the byte budget evicted `message_id` before its history window
+    /// would have dropped it, so that an IWANT for it now fails only for the budget.
+    pub(crate) fn byte_evicted(&self, message_id: &MessageId) -> bool {
+        self.byte_evicted.contains_key(message_id)
     }
 
     /// QUILIBRIUM: occupancy and eviction counters.
@@ -151,11 +162,13 @@ impl MessageCache {
             evicted_messages,
             evicted_bytes,
             evicted_unvalidated,
+            byte_evicted,
             ..
         } = self;
+        let windows = history.len();
         for validated_only in [true, false] {
             // `history[0]` is the newest window; within a window, entries are in arrival order.
-            for window in history.iter_mut().rev() {
+            for (age, window) in history.iter_mut().enumerate().rev() {
                 if *bytes <= target {
                     return;
                 }
@@ -179,6 +192,7 @@ impl MessageCache {
                         if !validated {
                             *evicted_unvalidated += 1;
                         }
+                        byte_evicted.insert(entry.mid.clone(), windows - age);
                     }
                     iwant_counts.remove(&entry.mid);
                     false
@@ -334,6 +348,11 @@ impl MessageCache {
 
         // Insert an empty vec in position 0
         self.history.insert(0, Vec::new());
+        // QUILIBRIUM: forget evictions whose window has now gone too.
+        self.byte_evicted.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
     }
 
     /// Removes a message from the cache and returns it if existent
@@ -659,5 +678,45 @@ mod tests {
         let (pending, m) = sized_message(5, 1000, topic);
         mc.put(&pending, m);
         assert!(mc.get_with_iwant_counts(&pending, &peer).is_none());
+    }
+    #[test]
+    /// QUILIBRIUM: a message the byte budget evicted is known as such until its history
+    /// window would have dropped it, and one the window dropped never is.
+    fn remembers_byte_evictions_until_their_window_ends() {
+        let topic = Topic::new("t").hash();
+        let (id, m) = sized_message(0, 1000, topic.clone());
+        let entry = cached_bytes(&id, &m);
+        let history = 5;
+        let mut mc = MessageCache::new(3, history, 4 * entry);
+        let (expired, m) = sized_message(9, 1000, topic.clone());
+        mc.put(&expired, m);
+        for _ in 0..history {
+            mc.shift();
+        }
+        assert!(mc.get(&expired).is_none() && !mc.byte_evicted(&expired));
+
+        let ids: Vec<MessageId> = (0..5)
+            .map(|i| {
+                let (id, m) = sized_message(i, 1000, topic.clone());
+                mc.put(&id, m);
+                id
+            })
+            .collect();
+        assert!(
+            mc.get(&ids[0]).is_none(),
+            "premise: the budget evicted the oldest"
+        );
+        assert!(mc.byte_evicted(&ids[0]));
+        assert!(!mc.byte_evicted(&ids[4]), "the newest is cached");
+        for shift in 1..history {
+            mc.shift();
+            assert!(
+                mc.byte_evicted(&ids[0]),
+                "still within its window after {shift}"
+            );
+        }
+        mc.shift();
+        assert!(!mc.byte_evicted(&ids[0]), "its window has gone");
+        assert!(mc.byte_evicted.is_empty());
     }
 }

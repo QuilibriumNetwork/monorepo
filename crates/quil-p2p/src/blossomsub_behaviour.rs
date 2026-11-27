@@ -180,6 +180,8 @@ pub struct BlossomSubBehaviour {
     /// Operator log state for gossip RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcLog,
     unsent_rpcs: UnsentRpcLog,
+    /// Operator log of peers' announcements (IHAVE) dropped, and of fallback asks.
+    announces: AnnounceLog,
     /// Operator log of peers answering under the message ids of releases before strict shard
     /// gossip.
     legacy_ids: LegacyIdLog,
@@ -235,6 +237,7 @@ impl BlossomSubBehaviour {
             cache_pressure: CachePressure::default(),
             rejected_rpcs: RejectedRpcLog::default(),
             unsent_rpcs: UnsentRpcLog::default(),
+            announces: AnnounceLog::default(),
             legacy_ids: LegacyIdLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
@@ -289,6 +292,7 @@ impl BlossomSubBehaviour {
         self.cache_pressure = CachePressure::default();
         self.rejected_rpcs = RejectedRpcLog::default();
         self.unsent_rpcs = UnsentRpcLog::default();
+        self.announces = AnnounceLog::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -545,6 +549,7 @@ impl BlossomSubBehaviour {
         self.rejected_rpcs
             .observe(self.inner.rejected_rpc_stats(), now);
         self.unsent_rpcs.observe(self.inner.unsent_rpc_stats(), now);
+        self.announces.observe(self.inner.announce_stats(), now);
         self.legacy_ids.observe(
             crate::node::strict_shard_gossip(),
             self.inner.take_legacy_id_answers(),
@@ -802,6 +807,121 @@ impl RejectedRpcLog {
             }
         }
         Some(line)
+    }
+}
+
+/// Dropped announcements and fallback asks are summarized at most this often.
+const ANNOUNCE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one [`AnnounceLog`] line counts, since the previous line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AnnounceCounts {
+    dropped_ihaves: u64,
+    dropped_ids: u64,
+    deferred_ids: u64,
+    unasked_ids: u64,
+    fallback_asks: u64,
+    deadline_asks: u64,
+    stale_announcers: u64,
+    evicted_iwants: u64,
+    large_first_from_source: u64,
+    large_first_pushed: u64,
+    large_first_pulled: u64,
+}
+
+/// Operator log of large gossip messages (a GLOBAL frame) by how their first copy came (from
+/// the source, pushed by a relay, pulled with IWANT), of peers' announcements (IHAVE) this
+/// node dropped or deferred to a later heartbeat (over gossipsub's per-heartbeat IHAVE and
+/// IWANT limits), of IWANTs sent to a kept announcer after the first broke its promise and of
+/// IWANTs it could not serve because
+/// its cache's byte budget evicted the message: one info line per [`ANNOUNCE_LOG_INTERVAL`]
+/// while any continues, with the counts since the previous line. A relay pushes a large
+/// message to a few mesh peers and announces it to the rest, which pull it unless a push
+/// arrives first, so a dropped announcement of one may be a copy this node must get from
+/// another announcer.
+#[derive(Debug, Default)]
+struct AnnounceLog {
+    /// Counters at the previous line.
+    logged: gossipsub::AnnounceStats,
+    last_log: Option<std::time::Instant>,
+}
+
+impl AnnounceLog {
+    /// Returns the counts since the previous line when one is due.
+    fn observe(
+        &mut self,
+        stats: gossipsub::AnnounceStats,
+        now: std::time::Instant,
+    ) -> Option<AnnounceCounts> {
+        let counts = AnnounceCounts {
+            dropped_ihaves: stats
+                .dropped_ihaves
+                .saturating_sub(self.logged.dropped_ihaves),
+            dropped_ids: stats.dropped_ids.saturating_sub(self.logged.dropped_ids),
+            deferred_ids: stats.deferred_ids.saturating_sub(self.logged.deferred_ids),
+            unasked_ids: stats.unasked_ids.saturating_sub(self.logged.unasked_ids),
+            fallback_asks: stats
+                .fallback_asks
+                .saturating_sub(self.logged.fallback_asks),
+            deadline_asks: stats
+                .deadline_asks
+                .saturating_sub(self.logged.deadline_asks),
+            stale_announcers: stats
+                .stale_announcers
+                .saturating_sub(self.logged.stale_announcers),
+            evicted_iwants: stats
+                .evicted_iwants
+                .saturating_sub(self.logged.evicted_iwants),
+            large_first_from_source: stats
+                .large_first_from_source
+                .saturating_sub(self.logged.large_first_from_source),
+            large_first_pushed: stats
+                .large_first_pushed
+                .saturating_sub(self.logged.large_first_pushed),
+            large_first_pulled: stats
+                .large_first_pulled
+                .saturating_sub(self.logged.large_first_pulled),
+        };
+        if counts == AnnounceCounts::default() {
+            return None;
+        }
+        let since = self.last_log.map(|at| now.duration_since(at));
+        if since.is_some_and(|since| since < ANNOUNCE_LOG_INTERVAL) {
+            return None;
+        }
+        self.logged = stats;
+        self.last_log = Some(now);
+        let latest_dropping_peer = stats
+            .last_dropping_peer
+            .map(|peer| peer.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            dropped_ihaves = counts.dropped_ihaves,
+            dropped_ids = counts.dropped_ids,
+            deferred_ids = counts.deferred_ids,
+            unasked_ids = counts.unasked_ids,
+            fallback_asks = counts.fallback_asks,
+            deadline_asks = counts.deadline_asks,
+            stale_announcers = counts.stale_announcers,
+            evicted_iwants = counts.evicted_iwants,
+            large_first_from_source = counts.large_first_from_source,
+            large_first_pushed = counts.large_first_pushed,
+            large_first_pulled = counts.large_first_pulled,
+            %latest_dropping_peer,
+            since_secs = since.map_or(0, |since| since.as_secs()),
+            "large gossip messages by how their first copy came (from the source, pushed by a \
+             relay, pulled), announcements dropped or deferred to a later heartbeat over the \
+             per-heartbeat IHAVE/IWANT limits, messages asked of a kept announcer after the \
+             first did not deliver in time (fallback) or of a kept mesh announcer by its latest \
+             start while the first stalled (deadline) or not asked of one past its relay cache window, \
+             and asks this node could \
+             not serve because its cache's byte budget evicted the message; the counts are \
+             since the previous line. A dropped announcement of a large message is pulled from \
+             another announcer or heartbeat gossip; check the latest dropping peer if \
+             dropped_ids stays high for hours, and the cache budget warning if evicted_iwants \
+             grows"
+        );
+        Some(counts)
     }
 }
 
@@ -1274,6 +1394,9 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
+        .lazy_forward_threshold(params.lazy_forward_threshold)
+        .lazy_eager_peers(params.lazy_eager_peers)
+        .lazy_followup_time(params.lazy_followup_time)
         // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
         // `protocol.rs` and is the smallest that carries the largest message
         // the node gossips: a GLOBAL frame of up to 15 MiB
@@ -1514,6 +1637,47 @@ mod propagation_tests {
     }
 
     #[test]
+    fn announce_drops_log_one_bounded_summary_per_interval() {
+        let stats = |dropped_ids, fallback_asks| gossipsub::AnnounceStats {
+            dropped_ihaves: dropped_ids,
+            dropped_ids,
+            fallback_asks,
+            ..Default::default()
+        };
+        let counts = |dropped_ids, fallback_asks| AnnounceCounts {
+            dropped_ihaves: dropped_ids,
+            dropped_ids,
+            fallback_asks,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = AnnounceLog::default();
+        let within = "at most one announce line per interval";
+        assert_eq!(log.observe(stats(0, 0), at(0)), None, "nothing to count");
+        assert_eq!(log.observe(stats(2, 0), at(1)), Some(counts(2, 0)));
+        assert_eq!(log.observe(stats(30, 1), at(2)), None, "{within}");
+        assert_eq!(log.observe(stats(40, 1), at(60)), None, "{within}");
+        assert_eq!(log.observe(stats(40, 1), at(61)), Some(counts(38, 1)));
+        assert_eq!(log.observe(stats(40, 1), at(200)), None, "nothing new");
+        assert_eq!(log.observe(stats(40, 2), at(201)), Some(counts(0, 1)));
+        let pulled = gossipsub::AnnounceStats {
+            large_first_pulled: 3,
+            evicted_iwants: 1,
+            ..stats(40, 2)
+        };
+        assert_eq!(
+            log.observe(pulled, at(300)),
+            Some(AnnounceCounts {
+                large_first_pulled: 3,
+                evicted_iwants: 1,
+                ..Default::default()
+            }),
+            "first copies and unserved asks alone make a line"
+        );
+    }
+
+    #[test]
     fn unsent_rpcs_log_one_bounded_summary_per_interval() {
         let stats = |unsent| gossipsub::UnsentRpcStats { unsent, last: None };
         let t0 = std::time::Instant::now();
@@ -1671,6 +1835,10 @@ mod propagation_tests {
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
+        build_swarm_with(crate::BlossomsubParams::default())
+    }
+
+    fn build_swarm_with(params: crate::BlossomsubParams) -> Swarm<BlossomSubBehaviour> {
         SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -1680,7 +1848,7 @@ mod propagation_tests {
             )
             .expect("tcp transport")
             .with_behaviour(|key| {
-                let mut b = BlossomSubBehaviour::new(0);
+                let mut b = BlossomSubBehaviour::with_params(0, params);
                 b.set_signing_identity(key.public().to_peer_id(), key.clone());
                 Ok(b)
             })
@@ -1955,6 +2123,100 @@ mod propagation_tests {
             "a relay must receive IDONTWANT (published={published}, a={}, b={})",
             idontwants_received(&relay_a),
             idontwants_received(&relay_b)
+        );
+    }
+
+    /// IWANT requests `swarm` sent, from gossipsub's own per-topic counter.
+    fn iwants_sent(swarm: &Swarm<BlossomSubBehaviour>) -> u64 {
+        crate::metrics::render(&swarm.behaviour().metrics_registry())
+            .lines()
+            .filter(|line| line.starts_with("gossipsub_topic_iwant_msgs_total{"))
+            .filter_map(|line| line.rsplit(' ').next()?.trim().parse::<u64>().ok())
+            .sum()
+    }
+
+    /// A relay that pushes no mesh peer a message over the lazy-forward
+    /// threshold (lazy_eager_peers 0) announces it, and a leaf that only the
+    /// relay reaches pulls it with IWANT. Chain hub - relay - leaf: the
+    /// hub's flood publish reaches the relay alone, so the leaf's copy comes
+    /// from the relay, by IWANT (counted on the leaf), not by a push.
+    #[tokio::test]
+    async fn a_large_message_crosses_a_relay_by_announce_and_pull() {
+        let bitmask = vec![0x80u8];
+        let payload = vec![9u8; crate::params::LAZY_FORWARD_THRESHOLD + 1];
+
+        let mut hub = build_swarm();
+        let mut relay = build_swarm_with(crate::BlossomsubParams {
+            lazy_eager_peers: 0,
+            ..Default::default()
+        });
+        let mut leaf = build_swarm();
+        let (relay_id, leaf_id) = (*relay.local_peer_id(), *leaf.local_peer_id());
+
+        for swarm in [&mut hub, &mut relay, &mut leaf] {
+            swarm.behaviour_mut().subscribe(bitmask.clone());
+        }
+        hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let hub_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
+                break address;
+            }
+        };
+        let relay_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                break address;
+            }
+        };
+        relay.dial(hub_addr).expect("relay dial hub");
+        leaf.dial(relay_addr).expect("leaf dial relay");
+
+        let mut published = false;
+        let mut leaf_got = false;
+        let ok = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                tokio::select! {
+                    _ = hub.select_next_some() => {}
+                    _ = relay.select_next_some() => {}
+                    ev = leaf.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BlossomSubEvent::Message { message, .. }) = ev {
+                            leaf_got |= message.data == payload;
+                        }
+                    }
+                }
+                if !published
+                    && hub.behaviour().peer_subscribed_to(&relay_id, &bitmask)
+                    && relay.behaviour().peer_subscribed_to(&leaf_id, &bitmask)
+                    && relay.behaviour().mesh_peers(&bitmask) >= 2
+                    && leaf.behaviour().mesh_peers(&bitmask) >= 1
+                {
+                    assert!(
+                        !hub.behaviour().peer_subscribed_to(&leaf_id, &bitmask),
+                        "premise: the hub does not reach the leaf"
+                    );
+                    published = hub
+                        .behaviour_mut()
+                        .publish(bitmask.clone(), payload.clone())
+                        .is_ok();
+                }
+                if leaf_got {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            ok,
+            "the leaf must receive the message (published={published})"
+        );
+        assert!(
+            iwants_sent(&leaf) >= 1,
+            "the leaf pulled its copy with IWANT after an IHAVE, not a push"
         );
     }
 }

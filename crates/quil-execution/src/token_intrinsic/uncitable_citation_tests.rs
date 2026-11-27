@@ -199,6 +199,7 @@ fn global_context() -> FrameExecutionContext {
         finalized_global_frame: Some(ANCHOR),
         shard: ShardPath::WHOLE,
         venue: Some(Venue::Global),
+        pomw_basis: None,
     }
 }
 
@@ -209,6 +210,7 @@ fn app_context() -> FrameExecutionContext {
         finalized_global_frame: Some(ANCHOR),
         shard: ShardPath::WHOLE,
         venue: Some(Venue::Application),
+        pomw_basis: None,
     }
 }
 

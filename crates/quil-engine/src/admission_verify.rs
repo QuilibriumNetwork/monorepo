@@ -847,6 +847,18 @@ impl AdmissionQueue {
             .contains(digest)
     }
 
+    /// Verifications running now, how many may run at once
+    /// ([`Self::set_threads`]) and submissions queued.
+    pub fn proof_load(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let queued = state.queue.len();
+        (
+            state.pending.len().saturating_sub(queued),
+            state.target_threads.max(1),
+            queued,
+        )
+    }
+
     /// Submissions queued ahead of `digest`; `None` when it is not queued
     /// (verifying, or not pending).
     pub fn queued_ahead(&self, digest: &[u8; 32]) -> Option<usize> {
@@ -856,6 +868,19 @@ impl AdmissionQueue {
             .queue
             .iter()
             .position(|item| &item.digest == digest)
+    }
+
+    /// Submissions queued ahead of the last queued of `digests` (a frame's
+    /// waiting on this queue); 0 when none of them is queued.
+    pub fn queued_ahead_of_any<'a>(
+        &self,
+        digests: impl IntoIterator<Item = &'a [u8; 32]>,
+    ) -> usize {
+        digests
+            .into_iter()
+            .filter_map(|digest| self.queued_ahead(digest))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Verify the first queued submission. False when none is queued.
@@ -916,14 +941,14 @@ impl AdmissionQueue {
             state.finish(&item.digest);
             state.window.released += 1;
             warn!(
-                scope = "this node's proof worker",
+                scope = "this process's proof worker",
                 submission = %hex::encode(&item.digest[..8]),
                 operations = item.operations,
                 failures,
                 action = "this node's proposals leave the submission out; it ages out of this node's pool unless \
                           another member's proposal carries it, and a frame carrying it verifies it inline; \
-                          check this node's proof worker (proofWorker settings, memory, CPU)",
-                "confidential proofs of a submission failed to verify in this node's proof worker"
+                          check this process's proof worker (proofWorker settings, memory, CPU)",
+                "confidential proofs of a submission failed to verify in this process's proof worker"
             );
         } else if (failures > 0 || counts.busy > 0) && !warm_back {
             // A warm-up whose proposal's time passed: left to the frame that
@@ -1050,21 +1075,172 @@ impl AdmissionQueue {
     }
 }
 
-/// Size the node's queue to a proof worker admitting `slots` verifications
-/// at once ([`background_threads`]); logged once per call (at startup).
-pub fn use_worker_slots(slots: usize) {
-    let threads = background_threads(Some(slots));
+/// This process's count of the node's shared proof worker slots and where
+/// it came from ([`use_worker_slots`]). A process takes at most its own
+/// count of the shared slot files; the node's processes together run at
+/// most the largest count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerSlots {
+    /// The shared slots this process's proof worker takes at most at once.
+    pub slots: usize,
+    /// `proofWorker.maxConcurrent` set the count.
+    pub configured: bool,
+    /// The count this process would size itself to with `maxConcurrent`
+    /// unset; `None` when it could not be read.
+    pub automatic: Option<usize>,
+}
+
+static WORKER_SLOTS: Mutex<Option<WorkerSlots>> = Mutex::new(None);
+
+/// Size this process's queue to a proof worker taking up to `slots.slots`
+/// of the node's shared slots at once ([`background_threads`]) and keep
+/// `slots` for the proof wait warnings ([`proof_queue_wait`]); logged once
+/// per call (at startup).
+pub fn use_worker_slots(slots: WorkerSlots) {
+    let threads = background_threads(Some(slots.slots));
     global().set_threads(threads);
+    *WORKER_SLOTS.lock().unwrap_or_else(|p| p.into_inner()) = Some(slots);
     info!(
-        scope = "this node",
-        worker_slots = slots,
+        scope = "this process",
+        worker_slots = slots.slots,
+        worker_slots_source = slots.slots_source(),
+        worker_slots_automatic = %or_unknown(slots.automatic),
         threads,
         "confidential proof admission queue sized: it verifies up to `threads` submissions at once and \
-         leaves the proof worker's other slots to frames and proposals verifying inline"
+         leaves the rest of this process's `worker_slots` to frames and proposals verifying inline"
     );
 }
 
-/// The node's queue.
+impl WorkerSlots {
+    /// Where the count came from, as the warnings name it.
+    pub fn slots_source(&self) -> &'static str {
+        if self.configured {
+            "proofWorker.maxConcurrent"
+        } else {
+            "automatic"
+        }
+    }
+}
+
+fn or_unknown(value: Option<usize>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+}
+
+/// What a busy refusal of the proof worker (`PROOF_WORKER_BUSY`) can mean,
+/// as the warnings say it: every way the worker client refuses busy (no
+/// slot of this process's or of the node's shared ones came free within the
+/// admission wait, the slot waiter list was full, or the memory admission
+/// refused). It claims none of them for a given frame.
+pub const PROOF_WORKER_REFUSAL: &str = "the proof worker refused admission: no slot came free in \
+    the wait, the slot waiter list was full, or memory admission refused";
+
+/// This process's proof queue and slot count as a frame waiting on them
+/// sees them, for the warnings of a frame still waiting for its proof
+/// verification and of a worker behind its shard on such a frame (mainnet,
+/// 2026-11-22: a node with `proofWorker.maxConcurrent: 2` on 128 CPUs
+/// waited up to 4700 s per frame behind 4-21 queued verifications, and its
+/// warnings named only memory, which was plentiful). These are facts of
+/// this process; the warnings infer no cause from them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofQueueWait {
+    /// Verifications the queue runs now.
+    pub verifying: usize,
+    /// Verifications it runs at once: the process's slots less one.
+    pub threads: usize,
+    /// Submissions queued in all.
+    pub queued: usize,
+    /// Submissions queued ahead of the frame's.
+    pub queued_ahead: usize,
+    /// The proof worker refused the frame busy (`PROOF_WORKER_BUSY`;
+    /// [`PROOF_WORKER_REFUSAL`]), rather than its proofs verifying on the
+    /// queue (`PROOF_VERIFICATION_PENDING`).
+    pub busy: bool,
+    /// This process's slot count; `None` before the worker was built.
+    pub slots: Option<WorkerSlots>,
+}
+
+/// [`ProofQueueWait`] now, for a frame whose submissions have `queued_ahead`
+/// queued ahead of them; `busy`: the proof worker refused it busy.
+pub fn proof_queue_wait(queued_ahead: usize, busy: bool) -> ProofQueueWait {
+    let (verifying, threads, queued) = global().proof_load();
+    ProofQueueWait {
+        verifying,
+        threads,
+        queued,
+        queued_ahead,
+        busy,
+        slots: *WORKER_SLOTS.lock().unwrap_or_else(|p| p.into_inner()),
+    }
+}
+
+impl ProofQueueWait {
+    /// The slot count, `unknown` before the worker was built.
+    pub fn slots_text(&self) -> String {
+        or_unknown(self.slots.map(|slots| slots.slots))
+    }
+
+    /// Where the slot count came from.
+    pub fn slots_source(&self) -> &'static str {
+        self.slots.map_or("unknown", |slots| slots.slots_source())
+    }
+
+    /// The count this process would size itself to with `maxConcurrent`
+    /// unset, `unknown` when not read.
+    pub fn automatic_text(&self) -> String {
+        or_unknown(self.slots.and_then(|slots| slots.automatic))
+    }
+
+    /// The one setting the warnings can name with certainty: a
+    /// `proofWorker.maxConcurrent` below the count this process would size
+    /// itself to with `maxConcurrent` unset. `None` otherwise. It never
+    /// depends on the queue or a busy refusal: several processes share the
+    /// slots and a refusal has several sources, so neither shows what holds
+    /// a frame.
+    pub fn check(&self) -> Option<String> {
+        let slots = self.slots.filter(|slots| slots.configured)?;
+        let automatic = slots
+            .automatic
+            .filter(|&automatic| automatic > slots.slots)?;
+        Some(format!(
+            "proofWorker.maxConcurrent={configured} is below the {automatic} this process would \
+             size itself to with maxConcurrent unset; this process uses up to {configured} of the \
+             node's shared slots; unset it or raise it toward {automatic} (keep maxConcurrent x \
+             nativeThreads within the CPUs)",
+            configured = slots.slots,
+        ))
+    }
+
+    /// [`PROOF_WORKER_REFUSAL`] when the proof worker refused the frame
+    /// busy.
+    pub fn refusal(&self) -> Option<&'static str> {
+        self.busy.then_some(PROOF_WORKER_REFUSAL)
+    }
+}
+
+impl std::fmt::Display for ProofQueueWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "queue verifying {} of {}, {} queued, {} ahead; proof_slots {} ({}, automatic {})",
+            self.verifying,
+            self.threads,
+            self.queued,
+            self.queued_ahead,
+            self.slots_text(),
+            self.slots_source(),
+            self.automatic_text(),
+        )?;
+        if let Some(check) = self.check() {
+            write!(f, "; {check}")?;
+        }
+        if let Some(refusal) = self.refusal() {
+            write!(f, "; {refusal}")?;
+        }
+        Ok(())
+    }
+}
+
+/// This process's queue.
 pub fn global() -> &'static Arc<AdmissionQueue> {
     static QUEUE: std::sync::OnceLock<Arc<AdmissionQueue>> = std::sync::OnceLock::new();
     QUEUE.get_or_init(|| AdmissionQueue::new(MAX_BUNDLES, MAX_BYTES, true))
@@ -1456,6 +1632,8 @@ mod tests {
         };
         assert_eq!(order(&queue), vec![[6; 32], [5; 32]]);
         assert_eq!(queue.queued_ahead(&[5; 32]), Some(1));
+        assert_eq!(queue.queued_ahead_of_any(&[[6; 32], [5; 32], [3; 32]]), 1);
+        assert_eq!(queue.queued_ahead_of_any(&[[3; 32]]), 0);
         // Full of submissions frames wait on, the queue refuses an arrival
         // (it verifies when a proposal or frame needs it) and takes it
         // again once one of them verified.
@@ -2082,5 +2260,141 @@ mod tests {
             2,
             "two of the bundles were seen: {line}"
         );
+    }
+
+    /// A proof wait of `slots` (configured, count, automatic) with the
+    /// queue and refusal given.
+    fn proof_wait_of(
+        slots: Option<(bool, usize, Option<usize>)>,
+        verifying: usize,
+        queued_ahead: usize,
+        busy: bool,
+    ) -> ProofQueueWait {
+        ProofQueueWait {
+            verifying,
+            threads: background_threads(slots.map(|(_, slots, _)| slots)),
+            queued: queued_ahead,
+            queued_ahead,
+            busy,
+            slots: slots.map(|(configured, slots, automatic)| WorkerSlots {
+                slots,
+                configured,
+                automatic,
+            }),
+        }
+    }
+
+    /// A `proofWorker.maxConcurrent` below the count this process would
+    /// size itself to with `maxConcurrent` unset is the one setting a proof
+    /// wait's check names: this process uses up to that many of the node's
+    /// shared slots. A node with two configured slots on 128 CPUs warned
+    /// 846 times naming only memory (mainnet, 2026-11-22).
+    #[test]
+    fn a_proof_wait_check_names_a_configured_slot_count_below_the_processs() {
+        let wait = proof_wait_of(Some((true, 2, Some(16))), 1, 21, false);
+        assert_eq!(
+            wait.check().as_deref(),
+            Some(
+                "proofWorker.maxConcurrent=2 is below the 16 this process would size itself to \
+                 with maxConcurrent unset; this process uses up to 2 of the node's shared slots; \
+                 unset it or raise it toward 16 (keep maxConcurrent x nativeThreads within the \
+                 CPUs)"
+            ),
+            "configured_below_unnamed"
+        );
+        assert_eq!(
+            wait.to_string(),
+            format!(
+                "queue verifying 1 of 1, 21 queued, 21 ahead; proof_slots 2 \
+                 (proofWorker.maxConcurrent, automatic 16); {}",
+                wait.check().unwrap()
+            ),
+            "configured_below_unshown"
+        );
+    }
+
+    /// Every other proof wait has no check: an automatic count, a
+    /// configured one at or above this process's, or an unknown one.
+    #[test]
+    fn a_proof_wait_has_no_check_unless_configured_below_the_processs() {
+        for (case, slots) in [
+            ("automatic", Some((false, 16, Some(16)))),
+            (
+                "automatic below its own reading",
+                Some((false, 2, Some(16))),
+            ),
+            ("configured at this process's", Some((true, 16, Some(16)))),
+            (
+                "configured above this process's",
+                Some((true, 32, Some(16))),
+            ),
+            ("this process's count unknown", Some((true, 2, None))),
+            ("no worker built", None),
+        ] {
+            let wait = proof_wait_of(slots, 1, 21, false);
+            assert_eq!(wait.check(), None, "check_without_a_setting ({case})");
+            assert!(
+                !wait.to_string().contains("maxConcurrent="),
+                "check_without_a_setting ({case}): {wait}"
+            );
+        }
+    }
+
+    /// A busy refusal is named by one fixed sentence listing every source
+    /// of the worker client's busy refusal (no slot came free in the wait,
+    /// the waiter list was full, memory admission refused) and claiming no
+    /// state; a wait that was not refused names none.
+    #[test]
+    fn a_busy_proof_wait_names_every_source_of_the_refusal() {
+        for slots in [Some((true, 2, Some(16))), Some((false, 16, Some(16))), None] {
+            let busy = proof_wait_of(slots, 0, 0, true);
+            assert_eq!(
+                busy.refusal(),
+                Some(
+                    "the proof worker refused admission: no slot came free in the wait, the \
+                     slot waiter list was full, or memory admission refused"
+                ),
+                "busy_refusal_misnamed"
+            );
+            assert!(
+                busy.to_string().ends_with(PROOF_WORKER_REFUSAL),
+                "busy_refusal_unshown: {busy}"
+            );
+            let verifying = proof_wait_of(slots, 0, 0, false);
+            assert_eq!(verifying.refusal(), None, "refusal_without_busy");
+            assert!(
+                !verifying.to_string().contains("refused"),
+                "refusal_without_busy: {verifying}"
+            );
+        }
+    }
+
+    /// A proof wait's check is the same whatever this process's queue
+    /// holds and whether the worker refused the frame busy: neither shows
+    /// what holds the frame (the slots are shared with the node's other
+    /// processes; a refusal has several sources), so the check infers no
+    /// cause from them.
+    #[test]
+    fn a_proof_wait_check_is_the_same_whatever_the_queue_holds_or_the_worker_refused() {
+        for slots in [
+            Some((true, 2, Some(16))),
+            Some((false, 16, Some(16))),
+            Some((true, 3, None)),
+            None,
+        ] {
+            let check = proof_wait_of(slots, 0, 0, false).check();
+            for verifying in [0, 1, 15] {
+                for queued_ahead in [0, 21] {
+                    for busy in [false, true] {
+                        assert_eq!(
+                            proof_wait_of(slots, verifying, queued_ahead, busy).check(),
+                            check,
+                            "check_infers_a_cause: slots {slots:?}, verifying {verifying}, \
+                             queued_ahead {queued_ahead}, busy {busy}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

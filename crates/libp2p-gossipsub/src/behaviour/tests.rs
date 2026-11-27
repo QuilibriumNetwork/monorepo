@@ -4659,6 +4659,10 @@ fn test_ignore_too_many_ihaves() {
     // add another peer not in the mesh
     let (peer, receiver) = add_peer(&mut gs, &topics, false, false);
     receivers.insert(peer, receiver);
+    // QUILIBRIUM: a subscribed peer joins a mesh below `mesh_n_low` at once; take it out, as
+    // a mesh peer's single-id IHAVEs are announcements, capped apart
+    // (`asks_for_a_mesh_announcement_past_the_ihave_message_cap`).
+    gs.mesh.get_mut(&topics[0]).unwrap().remove(&peer);
 
     // peer has 20 messages
     let mut seq = 0;
@@ -4786,17 +4790,22 @@ fn test_ignore_too_many_messages_in_ihave() {
     );
 
     // we sent 10 iwant messages ids via a IWANT rpc.
+    // QUILIBRIUM: the ids not asked for over the budget were kept with the peer
+    // as their announcer, and are those asked on the heartbeat, in one IWANT; the
+    // new IHAVE's ids are kept in turn.
+    let deferred: HashSet<_> = message_ids[8..20].iter().collect();
     let mut sum = 0;
     let (control_msgs, _) = count_control_msgs(receivers, |p, rpc| match rpc {
         RpcOut::IWant(IWant { message_ids }) => {
             p == &peer && {
+                assert!(deferred.is_superset(&message_ids.iter().collect()));
                 sum += message_ids.len();
                 true
             }
         }
         _ => false,
     });
-    assert_eq!(control_msgs, 1);
+    assert_eq!(control_msgs, 1, "the deferred ids are asked in one IWANT");
     assert_eq!(sum, 10, "exactly 20 iwants should get sent");
 }
 
@@ -7402,5 +7411,2069 @@ fn iwant_answers_under_a_legacy_id_are_counted() {
     assert!(
         gs.take_legacy_id_answers().is_empty(),
         "taking resets the counts"
+    );
+}
+
+/// QUILIBRIUM: the encoded size of the 1024-byte relayed message the lazy
+/// forwarding tests send on "topic1"; every random peer id encodes to the
+/// same length.
+fn lazy_test_message_len() -> usize {
+    RawMessage {
+        source: Some(PeerId::random()),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: Topic::new("topic1").hash(),
+        signature: None,
+        key: None,
+        validated: true,
+    }
+    .raw_protobuf_len()
+}
+
+/// QUILIBRIUM: with no eager peers, a relayed message one byte over
+/// `lazy_forward_threshold` goes to mesh peers as an IHAVE, never as the
+/// message, and an IWANT for it is answered from the cache; an explicit peer
+/// is still pushed the message.
+#[test]
+fn announces_a_large_relayed_message_to_mesh_peers() {
+    let threshold = lazy_test_message_len() - 1;
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(threshold)
+        .lazy_eager_peers(0)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mesh: HashSet<PeerId> = gs.mesh[&topic_hashes[0]].iter().copied().collect();
+    assert!(
+        !mesh.contains(&peers[0]) && mesh.contains(&peers[1]) && mesh.len() == 4,
+        "premise: the explicit peer is outside a mesh of the other four"
+    );
+
+    let raw_message = RawMessage {
+        source: Some(peers[1]),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert_eq!(
+        raw_message.raw_protobuf_len(),
+        threshold + 1,
+        "premise: one byte over the threshold"
+    );
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    gs.handle_received_message(raw_message, &PeerId::random());
+
+    let mut announced = HashSet::new();
+    let mut pushed = HashSet::new();
+    let (_, receivers) = count_control_msgs(receivers, |peer_id, rpc| {
+        match rpc {
+            RpcOut::IHave(IHave {
+                topic_hash,
+                message_ids,
+            }) if *topic_hash == topic_hashes[0] && message_ids == &vec![msg_id.clone()] => {
+                announced.insert(*peer_id);
+            }
+            RpcOut::Forward { .. } => {
+                pushed.insert(*peer_id);
+            }
+            _ => {}
+        }
+        false
+    });
+    let others: HashSet<PeerId> = mesh.iter().copied().filter(|p| *p != peers[1]).collect();
+    assert_eq!(
+        announced, others,
+        "every mesh peer but the source gets an IHAVE"
+    );
+    assert_eq!(
+        pushed,
+        HashSet::from([peers[0]]),
+        "only the explicit peer is pushed the message"
+    );
+
+    let puller = *others.iter().next().unwrap();
+    gs.handle_iwant(&puller, vec![msg_id.clone()]);
+    let mut served = Vec::new();
+    count_control_msgs(receivers, |peer_id, rpc| {
+        if let RpcOut::Forward { message, .. } = rpc {
+            served.push((*peer_id, message.clone()));
+        }
+        false
+    });
+    assert_eq!(served.len(), 1, "one copy, to the peer that asked");
+    assert_eq!(served[0].0, puller);
+    let served = gs
+        .data_transform
+        .inbound_transform(served[0].1.clone())
+        .unwrap();
+    assert_eq!(gs.config.message_id(&served), msg_id);
+}
+
+/// QUILIBRIUM: a relayed message exactly at `lazy_forward_threshold` is
+/// pushed to mesh peers as before, with no IHAVE.
+#[test]
+fn pushes_a_relayed_message_at_the_lazy_threshold() {
+    let threshold = lazy_test_message_len();
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(threshold)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(4)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let raw_message = RawMessage {
+        source: Some(peers[0]),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert_eq!(
+        raw_message.raw_protobuf_len(),
+        threshold,
+        "premise: exactly at the threshold"
+    );
+    gs.handle_received_message(raw_message, &PeerId::random());
+    let mut pushed = HashSet::new();
+    let (ihaves, _) = count_control_msgs(receivers, |peer_id, rpc| {
+        if matches!(rpc, RpcOut::Forward { .. }) {
+            pushed.insert(*peer_id);
+        }
+        matches!(rpc, RpcOut::IHave(_))
+    });
+    assert_eq!(
+        ihaves, 0,
+        "no IHAVE for a message at or below the threshold"
+    );
+    assert_eq!(pushed, HashSet::from([peers[1], peers[2], peers[3]]));
+}
+
+/// QUILIBRIUM: a relayed message over `lazy_forward_threshold` is still pushed
+/// to a floodsub peer, which has no mesh and never answers an IHAVE, while
+/// gossipsub mesh peers get the IHAVE (no eager peers).
+#[test]
+fn pushes_a_large_relayed_message_to_floodsub_peers() {
+    let threshold = lazy_test_message_len() - 1;
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(threshold)
+        .lazy_eager_peers(0)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (flood_peer, flood_receiver) = add_peer_with_addr_and_kind(
+        &mut gs,
+        &topic_hashes,
+        false,
+        false,
+        Multiaddr::empty(),
+        Some(PeerKind::Floodsub),
+    );
+    let mut receivers = receivers;
+    receivers.insert(flood_peer, flood_receiver);
+    assert!(
+        !gs.mesh[&topic_hashes[0]].contains(&flood_peer)
+            && gs.connected_peers[&flood_peer]
+                .topics
+                .contains(&topic_hashes[0]),
+        "premise: the floodsub peer is subscribed and outside the mesh"
+    );
+
+    let raw_message = RawMessage {
+        source: Some(PeerId::random()),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert!(
+        raw_message.raw_protobuf_len() > threshold,
+        "premise: over the threshold"
+    );
+    gs.handle_received_message(raw_message, &PeerId::random());
+
+    let mut announced = HashSet::new();
+    let mut pushed = HashSet::new();
+    count_control_msgs(receivers, |peer_id, rpc| {
+        match rpc {
+            RpcOut::IHave(_) => {
+                announced.insert(*peer_id);
+            }
+            RpcOut::Forward { .. } => {
+                pushed.insert(*peer_id);
+            }
+            _ => {}
+        }
+        false
+    });
+    assert_eq!(
+        pushed,
+        HashSet::from([flood_peer]),
+        "the floodsub peer is pushed the message"
+    );
+    assert_eq!(
+        announced,
+        peers.iter().copied().collect::<HashSet<_>>(),
+        "the gossipsub mesh peers get the IHAVE"
+    );
+}
+
+/// QUILIBRIUM: the message ids of the IWANTs queued for each peer since the
+/// last call, and the receivers back.
+fn iwants_by_peer(
+    receivers: HashMap<PeerId, Receiver>,
+) -> (HashMap<PeerId, Vec<MessageId>>, HashMap<PeerId, Receiver>) {
+    let mut iwants: HashMap<PeerId, Vec<MessageId>> = HashMap::new();
+    let (_, receivers) = count_control_msgs(receivers, |peer_id, rpc| {
+        if let RpcOut::IWant(IWant { message_ids }) = rpc {
+            iwants
+                .entry(*peer_id)
+                .or_default()
+                .extend(message_ids.iter().cloned());
+        }
+        false
+    });
+    (iwants, receivers)
+}
+
+/// QUILIBRIUM: the node's gossip timings (quil-p2p `params`): 24 heartbeats of
+/// 700 ms in the cache, 16 of them gossiped, and a follow-up of 8 s on a mesh
+/// announcement and 3 s on heartbeat gossip.
+fn node_timing_config() -> Config {
+    ConfigBuilder::default()
+        .history_length(24)
+        .history_gossip(16)
+        .heartbeat_interval(Duration::from_millis(700))
+        .lazy_followup_time(Duration::from_secs(8))
+        .iwant_followup_time(Duration::from_secs(3))
+        .build()
+        .unwrap()
+}
+
+/// QUILIBRIUM: lets `by` pass for the promises and kept announcers, then runs
+/// a heartbeat.
+fn heartbeat_after(
+    gs: &mut Behaviour<IdentityTransform, AllowAllSubscriptionFilter>,
+    by: Duration,
+) {
+    gs.gossip_promises.backdate(by);
+    gs.heartbeat();
+}
+
+/// QUILIBRIUM: a message announced by several mesh peers is asked of the
+/// first; when that one never answers, the announcer with the latest first IHAVE
+/// is asked on the first heartbeat after the follow-up time, and the message
+/// arrives from it. Nobody else is asked once it has arrived. The cache of ten
+/// heartbeats puts the others' latest start (5 s on) past that break (3 s).
+#[test]
+fn asks_the_next_announcer_when_the_first_never_answers() {
+    let config = ConfigBuilder::default().history_length(10).build().unwrap();
+    let followup = config.lazy_followup_time();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    assert!(
+        peers
+            .iter()
+            .all(|peer| gs.mesh[&topic_hashes[0]].contains(peer)),
+        "premise: every announcer is a mesh peer"
+    );
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "only the first announcer is asked at first"
+    );
+
+    // The first never answers.
+    heartbeat_after(&mut gs, followup / 2);
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert!(iwants.is_empty(), "nobody else while it may: {iwants:?}");
+    heartbeat_after(&mut gs, followup / 2 + Duration::from_millis(1));
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[2], vec![msg_id.clone()])]),
+        "the first heartbeat after the follow-up asks the freshest announcer, alone"
+    );
+    let stats = gs.announce_stats();
+    assert_eq!((stats.fallback_asks, stats.deadline_asks), (1, 0));
+
+    gs.handle_received_message(raw_message, &peers[2]);
+    assert!(
+        gs.events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+        )),
+        "the message arrives from it"
+    );
+
+    heartbeat_after(&mut gs, followup * 2);
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.values().all(|ids| !ids.contains(&msg_id)),
+        "nobody is asked again once the message arrived: {iwants:?}"
+    );
+}
+
+/// QUILIBRIUM: a promise from a mesh peer's announcement lasts
+/// `lazy_followup_time`, one from heartbeat gossip `iwant_followup_time`;
+/// only the second has broken, and the gossiped message's other announcer,
+/// outside the mesh, is asked on that heartbeat.
+#[test]
+fn a_mesh_announcement_waits_the_lazy_followup_time() {
+    let config = ConfigBuilder::default()
+        .iwant_followup_time(Duration::from_millis(1))
+        .lazy_followup_time(Duration::from_secs(3600))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mut receivers = receivers;
+    let mut outside = Vec::new();
+    // Outside the mesh: peers that did not subscribe, as heartbeat gossip may
+    // come from (a subscribed one joins a mesh below mesh_n_low at once).
+    for _ in 0..2 {
+        let (peer, receiver) = add_peer(&mut gs, &[], false, false);
+        receivers.insert(peer, receiver);
+        outside.push(peer);
+    }
+    let mesh = &gs.mesh[&topic_hashes[0]];
+    assert!(
+        peers.iter().all(|peer| mesh.contains(peer))
+            && outside.iter().all(|peer| !mesh.contains(peer)),
+        "premise: two mesh peers and two outside the mesh"
+    );
+    let mut seq = 0;
+    let mut id_of = |gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        let raw = random_message(&mut seq, &topic_hashes);
+        let message = gs.data_transform.inbound_transform(raw).unwrap();
+        gs.config.message_id(&message)
+    };
+    let announced = id_of(&gs);
+    let gossiped = id_of(&gs);
+
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topic_hashes[0].clone(), vec![announced.clone()])],
+    );
+    for peer in &outside {
+        gs.handle_ihave(
+            peer,
+            vec![(topic_hashes[0].clone(), vec![gossiped.clone()])],
+        );
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([
+            (peers[0], vec![announced.clone()]),
+            (outside[0], vec![gossiped.clone()]),
+        ]),
+        "premise: each message asked of its first announcer"
+    );
+
+    heartbeat_after(&mut gs, Duration::from_millis(20));
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(outside[1], vec![gossiped.clone()])]),
+        "the gossiped message's other announcer is asked on the break; the mesh \
+         announcement still waits"
+    );
+    assert!(
+        gs.gossip_promises.promised_by(&announced, &peers[0])
+            && gs.gossip_promises.promised_by(&gossiped, &outside[1])
+            && !gs.gossip_promises.promised_by(&gossiped, &outside[0]),
+        "only the gossiped message's first promise broke"
+    );
+}
+
+/// QUILIBRIUM: an IHAVE over the per-heartbeat count is dropped and counted;
+/// ids of an IHAVE past the IWANT budget are kept with their announcer and
+/// counted as deferred, and asked on the next heartbeat.
+#[test]
+fn counts_announcements_dropped_over_the_ihave_limits() {
+    let config = ConfigBuilder::default()
+        .max_ihave_messages(1)
+        .max_ihave_length(3)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut seq = 0;
+    let mut ids = |n: usize, gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        (0..n)
+            .map(|_| {
+                let raw = random_message(&mut seq, &topic_hashes);
+                let message = gs.data_transform.inbound_transform(raw).unwrap();
+                gs.config.message_id(&message)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Two ids: a mesh peer's single id is an announcement, counted apart.
+    let first = ids(2, &gs);
+    let dropped = ids(2, &gs);
+    let over_budget = ids(4, &gs);
+
+    // One peer sends a second IHAVE in the heartbeat: dropped whole.
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), first)]);
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), dropped)]);
+    // Another announces four ids against a budget of three: one is deferred.
+    gs.handle_ihave(
+        &peers[1],
+        vec![(topic_hashes[0].clone(), over_budget.clone())],
+    );
+
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (
+            stats.dropped_ihaves,
+            stats.dropped_ids,
+            stats.unasked_ids,
+            stats.deferred_ids
+        ),
+        (1, 2, 0, 1),
+        "one IHAVE of two ids dropped, one id over budget deferred: {stats:?}"
+    );
+    assert_eq!(stats.last_dropping_peer, Some(peers[1]));
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    let asked = iwants[&peers[1]].clone();
+    assert_eq!(asked.len(), 3, "premise: three asked at once");
+
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    let rest: Vec<_> = over_budget
+        .into_iter()
+        .filter(|id| !asked.contains(id))
+        .collect();
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[1], rest)]),
+        "the deferred id is asked on the next heartbeat"
+    );
+}
+
+/// QUILIBRIUM: `n` ids of random messages on the first topic.
+fn lazy_message_ids(
+    gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>,
+    seq: &mut u64,
+    topic_hashes: &[TopicHash],
+    n: usize,
+) -> Vec<MessageId> {
+    (0..n)
+        .map(|_| {
+            let raw = random_message(seq, topic_hashes);
+            let message = gs.data_transform.inbound_transform(raw).unwrap();
+            gs.config.message_id(&message)
+        })
+        .collect()
+}
+
+/// QUILIBRIUM: the peers pushed and announced one large relayed message from a
+/// source outside a mesh of six, with `eager` eager peers; `refused` sent an
+/// IDONTWANT for it first.
+fn lazy_forward_split(
+    eager: usize,
+    refused: bool,
+) -> (HashSet<PeerId>, HashSet<PeerId>, HashSet<PeerId>, PeerId) {
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(lazy_test_message_len() - 1)
+        .lazy_eager_peers(eager)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(6)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    gs.mesh
+        .get_mut(&topic_hashes[0])
+        .unwrap()
+        .extend(peers.iter().copied());
+    let mesh: HashSet<PeerId> = gs.mesh[&topic_hashes[0]].iter().copied().collect();
+    assert_eq!(mesh.len(), 6, "premise: all six peers in the mesh");
+    let raw_message = RawMessage {
+        source: Some(PeerId::random()),
+        data: vec![7u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    if refused {
+        gs.connected_peers
+            .get_mut(&peers[0])
+            .unwrap()
+            .dont_send
+            .insert(msg_id.clone(), Instant::now());
+    }
+    gs.handle_received_message(raw_message, &PeerId::random());
+    let mut announced = HashSet::new();
+    let mut pushed = HashSet::new();
+    count_control_msgs(receivers, |peer_id, rpc| {
+        match rpc {
+            RpcOut::IHave(IHave { message_ids, .. }) if message_ids == &vec![msg_id.clone()] => {
+                announced.insert(*peer_id);
+            }
+            RpcOut::Forward { .. } => {
+                pushed.insert(*peer_id);
+            }
+            _ => {}
+        }
+        false
+    });
+    (pushed, announced, mesh, peers[0])
+}
+
+/// QUILIBRIUM: a large relayed message is pushed to exactly `lazy_eager_peers`
+/// mesh peers and announced to the rest of the mesh; at 0 every mesh peer is
+/// announced to, and at or above the mesh size every one is pushed to.
+#[test]
+fn pushes_a_large_relayed_message_to_the_eager_peers_and_announces_it_to_the_rest() {
+    for eager in [0, 1, 2, 5, 6, 7] {
+        let (pushed, announced, mesh, _) = lazy_forward_split(eager, false);
+        assert_eq!(
+            (pushed.len(), announced.len()),
+            (eager.min(6), 6 - eager.min(6)),
+            "lazy_eager_peers {eager}: pushes and announcements"
+        );
+        assert!(
+            pushed.is_disjoint(&announced)
+                && pushed.union(&announced).copied().collect::<HashSet<_>>() == mesh,
+            "lazy_eager_peers {eager}: each mesh peer gets one, push or IHAVE"
+        );
+    }
+}
+
+/// QUILIBRIUM: a mesh peer that sent IDONTWANT for a large message is neither
+/// pushed nor announced it, and is not counted among the eager peers.
+#[test]
+fn a_peer_that_refused_a_large_message_is_neither_pushed_nor_announced_it() {
+    let (pushed, announced, _, refused) = lazy_forward_split(6, true);
+    assert!(
+        !pushed.contains(&refused) && !announced.contains(&refused),
+        "the refusing peer gets nothing"
+    );
+    assert_eq!(
+        (pushed.len(), announced.len()),
+        (5, 0),
+        "the other five are pushed"
+    );
+}
+
+/// QUILIBRIUM: a message a withholding mesh peer announced and was asked for
+/// arrives by a push from another peer without waiting for the promise; the
+/// withholder is then asked nothing more and nobody else is asked.
+#[test]
+fn a_withholding_announcer_delays_nothing_when_a_push_arrives() {
+    let config = ConfigBuilder::default()
+        .lazy_followup_time(Duration::from_secs(3600))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    for peer in &peers[..2] {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "premise: the withholder, first to announce, is asked"
+    );
+
+    gs.handle_received_message(raw_message, &peers[2]);
+    assert!(
+        gs.events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+        )),
+        "the pushed copy is delivered at once"
+    );
+    assert!(
+        !gs.gossip_promises.contains(&msg_id),
+        "no promise is left open for it"
+    );
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty(),
+        "nobody is asked after the push: {iwants:?}"
+    );
+}
+
+/// QUILIBRIUM: with no push, a withholding first announcer delays the message
+/// to the second announcer's latest start: at the node's timings it is not
+/// asked through nine heartbeats while the first promise is open, and is
+/// asked on the tenth (7 s), the last before its latest start (7.4 s), so its
+/// promise breaks (15 s) within its 16.1 s.
+#[test]
+fn a_withholding_announcer_delays_the_next_ask_to_its_latest_start() {
+    let config = node_timing_config();
+    let heartbeat = config.heartbeat_interval();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (_, mut receivers) = iwants_by_peer(receivers);
+
+    for _ in 0..9 {
+        heartbeat_after(&mut gs, heartbeat);
+    }
+    let (iwants, rest) = iwants_by_peer(receivers);
+    receivers = rest;
+    assert!(
+        iwants.is_empty(),
+        "no second ask before its latest start: {iwants:?}"
+    );
+
+    heartbeat_after(&mut gs, heartbeat);
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[1], vec![msg_id])]),
+        "the second announcer is asked by its latest start"
+    );
+    assert_eq!(gs.announce_stats().deadline_asks, 1);
+}
+
+/// QUILIBRIUM: when the first announcer breaks its promise, the kept ones
+/// that left or fell below the gossip threshold are forgotten, one that used
+/// up its IWANT budget stays kept, and the latest first IHAVE that can be asked is.
+#[test]
+fn skips_later_announcers_that_cannot_be_asked() {
+    let config = ConfigBuilder::default()
+        .lazy_followup_time(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .scoring(Some((
+            PeerScoreParams {
+                app_specific_weight: 1.0,
+                ..Default::default()
+            },
+            PeerScoreThresholds::default(),
+        )))
+        .create_network();
+    // Announced in this order, so the latest first IHAVE is left, low, spent.
+    let (first, next, spent, low, left) = (peers[0], peers[1], peers[2], peers[3], peers[4]);
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(first, vec![msg_id.clone()])]),
+        "premise: the first announcer is asked"
+    );
+
+    disconnect_peer(&mut gs, &left);
+    assert!(gs.set_application_score(&low, -1000.0));
+    assert!(
+        gs.peer_score
+            .below_threshold(&low, |ts| ts.gossip_threshold)
+            .0,
+        "premise: below the gossip threshold"
+    );
+    gs.gossip_promises.backdate(Duration::from_millis(20));
+    gs.count_sent_iwant
+        .insert(spent, gs.config.max_ihave_length());
+    gs.apply_iwant_penalties();
+    gs.ask_kept_announcers();
+
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(next, vec![msg_id.clone()])]),
+        "only the announcer that can be asked is"
+    );
+    assert!(gs.gossip_promises.promised_by(&msg_id, &next));
+    assert_eq!(gs.announce_stats().fallback_asks, 1);
+    assert_eq!(
+        gs.gossip_promises.kept_announcers(&msg_id),
+        vec![spent],
+        "the one over its budget stays kept; those gone are forgotten"
+    );
+}
+
+/// QUILIBRIUM: an IHAVE from a peer that used up its IWANT budget in this
+/// heartbeat is not dropped: its ids are kept with it as their announcer, up
+/// to `max_ihave_length` new ids per heartbeat (past that one is counted as
+/// unasked), and asked on the next heartbeat.
+#[test]
+fn keeps_ids_past_the_sent_iwant_budget_for_the_next_heartbeat() {
+    let config = ConfigBuilder::default()
+        .max_ihave_length(2)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut seq = 0;
+    let spends = lazy_message_ids(&gs, &mut seq, &topic_hashes, 2);
+    let later = lazy_message_ids(&gs, &mut seq, &topic_hashes, 3);
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), spends)]);
+    assert_eq!(gs.announce_stats(), AnnounceStats::default(), "premise");
+    let (_, receivers) = iwants_by_peer(receivers);
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), later.clone())]);
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (
+            stats.dropped_ihaves,
+            stats.deferred_ids,
+            stats.unasked_ids,
+            stats.last_dropping_peer
+        ),
+        (0, 2, 1, Some(peers[0])),
+        "two ids kept for later, one past the deferred cap: {stats:?}"
+    );
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty(),
+        "nothing asked past the budget: {iwants:?}"
+    );
+
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    let asked = iwants.get(&peers[0]).cloned().unwrap_or_default();
+    assert!(
+        asked.len() == 2 && asked.iter().all(|id| later.contains(id)),
+        "the two kept ids are asked on the next heartbeat: {iwants:?}"
+    );
+}
+
+/// QUILIBRIUM: a mesh peer's single-id announcements do not count against
+/// `max_ihave_messages`: the eleventh in a heartbeat is asked for, while a
+/// peer outside the mesh has its eleventh single-id IHAVE dropped.
+#[test]
+fn asks_for_a_mesh_announcement_past_the_ihave_message_cap() {
+    let config = Config::default();
+    assert_eq!(config.max_ihave_messages(), 10, "premise");
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut receivers = receivers;
+    let (outside, receiver) = add_peer(&mut gs, &[], false, false);
+    receivers.insert(outside, receiver);
+    assert!(
+        gs.mesh[&topic_hashes[0]].contains(&peers[0])
+            && !gs.mesh[&topic_hashes[0]].contains(&outside),
+        "premise: one peer in the mesh, one outside"
+    );
+    let mut seq = 0;
+    for peer in [peers[0], outside] {
+        for id in lazy_message_ids(&gs, &mut seq, &topic_hashes, 11) {
+            gs.handle_ihave(&peer, vec![(topic_hashes[0].clone(), vec![id])]);
+        }
+    }
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        (iwants[&peers[0]].len(), iwants[&outside].len()),
+        (11, 10),
+        "all eleven mesh announcements asked; the outside peer's eleventh dropped"
+    );
+}
+
+/// QUILIBRIUM: a mesh peer's announcements are capped at `max_ihave_length`
+/// per heartbeat on their own count, even those that cost no IWANT: the next
+/// is not asked but kept with its announcer and asked on the next heartbeat,
+/// while that peer's multi-id IHAVE is still asked. The count starts again
+/// each heartbeat.
+#[test]
+fn caps_mesh_announcements_at_the_iwant_budget_per_heartbeat() {
+    let config = ConfigBuilder::default()
+        .max_ihave_length(3)
+        .max_ihave_messages(1)
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut seq = 0;
+    let seen = lazy_message_ids(&gs, &mut seq, &topic_hashes, 2);
+    for id in &seen {
+        gs.duplicate_cache.insert(id.clone());
+    }
+    let at_cap = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    let over_cap = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for id in seen.iter().chain([&at_cap, &over_cap]) {
+        gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), vec![id.clone()])]);
+    }
+    let multi = lazy_message_ids(&gs, &mut seq, &topic_hashes, 2);
+    gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), multi.clone())]);
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (stats.dropped_ihaves, stats.deferred_ids, stats.unasked_ids),
+        (0, 1, 0),
+        "the fourth announcement is kept for later, nothing dropped: {stats:?}"
+    );
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    let mut asked = iwants.get(&peers[0]).cloned().unwrap_or_default();
+    asked.sort();
+    let mut want = multi;
+    want.push(at_cap);
+    want.sort();
+    assert_eq!(
+        asked, want,
+        "the third announcement is within the cap; the multi-id IHAVE counts against \
+         max_ihave_messages alone and is asked"
+    );
+
+    gs.heartbeat();
+    let fresh = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topic_hashes[0].clone(), vec![fresh.clone()])],
+    );
+    let (iwants, _) = iwants_by_peer(receivers);
+    let mut asked = iwants.get(&peers[0]).cloned().unwrap_or_default();
+    asked.sort();
+    let mut want = vec![over_cap, fresh];
+    want.sort();
+    assert_eq!(
+        asked, want,
+        "the announcement over the cap is asked on the next heartbeat, and a new one at once"
+    );
+}
+
+/// QUILIBRIUM: a mesh announcer serves an IWANT for `history_length - 1`
+/// heartbeats after its first IHAVE, the least time a message stays in its
+/// cache (16.1 s with the node's 24 x 700 ms); a gossip announcer for
+/// `history_gossip` heartbeats less after its first IHAVE (4.9 s), whatever
+/// `lazy_followup_time`: the relay serves the IWANT from its cache when it
+/// arrives.
+#[test]
+fn the_serve_windows_are_the_relay_cache() {
+    let build = |history: usize, followup: Duration| {
+        let config = ConfigBuilder::default()
+            .history_length(history)
+            .history_gossip(history.min(16))
+            .heartbeat_interval(Duration::from_millis(700))
+            .lazy_followup_time(followup)
+            .build()
+            .unwrap();
+        let (gs, _, _, _) = inject_nodes1()
+            .peer_no(1)
+            .topics(vec![String::from("topic1")])
+            .to_subscribe(true)
+            .gs_config(config)
+            .create_network();
+        (gs.serve_window(true), gs.serve_window(false))
+    };
+    assert_eq!(
+        build(24, Duration::from_secs(8)),
+        (Duration::from_millis(16_100), Duration::from_millis(4_900)),
+        "the node's windows: 23 and 7 x 700 ms; the follow-up is not taken off"
+    );
+    assert_eq!(
+        build(24, Duration::from_secs(20)),
+        (Duration::from_millis(16_100), Duration::from_millis(4_900)),
+        "a follow-up past the cache leaves the windows"
+    );
+    assert_eq!(
+        build(2, Duration::from_secs(8)),
+        (Duration::from_millis(700), Duration::ZERO),
+        "one heartbeat of cache, all of it gossiped"
+    );
+    assert_eq!(
+        build(1, Duration::from_secs(8)),
+        (Duration::ZERO, Duration::ZERO),
+        "no cache past the current heartbeat"
+    );
+}
+
+/// QUILIBRIUM: announcers that came with the first IHAVE are asked, all on
+/// one heartbeat, by their latest start while the first promise is open: not
+/// on a heartbeat `quiet` after their IHAVE (when given), and on one `due`
+/// after it.
+fn asks_first_ihave_announcers_by_their_latest_start(
+    config: Config,
+    quiet: Option<Duration>,
+    due: Duration,
+) {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    assert!(
+        peers
+            .iter()
+            .all(|peer| gs.mesh[&topic_hashes[0]].contains(peer)),
+        "premise: every announcer is a mesh peer"
+    );
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, mut receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "premise: only the first announcer is asked"
+    );
+
+    let mut passed = Duration::ZERO;
+    if let Some(quiet) = quiet {
+        heartbeat_after(&mut gs, quiet);
+        passed = quiet;
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        assert!(iwants.is_empty(), "nobody before the deadline: {iwants:?}");
+    }
+    heartbeat_after(&mut gs, due - passed);
+    let (iwants, _) = iwants_by_peer(receivers);
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (iwants, stats.deadline_asks, stats.stale_announcers),
+        (
+            HashMap::from([(peers[1], vec![msg_id.clone()]), (peers[2], vec![msg_id])]),
+            2,
+            0
+        ),
+        "both kept announcers are asked by their latest start"
+    );
+}
+
+/// QUILIBRIUM: with the node's 24 x 700 ms and 8 s follow-up, the kept mesh
+/// announcers' latest start is 7.4 s on: not asked at 6.3 s, asked at 7 s.
+#[test]
+fn asks_the_first_ihave_announcers_by_their_latest_start_on_the_node() {
+    let heartbeat = Duration::from_millis(700);
+    let followup = Duration::from_secs(8);
+    let config = ConfigBuilder::default()
+        .history_length(24)
+        .history_gossip(16)
+        .heartbeat_interval(heartbeat)
+        .lazy_followup_time(followup)
+        .build()
+        .unwrap();
+    asks_first_ihave_announcers_by_their_latest_start(config, Some(heartbeat * 9), heartbeat * 10);
+}
+
+/// QUILIBRIUM: with the library defaults (5 x 1 s, 3 s follow-up), a mesh
+/// announcer's 4 s window less the follow-up and a heartbeat leaves nothing:
+/// the kept ones are asked at the next heartbeat.
+#[test]
+fn asks_the_first_ihave_announcers_at_the_next_heartbeat_with_the_defaults() {
+    let config = Config::default();
+    let heartbeat = config.heartbeat_interval();
+    asks_first_ihave_announcers_by_their_latest_start(config, None, heartbeat);
+}
+
+/// QUILIBRIUM: a kept announcer heard longer ago than its serve window is
+/// dropped and counted, not asked.
+#[test]
+fn does_not_ask_an_announcer_past_the_relay_cache_window() {
+    let config = ConfigBuilder::default()
+        .history_length(5)
+        .history_gossip(3)
+        .heartbeat_interval(Duration::from_millis(10))
+        .lazy_followup_time(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    assert_eq!(gs.serve_window(true), Duration::from_millis(40), "premise");
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (_, receivers) = iwants_by_peer(receivers);
+    heartbeat_after(&mut gs, Duration::from_millis(100));
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty(),
+        "the stale announcer is not asked: {iwants:?}"
+    );
+    assert_eq!(gs.announce_stats().stale_announcers, 1);
+}
+
+/// QUILIBRIUM: asks of a message have no cap: with the most announcers kept
+/// and one more mesh announcer past that, the first announcer and each kept
+/// one are asked in turn, the latest first IHAVE first, as each promise breaks, then
+/// nobody (all kept are mesh announcers, so the one past the cap was not
+/// kept), and the next heartbeat gossip of the message is asked and delivers
+/// it.
+#[test]
+fn asks_the_next_gossip_announcement_once_every_kept_announcer_broke() {
+    let config = ConfigBuilder::default()
+        .lazy_followup_time(Duration::from_millis(1))
+        .iwant_followup_time(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let kept = crate::gossip_promises::MAX_FALLBACK_ANNOUNCERS;
+    let (mut gs, peers, mut receivers, topic_hashes) = inject_nodes1()
+        .peer_no(kept + 2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    gs.mesh
+        .get_mut(&topic_hashes[0])
+        .unwrap()
+        .extend(peers.iter().copied());
+    let (gossiper, receiver) = add_peer(&mut gs, &[], false, false);
+    receivers.insert(gossiper, receiver);
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let mut asked = Vec::new();
+    for _ in 0..=kept + 1 {
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        assert!(
+            iwants.len() <= 1 && iwants.values().all(|ids| *ids == vec![msg_id.clone()]),
+            "one ask at a time: {iwants:?}"
+        );
+        asked.extend(iwants.into_keys());
+        heartbeat_after(&mut gs, Duration::from_millis(20));
+    }
+    let want: Vec<_> = std::iter::once(peers[0])
+        .chain(peers[1..=kept].iter().rev().copied())
+        .collect();
+    assert_eq!(
+        asked, want,
+        "the first announcer and each kept one, freshest first, and not the one past the \
+         cap"
+    );
+    assert_eq!(gs.announce_stats().fallback_asks, kept as u64);
+
+    gs.handle_ihave(
+        &gossiper,
+        vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+    );
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(gossiper, vec![msg_id.clone()])]),
+        "the next heartbeat gossip of the message is asked"
+    );
+    gs.handle_received_message(raw_message, &gossiper);
+    assert!(
+        gs.events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+        )),
+        "and the message arrives"
+    );
+    assert!(!gs.gossip_promises.contains(&msg_id));
+}
+
+/// QUILIBRIUM: an IWANT this node cannot serve because its cache's byte budget
+/// evicted the message is counted; one for a message it never had, or one it
+/// serves, is not.
+#[test]
+fn counts_iwants_the_byte_budget_left_unserved() {
+    let config = ConfigBuilder::default()
+        .mcache_max_bytes(1)
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mut seq = 0;
+    let mut cached = Vec::new();
+    for _ in 0..2 {
+        let raw = random_message(&mut seq, &topic_hashes);
+        let message = gs.data_transform.inbound_transform(raw.clone()).unwrap();
+        let id = gs.config.message_id(&message);
+        gs.mcache.put(&id, raw);
+        let _ = gs.mcache.validate(&id);
+        cached.push(id);
+    }
+    let (evicted, kept) = (cached[0].clone(), cached[1].clone());
+    assert!(
+        gs.mcache.get(&evicted).is_none() && gs.mcache.get(&kept).is_some(),
+        "premise: the budget of one byte keeps only the newest"
+    );
+    let never = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+
+    gs.handle_iwant(&peers[0], vec![never, kept]);
+    assert_eq!(
+        gs.announce_stats().evicted_iwants,
+        0,
+        "neither a never-cached id nor a cached one is counted"
+    );
+    gs.handle_iwant(&peers[0], vec![evicted]);
+    assert_eq!(
+        gs.announce_stats().evicted_iwants,
+        1,
+        "an IWANT for a byte-evicted id is counted"
+    );
+}
+
+/// QUILIBRIUM: the first copy of each message over `lazy_forward_threshold` is
+/// counted by how it came: from its source, pushed by a relay, or as the answer
+/// to this node's IWANT; duplicates and smaller messages are not counted.
+#[test]
+fn counts_how_the_first_copy_of_a_large_message_came() {
+    let config = ConfigBuilder::default()
+        .lazy_forward_threshold(lazy_test_message_len() - 1)
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let large = |source: PeerId, seq: u64| RawMessage {
+        source: Some(source),
+        data: vec![7u8; 1024],
+        sequence_number: Some(seq),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    let counts = |gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        let stats = gs.announce_stats();
+        (
+            stats.large_first_from_source,
+            stats.large_first_pushed,
+            stats.large_first_pulled,
+        )
+    };
+
+    gs.handle_received_message(large(peers[0], 1), &peers[0]);
+    assert_eq!(counts(&gs), (1, 0, 0), "from its source");
+
+    let relayed = large(PeerId::random(), 2);
+    gs.handle_received_message(relayed.clone(), &peers[1]);
+    assert_eq!(counts(&gs), (1, 1, 0), "pushed by a relay");
+    gs.handle_received_message(relayed, &peers[0]);
+    assert_eq!(counts(&gs), (1, 1, 0), "a duplicate is not counted");
+
+    let pulled = large(PeerId::random(), 3);
+    let message = gs.data_transform.inbound_transform(pulled.clone()).unwrap();
+    let pulled_id = gs.config.message_id(&message);
+    gs.handle_ihave(&peers[2], vec![(topic_hashes[0].clone(), vec![pulled_id])]);
+    gs.handle_received_message(pulled, &peers[2]);
+    assert_eq!(counts(&gs), (1, 1, 1), "the answer to an IWANT");
+
+    let mut seq = 10;
+    let small = random_message(&mut seq, &topic_hashes);
+    assert!(small.raw_protobuf_len() <= gs.config.lazy_forward_threshold());
+    gs.handle_received_message(small, &peers[1]);
+    assert_eq!(counts(&gs), (1, 1, 1), "a smaller message is not counted");
+}
+
+/// QUILIBRIUM: a peer outside the mesh that announces a message already asked
+/// of a mesh peer is kept as an announcer while that promise is open, and is
+/// not asked while it is open, though its latest start (its IHAVE: its window
+/// is shorter than its follow-up) has passed; once the promise breaks, it is
+/// asked with the heartbeat-gossip follow-up.
+#[test]
+fn keeps_an_announcer_outside_the_mesh_while_a_promise_is_open() {
+    let config = ConfigBuilder::default()
+        .history_length(10)
+        .lazy_followup_time(Duration::from_secs(2))
+        .iwant_followup_time(Duration::from_secs(3600))
+        .build()
+        .unwrap();
+    let (mut gs, peers, mut receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (outside, receiver) = add_peer(&mut gs, &[], false, false);
+    receivers.insert(outside, receiver);
+    let mesh = &gs.mesh[&topic_hashes[0]];
+    assert!(
+        mesh.contains(&peers[0]) && !mesh.contains(&outside),
+        "premise: one mesh peer and one outside"
+    );
+    assert!(
+        gs.serve_window(false) > Duration::from_secs(3),
+        "premise: the announcer outside the mesh still serves when the promise breaks"
+    );
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    for peer in [peers[0], outside] {
+        gs.handle_ihave(&peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "premise: the mesh announcer is asked"
+    );
+    assert_eq!(
+        gs.gossip_promises.kept_announcers(&msg_id),
+        vec![outside],
+        "the announcer outside the mesh is kept while the promise is open"
+    );
+
+    heartbeat_after(&mut gs, Duration::from_millis(20));
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty(),
+        "the announcer outside the mesh is not asked while the promise is open: {iwants:?}"
+    );
+    assert_eq!(gs.gossip_promises.kept_announcers(&msg_id), vec![outside]);
+
+    heartbeat_after(&mut gs, Duration::from_secs(2));
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(outside, vec![msg_id.clone()])]),
+        "it is asked at the heartbeat after the promise broke"
+    );
+    let stats = gs.announce_stats();
+    assert_eq!((stats.deadline_asks, stats.fallback_asks), (0, 1));
+
+    heartbeat_after(&mut gs, Duration::from_secs(60));
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty() && gs.gossip_promises.promised_by(&msg_id, &outside),
+        "its promise lasts the heartbeat-gossip follow-up: {iwants:?}"
+    );
+}
+
+/// QUILIBRIUM: at the node's timings, a message two mesh peers announce and
+/// withhold arrives from a third mesh announcer, asked with the second at
+/// their latest start (7.4 s on, the 7 s heartbeat) while the first's promise
+/// is open. A peer outside the mesh whose heartbeat gossip of it runs from
+/// 0.7 s to 11.2 s (16 heartbeats) is kept but never asked while a promise is
+/// open, though its latest start (1.9 s) passes first.
+#[test]
+fn delivers_past_two_withholding_mesh_announcers_at_the_node_timings() {
+    let config = node_timing_config();
+    let heartbeat = config.heartbeat_interval();
+    let (mut gs, peers, mut receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (withholders, honest) = (&peers[..2], peers[2]);
+    let (gossiper, receiver) = add_peer(&mut gs, &[], false, false);
+    receivers.insert(gossiper, receiver);
+    let mesh = &gs.mesh[&topic_hashes[0]];
+    assert!(
+        peers.iter().all(|peer| mesh.contains(peer)) && !mesh.contains(&gossiper),
+        "premise: three mesh announcers and a gossiper outside the mesh"
+    );
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, rest) = iwants_by_peer(receivers);
+    receivers = rest;
+    assert_eq!(
+        iwants,
+        HashMap::from([(withholders[0], vec![msg_id.clone()])]),
+        "premise: the first withholder is asked"
+    );
+
+    let mut asked = Vec::new();
+    let mut delivered_at = None;
+    for beat in 1..=30u32 {
+        heartbeat_after(&mut gs, heartbeat);
+        if beat <= 16 {
+            gs.handle_ihave(
+                &gossiper,
+                vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+            );
+        }
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        let mut beat_asks: Vec<PeerId> = iwants
+            .into_iter()
+            .filter(|(_, ids)| ids.contains(&msg_id))
+            .map(|(peer, _)| peer)
+            .collect();
+        beat_asks.sort();
+        for peer in beat_asks {
+            asked.push((beat, peer));
+            if peer == honest && delivered_at.is_none() {
+                gs.handle_received_message(raw_message.clone(), &honest);
+                delivered_at = Some(beat);
+            }
+        }
+    }
+    let mut want = vec![(10, withholders[1]), (10, honest)];
+    want.sort();
+    assert_eq!(
+        asked, want,
+        "the other mesh announcers are asked at their latest start, the gossiper never"
+    );
+    assert_eq!(delivered_at, Some(10));
+    let stats = gs.announce_stats();
+    assert_eq!((stats.deadline_asks, stats.fallback_asks), (2, 0));
+    assert!(
+        gs.events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+        )),
+        "the message is delivered"
+    );
+}
+
+/// QUILIBRIUM: a kept announcer over its IWANT budget when its ask is due is
+/// not dropped: it stays kept, is counted as deferred, and is asked on the
+/// next heartbeat.
+#[test]
+fn defers_a_kept_announcer_over_its_iwant_budget_to_the_next_heartbeat() {
+    let config = ConfigBuilder::default()
+        .max_ihave_length(2)
+        .lazy_followup_time(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (first, other, next) = (peers[0], peers[1], peers[2]);
+    let mut seq = 0;
+    let ids = lazy_message_ids(&gs, &mut seq, &topic_hashes, 3);
+    // Two of the three asked of one peer, the third of another (the budget is
+    // two IWANTs a heartbeat); `next` announces all three after them.
+    for (id, peer) in ids.iter().zip([first, first, other]) {
+        gs.handle_ihave(&peer, vec![(topic_hashes[0].clone(), vec![id.clone()])]);
+    }
+    for id in &ids {
+        gs.handle_ihave(&next, vec![(topic_hashes[0].clone(), vec![id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert!(
+        !iwants.contains_key(&next),
+        "premise: the later announcer is kept, not asked: {iwants:?}"
+    );
+    assert!(ids
+        .iter()
+        .all(|id| gs.gossip_promises.kept_announcers(id) == vec![next]));
+
+    // Every promise breaks; `next` can be asked for two of the three.
+    heartbeat_after(&mut gs, Duration::from_millis(20));
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    let first_asks = iwants.get(&next).cloned().unwrap_or_default();
+    assert_eq!(first_asks.len(), 2, "two within the budget: {iwants:?}");
+    assert_eq!(
+        gs.announce_stats().deferred_ids,
+        1,
+        "the third is deferred, not dropped"
+    );
+    let rest: Vec<_> = ids
+        .iter()
+        .filter(|id| !first_asks.contains(id))
+        .cloned()
+        .collect();
+    assert_eq!(gs.gossip_promises.kept_announcers(&rest[0]), vec![next]);
+
+    gs.heartbeat();
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(next, rest)]),
+        "the deferred one is asked on the next heartbeat"
+    );
+}
+
+/// QUILIBRIUM: one announcer of a deadline sweep case: in our mesh or not,
+/// and whether it delivers the message when asked.
+#[derive(Clone, Copy, Debug)]
+struct SweepAnnouncer {
+    mesh: bool,
+    honest: bool,
+}
+
+/// QUILIBRIUM: what one deadline sweep case saw, in simulated milliseconds.
+#[derive(Debug)]
+struct SweepRun {
+    /// Per announcer: its first IHAVE, its latest start and serve-until at the
+    /// node timings, and when it was first asked.
+    announcers: Vec<(u64, u64, u64, Option<u64>)>,
+    /// Every ask of the message: the announcer and when.
+    asks: Vec<(usize, u64)>,
+    delivered: Option<u64>,
+    deadline_asks: u64,
+}
+
+/// QUILIBRIUM: runs one deadline sweep case at the node timings (24
+/// heartbeats of 700 ms, 16 gossiped, 8 s and 3 s follow-ups; the clock is
+/// moved by backdating): announcer `k` of `order` announces one message at
+/// 100 + 300 k ms; with `reannounce`, each withholder announces it again after
+/// every heartbeat; with `deliver`, an honest announcer delivers it when
+/// asked. Heartbeats run for 30 s, past every serve window.
+fn deadline_sweep_case(order: &[SweepAnnouncer], reannounce: bool, deliver: bool) -> SweepRun {
+    let config = ConfigBuilder::from(node_timing_config())
+        .mesh_n_low(1)
+        .mesh_outbound_min(0)
+        .build()
+        .unwrap();
+    let heartbeat_ms = config.heartbeat_interval().as_millis() as u64;
+    let window_ms = |mesh: bool| {
+        let left = if mesh {
+            config.history_length() - 1
+        } else {
+            config.history_length() - 1 - config.history_gossip()
+        };
+        left as u64 * heartbeat_ms
+    };
+    let followup_ms = |mesh: bool| {
+        if mesh {
+            config.lazy_followup_time()
+        } else {
+            config.iwant_followup_time()
+        }
+        .as_millis() as u64
+    };
+    let (mut gs, peers, mut receivers, topic_hashes) = inject_nodes1()
+        .peer_no(order.len())
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config.clone())
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let topic = topic_hashes[0].clone();
+    *gs.mesh.get_mut(&topic).unwrap() = peers
+        .iter()
+        .zip(order)
+        .filter(|(_, announcer)| announcer.mesh)
+        .map(|(peer, _)| *peer)
+        .collect();
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    let ihave = |gs: &mut Behaviour<IdentityTransform, AllowAllSubscriptionFilter>, k: usize| {
+        gs.handle_ihave(&peers[k], vec![(topic.clone(), vec![msg_id.clone()])]);
+    };
+
+    let mut run = SweepRun {
+        announcers: order
+            .iter()
+            .enumerate()
+            .map(|(k, announcer)| {
+                let at = 100 + 300 * k as u64;
+                let serve_until = at + window_ms(announcer.mesh);
+                let latest_start =
+                    (serve_until - followup_ms(announcer.mesh) - heartbeat_ms).max(at);
+                (at, latest_start, serve_until, None)
+            })
+            .collect(),
+        asks: Vec::new(),
+        delivered: None,
+        deadline_asks: 0,
+    };
+    let end = 30_000;
+    let mut now = 0;
+    let mut next_beat = heartbeat_ms;
+    let mut next_announcer = 0;
+    while now < end {
+        let next_ihave = run.announcers.get(next_announcer).map(|kept| kept.0);
+        let at = next_ihave.map_or(next_beat, |ihave| ihave.min(next_beat));
+        gs.gossip_promises.backdate(Duration::from_millis(at - now));
+        now = at;
+        if next_ihave == Some(at) {
+            ihave(&mut gs, next_announcer);
+            next_announcer += 1;
+        } else {
+            gs.heartbeat();
+            next_beat += heartbeat_ms;
+            if reannounce {
+                for (k, kept) in order.iter().enumerate().take(next_announcer) {
+                    if !kept.honest {
+                        ihave(&mut gs, k);
+                    }
+                }
+            }
+        }
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        for (peer, ids) in iwants {
+            if !ids.contains(&msg_id) {
+                continue;
+            }
+            let k = peers.iter().position(|p| *p == peer).unwrap();
+            run.announcers[k].3.get_or_insert(now);
+            run.asks.push((k, now));
+            if deliver && order[k].honest && run.delivered.is_none() {
+                gs.handle_received_message(raw_message.clone(), &peer);
+                run.delivered = Some(now);
+            }
+        }
+    }
+    run.deadline_asks = gs.announce_stats().deadline_asks;
+    run
+}
+
+/// QUILIBRIUM: the deadline property at the node timings. For 0 to 7
+/// withholders, in our mesh and outside it, announcing before, between or
+/// after one honest mesh announcer and one honest gossip announcer, once or
+/// again after every heartbeat: with nobody delivering, the honest mesh
+/// announcer is asked by its latest start (its serve-until less its follow-up
+/// and one heartbeat), so before its cache drops the message, whatever is
+/// open, and no announcer outside the mesh is asked while another ask's
+/// promise is open; with honest announcers delivering, the message is
+/// delivered within the honest mesh announcer's serve window.
+#[test]
+fn asks_every_honest_announcer_by_its_latest_start_against_withholders() {
+    let honest = [
+        SweepAnnouncer {
+            mesh: true,
+            honest: true,
+        },
+        SweepAnnouncer {
+            mesh: false,
+            honest: true,
+        },
+    ];
+    let config = node_timing_config();
+    let followup_ms = |mesh: bool| {
+        if mesh {
+            config.lazy_followup_time()
+        } else {
+            config.iwant_followup_time()
+        }
+        .as_millis() as u64
+    };
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for withholders in 0..=7usize {
+        for mix in ["mesh", "mixed", "outside"] {
+            let withheld: Vec<SweepAnnouncer> = (0..withholders)
+                .map(|n| SweepAnnouncer {
+                    mesh: match mix {
+                        "mesh" => true,
+                        "outside" => false,
+                        _ => n % 2 == 0,
+                    },
+                    honest: false,
+                })
+                .collect();
+            for arrival in ["withholders first", "interleaved", "withholders last"] {
+                let order: Vec<SweepAnnouncer> = match arrival {
+                    "withholders first" => withheld.iter().chain(&honest).copied().collect(),
+                    "withholders last" => honest.iter().chain(&withheld).copied().collect(),
+                    _ => {
+                        let mut order = withheld.clone();
+                        order.insert(withholders / 3, honest[0]);
+                        order.insert(2 * withholders / 3 + 1, honest[1]);
+                        order
+                    }
+                };
+                for reannounce in [false, true] {
+                    cases += 1;
+                    let case = format!(
+                        "{withholders} withholders ({mix}), {arrival}, reannounce {reannounce}"
+                    );
+                    let silent = deadline_sweep_case(&order, reannounce, false);
+                    for (k, (_, latest_start, serve_until, asked)) in
+                        silent.announcers.iter().enumerate()
+                    {
+                        if !order[k].honest || !order[k].mesh {
+                            continue;
+                        }
+                        if !matches!(asked, Some(asked) if asked <= latest_start) {
+                            failures.push(format!(
+                                "{case}: honest announcer {k} asked at {asked:?} ms, latest \
+                                 start {latest_start} ms, serve-until {serve_until} ms"
+                            ));
+                        }
+                    }
+                    for &(k, at) in &silent.asks {
+                        if order[k].mesh {
+                            continue;
+                        }
+                        let open: Vec<(usize, u64)> = silent
+                            .asks
+                            .iter()
+                            .filter(|&&(j, asked)| {
+                                (j, asked) != (k, at)
+                                    && asked <= at
+                                    && asked + followup_ms(order[j].mesh) >= at
+                            })
+                            .copied()
+                            .collect();
+                        if !open.is_empty() {
+                            failures.push(format!(
+                                "{case}: announcer {k} outside the mesh asked at {at} ms while \
+                                 these asks were open: {open:?}"
+                            ));
+                        }
+                    }
+                    let delivering = deadline_sweep_case(&order, reannounce, true);
+                    let honest_mesh = order.iter().position(|a| a.honest && a.mesh).unwrap();
+                    let serve_until = delivering.announcers[honest_mesh].2;
+                    if !matches!(delivering.delivered, Some(at) if at <= serve_until) {
+                        failures.push(format!(
+                            "{case}: delivered at {:?} ms, honest mesh serve-until {serve_until} \
+                             ms",
+                            delivering.delivered
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 8 * 3 * 3 * 2);
+    assert!(
+        failures.is_empty(),
+        "{} failures in {cases} cases:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// QUILIBRIUM: when the first ask delivers before the other announcers'
+/// latest starts, no deadline ask goes out and nobody else is asked: three
+/// honest mesh announcers at the node timings (latest start 7.4 s on, asked
+/// at the 7 s heartbeat), the first delivering at 6.3 s.
+#[test]
+fn sends_no_deadline_ask_when_the_first_ask_delivers_in_time() {
+    let config = node_timing_config();
+    let heartbeat = config.heartbeat_interval();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let mesh = &gs.mesh[&topic_hashes[0]];
+    assert!(
+        peers.iter().all(|peer| mesh.contains(peer)),
+        "premise: three mesh announcers"
+    );
+    let mut seq = 0;
+    let raw_message = random_message(&mut seq, &topic_hashes);
+    let message = gs
+        .data_transform
+        .inbound_transform(raw_message.clone())
+        .unwrap();
+    let msg_id = gs.config.message_id(&message);
+    for peer in &peers {
+        gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+    }
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(peers[0], vec![msg_id.clone()])]),
+        "premise: the first announcer is asked"
+    );
+    for _ in 0..9 {
+        heartbeat_after(&mut gs, heartbeat);
+    }
+    gs.handle_received_message(raw_message.clone(), &peers[0]);
+    for _ in 0..30 {
+        heartbeat_after(&mut gs, heartbeat);
+    }
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert!(
+        iwants.values().all(|ids| !ids.contains(&msg_id)),
+        "nobody else is asked: {iwants:?}"
+    );
+    let stats = gs.announce_stats();
+    assert_eq!((stats.deadline_asks, stats.fallback_asks), (0, 0));
+}
+
+/// QUILIBRIUM: the honest path with heartbeat gossip: while the first ask of
+/// a message is delivering, peers outside the mesh gossip it (IHAVE) at every
+/// heartbeat, their latest starts (1.2 s after their first IHAVE) pass, and
+/// none of them is asked: no second full copy. At the node timings, the first
+/// ask goes to a mesh announcer delivering at 2.1, 4.2 or 5.6 s, or to a
+/// gossiper delivering at 2.1 or 2.8 s.
+#[test]
+fn sends_no_extra_copy_to_gossip_announcers_while_the_first_ask_delivers() {
+    for (first_in_mesh, delivered_beat) in
+        [(true, 3u32), (true, 6), (true, 8), (false, 3), (false, 4)]
+    {
+        let config = node_timing_config();
+        let heartbeat = config.heartbeat_interval();
+        let (mut gs, peers, mut receivers, topic_hashes) = inject_nodes1()
+            .peer_no(1)
+            .topics(vec![String::from("topic1")])
+            .to_subscribe(true)
+            .gs_config(config)
+            .peer_kind(PeerKind::Gossipsubv1_2)
+            .create_network();
+        let mut gossipers = Vec::new();
+        for _ in 0..3 {
+            let (peer, receiver) = add_peer(&mut gs, &[], false, false);
+            receivers.insert(peer, receiver);
+            gossipers.push(peer);
+        }
+        let mesh = &gs.mesh[&topic_hashes[0]];
+        assert!(
+            mesh.contains(&peers[0]) && gossipers.iter().all(|peer| !mesh.contains(peer)),
+            "premise: one mesh peer and three gossipers outside the mesh"
+        );
+        let (first, gossiping) = if first_in_mesh {
+            (peers[0], &gossipers[..])
+        } else {
+            (gossipers[0], &gossipers[1..])
+        };
+        let case = format!("first in mesh {first_in_mesh}, delivered at beat {delivered_beat}");
+        let mut seq = 0;
+        let raw_message = random_message(&mut seq, &topic_hashes);
+        let message = gs
+            .data_transform
+            .inbound_transform(raw_message.clone())
+            .unwrap();
+        let msg_id = gs.config.message_id(&message);
+        gs.handle_ihave(
+            &first,
+            vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+        );
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        assert_eq!(
+            iwants,
+            HashMap::from([(first, vec![msg_id.clone()])]),
+            "{case}: premise: the first announcer is asked"
+        );
+
+        let mut others = Vec::new();
+        for beat in 1..=30u32 {
+            heartbeat_after(&mut gs, heartbeat);
+            if beat <= 16 {
+                for peer in gossiping {
+                    gs.handle_ihave(peer, vec![(topic_hashes[0].clone(), vec![msg_id.clone()])]);
+                }
+            }
+            if beat == 1 {
+                assert_eq!(
+                    gs.gossip_promises.kept_announcers(&msg_id).len(),
+                    gossiping.len(),
+                    "{case}: premise: the gossipers are kept"
+                );
+            }
+            if beat == delivered_beat {
+                gs.handle_received_message(raw_message.clone(), &first);
+            }
+            let (iwants, rest) = iwants_by_peer(receivers);
+            receivers = rest;
+            others.extend(
+                iwants
+                    .into_iter()
+                    .filter(|(_, ids)| ids.contains(&msg_id))
+                    .map(|(peer, _)| (beat, peer)),
+            );
+        }
+        assert!(
+            others.is_empty(),
+            "{case}: no gossiper is asked while the first ask delivers: {others:?}"
+        );
+        assert!(
+            gs.events.iter().any(|event| matches!(
+                event,
+                ToSwarm::GenerateEvent(Event::Message { message_id, .. }) if *message_id == msg_id
+            )),
+            "{case}: premise: the message is delivered"
+        );
+        let stats = gs.announce_stats();
+        assert_eq!((stats.deadline_asks, stats.fallback_asks), (0, 0), "{case}");
+    }
+}
+
+/// QUILIBRIUM: a deadline ask over the announcer's IWANT budget goes out at
+/// the next heartbeat, and its promise still ends by the announcer's
+/// serve-until: the latest start keeps one heartbeat for it. At the node
+/// timings with a budget of two, a mesh announcer of three messages whose
+/// first asks (8 s) are open is due for all three at the 7 s heartbeat (latest
+/// start 7.4 s), is asked for two, and for the third at 7.7 s, its promise
+/// ending at 15.7 s, within its 16.1 s serve window.
+#[test]
+fn asks_a_deadline_ask_over_the_iwant_budget_within_the_serve_window() {
+    let config = ConfigBuilder::from(node_timing_config())
+        .max_ihave_length(2)
+        .build()
+        .unwrap();
+    let heartbeat = config.heartbeat_interval();
+    let followup = config.lazy_followup_time();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(3)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    assert!(
+        peers
+            .iter()
+            .all(|peer| gs.mesh[&topic_hashes[0]].contains(peer)),
+        "premise: three mesh announcers"
+    );
+    let (first, other, kept) = (peers[0], peers[1], peers[2]);
+    let mut seq = 0;
+    let ids = lazy_message_ids(&gs, &mut seq, &topic_hashes, 3);
+    for (id, peer) in ids.iter().zip([first, first, other]) {
+        gs.handle_ihave(&peer, vec![(topic_hashes[0].clone(), vec![id.clone()])]);
+    }
+    for id in &ids {
+        gs.handle_ihave(&kept, vec![(topic_hashes[0].clone(), vec![id.clone()])]);
+    }
+    let (iwants, mut receivers) = iwants_by_peer(receivers);
+    assert!(
+        !iwants.contains_key(&kept)
+            && ids
+                .iter()
+                .all(|id| gs.gossip_promises.kept_announcers(id) == vec![kept]),
+        "premise: the later announcer is kept for all three: {iwants:?}"
+    );
+    let deferred = gs.announce_stats().deferred_ids;
+
+    let mut asked: Vec<(u32, MessageId)> = Vec::new();
+    for beat in 1..=11u32 {
+        heartbeat_after(&mut gs, heartbeat);
+        let (iwants, rest) = iwants_by_peer(receivers);
+        receivers = rest;
+        let ids = iwants.get(&kept).cloned().unwrap_or_default();
+        if beat == 10 {
+            assert_eq!(
+                gs.announce_stats().deferred_ids,
+                deferred + 1,
+                "the third is deferred at the 7 s heartbeat"
+            );
+        }
+        asked.extend(ids.into_iter().map(|id| (beat, id)));
+    }
+    let beats: Vec<u32> = asked.iter().map(|(beat, _)| *beat).collect();
+    assert_eq!(
+        beats,
+        vec![10, 10, 11],
+        "two asked at the 7 s heartbeat, the third at the next: {asked:?}"
+    );
+    let stats = gs.announce_stats();
+    assert_eq!(
+        (stats.deadline_asks, stats.fallback_asks),
+        (3, 0),
+        "all by deadline, the first asks still open"
+    );
+    let third = &asked[2].1;
+    assert!(gs.gossip_promises.promised_by(third, &kept));
+    assert!(
+        heartbeat * 11 + followup <= gs.serve_window(true),
+        "the deferred ask's promise ends within the serve window: {:?} + {followup:?} > {:?}",
+        heartbeat * 11,
+        gs.serve_window(true)
+    );
+}
+
+/// QUILIBRIUM: a peer asked for a message that never delivered it is not
+/// asked again when it announces it again, also once its promise broke and
+/// no other promise is open; another announcer then is.
+#[test]
+fn does_not_ask_a_withholder_again_when_it_announces_again() {
+    let config = node_timing_config();
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config.clone())
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let (withholder, other) = (peers[0], peers[1]);
+    let mut seq = 0;
+    let msg_id = lazy_message_ids(&gs, &mut seq, &topic_hashes, 1).remove(0);
+    gs.handle_ihave(
+        &withholder,
+        vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+    );
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(withholder, vec![msg_id.clone()])]),
+        "premise: the withholder is asked"
+    );
+    gs.gossip_promises
+        .backdate(config.lazy_followup_time() + Duration::from_millis(1));
+    gs.apply_iwant_penalties();
+    assert!(
+        !gs.gossip_promises.contains(&msg_id),
+        "premise: its promise broke and no other is open"
+    );
+    gs.handle_ihave(
+        &withholder,
+        vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+    );
+    let (iwants, receivers) = iwants_by_peer(receivers);
+    assert!(
+        iwants.is_empty(),
+        "the withholder is not asked again: {iwants:?}"
+    );
+    gs.handle_ihave(
+        &other,
+        vec![(topic_hashes[0].clone(), vec![msg_id.clone()])],
+    );
+    let (iwants, _) = iwants_by_peer(receivers);
+    assert_eq!(
+        iwants,
+        HashMap::from([(other, vec![msg_id])]),
+        "another announcer is"
+    );
+}
+
+/// QUILIBRIUM: the per-heartbeat count of new ids kept past the IWANT budget
+/// restarts at each heartbeat: once a peer's deferred ids reached
+/// `max_ihave_length` and one past it was dropped, the ids it announces past
+/// its budget after the next heartbeat are kept again.
+#[test]
+fn keeps_deferred_ids_again_after_the_heartbeat() {
+    let config = ConfigBuilder::default()
+        .max_ihave_length(2)
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let mut seq = 0;
+    let mut over_budget = |gs: &mut Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        gs.count_sent_iwant.insert(peers[0], 2);
+        let ids = lazy_message_ids(gs, &mut seq, &topic_hashes, 3);
+        gs.handle_ihave(&peers[0], vec![(topic_hashes[0].clone(), ids)]);
+        let stats = gs.announce_stats();
+        (stats.deferred_ids, stats.unasked_ids)
+    };
+    assert_eq!(
+        over_budget(&mut gs),
+        (2, 1),
+        "premise: two kept, one past the deferred cap"
+    );
+    gs.heartbeat();
+    assert_eq!(
+        over_budget(&mut gs),
+        (4, 2),
+        "after the heartbeat two more are kept, not dropped"
     );
 }

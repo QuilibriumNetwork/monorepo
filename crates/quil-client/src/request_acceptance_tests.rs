@@ -608,6 +608,7 @@ fn a_client_signed_compute_update_binds_the_metadata_it_replaces() {
         finalized_global_frame: None,
         shard: ShardPath::WHOLE,
         venue: None,
+        pomw_basis: None,
     };
     let signed = |binding: Option<&[u8]>| {
         let signed = build_compute_update(&km, &domain, cfg.clone(), Vec::new(), binding).unwrap();

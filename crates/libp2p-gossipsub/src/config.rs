@@ -142,6 +142,9 @@ pub struct Config {
     connection_handler_forward_duration: Duration,
     idontwant_message_size_threshold: usize,
     idontwant_on_publish: bool,
+    lazy_forward_threshold: usize,
+    lazy_eager_peers: usize,
+    lazy_followup_time: Duration,
     topic_configuration: TopicConfigs,
     mcache_max_bytes: usize,
 }
@@ -506,6 +509,39 @@ impl Config {
     pub fn idontwant_on_publish(&self) -> bool {
         self.idontwant_on_publish
     }
+
+    /// QUILIBRIUM: the encoded size above which a relayed message is pushed to only
+    /// [`Config::lazy_eager_peers`] random mesh peers and announced with an IHAVE to the rest;
+    /// a peer the pushes miss pulls one copy with IWANT. A peer can stop a push only after a
+    /// whole copy has arrived, so a message that takes long to transfer reaches a peer from
+    /// most of its mesh at once. Explicit and floodsub peers are still pushed to. Default
+    /// `usize::MAX` (off).
+    pub fn lazy_forward_threshold(&self) -> usize {
+        self.lazy_forward_threshold
+    }
+
+    /// QUILIBRIUM: how many random mesh peers that sent no IDONTWANT for it are pushed a
+    /// message over [`Config::lazy_forward_threshold`]; the rest of the mesh gets an IHAVE.
+    /// With a mesh of `D` peers each pushing to `k`, a peer gets no push with probability about
+    /// `(1 - k/D)^D`, and pulls a copy whenever an IHAVE reaches it before a whole push. At or
+    /// above the mesh size every mesh peer is pushed to, as below the threshold. Default 2.
+    pub fn lazy_eager_peers(&self) -> usize {
+        self.lazy_eager_peers
+    }
+
+    /// QUILIBRIUM: how long a mesh peer that announced a message has to deliver it after our
+    /// IWANT, in place of [`Config::iwant_followup_time`]. A mesh peer announces only a message
+    /// over its `lazy_forward_threshold` (heartbeat gossip goes to peers outside the mesh), and
+    /// the IHAVE does not carry the size, so this bounds the transfer of the largest such
+    /// message. When it passes, the promise breaks and, at the next heartbeat, the kept
+    /// announcer with the latest first IHAVE that still serves the message is asked. Serving
+    /// counts from an announcer's first IHAVE and a repeat changes nothing: `history_length - 1`
+    /// heartbeats for a mesh peer, `history_length - 1 - history_gossip` for another (a relay
+    /// serves IWANT from its cache when it arrives, unless its byte budget evicted the
+    /// message; PATCHES.md of this crate has the rule). Default 3 s.
+    pub fn lazy_followup_time(&self) -> Duration {
+        self.lazy_followup_time
+    }
 }
 
 impl Default for Config {
@@ -577,6 +613,9 @@ impl Default for ConfigBuilder {
                 connection_handler_forward_duration: Duration::from_secs(1),
                 idontwant_message_size_threshold: 1000,
                 idontwant_on_publish: false,
+                lazy_forward_threshold: usize::MAX,
+                lazy_eager_peers: 2,
+                lazy_followup_time: Duration::from_secs(3),
                 topic_configuration: TopicConfigs::default(),
                 mcache_max_bytes: usize::MAX,
             },
@@ -1102,6 +1141,24 @@ impl ConfigBuilder {
         self
     }
 
+    /// QUILIBRIUM: see [`Config::lazy_forward_threshold`].
+    pub fn lazy_forward_threshold(&mut self, size: usize) -> &mut Self {
+        self.config.lazy_forward_threshold = size;
+        self
+    }
+
+    /// QUILIBRIUM: see [`Config::lazy_eager_peers`].
+    pub fn lazy_eager_peers(&mut self, peers: usize) -> &mut Self {
+        self.config.lazy_eager_peers = peers;
+        self
+    }
+
+    /// QUILIBRIUM: see [`Config::lazy_followup_time`].
+    pub fn lazy_followup_time(&mut self, followup: Duration) -> &mut Self {
+        self.config.lazy_followup_time = followup;
+        self
+    }
+
     /// The topic configuration sets mesh parameter sizes for a given topic. Notes on default
     /// below.
     ///
@@ -1233,6 +1290,9 @@ impl std::fmt::Debug for Config {
             &self.idontwant_message_size_threshold,
         );
         let _ = builder.field("idontwant_on_publish", &self.idontwant_on_publish);
+        let _ = builder.field("lazy_forward_threshold", &self.lazy_forward_threshold);
+        let _ = builder.field("lazy_eager_peers", &self.lazy_eager_peers);
+        let _ = builder.field("lazy_followup_time", &self.lazy_followup_time);
         builder.finish()
     }
 }

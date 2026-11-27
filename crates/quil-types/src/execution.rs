@@ -250,6 +250,11 @@ pub struct FrameExecutionContext {
     /// (an archive's manager is otherwise a global-venue manager). `None`
     /// keeps the engine's configured venue.
     pub venue: Option<Venue>,
+    /// The PoMW basis of the pricing snapshot the frame charges at
+    /// (`pricing::pomw_basis` at its difficulty and world size, in QUIL
+    /// units): an application's creation pays at least a quarter of it once
+    /// that floor is active. `None` where the caller prices nothing.
+    pub pomw_basis: Option<u128>,
 }
 
 /// Where a frame executes.

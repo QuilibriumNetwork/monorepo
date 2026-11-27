@@ -1040,6 +1040,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 finalized_global_frame: None,
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             },
             fee_multiplier,
             address,
@@ -1120,6 +1121,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     ),
                     venue: context.venue,
                     shard: context.shard,
+                    pomw_basis: context.pomw_basis,
                 };
                 if inner_tp == crate::token_intrinsic::constants::TYPE_COIN_DELIVERY {
                     policy.check_venue(effective_mode(self.mode, context), _address, inner_tp)?;
@@ -1489,6 +1491,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             ),
                             frame_number: _frame_number,
                             multiplier: _fee_multiplier,
+                            basis: context.pomw_basis,
                             shard: context.shard,
                         },
                         _address,
@@ -1553,6 +1556,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             global_bound: None,
                             frame_number: _frame_number,
                             multiplier: _fee_multiplier,
+                            basis: context.pomw_basis,
                             shard: context.shard,
                         },
                         _address,
@@ -2245,6 +2249,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                 finalized_global_frame: None,
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             },
             fee_multiplier,
             address,
@@ -2274,6 +2279,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                     ),
                     frame_number: context.frame_number,
                     multiplier: fee_multiplier,
+                    basis: context.pomw_basis,
                     shard: context.shard,
                 },
                 address,
@@ -3255,6 +3261,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 finalized_global_frame: None,
                 venue: None,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             },
             fee_multiplier,
             address,
@@ -3289,6 +3296,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                     ),
                     frame_number,
                     multiplier: fee_multiplier,
+                    basis: context.pomw_basis,
                     shard: context.shard,
                 },
                 address,
@@ -4310,6 +4318,7 @@ mod tests {
                 finalized_global_frame,
                 venue,
                 shard: quil_types::execution::ShardPath::WHOLE,
+                pomw_basis: None,
             }
         }
     }
@@ -4948,6 +4957,7 @@ mod tests {
             finalized_global_frame: Some(anchor),
             venue: None,
             shard: quil_types::execution::ShardPath::WHOLE,
+            pomw_basis: None,
         };
         let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
         let view = crate::hypergraph_state::HypergraphState::new(crdt.clone());
@@ -5320,3 +5330,7 @@ mod token_deploy_replay_tests;
 #[cfg(test)]
 #[path = "update_replay_tests.rs"]
 mod update_replay_tests;
+
+#[cfg(all(test, feature = "confidential-tokens"))]
+#[path = "creation_floor_engine_tests.rs"]
+mod creation_floor_engine_tests;

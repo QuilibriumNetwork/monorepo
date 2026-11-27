@@ -6015,6 +6015,81 @@ struct BundleQuote {
     global_execution: bool,
 }
 
+/// Frames before the application creation floor frame from which a deploy
+/// already pays the floor: its settlement is certified and the deploy executes
+/// up to [`crate::send::PAID_SUBMISSION_WAIT`] after the quote. Twice the wait
+/// at the fastest frame time (10 s) covers that and the quote's snapshot lag
+/// (180 frames).
+#[cfg(feature = "native-proof")]
+const CREATION_FLOOR_MARGIN_FRAMES: u64 = 2 * crate::send::PAID_SUBMISSION_WAIT.as_secs() / 10;
+
+/// The settlement `quote` prices `rest` (`cost` bytes of growth) at, before
+/// headroom: the charge the admitting engine requires
+/// (`settlement_claim::required_settlement`), with the application creation
+/// floor from [`CREATION_FLOOR_MARGIN_FRAMES`] before `floor_from`, so a deploy
+/// quoted just before that frame still covers it when it executes. Also
+/// whether the floor raised the charge.
+#[cfg(feature = "native-proof")]
+fn bundle_charge(
+    selector: u8,
+    quote: &quil_types::proto::node::GetTokenFeeQuoteResponse,
+    rest: &quil_execution::message_envelope::CanonicalMessageBundle,
+    cost: u64,
+    floor_from: u64,
+) -> anyhow::Result<(u128, bool)> {
+    use quil_execution::token_intrinsic::settlement_claim::{
+        application_creations, required_settlement,
+    };
+    let multiplier = quil_execution::pricing::fee_multiplier_for_cost(
+        selector,
+        quote.difficulty,
+        quote.world_state_bytes,
+        &num_bigint::BigInt::from(cost),
+        quote.fee_multiplier_vote,
+    )?;
+    let floored = floor_from != u64::MAX
+        && quote
+            .observed_frame
+            .saturating_add(CREATION_FLOOR_MARGIN_FRAMES)
+            >= floor_from;
+    let basis = if floored {
+        Some(num_bigint::BigInt::from(
+            quil_execution::pricing::frame_pomw_basis(quote.difficulty, quote.world_state_bytes)?,
+        ))
+    } else {
+        None
+    };
+    let charge = required_settlement(
+        &multiplier,
+        cost,
+        application_creations(rest),
+        basis.as_ref(),
+    );
+    let raised = charge > &multiplier * num_bigint::BigInt::from(cost);
+    let charge: u128 = charge
+        .to_string()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("charge exceeds the token amount range"))?;
+    Ok((charge, raised))
+}
+
+/// What a quote at the application creation floor tells the operator: why
+/// the amount is what it is and, above the automatic fee limit, the
+/// `--max-fee` that pays it.
+#[cfg(feature = "native-proof")]
+fn floor_notice(amount: u128, max_fee: u128) -> String {
+    let mut notice = "That is the application creation floor: a deploy pays at least a \
+                      quarter of the PoMW basis per application it creates."
+        .to_string();
+    if amount > max_fee {
+        notice.push_str(&format!(
+            " It exceeds the automatic fee limit of {max_fee} base units; to pay it, \
+             rerun with --max-fee {amount} (or QUILIBRIUM_MAX_FEE={amount})."
+        ));
+    }
+    notice
+}
+
 /// Quote the settlement of `rest`, the destination bundle with its first
 /// request left empty: the destination venue's quoted charge for the bundle's
 /// state growth (plus the claim's marker) with the automatic headroom.
@@ -6070,21 +6145,16 @@ async fn quote_bundle(
     );
     let selector = quil_execution::pricing::network_selector(&network)
         .ok_or_else(|| anyhow::anyhow!("invalid network identifier"))?;
-    let charge = quil_execution::pricing::fee_multiplier_for_cost(
-        selector,
-        quote.difficulty,
-        quote.world_state_bytes,
-        &num_bigint::BigInt::from(cost),
-        quote.fee_multiplier_vote,
-    )? * num_bigint::BigInt::from(cost);
-    let charge: u128 = charge
-        .to_string()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("charge exceeds the token amount range"))?;
+    let floor_from =
+        quil_execution::token_intrinsic::settlement_claim::init_app_creation_floor_frame(selector);
+    let (charge, floored) = bundle_charge(selector, &quote, rest, cost, floor_from)?;
     let amount = with_fee_headroom(charge)?.max(1);
     let context = bundle_context(rest)?;
     println!("This bundle needs {amount} base units for {cost} bytes of state growth on {} (snapshot frame {}).",
         hex::encode(destination), quote.observed_frame);
+    if floored {
+        println!("{}", floor_notice(amount, tc.max_fee));
+    }
     check_automatic_fee("bundle settlement", amount, tc.max_fee)?;
     Ok(BundleQuote {
         amount,
@@ -8595,6 +8665,160 @@ mod tests {
         );
         // A malformed network identifier cannot be priced.
         assert!(super::checked_quil_fee_quote(&quote, &[7; 32], 64).is_err());
+    }
+
+    /// A deploy's quoted settlement is exactly what the admitting engine
+    /// requires of it, the application creation floor included: one unit less
+    /// is refused.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_deploy_quote_pays_what_the_engine_requires() {
+        use num_bigint::BigInt;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_execution::token_intrinsic::settlement_claim::{
+            admit_bundle, bundle_context, marker_record, request_cost,
+            set_app_creation_floor_frame_for_thread, PaymentContext, SettlementClaim,
+            TYPE_SETTLEMENT_CLAIM,
+        };
+        let deploy = quil_execution::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
+        let mut inner = deploy.to_be_bytes().to_vec();
+        inner.resize(300, 0xAB);
+        let rest = CanonicalMessageBundle {
+            requests: vec![
+                None,
+                Some(CanonicalMessageRequest {
+                    inner_type_prefix: deploy,
+                    inner_bytes: inner,
+                }),
+            ],
+            timestamp: 9,
+        };
+        let cost = marker_record().unwrap().len() as u64
+            + request_cost(rest.requests[1].as_ref().unwrap()).unwrap();
+        let (difficulty, world) = (50_000u64, 1u64 << 30);
+        let floor_from = 1_000;
+        let quote = |observed_frame| quil_types::proto::node::GetTokenFeeQuoteResponse {
+            application: [2; 32].to_vec(),
+            network: vec![0; 32],
+            observed_frame,
+            global_execution: true,
+            difficulty,
+            world_state_bytes: world,
+            fee_multiplier_vote: 1,
+            max_payload_bytes: cost,
+            fee_budget: Vec::new(),
+        };
+        // What the engine admits at GLOBAL anchor `anchor` for `settlement`:
+        // past the amount check, the missing state refuses it.
+        let engine_admits = |settlement: u128, anchor: u64| {
+            set_app_creation_floor_frame_for_thread(Some(floor_from));
+            let mut bundle = rest.clone();
+            bundle.requests[0] = Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_SETTLEMENT_CLAIM,
+                inner_bytes: SettlementClaim {
+                    network: [0; 32],
+                    application: [2; 32],
+                    cited_global_frame: anchor,
+                    global_root: [3; 32],
+                    receipt: [4; 32],
+                    settlement,
+                    context: bundle_context(&rest).unwrap(),
+                    payment_address: [0; 32],
+                    payment: 0,
+                    claimant_key_type: 0,
+                    claimant_public_key: Vec::new(),
+                    claimant_signature: Vec::new(),
+                    forest_proof: vec![6; 40],
+                }
+                .encode()
+                .unwrap(),
+            });
+            let multiplier = quil_execution::pricing::fee_multiplier_for_cost(
+                0,
+                difficulty,
+                world,
+                &BigInt::from(cost),
+                1,
+            )
+            .unwrap();
+            let error = admit_bundle(
+                &PaymentContext {
+                    state: None,
+                    clock: None,
+                    network: &[0; 32],
+                    global_bound: Some(anchor),
+                    frame_number: anchor + 1,
+                    multiplier: &multiplier,
+                    basis: Some(
+                        quil_execution::pricing::frame_pomw_basis(difficulty, world).unwrap(),
+                    ),
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                },
+                &[2; 32],
+                &bundle,
+                0,
+            )
+            .unwrap_err();
+            println!("REACH creation-floor admit");
+            error.is_execution_unavailable()
+        };
+        let basis = quil_execution::pricing::frame_pomw_basis(difficulty, world).unwrap();
+        // After the floor frame the floor sets the charge.
+        let (charge, floored) =
+            super::bundle_charge(0, &quote(floor_from), &rest, cost, floor_from).unwrap();
+        assert!(
+            engine_admits(charge, floor_from),
+            "client_fee_mismatch: {charge} refused"
+        );
+        assert!(
+            !engine_admits(charge - 1, floor_from),
+            "client_fee_mismatch: {charge} not exact"
+        );
+        assert!(
+            floored && charge == basis / 4,
+            "client_fee_mismatch: {charge} of basis {basis}"
+        );
+        // Well before it, the growth alone.
+        let early = floor_from - super::CREATION_FLOOR_MARGIN_FRAMES - 1;
+        let (charge, floored) =
+            super::bundle_charge(0, &quote(early), &rest, cost, floor_from).unwrap();
+        assert!(
+            !floored && charge < basis / 4,
+            "client_fee_mismatch: {charge} early"
+        );
+        assert!(
+            engine_admits(charge, early),
+            "client_fee_mismatch: {charge} refused early"
+        );
+        assert!(
+            !engine_admits(charge - 1, early),
+            "client_fee_mismatch: {charge} not exact early"
+        );
+        // Within the margin before it, already the floor.
+        let (charge, floored) =
+            super::bundle_charge(0, &quote(early + 1), &rest, cost, floor_from).unwrap();
+        assert!(
+            floored && charge == basis / 4,
+            "client_fee_mismatch: {charge} in margin"
+        );
+    }
+
+    /// A floored quote above the automatic fee limit names the `--max-fee`
+    /// that pays it; one within the limit only explains the floor.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_floored_quote_above_the_limit_names_the_max_fee() {
+        println!("REACH creation-floor notice");
+        let over = super::floor_notice(2_000_000_000, 800_000_000);
+        assert!(
+            over.contains("creation floor") && over.contains("--max-fee 2000000000"),
+            "floor_notice_no_max_fee: {over}"
+        );
+        let within = super::floor_notice(800_000_000, 800_000_000);
+        assert!(
+            within.contains("creation floor") && !within.contains("--max-fee"),
+            "floor_notice_no_max_fee: {within}"
+        );
     }
 
     #[cfg(feature = "native-proof")]

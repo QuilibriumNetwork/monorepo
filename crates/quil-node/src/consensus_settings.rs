@@ -485,6 +485,7 @@ mod tests {
                 finalized_global_frame: Some(anchor),
                 shard: ShardPath::WHOLE,
                 venue: None,
+                pomw_basis: None,
             },
             &network,
             &app,
