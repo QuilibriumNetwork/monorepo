@@ -94,7 +94,7 @@ pub(crate) fn live_entry_for_row(key: &[u8], len: usize) -> Option<Vec<u8>> {
     (len >= LARGE_VERTEX_MIN_BYTES).then(|| entry_key(LIVE, vertex_key))
 }
 
-fn row_vertex_key(key: &[u8]) -> Option<&[u8]> {
+pub(crate) fn row_vertex_key(key: &[u8]) -> Option<&[u8]> {
     let versioned = match key.get(..3)? {
         prefix if prefix == ROW_RANGES[0] => false,
         prefix if prefix == ROW_RANGES[1] => true,

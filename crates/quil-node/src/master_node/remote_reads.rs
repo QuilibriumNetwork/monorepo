@@ -584,6 +584,228 @@ impl From<&str> for ReadEndpoint {
     }
 }
 
+// Feed cursors outlive a scan's RAM-only snapshot pin. Only server-selected
+// routes are stored here; a cursor never supplies a dial address.
+const COIN_FEED_ROUTES_KEY: &[u8] = b"\x00quil/node/coin-feed-proxy/routes/v1";
+// Auxiliary clock tag reserved for this node-local routing cache.
+const COIN_FEED_ROUTE_TAGS: &[[u8; 2]] = &[[0x00, b'q']];
+const MAX_COIN_FEED_ROUTES: usize = 256;
+const MAX_COIN_FEED_CURSOR: usize = quil_rpc::node_service::MAX_COIN_CHANGE_CURSOR_BYTES;
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CoinFeedRoute {
+    #[prost(bytes = "vec", tag = "1")]
+    id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    domain: Vec<u8>,
+    #[prost(string, tag = "3")]
+    address: String,
+    #[prost(bytes = "vec", tag = "4")]
+    peer: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CoinFeedRouteTable {
+    #[prost(bytes = "vec", tag = "1")]
+    issuer: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    serial: u64,
+    #[prost(message, repeated, tag = "3")]
+    routes: Vec<CoinFeedRoute>,
+    #[prost(uint32, tag = "4")]
+    network: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    nonce: Vec<u8>,
+}
+
+struct CoinFeedRoutes {
+    db: quil_forest::CoordinatedDb,
+    seed: [u8; 32],
+    network: u8,
+    table: parking_lot::Mutex<CoinFeedRouteTable>,
+}
+
+impl CoinFeedRoutes {
+    fn open(
+        db: quil_forest::CoordinatedDb,
+        issuer: Vec<u8>,
+        seed: [u8; 32],
+        network: u8,
+    ) -> anyhow::Result<Self> {
+        use prost::Message;
+        anyhow::ensure!(
+            !issuer.is_empty() && issuer.len() <= 128,
+            "invalid feed route issuer"
+        );
+        let fresh = || {
+            use sha2::{Digest, Sha256};
+            let mut nonce = Sha256::new();
+            nonce.update(b"quil/node/coin-feed-route-table/v1");
+            nonce.update(seed);
+            nonce.update(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .to_be_bytes(),
+            );
+            nonce.update(std::process::id().to_be_bytes());
+            CoinFeedRouteTable {
+                issuer: issuer.clone(),
+                serial: 0,
+                routes: Vec::new(),
+                network: u32::from(network),
+                nonce: nonce.finalize().to_vec(),
+            }
+        };
+        let stored = db.get(COIN_FEED_ROUTES_KEY)?;
+        let mut changed = true;
+        let table = match stored {
+            Some(bytes) => {
+                let parsed = (bytes.len() <= 256 * 1024)
+                    .then(|| CoinFeedRouteTable::decode(bytes.as_slice()).ok())
+                    .flatten();
+                match parsed.filter(|table| {
+                    table.nonce.len() == 32
+                        && table.routes.len() <= MAX_COIN_FEED_ROUTES
+                        && table.routes.iter().all(|route| {
+                            route.id.len() == 32
+                                && route.domain.len() == 32
+                                && !route.address.is_empty()
+                                && route.address.len() <= 512
+                                && route.peer.len() <= 128
+                                && (route.peer.is_empty()
+                                    || quil_p2p::PeerId::from_bytes(&route.peer).is_ok())
+                        })
+                }) {
+                    Some(table)
+                        if table.issuer == issuer && table.network == u32::from(network) =>
+                    {
+                        changed = false;
+                        table
+                    }
+                    Some(_) => fresh(),
+                    None => {
+                        tracing::warn!("discarding malformed local coin feed routing cache; existing cursors require a new snapshot");
+                        fresh()
+                    }
+                }
+            }
+            None => fresh(),
+        };
+        let routes = Self {
+            db,
+            seed,
+            network,
+            table: parking_lot::Mutex::new(table),
+        };
+        if changed {
+            routes.persist(&routes.table.lock())?;
+        }
+        Ok(routes)
+    }
+
+    fn persist(&self, table: &CoinFeedRouteTable) -> anyhow::Result<()> {
+        use prost::Message;
+        let mut batch = quil_forest::DisjointBatch::new(COIN_FEED_ROUTE_TAGS);
+        batch.put(COIN_FEED_ROUTES_KEY, table.encode_to_vec())?;
+        self.db.write_disjoint(batch, &Default::default())?;
+        Ok(())
+    }
+
+    fn effective_peer(endpoint: &ReadEndpoint) -> Option<quil_p2p::PeerId> {
+        endpoint
+            .peer
+            .or_else(|| quil_rpc::archive_client::pinned_archive_peer(&endpoint.addr))
+    }
+
+    fn wrap(
+        &self,
+        domain: &[u8; 32],
+        endpoint: &ReadEndpoint,
+        backend: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            !backend.is_empty() && backend.len() <= MAX_COIN_FEED_CURSOR - 33,
+            "invalid backend coin change cursor size"
+        );
+        anyhow::ensure!(
+            !endpoint.addr.is_empty() && endpoint.addr.len() <= 512,
+            "invalid coin feed route address"
+        );
+        let peer = Self::effective_peer(endpoint)
+            .map(|p| p.to_bytes())
+            .unwrap_or_default();
+        let mut table = self.table.lock();
+        let id = if let Some(route) = table.routes.iter().find(|route| {
+            route.domain == domain.as_slice()
+                && route.address == endpoint.addr
+                && route.peer == peer
+        }) {
+            route.id.clone()
+        } else {
+            let mut next = table.clone();
+            next.serial = next
+                .serial
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("coin feed route serial exhausted"))?;
+            let mut hash = Sha256::new();
+            hash.update(b"quil/node/coin-feed-route/v1");
+            hash.update(self.seed);
+            hash.update([self.network]);
+            hash.update(&next.issuer);
+            hash.update(&next.nonce);
+            hash.update(next.serial.to_be_bytes());
+            hash.update(domain);
+            hash.update(endpoint.addr.as_bytes());
+            hash.update(&peer);
+            let id = hash.finalize().to_vec();
+            if next.routes.len() == MAX_COIN_FEED_ROUTES {
+                next.routes.remove(0);
+            }
+            next.routes.push(CoinFeedRoute {
+                id: id.clone(),
+                domain: domain.to_vec(),
+                address: endpoint.addr.clone(),
+                peer,
+            });
+            // Publish only after the route is durable. A failed write leaves
+            // the previous in-memory table intact for a safe retry.
+            self.persist(&next)?;
+            *table = next;
+            id
+        };
+        let mut cursor = Vec::with_capacity(33 + backend.len());
+        cursor.push(2);
+        cursor.extend_from_slice(&id);
+        cursor.extend_from_slice(backend);
+        Ok(cursor)
+    }
+
+    fn resolve(&self, domain: &[u8; 32], cursor: &[u8]) -> Option<(ReadEndpoint, Vec<u8>)> {
+        if cursor.len() <= 33 || cursor.len() > MAX_COIN_FEED_CURSOR || cursor[0] != 2 {
+            return None;
+        }
+        let table = self.table.lock();
+        let route = table.routes.iter().find(|route| {
+            route.id.as_slice() == &cursor[1..33] && route.domain == domain.as_slice()
+        })?;
+        let peer = if route.peer.is_empty() {
+            None
+        } else {
+            Some(quil_p2p::PeerId::from_bytes(&route.peer).ok()?)
+        };
+        Some((
+            ReadEndpoint {
+                addr: route.address.clone(),
+                peer,
+            },
+            cursor[33..].to_vec(),
+        ))
+    }
+}
+
 /// Reads an application's coins from whichever node holds it.
 pub struct PeerCoinReader {
     peer_info_cache: PeerInfoCache,
@@ -593,6 +815,8 @@ pub struct PeerCoinReader {
     /// Kept connections, dialed with the `:8340` mTLS identity.
     connections: ReadConnections<quil_rpc::ArchiveClient>,
     network: u8,
+    coin_feed_seed: [u8; 32],
+    coin_feed_routes: Option<Arc<CoinFeedRoutes>>,
     /// Scan snapshot → the endpoint that served it. A paged scan is pinned to
     /// one peer's snapshot, so continuing it anywhere else would restart the
     /// scan; the cursor means nothing to another node's store.
@@ -615,6 +839,8 @@ impl PeerCoinReader {
         falcon_key: Vec<u8>,
         network: u8,
     ) -> Self {
+        use sha2::Digest;
+        let coin_feed_seed: [u8; 32] = sha2::Sha256::digest(&falcon_key).into();
         let falcon_key: Arc<[u8]> = falcon_key.into();
         // A covering prover's endpoint must answer as that prover, so a
         // record cannot name another node's address and have that node
@@ -637,12 +863,186 @@ impl PeerCoinReader {
             prover_registry: None,
             connections: ReadConnections::new(dial, CONNECTION_IDLE, MAX_CONNECTIONS),
             network,
+            coin_feed_seed,
+            coin_feed_routes: None,
             served_by: parking_lot::Mutex::new(HashMap::new()),
             listings: parking_lot::Mutex::new(HashMap::new()),
             read_retry: (READ_RETRY_BUDGET, READ_RETRY_DELAY),
             page_attempt: PAGE_ATTEMPT,
             declines_logged: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Persist the backend routes embedded in wallet feed cursors. The table
+    /// belongs to this node, outside consensus state and snapshot imports.
+    pub fn with_coin_feed_routes(
+        mut self,
+        db: quil_forest::CoordinatedDb,
+        issuer: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        self.coin_feed_routes = Some(Arc::new(CoinFeedRoutes::open(
+            db,
+            issuer,
+            self.coin_feed_seed,
+            self.network,
+        )?));
+        Ok(self)
+    }
+
+    async fn wrap_coin_feed_cursor(
+        &self,
+        domain: &[u8; 32],
+        endpoint: &ReadEndpoint,
+        backend: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if backend.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(routes) = &self.coin_feed_routes else {
+            return Ok(Vec::new());
+        };
+        let routes = routes.clone();
+        let domain = *domain;
+        let endpoint = endpoint.clone();
+        let backend = backend.to_vec();
+        tokio::task::spawn_blocking(move || routes.wrap(&domain, &endpoint, &backend))
+            .await
+            .map_err(|error| format!("coin feed route task: {error}"))?
+            .map_err(|error| format!("coin feed route: {error}"))
+    }
+
+    /// Continue exactly the backend selected by ListCoins. A missing route
+    /// calls for bootstrap; a transport outage keeps the cursor retryable.
+    pub async fn coin_changes(
+        &self,
+        domain: [u8; 32],
+        cursor: Vec<u8>,
+        max_coins: u32,
+    ) -> Result<quil_types::store::CoinChangesPageData, tonic::Status> {
+        use quil_types::store::{scan_page_bytes, scan_page_entries, CoinChangesPageData};
+        let network = quil_execution::token_intrinsic::state::network_identifier(self.network);
+        let reset = || CoinChangesPageData {
+            network,
+            coins: Vec::new(),
+            cursor: Vec::new(),
+            has_more: false,
+            reset: true,
+        };
+        if cursor.len() > MAX_COIN_FEED_CURSOR {
+            return Err(tonic::Status::invalid_argument(
+                "coin change cursor exceeds size limit",
+            ));
+        }
+        let routes = self.coin_feed_routes.as_ref().ok_or_else(|| {
+            tonic::Status::unimplemented("forwarded coin changes are not enabled")
+        })?;
+        let Some((held, backend)) = routes.resolve(&domain, &cursor) else {
+            return Ok(reset());
+        };
+        // Revalidate the stored address and peer against trusted coverage or
+        // the full archive directory; preferred addresses do not revoke a route.
+        // Sample loading first: a concurrent registry load must not turn
+        // unknown trust into a cursor reset.
+        let registry_loading = self
+            .prover_registry
+            .as_deref()
+            .is_some_and(|registry| !registry.initial_load_complete());
+        let trusted = self
+            .covering_endpoints(&domain)
+            .into_iter()
+            .any(|candidate| {
+                candidate.addr == held.addr
+                    && CoinFeedRoutes::effective_peer(&candidate) == held.peer
+            })
+            || self
+                .archive_pool
+                .get_all()
+                .await
+                .into_iter()
+                .any(|address| {
+                    address == held.addr
+                        && quil_rpc::archive_client::pinned_archive_peer(&address) == held.peer
+                });
+        if !trusted {
+            if registry_loading {
+                return Err(tonic::Status::unavailable(
+                    "coin changes registry is loading",
+                ));
+            }
+            return Ok(reset());
+        }
+        let entries = scan_page_entries(max_coins);
+        let dials = AtomicU64::new(0);
+        let call = self.connections.call(&held, &dials, |mut client| {
+            let domain = domain.to_vec();
+            let cursor = backend.clone();
+            async move {
+                client
+                    .list_shard_coin_changes(domain, cursor, entries as u32)
+                    .await
+            }
+        });
+        let page = match tokio::time::timeout(self.page_attempt, call).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(CallError::Call(ArchiveClientError::Rpc(status)))) => return Err(status),
+            Ok(Err(CallError::Call(error))) => {
+                return Err(tonic::Status::unavailable(format!("coin changes: {error}")))
+            }
+            Ok(Err(CallError::Dial(error))) => {
+                return Err(tonic::Status::unavailable(format!(
+                    "coin changes dial: {error}"
+                )))
+            }
+            Err(_) => return Err(tonic::Status::unavailable("coin changes peer timed out")),
+        };
+        if prost::Message::encoded_len(&page) > scan_page_bytes(entries)
+            || page.network != network.as_slice()
+            || page.coins.len() > entries
+            || page.next_cursor.len() > MAX_COIN_FEED_CURSOR - 33
+            || (page.reset
+                && (!page.coins.is_empty() || page.has_more || !page.next_cursor.is_empty()))
+            || (!page.reset && page.next_cursor.is_empty())
+            || (page.has_more && page.next_cursor == backend)
+        {
+            return Err(tonic::Status::internal("invalid peer coin changes page"));
+        }
+        if page.reset {
+            return Ok(reset());
+        }
+        let coins =
+            page.coins
+                .into_iter()
+                .map(|coin| {
+                    let address = coin.address.try_into().map_err(|_| {
+                        tonic::Status::internal("invalid peer coin changes address")
+                    })?;
+                    if coin.owner.len() != 3648
+                        || coin.commitment.len() != 10368
+                        || coin.memo.len() != 1115
+                    {
+                        return Err(tonic::Status::internal("invalid peer coin changes coin"));
+                    }
+                    Ok(CoinData {
+                        address,
+                        frame_number: coin.frame_number,
+                        position: coin.position,
+                        owner: coin.owner,
+                        commitment: coin.commitment,
+                        memo: coin.memo,
+                    })
+                })
+                .collect::<Result<Vec<_>, tonic::Status>>()?;
+        let cursor = self
+            .wrap_coin_feed_cursor(&domain, &held, &page.next_cursor)
+            .await
+            .map_err(tonic::Status::internal)?;
+        Ok(CoinChangesPageData {
+            network,
+            coins,
+            cursor,
+            has_more: page.has_more,
+            reset: false,
+        })
     }
 
     /// The registry that decides which peers count as covering nodes: the
@@ -1000,7 +1400,22 @@ impl PeerCoinReader {
         } else {
             Some(page.cursor.try_into().map_err(|_| malformed())?)
         };
+        let change_cursor = match self
+            .wrap_coin_feed_cursor(domain, endpoint, &page.change_cursor)
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(reason) => {
+                tracing::warn!(
+                    application = %hex::encode(domain),
+                    reason = %bounded_reason(&reason),
+                    "forwarded Coin snapshot has no resumable change cursor"
+                );
+                Vec::new()
+            }
+        };
         Ok(CoinPageData {
+            change_cursor,
             network,
             snapshot_id: snapshot,
             root_record: page.root_record,
@@ -1506,6 +1921,280 @@ mod tests {
     use std::slice::from_ref;
     use tonic::{Request, Response, Status};
 
+    fn plaintext_dial() -> Dial<quil_rpc::ArchiveClient> {
+        Arc::new(|endpoint: ReadEndpoint| {
+            Box::pin(
+                async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint.addr).await },
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_route_write_failure_preserves_the_forwarded_coin_snapshot() {
+        let (endpoint, _) = serve_peer(1).await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(endpoint).await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(plaintext_dial())
+            .with_read_retry(Duration::ZERO, Duration::from_millis(1));
+        db.inner()
+            .refuse_writes("injected route persistence failure");
+
+        let page = reader.coin_page([3; 32], None, None, 8).await.unwrap();
+
+        assert_eq!(page.snapshot_id, [7; 32]);
+        assert_eq!(page.coins.len(), 2);
+        assert_eq!(page.coins[0].address, [0; 32]);
+        assert_eq!(page.coins[1].address, [1; 32]);
+        assert!(page.change_cursor.is_empty());
+        assert!(reader
+            .coin_feed_routes
+            .unwrap()
+            .table
+            .lock()
+            .routes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn forwarded_feed_survives_reader_restart_after_snapshot_finished() {
+        for pages in [0, 1] {
+            let (endpoint, _) = serve_peer(pages).await;
+            let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+            pool.add(endpoint).await;
+            let dir = tempfile::tempdir().unwrap();
+            let db = quil_store::RocksDb::open(dir.path()).unwrap();
+            let reader = |pool| {
+                PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+                    .with_coin_feed_routes(db.inner(), vec![7; 32])
+                    .unwrap()
+                    .with_dial(plaintext_dial())
+            };
+            let first = reader(pool.clone());
+            let page = first.coin_page([3; 32], None, None, 8).await.unwrap();
+            assert!(!page.has_more);
+            assert!(first.served_by.lock().is_empty());
+            assert_eq!(page.change_cursor.first(), Some(&2));
+            drop(first);
+            let restarted = reader(pool);
+            let changes = restarted
+                .coin_changes([3; 32], page.change_cursor, 8)
+                .await
+                .unwrap();
+            assert!(!changes.reset);
+            assert_eq!(changes.coins.len(), 1);
+            assert_eq!(changes.coins[0].frame_number, 5);
+            assert_eq!(changes.cursor.first(), Some(&2));
+        }
+    }
+
+    #[tokio::test]
+    async fn covering_feed_resume_waits_for_registry_warmup_without_resetting_cursor() {
+        let domain = [3; 32];
+        let root = domain.to_vec();
+        let record = registered(238, from_ref(&root), from_ref(&root), "10.0.0.238");
+        let (endpoint, _) = serve_peer(0).await;
+        let dials = Arc::new(AtomicU64::new(0));
+        let dial: Dial<quil_rpc::ArchiveClient> = {
+            let dials = dials.clone();
+            Arc::new(move |held: ReadEndpoint| {
+                assert_eq!(held.addr, "10.0.0.238:8340");
+                assert!(held.peer.is_some());
+                dials.fetch_add(1, Ordering::SeqCst);
+                let endpoint = endpoint.clone();
+                Box::pin(async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint).await })
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = {
+            let db = quil_store::RocksDb::open(dir.path()).unwrap();
+            let first = reader_of(vec![record.clone()], no_archives())
+                .with_coin_feed_routes(db.inner(), vec![7; 32])
+                .unwrap()
+                .with_dial(dial.clone());
+            let page = first.coin_page(domain, None, None, 8).await.unwrap();
+            assert!(!page.has_more);
+            assert_eq!(page.change_cursor.first(), Some(&2));
+            page.change_cursor
+        };
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let warming = Arc::new(quil_execution::prover_registry::SharedProverRegistry::new());
+        assert!(!warming.initial_load_complete());
+        let restarted = reader_of(vec![record.clone()], no_archives())
+            .with_prover_registry(warming.clone())
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(dial);
+        let before = dials.load(Ordering::SeqCst);
+        let status = restarted
+            .coin_changes(domain, cursor.clone(), 8)
+            .await
+            .err()
+            .expect("registry warmup must keep the persisted feed cursor retryable");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            before,
+            "unknown trust must not dial"
+        );
+
+        let store = quil_store::RocksHypergraphStore::new(db.inner());
+        warming.refresh_from_store(&store).unwrap();
+        warming.write_for_tests(|registry| registry.insert_prover_for_tests(record.1));
+        assert!(warming.initial_load_complete());
+        let changes = restarted
+            .coin_changes(domain, cursor.clone(), 8)
+            .await
+            .unwrap();
+        assert!(!changes.reset);
+        assert_eq!(changes.coins.len(), 1);
+        assert_eq!(changes.coins[0].address, [1; 32]);
+
+        warming.refresh_from_store(&store).unwrap();
+        let before = dials.load(Ordering::SeqCst);
+        let removed = restarted.coin_changes(domain, cursor, 8).await.unwrap();
+        assert!(removed.reset, "a loaded registry confirms route revocation");
+        assert_eq!(dials.load(Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn known_archive_feed_resumes_during_registry_warmup() {
+        let (endpoint, _) = serve_peer(0).await;
+        let pool = no_archives();
+        pool.add(endpoint).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_prover_registry(Arc::new(
+                quil_execution::prover_registry::SharedProverRegistry::new(),
+            ))
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(plaintext_dial());
+        let page = reader.coin_page([3; 32], None, None, 8).await.unwrap();
+        let changes = reader
+            .coin_changes([3; 32], page.change_cursor, 8)
+            .await
+            .unwrap();
+        assert!(!changes.reset);
+        assert_eq!(changes.coins.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forwarded_feed_preserves_old_peer_unimplemented_and_backend_reset() {
+        let (endpoint, _) = serve_peer(1).await;
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(endpoint.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(plaintext_dial());
+        let old = reader
+            .wrap_coin_feed_cursor(
+                &[3; 32],
+                &ReadEndpoint::archive(endpoint.clone()),
+                &[1, 255],
+            )
+            .await
+            .unwrap();
+        let status = reader
+            .coin_changes([3; 32], old, 8)
+            .await
+            .err()
+            .expect("old peer must refuse");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        let obsolete = reader
+            .wrap_coin_feed_cursor(&[3; 32], &ReadEndpoint::archive(endpoint), &[1, 254])
+            .await
+            .unwrap();
+        let page = reader.coin_changes([3; 32], obsolete, 8).await.unwrap();
+        assert!(page.reset);
+        assert!(page.cursor.is_empty());
+        assert!(page.coins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_feed_route_resets_without_dialing_any_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(Arc::new(|_| panic!("unknown cursor must never dial")));
+        let page = reader.coin_changes([3; 32], vec![2; 64], 8).await.unwrap();
+        assert!(page.reset);
+    }
+
+    #[tokio::test]
+    async fn known_feed_archive_address_stays_retryable_when_another_address_is_preferred() {
+        let preferred = "coin-feed-preferred.invalid:8340";
+        let alternate = "coin-feed-alternate.invalid:8340";
+        let peer = quil_p2p::PeerId::from_bytes(&quil_p2p::peer_id_from_falcon_pubkey(&[237; 897]))
+            .unwrap();
+        quil_rpc::archive_client::pin_archive_peer(preferred, peer).unwrap();
+        quil_rpc::archive_client::pin_archive_peer(alternate, peer).unwrap();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(preferred.to_string()).await;
+        pool.add(alternate.to_string()).await;
+        assert_eq!(pool.archives().await, vec![preferred.to_string()]);
+        assert!(pool.get_all().await.contains(&alternate.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(Arc::new(move |endpoint| {
+                assert_eq!(endpoint.addr, alternate);
+                assert_eq!(endpoint.peer, Some(peer));
+                Box::pin(async {
+                    Err(ArchiveClientError::Rpc(Status::unavailable(
+                        "temporarily offline",
+                    )))
+                })
+            }));
+        let cursor = reader
+            .wrap_coin_feed_cursor(
+                &[3; 32],
+                &ReadEndpoint::archive(alternate.to_string()),
+                &[1, 7],
+            )
+            .await
+            .unwrap();
+        let status =
+            reader.coin_changes([3; 32], cursor, 8).await.err().expect(
+                "a known backend outage must remain retryable, without resetting its cursor",
+            );
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn untrusted_feed_route_resets_without_dialing_its_stored_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        let reader = PeerCoinReader::new(Arc::default(), pool, vec![0; 32], 1)
+            .with_coin_feed_routes(db.inner(), vec![7; 32])
+            .unwrap()
+            .with_dial(Arc::new(|_| panic!("removed route must never dial")));
+        let cursor = reader
+            .wrap_coin_feed_cursor(
+                &[3; 32],
+                &ReadEndpoint::archive("127.0.0.1:1".into()),
+                &[1, 7],
+            )
+            .await
+            .unwrap();
+        let page = reader.coin_changes([3; 32], cursor, 8).await.unwrap();
+        assert!(page.reset);
+    }
+
     fn page(has_more: bool) -> PageCost {
         PageCost {
             started: Instant::now(),
@@ -1568,6 +2257,14 @@ mod tests {
             if request.max_coins > self.stall_above {
                 std::future::pending::<()>().await;
             }
+            if self.pages == 0 {
+                return Ok(Response::new(ListShardCoinsResponse {
+                    network: vec![0; 32],
+                    snapshot_id: vec![7; 32],
+                    change_cursor: vec![1, 0],
+                    ..Default::default()
+                }));
+            }
             let start = after.first().map_or(0, |last| last + 1);
             let step = if self.memo_bytes == 0 {
                 2
@@ -1576,6 +2273,7 @@ mod tests {
             };
             let end = start.saturating_add(step).min(2 * self.pages);
             Ok(Response::new(ListShardCoinsResponse {
+                change_cursor: vec![1, 0],
                 network: vec![0; 32],
                 snapshot_id: vec![7; 32],
                 root_record: vec![1],
@@ -1589,6 +2287,44 @@ mod tests {
                 cursor: vec![end - 1; 32],
                 has_more: end < 2 * self.pages,
             }))
+        }
+
+        async fn list_shard_coin_changes(
+            &self,
+            request: Request<quil_types::proto::global::ListShardCoinChangesRequest>,
+        ) -> Result<Response<quil_types::proto::global::ListShardCoinChangesResponse>, Status>
+        {
+            let req = request.into_inner();
+            if req.cursor == [1, 255] {
+                return Err(Status::unimplemented("old peer"));
+            }
+            if req.cursor == [1, 254] {
+                return Ok(Response::new(
+                    quil_types::proto::global::ListShardCoinChangesResponse {
+                        network: quil_execution::token_intrinsic::state::network_identifier(1)
+                            .to_vec(),
+                        reset: true,
+                        ..Default::default()
+                    },
+                ));
+            }
+            let step = req.cursor.last().copied().unwrap_or(0).saturating_add(1);
+            Ok(Response::new(
+                quil_types::proto::global::ListShardCoinChangesResponse {
+                    network: quil_execution::token_intrinsic::state::network_identifier(1).to_vec(),
+                    coins: vec![ShardCoin {
+                        address: vec![step; 32],
+                        frame_number: 5,
+                        position: 7,
+                        owner: vec![0; 3648],
+                        commitment: vec![0; 10368],
+                        memo: vec![0; 1115],
+                    }],
+                    next_cursor: vec![1, step],
+                    has_more: false,
+                    reset: false,
+                },
+            ))
         }
 
         async fn list_shard_legacy_coins(
@@ -2705,5 +3441,147 @@ mod tests {
             unregistered.is_empty(),
             "unregistered peers asked for a wallet read: {unregistered:?} (in order {asked:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod coin_feed_route_tests {
+    use super::*;
+
+    #[test]
+    fn reopening_valid_coin_feed_routes_does_not_write_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let database = db.inner();
+        let endpoint = ReadEndpoint::archive("trusted.example:8340".into());
+        let routes = CoinFeedRoutes::open(database.clone(), vec![7; 32], [9; 32], 1).unwrap();
+        let cursor = routes.wrap(&[3; 32], &endpoint, &[1, 7]).unwrap();
+        drop(routes);
+        let sequence = database.latest_sequence_number();
+
+        let reopened = CoinFeedRoutes::open(database.clone(), vec![7; 32], [9; 32], 1).unwrap();
+
+        assert_eq!(database.latest_sequence_number(), sequence);
+        let (held, backend) = reopened.resolve(&[3; 32], &cursor).unwrap();
+        assert_eq!(held, endpoint);
+        assert_eq!(backend, [1, 7]);
+    }
+
+    #[test]
+    fn coin_feed_route_cache_write_does_not_invalidate_canonical_execution() {
+        use quil_forest::{ExecutionOverlay, OverlayLimits, OverlayMutation};
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let database = db.inner();
+        let routes = CoinFeedRoutes::open(database.clone(), vec![7; 32], [9; 32], 1).unwrap();
+        let overlay = ExecutionOverlay::capture(
+            database.clone(),
+            OverlayLimits {
+                max_delta_bytes: 4096,
+                max_delta_entries: 8,
+                max_record_bytes: 4096,
+                max_read_bytes: 4096,
+                max_read_operations: 16,
+                max_cursors: 1,
+            },
+        )
+        .unwrap();
+        let canonical_key = b"\0\x09cursor";
+        overlay
+            .apply(&[OverlayMutation::Put(
+                canonical_key.to_vec(),
+                b"committed".to_vec(),
+            )])
+            .unwrap();
+        routes
+            .wrap(
+                &[3; 32],
+                &ReadEndpoint::archive("trusted.example:8340".into()),
+                &[1, 7],
+            )
+            .unwrap();
+        overlay
+            .prepare_commit()
+            .unwrap()
+            .commit(&database)
+            .expect("wallet routing cache writes must not stale unrelated GLOBAL execution");
+        assert_eq!(
+            database.get(canonical_key).unwrap().as_deref(),
+            Some(b"committed".as_slice())
+        );
+    }
+
+    #[test]
+    fn feed_route_survives_database_reopen_and_binds_domain_and_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = ReadEndpoint::archive("127.0.0.1:8340".into());
+        let cursor = {
+            let db = quil_store::RocksDb::open(dir.path()).unwrap();
+            let routes = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1).unwrap();
+            let cursor = routes.wrap(&[3; 32], &endpoint, &[1, 5, 9]).unwrap();
+            assert_eq!(
+                routes.wrap(&[3; 32], &endpoint, &[1, 5, 9]).unwrap(),
+                cursor
+            );
+            cursor
+        };
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let routes = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1).unwrap();
+        let (held, backend) = routes.resolve(&[3; 32], &cursor).unwrap();
+        assert_eq!(held, endpoint);
+        assert_eq!(backend, [1, 5, 9]);
+        assert!(routes.resolve(&[4; 32], &cursor).is_none());
+        let changed = CoinFeedRoutes::open(db.inner(), vec![8; 32], [10; 32], 1).unwrap();
+        assert!(changed.resolve(&[3; 32], &cursor).is_none());
+    }
+
+    #[test]
+    fn feed_route_network_change_resets_and_client_bytes_never_select_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let routes = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1).unwrap();
+        let endpoint = ReadEndpoint::archive("trusted.example:8340".into());
+        let cursor = routes
+            .wrap(&[3; 32], &endpoint, b"http://169.254.169.254/latest")
+            .unwrap();
+        let (held, _) = routes.resolve(&[3; 32], &cursor).unwrap();
+        assert_eq!(held.addr, "trusted.example:8340");
+        let mut forged = cursor.clone();
+        forged[1] ^= 1;
+        assert!(routes.resolve(&[3; 32], &forged).is_none());
+        let changed = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 2).unwrap();
+        assert!(changed.resolve(&[3; 32], &cursor).is_none());
+    }
+
+    #[test]
+    fn feed_route_table_is_bounded_and_eviction_explicitly_loses_old_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let routes = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1).unwrap();
+        let endpoint = ReadEndpoint::archive("trusted.example:8340".into());
+        let first = routes.wrap(&[3; 32], &endpoint, &[1]).unwrap();
+        for i in 0..MAX_COIN_FEED_ROUTES {
+            let mut domain = [0; 32];
+            domain[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            routes.wrap(&domain, &endpoint, &[1]).unwrap();
+        }
+        assert_eq!(routes.table.lock().routes.len(), MAX_COIN_FEED_ROUTES);
+        assert!(routes.resolve(&[3; 32], &first).is_none());
+    }
+    #[test]
+    fn corrupt_cache_recovers_with_new_handles_without_reusing_old_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let endpoint = ReadEndpoint::archive("trusted.example:8340".into());
+        let old = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1)
+            .unwrap()
+            .wrap(&[3; 32], &endpoint, &[1])
+            .unwrap();
+        db.inner().put(COIN_FEED_ROUTES_KEY, [255]).unwrap();
+        let recovered = CoinFeedRoutes::open(db.inner(), vec![7; 32], [9; 32], 1).unwrap();
+        assert!(recovered.resolve(&[3; 32], &old).is_none());
+        let fresh = recovered.wrap(&[3; 32], &endpoint, &[1]).unwrap();
+        assert_ne!(old, fresh);
+        assert!(recovered.resolve(&[3; 32], &old).is_none());
     }
 }

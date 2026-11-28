@@ -331,6 +331,7 @@ impl AppShardService for AppShardRpcServer {
             .await?
             .into_inner();
         Ok(Response::new(global::ListShardCoinsResponse {
+            change_cursor: page.change_cursor,
             network: page.network,
             snapshot_id: page.snapshot_id,
             root_record: page.root_record,
@@ -348,6 +349,40 @@ impl AppShardService for AppShardRpcServer {
                 .collect(),
             cursor: page.cursor,
             has_more: page.has_more,
+        }))
+    }
+
+    async fn list_shard_coin_changes(
+        &self,
+        request: Request<global::ListShardCoinChangesRequest>,
+    ) -> Result<Response<global::ListShardCoinChangesResponse>, Status> {
+        let req = request.into_inner();
+        let page = self
+            .reads
+            .list_coin_changes(Request::new(node::ListCoinChangesRequest {
+                domain: req.domain,
+                cursor: req.cursor,
+                max_coins: req.max_coins,
+            }))
+            .await?
+            .into_inner();
+        Ok(Response::new(global::ListShardCoinChangesResponse {
+            network: page.network,
+            coins: page
+                .coins
+                .into_iter()
+                .map(|coin| global::ShardCoin {
+                    address: coin.address,
+                    frame_number: coin.frame_number,
+                    owner: coin.owner,
+                    commitment: coin.commitment,
+                    memo: coin.memo,
+                    position: coin.position,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+            reset: page.reset,
         }))
     }
 

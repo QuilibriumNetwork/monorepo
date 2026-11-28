@@ -43,7 +43,7 @@ pub(crate) async fn start(
     );
     info!(core_id, db_path = %db_path.display(), "worker store path resolved");
     std::fs::create_dir_all(&db_path)?;
-    let db = quil_store::RocksDb::open(&db_path)?;
+    let db = quil_store::RocksDb::open_with_coin_changes(&db_path, config.db.coin_changes_enabled)?;
     db.inner()
         .register_store(quil_forest::StoreRole::Worker(core_id));
     quil_store::large_vertex_index::start(&db.inner(), format!("worker {core_id}"));

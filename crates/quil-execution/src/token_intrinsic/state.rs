@@ -328,7 +328,7 @@ pub(crate) fn decode_snapshot_coin(
 
 /// Validate the full stored output, including its content address, for both
 /// wallet enumeration and membership-tree reconstruction.
-pub(crate) fn decode_stored_snapshot_coin(
+pub fn decode_stored_snapshot_coin(
     context: &[u8; 32],
     application: &[u8; 32],
     key: &[u8],

@@ -4335,6 +4335,14 @@ impl HypergraphCrdt {
         let forest = self.forest.write().map_err(|_| poisoned("forest"))?;
         let mut dropped = Vec::new();
         for (phase_idx, phase) in PHASES.iter().enumerate() {
+            if dropped.is_empty()
+                && forest
+                    .orphaned_phase_head(shard_id, *phase)
+                    .map_err(|e| QuilError::ExecutionUnavailable(format!("read phase head: {e}")))?
+                    .is_some()
+            {
+                self.store.invalidate_coin_changes()?;
+            }
             if let Some(version) = forest
                 .drop_orphaned_phase_head(shard_id, *phase)
                 .map_err(|e| QuilError::ExecutionUnavailable(format!("drop phase head: {e}")))?
@@ -4767,6 +4775,12 @@ impl HypergraphCrdt {
             scopes.push((SYNC_HOLD_SCOPE, &[][..], true));
         }
         let change = mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
+        if leaves.iter().any(|(_, leaf)| leaf.is_none()) {
+            // Additions remain ordinary arrivals. A destructive repair resets
+            // the baseline in the same transaction as its removals.
+            self.store
+                .invalidate_coin_changes_in_transaction(txn.as_ref())?;
+        }
         txn.commit()?;
         self.invalidate_local_observer_after_sync(&app, plan.phase_idx);
         staged
@@ -4941,8 +4955,10 @@ impl HypergraphCrdt {
         let txn = self.store.new_transaction(false)?;
         let mut staged = Vec::new();
         let mut wiped = Vec::new();
+        let mut without_head = Vec::new();
         for (phase_idx, target) in targets.into_iter().enumerate() {
             let Some(head) = self.resolve_phase_version_with(&forest, &app, phase_idx) else {
+                without_head.push(phase_idx);
                 continue;
             };
             let current = forest
@@ -5067,26 +5083,98 @@ impl HypergraphCrdt {
             }
             staged.push((phase_idx, version, phase));
         }
-        if staged.is_empty() && wiped.is_empty() {
-            txn.abort()?;
-            return Ok(());
+        let coin_scope = [b"rewind/".as_slice(), filter].concat();
+        let unchanged = staged.is_empty() && wiped.is_empty();
+        if unchanged {
+            match self.store.is_coin_changes_installing(&coin_scope) {
+                Ok(true) => {}
+                state => {
+                    if let Err(error) = state {
+                        tracing::warn!(
+                            filter = %hex::encode(filter),
+                            %error,
+                            "cannot query optional Coin rewind recovery; keeping its state unchanged"
+                        );
+                    }
+                    txn.abort()?;
+                    return Ok(());
+                }
+            }
         }
-        txn.commit()?;
-        self.invalidate_local_observer_after_sync(&app, 0);
-        for (phase_idx, version, phase) in staged {
-            phase
-                .publish_memory()
-                .map_err(|e| QuilError::Internal(format!("publish rewound memory tree: {e}")))?;
-            self.phase_versions
-                .write()
-                .unwrap()
-                .insert((app.to_vec(), phase_idx), version);
+        let mut unverified = false;
+        for phase_idx in without_head {
+            // A headless phase may still contain migrated nodes. Only physical
+            // absence proves it empty. Clear root indices only for whole-phase
+            // rewinds.
+            let verified_absent = if empty(&roots[phase_idx]) {
+                match self.read_shard_phase_root_checked(&forest, &app, phase_idx) {
+                    Ok(root) => root == [0; 32],
+                    Err(error) if unchanged => {
+                        txn.abort()?;
+                        return Err(error);
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if verified_absent {
+                if bits.is_empty() {
+                    wiped.push(phase_idx);
+                }
+            } else if unchanged {
+                txn.abort()?;
+                tracing::warn!(
+                    filter = %hex::encode(filter),
+                    phase_idx,
+                    "cannot verify optional Coin rewind recovery; keeping canonical state and its feed fence unchanged"
+                );
+                return Ok(());
+            } else {
+                unverified = true;
+            }
+        }
+        // Unverified recovery keeps the feed fenced without failing this rewind.
+        let finish_scope = if !unchanged && unverified {
+            match self.store.is_coin_changes_installing(&coin_scope) {
+                Ok(false) => true,
+                state => {
+                    tracing::warn!(
+                        filter = %hex::encode(filter),
+                        scope_state = ?state,
+                        "rewind cannot verify an earlier installation; keeping its Coin feed fence"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if unchanged {
+            txn.abort()?;
+        } else {
+            self.store.begin_coin_changes_rewind(&coin_scope, roots)?;
+            txn.commit()?;
+            self.invalidate_local_observer_after_sync(&app, 0);
+            for (phase_idx, version, phase) in staged {
+                phase.publish_memory().map_err(|e| {
+                    QuilError::Internal(format!("publish rewound memory tree: {e}"))
+                })?;
+                self.phase_versions
+                    .write()
+                    .unwrap()
+                    .insert((app.to_vec(), phase_idx), version);
+            }
         }
         for phase_idx in wiped {
             self.finish_phase_wipe(&forest, &app, phase_idx)?;
         }
         drop(forest);
-        self.rebucket_app_locked(&app)
+        self.rebucket_app_locked(&app)?;
+        if finish_scope {
+            self.store.set_coin_changes_installing(&coin_scope, false)?;
+        }
+        Ok(())
     }
 
     /// Empty one phase tree of the single-shard tree `shard_id` (a 32-byte
@@ -5105,6 +5193,32 @@ impl HypergraphCrdt {
         phase_idx: usize,
         expected: [u8; 32],
     ) -> Result<usize> {
+        self.wipe_shard_phase_inner(shard_id, phase_idx, expected, false)
+    }
+
+    /// Resume an empty phase wipe only while its durable scope is active.
+    /// Unfenced empty and placeholder phases remain unchanged.
+    pub fn resume_empty_shard_phase_wipe(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        expected: [u8; 32],
+    ) -> Result<usize> {
+        if expected != [0; 32] && expected != *b"SPARSE_MERKLE_PLACEHOLDER_HASH__" {
+            return Err(QuilError::InvalidArgument(
+                "a phase wipe resume needs an empty phase".into(),
+            ));
+        }
+        self.wipe_shard_phase_inner(shard_id, phase_idx, expected, true)
+    }
+
+    fn wipe_shard_phase_inner(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        expected: [u8; 32],
+        only_if_installing: bool,
+    ) -> Result<usize> {
         let app: [u8; 32] = shard_id
             .try_into()
             .map_err(|_| QuilError::InvalidArgument("a phase wipe needs a 32-byte shard".into()))?;
@@ -5119,6 +5233,23 @@ impl HypergraphCrdt {
         };
         let _forest_guard = self.forest_write_lock.lock().unwrap();
         let _guard = self.commit_lock.lock().unwrap();
+        let coin_scope = [b"wipe/".as_slice(), shard_id, &[phase_idx as u8]].concat();
+        let installing = || match self.store.is_coin_changes_installing(&coin_scope) {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(
+                    shard = %hex::encode(shard_id),
+                    phase_idx,
+                    %error,
+                    "cannot query optional Coin phase wipe recovery; keeping its state unchanged"
+                );
+                false
+            }
+        };
+        let resuming = only_if_installing && installing();
+        if only_if_installing && !resuming {
+            return Ok(0);
+        }
         if self
             .pending
             .read()
@@ -5144,7 +5275,13 @@ impl HypergraphCrdt {
             ));
         }
         if root == [0; 32] {
-            return Ok(0); // never committed
+            if resuming || installing() {
+                // A reset can succeed before its root-index cleanup fails.
+                // Finish both before declaring this exact wipe complete.
+                self.finish_phase_wipe(&forest, &app, phase_idx)?;
+                self.store.set_coin_changes_installing(&coin_scope, false)?;
+            }
+            return Ok(0);
         }
         // A migrated tree has no head marker; its root reads at the forest version.
         let head = self
@@ -5152,9 +5289,11 @@ impl HypergraphCrdt {
             .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
         let txn = self.store.new_transaction(false)?;
         let leaves = self.stage_phase_wipe(&forest, txn.as_ref(), &shard, phase_idx, head)?;
+        self.store.set_coin_changes_installing(&coin_scope, true)?;
         txn.commit()?;
         self.invalidate_local_observer_after_sync(&app, phase_idx);
         self.finish_phase_wipe(&forest, &app, phase_idx)?;
+        self.store.set_coin_changes_installing(&coin_scope, false)?;
         Ok(leaves)
     }
 
@@ -5191,12 +5330,14 @@ impl HypergraphCrdt {
         forest
             .reset_shard_phase_tree(shard_id, PHASES[phase_idx])
             .map_err(|e| QuilError::Internal(format!("phase reset: {e}")))?;
-        let (set, kind) = PHASE_STR[phase_idx];
-        self.store.clear_phase_root_versions(set, kind, shard_id)?;
+        // The tree is gone even if clearing its root index fails. A stale
+        // cached head would prevent the retry from recognizing the empty tree.
         self.phase_versions
             .write()
             .unwrap()
             .remove(&(shard_id.to_vec(), phase_idx));
+        let (set, kind) = PHASE_STR[phase_idx];
+        self.store.clear_phase_root_versions(set, kind, shard_id)?;
         Ok(())
     }
 
@@ -5342,6 +5483,8 @@ impl HypergraphCrdt {
                 if staged.is_empty() {
                     txn.abort()?;
                 } else {
+                    self.store
+                        .invalidate_coin_changes_in_transaction(txn.as_ref())?;
                     txn.commit()?;
                     outcome.dropped_lineages.extend(dropped);
                     for (phase_idx, version) in &staged {
@@ -6212,6 +6355,8 @@ impl HypergraphCrdt {
         shard_l2: &[u8],
     ) -> Result<()> {
         self.maintain_forest(guard, |forest| {
+            let coin_scope = [b"reset/".as_slice(), shard_l2].concat();
+            self.store.set_coin_changes_installing(&coin_scope, true)?;
             forest.reset_shard_phase_trees(shard_l2).map_err(|e| {
                 QuilError::ExecutionUnavailable(format!("reset_shard_forest_trees: {e}"))
             })?;
@@ -6219,7 +6364,7 @@ impl HypergraphCrdt {
             // it resolves old roots to the rebuilt tree's reused versions, and the
             // retention pruner reads the restart as a history it must not touch.
             self.store.clear_root_versions(shard_l2)?;
-            Ok(())
+            self.store.set_coin_changes_installing(&coin_scope, false)
         })
     }
 
@@ -7720,6 +7865,25 @@ impl HypergraphCrdt {
         })
     }
 
+    /// Capture a Coin scan snapshot under the forest maintenance lock.
+    /// Reject snapshots with an incomplete sync for this domain.
+    pub fn acquire_or_capture_coin_scan_snapshot(
+        &self,
+        id: Option<&[u8; 32]>,
+        domain: &[u8; 32],
+    ) -> Result<Option<GenerationHandle>> {
+        let _forest_guard = self.lock_forest_writes();
+        let snapshot = self.acquire_or_capture_scan_snapshot(id)?;
+        if let Some(records) = snapshot.as_ref().and_then(|view| view.db_snapshot.as_ref()) {
+            if snapshot_sync_incomplete(records.as_ref(), domain)? {
+                return Err(QuilError::ExecutionUnavailable(
+                    "Coin scan snapshot contains an incomplete sync".into(),
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
     pub fn known_snapshot_roots(&self) -> Vec<Vec<u8>> {
         self.snapshot_mgr.known_roots()
     }
@@ -8588,7 +8752,7 @@ mod sync_value_binding_tests {
 #[cfg(test)]
 mod phase_wipe_tests {
     use super::*;
-    use crate::testing::{MemStore, StubProver};
+    use crate::testing::{CrdtTreeReader, MemStore, StubProver};
     use std::sync::Arc;
 
     fn at(app: [u8; 32], byte: u8) -> Location {
@@ -8596,6 +8760,221 @@ mod phase_wipe_tests {
             app_address: app,
             data_address: [byte; 32],
         }
+    }
+
+    #[test]
+    fn coin_feed_resets_for_semantic_wipe_and_rewind_but_not_commits_or_retention() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let app = [5; 32];
+        hg.add_vertex(&at(app, 1), b"coin").unwrap();
+        hg.remove_vertex(&at(app, 1)).unwrap();
+        hg.commit(1).unwrap();
+        hg.prune_to_frame(1).unwrap();
+        assert_eq!(store.coin_change_resets(), 0);
+
+        let root = hg.current_forest_phase_root(&app, 1).unwrap();
+        assert!(hg.wipe_shard_phase(&app, 1, [7; 32]).is_err());
+        assert_eq!(store.coin_change_resets(), 0, "a refused wipe is unchanged");
+        hg.wipe_shard_phase(&app, 1, root).unwrap();
+        let after_wipe = store.coin_change_resets();
+        assert!(
+            after_wipe > 0,
+            "a semantic wipe invalidates existing cursors"
+        );
+        assert!(!store.coin_change_installing());
+        hg.wipe_shard_phase(&app, 1, [0; 32]).unwrap();
+        assert_eq!(
+            store.coin_change_resets(),
+            after_wipe,
+            "an empty wipe is a no-op"
+        );
+
+        hg.rewind_app_shard(&app, &[[0; 32]; 4]).unwrap();
+        assert!(
+            store.coin_change_resets() > after_wipe,
+            "a rewind invalidates cursors"
+        );
+        assert!(!store.coin_change_installing());
+        let after_rewind = store.coin_change_resets();
+        hg.rewind_app_shard(&app, &[[0; 32]; 4]).unwrap();
+        assert_eq!(
+            store.coin_change_resets(),
+            after_rewind,
+            "an unchanged rewind is a no-op"
+        );
+    }
+
+    #[test]
+    fn coin_feed_resets_for_destructive_sync_but_not_regular_arrivals() {
+        let app = [0xff; 32];
+        let source = Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        source.set_unified_tree(true);
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0], b"value", &[], &BigInt::from(5)).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        source.add_vertex(&at(app, 1), &blob).unwrap();
+        source.commit(1).unwrap();
+        let (version, root) = source.serve_forest_head(&app, 0).unwrap();
+        let reader = CrdtTreeReader {
+            source,
+            shard_id: app.to_vec(),
+            phase: 0,
+        };
+        let store = Arc::new(MemStore::new());
+        let target = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        target.set_unified_tree(true);
+        let prepare = || {
+            target
+                .prepare_phase_sync(
+                    &reader,
+                    version,
+                    &app,
+                    0,
+                    &[],
+                    Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+                )
+                .unwrap()
+        };
+        let mut additions = prepare();
+        target
+            .apply_sync_chunk(&mut additions, &[blob.clone()])
+            .unwrap();
+        assert_eq!(store.coin_change_resets(), 0, "ordinary sync is an arrival");
+
+        target.add_vertex(&at(app, 2), &blob).unwrap();
+        target.commit(2).unwrap();
+        let mut repair = prepare();
+        assert!(repair.remaining().iter().any(|(_, value)| value.is_none()));
+        let blobs = repair
+            .remaining()
+            .iter()
+            .map(|(_, value)| value.as_ref().map_or_else(Vec::new, |_| blob.clone()))
+            .collect::<Vec<_>>();
+        target.apply_sync_chunk(&mut repair, &blobs).unwrap();
+        assert!(
+            store.coin_change_resets() > 0,
+            "a destructive repair invalidates cursors"
+        );
+    }
+
+    #[test]
+    fn coin_feed_keeps_a_failed_wipes_fence_until_that_scope_is_repaired() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let (first, second) = ([5; 32], [6; 32]);
+        for app in [first, second] {
+            hg.add_vertex(&at(app, 1), b"coin").unwrap();
+        }
+        hg.commit(1).unwrap();
+        let first_root = hg.current_forest_phase_root(&first, 0).unwrap();
+        let second_root = hg.current_forest_phase_root(&second, 0).unwrap();
+        store.fail_phase_root_clear(true);
+        assert!(hg.wipe_shard_phase(&first, 0, first_root).is_err());
+        assert!(
+            store.coin_change_installing(),
+            "failure leaves its durable fence"
+        );
+        store.fail_phase_root_clear(false);
+        hg.wipe_shard_phase(&second, 0, second_root).unwrap();
+        assert!(
+            store.coin_change_installing(),
+            "another scope cannot clear the fence"
+        );
+        hg.wipe_shard_phase(&first, 0, [0; 32]).unwrap();
+        assert!(
+            !store.coin_change_installing(),
+            "the completed retry clears its fence"
+        );
+    }
+
+    #[test]
+    fn an_empty_wipe_retry_keeps_its_fence_until_root_index_cleanup_succeeds() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let app = [5; 32];
+        hg.add_vertex(&at(app, 1), b"coin").unwrap();
+        hg.commit(1).unwrap();
+        let root = hg.current_forest_phase_root(&app, 0).unwrap();
+        store.fail_phase_root_clear(true);
+        assert!(hg.wipe_shard_phase(&app, 0, root).is_err());
+        assert_eq!(hg.current_forest_phase_root(&app, 0).unwrap(), [0; 32]);
+        assert!(hg.wipe_shard_phase(&app, 0, [0; 32]).is_err());
+        assert!(store.coin_change_installing());
+        store.fail_phase_root_clear(false);
+        hg.wipe_shard_phase(&app, 0, [0; 32]).unwrap();
+        assert!(!store.coin_change_installing());
+    }
+
+    #[test]
+    fn an_unchanged_rewind_retry_keeps_its_fence_until_root_index_cleanup_succeeds() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let app = [5; 32];
+        hg.add_vertex(&at(app, 1), b"coin").unwrap();
+        hg.commit(1).unwrap();
+        store.fail_phase_root_clear(true);
+        assert!(hg.rewind_app_shard(&app, &[[0; 32]; 4]).is_err());
+        assert_eq!(hg.current_forest_phase_root(&app, 0).unwrap(), [0; 32]);
+        assert!(hg.rewind_app_shard(&app, &[[0; 32]; 4]).is_err());
+        assert!(store.coin_change_installing());
+        store.fail_phase_root_clear(false);
+        hg.rewind_app_shard(&app, &[[0; 32]; 4]).unwrap();
+        assert!(!store.coin_change_installing());
+    }
+
+    #[test]
+    fn a_prefix_rewind_retry_can_verify_absent_phases_without_clearing_whole_phase_indices() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let app = [5; 32];
+        let filter = [app.as_slice(), &[1]].concat();
+        let scope = [b"rewind/".as_slice(), filter.as_slice()].concat();
+        store.set_coin_changes_installing(&scope, true).unwrap();
+        // Empty phases prove the prefix target, but do not permit clearing
+        // the application's indices.
+        store.fail_phase_root_clear(true);
+        hg.rewind_app_shard(&filter, &[[0; 32]; 4]).unwrap();
+        assert!(!store.coin_change_installing());
+    }
+
+    #[test]
+    fn an_unchanged_prefix_rewind_keeps_an_unverified_phase_and_its_optional_fence() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let app = [5; 32];
+        // Migrated trees can have version-zero nodes without a head marker.
+        // A missing head alone therefore cannot prove a wipe completed.
+        let staged = hg
+            .forest
+            .read()
+            .unwrap()
+            .stage_synced_phase(
+                &app,
+                PHASES[0],
+                0,
+                [(quil_forest::KeyHash([1; 32]), Some(vec![9]))],
+                &[],
+                None,
+            )
+            .unwrap();
+        let root = staged.root();
+        staged.publish_memory().unwrap();
+        let filter = [app.as_slice(), &[1]].concat();
+        let scope = [b"rewind/".as_slice(), filter.as_slice()].concat();
+        store.set_coin_changes_installing(&scope, true).unwrap();
+        hg.rewind_app_shard(&filter, &[[0; 32]; 4]).unwrap();
+        assert!(store.coin_change_installing());
+        assert_eq!(hg.current_forest_phase_root(&app, 0).unwrap(), root);
     }
 
     /// A phase wipe empties one phase tree with the blobs of its leaves, so a
@@ -8688,6 +9067,72 @@ mod committed_view_tests {
             .unwrap()
             .read_record(KEY)
             .unwrap()
+    }
+
+    #[test]
+    fn a_coin_scan_waits_until_the_entire_forest_maintenance_finishes() {
+        let (store, hg) = crdt();
+        commit(&store, b"before");
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let guard = hg.lock_forest_writes();
+            scope.spawn(|| {
+                asked_tx.send(()).unwrap();
+                let snapshot = hg
+                    .acquire_or_capture_coin_scan_snapshot(None, &[5; 32])
+                    .unwrap()
+                    .unwrap();
+                snapshot_tx.send(snapshot).unwrap();
+            });
+            asked_rx.recv().unwrap();
+            let early = snapshot_rx.recv_timeout(Duration::from_millis(100));
+            commit(&store, b"after");
+            drop(guard);
+            let snapshot = match early {
+                Ok(snapshot) => snapshot,
+                Err(_) => snapshot_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            };
+            assert_eq!(
+                snapshot
+                    .db_snapshot
+                    .unwrap()
+                    .read_record(KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"after"[..]),
+                "Coin bootstrap must not capture a maintenance intermediate state"
+            );
+        });
+    }
+
+    #[test]
+    fn a_coin_scan_refuses_an_incomplete_sync_but_keeps_an_older_retained_view() {
+        let (store, hg) = crdt();
+        let app = [5; 32];
+        let before = hg
+            .acquire_or_capture_coin_scan_snapshot(None, &app)
+            .unwrap()
+            .unwrap();
+        {
+            let _guard = hg.commit_lock.lock().unwrap();
+            let txn = store.new_transaction(false).unwrap();
+            mark_sync_incomplete(txn.as_ref(), &app, 0, &[], true).unwrap();
+            txn.commit().unwrap();
+        }
+        assert!(hg
+            .acquire_or_capture_coin_scan_snapshot(None, &app)
+            .is_err());
+        assert!(hg
+            .acquire_or_capture_coin_scan_snapshot(before.scan_id.as_ref(), &app)
+            .unwrap()
+            .is_some());
+        assert!(
+            hg.acquire_or_capture_coin_scan_snapshot(None, &[6; 32])
+                .unwrap()
+                .is_some(),
+            "another application's sync does not withhold this scan"
+        );
     }
 
     /// With a holder at work, a reader neither waits for it nor sees its

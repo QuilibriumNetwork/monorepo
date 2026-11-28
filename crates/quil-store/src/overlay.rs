@@ -306,6 +306,7 @@ impl Iterator for OverlayIterator {
 /// A failed staging operation poisons the entire transaction. Even callers
 /// using the WriteBatch-style void methods cannot commit a truncated batch.
 pub(crate) struct OverlayBatch {
+    projection_reset: bool,
     mutations: Vec<OverlayMutation>,
     bytes: usize,
     failure: Option<String>,
@@ -374,6 +375,7 @@ impl OverlayTxn {
     pub(crate) fn new(db: OverlayDb) -> Self {
         Self {
             batch: Mutex::new(OverlayBatch {
+                projection_reset: false,
                 mutations: Vec::new(),
                 bytes: 0,
                 failure: None,
@@ -394,6 +396,13 @@ impl OverlayTxn {
             ));
         }
         Ok(txn)
+    }
+
+    pub(crate) fn reset_coin_projection(&self) -> Result<()> {
+        let mut batch = self.batch.lock().unwrap();
+        self.check_batch(&batch)?;
+        batch.projection_reset = true;
+        Ok(())
     }
 
     /// Read our own staged writes when updating clock indices or committing a
@@ -456,7 +465,18 @@ impl Transaction for OverlayTxn {
             self.db.0.record_execution_failure();
             error
         })?;
-        self.db.0.apply(&batch.mutations).map_err(error)
+        if batch.projection_reset {
+            self.db
+                .0
+                .apply_with_local_projection_reset(
+                    &batch.mutations,
+                    crate::coin_changes::NAMESPACE,
+                    crate::coin_changes::RESET_REQUEST,
+                )
+                .map_err(error)
+        } else {
+            self.db.0.apply(&batch.mutations).map_err(error)
+        }
     }
     fn abort(self: Box<Self>) -> Result<()> {
         Ok(())

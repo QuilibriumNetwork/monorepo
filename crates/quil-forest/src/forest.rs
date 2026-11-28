@@ -668,6 +668,18 @@ impl Forest {
         Ok(())
     }
 
+    /// Physical absence, including the head marker; a headless migrated tree
+    /// with version-zero nodes is not an empty phase.
+    pub fn shard_phase_is_physically_empty(&self, shard_id: &[u8], phase: Phase) -> Result<bool> {
+        if self.read_head_version(shard_id, phase)?.is_some() {
+            return Ok(false);
+        }
+        match self.store(&TreeId::shard_phase(shard_id, phase)) {
+            TreeStore::Rocks(store) => Ok(!store.has_any_key()?),
+            TreeStore::Mem(_) => Ok(false),
+        }
+    }
+
     /// A head marker a reset left behind: it names a version with no root,
     /// and the tree holds no key at all. Resets before
     /// [`Self::reset_shard_phase_tree`] dropped the marker cleared the tree

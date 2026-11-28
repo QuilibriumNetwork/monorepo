@@ -1,6 +1,7 @@
 mod clock;
 mod clock_codec;
 mod clock_overlay;
+pub mod coin_changes;
 pub mod disk_monitor;
 mod dispatch;
 pub mod encoding;

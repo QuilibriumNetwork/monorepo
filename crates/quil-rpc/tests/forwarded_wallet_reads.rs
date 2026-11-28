@@ -81,6 +81,7 @@ impl CoinWitnessProvider for Coins {
         root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
         root_record[40] = 1;
         Ok(Some(CoinPageData {
+            change_cursor: vec![1, 7],
             network: [11; 32],
             snapshot_id: [8; 32],
             root_record,
@@ -361,6 +362,7 @@ async fn a_forwarded_coin_scan_asks_the_peer_for_the_wallets_page_size() {
                         .map_err(|status| status.message().to_string())?
                         .into_inner();
                     Ok::<_, String>(CoinPageData {
+                        change_cursor: Vec::new(),
                         network: page.network.try_into().unwrap(),
                         snapshot_id: page.snapshot_id.try_into().unwrap(),
                         root_record: page.root_record,
@@ -418,4 +420,33 @@ async fn a_forwarded_coin_scan_asks_the_peer_for_the_wallets_page_size() {
         .into_inner();
     assert_eq!(capped.coins.len(), 64);
     assert_eq!(*asked.lock().unwrap(), vec![64, 64, 8, 64]);
+}
+
+#[tokio::test]
+async fn snapshot_bootstrap_cursor_survives_gathering_and_peer_mapping() {
+    let node = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Coins));
+    let page = node
+        .list_coins(Request::new(node::ListCoinsRequest {
+            domain: DOMAIN.to_vec(),
+            max_coins: 64,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.coins.len(), 64);
+    assert_eq!(page.change_cursor, vec![1, 7]);
+    let peer = AppShardRpcServer::with_provider(Arc::new(NoFrames))
+        .with_coin_scan(Arc::new(Coins), Arc::new(|_| true));
+    let forwarded = peer
+        .list_shard_coins(Request::new(global::ListShardCoinsRequest {
+            domain: DOMAIN.to_vec(),
+            max_coins: 64,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(forwarded.coins.len(), 64);
+    assert_eq!(forwarded.change_cursor, page.change_cursor);
 }

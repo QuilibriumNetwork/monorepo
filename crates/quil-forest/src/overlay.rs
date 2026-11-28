@@ -678,6 +678,11 @@ impl ReadBudget {
 }
 
 struct Inner {
+    // Local metadata has its own fixed budget and joins the final write.
+    // It must not consume canonical delta entries or conflict prefixes.
+    projection_reset: Option<&'static [u8]>,
+    projection_records: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
+    projection_bytes: usize,
     base: Option<Arc<PinnedSnapshot>>,
     delta: Arc<Delta>,
     /// Counts the delta's changes, so a reader can prove it read the delta a
@@ -786,6 +791,9 @@ impl ExecutionOverlay {
             limits,
             failed_execution: AtomicBool::new(false),
             inner: Mutex::new(Inner {
+                projection_reset: None,
+                projection_records: Arc::new(BTreeMap::new()),
+                projection_bytes: 0,
                 base: Some(PinnedSnapshot::new(db, admission)?),
                 delta: Arc::new(Delta::default()),
                 generation: 0,
@@ -849,6 +857,12 @@ impl ExecutionOverlay {
                 self.execution_healthy(),
                 "failed execution overlay cannot publish"
             );
+            if let Some(key) = inner.projection_reset {
+                batch.put(key, b"1");
+            }
+            for (key, value) in inner.projection_records.iter() {
+                batch.put(key, value);
+            }
             let plan = PreparedOverlayCommit {
                 database: base._db.clone(),
                 sequence: base.sequence,
@@ -858,6 +872,9 @@ impl ExecutionOverlay {
             };
             inner.base = None;
             inner.delta = Arc::new(Delta::default());
+            inner.projection_reset = None;
+            inner.projection_records = Arc::new(BTreeMap::new());
+            inner.projection_bytes = 0;
             Ok(plan)
         })())
     }
@@ -911,6 +928,9 @@ impl ExecutionOverlay {
             limits,
             failed_execution: AtomicBool::new(!self.execution_healthy()),
             inner: Mutex::new(Inner {
+                projection_reset: inner.projection_reset,
+                projection_records: inner.projection_records.clone(),
+                projection_bytes: inner.projection_bytes,
                 base: Some(base.clone()),
                 delta: inner.delta.clone(),
                 generation: 0,
@@ -927,6 +947,9 @@ impl ExecutionOverlay {
         let mut inner = self.lock_cleanup();
         inner.base = None;
         inner.delta = Arc::new(Delta::default());
+        inner.projection_reset = None;
+        inner.projection_records = Arc::new(BTreeMap::new());
+        inner.projection_bytes = 0;
     }
 
     pub fn stats(&self) -> OverlayStats {
@@ -955,6 +978,22 @@ impl ExecutionOverlay {
 
     pub fn limits(&self) -> OverlayLimits {
         self.limits
+    }
+
+    /// Check source-store capabilities without reading execution records.
+    pub fn has_local_projection(&self, namespace: &[u8]) -> Result<bool> {
+        self.observe((|| {
+            let database = {
+                let inner = self.lock_inner()?;
+                let base = inner
+                    .base
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+                drop(base.view()?);
+                base._db.clone()
+            };
+            Ok(database.has_local_projection(namespace)?)
+        })())
     }
 
     /// Changes each time this branch's delta changes; fixed once it is frozen
@@ -1081,13 +1120,116 @@ impl ExecutionOverlay {
     /// throughout construction, including intermediate states within a batch.
     /// Previously opened cursors keep their earlier view.
     pub fn apply(&self, mutations: &[OverlayMutation]) -> Result<()> {
-        self.observe(self.apply_inner(mutations))
+        self.observe(self.apply_inner(mutations, None))
     }
 
-    fn apply_inner(&self, mutations: &[OverlayMutation]) -> Result<()> {
+    /// Stage one registered projection's reset with the canonical mutations.
+    /// Abort, failed admission and abandoned branches never publish the hint.
+    pub fn apply_with_local_projection_reset(
+        &self,
+        mutations: &[OverlayMutation],
+        namespace: &'static [u8],
+        reset_key: &'static [u8],
+    ) -> Result<()> {
+        self.observe((|| {
+            ensure!(
+                reset_key.starts_with(namespace) && reset_key.len() <= 256,
+                "local projection reset key escaped its namespace"
+            );
+            let reset = self.has_local_projection(namespace)?.then_some(reset_key);
+            self.apply_inner(mutations, reset)
+        })())
+    }
+
+    /// Stage bounded local metadata without spending canonical execution
+    /// budgets. Reject an oversized branch before publication; dropping an
+    /// installation identity would make its feed fence impossible to recover.
+    pub fn stage_local_projection_records(
+        &self,
+        namespace: &'static [u8],
+        reset_key: &'static [u8],
+        records: &[(&[u8], &[u8])],
+    ) -> Result<()> {
+        self.observe((|| {
+            ensure!(
+                reset_key.starts_with(namespace)
+                    && reset_key.len() <= 256
+                    && records.iter().all(|(key, _)| key.starts_with(namespace)),
+                "local projection record escaped its namespace"
+            );
+            if !self.has_local_projection(namespace)? {
+                return Ok(());
+            }
+            let mut inner = self.lock_inner()?;
+            let base = inner
+                .base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            drop(base.view()?);
+            inner.projection_reset = Some(reset_key);
+            for (key, value) in records {
+                let old = inner.projection_records.get(*key);
+                let bytes = inner
+                    .projection_bytes
+                    .saturating_sub(old.map_or(0, |old| key.len() + old.len()))
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+                ensure!(
+                    key.len() <= 512
+                        && value.len() <= 512
+                        && bytes <= 256 << 10
+                        && (old.is_some() || inner.projection_records.len() < 512),
+                    "local projection staging limit"
+                );
+                inner.projection_bytes = bytes;
+                Arc::make_mut(&mut inner.projection_records).insert(key.to_vec(), value.to_vec());
+            }
+            Ok(())
+        })())
+    }
+
+    /// Maintenance state belongs to the captured database, not execution
+    /// reads. Restrict this unmetered lookup to a registered local namespace.
+    pub fn local_projection_record(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        ensure!(
+            key.starts_with(namespace) && key.len() <= 1024,
+            "local projection read escaped its namespace"
+        );
+        if !self.has_local_projection(namespace)? {
+            return Ok(None);
+        }
+        let inner = self.lock_inner()?;
+        let base = inner
+            .base
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+        let held = self.observe(base.view())?;
+        if let Some(value) = inner.projection_records.get(key) {
+            return Ok(Some(value.clone()));
+        }
+        let value = self.observe(
+            held.as_ref()
+                .expect("view() holds the snapshot")
+                .get_pinned(key)
+                .map_err(anyhow::Error::from),
+        )?;
+        // Malformed optional metadata must not poison canonical execution.
+        ensure!(
+            value.as_ref().is_none_or(|value| value.len() <= 128 << 10),
+            "local projection read record limit"
+        );
+        Ok(value.map(|value| value.to_vec()))
+    }
+
+    fn apply_inner(
+        &self,
+        mutations: &[OverlayMutation],
+        reset: Option<&'static [u8]>,
+    ) -> Result<()> {
         let mut inner = self.lock_inner()?;
         ensure!(inner.base.is_some(), "execution overlay closed");
         if mutations.is_empty() {
+            inner.projection_reset = reset.or(inner.projection_reset);
             return Ok(());
         }
         let mut candidate = (*inner.delta).clone();
@@ -1110,6 +1252,7 @@ impl ExecutionOverlay {
             }
         }
         inner.delta = Arc::new(candidate);
+        inner.projection_reset = reset.or(inner.projection_reset);
         inner.generation += 1;
         Ok(())
     }

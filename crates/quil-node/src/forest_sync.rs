@@ -180,6 +180,14 @@ async fn empty_source(
 ) -> Result<Option<PhaseSource>> {
     let local = crdt.current_forest_phase_root(shard, phase as usize)?;
     if is_empty_phase_root(&local) {
+        if shard == PROVER_SHARD.as_slice() && phase != 0 {
+            let (c, sid) = (crdt.clone(), shard.to_vec());
+            tokio::task::spawn_blocking(move || {
+                c.resume_empty_shard_phase_wipe(&sid, phase as usize, local)
+            })
+            .await
+            .map_err(|e| QuilError::Internal(format!("phase wipe resume task: {e}")))??;
+        }
         return Ok(Some(PhaseSource::Empty));
     }
     if shard != PROVER_SHARD.as_slice() || phase == 0 {
@@ -921,6 +929,284 @@ pub async fn pull_shard_from_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash after the physical reset can leave the old sync-by-root index
+    /// behind. Empty-source recovery must finish that cleanup before releasing
+    /// the exact wipe scope, including when the CRDT was reopened.
+    #[tokio::test]
+    async fn empty_source_retry_cleans_interrupted_wipe_root_index() {
+        use quil_types::store::HypergraphStore;
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let stale = [0x7b; 32];
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .put_root_version(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &PROVER_SHARD,
+                &stale,
+                1,
+                1,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let scope = [b"wipe/".as_slice(), PROVER_SHARD.as_slice(), &[1]].concat();
+        quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_unified_tree(true);
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        assert_eq!(
+            crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap(),
+            [0; 32]
+        );
+        assert_eq!(
+            empty_source(&crdt, &PROVER_SHARD, 1, "interrupted wipe retry")
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert_eq!(
+            store
+                .get_root_version("vertex", "removes", &PROVER_SHARD, &stale)
+                .unwrap(),
+            None
+        );
+        let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+        assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_source_without_its_wipe_scope_does_not_write_or_release_other_scopes() {
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+        let scope = [b"wipe/".as_slice(), PROVER_SHARD.as_slice(), &[2]].concat();
+        quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_unified_tree(true);
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let sequence = db.inner().latest_sequence_number();
+        assert_eq!(
+            empty_source(&crdt, &PROVER_SHARD, 1, "already empty")
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert_eq!(db.inner().latest_sequence_number(), sequence);
+        let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+        assert!(
+            quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_source_with_unknown_coin_recovery_keeps_canonical_sync_read_only() {
+        use quil_types::store::HypergraphStore;
+        for invalid in [false, true] {
+            let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+            if invalid {
+                db.inner()
+                    .put(b"quil/local/coin-changes/v1/installing", b"bad-count")
+                    .unwrap();
+                quil_store::coin_changes::begin_install(&db.inner(), b"unrelated").unwrap();
+            } else {
+                db.inner()
+                    .put(b"quil/local/coin-changes/v1/install-overflow", b"1")
+                    .unwrap();
+            }
+            let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+            let scope = [b"wipe/".as_slice(), PROVER_SHARD.as_slice(), &[1]].concat();
+            assert!(store.is_coin_changes_installing(&scope).is_err());
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                store,
+                Arc::new(quil_tries::ShaInclusionProver),
+            ));
+            crdt.set_unified_tree(true);
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
+            let sequence = db.inner().latest_sequence_number();
+            assert_eq!(
+                empty_source(&crdt, &PROVER_SHARD, 1, "unknown optional Coin recovery")
+                    .await
+                    .unwrap(),
+                Some(PhaseSource::Empty)
+            );
+            assert_eq!(crdt.wipe_shard_phase(&PROVER_SHARD, 1, [0; 32]).unwrap(), 0);
+            crdt.rewind_app_shard(&PROVER_SHARD, &[[0; 32]; 4]).unwrap();
+            assert_eq!(db.inner().latest_sequence_number(), sequence);
+            let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+            assert!(
+                quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_source_resumes_a_placeholder_wipe_only_when_its_scope_is_active() {
+        use quil_types::store::HypergraphStore;
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let forest = quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE);
+        let phase = quil_forest::Phase::VertexRemoves;
+        let leaf = quil_forest::KeyHash([1; 32]);
+        let initial = forest
+            .stage_synced_phase(&PROVER_SHARD, phase, 0, [(leaf, Some(vec![9]))], &[], None)
+            .unwrap();
+        let txn = store.new_transaction(false).unwrap();
+        for (key, value) in initial.puts() {
+            txn.set(key, value).unwrap();
+        }
+        txn.commit().unwrap();
+        let staged = forest
+            .stage_synced_phase(&PROVER_SHARD, phase, 1, [(leaf, None)], &[], None)
+            .unwrap();
+        assert_eq!(staged.root(), *b"SPARSE_MERKLE_PLACEHOLDER_HASH__");
+        let txn = store.new_transaction(false).unwrap();
+        for (key, value) in staged.puts() {
+            txn.set(key, value).unwrap();
+        }
+        let (key, value) = forest.head_version_put(&PROVER_SHARD, phase, 1).unwrap();
+        txn.set(&key, &value).unwrap();
+        txn.commit().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store,
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_unified_tree(true);
+        crdt.set_forest(forest);
+        let sequence = db.inner().latest_sequence_number();
+        assert_eq!(
+            empty_source(&crdt, &PROVER_SHARD, 1, "committed empty tree")
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert_eq!(db.inner().latest_sequence_number(), sequence);
+        assert_eq!(
+            crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap(),
+            *b"SPARSE_MERKLE_PLACEHOLDER_HASH__"
+        );
+        let scope = [b"wipe/".as_slice(), PROVER_SHARD.as_slice(), &[1]].concat();
+        quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
+        assert_eq!(
+            empty_source(&crdt, &PROVER_SHARD, 1, "wipe stopped before reset")
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert_eq!(
+            crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap(),
+            [0; 32]
+        );
+        let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+        assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_ok());
+    }
+
+    #[test]
+    fn unchanged_rewind_retry_cleans_interrupted_phase_root_index() {
+        use quil_types::store::HypergraphStore;
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let stale = [0x7b; 32];
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .put_root_version(txn.as_ref(), "vertex", "adds", &PROVER_SHARD, &stale, 1, 1)
+            .unwrap();
+        txn.commit().unwrap();
+        let scope = [b"rewind/".as_slice(), PROVER_SHARD.as_slice()].concat();
+        quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
+        let crdt = quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        );
+        crdt.set_unified_tree(true);
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        crdt.rewind_app_shard(&PROVER_SHARD, &[[0; 32]; 4]).unwrap();
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &PROVER_SHARD, &stale)
+                .unwrap(),
+            None
+        );
+        let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+        assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_ok());
+        let sequence = db.inner().latest_sequence_number();
+        crdt.rewind_app_shard(&PROVER_SHARD, &[[0; 32]; 4]).unwrap();
+        assert_eq!(db.inner().latest_sequence_number(), sequence);
+    }
+
+    #[test]
+    fn partial_rewind_retry_cleans_an_already_reset_phases_root_index() {
+        use quil_types::store::HypergraphStore;
+        let db = quil_store::RocksDb::open_in_memory_with_coin_changes(true).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let forest = quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE);
+        let stale = [0x7b; 32];
+        let remaining = forest
+            .stage_synced_phase(
+                &PROVER_SHARD,
+                quil_forest::Phase::VertexRemoves,
+                1,
+                [(quil_forest::KeyHash([1; 32]), Some(vec![9]))],
+                &[],
+                None,
+            )
+            .unwrap();
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .put_root_version(txn.as_ref(), "vertex", "adds", &PROVER_SHARD, &stale, 1, 1)
+            .unwrap();
+        for (key, value) in remaining.puts() {
+            txn.set(key, value).unwrap();
+        }
+        let (key, value) = forest
+            .head_version_put(&PROVER_SHARD, quil_forest::Phase::VertexRemoves, 1)
+            .unwrap();
+        txn.set(&key, &value).unwrap();
+        txn.commit().unwrap();
+        let scope = [b"rewind/".as_slice(), PROVER_SHARD.as_slice()].concat();
+        quil_store::coin_changes::begin_install(&db.inner(), &scope).unwrap();
+        let crdt = quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_tries::ShaInclusionProver),
+        );
+        crdt.set_unified_tree(true);
+        crdt.set_forest(forest);
+        crdt.rewind_app_shard(&PROVER_SHARD, &[[0; 32]; 4]).unwrap();
+        assert_eq!(
+            crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap(),
+            [0; 32]
+        );
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &PROVER_SHARD, &stale)
+                .unwrap(),
+            None
+        );
+        let snapshot = quil_store::RocksHypergraphSnapshot::capture(db.inner()).unwrap();
+        assert!(quil_store::coin_changes::snapshot_cursor(&snapshot, &[3; 32]).is_ok());
+    }
 
     struct Peer {
         head: Option<(u64, Vec<u8>)>,

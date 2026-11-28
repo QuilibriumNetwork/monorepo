@@ -10304,6 +10304,7 @@ mod tests {
         .unwrap();
         let root = tree.root_at_depth(shape.depth()).unwrap();
         let first = ListCoinsResponse {
+            change_cursor: Vec::new(),
             network: wallet.network.to_vec(),
             snapshot_id: vec![7; 32],
             root_record: root.encode().unwrap().to_vec(),
@@ -10502,6 +10503,7 @@ mod tests {
         )
         .unwrap();
         let rootless = ListCoinsResponse {
+            change_cursor: Vec::new(),
             network: wallet.network.to_vec(),
             snapshot_id: vec![7; 32],
             root_record: Vec::new(),

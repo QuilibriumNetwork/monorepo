@@ -1016,6 +1016,7 @@ pub struct CoinWitnessBundle {
     pub witnesses: Vec<CoinWitnessData>,
 }
 
+#[derive(Debug)]
 pub struct CoinData {
     pub address: [u8; 32],
     pub frame_number: u64,
@@ -1040,7 +1041,25 @@ pub struct CoinPageData {
     pub coins: Vec<CoinData>,
     pub cursor: Option<[u8; 32]>,
     pub has_more: bool,
+    /// Arrival watermark from this page's retained snapshot. Empty when the
+    /// provider does not support incremental discovery.
+    pub change_cursor: Vec<u8>,
 }
+
+/// Public encrypted outputs committed after a snapshot's arrival watermark.
+#[derive(Debug)]
+pub struct CoinChangesPageData {
+    pub network: [u8; 32],
+    pub coins: Vec<CoinData>,
+    pub cursor: Vec<u8>,
+    pub has_more: bool,
+    /// Continuity was lost; discard the cursor and restart ListCoins.
+    pub reset: bool,
+}
+
+pub const MAX_COIN_CHANGE_CURSOR_BYTES: usize = 64 * 1024;
+/// Maximum local source ranges represented by one Coin change cursor.
+pub const MAX_COIN_CHANGE_SOURCES: usize = 256;
 
 /// One legacy (transparent) coin of an owner. Owner, amount and origin are
 /// public; `shielded` is whether GLOBAL has recorded it consumed by a shield.
@@ -1087,6 +1106,15 @@ pub fn scan_page_bytes(entries: usize) -> usize {
 
 /// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
+    fn coin_changes(
+        &self,
+        _domain: &[u8; 32],
+        _cursor: &[u8],
+        _max_coins: usize,
+    ) -> Result<Option<CoinChangesPageData>> {
+        Ok(None)
+    }
+
     /// `owner`'s legacy coins in `domain` after `after`. `None` when this node
     /// cannot list them (no complete owner index): the caller asks an
     /// archive instead.
@@ -1362,6 +1390,36 @@ pub trait HypergraphStore: Send + Sync {
     /// stores without a per-frame commit cache (test/in-memory impls).
     fn delete_shard_commits(&self, _frame_number: u64, _shard_address: &[u8]) -> Result<()> {
         Ok(())
+    }
+
+    /// Invalidate local discovery cursors after a destructive state change.
+    /// This metadata is outside the committed hypergraph.
+    fn invalidate_coin_changes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stage invalidation with the destructive write where the backend supports
+    /// it, so an aborted transaction does not discard valid discovery history.
+    fn invalidate_coin_changes_in_transaction(&self, _txn: &dyn Transaction) -> Result<()> {
+        self.invalidate_coin_changes()
+    }
+
+    /// Suspend incremental discovery during a multi-batch replacement.
+    /// Keep the fence after failure until the same scope is repaired.
+    fn set_coin_changes_installing(&self, _scope: &[u8], _installing: bool) -> Result<()> {
+        self.invalidate_coin_changes()
+    }
+
+    /// Retain the intended roots so a completed rewind can be recognized
+    /// after a crash without replaying or changing canonical state.
+    fn begin_coin_changes_rewind(&self, scope: &[u8], _roots: &[[u8; 32]; 4]) -> Result<()> {
+        self.set_coin_changes_installing(scope, true)
+    }
+
+    /// Check this replacement scope. Durable backends return an error for
+    /// unknown recovery state.
+    fn is_coin_changes_installing(&self, _scope: &[u8]) -> Result<bool> {
+        Ok(false)
     }
 
     /// Load one vertex's underlying data blob (Go-serialized tree format

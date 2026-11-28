@@ -4406,6 +4406,65 @@ pub(crate) mod successor_tests {
         );
     }
 
+    #[test]
+    fn a_headless_rewind_with_an_optional_fence_still_updates_the_handoff_cursor_and_clock() {
+        use quil_types::store::{ClockStore as _, HypergraphStore as _};
+
+        let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+        let shard = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        let app = [5; 32];
+        let filter = [app.as_slice(), &[1]].concat();
+        let forest = quil_forest::Forest::in_memory();
+        // Migration can install real version-zero nodes without a head.
+        let staged = forest
+            .stage_synced_phase(
+                &app,
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(quil_forest::KeyHash([1; 32]), Some(vec![9]))],
+                &[],
+                None,
+            )
+            .unwrap();
+        let root = staged.root();
+        staged.publish_memory().unwrap();
+        shard.set_forest(forest);
+        shard.set_unified_tree(true);
+        let scope = [b"rewind/".as_slice(), filter.as_slice()].concat();
+        store.set_coin_changes_installing(&scope, true).unwrap();
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        shard.checkpoint_frame_cursor(4, &cursor_key).unwrap();
+        let clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(clock_db.inner());
+        for number in [3, 4] {
+            store_header(
+                &clock,
+                header_frame(&filter, number, number as u8).header.unwrap(),
+            );
+        }
+        assert_eq!(shard.read_frame_cursor(&cursor_key).unwrap(), 4);
+        assert_eq!(
+            clock.get_latest_shard_clock_frame_number(&filter).unwrap(),
+            Some(4)
+        );
+        assert_eq!(shard.current_forest_phase_root(&app, 0).unwrap(), root);
+
+        rewind_shard(&shard, &clock, &filter, 3, 4, &[[0; 32]; 4]).unwrap();
+
+        assert_eq!(shard.read_frame_cursor(&cursor_key).unwrap(), 3);
+        assert_eq!(
+            clock.get_latest_shard_clock_frame_number(&filter).unwrap(),
+            Some(3)
+        );
+        assert!(clock.get_shard_clock_frame(&filter, 3, false).is_ok());
+        assert!(clock.get_shard_clock_frame(&filter, 4, false).is_err());
+        assert!(store.coin_change_installing());
+        assert_eq!(shard.current_forest_phase_root(&app, 0).unwrap(), root);
+    }
+
     // Fixture k's shard …000804: GLOBAL fenced its generation 5 at app frame
     // 651 while every member had materialized 652, so none could start the
     // successor. A member past the fence rewinds to it: state, cursor and head.

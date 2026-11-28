@@ -2,6 +2,8 @@ use std::sync::Arc;
 /// Canonical rank-1 identity encoding size (one packed polynomial) of the
 /// QCT token suite; mirrors `quil_lattice_ct::...::membership::IDENTITY_BYTES`.
 const IDENTITY_BYTES: usize = 3648;
+/// Bounds both local aggregate cursors and forwarded cursor envelopes.
+pub use quil_types::store::MAX_COIN_CHANGE_CURSOR_BYTES;
 /// Canonical root record size: 8 + 32 + 1 + 8 + NODE_BYTES (six 1,216-byte proof-ring polynomials).
 const NODE_BYTES: usize = 4 * 1216;
 const ROOT_RECORD_BYTES: usize = 8 + 32 + 1 + 8 + NODE_BYTES;
@@ -398,6 +400,7 @@ impl ScanPage for quil_types::store::CoinPageData {
     fn append(&mut self, next: Self) -> bool {
         if next.network != self.network
             || next.snapshot_id != self.snapshot_id
+            || next.change_cursor != self.change_cursor
             || next.root_record != self.root_record
             || next.cursor < self.cursor
         {
@@ -541,7 +544,23 @@ pub type RemoteVertex = Arc<
         + Sync,
 >;
 
-/// Forwards one coin-scan page to a node holding the application, asking
+/// Forwarded feed statuses retain UNIMPLEMENTED for older peers.
+pub type RemoteCoinChanges = Arc<
+    dyn Fn(
+            [u8; 32],
+            Vec<u8>,
+            u32,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<quil_types::store::CoinChangesPageData, Status>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Forwards one coin-scan page to a node that holds the application, asking
 /// for pages of up to the given number of coins (`max_coins`). `Err`
 /// carries the asked peers' reasons for declining, for the wallet's status.
 pub type RemoteCoinPage = Arc<
@@ -640,6 +659,7 @@ pub struct NodeRpcServer {
     pub application_coverage: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
     /// See [`NodeRpcServer::with_remote_coin_page`].
     pub remote_coin_page: Option<RemoteCoinPage>,
+    pub remote_coin_changes: Option<RemoteCoinChanges>,
     pub remote_escrow_page: Option<RemoteEscrowPage>,
     /// See [`NodeRpcServer::with_remote_legacy_coins`].
     pub remote_legacy_coins: Option<RemoteLegacyCoins>,
@@ -763,6 +783,7 @@ impl NodeRpcServer {
             app_hypergraph_stores: None,
             application_coverage: None,
             remote_coin_page: None,
+            remote_coin_changes: None,
             remote_escrow_page: None,
             remote_legacy_coins: None,
             remote_vertex: None,
@@ -870,6 +891,13 @@ impl NodeRpcServer {
             "this node does not serve application {}; read through a node covering it, or an archive",
             hex::encode(&application[..application.len().min(32)])
         ))
+    }
+
+    /// Continue durable reads on the backend selected by a snapshot.
+    /// Remote statuses, including UNIMPLEMENTED, reach the wallet unchanged.
+    pub fn with_remote_coin_changes(mut self, remote: RemoteCoinChanges) -> Self {
+        self.remote_coin_changes = Some(remote);
+        self
     }
 
     /// Forward a coin scan to a node that holds the application, when this one
@@ -1530,7 +1558,11 @@ impl NodeService for NodeRpcServer {
             }
             previous = Some(coin.address);
         }
+        if page.change_cursor.len() > MAX_COIN_CHANGE_CURSOR_BYTES {
+            return Err(Status::internal("coin change cursor exceeds size limit"));
+        }
         let response = node::ListCoinsResponse {
+            change_cursor: page.change_cursor,
             network: page.network.to_vec(),
             snapshot_id: page.snapshot_id.to_vec(),
             root_record: page.root_record,
@@ -1555,6 +1587,94 @@ impl NodeService for NodeRpcServer {
         if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
             return Err(Status::resource_exhausted(
                 "coin scan response exceeds size limit",
+            ));
+        }
+        Ok(Response::new(response))
+    }
+
+    async fn list_coin_changes(
+        &self,
+        request: Request<node::ListCoinChangesRequest>,
+    ) -> Result<Response<node::ListCoinChangesResponse>, Status> {
+        let req = request.into_inner();
+        let domain: [u8; 32] = req
+            .domain
+            .try_into()
+            .map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+        if req.cursor.len() > MAX_COIN_CHANGE_CURSOR_BYTES {
+            return Err(Status::invalid_argument(
+                "coin change cursor exceeds size limit",
+            ));
+        }
+        let entries = quil_types::store::scan_page_entries(req.max_coins);
+        // A forwarded cursor stays on its original backend even if this
+        // node acquired local coverage after it issued the cursor.
+        let forwarded = req.cursor.first() == Some(&2);
+        let page = if !self.serves_application(&domain)
+            || (forwarded && self.remote_coin_changes.is_some())
+        {
+            self.remote_coin_changes
+                .as_ref()
+                .ok_or_else(|| self.coverage_error(&domain))?(
+                domain,
+                req.cursor.clone(),
+                entries as u32,
+            )
+            .await?
+        } else {
+            let provider = self
+                .coin_witness_provider
+                .as_ref()
+                .ok_or_else(|| Status::unimplemented("coin changes are not enabled"))?
+                .clone();
+            let cursor = req.cursor.clone();
+            let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin changes").await?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                provider.coin_changes(&domain, &cursor, entries)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("coin changes task: {e}")))?
+            .map_err(coin_witness_status)?
+            .ok_or_else(|| Status::unimplemented("coin changes are not enabled"))?
+        };
+        if page.coins.len() > entries
+            || page.cursor.len() > MAX_COIN_CHANGE_CURSOR_BYTES
+            || (page.reset && (!page.coins.is_empty() || page.has_more || !page.cursor.is_empty()))
+            || (!page.reset && page.cursor.is_empty())
+            || (page.has_more && page.cursor == req.cursor)
+        {
+            return Err(Status::internal("invalid coin changes page"));
+        }
+        for coin in &page.coins {
+            if coin.owner.len() != IDENTITY_BYTES
+                || coin.commitment.len() != 10368
+                || coin.memo.len() != 1115
+            {
+                return Err(Status::internal("invalid coin changes coin"));
+            }
+        }
+        let response = node::ListCoinChangesResponse {
+            network: page.network.to_vec(),
+            coins: page
+                .coins
+                .into_iter()
+                .map(|coin| node::ConfidentialCoin {
+                    address: coin.address.to_vec(),
+                    frame_number: coin.frame_number,
+                    owner: coin.owner,
+                    commitment: coin.commitment,
+                    memo: coin.memo,
+                    position: coin.position,
+                })
+                .collect(),
+            next_cursor: page.cursor,
+            has_more: page.has_more,
+            reset: page.reset,
+        };
+        if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
+            return Err(Status::resource_exhausted(
+                "coin changes response exceeds size limit",
             ));
         }
         Ok(Response::new(response))
@@ -2926,6 +3046,7 @@ mod witness_tests {
             root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
             root_record[40] = 1;
             Ok(Some(CoinPageData {
+                change_cursor: Vec::new(),
                 network: [0; 32],
                 snapshot_id: if self.bad_root {
                     [99; 32]
@@ -3177,6 +3298,7 @@ mod witness_tests {
                 _: Option<&[u8; 32]>,
             ) -> quil_types::error::Result<Option<CoinPageData>> {
                 Ok(Some(CoinPageData {
+                    change_cursor: Vec::new(),
                     network: [0; 32],
                     snapshot_id: [7; 32],
                     root_record: Vec::new(),
@@ -3316,6 +3438,7 @@ mod witness_tests {
             root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
             root_record[40] = 1;
             Ok(Some(CoinPageData {
+                change_cursor: Vec::new(),
                 network: [0; 32],
                 snapshot_id: [7; 32],
                 root_record,

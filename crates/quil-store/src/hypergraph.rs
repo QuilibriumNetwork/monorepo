@@ -100,6 +100,78 @@ pub struct CommitteeOverlayRows {
 }
 
 impl OverlayHypergraphStore {
+    fn coin_changes_enabled_backend(&self) -> Result<bool> {
+        self.db
+            .0
+            .has_local_projection(crate::coin_changes::NAMESPACE)
+            .map_err(|error| QuilError::Store(error.to_string()))
+    }
+
+    fn invalidate_coin_changes_backend(&self) -> Result<()> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(());
+        }
+        self.db
+            .0
+            .apply_with_local_projection_reset(
+                &[],
+                crate::coin_changes::NAMESPACE,
+                crate::coin_changes::RESET_REQUEST,
+            )
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    fn set_coin_changes_installing_backend(&self, scope: &[u8], installing: bool) -> Result<()> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(());
+        }
+        let (request, _) = crate::coin_changes::installation_request(scope, installing)?;
+        self.db
+            .0
+            .stage_local_projection_records(
+                crate::coin_changes::NAMESPACE,
+                crate::coin_changes::RESET_REQUEST,
+                &[(&request, &[u8::from(installing)])],
+            )
+            .map_err(|error| QuilError::Store(error.to_string()))
+    }
+
+    fn invalidate_coin_changes_in_transaction_backend(&self, txn: &dyn Transaction) -> Result<()> {
+        let txn = OverlayTxn::for_store(txn, &self.db)?;
+        if self.coin_changes_enabled_backend()? {
+            txn.reset_coin_projection()?;
+        }
+        Ok(())
+    }
+
+    fn begin_coin_changes_rewind_backend(&self, scope: &[u8], roots: &[[u8; 32]; 4]) -> Result<()> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(());
+        }
+        let (request, value) = crate::coin_changes::installation_request(scope, true)?;
+        let (target, roots) = crate::coin_changes::rewind_target(scope, roots);
+        self.db
+            .0
+            .stage_local_projection_records(
+                crate::coin_changes::NAMESPACE,
+                crate::coin_changes::RESET_REQUEST,
+                &[(&target, &roots), (&request, &value)],
+            )
+            .map_err(|error| QuilError::Store(error.to_string()))
+    }
+
+    fn is_coin_changes_installing_backend(&self, scope: &[u8]) -> Result<bool> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(false);
+        }
+        crate::coin_changes::is_installing(scope, |key| {
+            self.db
+                .0
+                .local_projection_record(crate::coin_changes::NAMESPACE, key)
+                .map_err(|e| QuilError::Store(e.to_string()))
+        })
+    }
+
     /// Pin one view for the coverage probes, the cumulative write list and
     /// every replacement row. Decline when a deleted range cannot be listed.
     pub fn committee_rows(&self, indexed_generation: u64) -> Result<Option<CommitteeOverlayRows>> {
@@ -317,6 +389,9 @@ impl RocksHypergraphStore {
         *upper.last_mut().unwrap() += 1; // 0xF7 -> 0xF8
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
+        if self.coin_changes_enabled_backend()? {
+            batch.put(crate::coin_changes::RESET_REQUEST, b"1");
+        }
         self.db
             .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
@@ -1708,6 +1783,56 @@ impl RocksTxn {
 }
 
 impl RocksHypergraphStore {
+    fn coin_changes_enabled_backend(&self) -> Result<bool> {
+        self.db
+            .has_local_projection(crate::coin_changes::NAMESPACE)
+            .map_err(|error| QuilError::Store(error.to_string()))
+    }
+
+    fn invalidate_coin_changes_backend(&self) -> Result<()> {
+        crate::coin_changes::reset(&self.db)
+    }
+
+    fn set_coin_changes_installing_backend(&self, scope: &[u8], installing: bool) -> Result<()> {
+        if installing {
+            crate::coin_changes::begin_install(&self.db, scope)
+        } else {
+            crate::coin_changes::finish_install(&self.db, scope)
+        }
+    }
+
+    fn invalidate_coin_changes_in_transaction_backend(&self, txn: &dyn Transaction) -> Result<()> {
+        RocksTxn::for_store(txn, &self.db)?;
+        if self.coin_changes_enabled_backend()? {
+            txn.set(crate::coin_changes::RESET_REQUEST, b"1")?;
+        }
+        Ok(())
+    }
+
+    fn begin_coin_changes_rewind_backend(&self, scope: &[u8], roots: &[[u8; 32]; 4]) -> Result<()> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(());
+        }
+        let (request, value) = crate::coin_changes::installation_request(scope, true)?;
+        let (target, roots) = crate::coin_changes::rewind_target(scope, roots);
+        let txn = self.new_transaction_backend(false)?;
+        txn.set(&target, &roots)?;
+        txn.set(&request, &value)?;
+        txn.commit()
+    }
+
+    fn is_coin_changes_installing_backend(&self, scope: &[u8]) -> Result<bool> {
+        if !self.coin_changes_enabled_backend()? {
+            return Ok(false);
+        }
+        let snapshot = self.db.snapshot();
+        crate::coin_changes::is_installing(scope, |key| {
+            snapshot
+                .get(key)
+                .map_err(|e| QuilError::Store(e.to_string()))
+        })
+    }
+
     /// The record that marks the large-vertex index complete, for a write of a
     /// store that opened empty, until it is stored: its rows were all written
     /// with their entries.
@@ -1740,29 +1865,74 @@ impl RocksHypergraphStore {
         // (`node/store/hypergraph.go:2110`). The peer's snapshot was
         // dropped at `<db_path>/snapshot` as a self-contained DB; bulk-
         // copy every key into the active store, then remove the temp
-        // directory. Idempotent — if the snapshot dir is missing, just
-        // clean up anything stale and return Ok.
+        // directory. Preserve that retry source until installation completes.
         use std::path::Path;
         let snap_dir = Path::new(db_path).join("snapshot");
         let cleanup = |dir: &Path| {
-            let _ = std::fs::remove_dir_all(dir);
+            if let Err(error) = std::fs::remove_dir_all(dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %dir.display(), %error, "cannot remove completed snapshot staging");
+                }
+            }
         };
         match std::fs::metadata(&snap_dir) {
             Ok(md) if md.is_dir() => {}
-            _ => {
-                cleanup(&snap_dir);
+            Ok(_) => {
+                return Err(QuilError::Store(
+                    "apply snapshot: source is not a directory".into(),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let canonical_state = self
+                    .db
+                    .get(crate::coin_changes::SNAPSHOT_INSTALL_STATE)
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
+                let completed = canonical_state
+                    .as_deref()
+                    .is_some_and(crate::coin_changes::completed_snapshot_import);
+                let canonical_pending = canonical_state
+                    .as_deref()
+                    .is_some_and(|value| !crate::coin_changes::completed_snapshot_import(value));
+                let legacy_state = self.is_coin_changes_installing_backend(b"snapshot-install");
+                let legacy_pending = match legacy_state {
+                    Ok(pending) => pending && !completed,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "cannot query optional Coin snapshot recovery without a staging source"
+                        );
+                        false
+                    }
+                };
+                if canonical_pending || legacy_pending {
+                    return Err(QuilError::Store(
+                        "apply snapshot: unfinished installation has no retry source".into(),
+                    ));
+                }
                 return Ok(());
             }
+            Err(e) => return Err(QuilError::Store(format!("apply snapshot: source: {e}"))),
         }
 
         // Open the snapshot DB read-only so we don't trigger compactions
         // or stray writes against the staging area.
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(false);
-        let src = rocksdb::DB::open_for_read_only(&opts, &snap_dir, true).map_err(|e| {
-            cleanup(&snap_dir);
-            QuilError::Store(format!("apply snapshot: open src: {}", e))
-        })?;
+        let src = rocksdb::DB::open_for_read_only(&opts, &snap_dir, true)
+            .map_err(|e| QuilError::Store(format!("apply snapshot: open src: {}", e)))?;
+
+        // Track multi-batch import completion independently of the Coin journal.
+        let journal_enabled = self.coin_changes_enabled_backend()?;
+        let mut pending = rocksdb::WriteBatch::default();
+        pending.put(crate::coin_changes::SNAPSHOT_INSTALL_STATE, b"1");
+        if journal_enabled {
+            let (key, value) =
+                crate::coin_changes::installation_request(b"snapshot-install", true)?;
+            pending.put(key, value);
+        }
+        self.db
+            .write(pending)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
 
         let mut batch = rocksdb::WriteBatch::default();
         let mut count: usize = 0;
@@ -1771,13 +1941,16 @@ impl RocksHypergraphStore {
             let (k, v) = match entry {
                 Ok(p) => p,
                 Err(e) => {
-                    cleanup(&snap_dir);
                     return Err(QuilError::Store(format!("apply snapshot: iter: {}", e)));
                 }
             };
             // The copied rows' index entries; another store's walk state
             // does not describe this one's rows.
-            if crate::large_vertex_index::is_walk_record(&k) {
+            if crate::large_vertex_index::is_walk_record(&k)
+                || k.starts_with(crate::coin_changes::NAMESPACE)
+                || k.as_ref() == crate::coin_changes::SNAPSHOT_INSTALL_STATE
+                || k.starts_with(b"\0quil/node/coin-feed-proxy/routes/v1")
+            {
                 continue;
             }
             batch.put(&k, &v);
@@ -1788,19 +1961,34 @@ impl RocksHypergraphStore {
             if count % CHUNK == 0 {
                 let to_commit = std::mem::take(&mut batch);
                 if let Err(e) = self.db.write(to_commit) {
-                    cleanup(&snap_dir);
                     return Err(QuilError::Store(format!("apply snapshot: write: {}", e)));
                 }
             }
         }
-        // Final commit for the remainder.
-        if let Err(e) = self.db.write(batch) {
-            cleanup(&snap_dir);
+        // Commit completion with the final batch, including an empty remainder.
+        // A failed write leaves the import pending.
+        batch.put(crate::coin_changes::SNAPSHOT_INSTALL_STATE, b"0");
+        if journal_enabled {
+            let (key, value) =
+                crate::coin_changes::installation_request(b"snapshot-install", false)?;
+            batch.put(key, value);
+        }
+        let final_write = || self.db.write(batch).map_err(|e| e.to_string());
+        #[cfg(any(test, feature = "test-utils"))]
+        let final_result = if self.fail_commit.load(std::sync::atomic::Ordering::Relaxed) {
+            Err("injected final write failure".to_string())
+        } else {
+            final_write()
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let final_result = final_write();
+        if let Err(e) = final_result {
             return Err(QuilError::Store(format!(
                 "apply snapshot: final write: {}",
                 e
             )));
         }
+        drop(src);
         cleanup(&snap_dir);
         tracing::info!(keys = count, "imported snapshot via raw key/value copy");
         Ok(())

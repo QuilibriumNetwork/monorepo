@@ -736,6 +736,7 @@ service NodeService {
     returns (GetCoinWitnessesResponse);
   rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
   rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+  rpc ListCoinChanges(ListCoinChangesRequest) returns (ListCoinChangesResponse);
   rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
   rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
@@ -1048,9 +1049,27 @@ message ConfidentialCoin {
   // committed content address.
   uint64 position = 6;
 }
+message ListCoinChangesRequest {
+  bytes domain = 1; // Exactly 32 bytes.
+  bytes cursor = 2; // Opaque node-local cursor from ListCoins or a prior page.
+  uint32 max_coins = 3; // Same bounded page size as ListCoins.
+}
+// Arrival-order public encrypted outputs; ownership and consumption are checked separately.
+message ListCoinChangesResponse {
+  bytes network = 1;
+  repeated ConfidentialCoin coins = 2;
+  // Persist after processing this page, including an empty page.
+  bytes next_cursor = 3;
+  // More recorded candidates remain; an empty coins list can still advance.
+  bool has_more = 4;
+  // The cursor no longer names retained local history: restart ListCoins.
+  bool reset = 5;
+}
+
 // An empty root_record answers a fresh scan of an application that has no
 // coin root: no confidential coin exists in it yet. Such a page has no
-// coins, no cursor and has_more false; every other page carries the root.
+// coins, no address cursor and has_more false; every other page carries the
+// root. An empty application can still return a change_cursor.
 message ListCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;
@@ -1058,6 +1077,12 @@ message ListCoinsResponse {
   repeated ConfidentialCoin coins = 4;
   bytes cursor = 5;
   bool has_more = 6;
+  // Watermark of the first page's snapshot, including an empty application.
+  // History is bounded; read or buffer ListCoinChanges while paging.
+  // Deduplicate outputs by address and save each cursor after processing its page.
+  // On reset, restart ListCoins.
+  // Empty when incremental discovery is unavailable; continue using ListCoins.
+  bytes change_cursor = 7;
 }
 
 // Snapshot enumeration of public encrypted records; consumption is checked
