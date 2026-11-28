@@ -149,7 +149,7 @@ fn private_projection_metadata_cannot_overwrite_canonical_records() {
     )
     .unwrap();
     assert!(overlay
-        .stage_local_projection_records(b"local-test/", b"canonical", b"local-test/overflow", &[])
+        .stage_local_projection_records(b"local-test/", b"canonical", &[])
         .is_err());
     assert!(overlay.prepare_commit().is_err());
     assert!(db.get(b"canonical").unwrap().is_none());

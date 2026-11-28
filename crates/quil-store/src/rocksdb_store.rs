@@ -405,10 +405,29 @@ impl RocksDb {
         let migrations = crate::migration::rust_node_migrations();
         crate::migration::run_migrations(&db, &migrations)?;
 
-        Ok(Self {
-            db: Self::coordinated(db, coin_changes_enabled, Some(path))?,
+        let store = Self {
+            db: Self::coordinated(db, coin_changes_enabled)?,
             shared_block_cache: shared,
-        })
+        };
+        if store
+            .db
+            .get(crate::coin_changes::SNAPSHOT_INSTALL_STATE)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .as_deref()
+            .is_some_and(|value| !crate::coin_changes::completed_snapshot_import(value))
+        {
+            let path = path.to_str().ok_or_else(|| {
+                QuilError::Store("apply snapshot: store path is not UTF-8".into())
+            })?;
+            store::HypergraphStore::apply_snapshot(
+                &crate::RocksHypergraphStore::new(store.inner()),
+                path,
+            )?;
+            if coin_changes_enabled {
+                crate::coin_changes::recover_after_snapshot(&store.db)?;
+            }
+        }
+        Ok(store)
     }
 
     /// The options a node store opens with, with a block cache of its own
@@ -426,7 +445,7 @@ impl RocksDb {
         let db = rocksdb::DB::open(opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
         Ok(Self {
-            db: Self::coordinated(db, false, None)?,
+            db: Self::coordinated(db, false)?,
             shared_block_cache: false,
         })
     }
@@ -571,7 +590,7 @@ impl RocksDb {
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
         Ok(Self {
-            db: Self::coordinated(db, coin_changes_enabled, None)?,
+            db: Self::coordinated(db, coin_changes_enabled)?,
             shared_block_cache: false,
         })
     }
@@ -581,13 +600,12 @@ impl RocksDb {
     fn coordinated(
         db: rocksdb::DB,
         coin_changes_enabled: bool,
-        path: Option<&Path>,
     ) -> Result<quil_forest::CoordinatedDb> {
         let db = quil_forest::CoordinatedDb::with_watched_prefixes(
             db,
             crate::encoding::prover_registry_key_prefixes(),
         );
-        crate::coin_changes::configure(&db, coin_changes_enabled, path)?;
+        crate::coin_changes::configure(&db, coin_changes_enabled)?;
         open_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

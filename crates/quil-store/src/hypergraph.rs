@@ -131,7 +131,6 @@ impl OverlayHypergraphStore {
             .stage_local_projection_records(
                 crate::coin_changes::NAMESPACE,
                 crate::coin_changes::RESET_REQUEST,
-                crate::coin_changes::INSTALL_OVERFLOW,
                 &[(&request, &[u8::from(installing)])],
             )
             .map_err(|error| QuilError::Store(error.to_string()))
@@ -156,7 +155,6 @@ impl OverlayHypergraphStore {
             .stage_local_projection_records(
                 crate::coin_changes::NAMESPACE,
                 crate::coin_changes::RESET_REQUEST,
-                crate::coin_changes::INSTALL_OVERFLOW,
                 &[(&target, &roots), (&request, &value)],
             )
             .map_err(|error| QuilError::Store(error.to_string()))

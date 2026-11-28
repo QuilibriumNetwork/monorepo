@@ -683,7 +683,6 @@ struct Inner {
     projection_reset: Option<&'static [u8]>,
     projection_records: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
     projection_bytes: usize,
-    projection_overflow: Option<&'static [u8]>,
     base: Option<Arc<PinnedSnapshot>>,
     delta: Arc<Delta>,
     /// Counts the delta's changes, so a reader can prove it read the delta a
@@ -795,7 +794,6 @@ impl ExecutionOverlay {
                 projection_reset: None,
                 projection_records: Arc::new(BTreeMap::new()),
                 projection_bytes: 0,
-                projection_overflow: None,
                 base: Some(PinnedSnapshot::new(db, admission)?),
                 delta: Arc::new(Delta::default()),
                 generation: 0,
@@ -865,9 +863,6 @@ impl ExecutionOverlay {
             for (key, value) in inner.projection_records.iter() {
                 batch.put(key, value);
             }
-            if let Some(key) = inner.projection_overflow {
-                batch.put(key, b"1");
-            }
             let plan = PreparedOverlayCommit {
                 database: base._db.clone(),
                 sequence: base.sequence,
@@ -880,7 +875,6 @@ impl ExecutionOverlay {
             inner.projection_reset = None;
             inner.projection_records = Arc::new(BTreeMap::new());
             inner.projection_bytes = 0;
-            inner.projection_overflow = None;
             Ok(plan)
         })())
     }
@@ -937,7 +931,6 @@ impl ExecutionOverlay {
                 projection_reset: inner.projection_reset,
                 projection_records: inner.projection_records.clone(),
                 projection_bytes: inner.projection_bytes,
-                projection_overflow: inner.projection_overflow,
                 base: Some(base.clone()),
                 delta: inner.delta.clone(),
                 generation: 0,
@@ -957,7 +950,6 @@ impl ExecutionOverlay {
         inner.projection_reset = None;
         inner.projection_records = Arc::new(BTreeMap::new());
         inner.projection_bytes = 0;
-        inner.projection_overflow = None;
     }
 
     pub fn stats(&self) -> OverlayStats {
@@ -1150,38 +1142,45 @@ impl ExecutionOverlay {
     }
 
     /// Stage bounded local metadata without spending canonical execution
-    /// budgets. Overflow fences the optional feed instead of failing execution.
+    /// budgets. Reject an oversized branch before publication; dropping an
+    /// installation identity would make its feed fence impossible to recover.
     pub fn stage_local_projection_records(
         &self,
         namespace: &'static [u8],
         reset_key: &'static [u8],
-        overflow_key: &'static [u8],
         records: &[(&[u8], &[u8])],
     ) -> Result<()> {
         self.observe((|| {
-            ensure!(reset_key.starts_with(namespace) && reset_key.len() <= 256
-                && overflow_key.starts_with(namespace) && overflow_key.len() <= 256
-                && records.iter().all(|(key, _)| key.starts_with(namespace)),
-                "local projection record escaped its namespace");
+            ensure!(
+                reset_key.starts_with(namespace)
+                    && reset_key.len() <= 256
+                    && records.iter().all(|(key, _)| key.starts_with(namespace)),
+                "local projection record escaped its namespace"
+            );
             if !self.has_local_projection(namespace)? {
                 return Ok(());
             }
             let mut inner = self.lock_inner()?;
-            let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            let base = inner
+                .base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
             drop(base.view()?);
             inner.projection_reset = Some(reset_key);
             for (key, value) in records {
                 let old = inner.projection_records.get(*key);
-                let bytes = inner.projection_bytes.saturating_sub(old.map_or(0, |old| key.len() + old.len()))
-                    .saturating_add(key.len()).saturating_add(value.len());
-                if key.len() > 512 || value.len() > 512 || bytes > 64 << 10
-                    || (old.is_none() && inner.projection_records.len() >= 256) {
-                    if inner.projection_overflow.is_none() {
-                        tracing::warn!("local projection staging limit; incremental discovery requires recovery");
-                    }
-                    inner.projection_overflow = Some(overflow_key);
-                    continue;
-                }
+                let bytes = inner
+                    .projection_bytes
+                    .saturating_sub(old.map_or(0, |old| key.len() + old.len()))
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+                ensure!(
+                    key.len() <= 512
+                        && value.len() <= 512
+                        && bytes <= 256 << 10
+                        && (old.is_some() || inner.projection_records.len() < 512),
+                    "local projection staging limit"
+                );
                 inner.projection_bytes = bytes;
                 Arc::make_mut(&mut inner.projection_records).insert(key.to_vec(), value.to_vec());
             }
@@ -1207,9 +1206,6 @@ impl ExecutionOverlay {
         let held = self.observe(base.view())?;
         if let Some(value) = inner.projection_records.get(key) {
             return Ok(Some(value.clone()));
-        }
-        if inner.projection_overflow == Some(key) {
-            return Ok(Some(b"1".to_vec()));
         }
         let value = self.observe(
             held.as_ref()

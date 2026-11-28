@@ -123,25 +123,22 @@ fn event_bytes(blob_len: usize) -> usize {
 
 /// Configure the journal before exposing the store. A clean restart keeps
 /// the existing cursor epoch.
-pub(crate) fn configure(
-    db: &CoordinatedDb,
-    enabled: bool,
-    path: Option<&std::path::Path>,
-) -> Result<()> {
+pub(crate) fn configure(db: &CoordinatedDb, enabled: bool) -> Result<()> {
     if db.get(SNAPSHOT_INSTALL_STATE).map_err(error)?.is_none() {
         let snapshot_request = [INSTALL_REQUESTS, b"snapshot-install"].concat();
         let snapshot_scope = [INSTALL_SCOPES, b"snapshot-install"].concat();
         let request = db.get(&snapshot_request).map_err(error)?;
         let scope = db.get(&snapshot_scope).map_err(error)?;
         let legacy_import = legacy_snapshot_import_pending(request.as_deref(), scope.as_deref());
-        let uncertain_import = path.is_some_and(|path| path.join("snapshot").is_dir())
-            && (db.get(INSTALLING).map_err(error)?.is_some()
-                || db.get(INSTALL_OVERFLOW).map_err(error)?.is_some()
-                || db.get(INVALID).map_err(error)?.is_some());
-        if legacy_import || uncertain_import {
+        if legacy_import {
             db.put(SNAPSHOT_INSTALL_STATE, b"1").map_err(error)?;
         }
     }
+    let canonical_import_pending = db
+        .get(SNAPSHOT_INSTALL_STATE)
+        .map_err(error)?
+        .as_deref()
+        .is_some_and(|value| !completed_snapshot_import(value));
     let stored = db.get(META).map_err(error)?;
     if !enabled {
         if stored.is_some() && db.get(DISABLED).map_err(error)?.is_none() {
@@ -189,10 +186,11 @@ pub(crate) fn configure(
             }
             let request = [INSTALL_REQUESTS, scope].concat();
             // Verify each scope once, through its pending request when present.
-            if requests
-                .entries
-                .binary_search_by(|(key, _)| key.cmp(&request))
-                .is_err()
+            if !canonical_import_pending
+                && requests
+                    .entries
+                    .binary_search_by(|(key, _)| key.cmp(&request))
+                    .is_err()
                 && completed_installation(db, scope)?
             {
                 batch.put(request, [0]);
@@ -205,14 +203,14 @@ pub(crate) fn configure(
             untracked = true;
             continue;
         }
-        if value == [0] || completed_installation(db, scope)? {
+        if value == [0] || (!canonical_import_pending && completed_installation(db, scope)?) {
             batch.put(key, [0]);
         } else {
             batch.put(key, value);
         }
     }
     if uncertain || untracked {
-        let value = if !untracked && overflow.as_deref() == Some(b"2") {
+        let value = if !untracked && recoverable_overflow(overflow.as_deref()) {
             tracing::info!("Coin journal has deferred requests; verifying bounded recovery pages");
             b"2".as_slice()
         } else {
@@ -239,7 +237,57 @@ pub(crate) fn configure(
         batch.put(RESET_REQUEST, b"1");
         db.write(batch).map_err(error)?;
     }
-    if !requests_complete && !untracked && overflow.as_deref() == Some(b"2") {
+    if !canonical_import_pending
+        && !requests_complete
+        && !untracked
+        && recoverable_overflow(overflow.as_deref())
+    {
+        recover_deferred_requests(db, remaining)?;
+    }
+    Ok(())
+}
+
+fn recoverable_overflow(value: Option<&[u8]>) -> bool {
+    value.is_none_or(|value| value == b"2")
+}
+
+/// Recheck maintenance against canonical rows only after a pending snapshot
+/// has finished replaying. The first configure pass cannot verify these rows.
+pub(crate) fn recover_after_snapshot(db: &CoordinatedDb) -> Result<()> {
+    let scopes = recovery_page(db, INSTALL_SCOPES, MAX_RECOVERY_BYTES)?;
+    let requests = recovery_page(db, INSTALL_REQUESTS, MAX_RECOVERY_BYTES)?;
+    let requests_complete = requests.complete;
+    let remaining = MAX_RECOVERY_BYTES.saturating_sub(requests.bytes);
+    let mut batch = rocksdb::WriteBatch::default();
+    for (key, value) in scopes.entries {
+        if value != b"1" {
+            continue;
+        }
+        let scope = &key[INSTALL_SCOPES.len()..];
+        let request = [INSTALL_REQUESTS, scope].concat();
+        if requests
+            .entries
+            .binary_search_by(|(key, _)| key.cmp(&request))
+            .is_err()
+            && completed_installation(db, scope)?
+        {
+            batch.put(request, [0]);
+        }
+    }
+    for (key, value) in requests.entries {
+        let scope = &key[INSTALL_REQUESTS.len()..];
+        if !scope.is_empty()
+            && scope.len() <= 256
+            && matches!(value.as_slice(), [0] | [1])
+            && (value == [0] || completed_installation(db, scope)?)
+        {
+            batch.put(key, [0]);
+        }
+    }
+    if batch.len() > 0 {
+        db.write(batch).map_err(error)?;
+    }
+    if !requests_complete && db.get(INSTALL_OVERFLOW).map_err(error)?.as_deref() == Some(b"2") {
         recover_deferred_requests(db, remaining)?;
     }
     Ok(())
@@ -648,7 +696,6 @@ impl LocalBatchProjection for CoinProjection {
                 None => {
                     install_overrun = true;
                     pending_left = true;
-                    unknown_installation = !tracked_overflow;
                 }
             }
         }
@@ -757,11 +804,12 @@ impl LocalBatchProjection for CoinProjection {
         {
             return Ok(());
         }
-        let overflow_value = if unknown_installation || stored_overflow.as_deref() == Some(b"1") {
-            b"1".as_slice()
-        } else {
-            b"2".as_slice()
-        };
+        let overflow_value =
+            if unknown_installation || !recoverable_overflow(stored_overflow.as_deref()) {
+                b"1".as_slice()
+            } else {
+                b"2".as_slice()
+            };
         let installed_count = view.get(INSTALLING).map_err(|e| e.to_string())?;
         let had_installed_count = installed_count.is_some();
         let mut installing = match installed_count {
