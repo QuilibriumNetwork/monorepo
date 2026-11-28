@@ -326,6 +326,7 @@ impl DirectGlobalConsensusPublisher {
                             from: self_id,
                             via: Vec::new(),
                             direct: false,
+                            ack: None,
                         })
                         .await;
                     Ok(())

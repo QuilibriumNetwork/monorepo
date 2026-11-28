@@ -44,9 +44,10 @@ use crate::frame_validator::BlsAppFrameValidator;
 pub const CW_APP_BLOCK_CHANNEL: u64 = 3;
 
 /// The simplex resolver's channel: requests for missing certificates and their
-/// responses, each addressed to one committee member. The only channel whose
-/// recipients travel to the network layer ([`crate::app_engine::AppEngineEvent::CwOut`]),
-/// so it can be delivered directly instead of to the shard's whole topic.
+/// responses, each addressed to one committee member
+/// ([`crate::app_engine::AppEngineEvent::CwOut`]). One lost is asked again, so
+/// a member on an earlier build, which answers a direct send once queued,
+/// counts as served on this channel only.
 pub const CW_APP_RESOLVER_CHANNEL: u64 = 2;
 
 /// Build the full `AppShardFrame{header, requests}` from a produced consensus
@@ -2728,9 +2729,10 @@ impl AppConsensusCwHandle {
     }
 }
 
-/// An application shard's engine tunables. Its transport is the shard's
-/// gossip ([`AppConsensusTransport`]), which relays every copy to every
-/// member, so certificates go out from `f+1` members
+/// An application shard's engine tunables. Its transport
+/// ([`AppConsensusTransport`]) reaches every member a message names, directly
+/// or else through the shard's gossip topic every member reads, so
+/// certificates go out from `f+1` members
 /// ([`GlobalEngineParams::certificate_fanout`]).
 fn app_engine_params(
     partition: String,

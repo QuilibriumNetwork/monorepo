@@ -29,6 +29,65 @@ use crate::message_collector::MessageCollector;
 static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate =
     crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
 
+/// Votes, certificates and blocks being relayed to a shard's members at once.
+/// One that finds this full goes to the topic instead.
+static COMMITTEE_RELAY_TASKS: crate::spawn_gate::SpawnGate =
+    crate::spawn_gate::SpawnGate::new("committee-relay", 256);
+
+/// How the pump sends a CW message that names its recipients.
+#[derive(Debug)]
+enum CwRelay {
+    /// Through the master, in a task holding this place.
+    Relay(tokio::sync::SemaphorePermit<'static>),
+    /// To the topic now: the committee's relay tasks are full, and consensus
+    /// waits on votes, certificates and blocks.
+    Topic,
+    /// Not at all: the resolver's relay tasks are full. A peer's resolver
+    /// requests drive these, and a dropped reply is re-asked.
+    Drop,
+}
+
+fn cw_relay(
+    channel: u64,
+    resolver: &'static crate::spawn_gate::SpawnGate,
+    committee: &'static crate::spawn_gate::SpawnGate,
+) -> CwRelay {
+    if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+        return resolver.try_enter().map_or(CwRelay::Drop, CwRelay::Relay);
+    }
+    committee.try_enter().map_or(CwRelay::Topic, CwRelay::Relay)
+}
+
+/// Whether a master's relay answer says it relays votes, certificates and
+/// blocks, not only resolver messages ([`quil_p2p::direct::ANSWERS_TAKEN`]):
+/// an earlier master's answer does not.
+pub fn master_relays_consensus(
+    response: &quil_types::proto::global::SendShardConsensusDirectResponse,
+) -> bool {
+    quil_p2p::direct::DirectAnswer::of(true, response.relays_consensus)
+        == quil_p2p::direct::DirectAnswer::Taken
+}
+
+/// A worker's answer to its master for a shard consensus message the engine
+/// took (`accepted`) or not: "taken" says that acceptance was the engine's
+/// ([`quil_p2p::direct::ANSWERS_TAKEN`]).
+pub fn shard_consensus_answer(
+    accepted: bool,
+) -> quil_types::proto::node::DeliverShardConsensusResponse {
+    quil_types::proto::node::DeliverShardConsensusResponse {
+        accepted,
+        taken: accepted && quil_p2p::direct::ANSWERS_TAKEN,
+    }
+}
+
+/// Whether a CW message on `channel` goes to the master's relay: a resolver
+/// message to any master with the relay, a vote, certificate or block only
+/// to one that `relays_consensus` (asked only then). Otherwise the worker
+/// sends it to the topic itself, as before the relay took them.
+pub fn relays_through_master(channel: u64, relays_consensus: impl FnOnce() -> bool) -> bool {
+    channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL || relays_consensus()
+}
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -235,15 +294,113 @@ pub struct WorkerOnlyNode {
     master_relay: Arc<MasterRelay>,
 }
 
-/// How long a master without the relay is not asked again.
+/// How long a master without the relay is not asked again, and how long its
+/// answer on relaying votes, certificates and blocks is kept unless a relay
+/// answers again.
 const MASTER_RELAY_RETRY_AFTER: Duration = Duration::from_secs(600);
-/// How long a relayed send may take: the master's own direct send times out
-/// after five seconds.
+/// How long a call to the master that is not on a vote's path may take, and
+/// a channel to it may take to make.
 const MASTER_RELAY_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long votes, certificates and blocks go to the topic after the master
+/// left a probe or a relay unanswered, before it is asked again.
+const MASTER_RELAY_FAILED_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// What a relay waits for its master beyond the master's own committee send
+/// ([`quil_p2p::direct::committee_send_timeout`]).
+const MASTER_RELAY_MARGIN: Duration = Duration::from_millis(500);
 
 type MasterClient = quil_types::proto::global::global_service_client::GlobalServiceClient<
     tonic::transport::Channel,
 >;
+
+/// What the master's relay call returned: `None` without a channel to it.
+type RelayAnswer = Option<
+    std::result::Result<quil_types::proto::global::SendShardConsensusDirectResponse, tonic::Status>,
+>;
+
+/// A test's stand-in for the master's relay call.
+#[cfg(test)]
+type RelayStandIn = Arc<
+    dyn Fn(
+            quil_types::proto::global::SendShardConsensusDirectRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RelayAnswer> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Where a vote, certificate or block goes, by what the worker knows of its
+/// master ([`ConsensusRelayKnown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsensusRoute {
+    /// Through the master's relay.
+    Master,
+    /// To the topic: the master does not relay it, left a call unanswered
+    /// lately, or is being asked.
+    Topic,
+    /// To the topic, and the master is to be asked, off the send path.
+    TopicAndProbe,
+}
+
+/// Whether a worker's master relays votes, certificates and blocks, read
+/// without waiting on the master: consensus waits on votes, and on the tip
+/// a vote went to the topic whatever the master did. Unknown means the
+/// topic; one probe at a time asks.
+#[derive(Debug, Default)]
+pub(crate) struct ConsensusRelayKnown {
+    /// The master's last answer, and when: kept for
+    /// [`MASTER_RELAY_RETRY_AFTER`], replaced by every relay answer.
+    answer: Option<(tokio::time::Instant, bool)>,
+    /// When a probe or relay went unanswered: the topic for
+    /// [`MASTER_RELAY_FAILED_RETRY_AFTER`].
+    failed: Option<tokio::time::Instant>,
+    /// A probe is out.
+    probing: bool,
+}
+
+impl ConsensusRelayKnown {
+    /// Where a vote sent at `now` goes; [`ConsensusRoute::TopicAndProbe`]
+    /// marks a probe out until [`Self::probed`].
+    pub(crate) fn route(&mut self, now: tokio::time::Instant) -> ConsensusRoute {
+        if let Some((since, relays)) = self.answer {
+            if now.saturating_duration_since(since) < MASTER_RELAY_RETRY_AFTER {
+                return if relays {
+                    ConsensusRoute::Master
+                } else {
+                    ConsensusRoute::Topic
+                };
+            }
+        }
+        let failed_lately = self
+            .failed
+            .is_some_and(|at| now.saturating_duration_since(at) < MASTER_RELAY_FAILED_RETRY_AFTER);
+        if failed_lately || self.probing {
+            return ConsensusRoute::Topic;
+        }
+        self.probing = true;
+        ConsensusRoute::TopicAndProbe
+    }
+
+    /// The master answered a probe or a relay at `now`.
+    pub(crate) fn answered(&mut self, now: tokio::time::Instant, relays: bool) {
+        self.answer = Some((now, relays));
+        self.failed = None;
+    }
+
+    /// The master left a probe or a relay unanswered at `now`.
+    pub(crate) fn failed(&mut self, now: tokio::time::Instant) {
+        self.answer = None;
+        self.failed = Some(now);
+    }
+
+    /// The channel to the master is gone: ask it again.
+    pub(crate) fn forget(&mut self) {
+        self.answer = None;
+    }
+
+    /// The probe is back, its answer noted.
+    pub(crate) fn probed(&mut self) {
+        self.probing = false;
+    }
+}
 
 /// A standalone worker's channel to its master's `GlobalService` calls that
 /// act as the node. The worker connects under a synthetic identity: members
@@ -252,14 +409,22 @@ type MasterClient = quil_types::proto::global::global_service_client::GlobalServ
 /// failure.
 pub(crate) struct MasterRelay {
     factory: Option<MasterChannelFactory>,
-    client: tokio::sync::Mutex<Option<MasterClient>>,
+    /// The channel, once made: taken without waiting.
+    client: std::sync::Mutex<Option<MasterClient>>,
+    /// Held while a channel is made, so one is made at a time.
+    connecting: tokio::sync::Mutex<()>,
     /// When the master last answered that it lacks the direct relay (an older
     /// build): resolver messages go to the topic for a while.
     direct_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Whether the master relays votes, certificates and blocks
+    /// ([`master_relays_consensus`]).
+    relays_consensus: std::sync::Mutex<ConsensusRelayKnown>,
     /// When the master last answered that it cannot take GLOBAL submissions.
     submit_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
     /// When a reward proof was last lost, for a warning at most once a minute.
     proof_lost_warned: std::sync::Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    stand_in: Option<RelayStandIn>,
 }
 
 /// What became of a GLOBAL submission handed to the master.
@@ -280,10 +445,23 @@ impl MasterRelay {
     pub(crate) fn new(factory: Option<MasterChannelFactory>) -> Self {
         Self {
             factory,
-            client: tokio::sync::Mutex::new(None),
+            client: std::sync::Mutex::new(None),
+            connecting: tokio::sync::Mutex::new(()),
             direct_unsupported: std::sync::Mutex::new(None),
+            relays_consensus: std::sync::Mutex::new(ConsensusRelayKnown::default()),
             submit_unsupported: std::sync::Mutex::new(None),
             proof_lost_warned: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            stand_in: None,
+        }
+    }
+
+    /// A relay whose master's relay call is `stand_in`.
+    #[cfg(test)]
+    fn standing_in(stand_in: RelayStandIn) -> Self {
+        Self {
+            stand_in: Some(stand_in),
+            ..Self::new(None)
         }
     }
 
@@ -294,29 +472,114 @@ impl MasterRelay {
             .is_some_and(|since| since.elapsed() < MASTER_RELAY_RETRY_AFTER)
     }
 
+    /// The channel to the master, made if there is none: one at a time, each
+    /// within [`MASTER_RELAY_TIMEOUT`].
     async fn client(&self) -> Option<MasterClient> {
-        let factory = self.factory.clone()?;
-        let mut client = self.client.lock().await;
-        if client.is_none() {
-            let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await
-            else {
-                return None;
-            };
-            *client = Some(MasterClient::new(channel));
+        if let Some(client) = self.client_now() {
+            return Some(client);
         }
-        client.clone()
+        let factory = self.factory.clone()?;
+        let _connecting = self.connecting.lock().await;
+        if let Some(client) = self.client_now() {
+            return Some(client);
+        }
+        let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await else {
+            return None;
+        };
+        let client = MasterClient::new(channel);
+        *self.client.lock().unwrap() = Some(client.clone());
+        Some(client)
     }
 
-    async fn reconnect(&self) {
-        *self.client.lock().await = None;
+    /// The channel to the master if one is made, without waiting.
+    fn client_now(&self) -> Option<MasterClient> {
+        self.client.lock().unwrap().clone()
     }
 
-    /// Have the master deliver a resolver message directly to the committee
-    /// members it names. False: send it to the topic (no master channel, a
-    /// master without the relay, a failure, or a recipient the master could
-    /// not reach).
-    async fn relay_direct(
+    /// Drop the channel after a failure; the next call that may wait makes
+    /// another.
+    fn reconnect(&self) {
+        *self.client.lock().unwrap() = None;
+    }
+
+    /// The master's relay call; `wait` for a channel to be made, else only
+    /// on one already made.
+    async fn relay_call(
         &self,
+        request: quil_types::proto::global::SendShardConsensusDirectRequest,
+        wait: bool,
+    ) -> RelayAnswer {
+        #[cfg(test)]
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in(request).await;
+        }
+        let mut client = if wait {
+            self.client().await
+        } else {
+            self.client_now()
+        }?;
+        Some(
+            client
+                .send_shard_consensus_direct(request)
+                .await
+                .map(tonic::Response::into_inner),
+        )
+    }
+
+    /// Whether a vote, certificate or block goes through the master now
+    /// ([`ConsensusRelayKnown`]); never waits. When the master is to be
+    /// asked, a probe goes out in its own task.
+    fn consensus_through_master(self: &Arc<Self>) -> bool {
+        let route = self
+            .relays_consensus
+            .lock()
+            .unwrap()
+            .route(tokio::time::Instant::now());
+        if route == ConsensusRoute::TopicAndProbe {
+            self.probe_relays_consensus();
+        }
+        route == ConsensusRoute::Master
+    }
+
+    /// Ask the master whether it relays votes, certificates and blocks, with
+    /// a request naming no recipient, which sends nothing; the answer is
+    /// noted in [`Self::relays_consensus`], an unanswered probe as a failure.
+    fn probe_relays_consensus(self: &Arc<Self>) {
+        let relay = self.clone();
+        tokio::spawn(async move {
+            let probe = quil_types::proto::global::SendShardConsensusDirectRequest::default();
+            let answer =
+                tokio::time::timeout(MASTER_RELAY_TIMEOUT, relay.relay_call(probe, true)).await;
+            let now = tokio::time::Instant::now();
+            let relays = match answer {
+                Ok(Some(Ok(response))) => Some(master_relays_consensus(&response)),
+                Ok(Some(Err(status))) if status.code() == tonic::Code::Unimplemented => {
+                    *relay.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
+                    Some(false)
+                }
+                _ => {
+                    relay.reconnect();
+                    None
+                }
+            };
+            let mut known = relay.relays_consensus.lock().unwrap();
+            match relays {
+                Some(relays) => known.answered(now, relays),
+                None => known.failed(now),
+            }
+            known.probed();
+        });
+    }
+
+    /// Have the master deliver a shard CW message directly to the committee
+    /// members it names. False: send it to the topic (no master channel, a
+    /// master without the relay, a vote, certificate or block for a master
+    /// that does not relay them or is not known to, a failure, or a
+    /// recipient the master could not reach). Waits at most the master's own
+    /// committee send plus [`MASTER_RELAY_MARGIN`]; a vote never waits for a
+    /// channel to be made.
+    async fn relay_direct(
+        self: &Arc<Self>,
         filter: Vec<u8>,
         channel: u64,
         data: Vec<u8>,
@@ -325,28 +588,39 @@ impl MasterRelay {
         if Self::recently(&self.direct_unsupported) {
             return false;
         }
-        let Some(mut client) = self.client().await else {
+        if !relays_through_master(channel, || self.consensus_through_master()) {
             return false;
-        };
+        }
+        let consensus = channel != crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL;
+        let timeout = quil_p2p::direct::committee_send_timeout(recipients.len(), data.len())
+            + MASTER_RELAY_MARGIN;
         let request = quil_types::proto::global::SendShardConsensusDirectRequest {
             filter,
             channel,
             data,
             recipients,
         };
-        match tokio::time::timeout(
-            MASTER_RELAY_TIMEOUT,
-            client.send_shard_consensus_direct(request),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response.into_inner().delivered,
-            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+        let answer = tokio::time::timeout(timeout, self.relay_call(request, !consensus)).await;
+        let now = tokio::time::Instant::now();
+        match answer {
+            Ok(Some(Ok(response))) => {
+                self.relays_consensus
+                    .lock()
+                    .unwrap()
+                    .answered(now, master_relays_consensus(&response));
+                response.delivered
+            }
+            Ok(None) => {
+                self.relays_consensus.lock().unwrap().forget();
+                false
+            }
+            Ok(Some(Err(status))) if status.code() == tonic::Code::Unimplemented => {
                 *self.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
                 false
             }
             _ => {
-                self.reconnect().await;
+                self.relays_consensus.lock().unwrap().failed(now);
+                self.reconnect();
                 false
             }
         }
@@ -379,7 +653,7 @@ impl MasterRelay {
                 MasterSubmission::Unavailable
             }
             _ => {
-                self.reconnect().await;
+                self.reconnect();
                 MasterSubmission::Unavailable
             }
         }
@@ -964,17 +1238,25 @@ impl WorkerOnlyNode {
                                             .await;
                                             continue;
                                         }
-                                        // A resolver message: through the master to just
-                                        // its recipients, else the topic. Off the pump,
-                                        // which also carries votes, since a relayed send
-                                        // can wait out the master's timeout.
-                                        // Either way it names its recipient, so other
-                                        // members drop it unread.
+                                        // Through the master to each recipient, else the
+                                        // topic. Off the pump, which also carries votes,
+                                        // since a relayed send can wait out the master's
+                                        // timeout. A copy for one member names it, so
+                                        // other members drop it unread.
                                         let worker = worker_for_pump.clone();
                                         let publish = publish.clone();
-                                        // A peer's resolver requests drive these; each can wait
-                                        // out the master's timeout. A dropped reply is re-asked.
-                                        let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
+                                        let permit = match cw_relay(channel, &RESOLVER_RELAY_TASKS, &COMMITTEE_RELAY_TASKS) {
+                                            CwRelay::Relay(permit) => permit,
+                                            CwRelay::Drop => continue,
+                                            CwRelay::Topic => {
+                                                publish(
+                                                    crate::bitmasks::shard_cw_bitmask(&filter),
+                                                    crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                        };
                                         tokio::spawn(async move {
                                             let _permit = permit;
                                             let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
@@ -2202,12 +2484,12 @@ fn deliver_to_engine(
             crate::resolver_traffic::Addressed::Here,
         );
     }
-    handle.send(crate::app_engine::AppEngineMessage::CwIn {
+    // Its sender was told "delivered" only if the engine took it.
+    handle.try_deliver(crate::app_engine::AppEngineMessage::CwIn {
         channel: request.channel,
         from: request.from,
         data: request.data,
-    });
-    true
+    })
 }
 
 /// Start the eviction passes for `keep` unless the binding of `handle`
@@ -2309,9 +2591,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService for DataIp
             .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
             .clone();
         let accepted = deliver_to_engine(handle, request.into_inner());
-        Ok(tonic::Response::new(
-            quil_types::proto::node::DeliverShardConsensusResponse { accepted },
-        ))
+        Ok(tonic::Response::new(shard_consensus_answer(accepted)))
     }
 
     /// The engine this worker runs and its latest execution report, for the
@@ -3090,6 +3370,383 @@ mod tests {
             }
             _ => panic!("expected CwIn"),
         }
+    }
+
+    /// A vote relayed through `relay`: false sends it to the topic.
+    async fn vote(relay: &Arc<MasterRelay>, n: u8) -> bool {
+        relay
+            .relay_direct(vec![1; 32], 0, vec![n; 200], vec![vec![n; 897]])
+            .await
+    }
+
+    /// Lets spawned probes run.
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A master that takes the worker's connection and never answers holds
+    /// back no vote: each of many sent at once is handed back for the topic
+    /// within a small vote's committee send timeout, though nothing is known
+    /// of the master yet. Before the relay took votes, they went to the
+    /// topic whatever the master did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vote_goes_to_the_topic_at_once_while_the_master_never_answers() {
+        // A small vote's committee send timeout (`COMMITTEE_SEND_TIMEOUT`).
+        const BOUND: Duration = Duration::from_millis(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepting = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((connection, _)) = listener.accept().await {
+                accepting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(connection);
+            }
+        });
+        let factory: MasterChannelFactory = Arc::new(move || {
+            let master = master.clone();
+            Box::pin(async move {
+                let endpoint = tonic::transport::Endpoint::from_shared(master)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                Ok(endpoint.connect_lazy())
+            })
+        });
+        let relay = Arc::new(MasterRelay::new(Some(factory)));
+        let votes: Vec<_> = (0..16u8)
+            .map(|n| {
+                let relay = relay.clone();
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let relayed = tokio::time::timeout(BOUND, vote(&relay, n)).await;
+                    (relayed, started.elapsed())
+                })
+            })
+            .collect();
+        for vote in votes {
+            let (relayed, took) = vote.await.unwrap();
+            assert_eq!(
+                relayed,
+                Ok(false),
+                "a vote waited {took:?} on a master that never answers"
+            );
+        }
+        for _ in 0..500 {
+            if accepted.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the master took the worker's connection"
+        );
+    }
+
+    /// Stands in for the master's relay call: counts probes (no recipient)
+    /// and relays, and answers each at once, saying whether it relays
+    /// votes, certificates and blocks, or never answers.
+    #[derive(Clone, Default)]
+    struct StandInMaster {
+        answers: Arc<std::sync::atomic::AtomicBool>,
+        relays_consensus: Arc<std::sync::atomic::AtomicBool>,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+        relays: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StandInMaster {
+        fn answering(relays_consensus: bool) -> Self {
+            let master = Self::default();
+            master
+                .answers
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            master.relays_consensus(relays_consensus);
+            master
+        }
+
+        fn relays_consensus(&self, relays: bool) {
+            self.relays_consensus
+                .store(relays, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Probes and relays it was sent.
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.probes.load(std::sync::atomic::Ordering::SeqCst),
+                self.relays.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        fn relay(&self) -> Arc<MasterRelay> {
+            let master = self.clone();
+            Arc::new(MasterRelay::standing_in(Arc::new(
+                move |request: quil_types::proto::global::SendShardConsensusDirectRequest| {
+                    let master = master.clone();
+                    Box::pin(async move {
+                        let calls = if request.recipients.is_empty() {
+                            &master.probes
+                        } else {
+                            &master.relays
+                        };
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if !master.answers.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::future::pending::<()>().await;
+                        }
+                        Some(Ok(
+                            quil_types::proto::global::SendShardConsensusDirectResponse {
+                                delivered: true,
+                                relays_consensus: master
+                                    .relays_consensus
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                            },
+                        ))
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = RelayAnswer> + Send>>
+                },
+            )))
+        }
+    }
+
+    /// While the master is asked whether it relays votes, they go to the
+    /// topic and no second probe goes out; a probe it leaves unanswered
+    /// sends votes to the topic, unasked, for thirty seconds.
+    #[tokio::test(start_paused = true)]
+    async fn one_probe_at_a_time_and_an_unanswered_one_sends_votes_to_the_topic_for_thirty_seconds()
+    {
+        let master = StandInMaster::default();
+        let relay = master.relay();
+        let start = tokio::time::Instant::now();
+        for n in 0..8 {
+            assert!(
+                !vote(&relay, n).await,
+                "vote {n} goes to the topic while asking"
+            );
+        }
+        settle().await;
+        assert_eq!(master.calls(), (1, 0), "one probe at a time");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "no vote waited on the master"
+        );
+        tokio::time::sleep(MASTER_RELAY_TIMEOUT).await;
+        settle().await;
+        tokio::time::advance(MASTER_RELAY_FAILED_RETRY_AFTER - Duration::from_millis(1)).await;
+        assert!(!vote(&relay, 8).await);
+        settle().await;
+        assert_eq!(
+            master.calls(),
+            (1, 0),
+            "an unanswered probe is not repeated for thirty seconds"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!vote(&relay, 9).await);
+        settle().await;
+        assert_eq!(master.calls(), (2, 0), "then the master is asked again");
+    }
+
+    /// A master known to relay votes that stops answering holds one vote
+    /// only as long as the master's own committee send may take, plus a
+    /// margin; the next votes go to the topic at once, the master unasked.
+    #[tokio::test(start_paused = true)]
+    async fn a_master_that_stops_answering_holds_one_vote_only_its_committee_send() {
+        let master = StandInMaster::default();
+        let relay = master.relay();
+        relay
+            .relays_consensus
+            .lock()
+            .unwrap()
+            .answered(tokio::time::Instant::now(), true);
+        let start = tokio::time::Instant::now();
+        assert!(
+            !vote(&relay, 1).await,
+            "an unanswered relay sends the vote to the topic"
+        );
+        assert_eq!(
+            start.elapsed(),
+            quil_p2p::direct::committee_send_timeout(1, 200) + MASTER_RELAY_MARGIN,
+            "the vote waited the master's committee send and the margin"
+        );
+        let next = tokio::time::Instant::now();
+        for n in 2..6 {
+            assert!(!vote(&relay, n).await);
+        }
+        settle().await;
+        assert_eq!(
+            next.elapsed(),
+            Duration::ZERO,
+            "the next votes did not wait"
+        );
+        assert_eq!(master.calls(), (0, 1), "nor was the master asked again");
+    }
+
+    /// A master known to relay votes, with no channel to it made, holds no
+    /// vote while one is made: the vote goes to the topic at once, the
+    /// answer is forgotten, and the next vote sends a probe, which makes
+    /// the channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_vote_for_a_master_with_no_channel_goes_to_the_topic_and_a_probe_follows() {
+        let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let making = made.clone();
+        // A master not reached yet: its channel is never made.
+        let factory: MasterChannelFactory = Arc::new(move || {
+            making.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending::<
+                std::result::Result<
+                    tonic::transport::Channel,
+                    Box<dyn std::error::Error + Send + Sync>,
+                >,
+            >())
+        });
+        let relay = Arc::new(MasterRelay::new(Some(factory)));
+        relay
+            .relays_consensus
+            .lock()
+            .unwrap()
+            .answered(tokio::time::Instant::now(), true);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), vote(&relay, 1)).await,
+            Ok(false),
+            "the vote goes to the topic, not waiting for a channel"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the vote did not wait");
+        settle().await;
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the vote made no channel"
+        );
+        assert!(
+            !vote(&relay, 2).await,
+            "the next vote goes to the topic while the master is asked"
+        );
+        settle().await;
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a probe follows, making the channel"
+        );
+    }
+
+    /// The master's answer is kept ten minutes, so votes do not each probe
+    /// it; every relay answer replaces it, renewing it, or, from a master
+    /// that no longer relays votes, sending the next to the topic at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_masters_answer_is_kept_ten_minutes_and_each_relay_answer_replaces_it() {
+        let master = StandInMaster::answering(true);
+        let relay = master.relay();
+        assert!(
+            !vote(&relay, 0).await,
+            "unknown: the topic, and the master is asked"
+        );
+        settle().await;
+        assert!(
+            vote(&relay, 1).await,
+            "a master that relays votes takes the next"
+        );
+        assert!(vote(&relay, 2).await);
+        assert_eq!(
+            master.calls(),
+            (1, 2),
+            "the answer is kept: no probe per vote"
+        );
+
+        tokio::time::advance(MASTER_RELAY_RETRY_AFTER - Duration::from_millis(1)).await;
+        assert!(vote(&relay, 3).await, "kept until ten minutes");
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(vote(&relay, 4).await, "renewed by the last relay's answer");
+        assert_eq!(master.calls(), (1, 4));
+
+        tokio::time::advance(MASTER_RELAY_RETRY_AFTER).await;
+        assert!(
+            !vote(&relay, 5).await,
+            "an answer ten minutes old is asked again"
+        );
+        settle().await;
+        assert_eq!(master.calls(), (2, 4));
+
+        master.relays_consensus(false);
+        assert!(vote(&relay, 6).await);
+        assert!(
+            !vote(&relay, 7).await,
+            "a relay answer that the master no longer relays votes sends the next to the topic"
+        );
+        settle().await;
+        assert_eq!(master.calls(), (2, 5), "without asking it");
+    }
+
+    /// A vote, certificate or block finding every committee relay task busy
+    /// goes to the topic, never dropped; a resolver message is dropped (its
+    /// requester asks again). A place frees as its relay ends.
+    #[test]
+    fn a_full_committee_relay_sends_to_the_topic_and_a_full_resolver_relay_drops() {
+        static RESOLVER: crate::spawn_gate::SpawnGate =
+            crate::spawn_gate::SpawnGate::new("test-resolver", 64);
+        static COMMITTEE: crate::spawn_gate::SpawnGate =
+            crate::spawn_gate::SpawnGate::new("test-committee", 256);
+        let resolver = crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL;
+        let block = crate::cw_app_seams::CW_APP_BLOCK_CHANNEL;
+        let mut relaying = Vec::new();
+        for channel in [0, 1, block].into_iter().cycle().take(256) {
+            match cw_relay(channel, &RESOLVER, &COMMITTEE) {
+                CwRelay::Relay(permit) => relaying.push(permit),
+                other => panic!(
+                    "channel {channel} with {} relaying: {other:?}",
+                    relaying.len()
+                ),
+            }
+        }
+        for channel in [0, 1, block] {
+            assert!(
+                matches!(cw_relay(channel, &RESOLVER, &COMMITTEE), CwRelay::Topic),
+                "channel {channel}"
+            );
+        }
+        assert!(
+            matches!(cw_relay(resolver, &RESOLVER, &COMMITTEE), CwRelay::Relay(_)),
+            "the resolver's own places"
+        );
+        relaying.pop();
+        assert!(
+            matches!(cw_relay(0, &RESOLVER, &COMMITTEE), CwRelay::Relay(_)),
+            "a freed place"
+        );
+        let resolving: Vec<_> = (0..64)
+            .map(|_| cw_relay(resolver, &RESOLVER, &COMMITTEE))
+            .collect();
+        assert!(resolving
+            .iter()
+            .all(|relay| matches!(relay, CwRelay::Relay(_))));
+        assert!(matches!(
+            cw_relay(resolver, &RESOLVER, &COMMITTEE),
+            CwRelay::Drop
+        ));
+    }
+
+    /// The master tells a direct message's sender "delivered" from this
+    /// answer, and the sender then sends no topic copy: a message the
+    /// engine's full queue drops must be answered "not delivered".
+    #[test]
+    fn a_message_the_engines_full_queue_drops_is_not_reported_delivered() {
+        let request = || quil_types::proto::node::DeliverShardConsensusRequest {
+            filter: vec![1; 32],
+            channel: 0,
+            data: b"vote".to_vec(),
+            from: vec![5; 897],
+        };
+        let (handle, _engine) = crate::app_engine::AppEngineHandle::for_test(vec![1; 32]);
+        let mut taken = 0;
+        while deliver_to_engine(Some(handle.clone()), request()) {
+            taken += 1;
+            assert!(
+                taken <= 1024,
+                "every message reported delivered, though the queue holds 16"
+            );
+        }
+        assert_eq!(taken, 16, "the queue's capacity, then refused");
     }
 
     #[tokio::test]
