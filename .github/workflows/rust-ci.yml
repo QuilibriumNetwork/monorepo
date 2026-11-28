@@ -65,6 +65,39 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
 
   # -----------------------------------------------------------------
+  # version — the release version (VERSION, PATCH_NUMBER, subpatch) never
+  # goes backwards: head against the pull request or merge-queue base, or
+  # the previous commit for a push. Read from the files; nothing builds.
+  # -----------------------------------------------------------------
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case $EVENT in
+            pull_request) base=$PR_BASE ;;
+            merge_group) base=$MQ_BASE ;;
+            *) base=$PUSH_BEFORE ;;
+          esac
+          # A new branch has no previous push; compare with the parent.
+          case $base in ''|0000000000000000000000000000000000000000) base=HEAD^ ;; esac
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base"
+          fi
+          scripts/tests/check-version-monotonic.test.sh
+          scripts/check-version-monotonic.sh "$base" HEAD
+
+  # -----------------------------------------------------------------
   # build — compile every workspace target early, including test-only code.
   # -----------------------------------------------------------------
   build:
