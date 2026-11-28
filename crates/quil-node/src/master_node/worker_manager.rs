@@ -1420,17 +1420,11 @@ pub(crate) fn init(
                                         let p2p = drain_p2p.clone();
                                         let committee_peers = drain_committee_peers.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {
-                                            let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
-                                            // A message for one member names it, so a copy the
-                                            // topic carries is dropped unread by the others.
-                                            let payload = quil_engine::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
-                                            if !recipients.is_empty() {
-                                                if super::direct_delivery::deliver_direct(&p2p, &committee_peers, &recipients, &topic, &payload).await {
-                                                    return Ok(());
-                                                }
-                                                p2p.note_direct_fallback();
-                                            }
-                                            super::cw_publish::publish_shard_cw(&p2p, core_id, &filter, topic, payload).await;
+                                            // Each member directly; the rest share one topic copy.
+                                            super::direct_delivery::send_committee(
+                                                &p2p, &committee_peers, core_id, &filter, channel, &bytes, &recipients,
+                                            )
+                                            .await;
                                             Ok(())
                                         });
                                     }

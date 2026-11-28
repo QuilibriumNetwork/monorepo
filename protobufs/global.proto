@@ -683,6 +683,10 @@ message SendShardConsensusDirectRequest {
 message SendShardConsensusDirectResponse {
   // Every recipient accepted it; otherwise the worker sends it to the topic.
   bool delivered = 1;
+  // This node relays votes, certificates and blocks: "delivered" means each
+  // member took it or gets a topic copy sent from here. Absent from an
+  // earlier build, to which a worker relays only resolver messages.
+  bool relays_consensus = 2;
 }
 
 message SubmitWorkerProverMessageRequest {

@@ -14,10 +14,20 @@
 //! protocol (an older build) fails negotiation and is remembered for a while
 //! so senders go straight to gossip. Only already-connected peers are used:
 //! no dial, so delivery never waits on NAT traversal.
+//!
+//! An accepted message is answered once the application takes it
+//! ([`DirectAck`]), or as refused when it does not within
+//! [`DIRECT_TAKE_WAIT`]: a sender told "delivered" sends no gossip copy, so
+//! a message queued here and then dropped would be lost to its member.
+//! Receivers since [`direct_taken_protocol`] answer that way; an earlier
+//! one answered on queueing, which its sender reads as
+//! [`DirectOutcome::Queued`]. A node that hands a message on to a standalone
+//! worker answers what that worker answers ([`ANSWERS_TAKEN`]).
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,8 +39,37 @@ pub const MAX_DIRECT_BITMASK: usize = 256;
 pub const MAX_DIRECT_DATA: usize = 8 * 1024 * 1024;
 /// How long a direct send may take before it is reported failed.
 pub const DIRECT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long a peer that lacks the protocol is not asked again.
+/// How long an accepted message may wait for the application to take it
+/// before its sender is answered "refused". Well under a committee send's
+/// own timeout, so the sender still has time for its gossip copy.
+pub const DIRECT_TAKE_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+/// How long a peer that lacks the protocol, or answers only "queued" to a
+/// send that needs a take ([`DirectAnswers`]), is not asked again.
 pub const UNSUPPORTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long one member's direct send of a small committee message (a vote,
+/// certificate or block) may take before that member is served by the topic
+/// copy instead. Consensus waits on votes, so this is well under
+/// [`DIRECT_REQUEST_TIMEOUT`]; a send that lands later is a duplicate
+/// consensus ignores.
+pub const COMMITTEE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The upload rate, in bytes per second, a committee send is given time for
+/// on top of [`COMMITTEE_SEND_TIMEOUT`].
+const ASSUMED_UPLOAD_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// How long each of `copies` direct sends of `bytes`, all sent at once, may
+/// take: [`COMMITTEE_SEND_TIMEOUT`] plus the time to upload every copy at
+/// [`ASSUMED_UPLOAD_BYTES_PER_SEC`], within [`DIRECT_REQUEST_TIMEOUT`]. A
+/// standalone worker waits this long, plus a margin, for its master to relay
+/// a message.
+pub fn committee_send_timeout(copies: usize, bytes: usize) -> std::time::Duration {
+    let upload = (copies as u64).saturating_mul(bytes as u64);
+    let upload = std::time::Duration::from_millis(
+        upload.saturating_mul(1000) / ASSUMED_UPLOAD_BYTES_PER_SEC,
+    );
+    (COMMITTEE_SEND_TIMEOUT + upload).min(DIRECT_REQUEST_TIMEOUT)
+}
 
 /// Direct messages one peer may deliver per second, sustained.
 pub const DIRECT_PEER_RATE: f64 = 500.0;
@@ -85,10 +124,93 @@ impl DirectAdmission {
     }
 }
 
-/// The direct-delivery protocol on `network`.
+/// The direct-delivery protocol on `network` whose "accepted" meant queued
+/// at the receiver (earlier builds).
 pub fn direct_protocol(network: u8) -> StreamProtocol {
     StreamProtocol::try_from_owned(format!("/quilibrium/direct/1.0.0/{network}"))
         .expect("valid protocol name")
+}
+
+/// Names of [`direct_taken_protocol`], before the network.
+const TAKEN_PROTOCOL_PREFIX: &str = "/quilibrium/direct/1.1.0/";
+
+/// The same exchange, whose "accepted" means the receiver's application took
+/// the message. Offered first; a peer without it answers on
+/// [`direct_protocol`].
+pub fn direct_taken_protocol(network: u8) -> StreamProtocol {
+    StreamProtocol::try_from_owned(format!("{TAKEN_PROTOCOL_PREFIX}{network}"))
+        .expect("valid protocol name")
+}
+
+/// Whether this build's answer on each hop of a direct delivery means its
+/// message was taken: the peer-to-peer answer ([`direct_taken_protocol`]),
+/// a standalone worker's answer to its master (`DeliverShardConsensus`,
+/// `taken`) and a master's answer to its worker's relay request
+/// (`SendShardConsensusDirect`, `relays_consensus`). Absent from an earlier
+/// build, whose acceptance meant at most queued; [`DirectAnswer::of`] reads
+/// every hop's answer by it.
+pub const ANSWERS_TAKEN: bool = true;
+
+/// A receiver's answer to one direct message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectAnswer {
+    /// Refused, or not taken by the receiver's application in time.
+    Refused,
+    /// Accepted by an earlier build ([`direct_protocol`], or a standalone
+    /// worker behind this receiver); whether its application took it is
+    /// unknown.
+    Queued,
+    /// Taken by the receiver's application ([`direct_taken_protocol`]).
+    Taken,
+}
+
+impl DirectAnswer {
+    /// The answer of a hop that `accepted` a message or not, by whether that
+    /// side `answers_taken` ([`ANSWERS_TAKEN`] on this build, absent on an
+    /// earlier one).
+    pub fn of(accepted: bool, answers_taken: bool) -> Self {
+        match (accepted, answers_taken) {
+            (false, _) => Self::Refused,
+            (true, true) => Self::Taken,
+            (true, false) => Self::Queued,
+        }
+    }
+}
+
+/// What a direct message's receiver owes its sender: whether the application
+/// took it. Dropped unanswered (every copy of it), it answers "refused".
+#[derive(Clone)]
+pub struct DirectAck(Arc<Mutex<Option<tokio::sync::oneshot::Sender<DirectAnswer>>>>);
+
+impl DirectAck {
+    /// An ack and the receiver of its answer.
+    pub fn new() -> (Self, tokio::sync::oneshot::Receiver<DirectAnswer>) {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some(answer)))), answered)
+    }
+
+    /// The application took the message.
+    pub fn taken(&self) {
+        self.answer(DirectAnswer::Taken);
+    }
+
+    /// Answer the sender; only the first answer counts.
+    pub fn answer(&self, answer: DirectAnswer) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(answer);
+        }
+    }
+}
+
+impl std::fmt::Debug for DirectAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DirectAck")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,22 +222,39 @@ pub struct DirectRequest {
 /// What became of one direct send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectOutcome {
-    /// The peer accepted it for delivery.
+    /// The peer's application took it.
     Delivered,
+    /// An earlier build accepted it to its receive queue; whether its
+    /// application took it is unknown.
+    Queued,
     /// The peer does not take direct messages on that bitmask.
     Refused,
     /// No connection to the peer; nothing was sent.
     NotConnected,
-    /// The peer lacks the protocol (an older build).
+    /// The peer lacks the protocol (an older build), or answers only
+    /// "queued" and the send needs its message taken ([`DirectAnswers`]);
+    /// nothing was sent.
     Unsupported,
     /// Timed out, the connection closed, or an I/O error.
     Failed,
+}
+
+impl DirectOutcome {
+    /// What a send whose receiver gave `answer` became.
+    pub fn answered(answer: DirectAnswer) -> Self {
+        match answer {
+            DirectAnswer::Taken => Self::Delivered,
+            DirectAnswer::Queued => Self::Queued,
+            DirectAnswer::Refused => Self::Refused,
+        }
+    }
 }
 
 /// Counters for direct delivery and gossip admission to the receive queue.
 #[derive(Default)]
 pub struct DirectStats {
     pub delivered: AtomicU64,
+    pub queued: AtomicU64,
     pub refused: AtomicU64,
     pub not_connected: AtomicU64,
     pub unsupported: AtomicU64,
@@ -124,6 +263,10 @@ pub struct DirectStats {
     pub fallbacks: AtomicU64,
     pub received: AtomicU64,
     pub received_refused: AtomicU64,
+    /// Received messages the application did not take in time. Their
+    /// senders were answered "refused" and send a gossip copy; a message
+    /// still taken later makes that copy a duplicate.
+    pub received_untaken: AtomicU64,
     /// Gossip messages admitted to the local application queue, not processed.
     pub gossip_received: AtomicU64,
     /// Gossip messages dropped because the application queue was full.
@@ -136,6 +279,7 @@ pub struct DirectStats {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DirectStatsSnapshot {
     pub delivered: u64,
+    pub queued: u64,
     pub refused: u64,
     pub not_connected: u64,
     pub unsupported: u64,
@@ -143,6 +287,7 @@ pub struct DirectStatsSnapshot {
     pub fallbacks: u64,
     pub received: u64,
     pub received_refused: u64,
+    pub received_untaken: u64,
     pub gossip_received: u64,
     pub gossip_received_queue_full: u64,
     pub gossip_received_queue_closed: u64,
@@ -168,6 +313,7 @@ impl DirectStats {
     pub fn note(&self, outcome: DirectOutcome) {
         let counter = match outcome {
             DirectOutcome::Delivered => &self.delivered,
+            DirectOutcome::Queued => &self.queued,
             DirectOutcome::Refused => &self.refused,
             DirectOutcome::NotConnected => &self.not_connected,
             DirectOutcome::Unsupported => &self.unsupported,
@@ -180,6 +326,7 @@ impl DirectStats {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         DirectStatsSnapshot {
             delivered: get(&self.delivered),
+            queued: get(&self.queued),
             refused: get(&self.refused),
             not_connected: get(&self.not_connected),
             unsupported: get(&self.unsupported),
@@ -187,6 +334,7 @@ impl DirectStats {
             fallbacks: get(&self.fallbacks),
             received: get(&self.received),
             received_refused: get(&self.received_refused),
+            received_untaken: get(&self.received_untaken),
             gossip_received: get(&self.gossip_received),
             gossip_received_queue_full: get(&self.gossip_received_queue_full),
             gossip_received_queue_closed: get(&self.gossip_received_queue_closed),
@@ -194,8 +342,63 @@ impl DirectStats {
     }
 }
 
-/// Request: `u32 len ‖ bitmask ‖ u32 len ‖ data`. Response: one byte, 1 when
-/// accepted.
+/// Peers a direct send skips for [`UNSUPPORTED_RETRY_AFTER`]: those that lack
+/// the protocol, and, for a send that needs its message taken, those that
+/// answered "queued" on its bitmask (an earlier build, or a node whose
+/// standalone worker for that shard is one). Such a send would cost a copy
+/// that serves nothing, and its sender sends the gossip copy anyway. An
+/// answer "taken" on a bitmask forgets that bitmask's "queued": a node's
+/// workers for other shards may be later builds.
+#[derive(Debug, Default)]
+pub struct DirectAnswers {
+    /// Peers without the protocol, since when.
+    unsupported: HashMap<PeerId, Instant>,
+    /// Peers that answered "queued" on a bitmask, since when.
+    queued: HashMap<(PeerId, Vec<u8>), Instant>,
+}
+
+impl DirectAnswers {
+    /// Remember what `peer` answered at `now` to a send on `bitmask`.
+    pub fn note(&mut self, peer: PeerId, bitmask: &[u8], outcome: DirectOutcome, now: Instant) {
+        match outcome {
+            DirectOutcome::Unsupported => {
+                self.unsupported.insert(peer, now);
+            }
+            DirectOutcome::Queued => {
+                self.queued.insert((peer, bitmask.to_vec()), now);
+            }
+            DirectOutcome::Delivered => {
+                self.queued.remove(&(peer, bitmask.to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    /// The outcome a send to `peer` on `bitmask` at `now` gets without being
+    /// sent, if any: [`DirectOutcome::Unsupported`] for a peer without the
+    /// protocol, and for one that answers only "queued" on `bitmask` when
+    /// the send `needs_taken`.
+    pub fn skip(
+        &mut self,
+        peer: &PeerId,
+        bitmask: &[u8],
+        needs_taken: bool,
+        now: Instant,
+    ) -> Option<DirectOutcome> {
+        let fresh = |since: Instant| now.saturating_duration_since(since) < UNSUPPORTED_RETRY_AFTER;
+        self.unsupported.retain(|_, since| fresh(*since));
+        self.queued.retain(|_, since| fresh(*since));
+        if self.unsupported.contains_key(peer) {
+            return Some(DirectOutcome::Unsupported);
+        }
+        (needs_taken && self.queued.contains_key(&(*peer, bitmask.to_vec())))
+            .then_some(DirectOutcome::Unsupported)
+    }
+}
+
+/// Request: `u32 len ‖ bitmask ‖ u32 len ‖ data`. Response: one byte, 0 when
+/// refused, else 1; on [`direct_taken_protocol`], 1 is taken and 2 queued
+/// (the receiver's standalone worker is an earlier build).
 #[derive(Debug, Clone, Default)]
 pub struct DirectCodec;
 
@@ -229,7 +432,7 @@ async fn write_prefixed<T: AsyncWrite + Unpin + Send>(io: &mut T, bytes: &[u8]) 
 impl libp2p::request_response::Codec for DirectCodec {
     type Protocol = StreamProtocol;
     type Request = DirectRequest;
-    type Response = bool;
+    type Response = DirectAnswer;
 
     async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<DirectRequest>
     where
@@ -240,13 +443,21 @@ impl libp2p::request_response::Codec for DirectCodec {
         Ok(DirectRequest { bitmask, data })
     }
 
-    async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<bool>
+    async fn read_response<T>(
+        &mut self,
+        protocol: &StreamProtocol,
+        io: &mut T,
+    ) -> io::Result<DirectAnswer>
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut accepted = [0u8; 1];
-        io.read_exact(&mut accepted).await?;
-        Ok(accepted[0] == 1)
+        let mut answer = [0u8; 1];
+        io.read_exact(&mut answer).await?;
+        let taken_protocol = protocol.as_ref().starts_with(TAKEN_PROTOCOL_PREFIX);
+        Ok(DirectAnswer::of(
+            answer[0] != 0,
+            taken_protocol && answer[0] == 1,
+        ))
     }
 
     async fn write_request<T>(
@@ -271,14 +482,19 @@ impl libp2p::request_response::Codec for DirectCodec {
 
     async fn write_response<T>(
         &mut self,
-        _: &StreamProtocol,
+        protocol: &StreamProtocol,
         io: &mut T,
-        accepted: bool,
+        answer: DirectAnswer,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&[u8::from(accepted)]).await?;
+        let byte = match answer {
+            DirectAnswer::Refused => 0,
+            DirectAnswer::Queued if protocol.as_ref().starts_with(TAKEN_PROTOCOL_PREFIX) => 2,
+            DirectAnswer::Queued | DirectAnswer::Taken => 1,
+        };
+        io.write_all(&[byte]).await?;
         io.flush().await
     }
 }
@@ -310,19 +526,29 @@ mod tests {
                 request
             );
 
-            for accepted in [true, false] {
+            // "Taken" only on the newer protocol, where "queued" has its own
+            // byte; on the earlier one every acceptance reads as "queued".
+            let taken = direct_taken_protocol(0);
+            for (on, sent, byte, read) in [
+                (&protocol, DirectAnswer::Refused, 0, DirectAnswer::Refused),
+                (&protocol, DirectAnswer::Queued, 1, DirectAnswer::Queued),
+                (&protocol, DirectAnswer::Taken, 1, DirectAnswer::Queued),
+                (&taken, DirectAnswer::Refused, 0, DirectAnswer::Refused),
+                (&taken, DirectAnswer::Queued, 2, DirectAnswer::Queued),
+                (&taken, DirectAnswer::Taken, 1, DirectAnswer::Taken),
+            ] {
                 let mut wire = futures::io::Cursor::new(Vec::new());
                 DirectCodec
-                    .write_response(&protocol, &mut wire, accepted)
+                    .write_response(on, &mut wire, sent)
                     .await
                     .unwrap();
-                let mut read = futures::io::Cursor::new(wire.into_inner());
+                let wire = wire.into_inner();
+                assert_eq!(wire, [byte], "{on} {sent:?}");
+                let mut wire = futures::io::Cursor::new(wire);
                 assert_eq!(
-                    DirectCodec
-                        .read_response(&protocol, &mut read)
-                        .await
-                        .unwrap(),
-                    accepted
+                    DirectCodec.read_response(on, &mut wire).await.unwrap(),
+                    read,
+                    "{on}"
                 );
             }
 
@@ -348,6 +574,84 @@ mod tests {
         });
     }
 
+    /// A peer that answered "queued" is not sent what needs a take for
+    /// [`UNSUPPORTED_RETRY_AFTER`], but still what a queue serves; a peer
+    /// without the protocol is sent nothing; "taken" forgets the peer.
+    #[test]
+    fn a_peer_that_answers_queued_is_skipped_only_by_sends_that_need_a_take() {
+        let mut peers = DirectAnswers::default();
+        let start = Instant::now();
+        let shard = b"shard".as_slice();
+        let (earlier, without, upgraded) = (PeerId::random(), PeerId::random(), PeerId::random());
+        peers.note(earlier, shard, DirectOutcome::Queued, start);
+        peers.note(without, shard, DirectOutcome::Unsupported, start);
+        peers.note(upgraded, shard, DirectOutcome::Queued, start);
+        peers.note(upgraded, shard, DirectOutcome::Delivered, start);
+        for (row, peer, needs_taken, skipped) in [
+            (
+                "a queued peer, a vote",
+                earlier,
+                true,
+                Some(DirectOutcome::Unsupported),
+            ),
+            ("a queued peer, a resolver reply", earlier, false, None),
+            (
+                "no protocol, a vote",
+                without,
+                true,
+                Some(DirectOutcome::Unsupported),
+            ),
+            (
+                "no protocol, a resolver reply",
+                without,
+                false,
+                Some(DirectOutcome::Unsupported),
+            ),
+            ("an upgraded peer, a vote", upgraded, true, None),
+        ] {
+            assert_eq!(
+                peers.skip(&peer, shard, needs_taken, start),
+                skipped,
+                "{row}"
+            );
+        }
+        let later = start + UNSUPPORTED_RETRY_AFTER;
+        assert_eq!(
+            peers.skip(&earlier, shard, true, later),
+            None,
+            "asked again"
+        );
+        assert_eq!(
+            peers.skip(&without, shard, false, later),
+            None,
+            "asked again"
+        );
+        assert!(peers.unsupported.is_empty() && peers.queued.is_empty());
+    }
+
+    /// "Queued" is kept per shard: a node whose standalone worker for one
+    /// shard is an earlier build still gets votes directly for its other
+    /// shards, and a "taken" on another shard does not forget it.
+    #[test]
+    fn a_queued_answer_skips_only_the_shard_it_was_given_on() {
+        let mut peers = DirectAnswers::default();
+        let now = Instant::now();
+        let (earlier_worker, later_worker) = (b"shard a".as_slice(), b"shard b".as_slice());
+        let node = PeerId::random();
+        peers.note(node, earlier_worker, DirectOutcome::Queued, now);
+        peers.note(node, later_worker, DirectOutcome::Delivered, now);
+        assert_eq!(
+            peers.skip(&node, earlier_worker, true, now),
+            Some(DirectOutcome::Unsupported),
+            "a vote for the earlier worker's shard is skipped though another shard took one"
+        );
+        assert_eq!(
+            peers.skip(&node, later_worker, true, now),
+            None,
+            "a vote for the later worker's shard is still sent"
+        );
+    }
+
     #[test]
     fn outcomes_are_counted() {
         let stats = DirectStats::default();
@@ -371,6 +675,7 @@ mod tests {
             from: vec![3, 4],
             via: vec![3, 4],
             direct: false,
+            ack: None,
         };
         stats.note_gossip_receive(&tx.try_send(message(10)));
         let full = tx.try_send(message(20));

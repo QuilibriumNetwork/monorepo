@@ -989,6 +989,9 @@ message DeliverShardConsensusRequest {
 message DeliverShardConsensusResponse {
   // The worker runs this shard's engine and handed it the message.
   bool accepted = 1;
+  // Its engine took the message. Absent from an earlier worker, whose
+  // "accepted" did not say whether the engine's queue dropped it.
+  bool taken = 2;
 }
 
 message PrepareStorageConfirmRequest {
