@@ -60,7 +60,10 @@ impl ProxyPubSub {
             ep = ep.tls_config(cfg)?;
         }
         let channel = ep.connect().await?;
-        let client = PubSubProxyClient::new(channel.clone());
+        // The master's limits: it streams any gossip message it subscribed.
+        let client = PubSubProxyClient::new(channel.clone())
+            .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE);
         let inner = Arc::new(Mutex::new(client));
         // Cache cheap identity info up front so callers don't hit
         // round-trip latency on every peer_id()/own_multiaddrs() call.

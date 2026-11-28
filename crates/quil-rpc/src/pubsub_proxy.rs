@@ -132,6 +132,17 @@ impl PubSubProxyServer {
         self
     }
 
+    /// This proxy as the master serves it, with the limits the master and
+    /// its workers share ([`quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE`]):
+    /// a worker publishes any gossip message through it, up to
+    /// [`quil_p2p::protocol::MAX_MESSAGE_SIZE`]; tonic's default 4 MiB
+    /// refused a larger one.
+    pub fn into_service(self) -> pb::pub_sub_proxy_server::PubSubProxyServer<Self> {
+        pb::pub_sub_proxy_server::PubSubProxyServer::new(self)
+            .max_decoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(quil_p2p::protocol::MAX_GRPC_MESSAGE_SIZE)
+    }
+
     /// Gate a privileged proxy RPC to the node's OWN cluster identity.
     ///
     /// The proxy signs arbitrary bytes with the node's raw Ed448 key
@@ -475,7 +486,7 @@ mod self_identity_gate_tests {
     use crate::peer_auth_middleware::AuthenticatedPeer;
     use quil_p2p::PeerId;
 
-    fn noop_shim(peer_id_bytes: Vec<u8>) -> P2pHandleShim {
+    pub(super) fn noop_shim(peer_id_bytes: Vec<u8>) -> P2pHandleShim {
         P2pHandleShim {
             peer_id_bytes,
             publish: Arc::new(|_, _| {}),
@@ -539,5 +550,52 @@ mod self_identity_gate_tests {
         assert!(srv
             .require_self_identity(&ext_with(PeerId::random()))
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod message_limit_tests {
+    use super::*;
+
+    /// A worker's publish over tonic's default 4 MiB, of a gossip message
+    /// within the gossip limit, reaches the master's mesh through its
+    /// proxy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_publishes_a_message_over_4_mib_through_the_master() {
+        let published: Arc<std::sync::Mutex<Vec<usize>>> = Arc::default();
+        let shim = P2pHandleShim {
+            publish: Arc::new({
+                let published = published.clone();
+                move |_, data| published.lock().unwrap().push(data.len())
+            }),
+            ..self_identity_gate_tests::noop_shim(Vec::new())
+        };
+        let (inbound, _) = broadcast::channel(4);
+        let server =
+            PubSubProxyServer::new(shim, inbound, Arc::new(Vec::new), Arc::new(Vec::new), 0);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(server.into_service())
+                .serve_with_incoming(incoming),
+        );
+        let proxy = crate::proxy_pubsub::ProxyPubSub::connect(format!("http://{addr}"), None)
+            .await
+            .unwrap();
+        let size = 4_887_812;
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            proxy.publish(vec![0, 0], vec![0x5a; size]),
+        )
+        .await
+        .expect("no answer within 60 s");
+        println!("REACH grpc-limit publish answered");
+        if let Err(status) = sent {
+            panic!("publish over 4 MiB refused: {status}");
+        }
+        assert_eq!(*published.lock().unwrap(), vec![size]);
     }
 }

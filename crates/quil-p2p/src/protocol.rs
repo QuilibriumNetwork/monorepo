@@ -34,6 +34,12 @@ pub fn stream_protocol_for_network(network: u8) -> libp2p::StreamProtocol {
 /// Maximum RPC message size (16 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// Largest gRPC message a master and its workers exchange on the master's
+/// services, each way, and the limit its archive clients use (tonic's
+/// default is 4 MiB). Above [`MAX_MESSAGE_SIZE`], so any gossip message the
+/// master relays to a worker, or a worker to the master, fits.
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Encode an RPC message to bytes with a length prefix (unsigned varint).
 pub fn encode_rpc(rpc: &pb::Rpc) -> Vec<u8> {
     let msg_bytes = rpc.encode_to_vec();

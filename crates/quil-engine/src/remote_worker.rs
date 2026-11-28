@@ -1188,10 +1188,7 @@ impl RemoteWorkerManager {
         let Some(connection) = connection else {
             return RemoteDelivery::Failed;
         };
-        let mut client =
-            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(connection)
-                .max_decoding_message_size(16 << 20)
-                .max_encoding_message_size(16 << 20);
+        let mut client = shard_consensus_client(connection);
         let request = quil_types::proto::node::DeliverShardConsensusRequest {
             filter: filter.to_vec(),
             channel,
@@ -1856,6 +1853,18 @@ async fn resend_respawn(
         return RespawnOutcome::Superseded;
     }
     respawn_rpc(channel, filter).await
+}
+
+/// The master's client handing a standalone worker the shard consensus
+/// messages its committee sends this node directly: any gossip message,
+/// up to [`quil_p2p::protocol::MAX_MESSAGE_SIZE`].
+pub(crate) fn shard_consensus_client(
+    connection: tonic::transport::Channel,
+) -> quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient<tonic::transport::Channel>
+{
+    quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(connection)
+        .max_decoding_message_size(quil_p2p::protocol::MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(quil_p2p::protocol::MAX_MESSAGE_SIZE)
 }
 
 #[cfg(test)]
